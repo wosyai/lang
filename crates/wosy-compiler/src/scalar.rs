@@ -57,7 +57,10 @@ pub enum ScalarExpression {
         span: ByteSpan,
     },
     Call {
+        receiver: Option<String>,
         name: String,
+        receiver_span: Option<ByteSpan>,
+        name_span: ByteSpan,
         arguments: Vec<ScalarExpression>,
         span: ByteSpan,
     },
@@ -85,6 +88,17 @@ pub struct ScalarBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarNamespace {
+    pub binding: String,
+    pub package: String,
+    pub path: String,
+    pub binding_span: ByteSpan,
+    pub package_span: ByteSpan,
+    pub path_span: ByteSpan,
+    pub span: ByteSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarFunction {
     pub name: String,
     pub signature: ScalarType,
@@ -95,6 +109,7 @@ pub struct ScalarFunction {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ScalarItem {
+    Namespace(ScalarNamespace),
     Binding(ScalarBinding),
     Function(ScalarFunction),
 }
@@ -124,11 +139,15 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
         .expect("source root");
     for node in source_root.children() {
         match node.kind() {
+            SyntaxKind::NamespaceDecl => items.push(ScalarItem::Namespace(derive_namespace(&node))),
             SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node))),
             SyntaxKind::FunctionDecl => items.push(ScalarItem::Function(derive_function(&node))),
             SyntaxKind::Item => {
                 for item in node.children() {
                     match item.kind() {
+                        SyntaxKind::NamespaceDecl => {
+                            items.push(ScalarItem::Namespace(derive_namespace(&item)))
+                        }
                         SyntaxKind::BindingDecl => {
                             items.push(ScalarItem::Binding(derive_binding(&item)))
                         }
@@ -150,6 +169,26 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
     ScalarValidation {
         program,
         diagnostics,
+    }
+}
+
+fn derive_namespace(node: &CstNode) -> ScalarNamespace {
+    let identifiers: Vec<CstToken> = node
+        .children_with_tokens()
+        .filter_map(|element| match element {
+            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => Some(token),
+            _ => None,
+        })
+        .collect();
+    let path = direct_token(node, SyntaxKind::String).expect("namespace path");
+    ScalarNamespace {
+        binding: identifiers[0].text().to_owned(),
+        package: identifiers[1].text().to_owned(),
+        path: path.text().to_owned(),
+        binding_span: token_span(&identifiers[0]),
+        package_span: token_span(&identifiers[1]),
+        path_span: token_span(&path),
+        span: wosy_syntax::byte_span(node),
     }
 }
 
@@ -314,17 +353,37 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             value
         }
         SyntaxKind::Call => {
-            let name = direct_token(&actual, SyntaxKind::Identifier)
-                .expect("call name")
-                .text()
-                .to_owned();
+            let qualified = direct_nodes(&actual)
+                .into_iter()
+                .find(|child| child.kind() == SyntaxKind::QualifiedCall)
+                .expect("qualified call");
+            let identifiers: Vec<CstToken> = qualified
+                .children_with_tokens()
+                .filter_map(|element| match element {
+                    NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => {
+                        Some(token)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let receiver = identifiers
+                .first()
+                .filter(|_| identifiers.len() == 2)
+                .map(|token| token.text().to_owned());
+            let name_token = identifiers.last().expect("call member");
             let arguments = direct_nodes(&actual)
                 .iter()
                 .filter(|child| child.kind() == SyntaxKind::Expression)
                 .map(derive_expression)
                 .collect();
             ScalarExpression::Call {
-                name,
+                receiver,
+                name: name_token.text().to_owned(),
+                receiver_span: identifiers
+                    .first()
+                    .filter(|_| identifiers.len() == 2)
+                    .map(token_span),
+                name_span: token_span(name_token),
                 arguments,
                 span: wosy_syntax::byte_span(&actual),
             }
@@ -432,6 +491,7 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
     let mut declarations = BTreeMap::new();
     for item in &program.items {
         let (name, ty, span) = match item {
+            ScalarItem::Namespace(_) => continue,
             ScalarItem::Binding(binding) => (&binding.name, &binding.declared_type, binding.span),
             ScalarItem::Function(function) => (&function.name, &function.signature, function.span),
         };
@@ -442,6 +502,7 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
     }
     for item in &program.items {
         match item {
+            ScalarItem::Namespace(_) => {}
             ScalarItem::Binding(binding) => {
                 let actual =
                     expression_type(&binding.value, &declarations, program, &mut diagnostics);
@@ -564,11 +625,16 @@ fn expression_type(
             }
         }
         ScalarExpression::Call {
+            receiver,
             name,
             arguments,
             span,
+            ..
         } => {
-            let Some(ScalarType::Callable { result, parameters }) = scope.get(name) else {
+            let lookup_name = receiver
+                .as_ref()
+                .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"));
+            let Some(ScalarType::Callable { result, parameters }) = scope.get(&lookup_name) else {
                 diagnostics.push(diagnostic(program, "B0001", "unknown callable name", *span));
                 return ScalarType::Unit;
             };
@@ -734,5 +800,39 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "B0006"));
+    }
+
+    #[test]
+    fn derives_namespace_and_qualified_member_without_text_reparsing() {
+        let result = validate_text(
+            "%%start\nmath = namespace app \"src/math.w\";\ni32 result = math.add(20, 22);\n%%end",
+        );
+        let ScalarItem::Namespace(namespace) = &result.program.items[0] else {
+            panic!("namespace item");
+        };
+        assert_eq!(namespace.binding, "math");
+        assert_eq!(namespace.package, "app");
+        assert_eq!(namespace.path, "\"src/math.w\"");
+        assert_eq!(namespace.binding_span, ByteSpan::new(8, 12));
+        assert_eq!(namespace.package_span, ByteSpan::new(25, 28));
+        assert_eq!(namespace.path_span, ByteSpan::new(29, 41));
+
+        let ScalarItem::Binding(binding) = &result.program.items[1] else {
+            panic!("result binding");
+        };
+        let ScalarExpression::Call {
+            receiver,
+            name,
+            receiver_span,
+            name_span,
+            ..
+        } = &binding.value
+        else {
+            panic!("qualified call");
+        };
+        assert_eq!(receiver.as_deref(), Some("math"));
+        assert_eq!(name, "add");
+        assert_eq!(*receiver_span, Some(ByteSpan::new(56, 60)));
+        assert_eq!(*name_span, ByteSpan::new(61, 64));
     }
 }
