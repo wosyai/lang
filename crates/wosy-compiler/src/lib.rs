@@ -8,9 +8,10 @@ pub use llvm::{
     emit_scalar_llvm, emit_scalar_llvm_text, LlvmFunction, LlvmPartition, LlvmValueType,
 };
 pub use scalar::{
-    derive_scalar_program, derive_scalar_program_from_cst, BinaryOperator, ScalarBinding,
-    ScalarBlock, ScalarExpression, ScalarFunction, ScalarItem, ScalarProgram, ScalarType,
-    ScalarValidation,
+    derive_scalar_program, derive_scalar_program_from_cst, validate_scalar_project, BinaryOperator,
+    ScalarBinding, ScalarBlock, ScalarExpression, ScalarFunction, ScalarInitializationNode,
+    ScalarItem, ScalarModule, ScalarNamespaceBinding, ScalarProgram, ScalarProject,
+    ScalarProjectValidation, ScalarType, ScalarValidation,
 };
 
 mod llvm;

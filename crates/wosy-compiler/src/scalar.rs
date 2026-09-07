@@ -121,6 +121,86 @@ pub struct ScalarProgram {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarNamespaceBinding {
+    pub binding: String,
+    pub target: SourceIdentity,
+    pub span: ByteSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarInitializationNode {
+    pub item_index: usize,
+    pub span: ByteSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarModule {
+    pub source: SourceIdentity,
+    pub items: Vec<ScalarItem>,
+    pub namespace_bindings: Vec<ScalarNamespaceBinding>,
+    pub members: BTreeMap<String, ScalarType>,
+    pub initialization_nodes: Vec<ScalarInitializationNode>,
+}
+
+impl ScalarModule {
+    pub fn new(
+        source: SourceIdentity,
+        items: Vec<ScalarItem>,
+        namespace_bindings: Vec<ScalarNamespaceBinding>,
+    ) -> Self {
+        let mut members = BTreeMap::new();
+        let mut initialization_nodes = Vec::new();
+        for (item_index, item) in items.iter().enumerate() {
+            let (name, ty, span) = match item {
+                ScalarItem::Namespace(_) => continue,
+                ScalarItem::Binding(binding) => {
+                    (&binding.name, &binding.declared_type, binding.span)
+                }
+                ScalarItem::Function(function) => {
+                    (&function.name, &function.signature, function.span)
+                }
+            };
+            members.insert(name.clone(), ty.clone());
+            initialization_nodes.push(ScalarInitializationNode { item_index, span });
+        }
+        Self {
+            source,
+            items,
+            namespace_bindings,
+            members,
+            initialization_nodes,
+        }
+    }
+}
+
+impl ScalarProject {
+    pub fn new(modules: Vec<ScalarModule>, initialization_order: Vec<SourceIdentity>) -> Self {
+        let mut unique_initialization_order = Vec::new();
+        for source in initialization_order {
+            if !unique_initialization_order.contains(&source) {
+                unique_initialization_order.push(source);
+            }
+        }
+        Self {
+            modules,
+            initialization_order: unique_initialization_order,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarProject {
+    pub modules: Vec<ScalarModule>,
+    pub initialization_order: Vec<SourceIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarProjectValidation {
+    pub project: ScalarProject,
+    pub diagnostics: Vec<super::Diagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarValidation {
     pub program: ScalarProgram,
     pub diagnostics: Vec<super::Diagnostic>,
@@ -169,6 +249,340 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
     ScalarValidation {
         program,
         diagnostics,
+    }
+}
+
+pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
+    let mut diagnostics = Vec::new();
+    for module in &project.modules {
+        let mut declarations = BTreeMap::new();
+        for item in &module.items {
+            let (name, ty, span) = match item {
+                ScalarItem::Namespace(_) => continue,
+                ScalarItem::Binding(binding) => {
+                    (&binding.name, &binding.declared_type, binding.span)
+                }
+                ScalarItem::Function(function) => {
+                    (&function.name, &function.signature, function.span)
+                }
+            };
+            if declarations.insert(name.clone(), ty.clone()).is_some() {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0002",
+                    "duplicate declaration",
+                    span,
+                ));
+            }
+            validate_module_type(module, ty, span, &mut diagnostics);
+        }
+        for item in &module.items {
+            match item {
+                ScalarItem::Namespace(_) => {}
+                ScalarItem::Binding(binding) => {
+                    let actual = expression_type_in_module(
+                        &binding.value,
+                        &declarations,
+                        module,
+                        &project.modules,
+                        &mut diagnostics,
+                    );
+                    expect_module_type(
+                        module,
+                        &binding.declared_type,
+                        &actual,
+                        binding.span,
+                        &mut diagnostics,
+                    );
+                }
+                ScalarItem::Function(function) => {
+                    let ScalarType::Callable { result, parameters } = &function.signature else {
+                        continue;
+                    };
+                    let mut scope = declarations.clone();
+                    for (index, name) in function.parameters.iter().enumerate() {
+                        if index < parameters.len() {
+                            scope.insert(name.clone(), parameters[index].clone());
+                        }
+                    }
+                    let actual = block_type_in_module(
+                        &function.body,
+                        &scope,
+                        module,
+                        &project.modules,
+                        &mut diagnostics,
+                    );
+                    expect_module_type(
+                        module,
+                        result,
+                        &actual,
+                        function.body.span,
+                        &mut diagnostics,
+                    );
+                }
+            }
+        }
+    }
+    ScalarProjectValidation {
+        project,
+        diagnostics,
+    }
+}
+
+fn validate_module_type(
+    module: &ScalarModule,
+    ty: &ScalarType,
+    span: ByteSpan,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    match ty {
+        ScalarType::Named(_) => diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "unknown scalar type",
+            span,
+        )),
+        ScalarType::Callable { result, parameters } => {
+            validate_module_type(module, result, span, diagnostics);
+            for parameter in parameters {
+                validate_module_type(module, parameter, span, diagnostics);
+            }
+        }
+        ScalarType::Unit | ScalarType::Bool | ScalarType::I32 => {}
+    }
+}
+
+fn block_type_in_module(
+    block: &ScalarBlock,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    block
+        .expressions
+        .last()
+        .map_or(ScalarType::Unit, |expression| {
+            expression_type_in_module(expression, scope, module, modules, diagnostics)
+        })
+}
+
+fn expression_type_in_module(
+    expression: &ScalarExpression,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    match expression {
+        ScalarExpression::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
+            diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
+            ScalarType::Unit
+        }),
+        ScalarExpression::Integer { .. } => ScalarType::I32,
+        ScalarExpression::Boolean { .. } => ScalarType::Bool,
+        ScalarExpression::Binary {
+            operator,
+            left,
+            right,
+            span,
+        } => {
+            let left_type = expression_type_in_module(left, scope, module, modules, diagnostics);
+            let right_type = expression_type_in_module(right, scope, module, modules, diagnostics);
+            let comparison = matches!(
+                operator,
+                BinaryOperator::Equal
+                    | BinaryOperator::NotEqual
+                    | BinaryOperator::Less
+                    | BinaryOperator::LessEqual
+                    | BinaryOperator::Greater
+                    | BinaryOperator::GreaterEqual
+            );
+            let boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
+            if boolean {
+                expect_module_type(module, &ScalarType::Bool, &left_type, *span, diagnostics);
+                expect_module_type(module, &ScalarType::Bool, &right_type, *span, diagnostics);
+                ScalarType::Bool
+            } else if comparison {
+                expect_module_type(module, &left_type, &right_type, *span, diagnostics);
+                ScalarType::Bool
+            } else {
+                expect_module_type(module, &ScalarType::I32, &left_type, *span, diagnostics);
+                expect_module_type(module, &left_type, &right_type, *span, diagnostics);
+                ScalarType::I32
+            }
+        }
+        ScalarExpression::Call {
+            receiver,
+            name,
+            name_span,
+            arguments,
+            span,
+            ..
+        } => {
+            let (callable, target) = match receiver {
+                None => (scope.get(name), module),
+                Some(binding) => {
+                    let namespace = module
+                        .namespace_bindings
+                        .iter()
+                        .find(|namespace| namespace.binding == *binding);
+                    let Some(namespace) = namespace else {
+                        diagnostics.push(module_diagnostic(
+                            module,
+                            "B0001",
+                            "unknown callable name",
+                            *span,
+                        ));
+                        return ScalarType::Unit;
+                    };
+                    let Some(target) = modules
+                        .iter()
+                        .find(|module| module.source == namespace.target)
+                    else {
+                        diagnostics.push(module_diagnostic(
+                            module,
+                            "B0001",
+                            "unknown callable name",
+                            *span,
+                        ));
+                        return ScalarType::Unit;
+                    };
+                    let Some(callable) = target.members.get(name) else {
+                        diagnostics.push(unknown_member_diagnostic(
+                            module,
+                            *name_span,
+                            &target.source,
+                        ));
+                        return ScalarType::Unit;
+                    };
+                    (Some(callable), target)
+                }
+            };
+            let Some(callable) = callable else {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0001",
+                    "unknown callable name",
+                    *span,
+                ));
+                return ScalarType::Unit;
+            };
+            let ScalarType::Callable { result, parameters } = callable else {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0001",
+                    "unknown callable name",
+                    *span,
+                ));
+                return ScalarType::Unit;
+            };
+            if arguments.len() != parameters.len() {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0004",
+                    "call argument arity does not match callable type",
+                    *span,
+                ));
+            }
+            for (argument, parameter) in arguments.iter().zip(parameters) {
+                let actual =
+                    expression_type_in_module(argument, scope, module, modules, diagnostics);
+                expect_module_type(target, parameter, &actual, *span, diagnostics);
+            }
+            result.as_ref().clone()
+        }
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            span,
+        } => {
+            let condition_type =
+                expression_type_in_module(condition, scope, module, modules, diagnostics);
+            expect_module_type(
+                module,
+                &ScalarType::Bool,
+                &condition_type,
+                *span,
+                diagnostics,
+            );
+            let then_type = block_type_in_module(then_branch, scope, module, modules, diagnostics);
+            let else_type = block_type_in_module(else_branch, scope, module, modules, diagnostics);
+            if then_type != else_type {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0006",
+                    "conditional branches must have equal types",
+                    *span,
+                ));
+            }
+            then_type
+        }
+        ScalarExpression::Block(block) => {
+            block_type_in_module(block, scope, module, modules, diagnostics)
+        }
+    }
+}
+
+fn expect_module_type(
+    module: &ScalarModule,
+    expected: &ScalarType,
+    actual: &ScalarType,
+    span: ByteSpan,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    if expected != actual {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "expression type does not match expected type",
+            span,
+        ));
+    }
+}
+
+fn module_diagnostic(
+    module: &ScalarModule,
+    code: &str,
+    message: &str,
+    span: ByteSpan,
+) -> super::Diagnostic {
+    super::Diagnostic {
+        code: code.to_owned(),
+        severity: super::DiagnosticSeverity::Error,
+        message: message.to_owned(),
+        labels: vec![super::DiagnosticLabel {
+            kind: super::DiagnosticLabelKind::Primary,
+            span: SourceSpan::new(module.source.clone(), span),
+            message: message.to_owned(),
+        }],
+        notes: Vec::new(),
+    }
+}
+
+fn unknown_member_diagnostic(
+    importer: &ScalarModule,
+    member_span: ByteSpan,
+    target: &SourceIdentity,
+) -> super::Diagnostic {
+    super::Diagnostic {
+        code: "M0002".to_owned(),
+        severity: super::DiagnosticSeverity::Error,
+        message: "unknown module member".to_owned(),
+        labels: vec![
+            super::DiagnosticLabel {
+                kind: super::DiagnosticLabelKind::Primary,
+                span: SourceSpan::new(importer.source.clone(), member_span),
+                message: "unknown module member".to_owned(),
+            },
+            super::DiagnosticLabel {
+                kind: super::DiagnosticLabelKind::Secondary,
+                span: SourceSpan::new(target.clone(), ByteSpan::new(0, 0)),
+                message: "module resolved here".to_owned(),
+            },
+        ],
+        notes: Vec::new(),
     }
 }
 
@@ -834,5 +1248,164 @@ mod tests {
         assert_eq!(name, "add");
         assert_eq!(*receiver_span, Some(ByteSpan::new(56, 60)));
         assert_eq!(*name_span, ByteSpan::new(61, 64));
+    }
+
+    fn module_source(path: &str) -> SourceIdentity {
+        SourceIdentity::new("project".into(), "app".into(), path.into(), "r1".into())
+    }
+
+    fn module_from_text(source: SourceIdentity, text: &str) -> ScalarProgram {
+        let parsed = parse_source(source, text.to_owned(), &[]);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "syntax diagnostics: {:?}",
+            parsed.diagnostics
+        );
+        derive_scalar_program(&parsed.result).program
+    }
+
+    #[test]
+    fn resolves_qualified_member_only_through_bound_module() {
+        let math_source = module_source("src/math.w");
+        let math = module_from_text(
+            math_source.clone(),
+            "%%start\ni32(i32, i32) add = fn(left, right) { left + right };\n%%end",
+        );
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nmath = namespace app \"src/math.w\";\ni32 result = math.add(20, 22);\n%%end",
+        );
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let project = ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source.clone(),
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "math".to_owned(),
+                        target: math_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(math_source.clone(), math.items, Vec::new()),
+            ],
+            vec![main_source, math_source],
+        );
+        let result = validate_scalar_project(project);
+        assert!(
+            result.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn reports_unknown_member_at_member_span_and_target_source() {
+        let math_source = module_source("src/math.w");
+        let math = module_from_text(math_source.clone(), "%%start\ni32 value = 1;\n%%end");
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nmath = namespace app \"src/math.w\";\ni32 result = math.add(20, 22);\n%%end",
+        );
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let project = ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source.clone(),
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "math".to_owned(),
+                        target: math_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(math_source.clone(), math.items, Vec::new()),
+            ],
+            vec![main_source.clone(), math_source.clone()],
+        );
+        let result = validate_scalar_project(project);
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "M0002")
+            .expect("unknown member diagnostic");
+        assert_eq!(diagnostic.labels[0].span.source, main_source);
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(61, 64));
+        assert_eq!(diagnostic.labels[1].span.source, math_source);
+    }
+
+    #[test]
+    fn rejects_importer_unqualified_member_lookup() {
+        let math_source = module_source("src/math.w");
+        let math = module_from_text(
+            math_source.clone(),
+            "%%start\ni32(i32, i32) add = fn(left, right) { left + right };\n%%end",
+        );
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nmath = namespace app \"src/math.w\";\ni32 result = add(20, 22);\n%%end",
+        );
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let result = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source,
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "math".to_owned(),
+                        target: math_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(math_source, math.items, Vec::new()),
+            ],
+            Vec::new(),
+        ));
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0001"));
+    }
+
+    #[test]
+    fn represents_source_ordered_module_initialization_once() {
+        let first_source = module_source("src/first.w");
+        let second_source = module_source("src/second.w");
+        let first = ScalarModule::new(
+            first_source.clone(),
+            module_from_text(first_source.clone(), "%%start\ni32 first = 1;\n%%end").items,
+            Vec::new(),
+        );
+        let second = ScalarModule::new(
+            second_source.clone(),
+            module_from_text(second_source.clone(), "%%start\ni32 second = 2;\n%%end").items,
+            Vec::new(),
+        );
+        assert_eq!(first.initialization_nodes.len(), 1);
+        assert_eq!(second.initialization_nodes.len(), 1);
+        let project = ScalarProject::new(
+            vec![first, second],
+            vec![
+                second_source.clone(),
+                first_source.clone(),
+                second_source.clone(),
+            ],
+        );
+        assert_eq!(
+            project.initialization_order,
+            vec![second_source, first_source]
+        );
     }
 }
