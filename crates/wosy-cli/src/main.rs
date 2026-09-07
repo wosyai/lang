@@ -482,16 +482,37 @@ fn render_project_diagnostics(
     texts: &BTreeMap<PackageRelativePath, String>,
 ) {
     for diagnostic in diagnostics {
-        let Some(label) = diagnostic.labels.first() else {
-            continue;
-        };
-        let Ok(path) = PackageRelativePath::new(label.span.source.path.clone().into()) else {
-            continue;
-        };
-        let Some(text) = texts.get(&path) else {
-            continue;
-        };
-        render_diagnostics(text, std::slice::from_ref(diagnostic), &label.span.source);
+        let mut files = SimpleFiles::new();
+        let labels = diagnostic
+            .labels
+            .iter()
+            .filter_map(|label| {
+                let path = PackageRelativePath::new(label.span.source.path.clone().into()).ok()?;
+                let text = texts.get(&path)?;
+                let file_id = files.add(label.span.source.path.clone(), text.clone());
+                let range = label.span.range.start as usize..label.span.range.end as usize;
+                Some(
+                    match label.kind {
+                        wosy_compiler::DiagnosticLabelKind::Primary => {
+                            Label::primary(file_id, range)
+                        }
+                        wosy_compiler::DiagnosticLabelKind::Secondary => {
+                            Label::secondary(file_id, range)
+                        }
+                    }
+                    .with_message(label.message.clone()),
+                )
+            })
+            .collect();
+        let report = Report::error()
+            .with_code(diagnostic.code.clone())
+            .with_message(diagnostic.message.clone())
+            .with_labels(labels)
+            .with_notes(diagnostic.notes.clone());
+        let config = term::Config::default();
+        let stream = StandardStream::stderr(ColorChoice::Auto);
+        let mut stream_lock = stream.lock();
+        let _ = term::emit(&mut stream_lock, &config, &files, &report);
     }
 }
 
