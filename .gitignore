@@ -1,2 +1,4 @@
 /target/
 /tests/fixture-harness/target/
+/.wosy/
+/tests/fixtures/**/.wosy/
