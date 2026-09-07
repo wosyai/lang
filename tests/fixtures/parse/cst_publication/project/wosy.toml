@@ -1,0 +1,8 @@
+[package]
+name = "fixture-publication"
+
+[comments]
+categories = ["INTENT"]
+
+[targets.app]
+root = "src/main.w"

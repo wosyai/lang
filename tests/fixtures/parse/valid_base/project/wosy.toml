@@ -1,0 +1,8 @@
+[package]
+name = "fixture-valid"
+
+[comments]
+categories = ["INTENT"]
+
+[targets.app]
+root = "src/main.w"

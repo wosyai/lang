@@ -1,0 +1,8 @@
+[package]
+name = "fixture-recovery"
+
+[comments]
+categories = ["INTENT"]
+
+[targets.app]
+root = "src/main.w"

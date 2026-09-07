@@ -1,0 +1,14 @@
+[[steps]]
+command = ["wosy", "parse", "app"]
+exit = 0
+
+[[assert]]
+command = ["cat", ".wosy/cst/current.json"]
+exit = 0
+stdout = "expected/cst.json"
+
+[[assert]]
+command = ["cat", ".wosy/cst/current.json"]
+exit = 0
+stdout = "expected/typed-comment.json"
+select = ["/root/children/0/children/8/metadata"]

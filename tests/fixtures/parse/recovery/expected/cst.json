@@ -1,0 +1,15 @@
+{
+  "comments": [
+    {
+      "category": "INTENT",
+      "raw_payload": " retained while recovering.",
+      "valid": true
+    }
+  ],
+  "diagnostics": [
+    {
+      "code": "S0001",
+      "severity": "Error"
+    }
+  ]
+}

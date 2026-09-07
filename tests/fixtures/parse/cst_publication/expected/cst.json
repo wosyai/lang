@@ -1,0 +1,13 @@
+{
+  "source": {
+    "package": "fixture-publication",
+    "path": "src/main.w"
+  },
+  "root": {
+    "selector": "0",
+    "metadata": {
+      "kind": "none"
+    }
+  },
+  "diagnostics": []
+}

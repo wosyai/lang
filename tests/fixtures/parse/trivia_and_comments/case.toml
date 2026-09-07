@@ -1,0 +1,8 @@
+[[steps]]
+command = ["wosy", "parse", "app"]
+exit = 0
+
+[[assert]]
+command = ["cat", ".wosy/cst/current.json"]
+exit = 0
+stdout = "expected/cst.json"

@@ -4,6 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dependencies]
+blake3.workspace = true
+clap.workspace = true
+codespan-reporting.workspace = true
+serde_json.workspace = true
+wosy-compiler.workspace = true
+wosy-project.workspace = true
+wosy-syntax.workspace = true
+
 [[bin]]
 name = "wosy"
 path = "src/main.rs"

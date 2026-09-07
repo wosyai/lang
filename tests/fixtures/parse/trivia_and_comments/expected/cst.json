@@ -1,0 +1,10 @@
+{
+  "comments": [
+    {
+      "category": "INTENT",
+      "raw_payload": "  exact payload  ",
+      "valid": true
+    }
+  ],
+  "diagnostics": []
+}

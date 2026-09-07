@@ -1,0 +1,1610 @@
+{
+  "source": {
+    "project": "/mnt/windows/wosyai/lang/tests/fixtures/parse/valid_base/project",
+    "package": "fixture-valid",
+    "path": "src/main.w",
+    "revision": "316ea12cabf02db597098a05bff3bace9df1fd83f2de7146fbec1604c8615bd6"
+  },
+  "source_revision": "316ea12cabf02db597098a05bff3bace9df1fd83f2de7146fbec1604c8615bd6",
+  "root": {
+    "selector": "0",
+    "kind": "Root",
+    "span": {
+      "start": 0,
+      "end": 214
+    },
+    "text": "%%start\nenv = extern wasm \"env\" {\n\tunit(i32) print_i32;\n};\n\ni32(i32) add_one = fn(value) {\n\tvalue + 1\n};\n\n# INTENT: Exercise raw typed-comment preservation.\nunit() main = fn {\n\tenv.print_i32(add_one(41));\n};\n%%end\n",
+    "metadata": {
+      "kind": "none"
+    },
+    "recovery": false,
+    "children": [
+      {
+        "selector": "0.0",
+        "kind": "Root",
+        "span": {
+          "start": 0,
+          "end": 214
+        },
+        "text": "%%start\nenv = extern wasm \"env\" {\n\tunit(i32) print_i32;\n};\n\ni32(i32) add_one = fn(value) {\n\tvalue + 1\n};\n\n# INTENT: Exercise raw typed-comment preservation.\nunit() main = fn {\n\tenv.print_i32(add_one(41));\n};\n%%end\n",
+        "metadata": {
+          "kind": "none"
+        },
+        "recovery": false,
+        "children": [
+          {
+            "selector": "0.0.0",
+            "kind": "BoundaryStart",
+            "span": {
+              "start": 0,
+              "end": 7
+            },
+            "text": "%%start",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": []
+          },
+          {
+            "selector": "0.0.1",
+            "kind": "LineEnding",
+            "span": {
+              "start": 7,
+              "end": 8
+            },
+            "text": "\n",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": []
+          },
+          {
+            "selector": "0.0.2",
+            "kind": "ExternDecl",
+            "span": {
+              "start": 8,
+              "end": 58
+            },
+            "text": "env = extern wasm \"env\" {\n\tunit(i32) print_i32;\n};",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": [
+              {
+                "selector": "0.0.2.0",
+                "kind": "Identifier",
+                "span": {
+                  "start": 8,
+                  "end": 11
+                },
+                "text": "env",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.1",
+                "kind": "Whitespace",
+                "span": {
+                  "start": 11,
+                  "end": 12
+                },
+                "text": " ",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.2",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 12,
+                  "end": 13
+                },
+                "text": "=",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.3",
+                "kind": "Whitespace",
+                "span": {
+                  "start": 13,
+                  "end": 14
+                },
+                "text": " ",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.4",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 14,
+                  "end": 15
+                },
+                "text": "e",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.5",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 15,
+                  "end": 16
+                },
+                "text": "x",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.6",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 16,
+                  "end": 17
+                },
+                "text": "t",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.7",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 17,
+                  "end": 18
+                },
+                "text": "e",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.8",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 18,
+                  "end": 19
+                },
+                "text": "r",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.9",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 19,
+                  "end": 20
+                },
+                "text": "n",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.10",
+                "kind": "Whitespace",
+                "span": {
+                  "start": 20,
+                  "end": 21
+                },
+                "text": " ",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.11",
+                "kind": "Identifier",
+                "span": {
+                  "start": 21,
+                  "end": 25
+                },
+                "text": "wasm",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.12",
+                "kind": "Whitespace",
+                "span": {
+                  "start": 25,
+                  "end": 26
+                },
+                "text": " ",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.13",
+                "kind": "String",
+                "span": {
+                  "start": 26,
+                  "end": 31
+                },
+                "text": "\"env\"",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.14",
+                "kind": "Whitespace",
+                "span": {
+                  "start": 31,
+                  "end": 32
+                },
+                "text": " ",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.15",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 32,
+                  "end": 33
+                },
+                "text": "{",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.16",
+                "kind": "LineEnding",
+                "span": {
+                  "start": 33,
+                  "end": 34
+                },
+                "text": "\n",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.17",
+                "kind": "Indentation",
+                "span": {
+                  "start": 34,
+                  "end": 35
+                },
+                "text": "\t",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.18",
+                "kind": "ExternFunction",
+                "span": {
+                  "start": 35,
+                  "end": 55
+                },
+                "text": "unit(i32) print_i32;",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": [
+                  {
+                    "selector": "0.0.2.18.0",
+                    "kind": "CallableType",
+                    "span": {
+                      "start": 35,
+                      "end": 44
+                    },
+                    "text": "unit(i32)",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": [
+                      {
+                        "selector": "0.0.2.18.0.0",
+                        "kind": "TypeName",
+                        "span": {
+                          "start": 35,
+                          "end": 39
+                        },
+                        "text": "unit",
+                        "metadata": {
+                          "kind": "none"
+                        },
+                        "recovery": false,
+                        "children": []
+                      },
+                      {
+                        "selector": "0.0.2.18.0.1",
+                        "kind": "Punctuation",
+                        "span": {
+                          "start": 39,
+                          "end": 40
+                        },
+                        "text": "(",
+                        "metadata": {
+                          "kind": "none"
+                        },
+                        "recovery": false,
+                        "children": []
+                      },
+                      {
+                        "selector": "0.0.2.18.0.2",
+                        "kind": "TypeName",
+                        "span": {
+                          "start": 40,
+                          "end": 43
+                        },
+                        "text": "i32",
+                        "metadata": {
+                          "kind": "none"
+                        },
+                        "recovery": false,
+                        "children": []
+                      },
+                      {
+                        "selector": "0.0.2.18.0.3",
+                        "kind": "Punctuation",
+                        "span": {
+                          "start": 43,
+                          "end": 44
+                        },
+                        "text": ")",
+                        "metadata": {
+                          "kind": "none"
+                        },
+                        "recovery": false,
+                        "children": []
+                      }
+                    ]
+                  },
+                  {
+                    "selector": "0.0.2.18.1",
+                    "kind": "Whitespace",
+                    "span": {
+                      "start": 44,
+                      "end": 45
+                    },
+                    "text": " ",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.2.18.2",
+                    "kind": "Identifier",
+                    "span": {
+                      "start": 45,
+                      "end": 54
+                    },
+                    "text": "print_i32",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.2.18.3",
+                    "kind": "Punctuation",
+                    "span": {
+                      "start": 54,
+                      "end": 55
+                    },
+                    "text": ";",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "selector": "0.0.2.19",
+                "kind": "LineEnding",
+                "span": {
+                  "start": 55,
+                  "end": 56
+                },
+                "text": "\n",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.20",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 56,
+                  "end": 57
+                },
+                "text": "}",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.2.21",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 57,
+                  "end": 58
+                },
+                "text": ";",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              }
+            ]
+          },
+          {
+            "selector": "0.0.3",
+            "kind": "LineEnding",
+            "span": {
+              "start": 58,
+              "end": 59
+            },
+            "text": "\n",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": []
+          },
+          {
+            "selector": "0.0.4",
+            "kind": "LineEnding",
+            "span": {
+              "start": 59,
+              "end": 60
+            },
+            "text": "\n",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": []
+          },
+          {
+            "selector": "0.0.5",
+            "kind": "FunctionDecl",
+            "span": {
+              "start": 60,
+              "end": 104
+            },
+            "text": "i32(i32) add_one = fn(value) {\n\tvalue + 1\n};",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": [
+              {
+                "selector": "0.0.5.0",
+                "kind": "CallableType",
+                "span": {
+                  "start": 60,
+                  "end": 68
+                },
+                "text": "i32(i32)",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": [
+                  {
+                    "selector": "0.0.5.0.0",
+                    "kind": "TypeName",
+                    "span": {
+                      "start": 60,
+                      "end": 63
+                    },
+                    "text": "i32",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.5.0.1",
+                    "kind": "Punctuation",
+                    "span": {
+                      "start": 63,
+                      "end": 64
+                    },
+                    "text": "(",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.5.0.2",
+                    "kind": "TypeName",
+                    "span": {
+                      "start": 64,
+                      "end": 67
+                    },
+                    "text": "i32",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.5.0.3",
+                    "kind": "Punctuation",
+                    "span": {
+                      "start": 67,
+                      "end": 68
+                    },
+                    "text": ")",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "selector": "0.0.5.1",
+                "kind": "Whitespace",
+                "span": {
+                  "start": 68,
+                  "end": 69
+                },
+                "text": " ",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.5.2",
+                "kind": "Identifier",
+                "span": {
+                  "start": 69,
+                  "end": 76
+                },
+                "text": "add_one",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.5.3",
+                "kind": "Whitespace",
+                "span": {
+                  "start": 76,
+                  "end": 77
+                },
+                "text": " ",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.5.4",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 77,
+                  "end": 78
+                },
+                "text": "=",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.5.5",
+                "kind": "Whitespace",
+                "span": {
+                  "start": 78,
+                  "end": 79
+                },
+                "text": " ",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.5.6",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 79,
+                  "end": 80
+                },
+                "text": "f",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.5.7",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 80,
+                  "end": 81
+                },
+                "text": "n",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.5.8",
+                "kind": "Parameters",
+                "span": {
+                  "start": 81,
+                  "end": 88
+                },
+                "text": "(value)",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": [
+                  {
+                    "selector": "0.0.5.8.0",
+                    "kind": "Punctuation",
+                    "span": {
+                      "start": 81,
+                      "end": 82
+                    },
+                    "text": "(",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.5.8.1",
+                    "kind": "Identifier",
+                    "span": {
+                      "start": 82,
+                      "end": 87
+                    },
+                    "text": "value",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.5.8.2",
+                    "kind": "Punctuation",
+                    "span": {
+                      "start": 87,
+                      "end": 88
+                    },
+                    "text": ")",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "selector": "0.0.5.9",
+                "kind": "Whitespace",
+                "span": {
+                  "start": 88,
+                  "end": 89
+                },
+                "text": " ",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.5.10",
+                "kind": "Block",
+                "span": {
+                  "start": 89,
+                  "end": 103
+                },
+                "text": "{\n\tvalue + 1\n}",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": [
+                  {
+                    "selector": "0.0.5.10.0",
+                    "kind": "Punctuation",
+                    "span": {
+                      "start": 89,
+                      "end": 90
+                    },
+                    "text": "{",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.5.10.1",
+                    "kind": "LineEnding",
+                    "span": {
+                      "start": 90,
+                      "end": 91
+                    },
+                    "text": "\n",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.5.10.2",
+                    "kind": "Indentation",
+                    "span": {
+                      "start": 91,
+                      "end": 92
+                    },
+                    "text": "\t",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.5.10.3",
+                    "kind": "Expression",
+                    "span": {
+                      "start": 92,
+                      "end": 101
+                    },
+                    "text": "value + 1",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": [
+                      {
+                        "selector": "0.0.5.10.3.0",
+                        "kind": "Binary",
+                        "span": {
+                          "start": 92,
+                          "end": 101
+                        },
+                        "text": "value + 1",
+                        "metadata": {
+                          "kind": "none"
+                        },
+                        "recovery": false,
+                        "children": [
+                          {
+                            "selector": "0.0.5.10.3.0.0",
+                            "kind": "Identifier",
+                            "span": {
+                              "start": 92,
+                              "end": 97
+                            },
+                            "text": "value",
+                            "metadata": {
+                              "kind": "none"
+                            },
+                            "recovery": false,
+                            "children": []
+                          },
+                          {
+                            "selector": "0.0.5.10.3.0.1",
+                            "kind": "Whitespace",
+                            "span": {
+                              "start": 97,
+                              "end": 98
+                            },
+                            "text": " ",
+                            "metadata": {
+                              "kind": "none"
+                            },
+                            "recovery": false,
+                            "children": []
+                          },
+                          {
+                            "selector": "0.0.5.10.3.0.2",
+                            "kind": "Operator",
+                            "span": {
+                              "start": 98,
+                              "end": 99
+                            },
+                            "text": "+",
+                            "metadata": {
+                              "kind": "none"
+                            },
+                            "recovery": false,
+                            "children": []
+                          },
+                          {
+                            "selector": "0.0.5.10.3.0.3",
+                            "kind": "Whitespace",
+                            "span": {
+                              "start": 99,
+                              "end": 100
+                            },
+                            "text": " ",
+                            "metadata": {
+                              "kind": "none"
+                            },
+                            "recovery": false,
+                            "children": []
+                          },
+                          {
+                            "selector": "0.0.5.10.3.0.4",
+                            "kind": "Integer",
+                            "span": {
+                              "start": 100,
+                              "end": 101
+                            },
+                            "text": "1",
+                            "metadata": {
+                              "kind": "none"
+                            },
+                            "recovery": false,
+                            "children": []
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "selector": "0.0.5.10.4",
+                    "kind": "LineEnding",
+                    "span": {
+                      "start": 101,
+                      "end": 102
+                    },
+                    "text": "\n",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.5.10.5",
+                    "kind": "Punctuation",
+                    "span": {
+                      "start": 102,
+                      "end": 103
+                    },
+                    "text": "}",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "selector": "0.0.5.11",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 103,
+                  "end": 104
+                },
+                "text": ";",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              }
+            ]
+          },
+          {
+            "selector": "0.0.6",
+            "kind": "LineEnding",
+            "span": {
+              "start": 104,
+              "end": 105
+            },
+            "text": "\n",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": []
+          },
+          {
+            "selector": "0.0.7",
+            "kind": "LineEnding",
+            "span": {
+              "start": 105,
+              "end": 106
+            },
+            "text": "\n",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": []
+          },
+          {
+            "selector": "0.0.8",
+            "kind": "TypedComment",
+            "span": {
+              "start": 106,
+              "end": 156
+            },
+            "text": "# INTENT: Exercise raw typed-comment preservation.",
+            "metadata": {
+              "kind": "typed_comment",
+              "category": "INTENT",
+              "raw_payload": " Exercise raw typed-comment preservation."
+            },
+            "recovery": false,
+            "children": []
+          },
+          {
+            "selector": "0.0.9",
+            "kind": "LineEnding",
+            "span": {
+              "start": 156,
+              "end": 157
+            },
+            "text": "\n",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": []
+          },
+          {
+            "selector": "0.0.10",
+            "kind": "FunctionDecl",
+            "span": {
+              "start": 157,
+              "end": 207
+            },
+            "text": "unit() main = fn {\n\tenv.print_i32(add_one(41));\n};",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": [
+              {
+                "selector": "0.0.10.0",
+                "kind": "CallableType",
+                "span": {
+                  "start": 157,
+                  "end": 163
+                },
+                "text": "unit()",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": [
+                  {
+                    "selector": "0.0.10.0.0",
+                    "kind": "TypeName",
+                    "span": {
+                      "start": 157,
+                      "end": 161
+                    },
+                    "text": "unit",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.10.0.1",
+                    "kind": "Punctuation",
+                    "span": {
+                      "start": 161,
+                      "end": 162
+                    },
+                    "text": "(",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.10.0.2",
+                    "kind": "Punctuation",
+                    "span": {
+                      "start": 162,
+                      "end": 163
+                    },
+                    "text": ")",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "selector": "0.0.10.1",
+                "kind": "Whitespace",
+                "span": {
+                  "start": 163,
+                  "end": 164
+                },
+                "text": " ",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.10.2",
+                "kind": "Identifier",
+                "span": {
+                  "start": 164,
+                  "end": 168
+                },
+                "text": "main",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.10.3",
+                "kind": "Whitespace",
+                "span": {
+                  "start": 168,
+                  "end": 169
+                },
+                "text": " ",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.10.4",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 169,
+                  "end": 170
+                },
+                "text": "=",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.10.5",
+                "kind": "Whitespace",
+                "span": {
+                  "start": 170,
+                  "end": 171
+                },
+                "text": " ",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.10.6",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 171,
+                  "end": 172
+                },
+                "text": "f",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.10.7",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 172,
+                  "end": 173
+                },
+                "text": "n",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.10.8",
+                "kind": "Whitespace",
+                "span": {
+                  "start": 173,
+                  "end": 174
+                },
+                "text": " ",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              },
+              {
+                "selector": "0.0.10.9",
+                "kind": "Block",
+                "span": {
+                  "start": 174,
+                  "end": 206
+                },
+                "text": "{\n\tenv.print_i32(add_one(41));\n}",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": [
+                  {
+                    "selector": "0.0.10.9.0",
+                    "kind": "Punctuation",
+                    "span": {
+                      "start": 174,
+                      "end": 175
+                    },
+                    "text": "{",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.10.9.1",
+                    "kind": "LineEnding",
+                    "span": {
+                      "start": 175,
+                      "end": 176
+                    },
+                    "text": "\n",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.10.9.2",
+                    "kind": "Indentation",
+                    "span": {
+                      "start": 176,
+                      "end": 177
+                    },
+                    "text": "\t",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.10.9.3",
+                    "kind": "Expression",
+                    "span": {
+                      "start": 177,
+                      "end": 203
+                    },
+                    "text": "env.print_i32(add_one(41))",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": [
+                      {
+                        "selector": "0.0.10.9.3.0",
+                        "kind": "Call",
+                        "span": {
+                          "start": 177,
+                          "end": 203
+                        },
+                        "text": "env.print_i32(add_one(41))",
+                        "metadata": {
+                          "kind": "none"
+                        },
+                        "recovery": false,
+                        "children": [
+                          {
+                            "selector": "0.0.10.9.3.0.0",
+                            "kind": "Identifier",
+                            "span": {
+                              "start": 177,
+                              "end": 180
+                            },
+                            "text": "env",
+                            "metadata": {
+                              "kind": "none"
+                            },
+                            "recovery": false,
+                            "children": []
+                          },
+                          {
+                            "selector": "0.0.10.9.3.0.1",
+                            "kind": "Punctuation",
+                            "span": {
+                              "start": 180,
+                              "end": 181
+                            },
+                            "text": ".",
+                            "metadata": {
+                              "kind": "none"
+                            },
+                            "recovery": false,
+                            "children": []
+                          },
+                          {
+                            "selector": "0.0.10.9.3.0.2",
+                            "kind": "Identifier",
+                            "span": {
+                              "start": 181,
+                              "end": 190
+                            },
+                            "text": "print_i32",
+                            "metadata": {
+                              "kind": "none"
+                            },
+                            "recovery": false,
+                            "children": []
+                          },
+                          {
+                            "selector": "0.0.10.9.3.0.3",
+                            "kind": "Punctuation",
+                            "span": {
+                              "start": 190,
+                              "end": 191
+                            },
+                            "text": "(",
+                            "metadata": {
+                              "kind": "none"
+                            },
+                            "recovery": false,
+                            "children": []
+                          },
+                          {
+                            "selector": "0.0.10.9.3.0.4",
+                            "kind": "Expression",
+                            "span": {
+                              "start": 191,
+                              "end": 202
+                            },
+                            "text": "add_one(41)",
+                            "metadata": {
+                              "kind": "none"
+                            },
+                            "recovery": false,
+                            "children": [
+                              {
+                                "selector": "0.0.10.9.3.0.4.0",
+                                "kind": "Call",
+                                "span": {
+                                  "start": 191,
+                                  "end": 202
+                                },
+                                "text": "add_one(41)",
+                                "metadata": {
+                                  "kind": "none"
+                                },
+                                "recovery": false,
+                                "children": [
+                                  {
+                                    "selector": "0.0.10.9.3.0.4.0.0",
+                                    "kind": "Identifier",
+                                    "span": {
+                                      "start": 191,
+                                      "end": 198
+                                    },
+                                    "text": "add_one",
+                                    "metadata": {
+                                      "kind": "none"
+                                    },
+                                    "recovery": false,
+                                    "children": []
+                                  },
+                                  {
+                                    "selector": "0.0.10.9.3.0.4.0.1",
+                                    "kind": "Punctuation",
+                                    "span": {
+                                      "start": 198,
+                                      "end": 199
+                                    },
+                                    "text": "(",
+                                    "metadata": {
+                                      "kind": "none"
+                                    },
+                                    "recovery": false,
+                                    "children": []
+                                  },
+                                  {
+                                    "selector": "0.0.10.9.3.0.4.0.2",
+                                    "kind": "Expression",
+                                    "span": {
+                                      "start": 199,
+                                      "end": 201
+                                    },
+                                    "text": "41",
+                                    "metadata": {
+                                      "kind": "none"
+                                    },
+                                    "recovery": false,
+                                    "children": [
+                                      {
+                                        "selector": "0.0.10.9.3.0.4.0.2.0",
+                                        "kind": "Integer",
+                                        "span": {
+                                          "start": 199,
+                                          "end": 201
+                                        },
+                                        "text": "41",
+                                        "metadata": {
+                                          "kind": "none"
+                                        },
+                                        "recovery": false,
+                                        "children": []
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "selector": "0.0.10.9.3.0.4.0.3",
+                                    "kind": "Punctuation",
+                                    "span": {
+                                      "start": 201,
+                                      "end": 202
+                                    },
+                                    "text": ")",
+                                    "metadata": {
+                                      "kind": "none"
+                                    },
+                                    "recovery": false,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          {
+                            "selector": "0.0.10.9.3.0.5",
+                            "kind": "Punctuation",
+                            "span": {
+                              "start": 202,
+                              "end": 203
+                            },
+                            "text": ")",
+                            "metadata": {
+                              "kind": "none"
+                            },
+                            "recovery": false,
+                            "children": []
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "selector": "0.0.10.9.4",
+                    "kind": "Expression",
+                    "span": {
+                      "start": 203,
+                      "end": 204
+                    },
+                    "text": ";",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.10.9.5",
+                    "kind": "LineEnding",
+                    "span": {
+                      "start": 204,
+                      "end": 205
+                    },
+                    "text": "\n",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  },
+                  {
+                    "selector": "0.0.10.9.6",
+                    "kind": "Punctuation",
+                    "span": {
+                      "start": 205,
+                      "end": 206
+                    },
+                    "text": "}",
+                    "metadata": {
+                      "kind": "none"
+                    },
+                    "recovery": false,
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "selector": "0.0.10.10",
+                "kind": "Punctuation",
+                "span": {
+                  "start": 206,
+                  "end": 207
+                },
+                "text": ";",
+                "metadata": {
+                  "kind": "none"
+                },
+                "recovery": false,
+                "children": []
+              }
+            ]
+          },
+          {
+            "selector": "0.0.11",
+            "kind": "LineEnding",
+            "span": {
+              "start": 207,
+              "end": 208
+            },
+            "text": "\n",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": []
+          },
+          {
+            "selector": "0.0.12",
+            "kind": "BoundaryEnd",
+            "span": {
+              "start": 208,
+              "end": 213
+            },
+            "text": "%%end",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": []
+          },
+          {
+            "selector": "0.0.13",
+            "kind": "LineEnding",
+            "span": {
+              "start": 213,
+              "end": 214
+            },
+            "text": "\n",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": []
+          },
+          {
+            "selector": "0.0.14",
+            "kind": "Punctuation",
+            "span": {
+              "start": 214,
+              "end": 214
+            },
+            "text": "",
+            "metadata": {
+              "kind": "none"
+            },
+            "recovery": false,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  "comments": [
+    {
+      "span": {
+        "start": 106,
+        "end": 156
+      },
+      "category": "INTENT",
+      "raw_payload": " Exercise raw typed-comment preservation.",
+      "valid": true
+    }
+  ],
+  "diagnostics": []
+}

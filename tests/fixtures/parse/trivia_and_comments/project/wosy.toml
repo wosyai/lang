@@ -1,0 +1,8 @@
+[package]
+name = "fixture-trivia"
+
+[comments]
+categories = ["INTENT"]
+
+[targets.app]
+root = "src/main.w"

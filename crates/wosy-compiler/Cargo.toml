@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+codespan-reporting.workspace = true
 serde.workspace = true
-wosy-syntax.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+rowan.workspace = true
+wosy-syntax.workspace = true

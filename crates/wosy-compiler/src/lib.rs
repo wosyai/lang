@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use wosy_syntax::SourceSpan;
+use wosy_syntax::{
+    ByteSpan, CstNode, CstToken, ParseResult, SourceIdentity, SourceSpan, SyntaxKind,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DiagnosticSeverity {
@@ -30,53 +32,130 @@ pub struct Diagnostic {
     pub notes: Vec<String>,
 }
 
-impl Diagnostic {
-    pub fn new(
-        code: String,
-        severity: DiagnosticSeverity,
-        message: String,
-        labels: Vec<DiagnosticLabel>,
-        notes: Vec<String>,
-    ) -> Self {
-        Self {
-            code,
-            severity,
-            message,
-            labels,
-            notes,
-        }
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CstMetadata {
+    None,
+    TypedComment {
+        category: String,
+        raw_payload: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CstElement {
+    pub selector: String,
+    pub kind: String,
+    pub span: ByteSpan,
+    pub text: String,
+    pub metadata: CstMetadata,
+    pub recovery: bool,
+    pub children: Vec<CstElement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CstPublication {
+    pub source: SourceIdentity,
+    pub source_revision: String,
+    pub root: CstElement,
+    pub comments: Vec<wosy_syntax::TypedComment>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+pub struct ParseOutput {
+    pub result: ParseResult,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+pub fn parse_source(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+) -> ParseOutput {
+    let result = wosy_syntax::parse(source, text, configured_comments);
+    let diagnostics = result
+        .errors
+        .iter()
+        .map(|error| Diagnostic {
+            code: "S0001".to_owned(),
+            severity: DiagnosticSeverity::Error,
+            message: error.message.clone(),
+            labels: vec![DiagnosticLabel {
+                kind: DiagnosticLabelKind::Primary,
+                span: SourceSpan::new(result.source.clone(), error.span),
+                message: "syntax error originates here".to_owned(),
+            }],
+            notes: vec!["parse the selected source with the configured project rules".to_owned()],
+        })
+        .collect();
+    ParseOutput {
+        result,
+        diagnostics,
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{Diagnostic, DiagnosticLabel, DiagnosticLabelKind, DiagnosticSeverity};
-    use wosy_syntax::{ByteSpan, SourceIdentity, SourceSpan};
-
-    #[test]
-    fn diagnostic_serializes_source_ranges_and_labels() {
-        let source = SourceIdentity::new(
-            "project-a".to_owned(),
-            "main".to_owned(),
-            "src/main.w".to_owned(),
-            "revision-1".to_owned(),
-        );
-        let diagnostic = Diagnostic::new(
-            "S0001".to_owned(),
-            DiagnosticSeverity::Error,
-            "invalid source".to_owned(),
-            vec![DiagnosticLabel {
-                kind: DiagnosticLabelKind::Primary,
-                span: SourceSpan::new(source, ByteSpan::new(10, 15)),
-                message: "source starts here".to_owned(),
-            }],
-            vec!["repair the declaration".to_owned()],
-        );
-
-        let value = serde_json::to_value(&diagnostic).expect("diagnostic serialization");
-
-        assert_eq!(value["code"], "S0001");
-        assert_eq!(value["labels"][0]["kind"], "Primary");
-        assert_eq!(value["labels"][0]["span"]["range"]["start"], 10);
+pub fn publication(output: &ParseOutput) -> CstPublication {
+    CstPublication {
+        source: output.result.source.clone(),
+        source_revision: output.result.source.revision.clone(),
+        root: project_node(&output.result.root, &output.result.comments, "0"),
+        comments: output.result.comments.clone(),
+        diagnostics: output.diagnostics.clone(),
     }
+}
+
+fn project_node(
+    node: &CstNode,
+    comments: &[wosy_syntax::TypedComment],
+    selector: &str,
+) -> CstElement {
+    let span = wosy_syntax::byte_span(node);
+    let children = node
+        .children_with_tokens()
+        .enumerate()
+        .map(|(index, element)| {
+            let child_selector = format!("{selector}.{index}");
+            match element {
+                rowan::NodeOrToken::Node(child) => project_node(&child, comments, &child_selector),
+                rowan::NodeOrToken::Token(token) => {
+                    project_token(&token, comments, &child_selector)
+                }
+            }
+        })
+        .collect();
+    CstElement {
+        selector: selector.to_owned(),
+        kind: format!("{:?}", node.kind()),
+        span,
+        text: node.text().to_string(),
+        metadata: CstMetadata::None,
+        recovery: node.kind() == SyntaxKind::Error,
+        children,
+    }
+}
+
+fn project_token(
+    token: &CstToken,
+    comments: &[wosy_syntax::TypedComment],
+    selector: &str,
+) -> CstElement {
+    let token_range = token.text_range();
+    let exact_span = ByteSpan::new(u32::from(token_range.start()), u32::from(token_range.end()));
+    let comment = comments.iter().find(|comment| comment.span == exact_span);
+    CstElement {
+        selector: selector.to_owned(),
+        kind: format!("{:?}", token.kind()),
+        span: exact_span,
+        text: token.text().to_string(),
+        metadata: comment.map_or(CstMetadata::None, |value| CstMetadata::TypedComment {
+            category: value.category.clone(),
+            raw_payload: value.raw_payload.clone(),
+        }),
+        recovery: token.kind() == SyntaxKind::Error,
+        children: Vec::new(),
+    }
+}
+
+pub fn serialize_publication(publication: &CstPublication) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(publication)
 }

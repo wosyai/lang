@@ -1,0 +1,11 @@
+[package]
+name = "parse-fixture-harness"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace]
+
+[dependencies]
+serde_json = "1"
+toml_edit = "0.22"
