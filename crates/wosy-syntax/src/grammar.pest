@@ -6,20 +6,37 @@ comment_category = @{ (!(":" | "\r" | "\n") ~ ANY)* }
 comment_payload = @{ (!("\r" | "\n") ~ ANY)* }
 comment_scan = ${ SOI ~ (string | comment | (!("\"" | "#") ~ ANY))* ~ EOI }
 
-source = { SOI ~ boundary_start ~ extern_decl ~ function_decl ~ function_decl ~ boundary_end ~ EOI }
+source = { SOI ~ boundary_start ~ item+ ~ boundary_end ~ EOI }
 boundary_start = { "%%start" }
 boundary_end = { "%%end" }
+item = { extern_decl | function_decl | binding_decl }
 extern_decl = { identifier ~ "=" ~ "extern" ~ identifier ~ string ~ "{" ~ extern_function ~ "}" ~ ";" }
 extern_function = { callable_type ~ identifier ~ ";" }
 function_decl = { callable_type ~ identifier ~ "=" ~ "fn" ~ parameters? ~ block ~ ";" }
+binding_decl = { type_spec ~ identifier ~ "=" ~ expression ~ ";" }
+type_spec = { callable_type | type_name }
 callable_type = { type_name ~ "(" ~ (type_name ~ ("," ~ type_name)*)? ~ ")" }
 type_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 parameters = { "(" ~ (identifier ~ ("," ~ identifier)*)? ~ ")" }
-block = { "{" ~ expression* ~ "}" }
-expression = { call | binary | identifier | integer | ";" }
+block = { "{" ~ block_item* ~ "}" }
+block_item = { expression ~ ";"? }
+expression = { if_expr | logical_or }
+if_expr = { "if" ~ "(" ~ expression ~ ")" ~ block ~ "else" ~ block }
+logical_or = { logical_and ~ (or_operator ~ logical_and)* }
+logical_and = { comparison ~ (and_operator ~ comparison)* }
+comparison = { additive ~ (comparison_operator ~ additive)* }
+additive = { multiplicative ~ (add_operator ~ multiplicative)* }
+multiplicative = { primary ~ (multiply_operator ~ primary)* }
+primary = { call | boolean | identifier | integer | parenthesized }
+parenthesized = { "(" ~ expression ~ ")" }
 call = { identifier ~ ("." ~ identifier)? ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
-binary = { identifier ~ operator ~ integer }
-operator = { "+" | "-" | "*" | "/" }
+or_operator = { "||" }
+and_operator = { "&&" }
+comparison_operator = { "==" | "!=" | "<=" | ">=" | "<" | ">" }
+add_operator = { "+" | "-" }
+multiply_operator = { "*" | "/" | "%" }
+operator = { or_operator | and_operator | comparison_operator | add_operator | multiply_operator }
+boolean = { "true" | "false" }
 integer = @{ ASCII_DIGIT+ }
 string = @{ "\"" ~ ("\\" ~ ANY | !"\"" ~ ANY)* ~ "\"" }

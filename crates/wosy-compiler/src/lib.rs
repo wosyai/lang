@@ -3,6 +3,13 @@ use wosy_syntax::{
     ByteSpan, CstNode, CstToken, ParseResult, SourceIdentity, SourceSpan, SyntaxKind,
 };
 
+mod scalar;
+pub use scalar::{
+    derive_scalar_program, derive_scalar_program_from_cst, BinaryOperator, ScalarBinding,
+    ScalarBlock, ScalarExpression, ScalarFunction, ScalarItem, ScalarProgram, ScalarType,
+    ScalarValidation,
+};
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DiagnosticSeverity {
     Error,

@@ -21,13 +21,20 @@ pub enum SyntaxKind {
     ExternDecl,
     ExternFunction,
     FunctionDecl,
+    BindingDecl,
+    Item,
     CallableType,
+    TypeSpec,
     TypeName,
     Identifier,
     Parameters,
     Block,
+    BlockItem,
     Expression,
     Call,
+    IfExpr,
+    Parenthesized,
+    Boolean,
     Binary,
     Operator,
     Integer,
@@ -54,18 +61,25 @@ impl Language for WosyLanguage {
             8 => SyntaxKind::ExternDecl,
             9 => SyntaxKind::ExternFunction,
             10 => SyntaxKind::FunctionDecl,
-            11 => SyntaxKind::CallableType,
-            12 => SyntaxKind::TypeName,
-            13 => SyntaxKind::Identifier,
-            14 => SyntaxKind::Parameters,
-            15 => SyntaxKind::Block,
-            16 => SyntaxKind::Expression,
-            17 => SyntaxKind::Call,
-            18 => SyntaxKind::Binary,
-            19 => SyntaxKind::Operator,
-            20 => SyntaxKind::Integer,
-            21 => SyntaxKind::String,
-            22 => SyntaxKind::Punctuation,
+            11 => SyntaxKind::BindingDecl,
+            12 => SyntaxKind::Item,
+            13 => SyntaxKind::CallableType,
+            14 => SyntaxKind::TypeSpec,
+            15 => SyntaxKind::TypeName,
+            16 => SyntaxKind::Identifier,
+            17 => SyntaxKind::Parameters,
+            18 => SyntaxKind::Block,
+            19 => SyntaxKind::BlockItem,
+            20 => SyntaxKind::Expression,
+            21 => SyntaxKind::Call,
+            22 => SyntaxKind::IfExpr,
+            23 => SyntaxKind::Parenthesized,
+            24 => SyntaxKind::Boolean,
+            25 => SyntaxKind::Binary,
+            26 => SyntaxKind::Operator,
+            27 => SyntaxKind::Integer,
+            28 => SyntaxKind::String,
+            29 => SyntaxKind::Punctuation,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -77,6 +91,18 @@ impl Language for WosyLanguage {
 
 pub type CstNode = SyntaxNode<WosyLanguage>;
 pub type CstToken = SyntaxToken<WosyLanguage>;
+
+#[derive(Clone, Debug)]
+pub struct CanonicalCstRoot {
+    pub source: SourceIdentity,
+    pub root: CstNode,
+}
+
+impl CanonicalCstRoot {
+    pub fn new(source: SourceIdentity, root: CstNode) -> Self {
+        Self { source, root }
+    }
+}
 
 pub fn byte_span(node: &CstNode) -> ByteSpan {
     let range = node.text_range();
@@ -144,6 +170,7 @@ pub struct ParseResult {
     pub source: SourceIdentity,
     pub text: String,
     pub root: CstNode,
+    pub canonical_root: CanonicalCstRoot,
     pub comments: Vec<TypedComment>,
     pub errors: Vec<SyntaxError>,
 }
@@ -157,6 +184,10 @@ impl ParseResult {
     }
     pub fn range(&self) -> ByteSpan {
         ByteSpan::new(0, self.text.len() as u32)
+    }
+
+    pub fn canonical_cst(&self) -> &CanonicalCstRoot {
+        &self.canonical_root
     }
 }
 
@@ -180,10 +211,12 @@ pub fn parse(source: SourceIdentity, text: String, configured_comments: &[String
     }
     builder.finish_node();
     let root = CstNode::new_root(builder.finish());
+    let canonical_root = CanonicalCstRoot::new(source.clone(), root.clone());
     ParseResult {
         source,
         text,
         root,
+        canonical_root,
         comments,
         errors,
     }
@@ -354,15 +387,31 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::extern_decl => SyntaxKind::ExternDecl,
         Rule::extern_function => SyntaxKind::ExternFunction,
         Rule::function_decl => SyntaxKind::FunctionDecl,
+        Rule::binding_decl => SyntaxKind::BindingDecl,
+        Rule::item => SyntaxKind::Item,
+        Rule::type_spec => SyntaxKind::TypeSpec,
         Rule::callable_type => SyntaxKind::CallableType,
         Rule::type_name => SyntaxKind::TypeName,
         Rule::identifier => SyntaxKind::Identifier,
         Rule::parameters => SyntaxKind::Parameters,
         Rule::block => SyntaxKind::Block,
+        Rule::block_item => SyntaxKind::BlockItem,
         Rule::expression => SyntaxKind::Expression,
         Rule::call => SyntaxKind::Call,
-        Rule::binary => SyntaxKind::Binary,
-        Rule::operator => SyntaxKind::Operator,
+        Rule::if_expr => SyntaxKind::IfExpr,
+        Rule::parenthesized => SyntaxKind::Parenthesized,
+        Rule::boolean => SyntaxKind::Boolean,
+        Rule::logical_or
+        | Rule::logical_and
+        | Rule::comparison
+        | Rule::additive
+        | Rule::multiplicative => SyntaxKind::Binary,
+        Rule::or_operator
+        | Rule::and_operator
+        | Rule::comparison_operator
+        | Rule::add_operator
+        | Rule::multiply_operator
+        | Rule::operator => SyntaxKind::Operator,
         Rule::integer => SyntaxKind::Integer,
         Rule::string => SyntaxKind::String,
         Rule::comment => SyntaxKind::TypedComment,
