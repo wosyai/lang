@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[grammar = "grammar.pest"]
 struct WosyParser;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(u16)]
 pub enum SyntaxKind {
     Root,
@@ -102,6 +102,71 @@ impl CanonicalCstRoot {
     pub fn new(source: SourceIdentity, root: CstNode) -> Self {
         Self { source, root }
     }
+
+    pub fn snapshot(&self) -> CanonicalCstSnapshot {
+        CanonicalCstSnapshot {
+            source: self.source.clone(),
+            root: snapshot_node(&self.root),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: CanonicalCstSnapshot) -> Self {
+        let mut builder = GreenNodeBuilder::new();
+        build_snapshot_node(&mut builder, &snapshot.root);
+        Self::new(snapshot.source, CstNode::new_root(builder.finish()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalCstSnapshot {
+    pub source: SourceIdentity,
+    pub root: CanonicalCstSnapshotNode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalCstSnapshotNode {
+    pub kind: SyntaxKind,
+    pub text: String,
+    pub children: Vec<CanonicalCstSnapshotElement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CanonicalCstSnapshotElement {
+    Node(CanonicalCstSnapshotNode),
+    Token { kind: SyntaxKind, text: String },
+}
+
+fn snapshot_node(node: &CstNode) -> CanonicalCstSnapshotNode {
+    let children = node
+        .children_with_tokens()
+        .map(|element| match element {
+            rowan::NodeOrToken::Node(child) => {
+                CanonicalCstSnapshotElement::Node(snapshot_node(&child))
+            }
+            rowan::NodeOrToken::Token(token) => CanonicalCstSnapshotElement::Token {
+                kind: token.kind(),
+                text: token.text().to_owned(),
+            },
+        })
+        .collect();
+    CanonicalCstSnapshotNode {
+        kind: node.kind(),
+        text: node.text().to_string(),
+        children,
+    }
+}
+
+fn build_snapshot_node(builder: &mut GreenNodeBuilder<'_>, node: &CanonicalCstSnapshotNode) {
+    builder.start_node(WosyLanguage::kind_to_raw(node.kind));
+    for child in &node.children {
+        match child {
+            CanonicalCstSnapshotElement::Node(child) => build_snapshot_node(builder, child),
+            CanonicalCstSnapshotElement::Token { kind, text } => {
+                builder.token(WosyLanguage::kind_to_raw(*kind), text);
+            }
+        }
+    }
+    builder.finish_node();
 }
 
 pub fn byte_span(node: &CstNode) -> ByteSpan {

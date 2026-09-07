@@ -1,0 +1,8 @@
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 1
+
+[[assert]]
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["expression type does not match expected type", "src/main.w"]

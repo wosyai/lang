@@ -96,6 +96,38 @@ impl ProjectConfiguration {
             targets,
         })
     }
+
+    pub fn artifact_profile(
+        &self,
+        target: &str,
+        profile: &str,
+    ) -> Result<
+        (
+            &TargetConfig,
+            &ArtifactConfig,
+            &ArtifactProfile,
+            &TargetProfile,
+        ),
+        String,
+    > {
+        let target_config = self
+            .targets
+            .get(target)
+            .ok_or_else(|| format!("target {target} is missing from wosy.toml"))?;
+        let target_profile = target_config
+            .profiles
+            .get(profile)
+            .ok_or_else(|| format!("target {target} profile {profile} is missing"))?;
+        let artifact = target_config
+            .artifacts
+            .get(&target_profile.main_artifact)
+            .ok_or_else(|| format!("main artifact {} is missing", target_profile.main_artifact))?;
+        let artifact_profile = artifact
+            .profiles
+            .get(profile)
+            .ok_or_else(|| format!("artifact profile {profile} is missing"))?;
+        Ok((target_config, artifact, artifact_profile, target_profile))
+    }
 }
 
 fn named_commands(
@@ -257,6 +289,21 @@ pub struct ArtifactIdentity {
 pub struct ArtifactManifest {
     pub identity: ArtifactIdentity,
     pub executable: PathBuf,
+}
+
+pub fn load_artifact_manifest(path: &Path) -> Result<ArtifactManifest, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
+pub fn artifact_manifest_path(root: &Path, target: &str, profile: &str, artifact: &str) -> PathBuf {
+    root.join(".wosy/artifacts")
+        .join(target)
+        .join(profile)
+        .join(artifact)
+        .join("artifact-manifest.json")
 }
 
 pub fn publish_artifact(

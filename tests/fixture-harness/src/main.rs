@@ -6,16 +6,12 @@ use toml_edit::{DocumentMut, Item};
 
 fn main() -> Result<(), String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let fixtures = root.join("../fixtures/parse");
-    for entry in fs::read_dir(&fixtures).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        if entry
-            .file_type()
-            .map_err(|error| error.to_string())?
-            .is_dir()
-        {
-            run_case(&entry.path())?;
-        }
+    let fixtures = root.join("../fixtures");
+    let mut cases = Vec::new();
+    collect_cases(&fixtures, &mut cases)?;
+    cases.sort();
+    for case in cases {
+        run_case(&case)?;
     }
     Ok(())
 }
@@ -39,6 +35,19 @@ fn run_case(case: &Path) -> Result<(), String> {
         .and_then(Item::as_array_of_tables)
         .ok_or_else(|| format!("{} has no [[steps]]", case.display()))?;
     for step in steps.iter() {
+        if let Some(path) = step.get("write").and_then(Item::as_value).and_then(|value| value.as_str()) {
+            let contents = step
+                .get("contents")
+                .and_then(Item::as_value)
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "write step contents must be a string".to_owned())?;
+            let destination = temporary.join(path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            fs::write(destination, contents).map_err(|error| error.to_string())?;
+            continue;
+        }
         let command = command_values(step)?;
         let expected = step
             .get("exit")
@@ -65,12 +74,12 @@ fn run_case(case: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("{} has no [[assert]]", case.display()))?;
     for assertion in assertions.iter() {
         let command = command_values(assertion)?;
-        let expected_path = assertion
-            .get("stdout")
-            .and_then(Item::as_value)
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| "assert stdout must be a string".to_owned())?;
-        let output = Command::new(&command[0])
+        let assertion_program = if command[0] == "wosy" {
+            binary.clone()
+        } else {
+            PathBuf::from(&command[0])
+        };
+        let output = Command::new(assertion_program)
             .args(command.iter().skip(1))
             .current_dir(&temporary)
             .output()
@@ -85,16 +94,21 @@ fn run_case(case: &Path) -> Result<(), String> {
         {
             return Err(format!("{}: unexpected assertion exit status", case.display()));
         }
-        let observed = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .map_err(|error| format!("{}: observed stdout is not JSON: {error}", case.display()))?;
-        let expected_bytes = fs::read(case.join(expected_path)).map_err(|error| error.to_string())?;
-        let expected = serde_json::from_slice::<serde_json::Value>(&expected_bytes)
-            .map_err(|error| format!("{}: expected file is not JSON: {error}", case.display()))?;
         let selectors = assertion
             .get("select")
             .and_then(Item::as_value)
             .and_then(|value| value.as_array());
         if let Some(selectors) = selectors {
+            let expected_path = assertion
+                .get("stdout")
+                .and_then(Item::as_value)
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "JSON assert stdout must be a string".to_owned())?;
+            let observed = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .map_err(|error| format!("{}: observed stdout is not JSON: {error}", case.display()))?;
+            let expected_bytes = fs::read(case.join(expected_path)).map_err(|error| error.to_string())?;
+            let expected = serde_json::from_slice::<serde_json::Value>(&expected_bytes)
+                .map_err(|error| format!("{}: expected file is not JSON: {error}", case.display()))?;
             for selector in selectors {
                 let selector = selector
                     .as_str()
@@ -105,11 +119,71 @@ fn run_case(case: &Path) -> Result<(), String> {
                 assert_json_subset(&expected, observed, &case.display().to_string())?;
             }
         } else {
-            assert_json_subset(&expected, &observed, &case.display().to_string())?;
+            assert_stream(assertion, "stdout", &output.stdout, &case)?;
+            assert_stream(assertion, "stderr", &output.stderr, &case)?;
+            assert_stream_contains(assertion, "stderr_contains", &output.stderr, &case)?;
+            if let Some(path) = assertion.get("file").and_then(Item::as_value).and_then(|value| value.as_str()) {
+                let expected_path = assertion
+                    .get("contents")
+                    .and_then(Item::as_value)
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| "file assert contents must be a string".to_owned())?;
+                let observed = fs::read(temporary.join(path)).map_err(|error| error.to_string())?;
+                let expected = fs::read(case.join(expected_path)).map_err(|error| error.to_string())?;
+                let terminal_newline = observed.len() == expected.len() + 1
+                    && observed[..expected.len()] == expected
+                    && observed[expected.len()] == b'\n';
+                if observed != expected && !terminal_newline {
+                    return Err(format!("{}: file assertion differs for {path}", case.display()));
+                }
+            }
         }
     }
     fs::remove_dir_all(&temporary).map_err(|error| error.to_string())?;
     println!("passed {}", case.display());
+    Ok(())
+}
+
+fn assert_stream_contains(
+    assertion: &toml_edit::Table,
+    key: &str,
+    observed: &[u8],
+    case: &Path,
+) -> Result<(), String> {
+    let Some(values) = assertion.get(key).and_then(Item::as_value).and_then(|value| value.as_array()) else {
+        return Ok(());
+    };
+    let text = String::from_utf8_lossy(observed);
+    for value in values {
+        let expected = value.as_str().ok_or_else(|| format!("{key} values must be strings"))?;
+        if !text.contains(expected) {
+            return Err(format!("{}: stderr is missing {expected:?}", case.display()));
+        }
+    }
+    Ok(())
+}
+
+fn assert_stream(
+    assertion: &toml_edit::Table,
+    stream: &str,
+    observed: &[u8],
+    case: &Path,
+) -> Result<(), String> {
+    let Some(expected_path) = assertion.get(stream).and_then(Item::as_value).and_then(|value| value.as_str()) else {
+        return Ok(());
+    };
+    let expected = fs::read(case.join(expected_path)).map_err(|error| error.to_string())?;
+    if stream == "stdout" {
+        if let (Ok(expected_json), Ok(observed_json)) = (
+            serde_json::from_slice::<serde_json::Value>(&expected),
+            serde_json::from_slice::<serde_json::Value>(observed),
+        ) {
+            return assert_json_subset(&expected_json, &observed_json, &case.display().to_string());
+        }
+    }
+    if observed != expected {
+        return Err(format!("{}: {stream} assertion differs", case.display()));
+    }
     Ok(())
 }
 
@@ -168,6 +242,19 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
             copy_tree(&entry.path(), &target)?;
         } else {
             fs::copy(entry.path(), target).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_cases(directory: &Path, cases: &mut Vec<PathBuf>) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.join("case.toml").is_file() {
+            cases.push(path);
+        } else if entry.file_type().map_err(|error| error.to_string())?.is_dir() {
+            collect_cases(&path, cases)?;
         }
     }
     Ok(())
