@@ -5,7 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+pest = "2"
+pest_derive = "2"
+rowan = "0.16"
 serde.workspace = true
+text-size = "1"
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -1,0 +1,25 @@
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" | comment }
+comment = { "#" ~ " "* ~ (typed_comment | untyped_comment) }
+typed_comment = { comment_category ~ ":" ~ comment_payload }
+untyped_comment = { comment_category }
+comment_category = @{ (!(":" | "\r" | "\n") ~ ANY)* }
+comment_payload = @{ (!("\r" | "\n") ~ ANY)* }
+comment_scan = ${ SOI ~ (string | comment | (!("\"" | "#") ~ ANY))* ~ EOI }
+
+source = { SOI ~ boundary_start ~ extern_decl ~ function_decl ~ function_decl ~ boundary_end ~ EOI }
+boundary_start = { "%%start" }
+boundary_end = { "%%end" }
+extern_decl = { identifier ~ "=" ~ "extern" ~ identifier ~ string ~ "{" ~ extern_function ~ "}" ~ ";" }
+extern_function = { callable_type ~ identifier ~ ";" }
+function_decl = { callable_type ~ identifier ~ "=" ~ "fn" ~ parameters? ~ block ~ ";" }
+callable_type = { type_name ~ "(" ~ (type_name ~ ("," ~ type_name)*)? ~ ")" }
+type_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+parameters = { "(" ~ (identifier ~ ("," ~ identifier)*)? ~ ")" }
+block = { "{" ~ expression* ~ "}" }
+expression = { call | binary | identifier | integer | ";" }
+call = { identifier ~ ("." ~ identifier)? ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
+binary = { identifier ~ operator ~ integer }
+operator = { "+" | "-" | "*" | "/" }
+integer = @{ ASCII_DIGIT+ }
+string = @{ "\"" ~ ("\\" ~ ANY | !"\"" ~ ANY)* ~ "\"" }
