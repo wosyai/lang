@@ -107,6 +107,13 @@ impl LlvmPartition {
         let mut text = format!("; ModuleID = '{}'\n", self.module_name);
         text.push_str("source_filename = \"wosy\"\n\n");
         for function in &self.declarations {
+            if self
+                .functions
+                .iter()
+                .any(|definition| definition.name == function.name)
+            {
+                continue;
+            }
             let _ = writeln!(
                 text,
                 "declare {} @{}({})",
@@ -710,8 +717,9 @@ mod tests {
         assert_eq!(partition.declarations.len(), 1);
         assert_eq!(partition.functions.len(), 2);
         assert!(partition
-            .to_text()
-            .contains("declare i32 @package__src_math_w__add"));
+            .declarations
+            .iter()
+            .any(|function| function.name == "package__src_math_w__add"));
         assert!(partition
             .functions
             .iter()
