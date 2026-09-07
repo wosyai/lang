@@ -5,7 +5,8 @@ use wosy_syntax::{
 
 mod scalar;
 pub use llvm::{
-    emit_scalar_llvm, emit_scalar_llvm_text, LlvmFunction, LlvmPartition, LlvmValueType,
+    emit_scalar_llvm, emit_scalar_llvm_text, emit_scalar_project_llvm, LlvmFunction, LlvmPartition,
+    LlvmValueType,
 };
 pub use scalar::{
     derive_scalar_program, derive_scalar_program_from_cst, validate_scalar_project, BinaryOperator,
