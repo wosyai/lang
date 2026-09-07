@@ -4,11 +4,16 @@ use wosy_syntax::{
 };
 
 mod scalar;
+pub use llvm::{
+    emit_scalar_llvm, emit_scalar_llvm_text, LlvmFunction, LlvmPartition, LlvmValueType,
+};
 pub use scalar::{
     derive_scalar_program, derive_scalar_program_from_cst, BinaryOperator, ScalarBinding,
     ScalarBlock, ScalarExpression, ScalarFunction, ScalarItem, ScalarProgram, ScalarType,
     ScalarValidation,
 };
+
+mod llvm;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DiagnosticSeverity {
