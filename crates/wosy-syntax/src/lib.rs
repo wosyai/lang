@@ -40,6 +40,8 @@ pub enum SyntaxKind {
     Integer,
     String,
     Punctuation,
+    NamespaceDecl,
+    QualifiedCall,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -80,6 +82,8 @@ impl Language for WosyLanguage {
             27 => SyntaxKind::Integer,
             28 => SyntaxKind::String,
             29 => SyntaxKind::Punctuation,
+            30 => SyntaxKind::NamespaceDecl,
+            31 => SyntaxKind::QualifiedCall,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -453,6 +457,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::extern_function => SyntaxKind::ExternFunction,
         Rule::function_decl => SyntaxKind::FunctionDecl,
         Rule::binding_decl => SyntaxKind::BindingDecl,
+        Rule::namespace_decl => SyntaxKind::NamespaceDecl,
         Rule::item => SyntaxKind::Item,
         Rule::type_spec => SyntaxKind::TypeSpec,
         Rule::callable_type => SyntaxKind::CallableType,
@@ -463,6 +468,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::block_item => SyntaxKind::BlockItem,
         Rule::expression => SyntaxKind::Expression,
         Rule::call => SyntaxKind::Call,
+        Rule::qualified_call => SyntaxKind::QualifiedCall,
         Rule::if_expr => SyntaxKind::IfExpr,
         Rule::parenthesized => SyntaxKind::Parenthesized,
         Rule::boolean => SyntaxKind::Boolean,
@@ -549,6 +555,7 @@ mod tests {
             SyntaxKind::BoundaryEnd,
             SyntaxKind::ExternDecl,
             SyntaxKind::ExternFunction,
+            SyntaxKind::NamespaceDecl,
             SyntaxKind::FunctionDecl,
             SyntaxKind::CallableType,
             SyntaxKind::TypeName,
@@ -557,6 +564,7 @@ mod tests {
             SyntaxKind::Block,
             SyntaxKind::Expression,
             SyntaxKind::Call,
+            SyntaxKind::QualifiedCall,
             SyntaxKind::Binary,
             SyntaxKind::Operator,
             SyntaxKind::Integer,
@@ -580,5 +588,29 @@ mod tests {
         assert!(result.root.descendants_with_tokens().any(|element| {
             element.kind() == SyntaxKind::TypedComment && element.to_string().starts_with('#')
         }));
+    }
+
+    #[test]
+    fn namespace_and_qualified_call_are_structural_and_lossless() {
+        let text =
+            "%%start\nmath = namespace app \"src/math.w\";\ni32 result = math.add(20, 22);\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid());
+        assert_eq!(result.reconstruct(), text);
+        let namespace = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::NamespaceDecl)
+            .expect("namespace declaration");
+        assert_eq!(byte_span(&namespace), ByteSpan::new(8, 42));
+        let call = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::Call)
+            .expect("qualified call");
+        assert_eq!(byte_span(&call), ByteSpan::new(56, 72));
+        assert!(call
+            .children()
+            .any(|node| node.kind() == SyntaxKind::QualifiedCall));
     }
 }
