@@ -1,7 +1,281 @@
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item};
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SourceIdentity {
+    pub project: String,
+    pub package: String,
+    pub path: PackageRelativePath,
+}
+
+impl SourceIdentity {
+    pub fn new(project: String, package: String, path: PackageRelativePath) -> Self {
+        Self {
+            project,
+            package,
+            path,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ContentRevision(pub String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct PackageRelativePath(PathBuf);
+
+impl PackageRelativePath {
+    pub fn new(path: PathBuf) -> Result<Self, String> {
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(format!(
+                "source path {} must be relative to the package root",
+                path.display()
+            ));
+        }
+        if path.as_os_str().is_empty() {
+            return Err("source path must not be empty".to_owned());
+        }
+        Ok(Self(path))
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ByteSpan {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl ByteSpan {
+    pub fn new(start: u32, end: u32) -> Self {
+        Self { start, end }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceSpan {
+    pub source: SourceIdentity,
+    pub range: ByteSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NamespaceEdgeInput {
+    pub origin: String,
+    pub path: PackageRelativePath,
+    pub binding: String,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceNodeInput {
+    pub source: SourceIdentity,
+    pub content_revision: ContentRevision,
+    pub namespace_edges: Vec<NamespaceEdgeInput>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct SourceNodeId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DfsState {
+    Unvisited,
+    Visiting,
+    Complete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NamespaceEdge {
+    pub origin: String,
+    pub path: PackageRelativePath,
+    pub binding: String,
+    pub span: SourceSpan,
+    pub target: SourceNodeId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReachableSourceNode {
+    pub id: SourceNodeId,
+    pub source: SourceIdentity,
+    pub content_revision: ContentRevision,
+    pub namespace_edges: Vec<NamespaceEdge>,
+    pub dfs_state: DfsState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceGraph {
+    pub nodes: Vec<ReachableSourceNode>,
+    pub initialization_order: Vec<SourceNodeId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MissingModuleDiagnostic {
+    pub code: String,
+    pub requested_path: PackageRelativePath,
+    pub edge: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CycleDiagnostic {
+    pub code: String,
+    pub edge: SourceSpan,
+    pub cycle: Vec<SourceSpan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum GraphDiagnostic {
+    MissingModule(MissingModuleDiagnostic),
+    Cycle(CycleDiagnostic),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GraphLoadError {
+    pub diagnostics: Vec<GraphDiagnostic>,
+}
+
+impl GraphLoadError {
+    fn missing(edge: &NamespaceEdgeInput) -> Self {
+        Self {
+            diagnostics: vec![GraphDiagnostic::MissingModule(MissingModuleDiagnostic {
+                code: "M0001".to_owned(),
+                requested_path: edge.path.clone(),
+                edge: edge.span.clone(),
+            })],
+        }
+    }
+
+    fn cycle(edge: &NamespaceEdgeInput, cycle: Vec<SourceSpan>) -> Self {
+        Self {
+            diagnostics: vec![GraphDiagnostic::Cycle(CycleDiagnostic {
+                code: "M0003".to_owned(),
+                edge: edge.span.clone(),
+                cycle,
+            })],
+        }
+    }
+}
+
+pub fn load_reachable_source_graph(
+    package: &str,
+    root: SourceNodeInput,
+    available: Vec<SourceNodeInput>,
+) -> Result<SourceGraph, GraphLoadError> {
+    let mut sources = BTreeMap::new();
+    sources.insert(root.source.path.clone(), root.clone());
+    for source in available {
+        sources.insert(source.source.path.clone(), source);
+    }
+
+    let mut graph = SourceGraph {
+        nodes: Vec::new(),
+        initialization_order: Vec::new(),
+    };
+    let mut node_by_path = HashMap::new();
+    let mut stack = Vec::new();
+    visit_source(
+        package,
+        &root.source.path,
+        &sources,
+        &mut graph,
+        &mut node_by_path,
+        &mut stack,
+        &SourceSpan {
+            source: root.source.clone(),
+            range: ByteSpan::new(0, 0),
+        },
+    )?;
+    Ok(graph)
+}
+
+fn visit_source(
+    package: &str,
+    path: &PackageRelativePath,
+    sources: &BTreeMap<PackageRelativePath, SourceNodeInput>,
+    graph: &mut SourceGraph,
+    node_by_path: &mut HashMap<PackageRelativePath, SourceNodeId>,
+    stack: &mut Vec<SourceNodeId>,
+    incoming: &SourceSpan,
+) -> Result<SourceNodeId, GraphLoadError> {
+    if let Some(id) = node_by_path.get(path) {
+        if graph.nodes[id.0].dfs_state == DfsState::Visiting {
+            let cycle = stack
+                .iter()
+                .map(|item| SourceSpan {
+                    source: graph.nodes[item.0].source.clone(),
+                    range: ByteSpan::new(0, 0),
+                })
+                .chain(std::iter::once(incoming.clone()))
+                .collect();
+            return Err(GraphLoadError::cycle(
+                &NamespaceEdgeInput {
+                    origin: incoming.source.package.clone(),
+                    path: path.clone(),
+                    binding: String::new(),
+                    span: incoming.clone(),
+                },
+                cycle,
+            ));
+        }
+        return Ok(*id);
+    }
+
+    let source = sources.get(path).ok_or_else(|| {
+        GraphLoadError::missing(&NamespaceEdgeInput {
+            origin: package.to_owned(),
+            path: path.clone(),
+            binding: String::new(),
+            span: incoming.clone(),
+        })
+    })?;
+    let id = SourceNodeId(graph.nodes.len());
+    node_by_path.insert(path.clone(), id);
+    graph.nodes.push(ReachableSourceNode {
+        id,
+        source: source.source.clone(),
+        content_revision: source.content_revision.clone(),
+        namespace_edges: Vec::new(),
+        dfs_state: DfsState::Visiting,
+    });
+    graph.initialization_order.push(id);
+    stack.push(id);
+
+    for edge in &source.namespace_edges {
+        if edge.origin != package {
+            return Err(GraphLoadError::missing(edge));
+        }
+        let target = visit_source(
+            package,
+            &edge.path,
+            sources,
+            graph,
+            node_by_path,
+            stack,
+            &edge.span,
+        )?;
+        graph.nodes[id.0].namespace_edges.push(NamespaceEdge {
+            origin: edge.origin.clone(),
+            path: edge.path.clone(),
+            binding: edge.binding.clone(),
+            span: edge.span.clone(),
+            target,
+        });
+    }
+    stack.pop();
+    graph.nodes[id.0].dfs_state = DfsState::Complete;
+    Ok(id)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProjectContext {
@@ -412,8 +686,37 @@ pub fn discover_root(start: &Path) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::ProjectContext;
+    use super::*;
     use std::path::PathBuf;
+
+    fn path(value: &str) -> PackageRelativePath {
+        PackageRelativePath::new(PathBuf::from(value)).expect("relative source path")
+    }
+
+    fn source(path_value: &str, edges: Vec<NamespaceEdgeInput>) -> SourceNodeInput {
+        let path = path(path_value);
+        SourceNodeInput {
+            source: SourceIdentity::new("project".to_owned(), "app".to_owned(), path),
+            content_revision: ContentRevision(format!("revision-{path_value}")),
+            namespace_edges: edges,
+        }
+    }
+
+    fn edge(source_path: &str, target_path: &str, binding: &str) -> NamespaceEdgeInput {
+        NamespaceEdgeInput {
+            origin: "app".to_owned(),
+            path: path(target_path),
+            binding: binding.to_owned(),
+            span: SourceSpan {
+                source: SourceIdentity::new(
+                    "project".to_owned(),
+                    "app".to_owned(),
+                    path(source_path),
+                ),
+                range: ByteSpan::new(4, 28),
+            },
+        }
+    }
 
     #[test]
     fn project_context_serializes_structured_configuration() {
@@ -428,5 +731,66 @@ mod tests {
 
         assert_eq!(value["package"], "app");
         assert_eq!(value["comment_categories"][0], "INTENT");
+    }
+
+    #[test]
+    fn reachable_graph_visits_edges_in_source_order_once() {
+        let root = source(
+            "src/main.w",
+            vec![
+                edge("src/main.w", "src/math.w", "math"),
+                edge("src/main.w", "src/math.w", "again"),
+            ],
+        );
+        let graph =
+            load_reachable_source_graph("app", root, vec![source("src/math.w", Vec::new())])
+                .expect("graph loads");
+
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(
+            graph.initialization_order,
+            vec![SourceNodeId(0), SourceNodeId(1)]
+        );
+        assert_eq!(graph.nodes[0].namespace_edges[0].target, SourceNodeId(1));
+        assert_eq!(graph.nodes[0].namespace_edges[1].target, SourceNodeId(1));
+        assert!(graph
+            .nodes
+            .iter()
+            .all(|node| node.dfs_state == DfsState::Complete));
+    }
+
+    #[test]
+    fn missing_module_has_typed_m0001_requesting_span() {
+        let root = source("src/main.w", vec![edge("src/main.w", "src/math.w", "math")]);
+        let error = load_reachable_source_graph("app", root, Vec::new()).expect_err("missing");
+
+        assert_eq!(error.diagnostics.len(), 1);
+        match &error.diagnostics[0] {
+            GraphDiagnostic::MissingModule(diagnostic) => {
+                assert_eq!(diagnostic.code, "M0001");
+                assert_eq!(diagnostic.requested_path, path("src/math.w"));
+                assert_eq!(diagnostic.edge.source.path, path("src/main.w"));
+                assert_eq!(diagnostic.edge.range, ByteSpan::new(4, 28));
+            }
+            GraphDiagnostic::Cycle(_) => panic!("expected missing module"),
+        }
+    }
+
+    #[test]
+    fn cycle_has_typed_m0003_participating_sources() {
+        let root = source("src/main.w", vec![edge("src/main.w", "src/math.w", "math")]);
+        let math = source("src/math.w", vec![edge("src/math.w", "src/main.w", "main")]);
+        let error = load_reachable_source_graph("app", root, vec![math]).expect_err("cycle");
+
+        match &error.diagnostics[0] {
+            GraphDiagnostic::Cycle(diagnostic) => {
+                assert_eq!(diagnostic.code, "M0003");
+                assert_eq!(diagnostic.edge.source.path, path("src/math.w"));
+                assert_eq!(diagnostic.cycle.len(), 3);
+                assert_eq!(diagnostic.cycle[0].source.path, path("src/main.w"));
+                assert_eq!(diagnostic.cycle[1].source.path, path("src/math.w"));
+            }
+            GraphDiagnostic::MissingModule(_) => panic!("expected cycle"),
+        }
     }
 }
