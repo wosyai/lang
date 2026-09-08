@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write;
 
 use inkwell::builder::{Builder, BuilderError};
 use inkwell::context::Context;
@@ -1051,16 +1052,20 @@ fn emit_return<'ctx>(
 }
 
 fn project_function_name(source: &wosy_syntax::SourceIdentity, name: &str) -> String {
-    format!("{}__{}__{}", source.package, source.path, name)
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    let mut symbol = String::from("wosy_fn");
+    for component in [
+        source.project.as_str(),
+        source.package.as_str(),
+        source.path.as_str(),
+        source.revision.as_str(),
+        name,
+    ] {
+        symbol.push_str("__");
+        for byte in component.as_bytes() {
+            write!(symbol, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+    }
+    symbol
 }
 
 fn project_global_name(source: &wosy_syntax::SourceIdentity, name: &str) -> String {
@@ -1088,6 +1093,7 @@ fn module_globals<'ctx>(
 mod tests {
     use super::emit_scalar_llvm;
     use super::emit_scalar_project_llvm;
+    use super::project_function_name;
     use crate::{
         derive_scalar_program, parse_source, validate_scalar_project, ScalarModule, ScalarProject,
     };
@@ -1138,10 +1144,60 @@ mod tests {
             .to_text();
         let main = text.split("define i32 @main").nth(1).expect("main");
         let read = text
-            .split("define i32 @package__src_main_w__read")
+            .split("define i32 @wosy_fn__70726f6a656374__7061636b616765__7372632f6d61696e2e77__7231__72656164")
             .nth(1)
             .expect("read");
         assert!(main.contains("store i32 41"));
         assert!(read.contains("load i32, ptr"));
+    }
+
+    #[test]
+    fn encodes_colliding_source_paths_as_distinct_verified_symbols() {
+        let first_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/a-b.w".into(),
+            "r1".into(),
+        );
+        let second_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/a/b.w".into(),
+            "r1".into(),
+        );
+        let first_program = derive_scalar_program(
+            &parse_source(
+                first_source.clone(),
+                "%%start\ni32() same = fn { 1 };\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let second_program = derive_scalar_program(
+            &parse_source(
+                second_source.clone(),
+                "%%start\ni32() same = fn { 2 };\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let project = ScalarProject::new(
+            vec![
+                ScalarModule::new(first_source.clone(), first_program.items, Vec::new()),
+                ScalarModule::new(second_source.clone(), second_program.items, Vec::new()),
+            ],
+            vec![first_source.clone(), second_source.clone()],
+        );
+        let text = emit_scalar_project_llvm(&validate_scalar_project(project))
+            .expect("verified LLVM")
+            .to_text();
+        let first_name = project_function_name(&first_source, "same");
+        let second_name = project_function_name(&second_source, "same");
+
+        assert_ne!(first_name, second_name);
+        assert!(text.contains(&format!("define i32 @{first_name}")));
+        assert!(text.contains(&format!("define i32 @{second_name}")));
     }
 }
