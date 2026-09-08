@@ -20,6 +20,16 @@ pub enum ScalarType {
     Named(String),
 }
 
+const POISONED_TYPE_NAME: &str = "\0wosy-internal-error";
+
+fn poisoned_type() -> ScalarType {
+    ScalarType::Named(POISONED_TYPE_NAME.to_owned())
+}
+
+fn is_poisoned_type(ty: &ScalarType) -> bool {
+    matches!(ty, ScalarType::Named(name) if name == POISONED_TYPE_NAME)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BinaryOperator {
     Add,
@@ -622,7 +632,7 @@ fn assignment_type_in_module(
                     assignment.target_span,
                     &target.source,
                 ));
-                return ScalarType::Unit;
+                return poisoned_type();
             };
             if is_const_binding_name(&assignment.target) {
                 diagnostics.push(module_diagnostic(
@@ -645,7 +655,11 @@ fn assignment_type_in_module(
         return ScalarType::Unit;
     };
     expect_module_type(module, expected, &actual, assignment.span, diagnostics);
-    expected.clone()
+    if is_poisoned_type(&actual) {
+        poisoned_type()
+    } else {
+        expected.clone()
+    }
 }
 
 fn while_type_in_module(
@@ -666,7 +680,7 @@ fn while_type_in_module(
         modules,
         diagnostics,
     );
-    if condition != ScalarType::Bool {
+    if !is_poisoned_type(&condition) && condition != ScalarType::Bool {
         diagnostics.push(module_diagnostic(
             module,
             "B0005",
@@ -728,7 +742,7 @@ fn expression_type_in_module(
                     *name_span,
                     &target.source,
                 ));
-                return ScalarType::Unit;
+                return poisoned_type();
             };
             member.clone()
         }
@@ -765,6 +779,9 @@ fn expression_type_in_module(
                 modules,
                 diagnostics,
             );
+            if is_poisoned_type(&left_type) || is_poisoned_type(&right_type) {
+                return poisoned_type();
+            }
             let comparison = matches!(
                 operator,
                 BinaryOperator::Equal
@@ -830,7 +847,7 @@ fn expression_type_in_module(
                             *name_span,
                             &target.source,
                         ));
-                        return ScalarType::Unit;
+                        return poisoned_type();
                     };
                     (Some(callable), target)
                 }
@@ -861,6 +878,7 @@ fn expression_type_in_module(
                     *span,
                 ));
             }
+            let mut poisoned_argument = false;
             for (argument, parameter) in arguments.iter().zip(parameters) {
                 let actual = expression_type_in_module(
                     argument,
@@ -872,8 +890,13 @@ fn expression_type_in_module(
                     diagnostics,
                 );
                 expect_module_type(target, parameter, &actual, *span, diagnostics);
+                poisoned_argument |= is_poisoned_type(&actual);
             }
-            result.as_ref().clone()
+            if poisoned_argument {
+                poisoned_type()
+            } else {
+                result.as_ref().clone()
+            }
         }
         ScalarExpression::If {
             condition,
@@ -915,7 +938,11 @@ fn expression_type_in_module(
                 modules,
                 diagnostics,
             );
-            if then_type != else_type {
+            if !is_poisoned_type(&condition_type)
+                && !is_poisoned_type(&then_type)
+                && !is_poisoned_type(&else_type)
+                && then_type != else_type
+            {
                 diagnostics.push(module_diagnostic(
                     module,
                     "B0006",
@@ -923,7 +950,13 @@ fn expression_type_in_module(
                     *span,
                 ));
             }
-            then_type
+            if is_poisoned_type(&condition_type) || is_poisoned_type(&then_type) {
+                poisoned_type()
+            } else if is_poisoned_type(&else_type) {
+                poisoned_type()
+            } else {
+                then_type
+            }
         }
         ScalarExpression::Block(block) => block_type_in_module(
             block,
@@ -944,7 +977,7 @@ fn expect_module_type(
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    if expected != actual {
+    if !is_poisoned_type(expected) && !is_poisoned_type(actual) && expected != actual {
         diagnostics.push(module_diagnostic(
             module,
             "B0003",
@@ -3086,6 +3119,10 @@ mod tests {
             .iter()
             .find(|diagnostic| diagnostic.code == "M0002")
             .expect("unknown member diagnostic");
+        assert!(!result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"));
         assert_eq!(diagnostic.labels[0].span.source, main_source);
         assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(61, 64));
         assert_eq!(diagnostic.labels[1].span.source, math_source);
@@ -3189,6 +3226,48 @@ mod tests {
         assert_eq!(diagnostics[0].labels[0].span.range, ByteSpan::new(61, 68));
         assert_eq!(diagnostics[1].labels[0].span.range, ByteSpan::new(75, 82));
         assert_eq!(diagnostics[0].labels[1].span.source, math_source);
+        assert!(!result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"));
+    }
+
+    #[test]
+    fn preserves_sibling_diagnostics_after_poisoned_namespace_member() {
+        let math_source = module_source("src/math.w");
+        let math = module_from_text(math_source.clone(), "%%start\ni32 value = 1;\n%%end");
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nmath = namespace app \"src/math.w\";\ni32 missing = math.missing;\ni32 invalid = true;\n%%end",
+        );
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let result = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source,
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "math".to_owned(),
+                        target: math_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(math_source, math.items, Vec::new()),
+            ],
+            Vec::new(),
+        ));
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "M0002"));
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"));
     }
 
     #[test]

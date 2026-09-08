@@ -6,3 +6,4 @@ exit = 1
 command = ["wosy", "build", "app"]
 exit = 1
 stderr_contains = ["M0002", "src/main.w", "src/math.w", "missing"]
+stderr = "expected/stderr"

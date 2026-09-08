@@ -1,0 +1,12 @@
+error[M0002]: unknown module member
+  ┌─ src/main.w:3:19
+  │
+3 │ i32 result = math.missing;
+  │                   ^^^^^^^ unknown module member
+  │
+  ┌─ src/math.w:1:1
+  │
+1 │ %%start
+  │ - module resolved here
+
+wosy: build rejected by semantic diagnostics
