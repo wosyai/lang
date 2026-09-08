@@ -280,7 +280,7 @@ pub fn parse(source: SourceIdentity, text: String, configured_comments: &[String
     let parsed = WosyParser::parse(Rule::source, &text);
     if let Ok(mut pairs) = parsed {
         let pair = pairs.next().expect("source pair");
-        build_pair(&mut builder, pair, &text, &comments);
+        build_pair(&mut builder, pair, &text, &comments, &mut errors);
     } else {
         builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Error));
         add_gap(&mut builder, &text, 0, &comments);
@@ -308,8 +308,20 @@ fn build_pair(
     pair: Pair<'_, Rule>,
     text: &str,
     comments: &[TypedComment],
+    errors: &mut Vec<SyntaxError>,
 ) {
     let span = pair.as_span();
+    if pair.as_rule() == Rule::error_item {
+        let range = ByteSpan::new(span.start() as u32, span.end() as u32);
+        builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Error));
+        add_gap(builder, span.as_str(), span.start(), comments);
+        builder.finish_node();
+        errors.push(SyntaxError {
+            span: range,
+            message: "source does not match the base grammar".to_owned(),
+        });
+        return;
+    }
     if pair.as_rule() == Rule::comment {
         builder.token(
             WosyLanguage::kind_to_raw(SyntaxKind::TypedComment),
@@ -328,7 +340,7 @@ fn build_pair(
     for child in std::iter::once(first).chain(inner) {
         let child_span = child.as_span();
         add_gap(builder, &text[cursor..child_span.start()], cursor, comments);
-        build_pair(builder, child, text, comments);
+        build_pair(builder, child, text, comments, errors);
         cursor = child_span.end();
     }
     add_gap(builder, &text[cursor..span.end()], cursor, comments);
@@ -488,6 +500,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::while_expr => SyntaxKind::While,
         Rule::assignment => SyntaxKind::Assignment,
         Rule::top_level_item => SyntaxKind::TopLevelItem,
+        Rule::error_item => SyntaxKind::Error,
         Rule::parenthesized => SyntaxKind::Parenthesized,
         Rule::boolean => SyntaxKind::Boolean,
         Rule::logical_or
@@ -576,6 +589,82 @@ mod tests {
             .root
             .descendants()
             .any(|node| node.kind() == SyntaxKind::Error));
+    }
+
+    #[test]
+    fn recovery_retains_adjacent_items_and_precise_structure() {
+        let text = "%%start\ni32 before = 1;\n# INTENT: retained while recovering.\nbroken source;\ni32 after = 2;\n%%end";
+        let result = parse(identity(), text.into(), &["INTENT".into()]);
+        assert!(!result.is_valid());
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(result.comments.len(), 1);
+        assert_eq!(result.comments[0].category, "INTENT");
+        assert_eq!(
+            result.comments[0].raw_payload,
+            " retained while recovering."
+        );
+        let error = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::Error)
+            .expect("recovered error node");
+        let error_span = byte_span(&error);
+        assert_eq!(
+            error_span,
+            ByteSpan::new(
+                text.find("broken source;").expect("error text") as u32,
+                (text.find("broken source;").expect("error text") + "broken source;".len()) as u32
+            )
+        );
+        assert_eq!(result.errors[0].span, error_span);
+        assert!(result.root.descendants_with_tokens().any(|element| {
+            element.kind() == SyntaxKind::TypedComment
+                && element.to_string() == "# INTENT: retained while recovering."
+        }));
+        let top_level: Vec<_> = result
+            .root
+            .descendants_with_tokens()
+            .filter(|element| {
+                matches!(
+                    element.kind(),
+                    SyntaxKind::BoundaryStart
+                        | SyntaxKind::BindingDecl
+                        | SyntaxKind::Error
+                        | SyntaxKind::BoundaryEnd
+                )
+            })
+            .collect();
+        assert_eq!(
+            top_level
+                .iter()
+                .map(|element| element.kind())
+                .collect::<Vec<_>>(),
+            vec![
+                SyntaxKind::BoundaryStart,
+                SyntaxKind::BindingDecl,
+                SyntaxKind::Error,
+                SyntaxKind::BindingDecl,
+                SyntaxKind::BoundaryEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_synchronizes_at_boundary_end() {
+        let text = "%%start\nbroken source\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(!result.is_valid());
+        let error = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::Error)
+            .expect("recovered error node");
+        assert_eq!(byte_span(&error), ByteSpan::new(8, 22));
+        assert_eq!(result.errors[0].span, ByteSpan::new(8, 22));
+        assert!(result.root.descendants_with_tokens().any(|element| {
+            element.kind() == SyntaxKind::BoundaryEnd && element.to_string() == "%%end"
+        }));
+        assert_eq!(result.reconstruct(), text);
     }
     #[test]
     fn raw_kinds_cover_declared_values() {
