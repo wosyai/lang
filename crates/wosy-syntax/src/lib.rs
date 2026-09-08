@@ -45,6 +45,7 @@ pub enum SyntaxKind {
     LocalBinding,
     While,
     Assignment,
+    TopLevelItem,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -90,6 +91,7 @@ impl Language for WosyLanguage {
             32 => SyntaxKind::LocalBinding,
             33 => SyntaxKind::While,
             34 => SyntaxKind::Assignment,
+            35 => SyntaxKind::TopLevelItem,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -479,6 +481,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::if_expr => SyntaxKind::IfExpr,
         Rule::while_expr => SyntaxKind::While,
         Rule::assignment => SyntaxKind::Assignment,
+        Rule::top_level_item => SyntaxKind::TopLevelItem,
         Rule::parenthesized => SyntaxKind::Parenthesized,
         Rule::boolean => SyntaxKind::Boolean,
         Rule::logical_or
@@ -654,5 +657,21 @@ mod tests {
 
         let expression_statement = "%%start\nunit() main = fn {\n\tprint();\n};\n%%end";
         assert!(parse(identity(), expression_statement.into(), &[]).is_valid());
+    }
+
+    #[test]
+    fn top_level_executable_items_are_structural_and_ordered() {
+        let text = "%%start\ni32 value = 0;\nvalue = 1;\nvalue;\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        let items: Vec<_> = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::TopLevelItem)
+            .collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text(), "value = 1;");
+        assert_eq!(items[1].text(), "value;");
+        assert!(byte_span(&items[0]).start < byte_span(&items[1]).start);
     }
 }

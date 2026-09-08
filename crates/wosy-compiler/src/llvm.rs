@@ -62,6 +62,22 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     let context = Context::create();
     let module = context.create_module(&validation.program.source.path);
     let builder = context.create_builder();
+    let mut globals = BTreeMap::new();
+    for item in &validation.program.items {
+        if let ScalarItem::Binding(binding) = item {
+            if binding.declared_type == ScalarType::Unit {
+                continue;
+            }
+            let ty = basic_type(&context, &binding.declared_type)?;
+            let global = module.add_global(ty, None, &binding.name);
+            global.set_linkage(Linkage::Internal);
+            global.set_initializer(&ty.const_zero());
+            globals.insert(
+                binding.name.clone(),
+                (global, binding.declared_type.clone()),
+            );
+        }
+    }
     let signatures = validation
         .program
         .items
@@ -73,7 +89,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             ScalarItem::Function(function) => {
                 Some((function.name.clone(), function.signature.clone()))
             }
-            ScalarItem::Namespace(_) => None,
+            ScalarItem::Namespace(_) | ScalarItem::Executable(_) => None,
         })
         .collect::<BTreeMap<_, _>>();
     let mut functions = BTreeMap::new();
@@ -98,10 +114,23 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     );
     for item in &validation.program.items {
         if let ScalarItem::Function(function) = item {
-            emit_function(&context, &builder, &functions, function, &function.name)?;
+            emit_function(
+                &context,
+                &builder,
+                &functions,
+                &globals,
+                function,
+                &function.name,
+            )?;
         }
     }
-    emit_main(&context, &builder, &functions, &validation.program.items)?;
+    emit_main(
+        &context,
+        &builder,
+        &functions,
+        &globals,
+        &validation.program.items,
+    )?;
     finish_partition(
         module,
         validation.program.source.path.clone(),
@@ -145,6 +174,9 @@ pub fn emit_scalar_project_llvm(
     for source_module in &modules {
         for item in &source_module.items {
             if let ScalarItem::Binding(binding) = item {
+                if binding.declared_type == ScalarType::Unit {
+                    continue;
+                }
                 let name = project_global_name(&source_module.source, &binding.name);
                 let ty = basic_type(&context, &binding.declared_type)?;
                 let global = module.add_global(ty, None, &name);
@@ -295,6 +327,7 @@ fn emit_function<'ctx>(
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
+    globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     function: &ScalarFunction,
     name: &str,
 ) -> Result<(), String> {
@@ -308,7 +341,7 @@ fn emit_function<'ctx>(
         functions,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
-        globals: BTreeMap::new(),
+        globals: globals.clone(),
         next_block: 0,
     };
     if let ScalarType::Callable { parameters, .. } = &function.signature {
@@ -338,6 +371,7 @@ fn emit_main<'ctx>(
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
+    globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     items: &[ScalarItem],
 ) -> Result<(), String> {
     let main = *functions
@@ -350,13 +384,30 @@ fn emit_main<'ctx>(
         functions,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
-        globals: BTreeMap::new(),
+        globals: globals.clone(),
         next_block: 0,
     };
     for item in items {
-        if let ScalarItem::Binding(binding) = item {
-            let value = emit_expression(context, &mut state, &binding.value)?;
-            state.values.insert(binding.name.clone(), value);
+        match item {
+            ScalarItem::Binding(binding) => {
+                let value = emit_expression(context, &mut state, &binding.value)?;
+                if binding.declared_type != ScalarType::Unit {
+                    let value = take_basic(value)?;
+                    let (global, _) = state
+                        .globals
+                        .get(&binding.name)
+                        .cloned()
+                        .ok_or_else(|| format!("unknown LLVM global {}", binding.name))?;
+                    state
+                        .builder
+                        .build_store(global.as_pointer_value(), value)
+                        .map_err(builder_error)?;
+                }
+            }
+            ScalarItem::Executable(item) => {
+                emit_block_item(context, &mut state, item)?;
+            }
+            ScalarItem::Namespace(_) | ScalarItem::Function(_) => {}
         }
     }
     builder
@@ -433,21 +484,35 @@ fn emit_project_main<'ctx>(
     };
     for module in modules {
         state.values.clear();
+        state.storage.clear();
         state.globals = module_globals(module, globals);
-        for node in &module.initialization_nodes {
-            if let ScalarItem::Binding(binding) = &module.items[node.item_index] {
-                let value =
-                    emit_project_expression(context, &mut state, &binding.value, module, modules)?;
-                let value = take_basic(value)?;
-                let (global, _) = state
-                    .globals
-                    .get(&binding.name)
-                    .cloned()
-                    .ok_or_else(|| format!("unknown LLVM global {}", binding.name))?;
-                state
-                    .builder
-                    .build_store(global.as_pointer_value(), value)
-                    .map_err(builder_error)?;
+        for item in &module.items {
+            match item {
+                ScalarItem::Binding(binding) => {
+                    let value = emit_project_expression(
+                        context,
+                        &mut state,
+                        &binding.value,
+                        module,
+                        modules,
+                    )?;
+                    if binding.declared_type != ScalarType::Unit {
+                        let value = take_basic(value)?;
+                        let (global, _) = state
+                            .globals
+                            .get(&binding.name)
+                            .cloned()
+                            .ok_or_else(|| format!("unknown LLVM global {}", binding.name))?;
+                        state
+                            .builder
+                            .build_store(global.as_pointer_value(), value)
+                            .map_err(builder_error)?;
+                    }
+                }
+                ScalarItem::Executable(item) => {
+                    emit_project_block_item(context, &mut state, item, module, modules)?;
+                }
+                ScalarItem::Namespace(_) | ScalarItem::Function(_) => {}
             }
         }
     }
@@ -543,19 +608,30 @@ fn emit_assignment<'ctx>(
     assignment: &ScalarAssignment,
 ) -> Result<EmitValue<'ctx>, String> {
     let value = take_basic(emit_expression(context, state, &assignment.value)?)?;
-    let (slot, ty) = state
-        .storage
-        .get(&assignment.target)
-        .cloned()
-        .ok_or_else(|| format!("unknown LLVM storage {}", assignment.target))?;
-    let old = state
-        .builder
-        .build_load(basic_type(context, &ty)?, slot, "old")
-        .map_err(builder_error)?;
-    state
-        .builder
-        .build_store(slot, value)
-        .map_err(builder_error)?;
+    let old = if let Some((slot, ty)) = state.storage.get(&assignment.target).cloned() {
+        let old = state
+            .builder
+            .build_load(basic_type(context, &ty)?, slot, "old")
+            .map_err(builder_error)?;
+        state
+            .builder
+            .build_store(slot, value)
+            .map_err(builder_error)?;
+        old
+    } else if let Some((global, ty)) = state.globals.get(&assignment.target).cloned() {
+        let slot = global.as_pointer_value();
+        let old = state
+            .builder
+            .build_load(basic_type(context, &ty)?, slot, "old")
+            .map_err(builder_error)?;
+        state
+            .builder
+            .build_store(slot, value)
+            .map_err(builder_error)?;
+        old
+    } else {
+        return Err(format!("unknown LLVM storage {}", assignment.target));
+    };
     Ok(EmitValue::Basic(old))
 }
 fn emit_project_assignment<'ctx>(
@@ -572,20 +648,99 @@ fn emit_project_assignment<'ctx>(
         module,
         modules,
     )?)?;
-    let (slot, ty) = state
-        .storage
-        .get(&assignment.target)
-        .cloned()
-        .ok_or_else(|| format!("unknown LLVM storage {}", assignment.target))?;
-    let old = state
-        .builder
-        .build_load(basic_type(context, &ty)?, slot, "old")
-        .map_err(builder_error)?;
-    state
-        .builder
-        .build_store(slot, value)
-        .map_err(builder_error)?;
+    let old = if let Some((slot, ty)) = state.storage.get(&assignment.target).cloned() {
+        let old = state
+            .builder
+            .build_load(basic_type(context, &ty)?, slot, "old")
+            .map_err(builder_error)?;
+        state
+            .builder
+            .build_store(slot, value)
+            .map_err(builder_error)?;
+        old
+    } else if let Some((global, ty)) = state.globals.get(&assignment.target).cloned() {
+        let slot = global.as_pointer_value();
+        let old = state
+            .builder
+            .build_load(basic_type(context, &ty)?, slot, "old")
+            .map_err(builder_error)?;
+        state
+            .builder
+            .build_store(slot, value)
+            .map_err(builder_error)?;
+        old
+    } else {
+        return Err(format!("unknown LLVM storage {}", assignment.target));
+    };
     Ok(EmitValue::Basic(old))
+}
+
+fn emit_block_item<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    item: &ScalarBlockItem,
+) -> Result<EmitValue<'ctx>, String> {
+    match item {
+        ScalarBlockItem::LocalBinding(binding) => {
+            let value = take_basic(emit_expression(context, state, &binding.value)?)?;
+            let slot = state
+                .builder
+                .build_alloca(basic_type(context, &binding.declared_type)?, &binding.name)
+                .map_err(builder_error)?;
+            state
+                .builder
+                .build_store(slot, value)
+                .map_err(builder_error)?;
+            state
+                .storage
+                .insert(binding.name.clone(), (slot, binding.declared_type.clone()));
+            Ok(EmitValue::Unit)
+        }
+        ScalarBlockItem::Expression(expression) => emit_expression(context, state, expression),
+        ScalarBlockItem::Assignment(assignment) => emit_assignment(context, state, assignment),
+        ScalarBlockItem::While(expression) => emit_while(context, state, expression),
+    }
+}
+
+fn emit_project_block_item<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    item: &ScalarBlockItem,
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    match item {
+        ScalarBlockItem::LocalBinding(binding) => {
+            let value = take_basic(emit_project_expression(
+                context,
+                state,
+                &binding.value,
+                module,
+                modules,
+            )?)?;
+            let slot = state
+                .builder
+                .build_alloca(basic_type(context, &binding.declared_type)?, &binding.name)
+                .map_err(builder_error)?;
+            state
+                .builder
+                .build_store(slot, value)
+                .map_err(builder_error)?;
+            state
+                .storage
+                .insert(binding.name.clone(), (slot, binding.declared_type.clone()));
+            Ok(EmitValue::Unit)
+        }
+        ScalarBlockItem::Expression(expression) => {
+            emit_project_expression(context, state, expression, module, modules)
+        }
+        ScalarBlockItem::Assignment(assignment) => {
+            emit_project_assignment(context, state, assignment, module, modules)
+        }
+        ScalarBlockItem::While(expression) => {
+            emit_project_while(context, state, expression, module, modules)
+        }
+    }
 }
 
 fn emit_while<'ctx>(
@@ -1084,7 +1239,7 @@ fn module_globals<'ctx>(
                 .get(&project_global_name(&module.source, &binding.name))
                 .cloned()
                 .map(|global| (binding.name.clone(), global)),
-            ScalarItem::Namespace(_) | ScalarItem::Function(_) => None,
+            ScalarItem::Namespace(_) | ScalarItem::Function(_) | ScalarItem::Executable(_) => None,
         })
         .collect()
 }
@@ -1149,6 +1304,55 @@ mod tests {
             .expect("read");
         assert!(main.contains("store i32 41"));
         assert!(read.contains("load i32, ptr"));
+    }
+
+    #[test]
+    fn emits_ordered_top_level_assignment_and_global_function_load() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let parsed = parse_source(
+            source.clone(),
+            "%%start\ni32 value = 0;\nvalue = 1;\ni32() read = fn { value };\nvalue;\n%%end".into(),
+            &[],
+        );
+        let validation = derive_scalar_program(&parsed.result);
+        let text = emit_scalar_llvm(&validation)
+            .expect("verified LLVM")
+            .to_text();
+        let main = text.split("define i32 @main").nth(1).expect("main");
+        assert!(
+            main.find("store i32 0").expect("initial store")
+                < main.find("store i32 1").expect("assignment store")
+        );
+        assert!(text.contains("@value = internal global i32 0"));
+        assert!(text.contains("define i32 @read"));
+        assert!(text.contains("load i32, ptr @value"));
+
+        let program = validation.program;
+        let project = ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        );
+        let project_text = emit_scalar_project_llvm(&validate_scalar_project(project))
+            .expect("verified project LLVM")
+            .to_text();
+        let project_main = project_text
+            .split("define i32 @main")
+            .nth(1)
+            .expect("project main");
+        assert!(
+            project_main
+                .find("store i32 0")
+                .expect("project initial store")
+                < project_main
+                    .find("store i32 1")
+                    .expect("project assignment store")
+        );
+        assert!(project_text.contains("load i32, ptr @wosy_fn__70726f6a656374__7061636b616765__7372632f6d61696e2e77__7231__676c6f62616c5f76616c7565"));
     }
 
     #[test]

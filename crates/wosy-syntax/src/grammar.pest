@@ -9,7 +9,8 @@ comment_scan = ${ SOI ~ (string | comment | (!("\"" | "#") ~ ANY))* ~ EOI }
 source = { SOI ~ boundary_start ~ item+ ~ boundary_end ~ EOI }
 boundary_start = { "%%start" }
 boundary_end = { "%%end" }
-item = { namespace_decl | extern_decl | function_decl | binding_decl }
+item = { namespace_decl | extern_decl | function_decl | binding_decl | top_level_item }
+top_level_item = { (assignment | expression) ~ ";"? }
 namespace_decl = { identifier ~ "=" ~ "namespace" ~ identifier ~ string ~ ";" }
 extern_decl = { identifier ~ "=" ~ "extern" ~ identifier ~ string ~ "{" ~ extern_function ~ "}" ~ ";" }
 extern_function = { callable_type ~ identifier ~ ";" }

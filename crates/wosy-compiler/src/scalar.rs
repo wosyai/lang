@@ -136,6 +136,7 @@ pub enum ScalarItem {
     Namespace(ScalarNamespace),
     Binding(ScalarBinding),
     Function(ScalarFunction),
+    Executable(ScalarBlockItem),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -183,6 +184,7 @@ impl ScalarModule {
                 ScalarItem::Function(function) => {
                     (&function.name, &function.signature, function.span)
                 }
+                ScalarItem::Executable(_) => continue,
             };
             members.insert(name.clone(), ty.clone());
             initialization_nodes.push(ScalarInitializationNode { item_index, span });
@@ -258,6 +260,9 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
                         SyntaxKind::FunctionDecl => {
                             items.push(ScalarItem::Function(derive_function(&item)))
                         }
+                        SyntaxKind::TopLevelItem => {
+                            items.push(ScalarItem::Executable(derive_executable_item(&item)))
+                        }
                         _ => {}
                     }
                 }
@@ -289,6 +294,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                 ScalarItem::Function(function) => {
                     (&function.name, &function.signature, function.span)
                 }
+                ScalarItem::Executable(_) => continue,
             };
             if declarations.insert(name.clone(), ty.clone()).is_some() {
                 diagnostics.push(module_diagnostic(
@@ -344,6 +350,16 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         &mut diagnostics,
                     );
                 }
+                ScalarItem::Executable(executable) => {
+                    let mut scope = declarations.clone();
+                    let _ = block_item_type_in_module(
+                        executable,
+                        &mut scope,
+                        module,
+                        &project.modules,
+                        &mut diagnostics,
+                    );
+                }
             }
         }
     }
@@ -386,32 +402,42 @@ fn block_type_in_module(
     let mut scope = scope.clone();
     let mut result = ScalarType::Unit;
     for item in &block.items {
-        result = match item {
-            ScalarBlockItem::LocalBinding(binding) => {
-                let actual =
-                    expression_type_in_module(&binding.value, &scope, module, modules, diagnostics);
-                expect_module_type(
-                    module,
-                    &binding.declared_type,
-                    &actual,
-                    binding.span,
-                    diagnostics,
-                );
-                scope.insert(binding.name.clone(), binding.declared_type.clone());
-                ScalarType::Unit
-            }
-            ScalarBlockItem::Expression(expression) => {
-                expression_type_in_module(expression, &scope, module, modules, diagnostics)
-            }
-            ScalarBlockItem::Assignment(assignment) => {
-                assignment_type_in_module(assignment, &mut scope, module, modules, diagnostics)
-            }
-            ScalarBlockItem::While(while_expression) => {
-                while_type_in_module(while_expression, &scope, module, modules, diagnostics)
-            }
-        };
+        result = block_item_type_in_module(item, &mut scope, module, modules, diagnostics);
     }
     result
+}
+
+fn block_item_type_in_module(
+    item: &ScalarBlockItem,
+    scope: &mut BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    match item {
+        ScalarBlockItem::LocalBinding(binding) => {
+            let actual =
+                expression_type_in_module(&binding.value, scope, module, modules, diagnostics);
+            expect_module_type(
+                module,
+                &binding.declared_type,
+                &actual,
+                binding.span,
+                diagnostics,
+            );
+            scope.insert(binding.name.clone(), binding.declared_type.clone());
+            ScalarType::Unit
+        }
+        ScalarBlockItem::Expression(expression) => {
+            expression_type_in_module(expression, scope, module, modules, diagnostics)
+        }
+        ScalarBlockItem::Assignment(assignment) => {
+            assignment_type_in_module(assignment, scope, module, modules, diagnostics)
+        }
+        ScalarBlockItem::While(while_expression) => {
+            while_type_in_module(while_expression, scope, module, modules, diagnostics)
+        }
+    }
 }
 
 fn assignment_type_in_module(
@@ -843,6 +869,24 @@ fn derive_block_item(node: &CstNode) -> ScalarBlockItem {
     }
 }
 
+fn derive_executable_item(node: &CstNode) -> ScalarBlockItem {
+    let child = direct_nodes(node)
+        .into_iter()
+        .next()
+        .expect("executable item");
+    match child.kind() {
+        SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&child)),
+        SyntaxKind::Expression => {
+            let actual = direct_nodes(&child).into_iter().next().expect("expression");
+            match actual.kind() {
+                SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&actual)),
+                _ => ScalarBlockItem::Expression(derive_expression(&child)),
+            }
+        }
+        _ => panic!("top-level item grammar"),
+    }
+}
+
 fn derive_assignment(node: &CstNode) -> ScalarAssignment {
     let target = direct_token(node, SyntaxKind::Identifier).expect("assignment target");
     let value = direct_nodes(node)
@@ -1046,12 +1090,14 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
             ScalarItem::Namespace(_) => continue,
             ScalarItem::Binding(binding) => (&binding.name, &binding.declared_type, binding.span),
             ScalarItem::Function(function) => (&function.name, &function.signature, function.span),
+            ScalarItem::Executable(_) => continue,
         };
         if declarations.insert(name.clone(), ty.clone()).is_some() {
             diagnostics.push(diagnostic(program, "B0002", "duplicate declaration", span));
         }
         validate_type(program, ty, span, &mut diagnostics);
     }
+    let mut scope = declarations.clone();
     for item in &program.items {
         match item {
             ScalarItem::Namespace(_) => {}
@@ -1093,6 +1139,9 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     ));
                 }
             }
+            ScalarItem::Executable(executable) => {
+                let _ = block_item_type(executable, &mut scope, program, &mut diagnostics);
+            }
         }
     }
     diagnostics
@@ -1127,31 +1176,40 @@ fn block_type(
     let mut scope = scope.clone();
     let mut result = ScalarType::Unit;
     for item in &block.items {
-        result = match item {
-            ScalarBlockItem::LocalBinding(binding) => {
-                let actual = expression_type(&binding.value, &scope, program, diagnostics);
-                expect_type(
-                    program,
-                    &binding.declared_type,
-                    &actual,
-                    binding.span,
-                    diagnostics,
-                );
-                scope.insert(binding.name.clone(), binding.declared_type.clone());
-                ScalarType::Unit
-            }
-            ScalarBlockItem::Expression(expression) => {
-                expression_type(expression, &scope, program, diagnostics)
-            }
-            ScalarBlockItem::Assignment(assignment) => {
-                assignment_type(assignment, &mut scope, program, diagnostics)
-            }
-            ScalarBlockItem::While(while_expression) => {
-                while_type(while_expression, &scope, program, diagnostics)
-            }
-        };
+        result = block_item_type(item, &mut scope, program, diagnostics);
     }
     result
+}
+
+fn block_item_type(
+    item: &ScalarBlockItem,
+    scope: &mut BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    match item {
+        ScalarBlockItem::LocalBinding(binding) => {
+            let actual = expression_type(&binding.value, scope, program, diagnostics);
+            expect_type(
+                program,
+                &binding.declared_type,
+                &actual,
+                binding.span,
+                diagnostics,
+            );
+            scope.insert(binding.name.clone(), binding.declared_type.clone());
+            ScalarType::Unit
+        }
+        ScalarBlockItem::Expression(expression) => {
+            expression_type(expression, scope, program, diagnostics)
+        }
+        ScalarBlockItem::Assignment(assignment) => {
+            assignment_type(assignment, scope, program, diagnostics)
+        }
+        ScalarBlockItem::While(while_expression) => {
+            while_type(while_expression, scope, program, diagnostics)
+        }
+    }
 }
 
 fn assignment_type(
@@ -1369,6 +1427,43 @@ mod tests {
         assert_eq!(result.program.items.len(), 5);
         assert!(matches!(result.program.items[0], ScalarItem::Function(_)));
         assert!(matches!(result.program.items[4], ScalarItem::Binding(_)));
+    }
+
+    #[test]
+    fn derives_and_type_checks_top_level_assignment_in_module_scope() {
+        let result = validate_text("%%start\ni32 value = 0;\nvalue = 1;\nvalue;\n%%end");
+        assert!(
+            result.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.program.items.len(), 3);
+        assert!(matches!(result.program.items[0], ScalarItem::Binding(_)));
+        assert!(matches!(
+            result.program.items[1],
+            ScalarItem::Executable(ScalarBlockItem::Assignment(_))
+        ));
+        assert!(matches!(
+            result.program.items[2],
+            ScalarItem::Executable(ScalarBlockItem::Expression(ScalarExpression::Name { .. }))
+        ));
+
+        let mismatch = validate_text("%%start\nbool value = false;\nvalue = 1;\n%%end");
+        assert!(mismatch
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"));
+        assert_eq!(
+            mismatch
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "B0003")
+                .expect("assignment type diagnostic")
+                .labels[0]
+                .span
+                .range,
+            ByteSpan::new(28, 37)
+        );
     }
 
     #[test]
