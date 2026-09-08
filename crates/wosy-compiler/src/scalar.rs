@@ -538,7 +538,26 @@ fn assignment_type_in_module(
         diagnostics,
     );
     let expected = match &assignment.receiver {
-        None => scope.get(&assignment.target),
+        None => {
+            if is_const_binding_name(&assignment.target)
+                && (scope.contains_key(&assignment.target)
+                    || module.items.iter().any(|item| {
+                        matches!(
+                            item,
+                            ScalarItem::Namespace(namespace)
+                                if namespace.binding == assignment.target
+                        )
+                    }))
+            {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0007",
+                    "assignment targets a SCREAMING_SNAKE_CASE const binding",
+                    assignment.target_span,
+                ));
+            }
+            scope.get(&assignment.target)
+        }
         Some(receiver) => {
             let Some(namespace) = module
                 .namespace_bindings
@@ -577,6 +596,14 @@ fn assignment_type_in_module(
                 ));
                 return ScalarType::Unit;
             };
+            if is_const_binding_name(&assignment.target) {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0007",
+                    "assignment targets a SCREAMING_SNAKE_CASE const binding",
+                    assignment.target_span,
+                ));
+            }
             Some(expected)
         }
     };
@@ -1542,6 +1569,22 @@ fn assignment_type(
         diagnostics,
     );
     let Some(expected) = scope.get(&assignment.target) else {
+        if is_const_binding_name(&assignment.target)
+            && program.items.iter().any(|item| {
+                matches!(
+                    item,
+                    ScalarItem::Namespace(namespace) if namespace.binding == assignment.target
+                )
+            })
+        {
+            diagnostics.push(diagnostic(
+                program,
+                "B0007",
+                "assignment targets a SCREAMING_SNAKE_CASE const binding",
+                assignment.target_span,
+            ));
+            return ScalarType::Unit;
+        }
         diagnostics.push(diagnostic(
             program,
             "B0001",
@@ -1550,6 +1593,14 @@ fn assignment_type(
         ));
         return ScalarType::Unit;
     };
+    if is_const_binding_name(&assignment.target) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0007",
+            "assignment targets a SCREAMING_SNAKE_CASE const binding",
+            assignment.target_span,
+        ));
+    }
     expect_type(program, expected, &actual, assignment.span, diagnostics);
     expected.clone()
 }
@@ -1777,6 +1828,14 @@ fn invalid_integer_diagnostic_program(
         "invalid integer literal",
         span,
     ));
+}
+
+fn is_const_binding_name(name: &str) -> bool {
+    name != "_"
+        && name.bytes().any(|byte| byte.is_ascii_uppercase())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte == b'_' || byte.is_ascii_digit())
 }
 
 fn diagnostic(
@@ -2148,6 +2207,88 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "B0003"));
+    }
+
+    #[test]
+    fn rejects_const_binding_assignments_at_target_span_in_single_file() {
+        let cases = [
+            ("%%start\ni32 MAX_VALUE = 1;\nMAX_VALUE = 2;\n%%end", "MAX_VALUE"),
+            (
+                "%%start\ni32(i32) f = fn(PARAMETER) { PARAMETER = 1; PARAMETER };\n%%end",
+                "PARAMETER",
+            ),
+            (
+                "%%start\ni32(i32) F = fn(value) { i32 LOCAL_VALUE = value; LOCAL_VALUE = value; LOCAL_VALUE };\n%%end",
+                "LOCAL_VALUE",
+            ),
+        ];
+        for (text, target) in cases {
+            let result = validate_text(text);
+            let diagnostic = result
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "B0007")
+                .expect("const assignment diagnostic");
+            let start = text
+                .match_indices(target)
+                .nth(1)
+                .map(|(start, _)| start)
+                .expect("assignment target") as u32;
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(start, start + target.len() as u32)
+            );
+        }
+
+        let valid = validate_text("%%start\ni32 MAX_VALUE = 1;\nMAX_VALUE;\n%%end");
+        assert!(
+            valid.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            valid.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_const_binding_assignments_at_target_span_in_project() {
+        let child_source = module_source("src/child.w");
+        let child = module_from_text(child_source.clone(), "%%start\ni32 MAX_VALUE = 1;\n%%end");
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nchild = namespace app \"src/child.w\";\ni32 value = child.MAX_VALUE;\nchild.MAX_VALUE = value;\n%%end",
+        );
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let assignment_target = match &main.items[2] {
+            ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) => {
+                assignment.target_span
+            }
+            _ => panic!("assignment item"),
+        };
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source.clone(),
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "child".to_owned(),
+                        target: child_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(child_source, child.items, Vec::new()),
+            ],
+            Vec::new(),
+        ));
+        let diagnostic = validation
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0007")
+            .expect("project const assignment diagnostic");
+        assert_eq!(diagnostic.labels[0].span.source, main_source);
+        assert_eq!(diagnostic.labels[0].span.range, assignment_target);
     }
 
     #[test]
