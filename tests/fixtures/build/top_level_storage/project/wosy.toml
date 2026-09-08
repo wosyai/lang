@@ -1,0 +1,28 @@
+[package]
+name = "top_level_storage"
+
+[comments]
+categories = []
+
+[builders.native]
+command = ["scripts/build-native"]
+args = []
+
+[runners.native]
+command = ["scripts/run-native"]
+args = []
+
+[targets.app]
+root = "src/main.w"
+
+[targets.app.artifacts.main]
+artifact = "Main"
+
+[targets.app.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.app.profiles.dev]
+main_artifact = "main"
