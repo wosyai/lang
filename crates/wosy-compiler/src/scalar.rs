@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rowan::NodeOrToken;
 use serde::{Deserialize, Serialize};
@@ -295,18 +295,19 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
     let mut diagnostics = Vec::new();
     for module in &project.modules {
         let mut declarations = BTreeMap::new();
+        let mut declaration_names = BTreeSet::new();
         for item in &module.items {
-            let (name, ty, span) = match item {
-                ScalarItem::Namespace(_) => continue,
+            let (name, span, ty) = match item {
+                ScalarItem::Namespace(namespace) => (&namespace.binding, namespace.span, None),
                 ScalarItem::Binding(binding) => {
-                    (&binding.name, &binding.declared_type, binding.span)
+                    (&binding.name, binding.span, Some(&binding.declared_type))
                 }
                 ScalarItem::Function(function) => {
-                    (&function.name, &function.signature, function.span)
+                    (&function.name, function.span, Some(&function.signature))
                 }
                 ScalarItem::Executable(_) => continue,
             };
-            if declarations.insert(name.clone(), ty.clone()).is_some() {
+            if !declaration_names.insert(name.clone()) {
                 diagnostics.push(module_diagnostic(
                     module,
                     "B0002",
@@ -314,7 +315,10 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                     span,
                 ));
             }
-            validate_module_type(module, ty, span, &mut diagnostics);
+            if let Some(ty) = ty {
+                declarations.insert(name.clone(), ty.clone());
+                validate_module_type(module, ty, span, &mut diagnostics);
+            }
         }
         for item in &module.items {
             match item {
@@ -1227,17 +1231,25 @@ fn operator(value: &str) -> BinaryOperator {
 fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut declarations = BTreeMap::new();
+    let mut declaration_names = BTreeSet::new();
     for item in &program.items {
-        let (name, ty, span) = match item {
-            ScalarItem::Namespace(_) => continue,
-            ScalarItem::Binding(binding) => (&binding.name, &binding.declared_type, binding.span),
-            ScalarItem::Function(function) => (&function.name, &function.signature, function.span),
+        let (name, span, ty) = match item {
+            ScalarItem::Namespace(namespace) => (&namespace.binding, namespace.span, None),
+            ScalarItem::Binding(binding) => {
+                (&binding.name, binding.span, Some(&binding.declared_type))
+            }
+            ScalarItem::Function(function) => {
+                (&function.name, function.span, Some(&function.signature))
+            }
             ScalarItem::Executable(_) => continue,
         };
-        if declarations.insert(name.clone(), ty.clone()).is_some() {
+        if !declaration_names.insert(name.clone()) {
             diagnostics.push(diagnostic(program, "B0002", "duplicate declaration", span));
         }
-        validate_type(program, ty, span, &mut diagnostics);
+        if let Some(ty) = ty {
+            declarations.insert(name.clone(), ty.clone());
+            validate_type(program, ty, span, &mut diagnostics);
+        }
     }
     let mut scope = declarations.clone();
     for item in &program.items {
@@ -1857,6 +1869,23 @@ mod tests {
         assert_eq!(*name_span, ByteSpan::new(61, 64));
     }
 
+    #[test]
+    fn rejects_duplicate_namespace_binding_in_single_program() {
+        let result = validate_text(
+            "%%start\nmath = namespace app \"src/first.w\";\nmath = namespace app \"src/second.w\";\n%%end",
+        );
+        let diagnostics: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "B0002")
+            .collect();
+        let ScalarItem::Namespace(second) = &result.program.items[1] else {
+            panic!("second namespace item");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].labels[0].span.range, second.span);
+    }
+
     fn module_source(path: &str) -> SourceIdentity {
         SourceIdentity::new("project".into(), "app".into(), path.into(), "r1".into())
     }
@@ -1907,6 +1936,99 @@ mod tests {
             result.diagnostics.is_empty(),
             "diagnostics: {:?}",
             result.diagnostics
+        );
+    }
+
+    #[test]
+    fn validates_project_namespace_uniqueness_and_preserves_distinct_targets() {
+        let first_source = module_source("src/first.w");
+        let second_source = module_source("src/second.w");
+        let main_source = module_source("src/main.w");
+        let duplicate = module_from_text(
+            main_source.clone(),
+            "%%start\nmath = namespace app \"src/first.w\";\nmath = namespace app \"src/second.w\";\n%%end",
+        );
+        let duplicate_bindings = vec![
+            match &duplicate.items[0] {
+                ScalarItem::Namespace(namespace) => ScalarNamespaceBinding {
+                    binding: namespace.binding.clone(),
+                    target: first_source.clone(),
+                    span: namespace.span,
+                },
+                _ => panic!("namespace item"),
+            },
+            match &duplicate.items[1] {
+                ScalarItem::Namespace(namespace) => ScalarNamespaceBinding {
+                    binding: namespace.binding.clone(),
+                    target: second_source.clone(),
+                    span: namespace.span,
+                },
+                _ => panic!("namespace item"),
+            },
+        ];
+        let second_span = duplicate_bindings[1].span;
+        let duplicate_result = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(main_source.clone(), duplicate.items, duplicate_bindings),
+                ScalarModule::new(
+                    first_source.clone(),
+                    module_from_text(first_source.clone(), "%%start\ni32 value = 1;\n%%end").items,
+                    Vec::new(),
+                ),
+                ScalarModule::new(
+                    second_source.clone(),
+                    module_from_text(second_source.clone(), "%%start\ni32 value = 2;\n%%end").items,
+                    Vec::new(),
+                ),
+            ],
+            vec![
+                main_source.clone(),
+                first_source.clone(),
+                second_source.clone(),
+            ],
+        ));
+        let diagnostics: Vec<_> = duplicate_result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "B0002")
+            .collect();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].labels[0].span.range, second_span);
+
+        let distinct = module_from_text(
+            main_source.clone(),
+            "%%start\nfirst = namespace app \"src/first.w\";\nsecond = namespace app \"src/second.w\";\n%%end",
+        );
+        let distinct_bindings = vec![
+            ScalarNamespaceBinding {
+                binding: "first".to_owned(),
+                target: first_source.clone(),
+                span: match &distinct.items[0] {
+                    ScalarItem::Namespace(namespace) => namespace.span,
+                    _ => panic!("namespace item"),
+                },
+            },
+            ScalarNamespaceBinding {
+                binding: "second".to_owned(),
+                target: second_source.clone(),
+                span: match &distinct.items[1] {
+                    ScalarItem::Namespace(namespace) => namespace.span,
+                    _ => panic!("namespace item"),
+                },
+            },
+        ];
+        let distinct_result = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(
+                main_source,
+                distinct.items,
+                distinct_bindings.clone(),
+            )],
+            Vec::new(),
+        ));
+        assert!(distinct_result.diagnostics.is_empty());
+        assert_eq!(
+            distinct_result.project.modules[0].namespace_bindings,
+            distinct_bindings
         );
     }
 
