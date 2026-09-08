@@ -8,7 +8,7 @@ i32(i32) value = fn(input) {
 };
 
 unit(i32) touch = fn(input) {
-	i32 ignored = value(input);
+	value(input);
 };
 
 bool observed = flag(42);

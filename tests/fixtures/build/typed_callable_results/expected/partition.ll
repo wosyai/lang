@@ -27,8 +27,6 @@ entry:
   store i32 %input, ptr %input1, align 4
   %input2 = load i32, ptr %input1, align 4
   %call = call i32 @value(i32 %input2)
-  %ignored = alloca i32, align 4
-  store i32 %call, ptr %ignored, align 4
   ret void
 }
 
