@@ -1,0 +1,5 @@
+{
+  "kind": "NamespaceDecl",
+  "span": { "start": 8, "end": 42 },
+  "text": "math = namespace app \"src/math.w\";"
+}

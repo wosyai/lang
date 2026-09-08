@@ -1,0 +1,12 @@
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[steps]]
+write = "src/math.w"
+contents = "%%start\ni32(i32, i32) add = fn(left, right) {\n\tleft + right + 1\n};\n%%end\n"
+
+[[assert]]
+command = ["wosy", "run", "app"]
+exit = 1
+stderr_contains = ["artifact manifest is stale"]

@@ -1,0 +1,5 @@
+{
+  "kind": "QualifiedCall",
+  "span": { "start": 56, "end": 64 },
+  "text": "math.add"
+}

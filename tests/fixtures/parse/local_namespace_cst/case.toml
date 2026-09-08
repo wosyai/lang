@@ -1,0 +1,15 @@
+[[steps]]
+command = ["wosy", "parse", "app"]
+exit = 0
+
+[[assert]]
+command = ["cat", ".wosy/cst/current.json"]
+exit = 0
+select = ["/root/children/0/children/2/children/0"]
+stdout = "expected/namespace.json"
+
+[[assert]]
+command = ["cat", ".wosy/cst/current.json"]
+exit = 0
+select = ["/root/children/0/children/4/children/0/children/6/children/0/children/0/children/0/children/0/children/0/children/0/children/0/children/0"]
+stdout = "expected/qualified.json"
