@@ -4,7 +4,7 @@ use inkwell::builder::{Builder, BuilderError};
 use inkwell::context::Context;
 use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue, ValueKind,
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, PointerValue, ValueKind,
 };
 use inkwell::IntPredicate;
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,7 @@ struct EmitState<'ctx> {
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
     values: BTreeMap<String, EmitValue<'ctx>>,
     storage: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
+    globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     next_block: usize,
 }
 
@@ -135,11 +136,18 @@ pub fn emit_scalar_project_llvm(
     let context = Context::create();
     let module = context.create_module(&module_name);
     let builder = context.create_builder();
+    let mut globals = BTreeMap::new();
     let mut functions = BTreeMap::new();
     let mut signatures = BTreeMap::new();
     let mut definitions = Vec::new();
     for source_module in &modules {
         for item in &source_module.items {
+            if let ScalarItem::Binding(binding) = item {
+                let name = project_global_name(&source_module.source, &binding.name);
+                let global =
+                    module.add_global(basic_type(&context, &binding.declared_type)?, None, &name);
+                globals.insert(name, (global, binding.declared_type.clone()));
+            }
             if let ScalarItem::Function(function) = item {
                 let name = project_function_name(&source_module.source, &function.name);
                 let value =
@@ -167,10 +175,11 @@ pub fn emit_scalar_project_llvm(
             function,
             source_module,
             &modules,
+            &globals,
             &name,
         )?;
     }
-    emit_project_main(&context, &builder, &functions, &modules)?;
+    emit_project_main(&context, &builder, &functions, &modules, &globals)?;
     finish_partition(module, module_name, functions, &signatures)
 }
 
@@ -295,6 +304,7 @@ fn emit_function<'ctx>(
         functions,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        globals: BTreeMap::new(),
         next_block: 0,
     };
     if let ScalarType::Callable { parameters, .. } = &function.signature {
@@ -336,6 +346,7 @@ fn emit_main<'ctx>(
         functions,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        globals: BTreeMap::new(),
         next_block: 0,
     };
     for item in items {
@@ -357,6 +368,7 @@ fn emit_project_function<'ctx>(
     function: &ScalarFunction,
     source_module: &ScalarModule,
     modules: &[&ScalarModule],
+    globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     name: &str,
 ) -> Result<(), String> {
     let value = *functions
@@ -369,6 +381,7 @@ fn emit_project_function<'ctx>(
         functions,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        globals: module_globals(source_module, globals),
         next_block: 0,
     };
     if let ScalarType::Callable { parameters, .. } = &function.signature {
@@ -399,6 +412,7 @@ fn emit_project_main<'ctx>(
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
     modules: &[&ScalarModule],
+    globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
 ) -> Result<(), String> {
     let main = *functions
         .get("main")
@@ -410,15 +424,26 @@ fn emit_project_main<'ctx>(
         functions,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        globals: BTreeMap::new(),
         next_block: 0,
     };
     for module in modules {
         state.values.clear();
+        state.globals = module_globals(module, globals);
         for node in &module.initialization_nodes {
             if let ScalarItem::Binding(binding) = &module.items[node.item_index] {
                 let value =
                     emit_project_expression(context, &mut state, &binding.value, module, modules)?;
-                state.values.insert(binding.name.clone(), value);
+                let value = take_basic(value)?;
+                let (global, _) = state
+                    .globals
+                    .get(&binding.name)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown LLVM global {}", binding.name))?;
+                state
+                    .builder
+                    .build_store(global.as_pointer_value(), value)
+                    .map_err(builder_error)?;
             }
         }
     }
@@ -657,6 +682,14 @@ fn emit_expression<'ctx>(
                     state
                         .builder
                         .build_load(basic_type(context, &ty)?, slot, name)
+                        .map_err(builder_error)?,
+                ));
+            }
+            if let Some((global, ty)) = state.globals.get(name).cloned() {
+                return Ok(EmitValue::Basic(
+                    state
+                        .builder
+                        .build_load(basic_type(context, &ty)?, global.as_pointer_value(), name)
                         .map_err(builder_error)?,
                 ));
             }
@@ -1027,10 +1060,34 @@ fn project_function_name(source: &wosy_syntax::SourceIdentity, name: &str) -> St
         .collect()
 }
 
+fn project_global_name(source: &wosy_syntax::SourceIdentity, name: &str) -> String {
+    project_function_name(source, &format!("global_{name}"))
+}
+
+fn module_globals<'ctx>(
+    module: &ScalarModule,
+    globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
+) -> BTreeMap<String, (GlobalValue<'ctx>, ScalarType)> {
+    module
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarItem::Binding(binding) => globals
+                .get(&project_global_name(&module.source, &binding.name))
+                .cloned()
+                .map(|global| (binding.name.clone(), global)),
+            ScalarItem::Namespace(_) | ScalarItem::Function(_) => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::emit_scalar_llvm;
-    use crate::{derive_scalar_program, parse_source};
+    use super::emit_scalar_project_llvm;
+    use crate::{
+        derive_scalar_program, parse_source, validate_scalar_project, ScalarModule, ScalarProject,
+    };
     use wosy_syntax::SourceIdentity;
 
     #[test]
@@ -1052,5 +1109,36 @@ mod tests {
         assert!(text.contains("call i1 @flag"));
         assert!(text.contains("call void @touch"));
         assert!(text.contains("call i32 @count"));
+    }
+
+    #[test]
+    fn emits_project_binding_store_and_function_load() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let parsed = parse_source(
+            source.clone(),
+            "%%start\ni32 count = 41;\ni32() read = fn { count + 1 };\n%%end".into(),
+            &[],
+        );
+        let program = derive_scalar_program(&parsed.result).program;
+        let project = ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        );
+        let validation = validate_scalar_project(project);
+        let text = emit_scalar_project_llvm(&validation)
+            .expect("LLVM")
+            .to_text();
+        let main = text.split("define i32 @main").nth(1).expect("main");
+        let read = text
+            .split("define i32 @package__src_main_w__read")
+            .nth(1)
+            .expect("read");
+        assert!(main.contains("store i32 41"));
+        assert!(read.contains("load i32, ptr"));
     }
 }
