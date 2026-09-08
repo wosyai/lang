@@ -1,0 +1,9 @@
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "build", "app"]
+exit = 0
+file = ".wosy/artifacts/app/dev/main/partition.ll"
+contents = "expected/partition.ll"
