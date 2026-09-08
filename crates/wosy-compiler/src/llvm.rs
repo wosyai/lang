@@ -4,8 +4,9 @@ use std::fmt::Write;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BinaryOperator, ScalarBlock, ScalarExpression, ScalarFunction, ScalarItem, ScalarModule,
-    ScalarProjectValidation, ScalarType, ScalarValidation,
+    BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarExpression,
+    ScalarFunction, ScalarItem, ScalarModule, ScalarProjectValidation, ScalarType,
+    ScalarValidation,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -175,10 +176,9 @@ fn emit_project_function(
         .map(|(name, _)| (name.clone(), format!("%{name}")))
         .collect();
     let mut state = EmitState::new(names, BTreeMap::new());
+    state.initialize_parameters(&signature.parameters);
     let value = emit_project_block(&function.body, &mut state, module, modules)?;
-    state
-        .body
-        .push_str(&format!("  ret {} {}\n", llvm_type(value.1), value.0));
+    append_return(&mut state, value, signature.result)?;
     Ok(LlvmFunction {
         body: state.body,
         ..signature
@@ -216,12 +216,77 @@ fn emit_project_block(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<(String, LlvmValueType), String> {
-    block
-        .expressions
-        .last()
-        .map_or(Ok(("0".to_owned(), LlvmValueType::I32)), |expression| {
-            emit_project_expression(expression, state, module, modules)
-        })
+    let storage = state.storage.clone();
+    let mut result = ("0".to_owned(), LlvmValueType::Void);
+    for item in &block.items {
+        result = match item {
+            ScalarBlockItem::LocalBinding(binding) => {
+                let value = emit_project_expression(&binding.value, state, module, modules)?;
+                let slot = state.allocate(&binding.name, value_type(&binding.declared_type)?);
+                state.body.push_str(&format!(
+                    "  store {} {}, ptr {}\n",
+                    llvm_type(value.1),
+                    value.0,
+                    slot
+                ));
+                ("0".to_owned(), LlvmValueType::Void)
+            }
+            ScalarBlockItem::Expression(expression) => {
+                emit_project_expression(expression, state, module, modules)?
+            }
+            ScalarBlockItem::Assignment(assignment) => {
+                emit_project_assignment(assignment, state, module, modules)?
+            }
+            ScalarBlockItem::While(while_expression) => {
+                let condition_label = state.block("while.cond");
+                let body_label = state.block("while.body");
+                let exit_label = state.block("while.exit");
+                state.body.push_str(&format!(
+                    "  br label %{condition_label}\n\n{condition_label}:\n"
+                ));
+                let condition =
+                    emit_project_expression(&while_expression.condition, state, module, modules)?;
+                state.body.push_str(&format!(
+                    "  br i1 {}, label %{body_label}, label %{exit_label}\n\n{body_label}:\n",
+                    condition.0
+                ));
+                let _ = emit_project_block(&while_expression.body, state, module, modules)?;
+                state
+                    .body
+                    .push_str(&format!("  br label %{condition_label}\n\n{exit_label}:\n"));
+                ("0".to_owned(), LlvmValueType::Void)
+            }
+        };
+    }
+    state.storage = storage;
+    Ok(result)
+}
+
+fn emit_project_assignment(
+    assignment: &ScalarAssignment,
+    state: &mut EmitState,
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<(String, LlvmValueType), String> {
+    let value = emit_project_expression(&assignment.value, state, module, modules)?;
+    let (slot, value_type) = state
+        .storage
+        .get(&assignment.target)
+        .cloned()
+        .ok_or_else(|| format!("unknown LLVM storage {}", assignment.target))?;
+    let old = state.value();
+    state.body.push_str(&format!(
+        "  {old} = load {} , ptr {}\n",
+        llvm_type(value_type),
+        slot
+    ));
+    state.body.push_str(&format!(
+        "  store {} {}, ptr {}\n",
+        llvm_type(value_type),
+        value.0,
+        slot
+    ));
+    Ok((old, value_type))
 }
 
 fn emit_project_expression(
@@ -343,14 +408,24 @@ fn emit_project_expression(
         }
         ScalarExpression::Block(block) => emit_project_block(block, state, module, modules),
         ScalarExpression::Name { name, .. } => state
-            .values
+            .storage
             .get(name)
             .cloned()
+            .map(|(slot, value_type)| {
+                let result = state.value();
+                state.body.push_str(&format!(
+                    "  {result} = load {}, ptr {slot}\n",
+                    llvm_type(value_type)
+                ));
+                (result, value_type)
+            })
             .or_else(|| {
-                state
-                    .names
-                    .get(name)
-                    .map(|value| (value.clone(), LlvmValueType::I32))
+                state.values.get(name).cloned().or_else(|| {
+                    state
+                        .names
+                        .get(name)
+                        .map(|value| (value.clone(), LlvmValueType::I32))
+                })
             })
             .ok_or_else(|| format!("unknown LLVM value {name}")),
         ScalarExpression::Integer { value, .. } => Ok((value.to_string(), LlvmValueType::I32)),
@@ -390,10 +465,9 @@ fn emit_function(function: &ScalarFunction) -> Result<LlvmFunction, String> {
         llvm_parameters.push((name, value_type));
     }
     let mut state = EmitState::new(names, BTreeMap::new());
+    state.initialize_parameters(&llvm_parameters);
     let value = emit_block(&function.body, &mut state)?;
-    state
-        .body
-        .push_str(&format!("  ret {} {}\n", llvm_type(value.1), value.0));
+    append_return(&mut state, value, value_type(result)?)?;
     Ok(LlvmFunction {
         name: function.name.clone(),
         result: value_type(result)?,
@@ -422,6 +496,7 @@ fn emit_main(items: &[ScalarItem]) -> Result<LlvmFunction, String> {
 struct EmitState {
     names: BTreeMap<String, String>,
     values: BTreeMap<String, (String, LlvmValueType)>,
+    storage: BTreeMap<String, (String, LlvmValueType)>,
     body: String,
     next_value: usize,
     next_block: usize,
@@ -435,6 +510,7 @@ impl EmitState {
         Self {
             names,
             values,
+            storage: BTreeMap::new(),
             body: "entry:\n".to_owned(),
             next_value: 0,
             next_block: 0,
@@ -447,6 +523,27 @@ impl EmitState {
         value
     }
 
+    fn allocate(&mut self, name: &str, value_type: LlvmValueType) -> String {
+        let slot = self.value();
+        self.body
+            .push_str(&format!("  {slot} = alloca {}\n", llvm_type(value_type)));
+        self.storage
+            .insert(name.to_owned(), (slot.clone(), value_type));
+        slot
+    }
+
+    fn initialize_parameters(&mut self, parameters: &[(String, LlvmValueType)]) {
+        for (name, value_type) in parameters {
+            let slot = self.allocate(name, *value_type);
+            self.body.push_str(&format!(
+                "  store {} %{}, ptr {}\n",
+                llvm_type(*value_type),
+                name,
+                slot
+            ));
+        }
+    }
+
     fn block(&mut self, prefix: &str) -> String {
         let block = format!("{}.{}", prefix, self.next_block);
         self.next_block += 1;
@@ -454,16 +551,95 @@ impl EmitState {
     }
 }
 
+fn append_return(
+    state: &mut EmitState,
+    value: (String, LlvmValueType),
+    result: LlvmValueType,
+) -> Result<(), String> {
+    if result == LlvmValueType::Void {
+        state.body.push_str("  ret void\n");
+        return Ok(());
+    }
+    if value.1 != result {
+        return Err(format!(
+            "LLVM block result {} does not match function result {}",
+            llvm_type(value.1),
+            llvm_type(result)
+        ));
+    }
+    state
+        .body
+        .push_str(&format!("  ret {} {}\n", llvm_type(result), value.0));
+    Ok(())
+}
+
 fn emit_block(
     block: &ScalarBlock,
     state: &mut EmitState,
 ) -> Result<(String, LlvmValueType), String> {
-    block
-        .expressions
-        .last()
-        .map_or(Ok(("0".to_owned(), LlvmValueType::I32)), |expression| {
-            emit_expression(expression, state)
-        })
+    let storage = state.storage.clone();
+    let mut result = ("0".to_owned(), LlvmValueType::Void);
+    for item in &block.items {
+        result = match item {
+            ScalarBlockItem::LocalBinding(binding) => {
+                let value = emit_expression(&binding.value, state)?;
+                let slot = state.allocate(&binding.name, value_type(&binding.declared_type)?);
+                state.body.push_str(&format!(
+                    "  store {} {}, ptr {}\n",
+                    llvm_type(value.1),
+                    value.0,
+                    slot
+                ));
+                ("0".to_owned(), LlvmValueType::Void)
+            }
+            ScalarBlockItem::Expression(expression) => emit_expression(expression, state)?,
+            ScalarBlockItem::Assignment(assignment) => emit_assignment(assignment, state)?,
+            ScalarBlockItem::While(while_expression) => {
+                let condition_label = state.block("while.cond");
+                let body_label = state.block("while.body");
+                let exit_label = state.block("while.exit");
+                state.body.push_str(&format!(
+                    "  br label %{condition_label}\n\n{condition_label}:\n"
+                ));
+                let condition = emit_expression(&while_expression.condition, state)?;
+                state.body.push_str(&format!(
+                    "  br i1 {}, label %{body_label}, label %{exit_label}\n\n{body_label}:\n",
+                    condition.0
+                ));
+                let _ = emit_block(&while_expression.body, state)?;
+                state
+                    .body
+                    .push_str(&format!("  br label %{condition_label}\n\n{exit_label}:\n"));
+                ("0".to_owned(), LlvmValueType::Void)
+            }
+        };
+    }
+    state.storage = storage;
+    Ok(result)
+}
+
+fn emit_assignment(
+    assignment: &ScalarAssignment,
+    state: &mut EmitState,
+) -> Result<(String, LlvmValueType), String> {
+    let value = emit_expression(&assignment.value, state)?;
+    let (slot, value_type) = state
+        .storage
+        .get(&assignment.target)
+        .cloned()
+        .ok_or_else(|| format!("unknown LLVM storage {}", assignment.target))?;
+    let old = state.value();
+    state.body.push_str(&format!(
+        "  {old} = load {}, ptr {slot}\n",
+        llvm_type(value_type)
+    ));
+    state.body.push_str(&format!(
+        "  store {} {}, ptr {}\n",
+        llvm_type(value_type),
+        value.0,
+        slot
+    ));
+    Ok((old, value_type))
 }
 
 fn emit_expression(
@@ -472,14 +648,24 @@ fn emit_expression(
 ) -> Result<(String, LlvmValueType), String> {
     match expression {
         ScalarExpression::Name { name, .. } => state
-            .values
+            .storage
             .get(name)
             .cloned()
+            .map(|(slot, value_type)| {
+                let result = state.value();
+                state.body.push_str(&format!(
+                    "  {result} = load {}, ptr {slot}\n",
+                    llvm_type(value_type)
+                ));
+                (result, value_type)
+            })
             .or_else(|| {
-                state
-                    .names
-                    .get(name)
-                    .map(|value| (value.clone(), LlvmValueType::I32))
+                state.values.get(name).cloned().or_else(|| {
+                    state
+                        .names
+                        .get(name)
+                        .map(|value| (value.clone(), LlvmValueType::I32))
+                })
             })
             .ok_or_else(|| format!("unknown LLVM value {name}")),
         ScalarExpression::Integer { value, .. } => Ok((value.to_string(), LlvmValueType::I32)),
@@ -659,6 +845,62 @@ mod tests {
         assert!(output.is_file());
         let result = Command::new(&output).status().expect("native artifact");
         assert_eq!(result.code(), Some(0));
+        fs::remove_dir_all(directory).expect("temporary directory cleanup");
+    }
+
+    #[test]
+    fn emits_typed_direct_block_while_in_source_order() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let parsed = parse_source(
+            source,
+            "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t}\n\tvalue\n};\n\ni32 result = loop(0);\n%%end"
+                .to_owned(),
+            &[],
+        );
+        let validation = derive_scalar_program(&parsed.result);
+        let partition = emit_scalar_llvm(&validation).expect("valid scalar LLVM");
+        let function = partition
+            .functions
+            .iter()
+            .find(|function| function.name == "loop")
+            .expect("loop function");
+        let body = &function.body;
+        let condition = body.find("while.cond.0:").expect("condition block");
+        let loop_body = body.find("while.body.1:").expect("body block");
+        let exit = body.find("while.exit.2:").expect("exit block");
+        assert!(condition < loop_body && loop_body < exit);
+        assert!(body.contains("alloca i32"));
+        assert!(body.contains("load i32, ptr"));
+        assert!(body.contains("store i32"));
+        assert!(body.contains("br label %while.cond.0"));
+        assert!(body.matches("br label %while.cond.0").count() >= 2);
+
+        let directory =
+            std::env::temp_dir().join(format!("wosy-llvm-while-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("temporary directory");
+        let input = directory.join("partition.ll");
+        let output = directory.join("main");
+        fs::write(&input, partition.to_text()).expect("LLVM text");
+        let status = Command::new("/usr/bin/clang")
+            .args(["-x", "ir"])
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .status()
+            .expect("clang");
+        assert!(status.success());
+        assert_eq!(
+            Command::new(&output)
+                .status()
+                .expect("native artifact")
+                .code(),
+            Some(0)
+        );
         fs::remove_dir_all(directory).expect("temporary directory cleanup");
     }
 
