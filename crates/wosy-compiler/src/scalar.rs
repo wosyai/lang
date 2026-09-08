@@ -83,6 +83,7 @@ pub enum ScalarExpression {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarBlock {
     pub items: Vec<ScalarBlockItem>,
+    pub terminated_items: Vec<bool>,
     pub expressions: Vec<ScalarExpression>,
     pub span: ByteSpan,
 }
@@ -410,8 +411,11 @@ fn block_type_in_module(
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut result = ScalarType::Unit;
-    for item in &block.items {
+    for (index, item) in block.items.iter().enumerate() {
         result = block_item_type_in_module(item, &mut scope, module, modules, diagnostics);
+        if index + 1 == block.items.len() && block.terminated_items[index] {
+            result = ScalarType::Unit;
+        }
     }
     result
 }
@@ -922,6 +926,19 @@ fn derive_block(node: &CstNode) -> ScalarBlock {
         .filter(|child| child.kind() == SyntaxKind::BlockItem)
         .map(|item| derive_block_item(&item))
         .collect();
+    let terminated_items = node
+        .children()
+        .filter(|child| child.kind() == SyntaxKind::BlockItem)
+        .map(|item| {
+            item.children_with_tokens().any(|element| {
+                matches!(
+                    element,
+                    NodeOrToken::Token(token)
+                        if token.kind() == SyntaxKind::Punctuation && token.text() == ";"
+                )
+            })
+        })
+        .collect();
     let expressions = items
         .iter()
         .filter_map(|item| match item {
@@ -931,6 +948,7 @@ fn derive_block(node: &CstNode) -> ScalarBlock {
         .collect();
     ScalarBlock {
         items,
+        terminated_items,
         expressions,
         span: wosy_syntax::byte_span(node),
     }
@@ -1291,8 +1309,11 @@ fn block_type(
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut result = ScalarType::Unit;
-    for item in &block.items {
+    for (index, item) in block.items.iter().enumerate() {
         result = block_item_type(item, &mut scope, program, diagnostics);
+        if index + 1 == block.items.len() && block.terminated_items[index] {
+            result = ScalarType::Unit;
+        }
     }
     result
 }
@@ -1547,6 +1568,54 @@ mod tests {
         assert_eq!(result.program.items.len(), 5);
         assert!(matches!(result.program.items[0], ScalarItem::Function(_)));
         assert!(matches!(result.program.items[4], ScalarItem::Binding(_)));
+    }
+
+    #[test]
+    fn terminated_final_expression_is_unit_in_program_and_project_blocks() {
+        let invalid = validate_text("%%start\ni32() f = fn { 1; };\n%%end");
+        assert!(invalid
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"));
+        let ScalarItem::Function(function) = &invalid.program.items[0] else {
+            panic!("function item");
+        };
+        assert_eq!(function.body.terminated_items, vec![true]);
+
+        let valid = validate_text("%%start\ni32() f = fn { 1 };\n%%end");
+        assert!(
+            valid.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            valid.diagnostics
+        );
+        let ScalarItem::Function(function) = &valid.program.items[0] else {
+            panic!("function item");
+        };
+        assert_eq!(function.body.terminated_items, vec![false]);
+
+        let source = module_source("src/main.w");
+        let invalid_project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(
+                source.clone(),
+                invalid.program.items,
+                Vec::new(),
+            )],
+            vec![source.clone()],
+        ));
+        assert!(invalid_project
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"));
+
+        let valid_project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(
+                source.clone(),
+                valid.program.items,
+                Vec::new(),
+            )],
+            vec![source],
+        ));
+        assert!(valid_project.diagnostics.is_empty());
     }
 
     #[test]
