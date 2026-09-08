@@ -27,16 +27,18 @@ local_binding = { type_spec ~ identifier ~ "=" ~ expression ~ ";" }
 expression = { if_expr | assignment | logical_or }
 if_expr = { "if" ~ "(" ~ expression ~ ")" ~ block ~ "else" ~ block }
 while_expr = { "while" ~ "(" ~ expression ~ ")" ~ block }
-assignment = { identifier ~ "=" ~ expression }
+assignment = { assignment_target ~ "=" ~ expression }
+assignment_target = { qualified_member | identifier }
 logical_or = { logical_and ~ (or_operator ~ logical_and)* }
 logical_and = { comparison ~ (and_operator ~ comparison)* }
 comparison = { additive ~ (comparison_operator ~ additive)* }
 additive = { multiplicative ~ (add_operator ~ multiplicative)* }
 multiplicative = { primary ~ (multiply_operator ~ primary)* }
-primary = { call | boolean | identifier | integer | parenthesized }
+primary = { call | qualified_member | boolean | identifier | integer | parenthesized }
 parenthesized = { "(" ~ expression ~ ")" }
 call = { qualified_call ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 qualified_call = { identifier ~ ("." ~ identifier)? }
+qualified_member = { identifier ~ "." ~ identifier }
 or_operator = { "||" }
 and_operator = { "&&" }
 comparison_operator = { "==" | "!=" | "<=" | ">=" | "<" | ">" }

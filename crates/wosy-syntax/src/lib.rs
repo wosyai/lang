@@ -42,6 +42,8 @@ pub enum SyntaxKind {
     Punctuation,
     NamespaceDecl,
     QualifiedCall,
+    QualifiedMember,
+    AssignmentTarget,
     LocalBinding,
     While,
     Assignment,
@@ -88,10 +90,12 @@ impl Language for WosyLanguage {
             29 => SyntaxKind::Punctuation,
             30 => SyntaxKind::NamespaceDecl,
             31 => SyntaxKind::QualifiedCall,
-            32 => SyntaxKind::LocalBinding,
-            33 => SyntaxKind::While,
-            34 => SyntaxKind::Assignment,
-            35 => SyntaxKind::TopLevelItem,
+            32 => SyntaxKind::QualifiedMember,
+            33 => SyntaxKind::AssignmentTarget,
+            34 => SyntaxKind::LocalBinding,
+            35 => SyntaxKind::While,
+            36 => SyntaxKind::Assignment,
+            37 => SyntaxKind::TopLevelItem,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -478,6 +482,8 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::expression => SyntaxKind::Expression,
         Rule::call => SyntaxKind::Call,
         Rule::qualified_call => SyntaxKind::QualifiedCall,
+        Rule::qualified_member => SyntaxKind::QualifiedMember,
+        Rule::assignment_target => SyntaxKind::AssignmentTarget,
         Rule::if_expr => SyntaxKind::IfExpr,
         Rule::while_expr => SyntaxKind::While,
         Rule::assignment => SyntaxKind::Assignment,
@@ -624,6 +630,30 @@ mod tests {
         assert!(call
             .children()
             .any(|node| node.kind() == SyntaxKind::QualifiedCall));
+    }
+
+    #[test]
+    fn qualified_member_read_and_assignment_are_structural_and_lossless() {
+        let text = "%%start\nmath = namespace app \"src/math.w\";\ni32 result = math.value;\nmath.value = result;\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid());
+        assert_eq!(result.reconstruct(), text);
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::QualifiedMember));
+        let assignment = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::Assignment)
+            .expect("qualified assignment");
+        assert_eq!(byte_span(&assignment), ByteSpan::new(68, 87));
+        assert!(assignment.descendants().any(|node| {
+            node.kind() == SyntaxKind::AssignmentTarget
+                && node
+                    .children()
+                    .any(|child| child.kind() == SyntaxKind::QualifiedMember)
+        }));
     }
 
     #[test]

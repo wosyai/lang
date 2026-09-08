@@ -42,6 +42,13 @@ pub enum ScalarExpression {
         name: String,
         span: ByteSpan,
     },
+    Member {
+        receiver: String,
+        name: String,
+        receiver_span: ByteSpan,
+        name_span: ByteSpan,
+        span: ByteSpan,
+    },
     Integer {
         value: i32,
         span: ByteSpan,
@@ -90,7 +97,9 @@ pub enum ScalarBlockItem {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarAssignment {
+    pub receiver: Option<String>,
     pub target: String,
+    pub receiver_span: Option<ByteSpan>,
     pub target_span: ByteSpan,
     pub value: ScalarExpression,
     pub span: ByteSpan,
@@ -448,7 +457,50 @@ fn assignment_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
     let actual = expression_type_in_module(&assignment.value, scope, module, modules, diagnostics);
-    let Some(expected) = scope.get(&assignment.target) else {
+    let expected = match &assignment.receiver {
+        None => scope.get(&assignment.target),
+        Some(receiver) => {
+            let Some(namespace) = module
+                .namespace_bindings
+                .iter()
+                .find(|namespace| namespace.binding == *receiver)
+            else {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0001",
+                    "unknown assignment target",
+                    assignment
+                        .receiver_span
+                        .expect("qualified assignment receiver span"),
+                ));
+                return ScalarType::Unit;
+            };
+            let Some(target) = modules
+                .iter()
+                .find(|candidate| candidate.source == namespace.target)
+            else {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0001",
+                    "unknown assignment target",
+                    assignment
+                        .receiver_span
+                        .expect("qualified assignment receiver span"),
+                ));
+                return ScalarType::Unit;
+            };
+            let Some(expected) = target.members.get(&assignment.target) else {
+                diagnostics.push(unknown_member_diagnostic(
+                    module,
+                    assignment.target_span,
+                    &target.source,
+                ));
+                return ScalarType::Unit;
+            };
+            Some(expected)
+        }
+    };
+    let Some(expected) = expected else {
         diagnostics.push(module_diagnostic(
             module,
             "B0001",
@@ -499,6 +551,38 @@ fn expression_type_in_module(
             diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
             ScalarType::Unit
         }),
+        ScalarExpression::Member {
+            receiver,
+            name,
+            name_span,
+            span,
+            ..
+        } => {
+            let Some(namespace) = module
+                .namespace_bindings
+                .iter()
+                .find(|namespace| namespace.binding == *receiver)
+            else {
+                diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
+                return ScalarType::Unit;
+            };
+            let Some(target) = modules
+                .iter()
+                .find(|candidate| candidate.source == namespace.target)
+            else {
+                diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
+                return ScalarType::Unit;
+            };
+            let Some(member) = target.members.get(name) else {
+                diagnostics.push(unknown_member_diagnostic(
+                    module,
+                    *name_span,
+                    &target.source,
+                ));
+                return ScalarType::Unit;
+            };
+            member.clone()
+        }
         ScalarExpression::Integer { .. } => ScalarType::I32,
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
         ScalarExpression::Binary {
@@ -888,14 +972,27 @@ fn derive_executable_item(node: &CstNode) -> ScalarBlockItem {
 }
 
 fn derive_assignment(node: &CstNode) -> ScalarAssignment {
-    let target = direct_token(node, SyntaxKind::Identifier).expect("assignment target");
+    let target_node = direct_nodes(node)
+        .into_iter()
+        .find(|child| child.kind() == SyntaxKind::AssignmentTarget)
+        .expect("assignment target node");
+    let identifiers: Vec<CstToken> = target_node
+        .descendants_with_tokens()
+        .filter_map(|element| match element {
+            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => Some(token),
+            _ => None,
+        })
+        .collect();
+    let target = identifiers.last().expect("assignment target name");
     let value = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::Expression)
         .map(|child| derive_expression(&child))
         .expect("assignment value");
     ScalarAssignment {
+        receiver: (identifiers.len() == 2).then(|| identifiers[0].text().to_owned()),
         target: target.text().to_owned(),
+        receiver_span: (identifiers.len() == 2).then(|| token_span(&identifiers[0])),
         target_span: token_span(&target),
         value,
         span: wosy_syntax::byte_span(node),
@@ -984,6 +1081,24 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 span: wosy_syntax::byte_span(&actual),
             }
         }
+        SyntaxKind::QualifiedMember => {
+            let identifiers: Vec<CstToken> = actual
+                .children_with_tokens()
+                .filter_map(|element| match element {
+                    NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => {
+                        Some(token)
+                    }
+                    _ => None,
+                })
+                .collect();
+            ScalarExpression::Member {
+                receiver: identifiers[0].text().to_owned(),
+                name: identifiers[1].text().to_owned(),
+                receiver_span: token_span(&identifiers[0]),
+                name_span: token_span(&identifiers[1]),
+                span: wosy_syntax::byte_span(&actual),
+            }
+        }
         SyntaxKind::Parenthesized => derive_expression(&direct_nodes(&actual)[0]),
         SyntaxKind::Expression => derive_element(&semantic_children(&actual)[0]),
         _ => derive_element(&semantic_children(&actual)[0]),
@@ -1054,6 +1169,7 @@ fn token_span(token: &CstToken) -> ByteSpan {
 fn span_of(expression: &ScalarExpression) -> ByteSpan {
     match expression {
         ScalarExpression::Name { span, .. }
+        | ScalarExpression::Member { span, .. }
         | ScalarExpression::Integer { span, .. }
         | ScalarExpression::Boolean { span, .. }
         | ScalarExpression::Binary { span, .. }
@@ -1262,6 +1378,10 @@ fn expression_type(
             diagnostics.push(diagnostic(program, "B0001", "unknown name", *span));
             ScalarType::Unit
         }),
+        ScalarExpression::Member { span, .. } => {
+            diagnostics.push(diagnostic(program, "B0001", "unknown name", *span));
+            ScalarType::Unit
+        }
         ScalarExpression::Integer { .. } => ScalarType::I32,
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
         ScalarExpression::Binary {
@@ -1702,6 +1822,106 @@ mod tests {
         assert_eq!(diagnostic.labels[0].span.source, main_source);
         assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(61, 64));
         assert_eq!(diagnostic.labels[1].span.source, math_source);
+    }
+
+    #[test]
+    fn resolves_qualified_member_read_and_assignment_through_bound_module() {
+        let math_source = module_source("src/math.w");
+        let math = module_from_text(math_source.clone(), "%%start\ni32 value = 1;\n%%end");
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nmath = namespace app \"src/math.w\";\ni32 result = math.value;\nmath.value = result;\n%%end",
+        );
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let read = match &main.items[1] {
+            ScalarItem::Binding(binding) => &binding.value,
+            _ => panic!("result binding"),
+        };
+        let ScalarExpression::Member {
+            receiver,
+            name,
+            receiver_span,
+            name_span,
+            span,
+        } = read
+        else {
+            panic!("qualified member read");
+        };
+        assert_eq!(receiver, "math");
+        assert_eq!(name, "value");
+        assert_eq!(*receiver_span, ByteSpan::new(56, 60));
+        assert_eq!(*name_span, ByteSpan::new(61, 66));
+        assert_eq!(*span, ByteSpan::new(56, 66));
+        let ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) = &main.items[2] else {
+            panic!("qualified member assignment");
+        };
+        assert_eq!(assignment.receiver.as_deref(), Some("math"));
+        assert_eq!(assignment.target, "value");
+        assert_eq!(assignment.receiver_span, Some(ByteSpan::new(68, 72)));
+        assert_eq!(assignment.target_span, ByteSpan::new(73, 78));
+        let result = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source.clone(),
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "math".to_owned(),
+                        target: math_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(math_source, math.items, Vec::new()),
+            ],
+            Vec::new(),
+        ));
+        assert!(
+            result.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn reports_unknown_qualified_member_read_and_assignment_at_member_span() {
+        let math_source = module_source("src/math.w");
+        let math = module_from_text(math_source.clone(), "%%start\ni32 value = 1;\n%%end");
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nmath = namespace app \"src/math.w\";\ni32 result = math.missing;\nmath.missing = result;\n%%end",
+        );
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let result = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source.clone(),
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "math".to_owned(),
+                        target: math_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(math_source.clone(), math.items, Vec::new()),
+            ],
+            Vec::new(),
+        ));
+        let diagnostics: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "M0002")
+            .collect();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].labels[0].span.range, ByteSpan::new(61, 68));
+        assert_eq!(diagnostics[1].labels[0].span.range, ByteSpan::new(75, 82));
+        assert_eq!(diagnostics[0].labels[1].span.source, math_source);
     }
 
     #[test]

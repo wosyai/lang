@@ -52,6 +52,7 @@ struct EmitState<'ctx> {
     values: BTreeMap<String, EmitValue<'ctx>>,
     storage: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
     globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
+    all_globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     next_block: usize,
 }
 
@@ -342,6 +343,7 @@ fn emit_function<'ctx>(
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         globals: globals.clone(),
+        all_globals: globals.clone(),
         next_block: 0,
     };
     if let ScalarType::Callable { parameters, .. } = &function.signature {
@@ -385,6 +387,7 @@ fn emit_main<'ctx>(
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         globals: globals.clone(),
+        all_globals: globals.clone(),
         next_block: 0,
     };
     for item in items {
@@ -437,6 +440,7 @@ fn emit_project_function<'ctx>(
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         globals: module_globals(source_module, globals),
+        all_globals: globals.clone(),
         next_block: 0,
     };
     if let ScalarType::Callable { parameters, .. } = &function.signature {
@@ -480,6 +484,7 @@ fn emit_project_main<'ctx>(
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         globals: BTreeMap::new(),
+        all_globals: globals.clone(),
         next_block: 0,
     };
     let root = modules
@@ -642,7 +647,13 @@ fn emit_assignment<'ctx>(
     assignment: &ScalarAssignment,
 ) -> Result<EmitValue<'ctx>, String> {
     let value = take_basic(emit_expression(context, state, &assignment.value)?)?;
-    let old = if let Some((slot, ty)) = state.storage.get(&assignment.target).cloned() {
+    let old = if assignment.receiver.is_some() {
+        return Err(format!(
+            "unknown LLVM storage {}.{}",
+            assignment.receiver.as_deref().expect("assignment receiver"),
+            assignment.target
+        ));
+    } else if let Some((slot, ty)) = state.storage.get(&assignment.target).cloned() {
         let old = state
             .builder
             .build_load(basic_type(context, &ty)?, slot, "old")
@@ -682,7 +693,20 @@ fn emit_project_assignment<'ctx>(
         module,
         modules,
     )?)?;
-    let old = if let Some((slot, ty)) = state.storage.get(&assignment.target).cloned() {
+    let old = if let Some(receiver) = &assignment.receiver {
+        let target = project_namespace_target(module, modules, receiver)?;
+        let (global, ty) = project_member_global(state, target, &assignment.target)?;
+        let slot = global.as_pointer_value();
+        let old = state
+            .builder
+            .build_load(basic_type(context, &ty)?, slot, "old")
+            .map_err(builder_error)?;
+        state
+            .builder
+            .build_store(slot, value)
+            .map_err(builder_error)?;
+        old
+    } else if let Some((slot, ty)) = state.storage.get(&assignment.target).cloned() {
         let old = state
             .builder
             .build_load(basic_type(context, &ty)?, slot, "old")
@@ -892,6 +916,9 @@ fn emit_expression<'ctx>(
                 .cloned()
                 .ok_or_else(|| format!("unknown LLVM value {name}"))
         }
+        ScalarExpression::Member { receiver, name, .. } => {
+            Err(format!("unknown LLVM member {receiver}.{name}"))
+        }
         ScalarExpression::Integer { value, .. } => Ok(EmitValue::Basic(
             context.i32_type().const_int(*value as u64, true).into(),
         )),
@@ -928,6 +955,16 @@ fn emit_project_expression<'ctx>(
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::Member { receiver, name, .. } => {
+            let target = project_namespace_target(module, modules, receiver)?;
+            let (global, ty) = project_member_global(state, target, name)?;
+            Ok(EmitValue::Basic(
+                state
+                    .builder
+                    .build_load(basic_type(context, &ty)?, global.as_pointer_value(), name)
+                    .map_err(builder_error)?,
+            ))
+        }
         ScalarExpression::Call {
             receiver,
             name,
@@ -1261,6 +1298,44 @@ fn project_global_name(source: &wosy_syntax::SourceIdentity, name: &str) -> Stri
     project_function_name(source, &format!("global_{name}"))
 }
 
+fn project_namespace_target<'a>(
+    module: &'a ScalarModule,
+    modules: &'a [&ScalarModule],
+    receiver: &str,
+) -> Result<&'a ScalarModule, String> {
+    let namespace = module
+        .namespace_bindings
+        .iter()
+        .find(|namespace| namespace.binding == receiver)
+        .ok_or_else(|| format!("unknown namespace binding {receiver}"))?;
+    modules
+        .iter()
+        .find(|candidate| candidate.source == namespace.target)
+        .copied()
+        .ok_or_else(|| format!("missing namespace target {}", namespace.target.path))
+}
+
+fn project_member_global<'ctx>(
+    state: &EmitState<'ctx>,
+    target: &ScalarModule,
+    name: &str,
+) -> Result<(GlobalValue<'ctx>, ScalarType), String> {
+    let binding = target.items.iter().find_map(|item| match item {
+        ScalarItem::Binding(binding) if binding.name == name => Some(binding),
+        ScalarItem::Binding(_)
+        | ScalarItem::Namespace(_)
+        | ScalarItem::Function(_)
+        | ScalarItem::Executable(_) => None,
+    });
+    let binding = binding.ok_or_else(|| format!("unknown LLVM member {name}"))?;
+    let (global, _) = state
+        .all_globals
+        .get(&project_global_name(&target.source, name))
+        .cloned()
+        .ok_or_else(|| format!("unknown LLVM member storage {name}"))?;
+    Ok((global, binding.declared_type.clone()))
+}
+
 fn module_globals<'ctx>(
     module: &ScalarModule,
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
@@ -1509,5 +1584,142 @@ mod tests {
         assert_ne!(first_name, second_name);
         assert!(text.contains(&format!("define i32 @{first_name}")));
         assert!(text.contains(&format!("define i32 @{second_name}")));
+    }
+
+    #[test]
+    fn emits_qualified_member_load_and_store() {
+        let child_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/child.w".into(),
+            "r1".into(),
+        );
+        let child = derive_scalar_program(
+            &parse_source(
+                child_source.clone(),
+                "%%start\ni32 value = 7;\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let root_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let root = derive_scalar_program(
+            &parse_source(
+                root_source.clone(),
+                "%%start\nmath = namespace package \"src/child.w\";\ni32() read = fn { math.value };\ni32 result = read();\nmath.value = result + 1;\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let namespace_bindings = root
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::ScalarItem::Namespace(namespace) => Some(crate::ScalarNamespaceBinding {
+                    binding: namespace.binding.clone(),
+                    target: child_source.clone(),
+                    span: namespace.span,
+                }),
+                _ => None,
+            })
+            .collect();
+        let project = ScalarProject::new(
+            vec![
+                ScalarModule::new(root_source, root.items, namespace_bindings),
+                ScalarModule::new(child_source.clone(), child.items, Vec::new()),
+            ],
+            vec![
+                SourceIdentity::new(
+                    "project".into(),
+                    "package".into(),
+                    "src/main.w".into(),
+                    "r1".into(),
+                ),
+                child_source.clone(),
+            ],
+        );
+        let text = emit_scalar_project_llvm(&validate_scalar_project(project))
+            .expect("qualified member LLVM")
+            .to_text();
+        let global = project_global_name(&child_source, "value");
+        let main = text.split("define i32 @main").nth(1).expect("main");
+        assert!(main.contains(&format!("store i32 %add, ptr @{global}")));
+        let read = text
+            .split(&format!(
+                "define i32 @{}",
+                project_function_name(
+                    &SourceIdentity::new(
+                        "project".into(),
+                        "package".into(),
+                        "src/main.w".into(),
+                        "r1".into(),
+                    ),
+                    "read"
+                )
+            ))
+            .nth(1)
+            .expect("read");
+        assert!(read.contains(&format!("load i32, ptr @{global}")));
+    }
+
+    #[test]
+    fn verifies_qualified_member_project_module() {
+        let child_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/child.w".into(),
+            "r1".into(),
+        );
+        let child = derive_scalar_program(
+            &parse_source(
+                child_source.clone(),
+                "%%start\ni32 value = 7;\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let root_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let root = derive_scalar_program(
+            &parse_source(
+                root_source.clone(),
+                "%%start\nmath = namespace package \"src/child.w\";\ni32 result = math.value;\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let namespace_bindings = root
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::ScalarItem::Namespace(namespace) => Some(crate::ScalarNamespaceBinding {
+                    binding: namespace.binding.clone(),
+                    target: child_source.clone(),
+                    span: namespace.span,
+                }),
+                _ => None,
+            })
+            .collect();
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(root_source.clone(), root.items, namespace_bindings),
+                ScalarModule::new(child_source.clone(), child.items, Vec::new()),
+            ],
+            vec![root_source, child_source],
+        ));
+        assert!(emit_scalar_project_llvm(&validation).is_ok());
     }
 }
