@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use inkwell::builder::{Builder, BuilderError};
 use inkwell::context::Context;
+use inkwell::module::Linkage;
 use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, PointerValue, ValueKind,
@@ -144,8 +145,10 @@ pub fn emit_scalar_project_llvm(
         for item in &source_module.items {
             if let ScalarItem::Binding(binding) = item {
                 let name = project_global_name(&source_module.source, &binding.name);
-                let global =
-                    module.add_global(basic_type(&context, &binding.declared_type)?, None, &name);
+                let ty = basic_type(&context, &binding.declared_type)?;
+                let global = module.add_global(ty, None, &name);
+                global.set_linkage(Linkage::Internal);
+                global.set_initializer(&ty.const_zero());
                 globals.insert(name, (global, binding.declared_type.clone()));
             }
             if let ScalarItem::Function(function) = item {
