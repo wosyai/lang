@@ -1,0 +1,28 @@
+[package]
+name = "scalar_case_collisions_invalid"
+
+[comments]
+categories = []
+
+[targets.app]
+root = "src/main.w"
+
+[targets.app.artifacts.main]
+artifact = "Main"
+
+[targets.app.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.app.profiles.dev]
+main_artifact = "main"
+
+[builders.native]
+command = ["sh", "scripts/build-native"]
+args = []
+
+[runners.native]
+command = ["sh", "scripts/run-native"]
+args = []
