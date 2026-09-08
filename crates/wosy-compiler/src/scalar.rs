@@ -75,7 +75,31 @@ pub enum ScalarExpression {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarBlock {
+    pub items: Vec<ScalarBlockItem>,
     pub expressions: Vec<ScalarExpression>,
+    pub span: ByteSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarBlockItem {
+    LocalBinding(ScalarBinding),
+    Expression(ScalarExpression),
+    Assignment(ScalarAssignment),
+    While(ScalarWhile),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarAssignment {
+    pub target: String,
+    pub target_span: ByteSpan,
+    pub value: ScalarExpression,
+    pub span: ByteSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarWhile {
+    pub condition: ScalarExpression,
+    pub body: ScalarBlock,
     pub span: ByteSpan,
 }
 
@@ -359,12 +383,82 @@ fn block_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
-    block
-        .expressions
-        .last()
-        .map_or(ScalarType::Unit, |expression| {
-            expression_type_in_module(expression, scope, module, modules, diagnostics)
-        })
+    let mut scope = scope.clone();
+    let mut result = ScalarType::Unit;
+    for item in &block.items {
+        result = match item {
+            ScalarBlockItem::LocalBinding(binding) => {
+                let actual =
+                    expression_type_in_module(&binding.value, &scope, module, modules, diagnostics);
+                expect_module_type(
+                    module,
+                    &binding.declared_type,
+                    &actual,
+                    binding.span,
+                    diagnostics,
+                );
+                scope.insert(binding.name.clone(), binding.declared_type.clone());
+                ScalarType::Unit
+            }
+            ScalarBlockItem::Expression(expression) => {
+                expression_type_in_module(expression, &scope, module, modules, diagnostics)
+            }
+            ScalarBlockItem::Assignment(assignment) => {
+                assignment_type_in_module(assignment, &mut scope, module, modules, diagnostics)
+            }
+            ScalarBlockItem::While(while_expression) => {
+                while_type_in_module(while_expression, &scope, module, modules, diagnostics)
+            }
+        };
+    }
+    result
+}
+
+fn assignment_type_in_module(
+    assignment: &ScalarAssignment,
+    scope: &mut BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    let actual = expression_type_in_module(&assignment.value, scope, module, modules, diagnostics);
+    let Some(expected) = scope.get(&assignment.target) else {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0001",
+            "unknown assignment target",
+            assignment.target_span,
+        ));
+        return ScalarType::Unit;
+    };
+    expect_module_type(module, expected, &actual, assignment.span, diagnostics);
+    expected.clone()
+}
+
+fn while_type_in_module(
+    while_expression: &ScalarWhile,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    let condition = expression_type_in_module(
+        &while_expression.condition,
+        scope,
+        module,
+        modules,
+        diagnostics,
+    );
+    if condition != ScalarType::Bool {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0005",
+            "while expression requires bool",
+            while_expression.span,
+        ));
+    }
+    let _ = block_type_in_module(&while_expression.body, scope, module, modules, diagnostics);
+    ScalarType::Unit
 }
 
 fn expression_type_in_module(
@@ -713,18 +807,62 @@ fn type_from_name(value: &str) -> ScalarType {
 }
 
 fn derive_block(node: &CstNode) -> ScalarBlock {
-    let expressions = node
+    let items: Vec<ScalarBlockItem> = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::BlockItem)
-        .filter_map(|item| {
-            direct_nodes(&item)
-                .into_iter()
-                .find(|child| child.kind() == SyntaxKind::Expression)
+        .map(|item| derive_block_item(&item))
+        .collect();
+    let expressions = items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarBlockItem::Expression(expression) => Some(expression.clone()),
+            _ => None,
         })
-        .map(|node| derive_expression(&node))
         .collect();
     ScalarBlock {
+        items,
         expressions,
+        span: wosy_syntax::byte_span(node),
+    }
+}
+
+fn derive_block_item(node: &CstNode) -> ScalarBlockItem {
+    let child = direct_nodes(node).into_iter().next().expect("block item");
+    match child.kind() {
+        SyntaxKind::LocalBinding => ScalarBlockItem::LocalBinding(derive_binding(&child)),
+        SyntaxKind::While => ScalarBlockItem::While(derive_while(&child)),
+        SyntaxKind::Expression => {
+            let actual = direct_nodes(&child).into_iter().next().expect("expression");
+            match actual.kind() {
+                SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&actual)),
+                SyntaxKind::While => ScalarBlockItem::While(derive_while(&actual)),
+                _ => ScalarBlockItem::Expression(derive_expression(&child)),
+            }
+        }
+        _ => panic!("block item grammar"),
+    }
+}
+
+fn derive_assignment(node: &CstNode) -> ScalarAssignment {
+    let target = direct_token(node, SyntaxKind::Identifier).expect("assignment target");
+    let value = direct_nodes(node)
+        .into_iter()
+        .find(|child| child.kind() == SyntaxKind::Expression)
+        .map(|child| derive_expression(&child))
+        .expect("assignment value");
+    ScalarAssignment {
+        target: target.text().to_owned(),
+        target_span: token_span(&target),
+        value,
+        span: wosy_syntax::byte_span(node),
+    }
+}
+
+fn derive_while(node: &CstNode) -> ScalarWhile {
+    let children = direct_nodes(node);
+    ScalarWhile {
+        condition: derive_expression(&children[0]),
+        body: derive_block(&children[1]),
         span: wosy_syntax::byte_span(node),
     }
 }
@@ -986,12 +1124,73 @@ fn block_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
-    block
-        .expressions
-        .last()
-        .map_or(ScalarType::Unit, |expression| {
-            expression_type(expression, scope, program, diagnostics)
-        })
+    let mut scope = scope.clone();
+    let mut result = ScalarType::Unit;
+    for item in &block.items {
+        result = match item {
+            ScalarBlockItem::LocalBinding(binding) => {
+                let actual = expression_type(&binding.value, &scope, program, diagnostics);
+                expect_type(
+                    program,
+                    &binding.declared_type,
+                    &actual,
+                    binding.span,
+                    diagnostics,
+                );
+                scope.insert(binding.name.clone(), binding.declared_type.clone());
+                ScalarType::Unit
+            }
+            ScalarBlockItem::Expression(expression) => {
+                expression_type(expression, &scope, program, diagnostics)
+            }
+            ScalarBlockItem::Assignment(assignment) => {
+                assignment_type(assignment, &mut scope, program, diagnostics)
+            }
+            ScalarBlockItem::While(while_expression) => {
+                while_type(while_expression, &scope, program, diagnostics)
+            }
+        };
+    }
+    result
+}
+
+fn assignment_type(
+    assignment: &ScalarAssignment,
+    scope: &mut BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    let actual = expression_type(&assignment.value, scope, program, diagnostics);
+    let Some(expected) = scope.get(&assignment.target) else {
+        diagnostics.push(diagnostic(
+            program,
+            "B0001",
+            "unknown assignment target",
+            assignment.target_span,
+        ));
+        return ScalarType::Unit;
+    };
+    expect_type(program, expected, &actual, assignment.span, diagnostics);
+    expected.clone()
+}
+
+fn while_type(
+    while_expression: &ScalarWhile,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    let condition = expression_type(&while_expression.condition, scope, program, diagnostics);
+    if condition != ScalarType::Bool {
+        diagnostics.push(diagnostic(
+            program,
+            "B0005",
+            "while expression requires bool",
+            while_expression.span,
+        ));
+    }
+    let _ = block_type(&while_expression.body, scope, program, diagnostics);
+    ScalarType::Unit
 }
 
 fn expression_type(
@@ -1170,6 +1369,74 @@ mod tests {
         assert_eq!(result.program.items.len(), 5);
         assert!(matches!(result.program.items[0], ScalarItem::Function(_)));
         assert!(matches!(result.program.items[4], ScalarItem::Binding(_)));
+    }
+
+    #[test]
+    fn derives_and_validates_ordered_local_mutation_and_unit_while() {
+        let result = validate_text(
+            "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t}\n\tvalue\n};\n%%end",
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+        let ScalarItem::Function(function) = &result.program.items[0] else {
+            panic!("function item");
+        };
+        assert_eq!(result.program.source, source());
+        assert_eq!(function.body.items.len(), 3);
+        assert!(matches!(
+            function.body.items[0],
+            ScalarBlockItem::LocalBinding(_)
+        ));
+        let ScalarBlockItem::While(while_expression) = &function.body.items[1] else {
+            panic!("while item");
+        };
+        assert_eq!(while_expression.span, ByteSpan::new(57, 100));
+        assert!(matches!(
+            while_expression.body.items[0],
+            ScalarBlockItem::Assignment(_)
+        ));
+        assert_eq!(
+            block_type(
+                &while_expression.body,
+                &BTreeMap::new(),
+                &result.program,
+                &mut Vec::new()
+            ),
+            ScalarType::Unit
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_assignment_target_and_mismatched_assignment_type() {
+        let unknown =
+            validate_text("%%start\ni32(i32) f = fn(value) { missing = value; 0 };\n%%end");
+        let diagnostic = unknown
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0001")
+            .expect("unknown assignment target");
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(33, 40));
+
+        let mismatch = validate_text(
+            "%%start\ni32(i32) f = fn(value) { i32 local = value; local = true; local };\n%%end",
+        );
+        assert!(mismatch
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"));
+    }
+
+    #[test]
+    fn rejects_non_boolean_while_condition() {
+        let result =
+            validate_text("%%start\ni32(i32) f = fn(value) { while (value) { value } 0 };\n%%end");
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0005"));
     }
 
     #[test]

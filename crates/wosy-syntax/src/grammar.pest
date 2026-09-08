@@ -21,9 +21,12 @@ type_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 parameters = { "(" ~ (identifier ~ ("," ~ identifier)*)? ~ ")" }
 block = { "{" ~ block_item* ~ "}" }
-block_item = { expression ~ ";"? }
-expression = { if_expr | logical_or }
+block_item = { local_binding | while_expr | expression ~ ";"? }
+local_binding = { type_spec ~ identifier ~ "=" ~ expression ~ ";" }
+expression = { if_expr | assignment | logical_or }
 if_expr = { "if" ~ "(" ~ expression ~ ")" ~ block ~ "else" ~ block }
+while_expr = { "while" ~ "(" ~ expression ~ ")" ~ block }
+assignment = { identifier ~ "=" ~ expression }
 logical_or = { logical_and ~ (or_operator ~ logical_and)* }
 logical_and = { comparison ~ (and_operator ~ comparison)* }
 comparison = { additive ~ (comparison_operator ~ additive)* }

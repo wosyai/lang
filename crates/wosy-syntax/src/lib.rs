@@ -42,6 +42,9 @@ pub enum SyntaxKind {
     Punctuation,
     NamespaceDecl,
     QualifiedCall,
+    LocalBinding,
+    While,
+    Assignment,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -84,6 +87,9 @@ impl Language for WosyLanguage {
             29 => SyntaxKind::Punctuation,
             30 => SyntaxKind::NamespaceDecl,
             31 => SyntaxKind::QualifiedCall,
+            32 => SyntaxKind::LocalBinding,
+            33 => SyntaxKind::While,
+            34 => SyntaxKind::Assignment,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -457,6 +463,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::extern_function => SyntaxKind::ExternFunction,
         Rule::function_decl => SyntaxKind::FunctionDecl,
         Rule::binding_decl => SyntaxKind::BindingDecl,
+        Rule::local_binding => SyntaxKind::LocalBinding,
         Rule::namespace_decl => SyntaxKind::NamespaceDecl,
         Rule::item => SyntaxKind::Item,
         Rule::type_spec => SyntaxKind::TypeSpec,
@@ -470,6 +477,8 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::call => SyntaxKind::Call,
         Rule::qualified_call => SyntaxKind::QualifiedCall,
         Rule::if_expr => SyntaxKind::IfExpr,
+        Rule::while_expr => SyntaxKind::While,
+        Rule::assignment => SyntaxKind::Assignment,
         Rule::parenthesized => SyntaxKind::Parenthesized,
         Rule::boolean => SyntaxKind::Boolean,
         Rule::logical_or
@@ -612,5 +621,38 @@ mod tests {
         assert!(call
             .children()
             .any(|node| node.kind() == SyntaxKind::QualifiedCall));
+    }
+
+    #[test]
+    fn local_binding_assignment_and_direct_block_while_are_structural() {
+        let text = "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t}\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid());
+        assert_eq!(result.reconstruct(), text);
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::LocalBinding));
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Assignment));
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::While));
+        let while_node = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::While)
+            .expect("while node");
+        assert_eq!(byte_span(&while_node), ByteSpan::new(57, 100));
+        let trailing_semicolon =
+            "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t};\n};\n%%end";
+        let rejected = parse(identity(), trailing_semicolon.into(), &[]);
+        assert!(!rejected.is_valid());
+
+        let expression_statement = "%%start\nunit() main = fn {\n\tprint();\n};\n%%end";
+        assert!(parse(identity(), expression_statement.into(), &[]).is_valid());
     }
 }
