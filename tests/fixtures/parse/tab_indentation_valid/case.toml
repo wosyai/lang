@@ -1,0 +1,7 @@
+[[steps]]
+command = ["wosy", "parse", "app"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "parse", "app"]
+exit = 0
