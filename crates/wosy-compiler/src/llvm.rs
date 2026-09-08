@@ -920,8 +920,15 @@ fn emit_expression<'ctx>(
             Err(format!("unknown LLVM member {receiver}.{name}"))
         }
         ScalarExpression::Integer { value, .. } => Ok(EmitValue::Basic(
-            context.i32_type().const_int(*value as u64, true).into(),
+            context
+                .i32_type()
+                .const_int(
+                    i32::try_from(value.clone()).map_err(|_| "invalid i32 literal")? as u64,
+                    true,
+                )
+                .into(),
         )),
+        ScalarExpression::InvalidInteger { .. } => Err("invalid integer literal".to_owned()),
         ScalarExpression::Boolean { value, .. } => Ok(EmitValue::Basic(
             context
                 .bool_type()
@@ -998,8 +1005,15 @@ fn emit_project_expression<'ctx>(
             },
         ),
         ScalarExpression::Integer { value, .. } => Ok(EmitValue::Basic(
-            context.i32_type().const_int(*value as u64, true).into(),
+            context
+                .i32_type()
+                .const_int(
+                    i32::try_from(value.clone()).map_err(|_| "invalid i32 literal")? as u64,
+                    true,
+                )
+                .into(),
         )),
+        ScalarExpression::InvalidInteger { .. } => Err("invalid integer literal".to_owned()),
         ScalarExpression::Boolean { value, .. } => Ok(EmitValue::Basic(
             context
                 .bool_type()

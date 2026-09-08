@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use num_bigint::BigInt;
 use rowan::NodeOrToken;
 use serde::{Deserialize, Serialize};
 use wosy_syntax::{
@@ -50,7 +51,10 @@ pub enum ScalarExpression {
         span: ByteSpan,
     },
     Integer {
-        value: i32,
+        value: BigInt,
+        span: ByteSpan,
+    },
+    InvalidInteger {
         span: ByteSpan,
     },
     Boolean {
@@ -669,7 +673,14 @@ fn expression_type_in_module(
             };
             member.clone()
         }
-        ScalarExpression::Integer { .. } => ScalarType::I32,
+        ScalarExpression::Integer { value, span } => {
+            validate_integer_range(module, value, *span, diagnostics);
+            ScalarType::I32
+        }
+        ScalarExpression::InvalidInteger { span } => {
+            invalid_integer_diagnostic(module, *span, diagnostics);
+            ScalarType::I32
+        }
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
         ScalarExpression::Binary {
             operator,
@@ -1286,10 +1297,13 @@ fn derive_element(element: &NodeOrToken<CstNode, CstToken>) -> ScalarExpression 
                 name: token.text().to_owned(),
                 span: token_span(token),
             },
-            SyntaxKind::Integer => ScalarExpression::Integer {
-                value: token.text().parse::<i32>().expect("integer grammar"),
-                span: token_span(token),
-            },
+            SyntaxKind::Integer => {
+                let span = token_span(token);
+                match BigInt::parse_bytes(token.text().as_bytes(), 10) {
+                    Some(value) => ScalarExpression::Integer { value, span },
+                    None => ScalarExpression::InvalidInteger { span },
+                }
+            }
             _ => panic!("expression token"),
         },
     }
@@ -1305,6 +1319,7 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
         ScalarExpression::Name { span, .. }
         | ScalarExpression::Member { span, .. }
         | ScalarExpression::Integer { span, .. }
+        | ScalarExpression::InvalidInteger { span }
         | ScalarExpression::Boolean { span, .. }
         | ScalarExpression::Binary { span, .. }
         | ScalarExpression::Call { span, .. }
@@ -1587,7 +1602,14 @@ fn expression_type(
             diagnostics.push(diagnostic(program, "B0001", "unknown name", *span));
             ScalarType::Unit
         }
-        ScalarExpression::Integer { .. } => ScalarType::I32,
+        ScalarExpression::Integer { value, span } => {
+            validate_integer_range_program(program, value, *span, diagnostics);
+            ScalarType::I32
+        }
+        ScalarExpression::InvalidInteger { span } => {
+            invalid_integer_diagnostic_program(program, *span, diagnostics);
+            ScalarType::I32
+        }
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
         ScalarExpression::Binary {
             operator,
@@ -1699,6 +1721,64 @@ fn expect_type(
     }
 }
 
+fn validate_integer_range(
+    module: &ScalarModule,
+    value: &BigInt,
+    span: ByteSpan,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    if value > &BigInt::from(i32::MAX) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0006",
+            "integer literal is outside the resolved target type range",
+            span,
+        ));
+    }
+}
+
+fn validate_integer_range_program(
+    program: &ScalarProgram,
+    value: &BigInt,
+    span: ByteSpan,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    if value > &BigInt::from(i32::MAX) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0006",
+            "integer literal is outside the resolved target type range",
+            span,
+        ));
+    }
+}
+
+fn invalid_integer_diagnostic(
+    module: &ScalarModule,
+    span: ByteSpan,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    diagnostics.push(module_diagnostic(
+        module,
+        "B0006",
+        "invalid integer literal",
+        span,
+    ));
+}
+
+fn invalid_integer_diagnostic_program(
+    program: &ScalarProgram,
+    span: ByteSpan,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    diagnostics.push(diagnostic(
+        program,
+        "B0006",
+        "invalid integer literal",
+        span,
+    ));
+}
+
 fn diagnostic(
     program: &ScalarProgram,
     code: &str,
@@ -1755,6 +1835,54 @@ mod tests {
         assert_eq!(result.program.items.len(), 5);
         assert!(matches!(result.program.items[0], ScalarItem::Function(_)));
         assert!(matches!(result.program.items[4], ScalarItem::Binding(_)));
+    }
+
+    #[test]
+    fn reports_integer_range_at_literal_span_and_preserves_i32_max() {
+        let invalid_text = "%%start\ni32 value = 2147483648;\n%%end";
+        let invalid = validate_text(invalid_text);
+        let diagnostic = invalid
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0006")
+            .expect("integer range diagnostic");
+        let start = invalid_text.find("2147483648").expect("literal") as u32;
+        assert_eq!(
+            diagnostic.labels[0].span.range,
+            ByteSpan::new(start, start + 10)
+        );
+
+        let valid = validate_text("%%start\ni32 minimum = 0;\ni32 maximum = 2147483647;\n%%end");
+        assert!(
+            valid.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            valid.diagnostics
+        );
+
+        let huge = validate_text(
+            "%%start\ni32 value = 999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999;\n%%end",
+        );
+        assert!(huge.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0006"
+                && diagnostic.message == "integer literal is outside the resolved target type range"
+        }));
+    }
+
+    #[test]
+    fn project_validation_reports_integer_range_at_literal_span() {
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), "%%start\ni32 value = 2147483648;\n%%end");
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source.clone()],
+        ));
+        let diagnostic = validation
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0006")
+            .expect("project integer range diagnostic");
+        assert_eq!(diagnostic.labels[0].span.source, source);
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(20, 30));
     }
 
     #[test]
