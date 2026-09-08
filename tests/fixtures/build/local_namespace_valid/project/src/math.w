@@ -1,5 +1,3 @@
 %%start
-i32(i32, i32) add = fn(left, right) {
-	left + right
-};
+i32 value = 40;
 %%end
