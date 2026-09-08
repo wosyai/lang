@@ -339,6 +339,14 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                     let ScalarType::Callable { result, parameters } = &function.signature else {
                         continue;
                     };
+                    if function.parameters.len() != parameters.len() {
+                        diagnostics.push(module_diagnostic(
+                            module,
+                            "B0004",
+                            "function parameter arity does not match its type",
+                            function.span,
+                        ));
+                    }
                     let mut scope = declarations.clone();
                     for (index, name) in function.parameters.iter().enumerate() {
                         if index < parameters.len() {
@@ -1614,6 +1622,54 @@ mod tests {
                 Vec::new(),
             )],
             vec![source],
+        ));
+        assert!(valid_project.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn validates_project_callable_parameter_arity_like_single_file_programs() {
+        let source = "%%start\ni32(i32, i32) add = fn(value) { value };\n%%end";
+        let single_file = validate_text(source);
+        assert!(single_file
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0004"));
+
+        let invalid_module_source = module_source("src/math.w");
+        let module = module_from_text(invalid_module_source.clone(), source);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(
+                invalid_module_source.clone(),
+                module.items,
+                Vec::new(),
+            )],
+            vec![invalid_module_source],
+        ));
+        let project_diagnostic = project
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0004")
+            .expect("project callable arity diagnostic");
+        assert_eq!(
+            project_diagnostic.message,
+            single_file
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "B0004")
+                .expect("single-file callable arity diagnostic")
+                .message
+        );
+
+        let valid_source = "%%start\ni32(i32, i32) add = fn(left, right) { left + right };\n%%end";
+        let valid_module_source = module_source("src/math.w");
+        let valid_module = module_from_text(valid_module_source.clone(), valid_source);
+        let valid_project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(
+                valid_module_source.clone(),
+                valid_module.items,
+                Vec::new(),
+            )],
+            vec![valid_module_source],
         ));
         assert!(valid_project.diagnostics.is_empty());
     }
