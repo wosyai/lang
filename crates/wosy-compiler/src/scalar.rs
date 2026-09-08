@@ -141,6 +141,7 @@ pub struct ScalarFunction {
     pub name: String,
     pub signature: ScalarType,
     pub parameters: Vec<String>,
+    pub parameter_spans: Vec<ByteSpan>,
     pub body: ScalarBlock,
     pub span: ByteSpan,
 }
@@ -408,6 +409,14 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                     );
                 }
             }
+        }
+        for span in unused_binding_spans(&module.items) {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0009",
+                "local binding or parameter has no required static use",
+                span,
+            ));
         }
     }
     ScalarProjectValidation {
@@ -1120,6 +1129,20 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
                 })
                 .collect()
         });
+    let parameter_spans = children
+        .iter()
+        .find(|child| child.kind() == SyntaxKind::Parameters)
+        .map_or_else(Vec::new, |parameters| {
+            parameters
+                .children_with_tokens()
+                .filter_map(|element| match element {
+                    NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => {
+                        Some(token_span(&token))
+                    }
+                    _ => None,
+                })
+                .collect()
+        });
     let body = children
         .iter()
         .find(|child| child.kind() == SyntaxKind::Block)
@@ -1129,6 +1152,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         name,
         signature,
         parameters,
+        parameter_spans,
         body,
         span: wosy_syntax::byte_span(node),
     }
@@ -1580,7 +1604,140 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
             }
         }
     }
+    for span in unused_binding_spans(&program.items) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0009",
+            "local binding or parameter has no required static use",
+            span,
+        ));
+    }
     diagnostics
+}
+
+struct StaticUseAnalyzer {
+    visible: BTreeMap<String, usize>,
+    declarations: Vec<ByteSpan>,
+    uses: BTreeSet<usize>,
+}
+
+impl StaticUseAnalyzer {
+    fn new(function: &ScalarFunction) -> Self {
+        let mut analyzer = Self {
+            visible: BTreeMap::new(),
+            declarations: Vec::new(),
+            uses: BTreeSet::new(),
+        };
+        for (index, name) in function.parameters.iter().enumerate() {
+            if let Some(span) = function.parameter_spans.get(index) {
+                let id = analyzer.declarations.len();
+                analyzer.visible.insert(name.clone(), id);
+                analyzer.declarations.push(*span);
+            }
+        }
+        analyzer
+    }
+
+    fn block(&mut self, block: &ScalarBlock, visible: &BTreeMap<String, usize>) {
+        let mut visible = visible.clone();
+        for item in &block.items {
+            self.item(item, &mut visible);
+        }
+    }
+
+    fn item(&mut self, item: &ScalarBlockItem, visible: &mut BTreeMap<String, usize>) {
+        match item {
+            ScalarBlockItem::LocalBinding(binding) => {
+                self.expression(&binding.value, visible);
+                let id = self.declarations.len();
+                visible.insert(binding.name.clone(), id);
+                self.declarations.push(binding.span);
+            }
+            ScalarBlockItem::Expression(expression) => self.expression(expression, visible),
+            ScalarBlockItem::Assignment(assignment) => {
+                self.expression(&assignment.value, visible);
+                if let Some(receiver) = &assignment.receiver {
+                    self.use_name(receiver, visible);
+                } else {
+                    self.use_name(&assignment.target, visible);
+                }
+            }
+            ScalarBlockItem::While(while_expression) => {
+                self.expression(&while_expression.condition, visible);
+                self.block(&while_expression.body, visible);
+            }
+        }
+    }
+
+    fn expression(&mut self, expression: &ScalarExpression, visible: &BTreeMap<String, usize>) {
+        match expression {
+            ScalarExpression::Name { name, .. } => self.use_name(name, visible),
+            ScalarExpression::Member { receiver, .. } => self.use_name(receiver, visible),
+            ScalarExpression::Binary { left, right, .. } => {
+                self.expression(left, visible);
+                self.expression(right, visible);
+            }
+            ScalarExpression::Call {
+                receiver,
+                name,
+                arguments,
+                ..
+            } => {
+                if let Some(receiver) = receiver {
+                    self.use_name(receiver, visible);
+                } else {
+                    self.use_name(name, visible);
+                }
+                for argument in arguments {
+                    self.expression(argument, visible);
+                }
+            }
+            ScalarExpression::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.expression(condition, visible);
+                self.block(then_branch, visible);
+                self.block(else_branch, visible);
+            }
+            ScalarExpression::Block(block) => self.block(block, visible),
+            ScalarExpression::Integer { .. }
+            | ScalarExpression::InvalidInteger { .. }
+            | ScalarExpression::Boolean { .. } => {}
+        }
+    }
+
+    fn use_name(&mut self, name: &str, visible: &BTreeMap<String, usize>) {
+        if let Some(id) = visible.get(name) {
+            self.uses.insert(*id);
+        }
+    }
+
+    fn unused(self) -> Vec<ByteSpan> {
+        self.declarations
+            .into_iter()
+            .enumerate()
+            .filter_map(|(id, span)| (!self.uses.contains(&id)).then_some(span))
+            .collect()
+    }
+}
+
+fn unused_binding_spans(items: &[ScalarItem]) -> Vec<ByteSpan> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarItem::Function(function) => {
+                let mut analyzer = StaticUseAnalyzer::new(function);
+                let visible = analyzer.visible.clone();
+                analyzer.block(&function.body, &visible);
+                Some(analyzer.unused())
+            }
+            ScalarItem::Namespace(_) | ScalarItem::Binding(_) | ScalarItem::Executable(_) => None,
+        })
+        .flatten()
+        .collect()
 }
 
 fn validate_type(
@@ -2686,6 +2843,67 @@ mod tests {
             .find(|diagnostic| diagnostic.code == "B0008")
             .expect("project case collision diagnostic");
         assert_eq!(diagnostic.labels.len(), 2);
+    }
+
+    #[test]
+    fn reports_unused_local_and_parameter_at_declaration_spans() {
+        let text = "%%start\nunit(i32) f = fn(unused_parameter) { i32 unused_local = 1; };\n%%end";
+        let result = validate_text(text);
+        let diagnostics: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "B0009")
+            .collect();
+        assert_eq!(diagnostics.len(), 2);
+        let ScalarItem::Function(function) = &result.program.items[0] else {
+            panic!("function item");
+        };
+        let local_span = match &function.body.items[0] {
+            ScalarBlockItem::LocalBinding(binding) => binding.span,
+            _ => panic!("local binding item"),
+        };
+        assert_eq!(
+            diagnostics[0].labels[0].span.range,
+            function.parameter_spans[0]
+        );
+        assert_eq!(diagnostics[1].labels[0].span.range, local_span);
+    }
+
+    #[test]
+    fn counts_resolved_uses_across_initializers_assignments_conditions_calls_and_branches() {
+        let result = validate_text(
+            "%%start\nunit(i32) consume = fn(value) { value; };\ni32(i32) f = fn(input) { i32 local = input; while (local < 2) { local = local + 1; } if (local == 2) { consume(local); } else { consume(input); } local };\n%%end",
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn validates_static_uses_in_project_path() {
+        let source = module_source("src/main.w");
+        let program = module_from_text(
+            source.clone(),
+            "%%start\nunit(i32) f = fn(unused_parameter) { i32 unused_local = 1; };\n%%end",
+        );
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source.clone()],
+        ));
+        assert_eq!(
+            validation
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0009")
+                .count(),
+            2
+        );
+        assert!(validation
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.labels[0].span.source == source));
     }
 
     fn module_source(path: &str) -> SourceIdentity {

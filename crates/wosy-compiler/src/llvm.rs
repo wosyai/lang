@@ -1388,7 +1388,7 @@ mod tests {
         );
         let parsed = parse_source(
             source,
-            "%%start\nbool() flag = fn { true };\nunit() touch = fn { i32 marker = 0; };\ni32() count = fn { 42 };\nbool selected = flag();\nunit done = touch();\ni32 result = count();\n%%end"
+            "%%start\nbool() flag = fn { true };\nunit() touch = fn { i32 marker = 0; marker = marker; };\ni32() count = fn { 42 };\nbool selected = flag();\nunit done = touch();\ni32 result = count();\n%%end"
                 .into(),
             &[],
         );
