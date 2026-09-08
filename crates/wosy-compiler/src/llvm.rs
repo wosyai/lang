@@ -1068,8 +1068,14 @@ fn emit_project_expression<'ctx>(
             ..
         } => {
             let left = emit_project_expression(context, state, left, module, modules)?;
-            let right = emit_project_expression(context, state, right, module, modules)?;
-            emit_binary_values(state, operator, left, right)
+            emit_binary_with_rhs(
+                context,
+                state,
+                operator,
+                left,
+                right,
+                ExpressionPath::Project { module, modules },
+            )
         }
         ScalarExpression::If {
             condition,
@@ -1141,9 +1147,91 @@ fn emit_binary<'ctx>(
     right: &ScalarExpression,
 ) -> Result<EmitValue<'ctx>, String> {
     let left = emit_expression(context, state, left)?;
-    let right = emit_expression(context, state, right)?;
-    emit_binary_values(state, operator, left, right)
+    emit_binary_with_rhs(
+        context,
+        state,
+        operator,
+        left,
+        right,
+        ExpressionPath::Single,
+    )
 }
+
+enum ExpressionPath<'a> {
+    Single,
+    Project {
+        module: &'a ScalarModule,
+        modules: &'a [&'a ScalarModule],
+    },
+}
+
+fn emit_binary_with_rhs<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    operator: &BinaryOperator,
+    left: EmitValue<'ctx>,
+    right: &ScalarExpression,
+    path: ExpressionPath<'_>,
+) -> Result<EmitValue<'ctx>, String> {
+    if !matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
+        let right = match path {
+            ExpressionPath::Single => emit_expression(context, state, right)?,
+            ExpressionPath::Project { module, modules } => {
+                emit_project_expression(context, state, right, module, modules)?
+            }
+        };
+        return emit_binary_values(state, operator, left, right);
+    }
+
+    let left = take_basic(left)?.into_int_value();
+    let function = state
+        .builder
+        .get_insert_block()
+        .ok_or_else(|| "missing insertion block".to_owned())?
+        .get_parent()
+        .ok_or_else(|| "missing function".to_owned())?;
+    let rhs_block = context.append_basic_block(function, "short_circuit.rhs");
+    let merge = context.append_basic_block(function, "short_circuit.merge");
+    let left_block = state
+        .builder
+        .get_insert_block()
+        .ok_or_else(|| "missing insertion block".to_owned())?;
+    let (true_block, false_block) = match operator {
+        BinaryOperator::And => (rhs_block, merge),
+        BinaryOperator::Or => (merge, rhs_block),
+        _ => return Err("invalid short-circuit operator".to_owned()),
+    };
+    state
+        .builder
+        .build_conditional_branch(left, true_block, false_block)
+        .map_err(builder_error)?;
+
+    state.builder.position_at_end(rhs_block);
+    let right = match path {
+        ExpressionPath::Single => emit_expression(context, state, right)?,
+        ExpressionPath::Project { module, modules } => {
+            emit_project_expression(context, state, right, module, modules)?
+        }
+    };
+    let right = take_basic(right)?.into_int_value();
+    state
+        .builder
+        .build_unconditional_branch(merge)
+        .map_err(builder_error)?;
+    let rhs_end = state.builder.get_insert_block().expect("RHS block");
+    state.builder.position_at_end(merge);
+
+    let skipped = left
+        .get_type()
+        .const_int(u64::from(matches!(operator, BinaryOperator::Or)), false);
+    let phi = state
+        .builder
+        .build_phi(left.get_type(), "short_circuit")
+        .map_err(builder_error)?;
+    phi.add_incoming(&[(&skipped, left_block), (&right, rhs_end)]);
+    Ok(EmitValue::Basic(phi.as_basic_value()))
+}
+
 fn emit_binary_values<'ctx>(
     state: &mut EmitState<'ctx>,
     operator: &BinaryOperator,
@@ -1178,16 +1266,9 @@ fn emit_binary_values<'ctx>(
             .build_int_signed_rem(left, right, "rem")
             .map_err(builder_error)?
             .into(),
-        BinaryOperator::And => state
-            .builder
-            .build_and(left, right, "and")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::Or => state
-            .builder
-            .build_or(left, right, "or")
-            .map_err(builder_error)?
-            .into(),
+        BinaryOperator::And | BinaryOperator::Or => {
+            return Err("short-circuit operators require expression lowering".to_owned())
+        }
         BinaryOperator::Equal => state
             .builder
             .build_int_compare(IntPredicate::EQ, left, right, "eq")
@@ -1939,5 +2020,108 @@ child.marker = child.touch();
         assert!(!text.contains("alloca"));
         assert!(!text.contains("load"));
         assert!(!text.contains("store"));
+    }
+
+    #[test]
+    fn emits_short_circuit_cfg_for_all_boolean_paths() {
+        let cases = [
+            ("false_and", "false && right()", "false"),
+            ("true_and", "true && right()", "true"),
+            ("true_or", "true || right()", "true"),
+            ("false_or", "false || right()", "false"),
+        ];
+
+        for (name, expression, left) in cases {
+            let source = SourceIdentity::new(
+                "project".into(),
+                "package".into(),
+                format!("src/{name}.w"),
+                "r1".into(),
+            );
+            let validation = derive_scalar_program(
+                &parse_source(
+                    source,
+                    format!(
+                        "%%start\nbool() right = fn {{ true }};\nbool result = {expression};\n%%end"
+                    ),
+                    &[],
+                )
+                .result,
+            );
+            let text = emit_scalar_llvm(&validation)
+                .expect("short-circuit LLVM")
+                .to_text();
+            let main = text.split("define i32 @main").nth(1).expect("main");
+            assert_eq!(main.matches("call i1 @right()").count(), 1);
+            assert!(main.contains("phi i1"));
+            assert!(main.contains(&format!("br i1 {left}")));
+            assert!(main.contains("short_circuit.rhs"));
+            assert!(main.contains("short_circuit.merge"));
+            assert!(
+                main.find("br i1").expect("conditional branch")
+                    < main.find("call i1 @right()").expect("RHS call")
+            );
+        }
+    }
+
+    #[test]
+    fn emits_project_short_circuit_cfg_with_qualified_rhs() {
+        let child_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/child.w".into(),
+            "r1".into(),
+        );
+        let child = derive_scalar_program(
+            &parse_source(
+                child_source.clone(),
+                "%%start\nbool() right = fn { true };\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let root_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let root = derive_scalar_program(
+            &parse_source(
+                root_source.clone(),
+                "%%start\nchild = namespace package \"src/child.w\";\nbool result = false && child.right();\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let namespace_bindings = root
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::ScalarItem::Namespace(namespace) => Some(crate::ScalarNamespaceBinding {
+                    binding: namespace.binding.clone(),
+                    target: child_source.clone(),
+                    span: namespace.span,
+                }),
+                _ => None,
+            })
+            .collect();
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(root_source.clone(), root.items, namespace_bindings),
+                ScalarModule::new(child_source.clone(), child.items, Vec::new()),
+            ],
+            vec![root_source, child_source.clone()],
+        ));
+        let text = emit_scalar_project_llvm(&validation)
+            .expect("project short-circuit LLVM")
+            .to_text();
+        assert!(text.contains("phi i1"));
+        assert!(text.contains(&format!(
+            "call i1 @{}",
+            project_function_name(&child_source, "right")
+        )));
     }
 }
