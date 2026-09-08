@@ -2131,7 +2131,7 @@ fn validate_integer_range(
     if value > &BigInt::from(i32::MAX) {
         diagnostics.push(module_diagnostic(
             module,
-            "B0006",
+            "B0010",
             "integer literal is outside the resolved target type range",
             span,
         ));
@@ -2147,7 +2147,7 @@ fn validate_integer_range_program(
     if value > &BigInt::from(i32::MAX) {
         diagnostics.push(diagnostic(
             program,
-            "B0006",
+            "B0010",
             "integer literal is outside the resolved target type range",
             span,
         ));
@@ -2161,7 +2161,7 @@ fn invalid_integer_diagnostic(
 ) {
     diagnostics.push(module_diagnostic(
         module,
-        "B0006",
+        "B0010",
         "invalid integer literal",
         span,
     ));
@@ -2174,7 +2174,7 @@ fn invalid_integer_diagnostic_program(
 ) {
     diagnostics.push(diagnostic(
         program,
-        "B0006",
+        "B0010",
         "invalid integer literal",
         span,
     ));
@@ -2289,7 +2289,7 @@ mod tests {
         let diagnostic = invalid
             .diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "B0006")
+            .find(|diagnostic| diagnostic.code == "B0010")
             .expect("integer range diagnostic");
         let start = invalid_text.find("2147483648").expect("literal") as u32;
         assert_eq!(
@@ -2308,7 +2308,7 @@ mod tests {
             "%%start\ni32 value = 999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999;\n%%end",
         );
         assert!(huge.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "B0006"
+            diagnostic.code == "B0010"
                 && diagnostic.message == "integer literal is outside the resolved target type range"
         }));
     }
@@ -2324,7 +2324,7 @@ mod tests {
         let diagnostic = validation
             .diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "B0006")
+            .find(|diagnostic| diagnostic.code == "B0010")
             .expect("project integer range diagnostic");
         assert_eq!(diagnostic.labels[0].span.source, source);
         assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(20, 30));
@@ -2726,10 +2726,10 @@ mod tests {
             .iter()
             .any(|diagnostic| diagnostic.code == "B0005"));
         let branches = validate_text("%%start\ni32 value = if (true) { 1 } else { true };\n%%end");
-        assert!(branches
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "B0006"));
+        assert!(branches.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0006"
+                && diagnostic.message == "conditional branches must have equal types"
+        }));
     }
 
     #[test]

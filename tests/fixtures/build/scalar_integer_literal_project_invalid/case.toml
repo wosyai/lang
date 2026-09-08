@@ -5,4 +5,4 @@ exit = 1
 [[assert]]
 command = ["wosy", "build", "app"]
 exit = 1
-stderr_contains = ["B0006", "src/child.w"]
+stderr_contains = ["B0010", "src/child.w"]
