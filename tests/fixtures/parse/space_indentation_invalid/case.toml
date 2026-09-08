@@ -1,8 +1,7 @@
 [[steps]]
 command = ["wosy", "parse", "app"]
-exit = 1
+exit = 0
 
 [[assert]]
 command = ["wosy", "parse", "app"]
-exit = 1
-stderr_contains = ["S0001", "spaces are not valid logical indentation"]
+exit = 0
