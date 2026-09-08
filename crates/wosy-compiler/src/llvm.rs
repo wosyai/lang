@@ -35,13 +35,27 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     if !validation.diagnostics.is_empty() {
         return Err("cannot emit LLVM for an invalid scalar program".to_owned());
     }
+    let callable_signatures = validation
+        .program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarItem::Binding(binding) => {
+                Some((binding.name.clone(), binding.declared_type.clone()))
+            }
+            ScalarItem::Function(function) => {
+                Some((function.name.clone(), function.signature.clone()))
+            }
+            ScalarItem::Namespace(_) => None,
+        })
+        .collect();
     let mut functions = Vec::new();
     for item in &validation.program.items {
         if let ScalarItem::Function(function) = item {
-            functions.push(emit_function(function)?);
+            functions.push(emit_function(function, &callable_signatures)?);
         }
     }
-    functions.push(emit_main(&validation.program.items)?);
+    functions.push(emit_main(&validation.program.items, &callable_signatures)?);
     Ok(LlvmPartition {
         module_name: validation.program.source.path.clone(),
         declarations: Vec::new(),
@@ -317,17 +331,38 @@ fn emit_project_expression(
                     .find(|candidate| candidate.source == namespace.target)
                     .expect("validated namespace target")
             });
-            let result = state.value();
+            let callable = target
+                .members
+                .get(name)
+                .ok_or_else(|| format!("unknown LLVM callable {name}"))?;
+            let ScalarType::Callable {
+                result: result_type,
+                ..
+            } = callable
+            else {
+                return Err(format!("LLVM value {name} is not callable"));
+            };
+            let result_type = value_type(result_type)?;
             let args = arguments
                 .iter()
                 .map(|value| format!("{} {}", llvm_type(value.1), value.0))
                 .collect::<Vec<_>>()
                 .join(", ");
-            state.body.push_str(&format!(
-                "  {result} = call i32 @{}({args})\n",
-                project_function_name(&target.source, name)
-            ));
-            Ok((result, LlvmValueType::I32))
+            if result_type == LlvmValueType::Void {
+                state.body.push_str(&format!(
+                    "  call void @{}({args})\n",
+                    project_function_name(&target.source, name)
+                ));
+                Ok(("0".to_owned(), result_type))
+            } else {
+                let result = state.value();
+                state.body.push_str(&format!(
+                    "  {result} = call {} @{}({args})\n",
+                    llvm_type(result_type),
+                    project_function_name(&target.source, name)
+                ));
+                Ok((result, result_type))
+            }
         }
         ScalarExpression::Binary {
             operator,
@@ -449,7 +484,10 @@ fn project_function_name(source: &wosy_syntax::SourceIdentity, name: &str) -> St
         .collect()
 }
 
-fn emit_function(function: &ScalarFunction) -> Result<LlvmFunction, String> {
+fn emit_function(
+    function: &ScalarFunction,
+    callable_signatures: &BTreeMap<String, ScalarType>,
+) -> Result<LlvmFunction, String> {
     let ScalarType::Callable { result, parameters } = &function.signature else {
         return Err(format!(
             "function {} has no callable signature",
@@ -466,7 +504,7 @@ fn emit_function(function: &ScalarFunction) -> Result<LlvmFunction, String> {
     }
     let mut state = EmitState::new(names, BTreeMap::new());
     state.initialize_parameters(&llvm_parameters);
-    let value = emit_block(&function.body, &mut state)?;
+    let value = emit_block(&function.body, &mut state, callable_signatures)?;
     append_return(&mut state, value, value_type(result)?)?;
     Ok(LlvmFunction {
         name: function.name.clone(),
@@ -476,11 +514,14 @@ fn emit_function(function: &ScalarFunction) -> Result<LlvmFunction, String> {
     })
 }
 
-fn emit_main(items: &[ScalarItem]) -> Result<LlvmFunction, String> {
+fn emit_main(
+    items: &[ScalarItem],
+    callable_signatures: &BTreeMap<String, ScalarType>,
+) -> Result<LlvmFunction, String> {
     let mut state = EmitState::new(BTreeMap::new(), BTreeMap::new());
     for item in items {
         if let ScalarItem::Binding(binding) = item {
-            let value = emit_expression(&binding.value, &mut state)?;
+            let value = emit_expression(&binding.value, &mut state, callable_signatures)?;
             state.values.insert(binding.name.clone(), value);
         }
     }
@@ -576,13 +617,14 @@ fn append_return(
 fn emit_block(
     block: &ScalarBlock,
     state: &mut EmitState,
+    callable_signatures: &BTreeMap<String, ScalarType>,
 ) -> Result<(String, LlvmValueType), String> {
     let storage = state.storage.clone();
     let mut result = ("0".to_owned(), LlvmValueType::Void);
     for item in &block.items {
         result = match item {
             ScalarBlockItem::LocalBinding(binding) => {
-                let value = emit_expression(&binding.value, state)?;
+                let value = emit_expression(&binding.value, state, callable_signatures)?;
                 let slot = state.allocate(&binding.name, value_type(&binding.declared_type)?);
                 state.body.push_str(&format!(
                     "  store {} {}, ptr {}\n",
@@ -592,8 +634,12 @@ fn emit_block(
                 ));
                 ("0".to_owned(), LlvmValueType::Void)
             }
-            ScalarBlockItem::Expression(expression) => emit_expression(expression, state)?,
-            ScalarBlockItem::Assignment(assignment) => emit_assignment(assignment, state)?,
+            ScalarBlockItem::Expression(expression) => {
+                emit_expression(expression, state, callable_signatures)?
+            }
+            ScalarBlockItem::Assignment(assignment) => {
+                emit_assignment(assignment, state, callable_signatures)?
+            }
             ScalarBlockItem::While(while_expression) => {
                 let condition_label = state.block("while.cond");
                 let body_label = state.block("while.body");
@@ -601,12 +647,13 @@ fn emit_block(
                 state.body.push_str(&format!(
                     "  br label %{condition_label}\n\n{condition_label}:\n"
                 ));
-                let condition = emit_expression(&while_expression.condition, state)?;
+                let condition =
+                    emit_expression(&while_expression.condition, state, callable_signatures)?;
                 state.body.push_str(&format!(
                     "  br i1 {}, label %{body_label}, label %{exit_label}\n\n{body_label}:\n",
                     condition.0
                 ));
-                let _ = emit_block(&while_expression.body, state)?;
+                let _ = emit_block(&while_expression.body, state, callable_signatures)?;
                 state
                     .body
                     .push_str(&format!("  br label %{condition_label}\n\n{exit_label}:\n"));
@@ -621,8 +668,9 @@ fn emit_block(
 fn emit_assignment(
     assignment: &ScalarAssignment,
     state: &mut EmitState,
+    callable_signatures: &BTreeMap<String, ScalarType>,
 ) -> Result<(String, LlvmValueType), String> {
-    let value = emit_expression(&assignment.value, state)?;
+    let value = emit_expression(&assignment.value, state, callable_signatures)?;
     let (slot, value_type) = state
         .storage
         .get(&assignment.target)
@@ -645,6 +693,7 @@ fn emit_assignment(
 fn emit_expression(
     expression: &ScalarExpression,
     state: &mut EmitState,
+    callable_signatures: &BTreeMap<String, ScalarType>,
 ) -> Result<(String, LlvmValueType), String> {
     match expression {
         ScalarExpression::Name { name, .. } => state
@@ -678,8 +727,8 @@ fn emit_expression(
             right,
             ..
         } => {
-            let left = emit_expression(left, state)?;
-            let right = emit_expression(right, state)?;
+            let left = emit_expression(left, state, callable_signatures)?;
+            let right = emit_expression(right, state, callable_signatures)?;
             let result = state.value();
             let instruction = match operator {
                 BinaryOperator::Add => format!("add i32 {}", operands(&left, &right)),
@@ -721,18 +770,37 @@ fn emit_expression(
         } => {
             let arguments = arguments
                 .iter()
-                .map(|argument| emit_expression(argument, state))
+                .map(|argument| emit_expression(argument, state, callable_signatures))
                 .collect::<Result<Vec<_>, _>>()?;
-            let result = state.value();
+            let callable = callable_signatures
+                .get(name)
+                .ok_or_else(|| format!("unknown LLVM callable {name}"))?;
+            let ScalarType::Callable {
+                result: result_type,
+                ..
+            } = callable
+            else {
+                return Err(format!("LLVM value {name} is not callable"));
+            };
+            let result_type = value_type(result_type)?;
             let args = arguments
                 .iter()
                 .map(|value| format!("{} {}", llvm_type(value.1), value.0))
                 .collect::<Vec<_>>()
                 .join(", ");
-            state
-                .body
-                .push_str(&format!("  {result} = call i32 @{name}({args})\n"));
-            Ok((result, LlvmValueType::I32))
+            if result_type == LlvmValueType::Void {
+                state
+                    .body
+                    .push_str(&format!("  call void @{name}({args})\n"));
+                Ok(("0".to_owned(), result_type))
+            } else {
+                let result = state.value();
+                state.body.push_str(&format!(
+                    "  {result} = call {} @{name}({args})\n",
+                    llvm_type(result_type)
+                ));
+                Ok((result, result_type))
+            }
         }
         ScalarExpression::If {
             condition,
@@ -740,7 +808,7 @@ fn emit_expression(
             else_branch,
             ..
         } => {
-            let condition = emit_expression(condition, state)?;
+            let condition = emit_expression(condition, state, callable_signatures)?;
             let then_label = state.block("if.then");
             let else_label = state.block("if.else");
             let merge_label = state.block("if.merge");
@@ -748,11 +816,11 @@ fn emit_expression(
                 "  br i1 {}, label %{then_label}, label %{else_label}\n\n{then_label}:\n",
                 condition.0
             ));
-            let then_value = emit_block(then_branch, state)?;
+            let then_value = emit_block(then_branch, state, callable_signatures)?;
             state
                 .body
                 .push_str(&format!("  br label %{merge_label}\n\n{else_label}:\n"));
-            let else_value = emit_block(else_branch, state)?;
+            let else_value = emit_block(else_branch, state, callable_signatures)?;
             state
                 .body
                 .push_str(&format!("  br label %{merge_label}\n\n{merge_label}:\n"));
@@ -767,7 +835,7 @@ fn emit_expression(
             ));
             Ok((result, then_value.1))
         }
-        ScalarExpression::Block(block) => emit_block(block, state),
+        ScalarExpression::Block(block) => emit_block(block, state, callable_signatures),
     }
 }
 
@@ -977,5 +1045,103 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn emits_typed_single_file_calls() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let parsed = parse_source(
+            source,
+            "%%start\nbool() flag = fn { true };\nunit() touch = fn { i32 marker = 0; };\ni32() count = fn { 42 };\nbool selected = flag();\nunit done = touch();\ni32 result = count();\n%%end"
+                .to_owned(),
+            &[],
+        );
+        let validation = derive_scalar_program(&parsed.result);
+        let partition = emit_scalar_llvm(&validation).expect("valid scalar LLVM");
+        let main = partition
+            .functions
+            .iter()
+            .find(|function| function.name == "main")
+            .expect("main");
+        assert!(main.body.contains("= call i1 @flag()"));
+        assert!(main.body.contains("call void @touch()"));
+        assert!(main.body.contains("= call i32 @count()"));
+        assert!(!main.body.contains("= call void @touch()"));
+    }
+
+    #[test]
+    fn emits_typed_project_calls() {
+        let library_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/library.w".into(),
+            "r1".into(),
+        );
+        let main_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let library = derive_scalar_program(
+            &parse_source(
+                library_source.clone(),
+                "%%start\nbool() flag = fn { true };\nunit() touch = fn { i32 marker = 0; };\ni32() count = fn { 42 };\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let main = derive_scalar_program(
+            &parse_source(
+                main_source.clone(),
+                "%%start\nlibrary = namespace package \"src/library.w\";\nbool selected = library.flag();\nunit done = library.touch();\ni32 result = library.count();\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source.clone(),
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "library".into(),
+                        target: library_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(library_source.clone(), library.items, Vec::new()),
+            ],
+            vec![main_source, library_source.clone(), library_source],
+        ));
+        let partition = emit_scalar_project_llvm(&validation).expect("valid scalar LLVM project");
+        let main = partition
+            .functions
+            .iter()
+            .find(|function| function.name == "main")
+            .expect("main");
+        assert!(main
+            .body
+            .contains("= call i1 @package__src_library_w__flag()"));
+        assert!(main
+            .body
+            .contains("call void @package__src_library_w__touch()"));
+        assert!(main
+            .body
+            .contains("= call i32 @package__src_library_w__count()"));
+        assert!(!main
+            .body
+            .contains("= call void @package__src_library_w__touch()"));
     }
 }
