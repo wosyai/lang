@@ -4,12 +4,12 @@ source_filename = "src/main.w"
 @observed = internal global i1 false
 @result = internal global i32 0
 
-define i1 @flag(i32 %value) {
+define i1 @flag(i32 %flag_value) {
 entry:
-  %value1 = alloca i32, align 4
-  store i32 %value, ptr %value1, align 4
-  %value2 = load i32, ptr %value1, align 4
-  %eq = icmp eq i32 %value2, 42
+  %flag_value1 = alloca i32, align 4
+  store i32 %flag_value, ptr %flag_value1, align 4
+  %flag_value2 = load i32, ptr %flag_value1, align 4
+  %eq = icmp eq i32 %flag_value2, 42
   ret i1 %eq
 }
 

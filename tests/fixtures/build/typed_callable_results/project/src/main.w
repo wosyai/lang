@@ -1,6 +1,6 @@
 %%start
-bool(i32) flag = fn(value) {
-	value == 42
+bool(i32) flag = fn(flag_value) {
+	flag_value == 42
 };
 
 i32(i32) value = fn(input) {
