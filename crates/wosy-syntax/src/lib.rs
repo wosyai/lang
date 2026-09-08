@@ -274,7 +274,6 @@ impl ParseResult {
 
 pub fn parse(source: SourceIdentity, text: String, configured_comments: &[String]) -> ParseResult {
     let mut errors = Vec::new();
-    errors.extend(leading_space_indentation_errors(&text));
     let comments = scan_comments(&text, configured_comments, &mut errors);
     let mut builder = GreenNodeBuilder::new();
     builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Root));
@@ -302,24 +301,6 @@ pub fn parse(source: SourceIdentity, text: String, configured_comments: &[String
         comments,
         errors,
     }
-}
-
-fn leading_space_indentation_errors(text: &str) -> Vec<SyntaxError> {
-    let mut errors = Vec::new();
-    let mut line_start = 0;
-    for line in text.split_inclusive('\n') {
-        let content = line.strip_suffix('\n').unwrap_or(line);
-        let indentation = content.len() - content.trim_start_matches(' ').len();
-        let remainder = &content[indentation..];
-        if indentation > 0 && remainder.bytes().any(|byte| byte != b'\r' && byte != b'\t') {
-            errors.push(SyntaxError {
-                span: ByteSpan::new(line_start as u32, (line_start + indentation) as u32),
-                message: "spaces are not valid logical indentation; use tabs".to_owned(),
-            });
-        }
-        line_start += line.len();
-    }
-    errors
 }
 
 fn build_pair(
@@ -554,16 +535,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_space_indentation_and_preserves_source() {
+    fn accepts_space_indentation_and_preserves_source() {
         let text = "%%start\ni32() main = fn {\n  1 + 2\n};\n%%end";
         let result = parse(identity(), text.into(), &[]);
-        assert!(!result.is_valid());
+        assert!(result.is_valid());
         assert_eq!(result.reconstruct(), text);
-        assert_eq!(result.errors[0].span, ByteSpan::new(26, 28));
-        assert_eq!(
-            result.errors[0].message,
-            "spaces are not valid logical indentation; use tabs"
-        );
     }
 
     #[test]
