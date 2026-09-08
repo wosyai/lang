@@ -200,7 +200,7 @@ impl ScalarModule {
                 }
                 ScalarItem::Executable(_) => continue,
             };
-            members.insert(name.clone(), ty.clone());
+            members.entry(name.clone()).or_insert_with(|| ty.clone());
             initialization_nodes.push(ScalarInitializationNode { item_index, span });
         }
         Self {
@@ -300,6 +300,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
     for module in &project.modules {
         let mut declarations = BTreeMap::new();
         let mut declaration_names = BTreeSet::new();
+        let mut folded_declarations = BTreeMap::new();
         for item in &module.items {
             let (name, span, ty) = match item {
                 ScalarItem::Namespace(namespace) => (&namespace.binding, namespace.span, None),
@@ -311,17 +312,18 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                 }
                 ScalarItem::Executable(_) => continue,
             };
-            if !declaration_names.insert(name.clone()) {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0002",
-                    "duplicate declaration",
-                    span,
-                ));
-            }
-            if let Some(ty) = ty {
-                declarations.insert(name.clone(), ty.clone());
-                validate_module_type(module, ty, span, &mut diagnostics);
+            if declare_module_name(
+                module,
+                name,
+                span,
+                &mut declaration_names,
+                &mut folded_declarations,
+                &mut diagnostics,
+            ) {
+                if let Some(ty) = ty {
+                    declarations.insert(name.clone(), ty.clone());
+                    validate_module_type(module, ty, span, &mut diagnostics);
+                }
             }
         }
         for item in &module.items {
@@ -332,6 +334,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         &binding.value,
                         &declarations,
                         &BTreeSet::new(),
+                        &BTreeMap::new(),
                         module,
                         &project.modules,
                         &mut diagnostics,
@@ -358,22 +361,26 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                     }
                     let mut scope = declarations.clone();
                     let mut visible_names = declaration_names.clone();
+                    let mut folded_names = folded_declarations.clone();
                     for (index, name) in function.parameters.iter().enumerate() {
-                        if index < parameters.len() && visible_names.insert(name.clone()) {
-                            scope.insert(name.clone(), parameters[index].clone());
-                        } else if index < parameters.len() {
-                            diagnostics.push(module_diagnostic(
+                        if index < parameters.len()
+                            && declare_module_name(
                                 module,
-                                "B0002",
-                                "duplicate declaration",
+                                name,
                                 function.span,
-                            ));
+                                &mut visible_names,
+                                &mut folded_names,
+                                &mut diagnostics,
+                            )
+                        {
+                            scope.insert(name.clone(), parameters[index].clone());
                         }
                     }
                     let actual = block_type_in_module(
                         &function.body,
                         &scope,
                         &visible_names,
+                        &folded_names,
                         module,
                         &project.modules,
                         &mut diagnostics,
@@ -389,10 +396,12 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                 ScalarItem::Executable(executable) => {
                     let mut scope = declarations.clone();
                     let mut visible_names = declaration_names.clone();
+                    let mut folded_names = folded_declarations.clone();
                     let _ = block_item_type_in_module(
                         executable,
                         &mut scope,
                         &mut visible_names,
+                        &mut folded_names,
                         module,
                         &project.modules,
                         &mut diagnostics,
@@ -434,18 +443,21 @@ fn block_type_in_module(
     block: &ScalarBlock,
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut visible_names = visible_names.clone();
+    let mut folded_names = folded_names.clone();
     let mut result = ScalarType::Unit;
     for (index, item) in block.items.iter().enumerate() {
         result = block_item_type_in_module(
             item,
             &mut scope,
             &mut visible_names,
+            &mut folded_names,
             module,
             modules,
             diagnostics,
@@ -461,6 +473,7 @@ fn block_item_type_in_module(
     item: &ScalarBlockItem,
     scope: &mut BTreeMap<String, ScalarType>,
     visible_names: &mut BTreeSet<String>,
+    folded_names: &mut BTreeMap<String, (String, ByteSpan)>,
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -471,6 +484,7 @@ fn block_item_type_in_module(
                 &binding.value,
                 scope,
                 visible_names,
+                folded_names,
                 module,
                 modules,
                 diagnostics,
@@ -482,15 +496,15 @@ fn block_item_type_in_module(
                 binding.span,
                 diagnostics,
             );
-            if visible_names.insert(binding.name.clone()) {
+            if declare_module_name(
+                module,
+                &binding.name,
+                binding.span,
+                visible_names,
+                folded_names,
+                diagnostics,
+            ) {
                 scope.insert(binding.name.clone(), binding.declared_type.clone());
-            } else {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0002",
-                    "duplicate declaration",
-                    binding.span,
-                ));
             }
             ScalarType::Unit
         }
@@ -498,6 +512,7 @@ fn block_item_type_in_module(
             expression,
             scope,
             visible_names,
+            folded_names,
             module,
             modules,
             diagnostics,
@@ -506,6 +521,7 @@ fn block_item_type_in_module(
             assignment,
             scope,
             visible_names,
+            folded_names,
             module,
             modules,
             diagnostics,
@@ -514,6 +530,7 @@ fn block_item_type_in_module(
             while_expression,
             scope,
             visible_names,
+            folded_names,
             module,
             modules,
             diagnostics,
@@ -525,6 +542,7 @@ fn assignment_type_in_module(
     assignment: &ScalarAssignment,
     scope: &mut BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -533,6 +551,7 @@ fn assignment_type_in_module(
         &assignment.value,
         scope,
         visible_names,
+        folded_names,
         module,
         modules,
         diagnostics,
@@ -624,6 +643,7 @@ fn while_type_in_module(
     while_expression: &ScalarWhile,
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -632,6 +652,7 @@ fn while_type_in_module(
         &while_expression.condition,
         scope,
         visible_names,
+        folded_names,
         module,
         modules,
         diagnostics,
@@ -648,6 +669,7 @@ fn while_type_in_module(
         &while_expression.body,
         scope,
         visible_names,
+        folded_names,
         module,
         modules,
         diagnostics,
@@ -659,6 +681,7 @@ fn expression_type_in_module(
     expression: &ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -715,12 +738,20 @@ fn expression_type_in_module(
             right,
             span,
         } => {
-            let left_type =
-                expression_type_in_module(left, scope, visible_names, module, modules, diagnostics);
+            let left_type = expression_type_in_module(
+                left,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+            );
             let right_type = expression_type_in_module(
                 right,
                 scope,
                 visible_names,
+                folded_names,
                 module,
                 modules,
                 diagnostics,
@@ -826,6 +857,7 @@ fn expression_type_in_module(
                     argument,
                     scope,
                     visible_names,
+                    folded_names,
                     module,
                     modules,
                     diagnostics,
@@ -844,6 +876,7 @@ fn expression_type_in_module(
                 condition,
                 scope,
                 visible_names,
+                folded_names,
                 module,
                 modules,
                 diagnostics,
@@ -859,6 +892,7 @@ fn expression_type_in_module(
                 then_branch,
                 scope,
                 visible_names,
+                folded_names,
                 module,
                 modules,
                 diagnostics,
@@ -867,6 +901,7 @@ fn expression_type_in_module(
                 else_branch,
                 scope,
                 visible_names,
+                folded_names,
                 module,
                 modules,
                 diagnostics,
@@ -881,9 +916,15 @@ fn expression_type_in_module(
             }
             then_type
         }
-        ScalarExpression::Block(block) => {
-            block_type_in_module(block, scope, visible_names, module, modules, diagnostics)
-        }
+        ScalarExpression::Block(block) => block_type_in_module(
+            block,
+            scope,
+            visible_names,
+            folded_names,
+            module,
+            modules,
+            diagnostics,
+        ),
     }
 }
 
@@ -921,6 +962,61 @@ fn module_diagnostic(
         }],
         notes: Vec::new(),
     }
+}
+
+fn fold_name(name: &str) -> String {
+    name.bytes()
+        .map(|byte| byte.to_ascii_lowercase() as char)
+        .collect()
+}
+
+fn declare_module_name(
+    module: &ScalarModule,
+    name: &str,
+    span: ByteSpan,
+    names: &mut BTreeSet<String>,
+    folded_names: &mut BTreeMap<String, (String, ByteSpan)>,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> bool {
+    if !names.insert(name.to_owned()) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0002",
+            "duplicate declaration",
+            span,
+        ));
+        return false;
+    }
+    let folded = fold_name(name);
+    if let Some((first_name, first_span)) = folded_names.get(&folded) {
+        if first_name != name {
+            names.remove(name);
+            diagnostics.push(module_collision_diagnostic(module, span, *first_span));
+            return false;
+        }
+    } else {
+        folded_names.insert(folded, (name.to_owned(), span));
+    }
+    true
+}
+
+fn module_collision_diagnostic(
+    module: &ScalarModule,
+    span: ByteSpan,
+    first_span: ByteSpan,
+) -> super::Diagnostic {
+    let mut diagnostic = module_diagnostic(
+        module,
+        "B0008",
+        "declaration collides with an existing name under ASCII case folding",
+        span,
+    );
+    diagnostic.labels.push(super::DiagnosticLabel {
+        kind: super::DiagnosticLabelKind::Secondary,
+        span: SourceSpan::new(module.source.clone(), first_span),
+        message: "first conflicting declaration".to_owned(),
+    });
+    diagnostic
 }
 
 fn unknown_member_diagnostic(
@@ -1378,6 +1474,7 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut declarations = BTreeMap::new();
     let mut declaration_names = BTreeSet::new();
+    let mut folded_declarations = BTreeMap::new();
     for item in &program.items {
         let (name, span, ty) = match item {
             ScalarItem::Namespace(namespace) => (&namespace.binding, namespace.span, None),
@@ -1389,12 +1486,18 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
             }
             ScalarItem::Executable(_) => continue,
         };
-        if !declaration_names.insert(name.clone()) {
-            diagnostics.push(diagnostic(program, "B0002", "duplicate declaration", span));
-        }
-        if let Some(ty) = ty {
-            declarations.insert(name.clone(), ty.clone());
-            validate_type(program, ty, span, &mut diagnostics);
+        if declare_program_name(
+            program,
+            name,
+            span,
+            &mut declaration_names,
+            &mut folded_declarations,
+            &mut diagnostics,
+        ) {
+            if let Some(ty) = ty {
+                declarations.insert(name.clone(), ty.clone());
+                validate_type(program, ty, span, &mut diagnostics);
+            }
         }
     }
     let mut scope = declarations.clone();
@@ -1406,6 +1509,7 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     &binding.value,
                     &declarations,
                     &BTreeSet::new(),
+                    &BTreeMap::new(),
                     program,
                     &mut diagnostics,
                 );
@@ -1423,22 +1527,26 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                 };
                 let mut scope = declarations.clone();
                 let mut visible_names = declaration_names.clone();
+                let mut folded_names = folded_declarations.clone();
                 for (index, name) in function.parameters.iter().enumerate() {
-                    if index < parameters.len() && visible_names.insert(name.clone()) {
-                        scope.insert(name.clone(), parameters[index].clone());
-                    } else if index < parameters.len() {
-                        diagnostics.push(diagnostic(
+                    if index < parameters.len()
+                        && declare_program_name(
                             program,
-                            "B0002",
-                            "duplicate declaration",
+                            name,
                             function.span,
-                        ));
+                            &mut visible_names,
+                            &mut folded_names,
+                            &mut diagnostics,
+                        )
+                    {
+                        scope.insert(name.clone(), parameters[index].clone());
                     }
                 }
                 let actual = block_type(
                     &function.body,
                     &scope,
                     &visible_names,
+                    &folded_names,
                     program,
                     &mut diagnostics,
                 );
@@ -1460,10 +1568,12 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
             }
             ScalarItem::Executable(executable) => {
                 let mut visible_names = declaration_names.clone();
+                let mut folded_names = folded_declarations.clone();
                 let _ = block_item_type(
                     executable,
                     &mut scope,
                     &mut visible_names,
+                    &mut folded_names,
                     program,
                     &mut diagnostics,
                 );
@@ -1497,14 +1607,23 @@ fn block_type(
     block: &ScalarBlock,
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut visible_names = visible_names.clone();
+    let mut folded_names = folded_names.clone();
     let mut result = ScalarType::Unit;
     for (index, item) in block.items.iter().enumerate() {
-        result = block_item_type(item, &mut scope, &mut visible_names, program, diagnostics);
+        result = block_item_type(
+            item,
+            &mut scope,
+            &mut visible_names,
+            &mut folded_names,
+            program,
+            diagnostics,
+        );
         if index + 1 == block.items.len() && block.terminated_items[index] {
             result = ScalarType::Unit;
         }
@@ -1516,13 +1635,20 @@ fn block_item_type(
     item: &ScalarBlockItem,
     scope: &mut BTreeMap<String, ScalarType>,
     visible_names: &mut BTreeSet<String>,
+    folded_names: &mut BTreeMap<String, (String, ByteSpan)>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            let actual =
-                expression_type(&binding.value, scope, visible_names, program, diagnostics);
+            let actual = expression_type(
+                &binding.value,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+            );
             expect_type(
                 program,
                 &binding.declared_type,
@@ -1530,27 +1656,42 @@ fn block_item_type(
                 binding.span,
                 diagnostics,
             );
-            if visible_names.insert(binding.name.clone()) {
+            if declare_program_name(
+                program,
+                &binding.name,
+                binding.span,
+                visible_names,
+                folded_names,
+                diagnostics,
+            ) {
                 scope.insert(binding.name.clone(), binding.declared_type.clone());
-            } else {
-                diagnostics.push(diagnostic(
-                    program,
-                    "B0002",
-                    "duplicate declaration",
-                    binding.span,
-                ));
             }
             ScalarType::Unit
         }
-        ScalarBlockItem::Expression(expression) => {
-            expression_type(expression, scope, visible_names, program, diagnostics)
-        }
-        ScalarBlockItem::Assignment(assignment) => {
-            assignment_type(assignment, scope, visible_names, program, diagnostics)
-        }
-        ScalarBlockItem::While(while_expression) => {
-            while_type(while_expression, scope, visible_names, program, diagnostics)
-        }
+        ScalarBlockItem::Expression(expression) => expression_type(
+            expression,
+            scope,
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+        ),
+        ScalarBlockItem::Assignment(assignment) => assignment_type(
+            assignment,
+            scope,
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+        ),
+        ScalarBlockItem::While(while_expression) => while_type(
+            while_expression,
+            scope,
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+        ),
     }
 }
 
@@ -1558,6 +1699,7 @@ fn assignment_type(
     assignment: &ScalarAssignment,
     scope: &mut BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
@@ -1565,6 +1707,7 @@ fn assignment_type(
         &assignment.value,
         scope,
         visible_names,
+        folded_names,
         program,
         diagnostics,
     );
@@ -1609,6 +1752,7 @@ fn while_type(
     while_expression: &ScalarWhile,
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
@@ -1616,6 +1760,7 @@ fn while_type(
         &while_expression.condition,
         scope,
         visible_names,
+        folded_names,
         program,
         diagnostics,
     );
@@ -1631,6 +1776,7 @@ fn while_type(
         &while_expression.body,
         scope,
         visible_names,
+        folded_names,
         program,
         diagnostics,
     );
@@ -1641,6 +1787,7 @@ fn expression_type(
     expression: &ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
@@ -1668,8 +1815,22 @@ fn expression_type(
             right,
             span,
         } => {
-            let left_type = expression_type(left, scope, visible_names, program, diagnostics);
-            let right_type = expression_type(right, scope, visible_names, program, diagnostics);
+            let left_type = expression_type(
+                left,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+            );
+            let right_type = expression_type(
+                right,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+            );
             let comparison = matches!(
                 operator,
                 BinaryOperator::Equal
@@ -1716,7 +1877,14 @@ fn expression_type(
                 ));
             }
             for (argument, parameter) in arguments.iter().zip(parameters) {
-                let actual = expression_type(argument, scope, visible_names, program, diagnostics);
+                let actual = expression_type(
+                    argument,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                );
                 expect_type(program, parameter, &actual, *span, diagnostics);
             }
             (**result).clone()
@@ -1727,8 +1895,14 @@ fn expression_type(
             else_branch,
             span,
         } => {
-            let condition_type =
-                expression_type(condition, scope, visible_names, program, diagnostics);
+            let condition_type = expression_type(
+                condition,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+            );
             if condition_type != ScalarType::Bool {
                 diagnostics.push(diagnostic(
                     program,
@@ -1737,8 +1911,22 @@ fn expression_type(
                     *span,
                 ));
             }
-            let then_type = block_type(then_branch, scope, visible_names, program, diagnostics);
-            let else_type = block_type(else_branch, scope, visible_names, program, diagnostics);
+            let then_type = block_type(
+                then_branch,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+            );
+            let else_type = block_type(
+                else_branch,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+            );
             if then_type != else_type {
                 diagnostics.push(diagnostic(
                     program,
@@ -1749,9 +1937,14 @@ fn expression_type(
             }
             then_type
         }
-        ScalarExpression::Block(block) => {
-            block_type(block, scope, visible_names, program, diagnostics)
-        }
+        ScalarExpression::Block(block) => block_type(
+            block,
+            scope,
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+        ),
     }
 }
 
@@ -1855,6 +2048,42 @@ fn diagnostic(
         }],
         notes: Vec::new(),
     }
+}
+
+fn declare_program_name(
+    program: &ScalarProgram,
+    name: &str,
+    span: ByteSpan,
+    names: &mut BTreeSet<String>,
+    folded_names: &mut BTreeMap<String, (String, ByteSpan)>,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> bool {
+    if !names.insert(name.to_owned()) {
+        diagnostics.push(diagnostic(program, "B0002", "duplicate declaration", span));
+        return false;
+    }
+    let folded = fold_name(name);
+    if let Some((first_name, first_span)) = folded_names.get(&folded) {
+        if first_name != name {
+            names.remove(name);
+            let mut collision = diagnostic(
+                program,
+                "B0008",
+                "declaration collides with an existing name under ASCII case folding",
+                span,
+            );
+            collision.labels.push(super::DiagnosticLabel {
+                kind: super::DiagnosticLabelKind::Secondary,
+                span: SourceSpan::new(program.source.clone(), *first_span),
+                message: "first conflicting declaration".to_owned(),
+            });
+            diagnostics.push(collision);
+            return false;
+        }
+    } else {
+        folded_names.insert(folded, (name.to_owned(), span));
+    }
+    true
 }
 
 #[cfg(test)]
@@ -2182,6 +2411,7 @@ mod tests {
                 &while_expression.body,
                 &BTreeMap::new(),
                 &BTreeSet::new(),
+                &BTreeMap::new(),
                 &result.program,
                 &mut Vec::new()
             ),
@@ -2394,6 +2624,68 @@ mod tests {
         };
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].labels[0].span.range, second.span);
+    }
+
+    #[test]
+    fn reports_ascii_case_collision_with_first_declaration_label_in_single_file() {
+        let result = validate_text("%%start\ni32 value = 1;\ni32 VALUE = 2;\n%%end");
+        let first_span = match &result.program.items[0] {
+            ScalarItem::Binding(binding) => binding.span,
+            _ => panic!("first binding"),
+        };
+        let second_span = match &result.program.items[1] {
+            ScalarItem::Binding(binding) => binding.span,
+            _ => panic!("second binding"),
+        };
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0008")
+            .expect("case collision diagnostic");
+        assert_eq!(diagnostic.labels[0].span.range, second_span);
+        assert_eq!(
+            diagnostic.labels[1].kind,
+            crate::DiagnosticLabelKind::Secondary
+        );
+        assert_eq!(diagnostic.labels[1].span.range, first_span);
+    }
+
+    #[test]
+    fn reports_case_collisions_for_parameters_and_locals_without_changing_lookup() {
+        let result = validate_text(
+            "%%start\ni32(i32, i32) parameter_collision = fn(first, FIRST) { first };\ni32(i32) local_collision = fn(value) { i32 VALUE = value; i32 value = value; value };\n%%end",
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0008")
+                .count(),
+            2
+        );
+        assert!(!result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0001"));
+    }
+
+    #[test]
+    fn reports_ascii_case_collision_in_project_namespace_scope() {
+        let source = module_source("src/main.w");
+        let program = module_from_text(
+            source.clone(),
+            "%%start\nmath = namespace app \"src/math.w\";\nMATH = namespace app \"src/other.w\";\n%%end",
+        );
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source, program.items, Vec::new())],
+            Vec::new(),
+        ));
+        let diagnostic = validation
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0008")
+            .expect("project case collision diagnostic");
+        assert_eq!(diagnostic.labels.len(), 2);
     }
 
     fn module_source(path: &str) -> SourceIdentity {
