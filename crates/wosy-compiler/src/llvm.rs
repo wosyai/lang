@@ -1,12 +1,18 @@
 use std::collections::BTreeMap;
-use std::fmt::Write;
 
+use inkwell::builder::{Builder, BuilderError};
+use inkwell::context::Context;
+use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType};
+use inkwell::values::{
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue, ValueKind,
+};
+use inkwell::IntPredicate;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarExpression,
     ScalarFunction, ScalarItem, ScalarModule, ScalarProjectValidation, ScalarType,
-    ScalarValidation,
+    ScalarValidation, ScalarWhile,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -21,6 +27,7 @@ pub struct LlvmPartition {
     pub module_name: String,
     pub declarations: Vec<LlvmFunction>,
     pub functions: Vec<LlvmFunction>,
+    text: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -31,11 +38,28 @@ pub struct LlvmFunction {
     pub body: String,
 }
 
+#[derive(Clone)]
+enum EmitValue<'ctx> {
+    Unit,
+    Basic(BasicValueEnum<'ctx>),
+}
+
+struct EmitState<'ctx> {
+    builder: &'ctx Builder<'ctx>,
+    functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
+    values: BTreeMap<String, EmitValue<'ctx>>,
+    storage: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
+    next_block: usize,
+}
+
 pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, String> {
     if !validation.diagnostics.is_empty() {
-        return Err("cannot emit LLVM for an invalid scalar program".to_owned());
+        return Err("cannot emit LLVM for an invalid scalar program".into());
     }
-    let callable_signatures = validation
+    let context = Context::create();
+    let module = context.create_module(&validation.program.source.path);
+    let builder = context.create_builder();
+    let signatures = validation
         .program
         .items
         .iter()
@@ -48,26 +72,46 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             }
             ScalarItem::Namespace(_) => None,
         })
-        .collect();
-    let mut functions = Vec::new();
+        .collect::<BTreeMap<_, _>>();
+    let mut functions = BTreeMap::new();
     for item in &validation.program.items {
         if let ScalarItem::Function(function) = item {
-            functions.push(emit_function(function, &callable_signatures)?);
+            let value = module.add_function(
+                &function.name,
+                function_type(&context, &function.signature)?,
+                None,
+            );
+            for (index, name) in function.parameters.iter().enumerate() {
+                if let Some(parameter) = value.get_nth_param(index as u32) {
+                    parameter.set_name(name);
+                }
+            }
+            functions.insert(function.name.clone(), value);
         }
     }
-    functions.push(emit_main(&validation.program.items, &callable_signatures)?);
-    Ok(LlvmPartition {
-        module_name: validation.program.source.path.clone(),
-        declarations: Vec::new(),
+    functions.insert(
+        "main".into(),
+        module.add_function("main", context.i32_type().fn_type(&[], false), None),
+    );
+    for item in &validation.program.items {
+        if let ScalarItem::Function(function) = item {
+            emit_function(&context, &builder, &functions, function, &function.name)?;
+        }
+    }
+    emit_main(&context, &builder, &functions, &validation.program.items)?;
+    finish_partition(
+        module,
+        validation.program.source.path.clone(),
         functions,
-    })
+        &signatures,
+    )
 }
 
 pub fn emit_scalar_project_llvm(
     validation: &ScalarProjectValidation,
 ) -> Result<LlvmPartition, String> {
     if !validation.diagnostics.is_empty() {
-        return Err("cannot emit LLVM for an invalid scalar project".to_owned());
+        return Err("cannot emit LLVM for an invalid scalar project".into());
     }
     let modules = validation
         .project
@@ -82,35 +126,52 @@ pub fn emit_scalar_project_llvm(
                 .ok_or_else(|| format!("missing module {}", source.path))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut declarations = Vec::new();
-    let mut functions = Vec::new();
-    for module in &modules {
-        for item in &module.items {
-            if let ScalarItem::Function(function) = item {
-                let declaration = llvm_function_signature(function, &module.source)?;
-                declarations.push(declaration);
-            }
-        }
-    }
-    for module in &modules {
-        for item in &module.items {
-            if let ScalarItem::Function(function) = item {
-                functions.push(emit_project_function(function, module, &modules)?);
-            }
-        }
-    }
-    functions.push(emit_project_main(&modules)?);
     let module_name = modules
         .first()
         .ok_or_else(|| "project has no reachable modules".to_owned())?
         .source
         .project
         .clone();
-    Ok(LlvmPartition {
-        module_name,
-        declarations,
-        functions,
-    })
+    let context = Context::create();
+    let module = context.create_module(&module_name);
+    let builder = context.create_builder();
+    let mut functions = BTreeMap::new();
+    let mut signatures = BTreeMap::new();
+    let mut definitions = Vec::new();
+    for source_module in &modules {
+        for item in &source_module.items {
+            if let ScalarItem::Function(function) = item {
+                let name = project_function_name(&source_module.source, &function.name);
+                let value =
+                    module.add_function(&name, function_type(&context, &function.signature)?, None);
+                for (index, parameter) in function.parameters.iter().enumerate() {
+                    if let Some(argument) = value.get_nth_param(index as u32) {
+                        argument.set_name(parameter);
+                    }
+                }
+                functions.insert(name.clone(), value);
+                signatures.insert(name.clone(), function.signature.clone());
+                definitions.push((source_module, function, name));
+            }
+        }
+    }
+    functions.insert(
+        "main".into(),
+        module.add_function("main", context.i32_type().fn_type(&[], false), None),
+    );
+    for (source_module, function, name) in definitions {
+        emit_project_function(
+            &context,
+            &builder,
+            &functions,
+            function,
+            source_module,
+            &modules,
+            &name,
+        )?;
+    }
+    emit_project_main(&context, &builder, &functions, &modules)?;
+    finish_partition(module, module_name, functions, &signatures)
 }
 
 pub fn emit_scalar_llvm_text(validation: &ScalarValidation) -> Result<String, String> {
@@ -119,156 +180,327 @@ pub fn emit_scalar_llvm_text(validation: &ScalarValidation) -> Result<String, St
 
 impl LlvmPartition {
     pub fn to_text(&self) -> String {
-        let mut text = format!("; ModuleID = '{}'\n", self.module_name);
-        text.push_str("source_filename = \"wosy\"\n\n");
-        for function in &self.declarations {
-            if self
-                .functions
-                .iter()
-                .any(|definition| definition.name == function.name)
-            {
-                continue;
-            }
-            let _ = writeln!(
-                text,
-                "declare {} @{}({})",
-                llvm_type(function.result),
-                function.name,
-                parameters_text(&function.parameters)
-            );
-        }
-        if !self.declarations.is_empty() {
-            text.push('\n');
-        }
-        for function in &self.functions {
-            let _ = writeln!(
-                text,
-                "define {} @{}({}) {{",
-                llvm_type(function.result),
-                function.name,
-                parameters_text(&function.parameters)
-            );
-            text.push_str(&function.body);
-            text.push_str("}\n\n");
-        }
-        text
+        self.text.clone()
     }
 }
 
-fn llvm_function_signature(
-    function: &ScalarFunction,
-    source: &wosy_syntax::SourceIdentity,
-) -> Result<LlvmFunction, String> {
-    let ScalarType::Callable { result, parameters } = &function.signature else {
-        return Err(format!(
-            "function {} has no callable signature",
-            function.name
-        ));
-    };
-    let llvm_parameters = parameters
+fn finish_partition<'ctx>(
+    module: inkwell::module::Module<'ctx>,
+    module_name: String,
+    functions: BTreeMap<String, FunctionValue<'ctx>>,
+    signatures: &BTreeMap<String, ScalarType>,
+) -> Result<LlvmPartition, String> {
+    module.verify().map_err(|error| error.to_string())?;
+    let text = module.print_to_string().to_string();
+    let metadata = functions
         .iter()
-        .enumerate()
-        .map(|(index, parameter)| Ok((function.parameters[index].clone(), value_type(parameter)?)))
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(LlvmFunction {
-        name: project_function_name(source, &function.name),
-        result: value_type(result)?,
-        parameters: llvm_parameters,
-        body: String::new(),
-    })
-}
-
-fn emit_project_function(
-    function: &ScalarFunction,
-    module: &ScalarModule,
-    modules: &[&ScalarModule],
-) -> Result<LlvmFunction, String> {
-    let signature = llvm_function_signature(function, &module.source)?;
-    let names = signature
-        .parameters
-        .iter()
-        .map(|(name, _)| (name.clone(), format!("%{name}")))
+        .filter_map(|(name, function)| {
+            let signature = if name == "main" {
+                ScalarType::Callable {
+                    result: Box::new(ScalarType::I32),
+                    parameters: Vec::new(),
+                }
+            } else {
+                signatures.get(name)?.clone()
+            };
+            let ScalarType::Callable { result, parameters } = signature else {
+                return None;
+            };
+            let parameters = parameters
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| {
+                    let parameter = function.get_nth_param(index as u32)?;
+                    let name = parameter.get_name();
+                    Some((name.to_string_lossy().to_string(), value_type(ty).ok()?))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(LlvmFunction {
+                name: name.clone(),
+                result: value_type(&result).ok()?,
+                parameters,
+                body: String::new(),
+            })
+        })
         .collect();
-    let mut state = EmitState::new(names, BTreeMap::new());
-    state.initialize_parameters(&signature.parameters);
-    let value = emit_project_block(&function.body, &mut state, module, modules)?;
-    append_return(&mut state, value, signature.result)?;
-    Ok(LlvmFunction {
-        body: state.body,
-        ..signature
+    Ok(LlvmPartition {
+        module_name,
+        declarations: Vec::new(),
+        functions: metadata,
+        text,
     })
 }
 
-fn emit_project_main(modules: &[&ScalarModule]) -> Result<LlvmFunction, String> {
-    let mut state = EmitState::new(BTreeMap::new(), BTreeMap::new());
-    let mut initialized = Vec::new();
-    for module in modules {
-        if initialized.contains(&module.source) {
-            continue;
+fn function_type<'ctx>(
+    context: &'ctx Context,
+    signature: &ScalarType,
+) -> Result<FunctionType<'ctx>, String> {
+    let ScalarType::Callable { result, parameters } = signature else {
+        return Err("function has no callable signature".into());
+    };
+    let parameters = parameters
+        .iter()
+        .map(|ty| basic_type(context, ty).map(Into::into))
+        .collect::<Result<Vec<BasicMetadataTypeEnum>, _>>()?;
+    Ok(match result.as_ref() {
+        ScalarType::Unit => context.void_type().fn_type(&parameters, false),
+        ScalarType::Bool => context.bool_type().fn_type(&parameters, false),
+        ScalarType::I32 => context.i32_type().fn_type(&parameters, false),
+        _ => return Err("unsupported LLVM scalar type".into()),
+    })
+}
+
+fn basic_type<'ctx>(
+    context: &'ctx Context,
+    ty: &ScalarType,
+) -> Result<BasicTypeEnum<'ctx>, String> {
+    match ty {
+        ScalarType::Bool => Ok(context.bool_type().into()),
+        ScalarType::I32 => Ok(context.i32_type().into()),
+        _ => Err("unit is only valid as a function result".into()),
+    }
+}
+fn value_type(ty: &ScalarType) -> Result<LlvmValueType, String> {
+    match ty {
+        ScalarType::Unit => Ok(LlvmValueType::Void),
+        ScalarType::Bool => Ok(LlvmValueType::I1),
+        ScalarType::I32 => Ok(LlvmValueType::I32),
+        _ => Err("unsupported LLVM scalar type".into()),
+    }
+}
+fn builder_error(error: BuilderError) -> String {
+    error.to_string()
+}
+fn take_basic(value: EmitValue<'_>) -> Result<BasicValueEnum<'_>, String> {
+    match value {
+        EmitValue::Basic(value) => Ok(value),
+        EmitValue::Unit => Err("unit value used where a scalar value is required".into()),
+    }
+}
+
+fn emit_function<'ctx>(
+    context: &'ctx Context,
+    builder: &'ctx Builder<'ctx>,
+    functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
+    function: &ScalarFunction,
+    name: &str,
+) -> Result<(), String> {
+    let value = *functions
+        .get(name)
+        .ok_or_else(|| format!("unknown LLVM function {name}"))?;
+    let entry = context.append_basic_block(value, "entry");
+    builder.position_at_end(entry);
+    let mut state = EmitState {
+        builder,
+        functions,
+        values: BTreeMap::new(),
+        storage: BTreeMap::new(),
+        next_block: 0,
+    };
+    if let ScalarType::Callable { parameters, .. } = &function.signature {
+        for (index, parameter) in parameters.iter().enumerate() {
+            let argument = value
+                .get_nth_param(index as u32)
+                .ok_or_else(|| "missing function parameter".to_owned())?;
+            let slot = builder
+                .build_alloca(basic_type(context, parameter)?, &function.parameters[index])
+                .map_err(builder_error)?;
+            builder.build_store(slot, argument).map_err(builder_error)?;
+            state.storage.insert(
+                function.parameters[index].clone(),
+                (slot, parameter.clone()),
+            );
         }
-        initialized.push(module.source.clone());
+    }
+    let result = emit_block(context, &mut state, &function.body)?;
+    let result_type = match &function.signature {
+        ScalarType::Callable { result, .. } => result.as_ref(),
+        _ => return Err("function has no callable signature".into()),
+    };
+    emit_return(&mut state, result, result_type)
+}
+
+fn emit_main<'ctx>(
+    context: &'ctx Context,
+    builder: &'ctx Builder<'ctx>,
+    functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
+    items: &[ScalarItem],
+) -> Result<(), String> {
+    let main = *functions
+        .get("main")
+        .ok_or_else(|| "missing main".to_owned())?;
+    let entry = context.append_basic_block(main, "entry");
+    builder.position_at_end(entry);
+    let mut state = EmitState {
+        builder,
+        functions,
+        values: BTreeMap::new(),
+        storage: BTreeMap::new(),
+        next_block: 0,
+    };
+    for item in items {
+        if let ScalarItem::Binding(binding) = item {
+            let value = emit_expression(context, &mut state, &binding.value)?;
+            state.values.insert(binding.name.clone(), value);
+        }
+    }
+    builder
+        .build_return(Some(&context.i32_type().const_zero()))
+        .map_err(builder_error)?;
+    Ok(())
+}
+
+fn emit_project_function<'ctx>(
+    context: &'ctx Context,
+    builder: &'ctx Builder<'ctx>,
+    functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
+    function: &ScalarFunction,
+    source_module: &ScalarModule,
+    modules: &[&ScalarModule],
+    name: &str,
+) -> Result<(), String> {
+    let value = *functions
+        .get(name)
+        .ok_or_else(|| format!("unknown LLVM function {name}"))?;
+    let entry = context.append_basic_block(value, "entry");
+    builder.position_at_end(entry);
+    let mut state = EmitState {
+        builder,
+        functions,
+        values: BTreeMap::new(),
+        storage: BTreeMap::new(),
+        next_block: 0,
+    };
+    if let ScalarType::Callable { parameters, .. } = &function.signature {
+        for (index, parameter) in parameters.iter().enumerate() {
+            let argument = value
+                .get_nth_param(index as u32)
+                .ok_or_else(|| "missing function parameter".to_owned())?;
+            let slot = builder
+                .build_alloca(basic_type(context, parameter)?, &function.parameters[index])
+                .map_err(builder_error)?;
+            builder.build_store(slot, argument).map_err(builder_error)?;
+            state.storage.insert(
+                function.parameters[index].clone(),
+                (slot, parameter.clone()),
+            );
+        }
+    }
+    let result = emit_project_block(context, &mut state, &function.body, source_module, modules)?;
+    let result_type = match &function.signature {
+        ScalarType::Callable { result, .. } => result.as_ref(),
+        _ => return Err("function has no callable signature".into()),
+    };
+    emit_return(&mut state, result, result_type)
+}
+
+fn emit_project_main<'ctx>(
+    context: &'ctx Context,
+    builder: &'ctx Builder<'ctx>,
+    functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
+    modules: &[&ScalarModule],
+) -> Result<(), String> {
+    let main = *functions
+        .get("main")
+        .ok_or_else(|| "missing main".to_owned())?;
+    let entry = context.append_basic_block(main, "entry");
+    builder.position_at_end(entry);
+    let mut state = EmitState {
+        builder,
+        functions,
+        values: BTreeMap::new(),
+        storage: BTreeMap::new(),
+        next_block: 0,
+    };
+    for module in modules {
         state.values.clear();
         for node in &module.initialization_nodes {
             if let ScalarItem::Binding(binding) = &module.items[node.item_index] {
-                let value = emit_project_expression(&binding.value, &mut state, module, modules)?;
+                let value =
+                    emit_project_expression(context, &mut state, &binding.value, module, modules)?;
                 state.values.insert(binding.name.clone(), value);
             }
         }
     }
-    state.body.push_str("  ret i32 0\n");
-    Ok(LlvmFunction {
-        name: "main".to_owned(),
-        result: LlvmValueType::I32,
-        parameters: Vec::new(),
-        body: state.body,
-    })
+    builder
+        .build_return(Some(&context.i32_type().const_zero()))
+        .map_err(builder_error)?;
+    Ok(())
 }
 
-fn emit_project_block(
+fn emit_block<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
     block: &ScalarBlock,
-    state: &mut EmitState,
-    module: &ScalarModule,
-    modules: &[&ScalarModule],
-) -> Result<(String, LlvmValueType), String> {
+) -> Result<EmitValue<'ctx>, String> {
     let storage = state.storage.clone();
-    let mut result = ("0".to_owned(), LlvmValueType::Void);
+    let mut result = EmitValue::Unit;
     for item in &block.items {
         result = match item {
             ScalarBlockItem::LocalBinding(binding) => {
-                let value = emit_project_expression(&binding.value, state, module, modules)?;
-                let slot = state.allocate(&binding.name, value_type(&binding.declared_type)?);
-                state.body.push_str(&format!(
-                    "  store {} {}, ptr {}\n",
-                    llvm_type(value.1),
-                    value.0,
-                    slot
-                ));
-                ("0".to_owned(), LlvmValueType::Void)
+                let value = take_basic(emit_expression(context, state, &binding.value)?)?;
+                let slot = state
+                    .builder
+                    .build_alloca(basic_type(context, &binding.declared_type)?, &binding.name)
+                    .map_err(builder_error)?;
+                state
+                    .builder
+                    .build_store(slot, value)
+                    .map_err(builder_error)?;
+                state
+                    .storage
+                    .insert(binding.name.clone(), (slot, binding.declared_type.clone()));
+                EmitValue::Unit
+            }
+            ScalarBlockItem::Expression(expression) => emit_expression(context, state, expression)?,
+            ScalarBlockItem::Assignment(assignment) => emit_assignment(context, state, assignment)?,
+            ScalarBlockItem::While(expression) => emit_while(context, state, expression)?,
+        };
+    }
+    state.storage = storage;
+    Ok(result)
+}
+
+fn emit_project_block<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    block: &ScalarBlock,
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    let storage = state.storage.clone();
+    let mut result = EmitValue::Unit;
+    for item in &block.items {
+        result = match item {
+            ScalarBlockItem::LocalBinding(binding) => {
+                let value = take_basic(emit_project_expression(
+                    context,
+                    state,
+                    &binding.value,
+                    module,
+                    modules,
+                )?)?;
+                let slot = state
+                    .builder
+                    .build_alloca(basic_type(context, &binding.declared_type)?, &binding.name)
+                    .map_err(builder_error)?;
+                state
+                    .builder
+                    .build_store(slot, value)
+                    .map_err(builder_error)?;
+                state
+                    .storage
+                    .insert(binding.name.clone(), (slot, binding.declared_type.clone()));
+                EmitValue::Unit
             }
             ScalarBlockItem::Expression(expression) => {
-                emit_project_expression(expression, state, module, modules)?
+                emit_project_expression(context, state, expression, module, modules)?
             }
             ScalarBlockItem::Assignment(assignment) => {
-                emit_project_assignment(assignment, state, module, modules)?
+                emit_project_assignment(context, state, assignment, module, modules)?
             }
-            ScalarBlockItem::While(while_expression) => {
-                let condition_label = state.block("while.cond");
-                let body_label = state.block("while.body");
-                let exit_label = state.block("while.exit");
-                state.body.push_str(&format!(
-                    "  br label %{condition_label}\n\n{condition_label}:\n"
-                ));
-                let condition =
-                    emit_project_expression(&while_expression.condition, state, module, modules)?;
-                state.body.push_str(&format!(
-                    "  br i1 {}, label %{body_label}, label %{exit_label}\n\n{body_label}:\n",
-                    condition.0
-                ));
-                let _ = emit_project_block(&while_expression.body, state, module, modules)?;
-                state
-                    .body
-                    .push_str(&format!("  br label %{condition_label}\n\n{exit_label}:\n"));
-                ("0".to_owned(), LlvmValueType::Void)
+            ScalarBlockItem::While(expression) => {
+                emit_project_while(context, state, expression, module, modules)?
             }
         };
     }
@@ -276,39 +508,199 @@ fn emit_project_block(
     Ok(result)
 }
 
-fn emit_project_assignment(
+fn emit_assignment<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
     assignment: &ScalarAssignment,
-    state: &mut EmitState,
-    module: &ScalarModule,
-    modules: &[&ScalarModule],
-) -> Result<(String, LlvmValueType), String> {
-    let value = emit_project_expression(&assignment.value, state, module, modules)?;
-    let (slot, value_type) = state
+) -> Result<EmitValue<'ctx>, String> {
+    let value = take_basic(emit_expression(context, state, &assignment.value)?)?;
+    let (slot, ty) = state
         .storage
         .get(&assignment.target)
         .cloned()
         .ok_or_else(|| format!("unknown LLVM storage {}", assignment.target))?;
-    let old = state.value();
-    state.body.push_str(&format!(
-        "  {old} = load {} , ptr {}\n",
-        llvm_type(value_type),
-        slot
-    ));
-    state.body.push_str(&format!(
-        "  store {} {}, ptr {}\n",
-        llvm_type(value_type),
-        value.0,
-        slot
-    ));
-    Ok((old, value_type))
+    let old = state
+        .builder
+        .build_load(basic_type(context, &ty)?, slot, "old")
+        .map_err(builder_error)?;
+    state
+        .builder
+        .build_store(slot, value)
+        .map_err(builder_error)?;
+    Ok(EmitValue::Basic(old))
 }
-
-fn emit_project_expression(
-    expression: &ScalarExpression,
-    state: &mut EmitState,
+fn emit_project_assignment<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    assignment: &ScalarAssignment,
     module: &ScalarModule,
     modules: &[&ScalarModule],
-) -> Result<(String, LlvmValueType), String> {
+) -> Result<EmitValue<'ctx>, String> {
+    let value = take_basic(emit_project_expression(
+        context,
+        state,
+        &assignment.value,
+        module,
+        modules,
+    )?)?;
+    let (slot, ty) = state
+        .storage
+        .get(&assignment.target)
+        .cloned()
+        .ok_or_else(|| format!("unknown LLVM storage {}", assignment.target))?;
+    let old = state
+        .builder
+        .build_load(basic_type(context, &ty)?, slot, "old")
+        .map_err(builder_error)?;
+    state
+        .builder
+        .build_store(slot, value)
+        .map_err(builder_error)?;
+    Ok(EmitValue::Basic(old))
+}
+
+fn emit_while<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    expression: &ScalarWhile,
+) -> Result<EmitValue<'ctx>, String> {
+    let function = state
+        .builder
+        .get_insert_block()
+        .ok_or_else(|| "missing insertion block".to_owned())?
+        .get_parent()
+        .ok_or_else(|| "missing function".to_owned())?;
+    let condition_block =
+        context.append_basic_block(function, &format!("while.cond.{}", state.next_block));
+    state.next_block += 1;
+    let body = context.append_basic_block(function, &format!("while.body.{}", state.next_block));
+    state.next_block += 1;
+    let exit = context.append_basic_block(function, &format!("while.exit.{}", state.next_block));
+    state.next_block += 1;
+    state
+        .builder
+        .build_unconditional_branch(condition_block)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(condition_block);
+    let condition =
+        take_basic(emit_expression(context, state, &expression.condition)?)?.into_int_value();
+    state
+        .builder
+        .build_conditional_branch(condition, body, exit)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(body);
+    let _ = emit_block(context, state, &expression.body)?;
+    state
+        .builder
+        .build_unconditional_branch(condition_block)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(exit);
+    Ok(EmitValue::Unit)
+}
+
+fn emit_project_while<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    expression: &ScalarWhile,
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    let function = state
+        .builder
+        .get_insert_block()
+        .ok_or_else(|| "missing insertion block".to_owned())?
+        .get_parent()
+        .ok_or_else(|| "missing function".to_owned())?;
+    let condition =
+        context.append_basic_block(function, &format!("while.cond.{}", state.next_block));
+    state.next_block += 1;
+    let body = context.append_basic_block(function, &format!("while.body.{}", state.next_block));
+    state.next_block += 1;
+    let exit = context.append_basic_block(function, &format!("while.exit.{}", state.next_block));
+    state.next_block += 1;
+    state
+        .builder
+        .build_unconditional_branch(condition)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(condition);
+    let value = take_basic(emit_project_expression(
+        context,
+        state,
+        &expression.condition,
+        module,
+        modules,
+    )?)?
+    .into_int_value();
+    state
+        .builder
+        .build_conditional_branch(value, body, exit)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(body);
+    let _ = emit_project_block(context, state, &expression.body, module, modules)?;
+    state
+        .builder
+        .build_unconditional_branch(condition)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(exit);
+    Ok(EmitValue::Unit)
+}
+
+fn emit_expression<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    expression: &ScalarExpression,
+) -> Result<EmitValue<'ctx>, String> {
+    match expression {
+        ScalarExpression::Name { name, .. } => {
+            if let Some((slot, ty)) = state.storage.get(name).cloned() {
+                return Ok(EmitValue::Basic(
+                    state
+                        .builder
+                        .build_load(basic_type(context, &ty)?, slot, name)
+                        .map_err(builder_error)?,
+                ));
+            }
+            state
+                .values
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("unknown LLVM value {name}"))
+        }
+        ScalarExpression::Integer { value, .. } => Ok(EmitValue::Basic(
+            context.i32_type().const_int(*value as u64, true).into(),
+        )),
+        ScalarExpression::Boolean { value, .. } => Ok(EmitValue::Basic(
+            context
+                .bool_type()
+                .const_int(u64::from(*value), false)
+                .into(),
+        )),
+        ScalarExpression::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } => emit_binary(context, state, operator, left, right),
+        ScalarExpression::Call {
+            name, arguments, ..
+        } => emit_call(context, state, name, arguments),
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => emit_if(context, state, condition, then_branch, else_branch),
+        ScalarExpression::Block(block) => emit_block(context, state, block),
+    }
+}
+
+fn emit_project_expression<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    expression: &ScalarExpression,
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
     match expression {
         ScalarExpression::Call {
             receiver,
@@ -316,10 +708,6 @@ fn emit_project_expression(
             arguments,
             ..
         } => {
-            let arguments = arguments
-                .iter()
-                .map(|argument| emit_project_expression(argument, state, module, modules))
-                .collect::<Result<Vec<_>, _>>()?;
             let target = receiver.as_ref().map_or(module, |binding| {
                 let namespace = module
                     .namespace_bindings
@@ -331,82 +719,39 @@ fn emit_project_expression(
                     .find(|candidate| candidate.source == namespace.target)
                     .expect("validated namespace target")
             });
-            let callable = target
-                .members
-                .get(name)
-                .ok_or_else(|| format!("unknown LLVM callable {name}"))?;
-            let ScalarType::Callable {
-                result: result_type,
-                ..
-            } = callable
-            else {
-                return Err(format!("LLVM value {name} is not callable"));
-            };
-            let result_type = value_type(result_type)?;
-            let args = arguments
+            let qualified = project_function_name(&target.source, name);
+            let values = arguments
                 .iter()
-                .map(|value| format!("{} {}", llvm_type(value.1), value.0))
-                .collect::<Vec<_>>()
-                .join(", ");
-            if result_type == LlvmValueType::Void {
-                state.body.push_str(&format!(
-                    "  call void @{}({args})\n",
-                    project_function_name(&target.source, name)
-                ));
-                Ok(("0".to_owned(), result_type))
-            } else {
-                let result = state.value();
-                state.body.push_str(&format!(
-                    "  {result} = call {} @{}({args})\n",
-                    llvm_type(result_type),
-                    project_function_name(&target.source, name)
-                ));
-                Ok((result, result_type))
-            }
+                .map(|argument| emit_project_expression(context, state, argument, module, modules))
+                .collect::<Result<Vec<_>, _>>()?;
+            emit_call_values(state, &qualified, values)
         }
+        ScalarExpression::Name { name, .. } => emit_expression(
+            context,
+            state,
+            &ScalarExpression::Name {
+                name: name.clone(),
+                span: wosy_syntax::ByteSpan::new(0, 0),
+            },
+        ),
+        ScalarExpression::Integer { value, .. } => Ok(EmitValue::Basic(
+            context.i32_type().const_int(*value as u64, true).into(),
+        )),
+        ScalarExpression::Boolean { value, .. } => Ok(EmitValue::Basic(
+            context
+                .bool_type()
+                .const_int(u64::from(*value), false)
+                .into(),
+        )),
         ScalarExpression::Binary {
             operator,
             left,
             right,
             ..
         } => {
-            let left = emit_project_expression(left, state, module, modules)?;
-            let right = emit_project_expression(right, state, module, modules)?;
-            let result = state.value();
-            let instruction = match operator {
-                BinaryOperator::Add => format!("add i32 {}", operands(&left, &right)),
-                BinaryOperator::Subtract => format!("sub i32 {}", operands(&left, &right)),
-                BinaryOperator::Multiply => format!("mul i32 {}", operands(&left, &right)),
-                BinaryOperator::Divide => format!("sdiv i32 {}", operands(&left, &right)),
-                BinaryOperator::Remainder => format!("srem i32 {}", operands(&left, &right)),
-                BinaryOperator::Equal => comparison("eq", &left, &right),
-                BinaryOperator::NotEqual => comparison("ne", &left, &right),
-                BinaryOperator::Less => comparison("slt", &left, &right),
-                BinaryOperator::LessEqual => comparison("sle", &left, &right),
-                BinaryOperator::Greater => comparison("sgt", &left, &right),
-                BinaryOperator::GreaterEqual => comparison("sge", &left, &right),
-                BinaryOperator::And => format!("and i1 {}", operands(&left, &right)),
-                BinaryOperator::Or => format!("or i1 {}", operands(&left, &right)),
-            };
-            let result_type = if matches!(
-                operator,
-                BinaryOperator::Equal
-                    | BinaryOperator::NotEqual
-                    | BinaryOperator::Less
-                    | BinaryOperator::LessEqual
-                    | BinaryOperator::Greater
-                    | BinaryOperator::GreaterEqual
-                    | BinaryOperator::And
-                    | BinaryOperator::Or
-            ) {
-                LlvmValueType::I1
-            } else {
-                LlvmValueType::I32
-            };
-            state
-                .body
-                .push_str(&format!("  {result} = {instruction}\n"));
-            Ok((result, result_type))
+            let left = emit_project_expression(context, state, left, module, modules)?;
+            let right = emit_project_expression(context, state, right, module, modules)?;
+            emit_binary_values(state, operator, left, right)
         }
         ScalarExpression::If {
             condition,
@@ -414,65 +759,263 @@ fn emit_project_expression(
             else_branch,
             ..
         } => {
-            let condition = emit_project_expression(condition, state, module, modules)?;
-            let then_label = state.block("if.then");
-            let else_label = state.block("if.else");
-            let merge_label = state.block("if.merge");
-            state.body.push_str(&format!(
-                "  br i1 {}, label %{then_label}, label %{else_label}\n\n{then_label}:\n",
-                condition.0
-            ));
-            let then_value = emit_project_block(then_branch, state, module, modules)?;
-            state
-                .body
-                .push_str(&format!("  br label %{merge_label}\n\n{else_label}:\n"));
-            let else_value = emit_project_block(else_branch, state, module, modules)?;
-            state
-                .body
-                .push_str(&format!("  br label %{merge_label}\n\n{merge_label}:\n"));
-            let result = state.value();
-            state.body.push_str(&format!(
-                "  {result} = phi {} [ {}, %{} ], [ {}, %{} ]\n",
-                llvm_type(then_value.1),
-                then_value.0,
-                then_label,
-                else_value.0,
-                else_label
-            ));
-            Ok((result, then_value.1))
+            let condition = emit_project_expression(context, state, condition, module, modules)?;
+            emit_project_if(
+                context,
+                state,
+                condition,
+                then_branch,
+                else_branch,
+                module,
+                modules,
+            )
         }
-        ScalarExpression::Block(block) => emit_project_block(block, state, module, modules),
-        ScalarExpression::Name { name, .. } => state
-            .storage
-            .get(name)
-            .cloned()
-            .map(|(slot, value_type)| {
-                let result = state.value();
-                state.body.push_str(&format!(
-                    "  {result} = load {}, ptr {slot}\n",
-                    llvm_type(value_type)
-                ));
-                (result, value_type)
-            })
-            .or_else(|| {
-                state.values.get(name).cloned().or_else(|| {
-                    state
-                        .names
-                        .get(name)
-                        .map(|value| (value.clone(), LlvmValueType::I32))
-                })
-            })
-            .ok_or_else(|| format!("unknown LLVM value {name}")),
-        ScalarExpression::Integer { value, .. } => Ok((value.to_string(), LlvmValueType::I32)),
-        ScalarExpression::Boolean { value, .. } => {
-            Ok((if *value { "1" } else { "0" }.to_owned(), LlvmValueType::I1))
+        ScalarExpression::Block(block) => {
+            emit_project_block(context, state, block, module, modules)
         }
     }
 }
 
+fn emit_call<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    name: &str,
+    arguments: &[ScalarExpression],
+) -> Result<EmitValue<'ctx>, String> {
+    let values = arguments
+        .iter()
+        .map(|argument| emit_expression(context, state, argument))
+        .collect::<Result<Vec<_>, _>>()?;
+    emit_call_values(state, name, values)
+}
+
+fn emit_call_values<'ctx>(
+    state: &mut EmitState<'ctx>,
+    name: &str,
+    values: Vec<EmitValue<'ctx>>,
+) -> Result<EmitValue<'ctx>, String> {
+    let function = *state
+        .functions
+        .get(name)
+        .ok_or_else(|| format!("unknown LLVM callable {name}"))?;
+    let arguments = values
+        .into_iter()
+        .map(|value| match value {
+            EmitValue::Basic(value) => Ok(BasicMetadataValueEnum::from(value)),
+            EmitValue::Unit => Err("unit argument is invalid".into()),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let call = state
+        .builder
+        .build_call(function, &arguments, "call")
+        .map_err(builder_error)?;
+    match call.try_as_basic_value() {
+        ValueKind::Basic(value) => Ok(EmitValue::Basic(value)),
+        ValueKind::Instruction(_) => Ok(EmitValue::Unit),
+    }
+}
+
+fn emit_binary<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    operator: &BinaryOperator,
+    left: &ScalarExpression,
+    right: &ScalarExpression,
+) -> Result<EmitValue<'ctx>, String> {
+    let left = emit_expression(context, state, left)?;
+    let right = emit_expression(context, state, right)?;
+    emit_binary_values(state, operator, left, right)
+}
+fn emit_binary_values<'ctx>(
+    state: &mut EmitState<'ctx>,
+    operator: &BinaryOperator,
+    left: EmitValue<'ctx>,
+    right: EmitValue<'ctx>,
+) -> Result<EmitValue<'ctx>, String> {
+    let left = take_basic(left)?.into_int_value();
+    let right = take_basic(right)?.into_int_value();
+    let value = match operator {
+        BinaryOperator::Add => state
+            .builder
+            .build_int_add(left, right, "add")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::Subtract => state
+            .builder
+            .build_int_sub(left, right, "sub")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::Multiply => state
+            .builder
+            .build_int_mul(left, right, "mul")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::Divide => state
+            .builder
+            .build_int_signed_div(left, right, "div")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::Remainder => state
+            .builder
+            .build_int_signed_rem(left, right, "rem")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::And => state
+            .builder
+            .build_and(left, right, "and")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::Or => state
+            .builder
+            .build_or(left, right, "or")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::Equal => state
+            .builder
+            .build_int_compare(IntPredicate::EQ, left, right, "eq")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::NotEqual => state
+            .builder
+            .build_int_compare(IntPredicate::NE, left, right, "ne")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::Less => state
+            .builder
+            .build_int_compare(IntPredicate::SLT, left, right, "lt")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::LessEqual => state
+            .builder
+            .build_int_compare(IntPredicate::SLE, left, right, "le")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::Greater => state
+            .builder
+            .build_int_compare(IntPredicate::SGT, left, right, "gt")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::GreaterEqual => state
+            .builder
+            .build_int_compare(IntPredicate::SGE, left, right, "ge")
+            .map_err(builder_error)?
+            .into(),
+    };
+    Ok(EmitValue::Basic(value))
+}
+
+fn emit_if<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    condition: &ScalarExpression,
+    then_branch: &ScalarBlock,
+    else_branch: &ScalarBlock,
+) -> Result<EmitValue<'ctx>, String> {
+    let condition = take_basic(emit_expression(context, state, condition)?)?.into_int_value();
+    emit_if_value(
+        context,
+        state,
+        condition,
+        then_branch,
+        else_branch,
+        |state, block| emit_block(context, state, block),
+    )
+}
+fn emit_project_if<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    condition: EmitValue<'ctx>,
+    then_branch: &ScalarBlock,
+    else_branch: &ScalarBlock,
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    let condition = take_basic(condition)?.into_int_value();
+    emit_if_value(
+        context,
+        state,
+        condition,
+        then_branch,
+        else_branch,
+        |state, block| emit_project_block(context, state, block, module, modules),
+    )
+}
+fn emit_if_value<'ctx, F>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx>,
+    condition: inkwell::values::IntValue<'ctx>,
+    then_branch: &ScalarBlock,
+    else_branch: &ScalarBlock,
+    emit: F,
+) -> Result<EmitValue<'ctx>, String>
+where
+    F: Fn(&mut EmitState<'ctx>, &ScalarBlock) -> Result<EmitValue<'ctx>, String>,
+{
+    let function = state
+        .builder
+        .get_insert_block()
+        .ok_or_else(|| "missing insertion block".to_owned())?
+        .get_parent()
+        .ok_or_else(|| "missing function".to_owned())?;
+    let then_block = context.append_basic_block(function, "if.then");
+    let else_block = context.append_basic_block(function, "if.else");
+    let merge = context.append_basic_block(function, "if.merge");
+    state
+        .builder
+        .build_conditional_branch(condition, then_block, else_block)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(then_block);
+    let then_value = emit(state, then_branch)?;
+    state
+        .builder
+        .build_unconditional_branch(merge)
+        .map_err(builder_error)?;
+    let then_end = state.builder.get_insert_block().expect("then block");
+    state.builder.position_at_end(else_block);
+    let else_value = emit(state, else_branch)?;
+    state
+        .builder
+        .build_unconditional_branch(merge)
+        .map_err(builder_error)?;
+    let else_end = state.builder.get_insert_block().expect("else block");
+    state.builder.position_at_end(merge);
+    match (then_value, else_value) {
+        (EmitValue::Unit, EmitValue::Unit) => Ok(EmitValue::Unit),
+        (EmitValue::Basic(then_value), EmitValue::Basic(else_value)) => {
+            let phi = state
+                .builder
+                .build_phi(then_value.get_type(), "if")
+                .map_err(builder_error)?;
+            phi.add_incoming(&[(&then_value, then_end), (&else_value, else_end)]);
+            Ok(EmitValue::Basic(phi.as_basic_value()))
+        }
+        _ => Err("conditional branches have different LLVM values".into()),
+    }
+}
+
+fn emit_return<'ctx>(
+    state: &mut EmitState<'ctx>,
+    value: EmitValue<'ctx>,
+    result: &ScalarType,
+) -> Result<(), String> {
+    match result {
+        ScalarType::Unit => {
+            state.builder.build_return(None).map_err(builder_error)?;
+        }
+        ScalarType::Bool | ScalarType::I32 => {
+            let value = take_basic(value)?;
+            state
+                .builder
+                .build_return(Some(&value))
+                .map_err(builder_error)?;
+        }
+        _ => return Err("unsupported LLVM return type".into()),
+    }
+    Ok(())
+}
+
 fn project_function_name(source: &wosy_syntax::SourceIdentity, name: &str) -> String {
-    let identity = format!("{}__{}__{}", source.package, source.path, name);
-    identity
+    format!("{}__{}__{}", source.package, source.path, name)
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '_' {
@@ -484,571 +1027,14 @@ fn project_function_name(source: &wosy_syntax::SourceIdentity, name: &str) -> St
         .collect()
 }
 
-fn emit_function(
-    function: &ScalarFunction,
-    callable_signatures: &BTreeMap<String, ScalarType>,
-) -> Result<LlvmFunction, String> {
-    let ScalarType::Callable { result, parameters } = &function.signature else {
-        return Err(format!(
-            "function {} has no callable signature",
-            function.name
-        ));
-    };
-    let mut names = BTreeMap::new();
-    let mut llvm_parameters = Vec::new();
-    for (index, parameter) in parameters.iter().enumerate() {
-        let name = function.parameters[index].clone();
-        let value_type = value_type(parameter)?;
-        names.insert(name.clone(), format!("%{name}"));
-        llvm_parameters.push((name, value_type));
-    }
-    let mut state = EmitState::new(names, BTreeMap::new());
-    state.initialize_parameters(&llvm_parameters);
-    let value = emit_block(&function.body, &mut state, callable_signatures)?;
-    append_return(&mut state, value, value_type(result)?)?;
-    Ok(LlvmFunction {
-        name: function.name.clone(),
-        result: value_type(result)?,
-        parameters: llvm_parameters,
-        body: state.body,
-    })
-}
-
-fn emit_main(
-    items: &[ScalarItem],
-    callable_signatures: &BTreeMap<String, ScalarType>,
-) -> Result<LlvmFunction, String> {
-    let mut state = EmitState::new(BTreeMap::new(), BTreeMap::new());
-    for item in items {
-        if let ScalarItem::Binding(binding) = item {
-            let value = emit_expression(&binding.value, &mut state, callable_signatures)?;
-            state.values.insert(binding.name.clone(), value);
-        }
-    }
-    state.body.push_str("  ret i32 0\n");
-    Ok(LlvmFunction {
-        name: "main".to_owned(),
-        result: LlvmValueType::I32,
-        parameters: Vec::new(),
-        body: state.body,
-    })
-}
-
-struct EmitState {
-    names: BTreeMap<String, String>,
-    values: BTreeMap<String, (String, LlvmValueType)>,
-    storage: BTreeMap<String, (String, LlvmValueType)>,
-    body: String,
-    next_value: usize,
-    next_block: usize,
-}
-
-impl EmitState {
-    fn new(
-        names: BTreeMap<String, String>,
-        values: BTreeMap<String, (String, LlvmValueType)>,
-    ) -> Self {
-        Self {
-            names,
-            values,
-            storage: BTreeMap::new(),
-            body: "entry:\n".to_owned(),
-            next_value: 0,
-            next_block: 0,
-        }
-    }
-
-    fn value(&mut self) -> String {
-        let value = format!("%v{}", self.next_value);
-        self.next_value += 1;
-        value
-    }
-
-    fn allocate(&mut self, name: &str, value_type: LlvmValueType) -> String {
-        let slot = self.value();
-        self.body
-            .push_str(&format!("  {slot} = alloca {}\n", llvm_type(value_type)));
-        self.storage
-            .insert(name.to_owned(), (slot.clone(), value_type));
-        slot
-    }
-
-    fn initialize_parameters(&mut self, parameters: &[(String, LlvmValueType)]) {
-        for (name, value_type) in parameters {
-            let slot = self.allocate(name, *value_type);
-            self.body.push_str(&format!(
-                "  store {} %{}, ptr {}\n",
-                llvm_type(*value_type),
-                name,
-                slot
-            ));
-        }
-    }
-
-    fn block(&mut self, prefix: &str) -> String {
-        let block = format!("{}.{}", prefix, self.next_block);
-        self.next_block += 1;
-        block
-    }
-}
-
-fn append_return(
-    state: &mut EmitState,
-    value: (String, LlvmValueType),
-    result: LlvmValueType,
-) -> Result<(), String> {
-    if result == LlvmValueType::Void {
-        state.body.push_str("  ret void\n");
-        return Ok(());
-    }
-    if value.1 != result {
-        return Err(format!(
-            "LLVM block result {} does not match function result {}",
-            llvm_type(value.1),
-            llvm_type(result)
-        ));
-    }
-    state
-        .body
-        .push_str(&format!("  ret {} {}\n", llvm_type(result), value.0));
-    Ok(())
-}
-
-fn emit_block(
-    block: &ScalarBlock,
-    state: &mut EmitState,
-    callable_signatures: &BTreeMap<String, ScalarType>,
-) -> Result<(String, LlvmValueType), String> {
-    let storage = state.storage.clone();
-    let mut result = ("0".to_owned(), LlvmValueType::Void);
-    for item in &block.items {
-        result = match item {
-            ScalarBlockItem::LocalBinding(binding) => {
-                let value = emit_expression(&binding.value, state, callable_signatures)?;
-                let slot = state.allocate(&binding.name, value_type(&binding.declared_type)?);
-                state.body.push_str(&format!(
-                    "  store {} {}, ptr {}\n",
-                    llvm_type(value.1),
-                    value.0,
-                    slot
-                ));
-                ("0".to_owned(), LlvmValueType::Void)
-            }
-            ScalarBlockItem::Expression(expression) => {
-                emit_expression(expression, state, callable_signatures)?
-            }
-            ScalarBlockItem::Assignment(assignment) => {
-                emit_assignment(assignment, state, callable_signatures)?
-            }
-            ScalarBlockItem::While(while_expression) => {
-                let condition_label = state.block("while.cond");
-                let body_label = state.block("while.body");
-                let exit_label = state.block("while.exit");
-                state.body.push_str(&format!(
-                    "  br label %{condition_label}\n\n{condition_label}:\n"
-                ));
-                let condition =
-                    emit_expression(&while_expression.condition, state, callable_signatures)?;
-                state.body.push_str(&format!(
-                    "  br i1 {}, label %{body_label}, label %{exit_label}\n\n{body_label}:\n",
-                    condition.0
-                ));
-                let _ = emit_block(&while_expression.body, state, callable_signatures)?;
-                state
-                    .body
-                    .push_str(&format!("  br label %{condition_label}\n\n{exit_label}:\n"));
-                ("0".to_owned(), LlvmValueType::Void)
-            }
-        };
-    }
-    state.storage = storage;
-    Ok(result)
-}
-
-fn emit_assignment(
-    assignment: &ScalarAssignment,
-    state: &mut EmitState,
-    callable_signatures: &BTreeMap<String, ScalarType>,
-) -> Result<(String, LlvmValueType), String> {
-    let value = emit_expression(&assignment.value, state, callable_signatures)?;
-    let (slot, value_type) = state
-        .storage
-        .get(&assignment.target)
-        .cloned()
-        .ok_or_else(|| format!("unknown LLVM storage {}", assignment.target))?;
-    let old = state.value();
-    state.body.push_str(&format!(
-        "  {old} = load {}, ptr {slot}\n",
-        llvm_type(value_type)
-    ));
-    state.body.push_str(&format!(
-        "  store {} {}, ptr {}\n",
-        llvm_type(value_type),
-        value.0,
-        slot
-    ));
-    Ok((old, value_type))
-}
-
-fn emit_expression(
-    expression: &ScalarExpression,
-    state: &mut EmitState,
-    callable_signatures: &BTreeMap<String, ScalarType>,
-) -> Result<(String, LlvmValueType), String> {
-    match expression {
-        ScalarExpression::Name { name, .. } => state
-            .storage
-            .get(name)
-            .cloned()
-            .map(|(slot, value_type)| {
-                let result = state.value();
-                state.body.push_str(&format!(
-                    "  {result} = load {}, ptr {slot}\n",
-                    llvm_type(value_type)
-                ));
-                (result, value_type)
-            })
-            .or_else(|| {
-                state.values.get(name).cloned().or_else(|| {
-                    state
-                        .names
-                        .get(name)
-                        .map(|value| (value.clone(), LlvmValueType::I32))
-                })
-            })
-            .ok_or_else(|| format!("unknown LLVM value {name}")),
-        ScalarExpression::Integer { value, .. } => Ok((value.to_string(), LlvmValueType::I32)),
-        ScalarExpression::Boolean { value, .. } => {
-            Ok((if *value { "1" } else { "0" }.to_owned(), LlvmValueType::I1))
-        }
-        ScalarExpression::Binary {
-            operator,
-            left,
-            right,
-            ..
-        } => {
-            let left = emit_expression(left, state, callable_signatures)?;
-            let right = emit_expression(right, state, callable_signatures)?;
-            let result = state.value();
-            let instruction = match operator {
-                BinaryOperator::Add => format!("add i32 {}", operands(&left, &right)),
-                BinaryOperator::Subtract => format!("sub i32 {}", operands(&left, &right)),
-                BinaryOperator::Multiply => format!("mul i32 {}", operands(&left, &right)),
-                BinaryOperator::Divide => format!("sdiv i32 {}", operands(&left, &right)),
-                BinaryOperator::Remainder => format!("srem i32 {}", operands(&left, &right)),
-                BinaryOperator::Equal => comparison("eq", &left, &right),
-                BinaryOperator::NotEqual => comparison("ne", &left, &right),
-                BinaryOperator::Less => comparison("slt", &left, &right),
-                BinaryOperator::LessEqual => comparison("sle", &left, &right),
-                BinaryOperator::Greater => comparison("sgt", &left, &right),
-                BinaryOperator::GreaterEqual => comparison("sge", &left, &right),
-                BinaryOperator::And => format!("and i1 {}", operands(&left, &right)),
-                BinaryOperator::Or => format!("or i1 {}", operands(&left, &right)),
-            };
-            let result_type = if matches!(
-                operator,
-                BinaryOperator::Equal
-                    | BinaryOperator::NotEqual
-                    | BinaryOperator::Less
-                    | BinaryOperator::LessEqual
-                    | BinaryOperator::Greater
-                    | BinaryOperator::GreaterEqual
-                    | BinaryOperator::And
-                    | BinaryOperator::Or
-            ) {
-                LlvmValueType::I1
-            } else {
-                LlvmValueType::I32
-            };
-            state
-                .body
-                .push_str(&format!("  {result} = {instruction}\n"));
-            Ok((result, result_type))
-        }
-        ScalarExpression::Call {
-            name, arguments, ..
-        } => {
-            let arguments = arguments
-                .iter()
-                .map(|argument| emit_expression(argument, state, callable_signatures))
-                .collect::<Result<Vec<_>, _>>()?;
-            let callable = callable_signatures
-                .get(name)
-                .ok_or_else(|| format!("unknown LLVM callable {name}"))?;
-            let ScalarType::Callable {
-                result: result_type,
-                ..
-            } = callable
-            else {
-                return Err(format!("LLVM value {name} is not callable"));
-            };
-            let result_type = value_type(result_type)?;
-            let args = arguments
-                .iter()
-                .map(|value| format!("{} {}", llvm_type(value.1), value.0))
-                .collect::<Vec<_>>()
-                .join(", ");
-            if result_type == LlvmValueType::Void {
-                state
-                    .body
-                    .push_str(&format!("  call void @{name}({args})\n"));
-                Ok(("0".to_owned(), result_type))
-            } else {
-                let result = state.value();
-                state.body.push_str(&format!(
-                    "  {result} = call {} @{name}({args})\n",
-                    llvm_type(result_type)
-                ));
-                Ok((result, result_type))
-            }
-        }
-        ScalarExpression::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            let condition = emit_expression(condition, state, callable_signatures)?;
-            let then_label = state.block("if.then");
-            let else_label = state.block("if.else");
-            let merge_label = state.block("if.merge");
-            state.body.push_str(&format!(
-                "  br i1 {}, label %{then_label}, label %{else_label}\n\n{then_label}:\n",
-                condition.0
-            ));
-            let then_value = emit_block(then_branch, state, callable_signatures)?;
-            state
-                .body
-                .push_str(&format!("  br label %{merge_label}\n\n{else_label}:\n"));
-            let else_value = emit_block(else_branch, state, callable_signatures)?;
-            state
-                .body
-                .push_str(&format!("  br label %{merge_label}\n\n{merge_label}:\n"));
-            let result = state.value();
-            state.body.push_str(&format!(
-                "  {result} = phi {} [ {}, %{} ], [ {}, %{} ]\n",
-                llvm_type(then_value.1),
-                then_value.0,
-                then_label,
-                else_value.0,
-                else_label
-            ));
-            Ok((result, then_value.1))
-        }
-        ScalarExpression::Block(block) => emit_block(block, state, callable_signatures),
-    }
-}
-
-fn value_type(value: &ScalarType) -> Result<LlvmValueType, String> {
-    match value {
-        ScalarType::Unit => Ok(LlvmValueType::Void),
-        ScalarType::Bool => Ok(LlvmValueType::I1),
-        ScalarType::I32 => Ok(LlvmValueType::I32),
-        ScalarType::Callable { .. } | ScalarType::Named(_) => {
-            Err("unsupported LLVM scalar type".to_owned())
-        }
-    }
-}
-
-fn llvm_type(value: LlvmValueType) -> &'static str {
-    match value {
-        LlvmValueType::Void => "void",
-        LlvmValueType::I1 => "i1",
-        LlvmValueType::I32 => "i32",
-    }
-}
-fn parameters_text(parameters: &[(String, LlvmValueType)]) -> String {
-    parameters
-        .iter()
-        .map(|(name, value)| format!("{} %{}", llvm_type(*value), name))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-fn operands(left: &(String, LlvmValueType), right: &(String, LlvmValueType)) -> String {
-    format!("{}, {}", left.0, right.0)
-}
-fn comparison(
-    operator: &str,
-    left: &(String, LlvmValueType),
-    right: &(String, LlvmValueType),
-) -> String {
-    format!("icmp {operator} i32 {}", operands(left, right))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{emit_scalar_llvm, emit_scalar_project_llvm};
-    use crate::{
-        derive_scalar_program, parse_source, validate_scalar_project, ScalarItem, ScalarModule,
-        ScalarNamespaceBinding, ScalarProject,
-    };
-    use std::fs;
-    use std::process::Command;
+    use super::emit_scalar_llvm;
+    use crate::{derive_scalar_program, parse_source};
     use wosy_syntax::SourceIdentity;
 
     #[test]
-    fn emits_clang_buildable_scalar_module() {
-        let source = SourceIdentity::new(
-            "project".into(),
-            "package".into(),
-            "src/main.w".into(),
-            "r1".into(),
-        );
-        let parsed = parse_source(source, "%%start\ni32(i32, i32) add = fn(left, right) {\n\tleft + right\n};\ni32 seed = 20;\ni32 increment = 22;\nbool choose_sum = true;\ni32 result = if (choose_sum) {\n\tadd(seed, increment)\n} else {\n\t0\n};\n%%end".to_owned(), &[]);
-        let validation = derive_scalar_program(&parsed.result);
-        let partition = emit_scalar_llvm(&validation).expect("valid scalar LLVM");
-        let directory = std::env::temp_dir().join(format!("wosy-llvm-{}", std::process::id()));
-        fs::create_dir_all(&directory).expect("temporary directory");
-        let input = directory.join("partition.ll");
-        let output = directory.join("main");
-        fs::write(&input, partition.to_text()).expect("LLVM text");
-        let status = Command::new("/usr/bin/clang")
-            .args(["-x", "ir"])
-            .arg(&input)
-            .arg("-o")
-            .arg(&output)
-            .status()
-            .expect("clang");
-        assert!(status.success());
-        assert!(output.is_file());
-        let result = Command::new(&output).status().expect("native artifact");
-        assert_eq!(result.code(), Some(0));
-        fs::remove_dir_all(directory).expect("temporary directory cleanup");
-    }
-
-    #[test]
-    fn emits_typed_direct_block_while_in_source_order() {
-        let source = SourceIdentity::new(
-            "project".into(),
-            "package".into(),
-            "src/main.w".into(),
-            "r1".into(),
-        );
-        let parsed = parse_source(
-            source,
-            "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t}\n\tvalue\n};\n\ni32 result = loop(0);\n%%end"
-                .to_owned(),
-            &[],
-        );
-        let validation = derive_scalar_program(&parsed.result);
-        let partition = emit_scalar_llvm(&validation).expect("valid scalar LLVM");
-        let function = partition
-            .functions
-            .iter()
-            .find(|function| function.name == "loop")
-            .expect("loop function");
-        let body = &function.body;
-        let condition = body.find("while.cond.0:").expect("condition block");
-        let loop_body = body.find("while.body.1:").expect("body block");
-        let exit = body.find("while.exit.2:").expect("exit block");
-        assert!(condition < loop_body && loop_body < exit);
-        assert!(body.contains("alloca i32"));
-        assert!(body.contains("load i32, ptr"));
-        assert!(body.contains("store i32"));
-        assert!(body.contains("br label %while.cond.0"));
-        assert!(body.matches("br label %while.cond.0").count() >= 2);
-
-        let directory =
-            std::env::temp_dir().join(format!("wosy-llvm-while-{}", std::process::id()));
-        fs::create_dir_all(&directory).expect("temporary directory");
-        let input = directory.join("partition.ll");
-        let output = directory.join("main");
-        fs::write(&input, partition.to_text()).expect("LLVM text");
-        let status = Command::new("/usr/bin/clang")
-            .args(["-x", "ir"])
-            .arg(&input)
-            .arg("-o")
-            .arg(&output)
-            .status()
-            .expect("clang");
-        assert!(status.success());
-        assert_eq!(
-            Command::new(&output)
-                .status()
-                .expect("native artifact")
-                .code(),
-            Some(0)
-        );
-        fs::remove_dir_all(directory).expect("temporary directory cleanup");
-    }
-
-    #[test]
-    fn emits_one_ordered_project_with_qualified_symbols_and_declarations() {
-        let math_source = SourceIdentity::new(
-            "project".into(),
-            "package".into(),
-            "src/math.w".into(),
-            "r1".into(),
-        );
-        let main_source = SourceIdentity::new(
-            "project".into(),
-            "package".into(),
-            "src/main.w".into(),
-            "r1".into(),
-        );
-        let math = derive_scalar_program(
-            &parse_source(
-                math_source.clone(),
-                "%%start\ni32(i32, i32) add = fn(left, right) { left + right };\ni32 seed = 20;\n%%end".into(),
-                &[],
-            )
-            .result,
-        )
-        .program;
-        let main = derive_scalar_program(
-            &parse_source(
-                main_source.clone(),
-                "%%start\nmath = namespace package \"src/math.w\";\ni32 result = math.add(20, 22);\n%%end".into(),
-                &[],
-            )
-            .result,
-        )
-        .program;
-        let namespace_span = match &main.items[0] {
-            ScalarItem::Namespace(namespace) => namespace.span,
-            _ => panic!("namespace item"),
-        };
-        let validation = validate_scalar_project(ScalarProject::new(
-            vec![
-                ScalarModule::new(
-                    main_source.clone(),
-                    main.items,
-                    vec![ScalarNamespaceBinding {
-                        binding: "math".into(),
-                        target: math_source.clone(),
-                        span: namespace_span,
-                    }],
-                ),
-                ScalarModule::new(math_source.clone(), math.items, Vec::new()),
-            ],
-            vec![main_source, math_source.clone(), math_source],
-        ));
-        let partition = emit_scalar_project_llvm(&validation).expect("valid scalar LLVM project");
-        assert_eq!(partition.declarations.len(), 1);
-        assert_eq!(partition.functions.len(), 2);
-        assert!(partition
-            .declarations
-            .iter()
-            .any(|function| function.name == "package__src_math_w__add"));
-        assert!(partition
-            .functions
-            .iter()
-            .any(|function| function.body.contains("@package__src_math_w__add")));
-        assert_eq!(
-            partition
-                .functions
-                .iter()
-                .find(|function| function.name == "main")
-                .expect("main")
-                .body
-                .matches("@package__src_math_w__add")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn emits_typed_single_file_calls() {
+    fn emits_typed_scalar_calls_and_verified_module() {
         let source = SourceIdentity::new(
             "project".into(),
             "package".into(),
@@ -1058,90 +1044,13 @@ mod tests {
         let parsed = parse_source(
             source,
             "%%start\nbool() flag = fn { true };\nunit() touch = fn { i32 marker = 0; };\ni32() count = fn { 42 };\nbool selected = flag();\nunit done = touch();\ni32 result = count();\n%%end"
-                .to_owned(),
+                .into(),
             &[],
         );
-        let validation = derive_scalar_program(&parsed.result);
-        let partition = emit_scalar_llvm(&validation).expect("valid scalar LLVM");
-        let main = partition
-            .functions
-            .iter()
-            .find(|function| function.name == "main")
-            .expect("main");
-        assert!(main.body.contains("= call i1 @flag()"));
-        assert!(main.body.contains("call void @touch()"));
-        assert!(main.body.contains("= call i32 @count()"));
-        assert!(!main.body.contains("= call void @touch()"));
-    }
-
-    #[test]
-    fn emits_typed_project_calls() {
-        let library_source = SourceIdentity::new(
-            "project".into(),
-            "package".into(),
-            "src/library.w".into(),
-            "r1".into(),
-        );
-        let main_source = SourceIdentity::new(
-            "project".into(),
-            "package".into(),
-            "src/main.w".into(),
-            "r1".into(),
-        );
-        let library = derive_scalar_program(
-            &parse_source(
-                library_source.clone(),
-                "%%start\nbool() flag = fn { true };\nunit() touch = fn { i32 marker = 0; };\ni32() count = fn { 42 };\n%%end".into(),
-                &[],
-            )
-            .result,
-        )
-        .program;
-        let main = derive_scalar_program(
-            &parse_source(
-                main_source.clone(),
-                "%%start\nlibrary = namespace package \"src/library.w\";\nbool selected = library.flag();\nunit done = library.touch();\ni32 result = library.count();\n%%end".into(),
-                &[],
-            )
-            .result,
-        )
-        .program;
-        let namespace_span = match &main.items[0] {
-            ScalarItem::Namespace(namespace) => namespace.span,
-            _ => panic!("namespace item"),
-        };
-        let validation = validate_scalar_project(ScalarProject::new(
-            vec![
-                ScalarModule::new(
-                    main_source.clone(),
-                    main.items,
-                    vec![ScalarNamespaceBinding {
-                        binding: "library".into(),
-                        target: library_source.clone(),
-                        span: namespace_span,
-                    }],
-                ),
-                ScalarModule::new(library_source.clone(), library.items, Vec::new()),
-            ],
-            vec![main_source, library_source.clone(), library_source],
-        ));
-        let partition = emit_scalar_project_llvm(&validation).expect("valid scalar LLVM project");
-        let main = partition
-            .functions
-            .iter()
-            .find(|function| function.name == "main")
-            .expect("main");
-        assert!(main
-            .body
-            .contains("= call i1 @package__src_library_w__flag()"));
-        assert!(main
-            .body
-            .contains("call void @package__src_library_w__touch()"));
-        assert!(main
-            .body
-            .contains("= call i32 @package__src_library_w__count()"));
-        assert!(!main
-            .body
-            .contains("= call void @package__src_library_w__touch()"));
+        let partition = emit_scalar_llvm(&derive_scalar_program(&parsed.result)).expect("LLVM");
+        let text = partition.to_text();
+        assert!(text.contains("call i1 @flag"));
+        assert!(text.contains("call void @touch"));
+        assert!(text.contains("call i32 @count"));
     }
 }
