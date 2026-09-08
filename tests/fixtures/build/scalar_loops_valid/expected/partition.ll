@@ -1,6 +1,8 @@
 ; ModuleID = 'src/main.w'
 source_filename = "src/main.w"
 
+@result = internal global i32 0
+
 define i32 @loop(i32 %start) {
 entry:
   %start1 = alloca i32, align 4
@@ -30,5 +32,6 @@ while.exit.2:                                     ; preds = %while.cond.0
 define i32 @main() {
 entry:
   %call = call i32 @loop(i32 0)
+  store i32 %call, ptr @result, align 4
   ret i32 0
 }

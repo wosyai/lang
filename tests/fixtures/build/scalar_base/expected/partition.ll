@@ -1,6 +1,11 @@
 ; ModuleID = 'src/main.w'
 source_filename = "src/main.w"
 
+@seed = internal global i32 0
+@increment = internal global i32 0
+@choose_sum = internal global i1 false
+@result = internal global i32 0
+
 define i32 @add(i32 %left, i32 %right) {
 entry:
   %left1 = alloca i32, align 4
@@ -15,10 +20,16 @@ entry:
 
 define i32 @main() {
 entry:
-  br i1 true, label %if.then, label %if.else
+  store i32 20, ptr @seed, align 4
+  store i32 22, ptr @increment, align 4
+  store i1 true, ptr @choose_sum, align 1
+  %choose_sum = load i1, ptr @choose_sum, align 1
+  br i1 %choose_sum, label %if.then, label %if.else
 
 if.then:                                          ; preds = %entry
-  %call = call i32 @add(i32 20, i32 22)
+  %seed = load i32, ptr @seed, align 4
+  %increment = load i32, ptr @increment, align 4
+  %call = call i32 @add(i32 %seed, i32 %increment)
   br label %if.merge
 
 if.else:                                          ; preds = %entry
@@ -26,5 +37,6 @@ if.else:                                          ; preds = %entry
 
 if.merge:                                         ; preds = %if.else, %if.then
   %if = phi i32 [ %call, %if.then ], [ 0, %if.else ]
+  store i32 %if, ptr @result, align 4
   ret i32 0
 }
