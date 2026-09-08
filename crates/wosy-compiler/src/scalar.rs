@@ -327,6 +327,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                     let actual = expression_type_in_module(
                         &binding.value,
                         &declarations,
+                        &BTreeSet::new(),
                         module,
                         &project.modules,
                         &mut diagnostics,
@@ -352,14 +353,23 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         ));
                     }
                     let mut scope = declarations.clone();
+                    let mut visible_names = declaration_names.clone();
                     for (index, name) in function.parameters.iter().enumerate() {
-                        if index < parameters.len() {
+                        if index < parameters.len() && visible_names.insert(name.clone()) {
                             scope.insert(name.clone(), parameters[index].clone());
+                        } else if index < parameters.len() {
+                            diagnostics.push(module_diagnostic(
+                                module,
+                                "B0002",
+                                "duplicate declaration",
+                                function.span,
+                            ));
                         }
                     }
                     let actual = block_type_in_module(
                         &function.body,
                         &scope,
+                        &visible_names,
                         module,
                         &project.modules,
                         &mut diagnostics,
@@ -374,9 +384,11 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                 }
                 ScalarItem::Executable(executable) => {
                     let mut scope = declarations.clone();
+                    let mut visible_names = declaration_names.clone();
                     let _ = block_item_type_in_module(
                         executable,
                         &mut scope,
+                        &mut visible_names,
                         module,
                         &project.modules,
                         &mut diagnostics,
@@ -417,14 +429,23 @@ fn validate_module_type(
 fn block_type_in_module(
     block: &ScalarBlock,
     scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
     let mut scope = scope.clone();
+    let mut visible_names = visible_names.clone();
     let mut result = ScalarType::Unit;
     for (index, item) in block.items.iter().enumerate() {
-        result = block_item_type_in_module(item, &mut scope, module, modules, diagnostics);
+        result = block_item_type_in_module(
+            item,
+            &mut scope,
+            &mut visible_names,
+            module,
+            modules,
+            diagnostics,
+        );
         if index + 1 == block.items.len() && block.terminated_items[index] {
             result = ScalarType::Unit;
         }
@@ -435,14 +456,21 @@ fn block_type_in_module(
 fn block_item_type_in_module(
     item: &ScalarBlockItem,
     scope: &mut BTreeMap<String, ScalarType>,
+    visible_names: &mut BTreeSet<String>,
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            let actual =
-                expression_type_in_module(&binding.value, scope, module, modules, diagnostics);
+            let actual = expression_type_in_module(
+                &binding.value,
+                scope,
+                visible_names,
+                module,
+                modules,
+                diagnostics,
+            );
             expect_module_type(
                 module,
                 &binding.declared_type,
@@ -450,29 +478,61 @@ fn block_item_type_in_module(
                 binding.span,
                 diagnostics,
             );
-            scope.insert(binding.name.clone(), binding.declared_type.clone());
+            if visible_names.insert(binding.name.clone()) {
+                scope.insert(binding.name.clone(), binding.declared_type.clone());
+            } else {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0002",
+                    "duplicate declaration",
+                    binding.span,
+                ));
+            }
             ScalarType::Unit
         }
-        ScalarBlockItem::Expression(expression) => {
-            expression_type_in_module(expression, scope, module, modules, diagnostics)
-        }
-        ScalarBlockItem::Assignment(assignment) => {
-            assignment_type_in_module(assignment, scope, module, modules, diagnostics)
-        }
-        ScalarBlockItem::While(while_expression) => {
-            while_type_in_module(while_expression, scope, module, modules, diagnostics)
-        }
+        ScalarBlockItem::Expression(expression) => expression_type_in_module(
+            expression,
+            scope,
+            visible_names,
+            module,
+            modules,
+            diagnostics,
+        ),
+        ScalarBlockItem::Assignment(assignment) => assignment_type_in_module(
+            assignment,
+            scope,
+            visible_names,
+            module,
+            modules,
+            diagnostics,
+        ),
+        ScalarBlockItem::While(while_expression) => while_type_in_module(
+            while_expression,
+            scope,
+            visible_names,
+            module,
+            modules,
+            diagnostics,
+        ),
     }
 }
 
 fn assignment_type_in_module(
     assignment: &ScalarAssignment,
     scope: &mut BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
-    let actual = expression_type_in_module(&assignment.value, scope, module, modules, diagnostics);
+    let actual = expression_type_in_module(
+        &assignment.value,
+        scope,
+        visible_names,
+        module,
+        modules,
+        diagnostics,
+    );
     let expected = match &assignment.receiver {
         None => scope.get(&assignment.target),
         Some(receiver) => {
@@ -532,6 +592,7 @@ fn assignment_type_in_module(
 fn while_type_in_module(
     while_expression: &ScalarWhile,
     scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -539,6 +600,7 @@ fn while_type_in_module(
     let condition = expression_type_in_module(
         &while_expression.condition,
         scope,
+        visible_names,
         module,
         modules,
         diagnostics,
@@ -551,13 +613,21 @@ fn while_type_in_module(
             while_expression.span,
         ));
     }
-    let _ = block_type_in_module(&while_expression.body, scope, module, modules, diagnostics);
+    let _ = block_type_in_module(
+        &while_expression.body,
+        scope,
+        visible_names,
+        module,
+        modules,
+        diagnostics,
+    );
     ScalarType::Unit
 }
 
 fn expression_type_in_module(
     expression: &ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -607,8 +677,16 @@ fn expression_type_in_module(
             right,
             span,
         } => {
-            let left_type = expression_type_in_module(left, scope, module, modules, diagnostics);
-            let right_type = expression_type_in_module(right, scope, module, modules, diagnostics);
+            let left_type =
+                expression_type_in_module(left, scope, visible_names, module, modules, diagnostics);
+            let right_type = expression_type_in_module(
+                right,
+                scope,
+                visible_names,
+                module,
+                modules,
+                diagnostics,
+            );
             let comparison = matches!(
                 operator,
                 BinaryOperator::Equal
@@ -706,8 +784,14 @@ fn expression_type_in_module(
                 ));
             }
             for (argument, parameter) in arguments.iter().zip(parameters) {
-                let actual =
-                    expression_type_in_module(argument, scope, module, modules, diagnostics);
+                let actual = expression_type_in_module(
+                    argument,
+                    scope,
+                    visible_names,
+                    module,
+                    modules,
+                    diagnostics,
+                );
                 expect_module_type(target, parameter, &actual, *span, diagnostics);
             }
             result.as_ref().clone()
@@ -718,8 +802,14 @@ fn expression_type_in_module(
             else_branch,
             span,
         } => {
-            let condition_type =
-                expression_type_in_module(condition, scope, module, modules, diagnostics);
+            let condition_type = expression_type_in_module(
+                condition,
+                scope,
+                visible_names,
+                module,
+                modules,
+                diagnostics,
+            );
             expect_module_type(
                 module,
                 &ScalarType::Bool,
@@ -727,8 +817,22 @@ fn expression_type_in_module(
                 *span,
                 diagnostics,
             );
-            let then_type = block_type_in_module(then_branch, scope, module, modules, diagnostics);
-            let else_type = block_type_in_module(else_branch, scope, module, modules, diagnostics);
+            let then_type = block_type_in_module(
+                then_branch,
+                scope,
+                visible_names,
+                module,
+                modules,
+                diagnostics,
+            );
+            let else_type = block_type_in_module(
+                else_branch,
+                scope,
+                visible_names,
+                module,
+                modules,
+                diagnostics,
+            );
             if then_type != else_type {
                 diagnostics.push(module_diagnostic(
                     module,
@@ -740,7 +844,7 @@ fn expression_type_in_module(
             then_type
         }
         ScalarExpression::Block(block) => {
-            block_type_in_module(block, scope, module, modules, diagnostics)
+            block_type_in_module(block, scope, visible_names, module, modules, diagnostics)
         }
     }
 }
@@ -1256,8 +1360,13 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
         match item {
             ScalarItem::Namespace(_) => {}
             ScalarItem::Binding(binding) => {
-                let actual =
-                    expression_type(&binding.value, &declarations, program, &mut diagnostics);
+                let actual = expression_type(
+                    &binding.value,
+                    &declarations,
+                    &BTreeSet::new(),
+                    program,
+                    &mut diagnostics,
+                );
                 expect_type(
                     program,
                     &binding.declared_type,
@@ -1271,12 +1380,26 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     continue;
                 };
                 let mut scope = declarations.clone();
+                let mut visible_names = declaration_names.clone();
                 for (index, name) in function.parameters.iter().enumerate() {
-                    if index < parameters.len() {
+                    if index < parameters.len() && visible_names.insert(name.clone()) {
                         scope.insert(name.clone(), parameters[index].clone());
+                    } else if index < parameters.len() {
+                        diagnostics.push(diagnostic(
+                            program,
+                            "B0002",
+                            "duplicate declaration",
+                            function.span,
+                        ));
                     }
                 }
-                let actual = block_type(&function.body, &scope, program, &mut diagnostics);
+                let actual = block_type(
+                    &function.body,
+                    &scope,
+                    &visible_names,
+                    program,
+                    &mut diagnostics,
+                );
                 expect_type(
                     program,
                     result,
@@ -1294,7 +1417,14 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                 }
             }
             ScalarItem::Executable(executable) => {
-                let _ = block_item_type(executable, &mut scope, program, &mut diagnostics);
+                let mut visible_names = declaration_names.clone();
+                let _ = block_item_type(
+                    executable,
+                    &mut scope,
+                    &mut visible_names,
+                    program,
+                    &mut diagnostics,
+                );
             }
         }
     }
@@ -1324,13 +1454,15 @@ fn validate_type(
 fn block_type(
     block: &ScalarBlock,
     scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
     let mut scope = scope.clone();
+    let mut visible_names = visible_names.clone();
     let mut result = ScalarType::Unit;
     for (index, item) in block.items.iter().enumerate() {
-        result = block_item_type(item, &mut scope, program, diagnostics);
+        result = block_item_type(item, &mut scope, &mut visible_names, program, diagnostics);
         if index + 1 == block.items.len() && block.terminated_items[index] {
             result = ScalarType::Unit;
         }
@@ -1341,12 +1473,14 @@ fn block_type(
 fn block_item_type(
     item: &ScalarBlockItem,
     scope: &mut BTreeMap<String, ScalarType>,
+    visible_names: &mut BTreeSet<String>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            let actual = expression_type(&binding.value, scope, program, diagnostics);
+            let actual =
+                expression_type(&binding.value, scope, visible_names, program, diagnostics);
             expect_type(
                 program,
                 &binding.declared_type,
@@ -1354,17 +1488,26 @@ fn block_item_type(
                 binding.span,
                 diagnostics,
             );
-            scope.insert(binding.name.clone(), binding.declared_type.clone());
+            if visible_names.insert(binding.name.clone()) {
+                scope.insert(binding.name.clone(), binding.declared_type.clone());
+            } else {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0002",
+                    "duplicate declaration",
+                    binding.span,
+                ));
+            }
             ScalarType::Unit
         }
         ScalarBlockItem::Expression(expression) => {
-            expression_type(expression, scope, program, diagnostics)
+            expression_type(expression, scope, visible_names, program, diagnostics)
         }
         ScalarBlockItem::Assignment(assignment) => {
-            assignment_type(assignment, scope, program, diagnostics)
+            assignment_type(assignment, scope, visible_names, program, diagnostics)
         }
         ScalarBlockItem::While(while_expression) => {
-            while_type(while_expression, scope, program, diagnostics)
+            while_type(while_expression, scope, visible_names, program, diagnostics)
         }
     }
 }
@@ -1372,10 +1515,17 @@ fn block_item_type(
 fn assignment_type(
     assignment: &ScalarAssignment,
     scope: &mut BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
-    let actual = expression_type(&assignment.value, scope, program, diagnostics);
+    let actual = expression_type(
+        &assignment.value,
+        scope,
+        visible_names,
+        program,
+        diagnostics,
+    );
     let Some(expected) = scope.get(&assignment.target) else {
         diagnostics.push(diagnostic(
             program,
@@ -1392,10 +1542,17 @@ fn assignment_type(
 fn while_type(
     while_expression: &ScalarWhile,
     scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
-    let condition = expression_type(&while_expression.condition, scope, program, diagnostics);
+    let condition = expression_type(
+        &while_expression.condition,
+        scope,
+        visible_names,
+        program,
+        diagnostics,
+    );
     if condition != ScalarType::Bool {
         diagnostics.push(diagnostic(
             program,
@@ -1404,13 +1561,20 @@ fn while_type(
             while_expression.span,
         ));
     }
-    let _ = block_type(&while_expression.body, scope, program, diagnostics);
+    let _ = block_type(
+        &while_expression.body,
+        scope,
+        visible_names,
+        program,
+        diagnostics,
+    );
     ScalarType::Unit
 }
 
 fn expression_type(
     expression: &ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
@@ -1431,8 +1595,8 @@ fn expression_type(
             right,
             span,
         } => {
-            let left_type = expression_type(left, scope, program, diagnostics);
-            let right_type = expression_type(right, scope, program, diagnostics);
+            let left_type = expression_type(left, scope, visible_names, program, diagnostics);
+            let right_type = expression_type(right, scope, visible_names, program, diagnostics);
             let comparison = matches!(
                 operator,
                 BinaryOperator::Equal
@@ -1479,7 +1643,7 @@ fn expression_type(
                 ));
             }
             for (argument, parameter) in arguments.iter().zip(parameters) {
-                let actual = expression_type(argument, scope, program, diagnostics);
+                let actual = expression_type(argument, scope, visible_names, program, diagnostics);
                 expect_type(program, parameter, &actual, *span, diagnostics);
             }
             (**result).clone()
@@ -1490,7 +1654,8 @@ fn expression_type(
             else_branch,
             span,
         } => {
-            let condition_type = expression_type(condition, scope, program, diagnostics);
+            let condition_type =
+                expression_type(condition, scope, visible_names, program, diagnostics);
             if condition_type != ScalarType::Bool {
                 diagnostics.push(diagnostic(
                     program,
@@ -1499,8 +1664,8 @@ fn expression_type(
                     *span,
                 ));
             }
-            let then_type = block_type(then_branch, scope, program, diagnostics);
-            let else_type = block_type(else_branch, scope, program, diagnostics);
+            let then_type = block_type(then_branch, scope, visible_names, program, diagnostics);
+            let else_type = block_type(else_branch, scope, visible_names, program, diagnostics);
             if then_type != else_type {
                 diagnostics.push(diagnostic(
                     program,
@@ -1511,7 +1676,9 @@ fn expression_type(
             }
             then_type
         }
-        ScalarExpression::Block(block) => block_type(block, scope, program, diagnostics),
+        ScalarExpression::Block(block) => {
+            block_type(block, scope, visible_names, program, diagnostics)
+        }
     }
 }
 
@@ -1687,6 +1854,79 @@ mod tests {
     }
 
     #[test]
+    fn rejects_visible_binding_collisions_in_single_and_project_validation() {
+        let cases = [
+            (
+                "%%start\ni32 value = 1;\ni32(i32) f = fn(value) { value };\n%%end",
+                "parameter/module",
+            ),
+            (
+                "%%start\ni32(i32) f = fn(outer) { if (true) { i32 outer = 1; outer } else { outer } };\n%%end",
+                "nested local/outer",
+            ),
+            (
+                "%%start\ni32(i32, i32) f = fn(value, value) { value };\n%%end",
+                "repeated parameter",
+            ),
+            (
+                "%%start\nmath = namespace app \"src/math.w\";\ni32(i32) f = fn(math) { 0 };\n%%end",
+                "parameter/namespace",
+            ),
+        ];
+        for (text, case_name) in cases {
+            let single = validate_text(text);
+            assert!(
+                single
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0002"),
+                "missing single-program collision diagnostic for {case_name}: {:?}",
+                single.diagnostics
+            );
+
+            let source = module_source("src/main.w");
+            let program = module_from_text(source.clone(), text);
+            let namespace_bindings = program
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    ScalarItem::Namespace(namespace) => Some(ScalarNamespaceBinding {
+                        binding: namespace.binding.clone(),
+                        target: module_source("src/math.w"),
+                        span: namespace.span,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::new(
+                    source.clone(),
+                    program.items,
+                    namespace_bindings,
+                )],
+                vec![source],
+            ));
+            assert!(
+                project
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0002"),
+                "missing project collision diagnostic for {case_name}: {:?}",
+                project.diagnostics
+            );
+        }
+
+        let valid = validate_text(
+            "%%start\ni32 module_value = 1;\ni32(i32) f = fn(parameter) { if (true) { i32 inner = parameter; inner } else { parameter } };\n%%end",
+        );
+        assert!(
+            valid.diagnostics.is_empty(),
+            "distinct bindings produced diagnostics: {:?}",
+            valid.diagnostics
+        );
+    }
+
+    #[test]
     fn derives_and_type_checks_top_level_assignment_in_module_scope() {
         let result = validate_text("%%start\ni32 value = 0;\nvalue = 1;\nvalue;\n%%end");
         assert!(
@@ -1754,6 +1994,7 @@ mod tests {
             block_type(
                 &while_expression.body,
                 &BTreeMap::new(),
+                &BTreeSet::new(),
                 &result.program,
                 &mut Vec::new()
             ),
