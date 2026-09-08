@@ -1,0 +1,28 @@
+[package]
+name = "terminated_callable_result_invalid"
+
+[comments]
+categories = []
+
+[targets.app]
+root = "src/main.w"
+
+[targets.app.artifacts.main]
+artifact = "Main"
+
+[targets.app.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[builders.native]
+command = ["scripts/build-native"]
+args = []
+
+[runners.native]
+command = ["scripts/run-native"]
+args = []
+
+[targets.app.profiles.dev]
+main_artifact = "main"
