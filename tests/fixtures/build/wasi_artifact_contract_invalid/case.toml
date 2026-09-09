@@ -1,4 +1,8 @@
 [[steps]]
+write = "src/main.w"
+contents = "%%start\ni32 value = 0;\n%%end\n"
+
+[[steps]]
 command = ["wosy", "parse", "app"]
 exit = 0
 
