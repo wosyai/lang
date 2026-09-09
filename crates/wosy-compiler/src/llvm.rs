@@ -57,6 +57,10 @@ pub struct LlvmFunctionAttributes {
 enum EmitValue<'ctx> {
     Unit,
     Basic(BasicValueEnum<'ctx>),
+    Utf8View {
+        pointer: BasicValueEnum<'ctx>,
+        length: BasicValueEnum<'ctx>,
+    },
 }
 
 struct EmitState<'ctx, 'module> {
@@ -515,9 +519,7 @@ fn function_type<'ctx>(
         ScalarType::U8 => context.i8_type().fn_type(&parameters, false),
         ScalarType::U32 => context.i32_type().fn_type(&parameters, false),
         ScalarType::U64 => context.i64_type().fn_type(&parameters, false),
-        ScalarType::Utf8 => context
-            .ptr_type(AddressSpace::default())
-            .fn_type(&parameters, false),
+        ScalarType::Utf8 => context.i32_type().fn_type(&parameters, false),
         ScalarType::RawPointer(_) => context.i32_type().fn_type(&parameters, false),
         _ => return Err("unsupported LLVM scalar type".into()),
     })
@@ -533,7 +535,7 @@ fn basic_type<'ctx>(
         ScalarType::U8 => Ok(context.i8_type().into()),
         ScalarType::U32 => Ok(context.i32_type().into()),
         ScalarType::U64 => Ok(context.i64_type().into()),
-        ScalarType::Utf8 => Ok(context.ptr_type(AddressSpace::default()).into()),
+        ScalarType::Utf8 => Ok(context.i32_type().into()),
         ScalarType::RawPointer(_) => Ok(context.i32_type().into()),
         ScalarType::Struct(_) => Ok(context.ptr_type(AddressSpace::default()).into()),
         _ => Err("unit is only valid as a function result".into()),
@@ -866,6 +868,97 @@ fn utf8_length<'ctx, 'module>(
     }
 }
 
+fn project_utf8_length(
+    state: &EmitState<'_, '_>,
+    expression: &ScalarExpression,
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<u64, String> {
+    match expression {
+        ScalarExpression::Member { receiver, name, .. } => {
+            let target = project_namespace_target(module, modules, receiver)?;
+            let binding = target.items.iter().find_map(|item| match item {
+                ScalarItem::Binding(binding) if binding.name == *name => Some(binding),
+                _ => None,
+            });
+            let binding = binding.ok_or_else(|| format!("unknown UTF-8 member {name}"))?;
+            match &binding.value {
+                ScalarExpression::Utf8 { value, .. } => u64::try_from(value.len())
+                    .map_err(|_| "utf8 literal length is not u64".to_owned()),
+                _ => Err(format!("unknown UTF-8 length {receiver}.{name}")),
+            }
+        }
+        _ => utf8_length(state, expression),
+    }
+}
+
+fn emit_utf8_view<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    argument: &ScalarExpression,
+) -> Result<EmitValue<'ctx>, String> {
+    let pointer = emit_expression(context, state, argument)?;
+    let pointer = take_basic(pointer)?;
+    let length = context
+        .i64_type()
+        .const_int(utf8_length(state, argument)?, false);
+    Ok(EmitValue::Utf8View {
+        pointer,
+        length: length.into(),
+    })
+}
+
+fn insert_utf8_lengths(
+    lengths: &mut BTreeMap<String, u64>,
+    items: &[ScalarItem],
+) -> Result<(), String> {
+    for item in items {
+        if let ScalarItem::Binding(binding) = item {
+            if let ScalarExpression::Utf8 { value, .. } = &binding.value {
+                lengths.insert(
+                    binding.name.clone(),
+                    u64::try_from(value.len()).map_err(|_| "utf8 literal length is not u64")?,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn materialize_utf8_view<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    receivers: &[crate::ScalarOutputReceiver],
+    value: EmitValue<'ctx>,
+) -> Result<(), String> {
+    let EmitValue::Utf8View { pointer, length } = value else {
+        return Err("core.utf8_view did not produce its canonical outputs".to_owned());
+    };
+    let first = state
+        .builder
+        .build_alloca(basic_type(context, &receivers[0].ty)?, &receivers[0].name)
+        .map_err(builder_error)?;
+    state
+        .builder
+        .build_store(first, pointer)
+        .map_err(builder_error)?;
+    let second = state
+        .builder
+        .build_alloca(basic_type(context, &receivers[1].ty)?, &receivers[1].name)
+        .map_err(builder_error)?;
+    state
+        .builder
+        .build_store(second, length)
+        .map_err(builder_error)?;
+    state
+        .storage
+        .insert(receivers[0].name.clone(), (first, receivers[0].ty.clone()));
+    state
+        .storage
+        .insert(receivers[1].name.clone(), (second, receivers[1].ty.clone()));
+    Ok(())
+}
+
 fn store_value<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -901,6 +994,9 @@ fn store_value<'ctx, 'module>(
 fn take_basic(value: EmitValue<'_>) -> Result<BasicValueEnum<'_>, String> {
     match value {
         EmitValue::Basic(value) => Ok(value),
+        EmitValue::Utf8View { .. } => {
+            Err("structured UTF-8 view used where a scalar value is required".into())
+        }
         EmitValue::Unit => Err("unit value used where a scalar value is required".into()),
     }
 }
@@ -999,6 +1095,10 @@ fn emit_main<'ctx, 'module>(
         match item {
             ScalarItem::Binding(binding) => {
                 let value = emit_expression(context, &mut state, &binding.value)?;
+                if binding.receivers.len() == 2 {
+                    materialize_utf8_view(context, &mut state, &binding.receivers, value)?;
+                    continue;
+                }
                 if binding.declared_type != ScalarType::Unit {
                     let (global, _) = state
                         .globals
@@ -1012,6 +1112,12 @@ fn emit_main<'ctx, 'module>(
                         &binding.declared_type,
                         value,
                     )?;
+                }
+                if let ScalarExpression::Utf8 { value, .. } = &binding.value {
+                    state.utf8_lengths.insert(
+                        binding.name.clone(),
+                        u64::try_from(value.len()).map_err(|_| "utf8 literal length is not u64")?,
+                    );
                 }
             }
             ScalarItem::Executable(item) => {
@@ -1057,6 +1163,7 @@ fn emit_project_function<'ctx, 'module>(
         next_block: 0,
     };
     insert_unit_values(&mut state.values, &source_module.items);
+    insert_utf8_lengths(&mut state.utf8_lengths, &source_module.items)?;
     if let ScalarType::Callable { parameters, .. } = &function.signature {
         for (index, parameter) in parameters.iter().enumerate() {
             let argument = value
@@ -1141,6 +1248,7 @@ fn initialize_project_module<'ctx, 'module>(
 
     let values = state.values.clone();
     let storage = state.storage.clone();
+    let utf8_lengths = state.utf8_lengths.clone();
     let current_structs = state.structs;
     state.structs = &module.structs;
     let current_module_globals = module_globals(module, globals);
@@ -1148,6 +1256,8 @@ fn initialize_project_module<'ctx, 'module>(
     state.values.clear();
     state.storage.clear();
     insert_unit_values(&mut state.values, &module.items);
+    state.utf8_lengths.clear();
+    insert_utf8_lengths(&mut state.utf8_lengths, &module.items)?;
 
     for item in &module.items {
         match item {
@@ -1167,6 +1277,10 @@ fn initialize_project_module<'ctx, 'module>(
             ScalarItem::Binding(binding) => {
                 let value =
                     emit_project_expression(context, state, &binding.value, module, modules)?;
+                if binding.receivers.len() == 2 {
+                    materialize_utf8_view(context, state, &binding.receivers, value)?;
+                    continue;
+                }
                 if binding.declared_type != ScalarType::Unit {
                     let (global, _) = state
                         .globals
@@ -1181,6 +1295,12 @@ fn initialize_project_module<'ctx, 'module>(
                         value,
                     )?;
                 }
+                if let ScalarExpression::Utf8 { value, .. } = &binding.value {
+                    state.utf8_lengths.insert(
+                        binding.name.clone(),
+                        u64::try_from(value.len()).map_err(|_| "utf8 literal length is not u64")?,
+                    );
+                }
             }
             ScalarItem::Executable(item) => {
                 emit_project_block_item(context, state, item, module, modules)?;
@@ -1193,6 +1313,7 @@ fn initialize_project_module<'ctx, 'module>(
     state.structs = current_structs;
     state.values = values;
     state.storage = storage;
+    state.utf8_lengths = utf8_lengths;
     Ok(())
 }
 
@@ -1203,6 +1324,7 @@ fn emit_block<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     let storage = state.storage.clone();
     let values = state.values.clone();
+    let utf8_lengths = state.utf8_lengths.clone();
     let mut result = EmitValue::Unit;
     for item in &block.items {
         result = match item {
@@ -1211,11 +1333,17 @@ fn emit_block<'ctx, 'module>(
                 if binding.declared_type == ScalarType::Unit {
                     state.values.insert(binding.name.clone(), EmitValue::Unit);
                     EmitValue::Unit
+                } else if binding.receivers.len() == 2 {
+                    materialize_utf8_view(context, state, &binding.receivers, value)?;
+                    EmitValue::Unit
                 } else {
                     let value = take_basic(value)?;
                     let slot = state
                         .builder
-                        .build_alloca(basic_type(context, &binding.declared_type)?, &binding.name)
+                        .build_alloca(
+                            storage_type(context, &binding.declared_type, state.structs)?,
+                            &binding.name,
+                        )
                         .map_err(builder_error)?;
                     state
                         .builder
@@ -1224,6 +1352,13 @@ fn emit_block<'ctx, 'module>(
                     state
                         .storage
                         .insert(binding.name.clone(), (slot, binding.declared_type.clone()));
+                    if let ScalarExpression::Utf8 { value, .. } = &binding.value {
+                        state.utf8_lengths.insert(
+                            binding.name.clone(),
+                            u64::try_from(value.len())
+                                .map_err(|_| "utf8 literal length is not u64")?,
+                        );
+                    }
                     EmitValue::Unit
                 }
             }
@@ -1234,6 +1369,7 @@ fn emit_block<'ctx, 'module>(
     }
     state.storage = storage;
     state.values = values;
+    state.utf8_lengths = utf8_lengths;
     Ok(result)
 }
 
@@ -1246,6 +1382,7 @@ fn emit_project_block<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     let storage = state.storage.clone();
     let values = state.values.clone();
+    let utf8_lengths = state.utf8_lengths.clone();
     let mut result = EmitValue::Unit;
     for item in &block.items {
         result = match item {
@@ -1255,11 +1392,17 @@ fn emit_project_block<'ctx, 'module>(
                 if binding.declared_type == ScalarType::Unit {
                     state.values.insert(binding.name.clone(), EmitValue::Unit);
                     EmitValue::Unit
+                } else if binding.receivers.len() == 2 {
+                    materialize_utf8_view(context, state, &binding.receivers, value)?;
+                    EmitValue::Unit
                 } else {
                     let value = take_basic(value)?;
                     let slot = state
                         .builder
-                        .build_alloca(basic_type(context, &binding.declared_type)?, &binding.name)
+                        .build_alloca(
+                            storage_type(context, &binding.declared_type, state.structs)?,
+                            &binding.name,
+                        )
                         .map_err(builder_error)?;
                     state
                         .builder
@@ -1268,6 +1411,13 @@ fn emit_project_block<'ctx, 'module>(
                     state
                         .storage
                         .insert(binding.name.clone(), (slot, binding.declared_type.clone()));
+                    if let ScalarExpression::Utf8 { value, .. } = &binding.value {
+                        state.utf8_lengths.insert(
+                            binding.name.clone(),
+                            u64::try_from(value.len())
+                                .map_err(|_| "utf8 literal length is not u64")?,
+                        );
+                    }
                     EmitValue::Unit
                 }
             }
@@ -1284,6 +1434,7 @@ fn emit_project_block<'ctx, 'module>(
     }
     state.storage = storage;
     state.values = values;
+    state.utf8_lengths = utf8_lengths;
     Ok(result)
 }
 
@@ -1303,7 +1454,7 @@ fn emit_assignment<'ctx, 'module>(
         let value = take_basic(value)?;
         let old = state
             .builder
-            .build_load(basic_type(context, &ty)?, slot, "old")
+            .build_load(storage_type(context, &ty, state.structs)?, slot, "old")
             .map_err(builder_error)?;
         state
             .builder
@@ -1315,7 +1466,7 @@ fn emit_assignment<'ctx, 'module>(
         let slot = global.as_pointer_value();
         let old = state
             .builder
-            .build_load(basic_type(context, &ty)?, slot, "old")
+            .build_load(storage_type(context, &ty, state.structs)?, slot, "old")
             .map_err(builder_error)?;
         state
             .builder
@@ -1326,6 +1477,9 @@ fn emit_assignment<'ctx, 'module>(
         match state.values.get(&assignment.target) {
             Some(EmitValue::Unit) => return Ok(EmitValue::Unit),
             Some(EmitValue::Basic(_)) => {
+                return Err(format!("unknown LLVM storage {}", assignment.target))
+            }
+            Some(EmitValue::Utf8View { .. }) => {
                 return Err(format!("unknown LLVM storage {}", assignment.target))
             }
             None => return Err(format!("unknown LLVM storage {}", assignment.target)),
@@ -1353,7 +1507,7 @@ fn emit_project_assignment<'ctx, 'module>(
         let slot = global.as_pointer_value();
         let old = state
             .builder
-            .build_load(basic_type(context, &ty)?, slot, "old")
+            .build_load(storage_type(context, &ty, state.structs)?, slot, "old")
             .map_err(builder_error)?;
         state
             .builder
@@ -1364,7 +1518,7 @@ fn emit_project_assignment<'ctx, 'module>(
         let value = take_basic(value)?;
         let old = state
             .builder
-            .build_load(basic_type(context, &ty)?, slot, "old")
+            .build_load(storage_type(context, &ty, state.structs)?, slot, "old")
             .map_err(builder_error)?;
         state
             .builder
@@ -1376,7 +1530,7 @@ fn emit_project_assignment<'ctx, 'module>(
         let slot = global.as_pointer_value();
         let old = state
             .builder
-            .build_load(basic_type(context, &ty)?, slot, "old")
+            .build_load(storage_type(context, &ty, state.structs)?, slot, "old")
             .map_err(builder_error)?;
         state
             .builder
@@ -1387,6 +1541,9 @@ fn emit_project_assignment<'ctx, 'module>(
         match state.values.get(&assignment.target) {
             Some(EmitValue::Unit) => return Ok(EmitValue::Unit),
             Some(EmitValue::Basic(_)) => {
+                return Err(format!("unknown LLVM storage {}", assignment.target))
+            }
+            Some(EmitValue::Utf8View { .. }) => {
                 return Err(format!("unknown LLVM storage {}", assignment.target))
             }
             None => return Err(format!("unknown LLVM storage {}", assignment.target)),
@@ -1407,50 +1564,8 @@ fn emit_block_item<'ctx, 'module>(
                 state.values.insert(binding.name.clone(), EmitValue::Unit);
                 return Ok(EmitValue::Unit);
             }
-            if binding.receivers.len() == 2
-                && matches!(
-                    &binding.value,
-                    ScalarExpression::Call {
-                        receiver: Some(receiver),
-                        name,
-                        ..
-                    } if receiver == "core" && name == "utf8_view"
-                )
-            {
-                let ScalarExpression::Call { arguments, .. } = &binding.value else {
-                    unreachable!()
-                };
-                let length = utf8_length(state, &arguments[0])?;
-                let first = state
-                    .builder
-                    .build_alloca(
-                        basic_type(context, &binding.receivers[0].ty)?,
-                        &binding.receivers[0].name,
-                    )
-                    .map_err(builder_error)?;
-                state
-                    .builder
-                    .build_store(first, take_basic(value)?)
-                    .map_err(builder_error)?;
-                let second = state
-                    .builder
-                    .build_alloca(
-                        basic_type(context, &binding.receivers[1].ty)?,
-                        &binding.receivers[1].name,
-                    )
-                    .map_err(builder_error)?;
-                state
-                    .builder
-                    .build_store(second, context.i64_type().const_int(length, false))
-                    .map_err(builder_error)?;
-                state.storage.insert(
-                    binding.receivers[0].name.clone(),
-                    (first, binding.receivers[0].ty.clone()),
-                );
-                state.storage.insert(
-                    binding.receivers[1].name.clone(),
-                    (second, binding.receivers[1].ty.clone()),
-                );
+            if binding.receivers.len() == 2 {
+                materialize_utf8_view(context, state, &binding.receivers, value)?;
                 return Ok(EmitValue::Unit);
             }
             let slot = state
@@ -1492,50 +1607,8 @@ fn emit_project_block_item<'ctx, 'module>(
                 state.values.insert(binding.name.clone(), EmitValue::Unit);
                 return Ok(EmitValue::Unit);
             }
-            if binding.receivers.len() == 2
-                && matches!(
-                    &binding.value,
-                    ScalarExpression::Call {
-                        receiver: Some(receiver),
-                        name,
-                        ..
-                    } if receiver == "core" && name == "utf8_view"
-                )
-            {
-                let ScalarExpression::Call { arguments, .. } = &binding.value else {
-                    unreachable!()
-                };
-                let length = utf8_length(state, &arguments[0])?;
-                let first = state
-                    .builder
-                    .build_alloca(
-                        basic_type(context, &binding.receivers[0].ty)?,
-                        &binding.receivers[0].name,
-                    )
-                    .map_err(builder_error)?;
-                state
-                    .builder
-                    .build_store(first, take_basic(value)?)
-                    .map_err(builder_error)?;
-                let second = state
-                    .builder
-                    .build_alloca(
-                        basic_type(context, &binding.receivers[1].ty)?,
-                        &binding.receivers[1].name,
-                    )
-                    .map_err(builder_error)?;
-                state
-                    .builder
-                    .build_store(second, context.i64_type().const_int(length, false))
-                    .map_err(builder_error)?;
-                state.storage.insert(
-                    binding.receivers[0].name.clone(),
-                    (first, binding.receivers[0].ty.clone()),
-                );
-                state.storage.insert(
-                    binding.receivers[1].name.clone(),
-                    (second, binding.receivers[1].ty.clone()),
-                );
+            if binding.receivers.len() == 2 {
+                materialize_utf8_view(context, state, &binding.receivers, value)?;
                 return Ok(EmitValue::Unit);
             }
             let slot = state
@@ -1672,7 +1745,7 @@ fn emit_expression<'ctx, 'module>(
                 return Ok(EmitValue::Basic(
                     state
                         .builder
-                        .build_load(basic_type(context, &ty)?, slot, name)
+                        .build_load(storage_type(context, &ty, state.structs)?, slot, name)
                         .map_err(builder_error)?,
                 ));
             }
@@ -1683,7 +1756,11 @@ fn emit_expression<'ctx, 'module>(
                 return Ok(EmitValue::Basic(
                     state
                         .builder
-                        .build_load(basic_type(context, &ty)?, global.as_pointer_value(), name)
+                        .build_load(
+                            storage_type(context, &ty, state.structs)?,
+                            global.as_pointer_value(),
+                            name,
+                        )
                         .map_err(builder_error)?,
                 ));
             }
@@ -1773,7 +1850,11 @@ fn emit_project_expression<'ctx, 'module>(
             Ok(EmitValue::Basic(
                 state
                     .builder
-                    .build_load(basic_type(context, &ty)?, global.as_pointer_value(), name)
+                    .build_load(
+                        storage_type(context, &ty, state.structs)?,
+                        global.as_pointer_value(),
+                        name,
+                    )
                     .map_err(builder_error)?,
             ))
         }
@@ -1788,10 +1869,19 @@ fn emit_project_expression<'ctx, 'module>(
                     return Err("core.utf8_view has invalid argument arity".to_owned());
                 };
                 return match argument {
-                    ScalarExpression::Utf8 { value, .. } => {
-                        emit_utf8_literal(context, state, value)
+                    ScalarExpression::Utf8 { .. }
+                    | ScalarExpression::Name { .. }
+                    | ScalarExpression::Member { .. } => {
+                        let pointer =
+                            emit_project_expression(context, state, argument, module, modules)?;
+                        let pointer = take_basic(pointer)?;
+                        let length = project_utf8_length(state, argument, module, modules)?;
+                        Ok(EmitValue::Utf8View {
+                            pointer,
+                            length: context.i64_type().const_int(length, false).into(),
+                        })
                     }
-                    _ => emit_project_expression(context, state, argument, module, modules),
+                    _ => Err("core.utf8_view requires a UTF-8 value with known storage".to_owned()),
                 };
             }
             let target = receiver.as_ref().map_or(module, |binding| {
@@ -1904,11 +1994,10 @@ fn emit_call<'ctx, 'module>(
             return Err("core.utf8_view has invalid argument arity".to_owned());
         };
         return match argument {
-            ScalarExpression::Utf8 { value, .. } => emit_utf8_literal(context, state, value),
-            _ => {
-                let value = emit_expression(context, state, argument)?;
-                Ok(value)
+            ScalarExpression::Utf8 { .. } | ScalarExpression::Name { .. } => {
+                emit_utf8_view(context, state, argument)
             }
+            _ => Err("core.utf8_view requires a UTF-8 value with known storage".to_owned()),
         };
     }
     let values = arguments
@@ -1934,6 +2023,7 @@ fn emit_call_values<'ctx, 'module>(
         .map(|value| match value {
             EmitValue::Basic(value) => Ok(BasicMetadataValueEnum::from(value)),
             EmitValue::Unit => Err("unit argument is invalid".into()),
+            EmitValue::Utf8View { .. } => Err("structured UTF-8 view argument is invalid".into()),
         })
         .collect::<Result<Vec<_>, String>>()?;
     let call = state
@@ -3031,5 +3121,138 @@ child.marker = child.touch();
             "{text}"
         );
         assert!(text.contains("ptrtoint"), "{text}");
+    }
+
+    #[test]
+    fn emits_utf8_view_literal_and_bound_outputs_in_order() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start
+utf8 text = \"hé\";
+unsafe {
+    *?u8 literal_bytes, u64 literal_length = core.utf8_view(\"hé\");
+    *?u8 bound_bytes, u64 bound_length = core.utf8_view(text);
+};
+%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_llvm(&validation)
+            .expect("UTF-8 view LLVM")
+            .to_text();
+        let main = text.split("define i32 @main").nth(1).expect("main");
+        assert!(
+            text.contains("@wosy_utf8_literal_0 = private constant [3 x i8]"),
+            "{text}"
+        );
+        assert!(main.matches("store i64 3").count() == 2, "{main}");
+        assert!(
+            main.find("store i32").expect("pointer store")
+                < main.find("store i64 3").expect("length store")
+        );
+        assert!(main.contains("alloca i32"));
+        assert!(main.contains("alloca i64"));
+    }
+
+    #[test]
+    fn emits_utf8_view_for_project_module_binding() {
+        let child_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/child.w".into(),
+            "r1".into(),
+        );
+        let child = derive_scalar_program(
+            &parse_source(
+                child_source.clone(),
+                "%%start
+utf8 text = \"猫\";
+%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let root_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let root = derive_scalar_program(
+            &parse_source(
+                root_source.clone(),
+                "%%start
+child = namespace package \"src/child.w\";
+unsafe {
+    *?u8 bytes, u64 length = core.utf8_view(child.text);
+};
+%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let namespace_bindings = root
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::ScalarItem::Namespace(namespace) => Some(crate::ScalarNamespaceBinding {
+                    binding: namespace.binding.clone(),
+                    target: child_source.clone(),
+                    span: namespace.span,
+                }),
+                _ => None,
+            })
+            .collect();
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(root_source, root.items, namespace_bindings),
+                ScalarModule::new(child_source, child.items, Vec::new()),
+            ],
+            vec![
+                SourceIdentity::new(
+                    "project".into(),
+                    "package".into(),
+                    "src/main.w".into(),
+                    "r1".into(),
+                ),
+                SourceIdentity::new(
+                    "project".into(),
+                    "package".into(),
+                    "src/child.w".into(),
+                    "r1".into(),
+                ),
+            ],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_project_llvm(&validation)
+            .expect("project UTF-8 view LLVM")
+            .to_text();
+        assert!(
+            text.contains("@wosy_utf8_literal_0 = private constant [3 x i8]"),
+            "{text}"
+        );
+        assert!(text.contains("store i64 3"), "{text}");
     }
 }
