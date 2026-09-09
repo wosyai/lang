@@ -8,9 +8,9 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 use wosy_compiler::{
-    derive_scalar_program_from_cst, emit_scalar_llvm_text, emit_scalar_project_llvm, parse_source,
-    publication, serialize_publication, validate_scalar_project, ScalarModule,
-    ScalarNamespaceBinding, ScalarProject,
+    derive_scalar_diagnostics_from_cst, derive_scalar_program_from_cst, emit_scalar_llvm_text,
+    emit_scalar_project_llvm, parse_source, publication, serialize_publication,
+    validate_scalar_project, ScalarModule, ScalarNamespaceBinding, ScalarProject,
 };
 use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest, load_reachable_source_graph,
@@ -308,6 +308,7 @@ fn compile_project(
         })?;
     let mut modules = Vec::new();
     let mut source_by_path = BTreeMap::new();
+    let mut derivation_diagnostics = Vec::new();
     for node in &graph.nodes {
         let source =
             compiler_source_identity(root, project, &node.source.path, &node.content_revision);
@@ -320,6 +321,7 @@ fn compile_project(
                 node.source.path.as_path().display()
             )
         })?;
+        derivation_diagnostics.extend(derive_scalar_diagnostics_from_cst(cst));
         let validation = derive_scalar_program_from_cst(cst);
         let namespace_bindings = node
             .namespace_edges
@@ -344,6 +346,10 @@ fn compile_project(
             validation.program.items,
             namespace_bindings,
         ));
+    }
+    render_project_diagnostics(&derivation_diagnostics, &texts);
+    if !derivation_diagnostics.is_empty() {
+        return Err("build rejected by CST derivation diagnostics".to_owned());
     }
     let initialization_order = graph
         .initialization_order
