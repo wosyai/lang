@@ -1269,6 +1269,9 @@ fn call_output_sequence_in_module(
     let ScalarExpression::Call { receiver, name, .. } = expression else {
         return None;
     };
+    if receiver.as_deref() == Some("core") && name == "utf8_view" {
+        return Some(utf8_view_outputs(expression_span(expression)));
+    }
     let callable = match receiver {
         None => scope.get(name),
         Some(binding) => {
@@ -1309,6 +1312,9 @@ fn call_output_sequence(
     let ScalarExpression::Call { receiver, name, .. } = expression else {
         return None;
     };
+    if receiver.as_deref() == Some("core") && name == "utf8_view" {
+        return Some(utf8_view_outputs(expression_span(expression)));
+    }
     let callable = if receiver.is_none() {
         scope.get(name)
     } else {
@@ -1329,6 +1335,29 @@ fn call_output_sequence(
         return None;
     };
     Some(outputs.clone())
+}
+
+fn expression_span(expression: &ScalarExpression) -> ByteSpan {
+    match expression {
+        ScalarExpression::Call { span, .. } => *span,
+        _ => ByteSpan::new(0, 0),
+    }
+}
+
+fn utf8_view_outputs(span: ByteSpan) -> ScalarOutputSequence {
+    ScalarOutputSequence {
+        outputs: vec![
+            ScalarOutput {
+                ty: ScalarType::RawPointer(Box::new(ScalarType::U8)),
+                span,
+            },
+            ScalarOutput {
+                ty: ScalarType::U64,
+                span,
+            },
+        ],
+        span,
+    }
 }
 
 fn validate_output_receivers_in_module(
@@ -1967,6 +1996,34 @@ fn expression_type_in_module(
             span,
             ..
         } => {
+            if receiver.as_deref() == Some("core") && name == "utf8_view" {
+                if arguments.len() != 1 {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0004",
+                        "call argument arity does not match callable type",
+                        *span,
+                    ));
+                    return ScalarType::Error;
+                }
+                let actual = expression_type_in_module_expected(
+                    &arguments[0],
+                    Some(&ScalarType::Utf8),
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+                expect_module_type(module, &ScalarType::Utf8, &actual, *span, diagnostics);
+                return if is_error_type(&actual) {
+                    ScalarType::Error
+                } else {
+                    ScalarType::RawPointer(Box::new(ScalarType::U8))
+                };
+            }
             let (callable, target, unsafe_callable) = match receiver {
                 None => (scope.get(name), module, false),
                 Some(binding) => {
@@ -4533,6 +4590,33 @@ fn expression_type(
             span,
             ..
         } => {
+            if receiver.as_deref() == Some("core") && name == "utf8_view" {
+                if arguments.len() != 1 {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "B0004",
+                        "call argument arity does not match callable type",
+                        *span,
+                    ));
+                    return ScalarType::Error;
+                }
+                let actual = expression_type_expected(
+                    &arguments[0],
+                    &ScalarType::Utf8,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                expect_type(program, &ScalarType::Utf8, &actual, *span, diagnostics);
+                return if is_error_type(&actual) {
+                    ScalarType::Error
+                } else {
+                    ScalarType::RawPointer(Box::new(ScalarType::U8))
+                };
+            }
             let lookup_name = receiver
                 .as_ref()
                 .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"));
@@ -6631,6 +6715,41 @@ wasi = extern wasm "\q" { i32(i32, utf8) fd_write; };
             ScalarType::RawPointer(Box::new(ScalarType::U8))
         );
         assert_eq!(binding.receivers[1].ty, ScalarType::U64);
+    }
+
+    #[test]
+    fn types_core_utf8_view_for_literal_and_binding_inputs() {
+        let literal = validate_text(
+            "%%start\nunsafe {\n\t*?u8 bytes, u64 length = core.utf8_view(\"text\");\n};\n%%end",
+        );
+        assert!(literal.diagnostics.is_empty(), "{:?}", literal.diagnostics);
+
+        let binding = validate_text(
+            "%%start\nutf8 text = \"text\";\nunsafe {\n\t*?u8 bytes, u64 length = core.utf8_view(text);\n};\n%%end",
+        );
+        assert!(binding.diagnostics.is_empty(), "{:?}", binding.diagnostics);
+    }
+
+    #[test]
+    fn diagnoses_invalid_core_utf8_view_calls() {
+        let wrong_arity = validate_text(
+            "%%start\nunsafe {\n\t*?u8 bytes, u64 length = core.utf8_view();\n};\n%%end",
+        );
+        assert!(wrong_arity
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0004"));
+
+        let wrong_type = validate_text(
+            "%%start\nunsafe {\n\t*?u8 bytes, u64 length = core.utf8_view(1);\n};\n%%end",
+        );
+        assert!(
+            wrong_type
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message
+                    == "expression type does not match expected type")
+        );
     }
 
     #[test]
