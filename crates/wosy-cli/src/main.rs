@@ -128,6 +128,7 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let configuration = ProjectConfiguration::load(&root)?;
     let (_target_config, artifact, artifact_profile, target_profile) =
         configuration.artifact_profile(target_name, profile)?;
+    validate_artifact_contract(&configuration, artifact_profile)?;
     let (llvm, source_identity) = compile_project(&root, &project)?;
     let artifact_name = &target_profile.main_artifact;
     let output_dir = root
@@ -183,6 +184,7 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
     let configuration = ProjectConfiguration::load(&root)?;
     let (_target_config, artifact, artifact_profile, target_profile) =
         configuration.artifact_profile(target_name, profile)?;
+    validate_artifact_contract(&configuration, artifact_profile)?;
     let manifest_path =
         artifact_manifest_path(&root, target_name, profile, &target_profile.main_artifact);
     let manifest = load_artifact_manifest(&manifest_path)?;
@@ -217,6 +219,26 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
         &manifest_path,
         arguments,
     )
+}
+
+fn validate_artifact_contract(
+    configuration: &ProjectConfiguration,
+    artifact_profile: &wosy_project::ArtifactProfile,
+) -> Result<(), String> {
+    let diagnostics = configuration.validate_artifact_profile(artifact_profile);
+    if diagnostics.is_empty() {
+        return Ok(());
+    }
+    Err(diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            format!(
+                "{}: field={} actual={} expected={}",
+                diagnostic.code, diagnostic.field, diagnostic.actual, diagnostic.expected
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 fn compile_project(
