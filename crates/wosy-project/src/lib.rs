@@ -734,6 +734,33 @@ mod tests {
     }
 
     #[test]
+    fn artifact_profile_loads_wasm_wasip1_with_builder_and_runner_identities() {
+        let document = r#"
+            [artifacts.main]
+            artifact = "runtime"
+
+            [artifacts.main.profiles.dev]
+            backend = "llvm"
+            output = "wasm-wasip1"
+            builder = "llvm-wasm"
+            run_runner = "wasmtime-wasip1"
+        "#
+        .parse::<DocumentMut>()
+        .expect("artifact configuration");
+
+        let artifacts = parse_artifacts(document.as_table().get("artifacts"));
+        let artifact = artifacts
+            .expect("Wasm artifact configuration")
+            .remove("main")
+            .expect("main artifact");
+        let profile = artifact.profiles.get("dev").expect("dev profile");
+
+        assert_eq!(profile.output, "wasm-wasip1");
+        assert_eq!(profile.builder, "llvm-wasm");
+        assert_eq!(profile.run_runner, "wasmtime-wasip1");
+    }
+
+    #[test]
     fn reachable_graph_visits_edges_in_source_order_once() {
         let root = source(
             "src/main.w",
