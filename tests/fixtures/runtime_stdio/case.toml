@@ -1,0 +1,36 @@
+[[steps]]
+source = "project/src/stdout.w"
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+source = "project/src/stdout.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/stdout"
+stderr = "expected/empty"
+exact = true
+
+[[steps]]
+source = "project/src/stderr.w"
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+source = "project/src/stderr.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/stderr"
+exact = true
+
+[[steps]]
+source = "project/src/missing_extern.w"
+command = ["wosy", "build", "app"]
+exit = 1
+
+[[assert]]
+source = "project/src/missing_extern.w"
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["B0001"]
