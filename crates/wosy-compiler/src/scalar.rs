@@ -1216,7 +1216,8 @@ fn validate_module_type(
         }
         ScalarType::Unit | ScalarType::Bool | ScalarType::I32 => {}
         ScalarType::U8 | ScalarType::U32 | ScalarType::U64 | ScalarType::Utf8 => {}
-        ScalarType::RawPointer(inner) if matches!(inner.as_ref(), ScalarType::U8) => {}
+        ScalarType::RawPointer(inner)
+            if matches!(inner.as_ref(), ScalarType::U8 | ScalarType::Struct(_)) => {}
         ScalarType::RawPointer(_) => diagnostics.push(module_diagnostic(
             module,
             "B0003",
@@ -1240,7 +1241,7 @@ fn validate_extern(
 ) {
     let valid_binding = extern_decl.kind == "wasm"
         && matches!(extern_decl.actual_module, ScalarExternModule::Valid(_))
-        && extern_decl.functions.len() == 1;
+        && !extern_decl.functions.is_empty();
     if !valid_binding {
         diagnostics.push(module_diagnostic(
             module,
@@ -1250,7 +1251,12 @@ fn validate_extern(
         ));
     }
     for function in &extern_decl.functions {
-        let _ = function;
+        validate_module_type(
+            module,
+            &function.signature,
+            function.signature_span,
+            diagnostics,
+        );
     }
 }
 
@@ -2019,12 +2025,7 @@ fn expression_type_in_module(
                             ));
                             return ScalarType::Error;
                         };
-                        (
-                            Some(&function.signature),
-                            module,
-                            function.unsafe_marker
-                                && !(receiver.as_deref() == Some("wasi") && name == "fd_write"),
-                        )
+                        (Some(&function.signature), module, function.unsafe_marker)
                     }
                 }
             };
@@ -2751,22 +2752,36 @@ fn derive_extern(node: &CstNode) -> ScalarExtern {
         })
         .collect();
     let module = direct_token(node, SyntaxKind::String).expect("extern module");
-    let callable = node
+    let functions = node
         .children()
-        .find(|child| child.kind() == SyntaxKind::ExternFunction)
-        .expect("extern function");
-    let signature = callable
-        .children()
-        .find(|child| child.kind() == SyntaxKind::CallableType)
-        .expect("extern signature");
-    let name = callable
-        .children_with_tokens()
-        .filter_map(|element| match element {
-            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => Some(token),
-            _ => None,
+        .filter(|child| child.kind() == SyntaxKind::ExternFunction)
+        .map(|callable| {
+            let signature = callable
+                .children()
+                .find(|child| child.kind() == SyntaxKind::CallableType)
+                .expect("extern signature");
+            let name = callable
+                .children_with_tokens()
+                .filter_map(|element| match element {
+                    NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => {
+                        Some(token)
+                    }
+                    _ => None,
+                })
+                .next()
+                .expect("extern symbol");
+            ScalarExternFunction {
+                name: name.text().to_owned(),
+                signature: derive_type(&signature),
+                unsafe_marker: callable
+                    .children_with_tokens()
+                    .any(|element| element.kind() == SyntaxKind::Unsafe),
+                name_span: token_span(&name),
+                signature_span: wosy_syntax::byte_span(&signature),
+                span: wosy_syntax::byte_span(&callable),
+            }
         })
-        .next()
-        .expect("extern symbol");
+        .collect();
     ScalarExtern {
         binding: identifiers[0].text().to_owned(),
         kind: identifiers[1].text().to_owned(),
@@ -2777,16 +2792,7 @@ fn derive_extern(node: &CstNode) -> ScalarExtern {
                 error_span: string_error_span(&module, start, length),
             },
         },
-        functions: vec![ScalarExternFunction {
-            name: name.text().to_owned(),
-            signature: derive_type(&signature),
-            unsafe_marker: callable
-                .children_with_tokens()
-                .any(|element| element.kind() == SyntaxKind::Unsafe),
-            name_span: token_span(&name),
-            signature_span: wosy_syntax::byte_span(&signature),
-            span: wosy_syntax::byte_span(&callable),
-        }],
+        functions,
         binding_span: token_span(&identifiers[0]),
         module_span: token_span(&module),
         span: wosy_syntax::byte_span(node),
@@ -4549,7 +4555,6 @@ fn expression_type(
                     item,
                     ScalarItem::Extern(extern_decl)
                         if receiver.as_deref() == Some(extern_decl.binding.as_str())
-                            && !(extern_decl.binding == "wasi" && name == "fd_write")
                             && extern_decl.functions.iter().any(|function| {
                                 function.name == *name && function.unsafe_marker
                             })
@@ -5228,6 +5233,22 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "B0001"));
+    }
+
+    #[test]
+    fn derives_all_generic_extern_functions_in_declaration_order() {
+        let result = validate_text(
+            "%%start\nenv = extern wasm \"helper\" { unsafe i32(i32) read; unit() flush; };\ni32 value = unsafe { env.read(7) };\nenv.flush();\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Extern(extern_decl) = &result.program.items[0] else {
+            panic!("extern item");
+        };
+        assert_eq!(extern_decl.functions.len(), 2);
+        assert_eq!(extern_decl.functions[0].name, "read");
+        assert!(extern_decl.functions[0].unsafe_marker);
+        assert_eq!(extern_decl.functions[1].name, "flush");
+        assert!(!extern_decl.functions[1].unsafe_marker);
     }
 
     #[test]

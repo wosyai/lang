@@ -15,7 +15,7 @@ top_level_item = { (assignment | expression) ~ ";" }
 struct_decl = { "struct" ~ identifier ~ "{" ~ struct_field* ~ "}" }
 struct_field = { type_spec ~ identifier ~ ";" }
 namespace_decl = { identifier ~ "=" ~ "namespace" ~ identifier ~ string ~ ";" }
-extern_decl = { identifier ~ "=" ~ "extern" ~ identifier ~ string ~ "{" ~ extern_function ~ "}" ~ ";" }
+extern_decl = { identifier ~ "=" ~ "extern" ~ identifier ~ string ~ "{" ~ extern_function+ ~ "}" ~ ";" }
 extern_function = { unsafe_marker? ~ callable_type ~ identifier ~ ";" }
 function_decl = { callable_type ~ identifier ~ "=" ~ "fn" ~ parameters? ~ block ~ ";" }
 binding_decl = { receiver_list ~ "=" ~ output_list ~ ";" }
