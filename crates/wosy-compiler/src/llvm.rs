@@ -294,11 +294,30 @@ impl LlvmPartition {
             serialized.push_str(&body);
             text = serialized;
         } else {
-            text = text
+            let has_trailing_newline = text.ends_with('\n');
+            let mut lines = text
                 .lines()
                 .filter(|line| !line.contains("@wosy_fd_write_scratch"))
-                .collect::<Vec<_>>()
-                .join("\n");
+                .collect::<Vec<_>>();
+            if let Some(index) = lines
+                .iter()
+                .position(|line| line.starts_with("declare i32 @fd_write("))
+            {
+                lines.remove(index);
+                lines.remove(index - 1);
+            }
+            if let Some(index) = lines
+                .iter()
+                .position(|line| line.starts_with("source_filename"))
+            {
+                if lines.get(index + 1) == Some(&"") && lines.get(index + 2) == Some(&"") {
+                    lines.remove(index + 2);
+                }
+            }
+            text = lines.join("\n");
+            if has_trailing_newline {
+                text.push('\n');
+            }
         }
         text
     }
@@ -2179,6 +2198,11 @@ unit() use = fn {
         let text = emit_scalar_llvm(&validation).expect("unit LLVM").to_text();
 
         assert_eq!(text.matches("call void @touch()").count(), 5);
+        assert!(!text.contains("declare i32 @fd_write("));
+        assert!(
+            text.contains("source_filename = \"src/main.w\"\n\ndefine void @touch()"),
+            "{text}"
+        );
         assert!(!text.contains("global"), "{text}");
         assert!(!text.contains("alloca"));
         assert!(!text.contains("load"));
