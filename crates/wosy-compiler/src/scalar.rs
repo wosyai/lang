@@ -72,6 +72,7 @@ pub enum ScalarPlace {
     Field {
         base: Box<ScalarPlace>,
         field: ScalarStructFieldId,
+        field_name: String,
         span: ByteSpan,
     },
     Dereference {
@@ -479,6 +480,7 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
         target_layout: ScalarTargetLayout::WASM32,
     };
     resolve_program_types(&mut program);
+    resolve_program_places(&mut program);
     let mut validation_diagnostics = validate(&program);
     let mut diagnostics = diagnostics;
     diagnostics.append(&mut validation_diagnostics);
@@ -581,7 +583,7 @@ fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarStructId>) -> Sc
         ScalarType::Named(name) => names
             .get(name)
             .copied()
-            .map_or(ScalarType::Error, ScalarType::Struct),
+            .map_or_else(|| ScalarType::Named(name.clone()), ScalarType::Struct),
         ScalarType::RawPointer(inner) => {
             ScalarType::RawPointer(Box::new(resolve_type(inner, names)))
         }
@@ -593,6 +595,162 @@ fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarStructId>) -> Sc
                 .collect(),
         },
         value => value.clone(),
+    }
+}
+
+fn resolve_program_places(program: &mut ScalarProgram) {
+    let context = program.clone();
+    let declarations = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarItem::Binding(binding) => {
+                Some((binding.name.clone(), binding.declared_type.clone()))
+            }
+            ScalarItem::Function(function) => {
+                Some((function.name.clone(), function.signature.clone()))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    for item in &mut program.items {
+        match item {
+            ScalarItem::Binding(binding) => {
+                resolve_expression_places(&mut binding.value, &declarations, &context);
+            }
+            ScalarItem::Function(function) => {
+                let mut scope = declarations.clone();
+                if let ScalarType::Callable { parameters, .. } = &function.signature {
+                    for (name, ty) in function.parameters.iter().zip(parameters) {
+                        scope.insert(name.clone(), ty.clone());
+                    }
+                }
+                resolve_block_places(&mut function.body, &mut scope, &context);
+            }
+            ScalarItem::Executable(item) => {
+                resolve_item_places(item, &mut declarations.clone(), &context);
+            }
+            ScalarItem::Extern(_) | ScalarItem::Namespace(_) => {}
+        }
+    }
+}
+
+fn resolve_item_places(
+    item: &mut ScalarBlockItem,
+    scope: &mut BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+) {
+    match item {
+        ScalarBlockItem::LocalBinding(binding) => {
+            resolve_expression_places(&mut binding.value, scope, program);
+            scope.insert(binding.name.clone(), binding.declared_type.clone());
+        }
+        ScalarBlockItem::Expression(expression) => {
+            resolve_expression_places(expression, scope, program)
+        }
+        ScalarBlockItem::Assignment(assignment) => {
+            resolve_expression_places(&mut assignment.value, scope, program)
+        }
+        ScalarBlockItem::While(while_expression) => {
+            resolve_expression_places(&mut while_expression.condition, scope, program);
+            resolve_block_places(&mut while_expression.body, scope, program);
+        }
+    }
+}
+
+fn resolve_block_places(
+    block: &mut ScalarBlock,
+    scope: &mut BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+) {
+    for item in &mut block.items {
+        resolve_item_places(item, scope, program);
+    }
+}
+
+fn resolve_expression_places(
+    expression: &mut ScalarExpression,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+) {
+    match expression {
+        ScalarExpression::RawAddress { place, .. } => resolve_place(place, scope, program),
+        ScalarExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                resolve_expression_places(&mut field.value, scope, program);
+            }
+        }
+        ScalarExpression::Binary { left, right, .. } => {
+            resolve_expression_places(left, scope, program);
+            resolve_expression_places(right, scope, program);
+        }
+        ScalarExpression::Call { arguments, .. } => {
+            for argument in arguments {
+                resolve_expression_places(argument, scope, program);
+            }
+        }
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            resolve_expression_places(condition, scope, program);
+            let mut then_scope = scope.clone();
+            resolve_block_places(then_branch, &mut then_scope, program);
+            let mut else_scope = scope.clone();
+            resolve_block_places(else_branch, &mut else_scope, program);
+        }
+        ScalarExpression::Block(block) => {
+            let mut scope = scope.clone();
+            resolve_block_places(block, &mut scope, program);
+        }
+        ScalarExpression::Name { .. }
+        | ScalarExpression::Member { .. }
+        | ScalarExpression::Integer { .. }
+        | ScalarExpression::InvalidInteger { .. }
+        | ScalarExpression::Boolean { .. }
+        | ScalarExpression::Utf8 { .. } => {}
+    }
+}
+
+fn resolve_place(
+    place: &mut ScalarPlace,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+) {
+    match place {
+        ScalarPlace::Name { .. } => {}
+        ScalarPlace::Dereference { pointer, .. } => {
+            resolve_expression_places(pointer, scope, program)
+        }
+        ScalarPlace::Field {
+            base,
+            field,
+            field_name,
+            span,
+        } => {
+            resolve_place(base, scope, program);
+            let base_type = place_type(base, scope, program, &mut Vec::new());
+            let structure = match base_type {
+                ScalarType::Struct(id) => program.structs.get(id.index),
+                ScalarType::RawPointer(inner) => match inner.as_ref() {
+                    ScalarType::Struct(id) => program.structs.get(id.index),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(declared) = structure.and_then(|structure| {
+                structure
+                    .fields
+                    .iter()
+                    .find(|candidate| candidate.name == *field_name)
+            }) {
+                *field = declared.id;
+            } else {
+                let _ = span;
+            }
+        }
     }
 }
 
@@ -618,6 +776,10 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
 }
 
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
+    let mut project = project;
+    for module in &mut project.modules {
+        resolve_module_types(module);
+    }
     let mut diagnostics = Vec::new();
     for module in &project.modules {
         let mut declarations = BTreeMap::new();
@@ -754,6 +916,62 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
     ScalarProjectValidation {
         project,
         diagnostics,
+    }
+}
+
+fn resolve_module_types(module: &mut ScalarModule) {
+    let names = module
+        .structs
+        .iter()
+        .map(|structure| (structure.name.clone(), structure.id))
+        .collect::<BTreeMap<_, _>>();
+    for structure in &mut module.structs {
+        for field in &mut structure.fields {
+            field.ty = resolve_type(&field.ty, &names);
+            field.layout = layout_for_type(&field.ty);
+        }
+    }
+    for item in &mut module.items {
+        match item {
+            ScalarItem::Binding(binding) => {
+                binding.declared_type = resolve_type(&binding.declared_type, &names);
+                for receiver in &mut binding.receivers {
+                    receiver.ty = resolve_type(&receiver.ty, &names);
+                }
+            }
+            ScalarItem::Function(function) => {
+                function.signature = resolve_type(&function.signature, &names);
+                function.outputs = callable_outputs_from_type(&function.signature);
+                function.output_sequence =
+                    output_sequence_from_type(&function.signature, function.span);
+                resolve_block_types(&mut function.body, &names);
+            }
+            ScalarItem::Extern(extern_decl) => {
+                for function in &mut extern_decl.functions {
+                    function.signature = resolve_type(&function.signature, &names);
+                    function.outputs = callable_outputs_from_type(&function.signature);
+                    function.output_sequence =
+                        output_sequence_from_type(&function.signature, function.span);
+                }
+            }
+            ScalarItem::Executable(item) => resolve_item_types(item, &names),
+            ScalarItem::Namespace(_) => {}
+        }
+    }
+    for item in &module.items {
+        match item {
+            ScalarItem::Binding(binding) => {
+                module
+                    .members
+                    .insert(binding.name.clone(), binding.declared_type.clone());
+            }
+            ScalarItem::Function(function) => {
+                module
+                    .members
+                    .insert(function.name.clone(), function.signature.clone());
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1728,12 +1946,33 @@ fn place_type(
             diagnostics.push(diagnostic(program, "B0001", "unknown name", *span));
             ScalarType::Error
         }),
-        ScalarPlace::Field { base, field, span } => {
-            let ScalarType::Struct(id) = place_type(base, scope, program, diagnostics) else {
+        ScalarPlace::Field {
+            base, field, span, ..
+        } => {
+            let base_type = place_type(base, scope, program, diagnostics);
+            let id = match base_type {
+                ScalarType::Struct(id) => id,
+                ScalarType::RawPointer(inner) => match inner.as_ref() {
+                    ScalarType::Struct(id) => *id,
+                    _ => {
+                        diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
+                        return ScalarType::Error;
+                    }
+                },
+                _ => {
+                    diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
+                    return ScalarType::Error;
+                }
+            };
+            let Some(resolved_field) = program
+                .structs
+                .get(id.index)
+                .and_then(|structure| structure.fields.get(field.index))
+            else {
                 diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
                 return ScalarType::Error;
             };
-            program.structs[id.index].fields[field.index].ty.clone()
+            resolved_field.ty.clone()
         }
         ScalarPlace::Dereference { pointer, span } => match expression_type(
             pointer,
@@ -1790,7 +2029,9 @@ fn place_type_in_module(
                 ScalarType::Error
             }
         },
-        ScalarPlace::Field { base, field, span } => {
+        ScalarPlace::Field {
+            base, field, span, ..
+        } => {
             let base_type = place_type_in_module(base, scope, module, diagnostics);
             let ScalarType::Struct(id) = base_type else {
                 diagnostics.push(module_diagnostic(
@@ -2762,6 +3003,7 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                     structure: ScalarStructId { index: usize::MAX },
                     index: usize::MAX,
                 },
+                field_name: identifiers[1].text().to_owned(),
                 span: wosy_syntax::byte_span(node),
             }
         }
@@ -2780,6 +3022,7 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                     structure: ScalarStructId { index: usize::MAX },
                     index: usize::MAX,
                 },
+                field_name: field.text().to_owned(),
                 span: wosy_syntax::byte_span(node),
             }
         }
