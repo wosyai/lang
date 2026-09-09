@@ -66,6 +66,7 @@ pub enum ScalarExpression {
     },
     InvalidInteger {
         span: ByteSpan,
+        error_span: Option<ByteSpan>,
     },
     Boolean {
         value: bool,
@@ -96,6 +97,15 @@ pub enum ScalarExpression {
         span: ByteSpan,
     },
     Block(ScalarBlock),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarExternModule {
+    Valid(String),
+    Invalid {
+        span: ByteSpan,
+        error_span: ByteSpan,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -173,7 +183,7 @@ pub struct ScalarExternFunction {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarExtern {
     pub binding: String,
-    pub actual_module: String,
+    pub actual_module: ScalarExternModule,
     pub kind: String,
     pub functions: Vec<ScalarExternFunction>,
     pub binding_span: ByteSpan,
@@ -295,6 +305,7 @@ pub fn derive_scalar_program(parse: &ParseResult) -> ScalarValidation {
 
 pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarValidation {
     let mut items = Vec::new();
+    let diagnostics = string_diagnostics(canonical);
     let source_root = canonical
         .root
         .children()
@@ -335,7 +346,9 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
         source: canonical.source.clone(),
         items,
     };
-    let diagnostics = validate(&program);
+    let mut validation_diagnostics = validate(&program);
+    let mut diagnostics = diagnostics;
+    diagnostics.append(&mut validation_diagnostics);
     ScalarValidation {
         program,
         diagnostics,
@@ -521,7 +534,8 @@ fn validate_extern(
 ) {
     let valid_binding = extern_decl.binding == "wasi"
         && extern_decl.kind == "wasm"
-        && extern_decl.actual_module == "wasi_snapshot_preview1"
+        && extern_decl.actual_module
+            == ScalarExternModule::Valid("wasi_snapshot_preview1".to_owned())
         && extern_decl.functions.len() == 1;
     if !valid_binding {
         diagnostics.push(module_diagnostic(
@@ -842,9 +856,13 @@ fn expression_type_in_module(
             validate_integer_range(module, value, *span, diagnostics);
             ScalarType::I32
         }
-        ScalarExpression::InvalidInteger { span } => {
-            invalid_integer_diagnostic(module, *span, diagnostics);
-            ScalarType::I32
+        ScalarExpression::InvalidInteger { span, error_span } => {
+            if error_span.is_some() {
+                ScalarType::Error
+            } else {
+                invalid_integer_diagnostic(module, *span, diagnostics);
+                ScalarType::I32
+            }
         }
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
         ScalarExpression::Utf8 { .. } => ScalarType::Utf8,
@@ -1244,7 +1262,13 @@ fn derive_extern(node: &CstNode) -> ScalarExtern {
     ScalarExtern {
         binding: identifiers[0].text().to_owned(),
         kind: identifiers[1].text().to_owned(),
-        actual_module: decode_string(module.text()).expect("valid extern module string"),
+        actual_module: match decode_string(module.text()) {
+            Ok(value) => ScalarExternModule::Valid(value),
+            Err((start, length)) => ScalarExternModule::Invalid {
+                span: token_span(&module),
+                error_span: string_error_span(&module, start, length),
+            },
+        },
         functions: vec![ScalarExternFunction {
             name: name.text().to_owned(),
             signature: derive_type(&signature),
@@ -1394,29 +1418,108 @@ fn type_from_name(value: &str) -> ScalarType {
     }
 }
 
-fn decode_string(value: &str) -> Result<String, ()> {
-    let quoted = value
+fn decode_string(value: &str) -> Result<String, (usize, usize)> {
+    let Some(quoted) = value
         .strip_prefix('"')
-        .ok_or(())?
-        .strip_suffix('"')
-        .ok_or(())?;
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return Err((0, value.len()));
+    };
     let mut decoded = String::new();
-    let mut chars = quoted.chars();
-    while let Some(character) = chars.next() {
+    let mut chars = quoted.char_indices();
+    while let Some((index, character)) = chars.next() {
         if character != '\\' {
             decoded.push(character);
             continue;
         }
-        decoded.push(match chars.next().ok_or(())? {
-            'n' => '\n',
-            'r' => '\r',
-            't' => '\t',
-            '"' => '"',
-            '\\' => '\\',
-            _ => return Err(()),
-        });
+        let Some((escape_index, escape)) = chars.next() else {
+            return Err((index, 1));
+        };
+        match escape {
+            'n' => decoded.push('\n'),
+            'r' => decoded.push('\r'),
+            't' => decoded.push('\t'),
+            '0' => decoded.push('\0'),
+            '"' => decoded.push('"'),
+            '\'' => decoded.push('\''),
+            '\\' => decoded.push('\\'),
+            'u' => {
+                let Some((brace_index, brace)) = chars.next() else {
+                    return Err((index, escape_index + escape.len_utf8() - index));
+                };
+                if brace != '{' {
+                    return Err((index, brace_index + brace.len_utf8() - index));
+                }
+                let mut code_point = 0u32;
+                let mut digit_count = 0;
+                let mut end = brace_index + brace.len_utf8();
+                let mut closed = false;
+                while let Some((digit_index, digit)) = chars.next() {
+                    end = digit_index + digit.len_utf8();
+                    if digit == '}' {
+                        closed = true;
+                        break;
+                    }
+                    let Some(digit_value) = digit.to_digit(16) else {
+                        return Err((index, end - index));
+                    };
+                    code_point = match code_point
+                        .checked_mul(16)
+                        .and_then(|value| value.checked_add(digit_value))
+                    {
+                        Some(value) => value,
+                        None => return Err((index, end - index)),
+                    };
+                    digit_count += 1;
+                }
+                if !closed || digit_count == 0 {
+                    return Err((index, end - index));
+                }
+                let Some(character) = char::from_u32(code_point) else {
+                    return Err((index, end - index));
+                };
+                decoded.push(character);
+            }
+            _ => return Err((index, escape_index + escape.len_utf8() - index)),
+        }
     }
     Ok(decoded)
+}
+
+fn string_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
+    canonical
+        .root
+        .descendants_with_tokens()
+        .filter_map(|element| match element {
+            NodeOrToken::Token(token) if token.kind() == SyntaxKind::String => {
+                decode_string(token.text())
+                    .err()
+                    .map(|(start, length)| super::Diagnostic {
+                        code: "B0003".to_owned(),
+                        severity: super::DiagnosticSeverity::Error,
+                        message: "invalid string literal".to_owned(),
+                        labels: vec![super::DiagnosticLabel {
+                            kind: super::DiagnosticLabelKind::Primary,
+                            span: SourceSpan::new(
+                                canonical.source.clone(),
+                                string_error_span(&token, start, length),
+                            ),
+                            message: "invalid string literal".to_owned(),
+                        }],
+                        notes: Vec::new(),
+                    })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn string_error_span(token: &CstToken, start: usize, length: usize) -> ByteSpan {
+    let span = token_span(token);
+    ByteSpan::new(
+        span.start + 1 + start as u32,
+        span.start + 1 + (start + length) as u32,
+    )
 }
 
 fn derive_block(node: &CstNode) -> ScalarBlock {
@@ -1674,15 +1777,23 @@ fn derive_element(element: &NodeOrToken<CstNode, CstToken>) -> ScalarExpression 
                 let span = token_span(token);
                 match BigInt::parse_bytes(token.text().as_bytes(), 10) {
                     Some(value) => ScalarExpression::Integer { value, span },
-                    None => ScalarExpression::InvalidInteger { span },
+                    None => ScalarExpression::InvalidInteger {
+                        span,
+                        error_span: None,
+                    },
                 }
             }
             SyntaxKind::String => {
                 let span = token_span(token);
-                let value = decode_string(token.text()).expect("valid UTF-8 string literal");
-                ScalarExpression::Utf8 {
-                    value: value.into_bytes(),
-                    span,
+                match decode_string(token.text()) {
+                    Ok(value) => ScalarExpression::Utf8 {
+                        value: value.into_bytes(),
+                        span,
+                    },
+                    Err((start, length)) => ScalarExpression::InvalidInteger {
+                        span,
+                        error_span: Some(string_error_span(token, start, length)),
+                    },
                 }
             }
             _ => panic!("expression token"),
@@ -1700,7 +1811,7 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
         ScalarExpression::Name { span, .. }
         | ScalarExpression::Member { span, .. }
         | ScalarExpression::Integer { span, .. }
-        | ScalarExpression::InvalidInteger { span }
+        | ScalarExpression::InvalidInteger { span, .. }
         | ScalarExpression::Boolean { span, .. }
         | ScalarExpression::Utf8 { span, .. }
         | ScalarExpression::Binary { span, .. }
@@ -2223,9 +2334,13 @@ fn expression_type(
             validate_integer_range_program(program, value, *span, diagnostics);
             ScalarType::I32
         }
-        ScalarExpression::InvalidInteger { span } => {
-            invalid_integer_diagnostic_program(program, *span, diagnostics);
-            ScalarType::I32
+        ScalarExpression::InvalidInteger { span, error_span } => {
+            if error_span.is_some() {
+                ScalarType::Error
+            } else {
+                invalid_integer_diagnostic_program(program, *span, diagnostics);
+                ScalarType::I32
+            }
         }
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
         ScalarExpression::Utf8 { .. } => ScalarType::Utf8,
@@ -2589,7 +2704,10 @@ mod tests {
         let ScalarItem::Extern(extern_decl) = &result.program.items[0] else {
             panic!("extern item");
         };
-        assert_eq!(extern_decl.actual_module, "wasi_snapshot_preview1");
+        assert_eq!(
+            extern_decl.actual_module,
+            ScalarExternModule::Valid("wasi_snapshot_preview1".to_owned())
+        );
         assert_eq!(extern_decl.functions[0].name, "fd_write");
         assert!(extern_decl.functions[0].unsafe_marker);
         let ScalarItem::Binding(binding) = &result.program.items[1] else {
@@ -3316,6 +3434,93 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "B0001"));
+    }
+
+    #[test]
+    fn decodes_all_scalar_string_escapes_and_unicode_values() {
+        let result = validate_text(
+            r##"%%start
+utf8 value = "\\\"\'\n\r\t\0\u{0}\u{41}\u{1F600}";
+%%end"##,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(binding) = &result.program.items[0] else {
+            panic!("binding item");
+        };
+        let ScalarExpression::Utf8 { value, .. } = &binding.value else {
+            panic!("utf8 expression");
+        };
+        assert_eq!(
+            value,
+            &vec![b'\\', b'"', b'\'', b'\n', b'\r', b'\t', 0, 0, b'A', 0xF0, 0x9F, 0x98, 0x80]
+        );
+    }
+
+    #[test]
+    fn reports_malformed_string_escapes_at_their_exact_spans() {
+        let cases = [
+            (r##"\q"##, 1, 3),
+            (r##"\u{}"##, 1, 5),
+            (r##"\u{12"##, 1, 6),
+            (r##"\u{D800}"##, 1, 9),
+            (r##"\u{110000}"##, 1, 11),
+        ];
+        for (literal, relative_start, relative_end) in cases {
+            let text = format!("%%start\nutf8 value = \"{}\";\n%%end", literal);
+            let parsed = parse_source(source(), text.clone(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let result = derive_scalar_program(&parsed.result);
+            let diagnostic = result
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.message == "invalid string literal")
+                .expect("string diagnostic");
+            let ScalarItem::Binding(binding) = &result.program.items[0] else {
+                panic!("binding item");
+            };
+            let (literal_start, error_span) = match &binding.value {
+                ScalarExpression::InvalidInteger {
+                    span,
+                    error_span: Some(error_span),
+                } => (span.start, *error_span),
+                _ => panic!("invalid string expression"),
+            };
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(literal_start + relative_start, literal_start + relative_end)
+            );
+            assert_eq!(error_span, diagnostic.labels[0].span.range);
+        }
+    }
+
+    #[test]
+    fn reports_malformed_extern_module_string_without_panicking() {
+        let text = r##"%%start
+wasi = extern wasm "\q" { unsafe i32(i32, utf8) fd_write; };
+%%end"##;
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = derive_scalar_program(&parsed.result);
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message == "invalid string literal")
+            .expect("extern string diagnostic");
+        let ScalarItem::Extern(extern_decl) = &result.program.items[0] else {
+            panic!("extern item");
+        };
+        let start = extern_decl.module_span.start;
+        assert_eq!(
+            diagnostic.labels[0].span.range,
+            ByteSpan::new(start + 1, start + 3)
+        );
+        assert_eq!(
+            extern_decl.actual_module,
+            ScalarExternModule::Invalid {
+                span: ByteSpan::new(start, start + 4),
+                error_span: ByteSpan::new(start + 1, start + 3),
+            }
+        );
     }
 
     #[test]
