@@ -130,6 +130,12 @@ pub struct ScalarStructLiteralField {
     pub span: ByteSpan,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarTypeArgument {
+    pub ty: ScalarType,
+    pub span: ByteSpan,
+}
+
 fn is_error_type(ty: &ScalarType) -> bool {
     matches!(ty, ScalarType::Error)
 }
@@ -232,6 +238,7 @@ pub enum ScalarExpression {
         name: String,
         receiver_span: Option<ByteSpan>,
         name_span: ByteSpan,
+        type_arguments: Vec<ScalarTypeArgument>,
         arguments: Vec<ScalarExpression>,
         span: ByteSpan,
     },
@@ -3485,6 +3492,25 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .filter(|_| identifiers.len() == 2)
                 .map(|token| token.text().to_owned());
             let name_token = identifiers.last().expect("call member");
+            let type_arguments = direct_nodes(&actual)
+                .into_iter()
+                .find(|child| child.kind() == SyntaxKind::GenericTypeArguments)
+                .map(|generic| {
+                    generic
+                        .children()
+                        .filter(|child| child.kind() == SyntaxKind::GenericTypeArgument)
+                        .map(|argument| ScalarTypeArgument {
+                            ty: derive_type(
+                                &direct_nodes(&argument)
+                                    .into_iter()
+                                    .next()
+                                    .expect("generic type argument type"),
+                            ),
+                            span: wosy_syntax::byte_span(&argument),
+                        })
+                        .collect()
+                })
+                .map_or_else(Vec::new, |arguments| arguments);
             let arguments = direct_nodes(&actual)
                 .iter()
                 .filter(|child| child.kind() == SyntaxKind::Expression)
@@ -3498,6 +3524,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                     .filter(|_| identifiers.len() == 2)
                     .map(token_span),
                 name_span: token_span(name_token),
+                type_arguments,
                 arguments,
                 span: wosy_syntax::byte_span(&actual),
             }
@@ -5999,6 +6026,35 @@ mod tests {
         assert_eq!(name, "add");
         assert_eq!(*receiver_span, Some(ByteSpan::new(56, 60)));
         assert_eq!(*name_span, ByteSpan::new(61, 64));
+    }
+
+    #[test]
+    fn derives_generic_call_type_arguments_with_unresolved_type_and_span() {
+        let result =
+            validate_text("%%start\nu32 result = core.cast<u32>(value, \"exact\");\n%%end");
+        let ScalarItem::Binding(binding) = &result.program.items[0] else {
+            panic!("result binding");
+        };
+        let ScalarExpression::Call {
+            receiver,
+            name,
+            type_arguments,
+            arguments,
+            ..
+        } = &binding.value
+        else {
+            panic!("generic call");
+        };
+        assert_eq!(receiver.as_deref(), Some("core"));
+        assert_eq!(name, "cast");
+        assert_eq!(arguments.len(), 2);
+        assert_eq!(type_arguments.len(), 1);
+        assert_eq!(type_arguments[0].ty, ScalarType::U32);
+        assert_eq!(type_arguments[0].span, ByteSpan::new(31, 34));
+        let serialized = serde_json::to_string(type_arguments).expect("serialize type arguments");
+        let restored: Vec<ScalarTypeArgument> =
+            serde_json::from_str(&serialized).expect("deserialize type arguments");
+        assert_eq!(restored, *type_arguments);
     }
 
     #[test]
