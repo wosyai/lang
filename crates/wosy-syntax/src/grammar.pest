@@ -51,4 +51,6 @@ multiply_operator = { "*" | "/" | "%" }
 operator = { or_operator | and_operator | comparison_operator | add_operator | multiply_operator }
 boolean = { "true" | "false" }
 integer = @{ ASCII_DIGIT+ }
-string = @{ "\"" ~ ("\\" ~ ANY | !"\"" ~ ANY)* ~ "\"" }
+string = @{ "\"" ~ (string_escape | malformed_string_escape | ! ("\"" | "\\" | "\r" | "\n") ~ ANY)* ~ "\"" }
+string_escape = { "\\" ~ ("\\" | "\"" | "'" | "n" | "r" | "t" | "0" | ("u{" ~ ASCII_HEX_DIGIT+ ~ "}")) }
+malformed_string_escape = { "\\" ~ (! ("\"" | "\\" | "\r" | "\n") ~ ANY)+ }
