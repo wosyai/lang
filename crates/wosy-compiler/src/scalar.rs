@@ -931,36 +931,59 @@ fn expression_type_in_module(
                         .namespace_bindings
                         .iter()
                         .find(|namespace| namespace.binding == *binding);
-                    let Some(namespace) = namespace else {
-                        diagnostics.push(module_diagnostic(
-                            module,
-                            "B0001",
-                            "unknown callable name",
-                            *span,
-                        ));
-                        return ScalarType::Error;
-                    };
-                    let Some(target) = modules
-                        .iter()
-                        .find(|module| module.source == namespace.target)
-                    else {
-                        diagnostics.push(module_diagnostic(
-                            module,
-                            "B0001",
-                            "unknown callable name",
-                            *span,
-                        ));
-                        return ScalarType::Error;
-                    };
-                    let Some(callable) = target.members.get(name) else {
-                        diagnostics.push(unknown_member_diagnostic(
-                            module,
-                            *name_span,
-                            &target.source,
-                        ));
-                        return ScalarType::Error;
-                    };
-                    (Some(callable), target)
+                    if let Some(namespace) = namespace {
+                        let Some(target) = modules
+                            .iter()
+                            .find(|module| module.source == namespace.target)
+                        else {
+                            diagnostics.push(module_diagnostic(
+                                module,
+                                "B0001",
+                                "unknown callable name",
+                                *span,
+                            ));
+                            return ScalarType::Error;
+                        };
+                        let Some(callable) = target.members.get(name) else {
+                            diagnostics.push(unknown_member_diagnostic(
+                                module,
+                                *name_span,
+                                &target.source,
+                            ));
+                            return ScalarType::Error;
+                        };
+                        (Some(callable), target)
+                    } else {
+                        let extern_decl = module.items.iter().find_map(|item| match item {
+                            ScalarItem::Extern(extern_decl) if extern_decl.binding == *binding => {
+                                Some(extern_decl)
+                            }
+                            _ => None,
+                        });
+                        let Some(extern_decl) = extern_decl else {
+                            diagnostics.push(module_diagnostic(
+                                module,
+                                "B0001",
+                                "unknown callable name",
+                                *span,
+                            ));
+                            return ScalarType::Error;
+                        };
+                        let Some(function) = extern_decl
+                            .functions
+                            .iter()
+                            .find(|function| function.name == *name)
+                        else {
+                            diagnostics.push(module_diagnostic(
+                                module,
+                                "B0001",
+                                "unknown callable name",
+                                *span,
+                            ));
+                            return ScalarType::Error;
+                        };
+                        (Some(&function.signature), module)
+                    }
                 }
             };
             let Some(callable) = callable else {
@@ -3647,6 +3670,42 @@ wasi = extern wasm "\q" { unsafe i32(i32, utf8) fd_write; };
                 ScalarModule::new(math_source.clone(), math.items, Vec::new()),
             ],
             vec![main_source, math_source],
+        );
+        let result = validate_scalar_project(project);
+        assert!(
+            result.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn resolves_direct_root_extern_with_local_namespace_present() {
+        let local_source = module_source("src/local.w");
+        let local = module_from_text(local_source.clone(), "%%start\ni32 value = 7;\n%%end");
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\nlocal = namespace app \"src/local.w\";\ni32 value = local.value;\ni32 out = wasi.fd_write(1, \"direct root\\n\");\n%%end",
+        );
+        let namespace_span = match &main.items[1] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let project = ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source.clone(),
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "local".to_owned(),
+                        target: local_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(local_source.clone(), local.items, Vec::new()),
+            ],
+            vec![main_source, local_source],
         );
         let result = validate_scalar_project(project);
         assert!(
