@@ -1346,8 +1346,18 @@ fn call_output_sequence(
 
 fn expression_span(expression: &ScalarExpression) -> ByteSpan {
     match expression {
-        ScalarExpression::Call { span, .. } => *span,
-        _ => ByteSpan::new(0, 0),
+        ScalarExpression::Name { span, .. }
+        | ScalarExpression::Integer { span, .. }
+        | ScalarExpression::InvalidInteger { span, .. }
+        | ScalarExpression::Boolean { span, .. }
+        | ScalarExpression::Utf8 { span, .. }
+        | ScalarExpression::RawAddress { span, .. }
+        | ScalarExpression::StructLiteral { span, .. }
+        | ScalarExpression::Binary { span, .. }
+        | ScalarExpression::Call { span, .. }
+        | ScalarExpression::If { span, .. } => *span,
+        ScalarExpression::Member { span, .. } => *span,
+        ScalarExpression::Block(block) => block.span,
     }
 }
 
@@ -1834,6 +1844,184 @@ fn while_type_in_module(
     ScalarType::Unit
 }
 
+fn type_core_cast_in_module(
+    type_arguments: &[ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if type_arguments.len() != 1 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            "core.cast requires one destination type argument",
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    if type_arguments[0].ty != ScalarType::U32 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "core.cast supports only a u32 destination type",
+            type_arguments[0].span,
+        ));
+        return ScalarType::Error;
+    }
+    if arguments.len() != 2 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            "core.cast requires one value and one static mode",
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let actual = expression_type_in_module_expected(
+        &arguments[0],
+        Some(&ScalarType::U64),
+        scope,
+        visible_names,
+        folded_names,
+        module,
+        modules,
+        diagnostics,
+        unsafe_context,
+    );
+    validate_exact_u32_source_in_module(&arguments[0], module, diagnostics);
+    expect_module_type(
+        module,
+        &ScalarType::U64,
+        &actual,
+        expression_span(&arguments[0]),
+        diagnostics,
+    );
+    if !matches!(&arguments[1], ScalarExpression::Utf8 { value, .. } if value == b"exact") {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "core.cast requires the static mode \"exact\"",
+            expression_span(&arguments[1]),
+        ));
+    }
+    if is_error_type(&actual) {
+        ScalarType::Error
+    } else {
+        ScalarType::U32
+    }
+}
+
+fn type_core_cast(
+    type_arguments: &[ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if type_arguments.len() != 1 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            "core.cast requires one destination type argument",
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    if type_arguments[0].ty != ScalarType::U32 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            "core.cast supports only a u32 destination type",
+            type_arguments[0].span,
+        ));
+        return ScalarType::Error;
+    }
+    if arguments.len() != 2 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            "core.cast requires one value and one static mode",
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let actual = expression_type_expected(
+        &arguments[0],
+        &ScalarType::U64,
+        scope,
+        visible_names,
+        folded_names,
+        program,
+        diagnostics,
+        unsafe_context,
+    );
+    validate_exact_u32_source(program, &arguments[0], diagnostics);
+    expect_type(
+        program,
+        &ScalarType::U64,
+        &actual,
+        expression_span(&arguments[0]),
+        diagnostics,
+    );
+    if !matches!(&arguments[1], ScalarExpression::Utf8 { value, .. } if value == b"exact") {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            "core.cast requires the static mode \"exact\"",
+            expression_span(&arguments[1]),
+        ));
+    }
+    if is_error_type(&actual) {
+        ScalarType::Error
+    } else {
+        ScalarType::U32
+    }
+}
+
+fn validate_exact_u32_source_in_module(
+    expression: &ScalarExpression,
+    module: &ScalarModule,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    if let ScalarExpression::Integer { value, span } = expression {
+        if value > &BigInt::from(u32::MAX) {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0010",
+                "integer literal is outside the resolved target type range",
+                *span,
+            ));
+        }
+    }
+}
+
+fn validate_exact_u32_source(
+    program: &ScalarProgram,
+    expression: &ScalarExpression,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    if let ScalarExpression::Integer { value, span } = expression {
+        if value > &BigInt::from(u32::MAX) {
+            diagnostics.push(diagnostic(
+                program,
+                "B0010",
+                "integer literal is outside the resolved target type range",
+                *span,
+            ));
+        }
+    }
+}
+
 fn expression_type_in_module(
     expression: &ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
@@ -2001,8 +2189,23 @@ fn expression_type_in_module(
             name_span,
             arguments,
             span,
+            type_arguments,
             ..
         } => {
+            if receiver.as_deref() == Some("core") && name == "cast" {
+                return type_core_cast_in_module(
+                    type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
             if receiver.as_deref() == Some("core") && name == "utf8_view" {
                 if arguments.len() != 1 {
                     diagnostics.push(module_diagnostic(
@@ -2390,7 +2593,7 @@ fn expression_type_in_module_expected(
             expected @ (ScalarType::I32 | ScalarType::U8 | ScalarType::U32 | ScalarType::U64),
         ) = expected
         {
-            validate_integer_range(module, value, *span, diagnostics);
+            validate_integer_range_for_type(module, value, *span, expected, diagnostics);
             return expected.clone();
         }
     }
@@ -4615,8 +4818,22 @@ fn expression_type(
             name,
             arguments,
             span,
+            type_arguments,
             ..
         } => {
+            if receiver.as_deref() == Some("core") && name == "cast" {
+                return type_core_cast(
+                    type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
             if receiver.as_deref() == Some("core") && name == "utf8_view" {
                 if arguments.len() != 1 {
                     diagnostics.push(diagnostic(
@@ -4888,7 +5105,7 @@ fn expression_type_expected(
         )
     {
         if let ScalarExpression::Integer { value, span } = expression {
-            validate_integer_range_program(program, value, *span, diagnostics);
+            validate_integer_range_for_type_program(program, value, *span, expected, diagnostics);
         }
         return expected.clone();
     }
@@ -5171,6 +5388,30 @@ fn validate_integer_range(
     }
 }
 
+fn validate_integer_range_for_type(
+    module: &ScalarModule,
+    value: &BigInt,
+    span: ByteSpan,
+    ty: &ScalarType,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    let maximum = match ty {
+        ScalarType::U8 => BigInt::from(u8::MAX),
+        ScalarType::U32 => BigInt::from(u32::MAX),
+        ScalarType::U64 => BigInt::from(u64::MAX),
+        ScalarType::I32 => BigInt::from(i32::MAX),
+        _ => return,
+    };
+    if value > &maximum {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0010",
+            "integer literal is outside the resolved target type range",
+            span,
+        ));
+    }
+}
+
 fn validate_integer_range_program(
     program: &ScalarProgram,
     value: &BigInt,
@@ -5178,6 +5419,30 @@ fn validate_integer_range_program(
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     if value > &BigInt::from(i32::MAX) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0010",
+            "integer literal is outside the resolved target type range",
+            span,
+        ));
+    }
+}
+
+fn validate_integer_range_for_type_program(
+    program: &ScalarProgram,
+    value: &BigInt,
+    span: ByteSpan,
+    ty: &ScalarType,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    let maximum = match ty {
+        ScalarType::U8 => BigInt::from(u8::MAX),
+        ScalarType::U32 => BigInt::from(u32::MAX),
+        ScalarType::U64 => BigInt::from(u64::MAX),
+        ScalarType::I32 => BigInt::from(i32::MAX),
+        _ => return,
+    };
+    if value > &maximum {
         diagnostics.push(diagnostic(
             program,
             "B0010",
@@ -6055,6 +6320,60 @@ mod tests {
         let restored: Vec<ScalarTypeArgument> =
             serde_json::from_str(&serialized).expect("deserialize type arguments");
         assert_eq!(restored, *type_arguments);
+    }
+
+    #[test]
+    fn validates_generic_exact_u64_to_u32_cast() {
+        let result = validate_text(
+            "%%start\nu64 source = 42;\nu32 result = core.cast<u32>(source, \"exact\");\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(binding) = &result.program.items[1] else {
+            panic!("cast binding");
+        };
+        assert_eq!(binding.declared_type, ScalarType::U32);
+    }
+
+    #[test]
+    fn reports_exact_cast_range_at_value_span() {
+        let text = "%%start\nu32 result = core.cast<u32>(4294967296, \"exact\");\n%%end";
+        let result = validate_text(text);
+        let value_start = text.find("4294967296").expect("cast value") as u32;
+        let value_end = value_start + 10;
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0010")
+            .expect("exact cast range diagnostic");
+        assert_eq!(
+            diagnostic.labels[0].span.range,
+            ByteSpan::new(value_start, value_end)
+        );
+    }
+
+    #[test]
+    fn rejects_non_static_exact_cast_modes_and_shapes() {
+        let dynamic = validate_text(
+            "%%start\nu64 source = 1;\nutf8 mode = \"exact\";\nu32 result = core.cast<u32>(source, mode);\n%%end",
+        );
+        assert!(dynamic
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"));
+        let wrong_source = validate_text(
+            "%%start\ni32 source = 1;\nu32 result = core.cast<u32>(source, \"exact\");\n%%end",
+        );
+        assert!(wrong_source
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"));
+        let wrong_destination = validate_text(
+            "%%start\nu64 source = 1;\ni32 result = core.cast<i32>(source, \"exact\");\n%%end",
+        );
+        assert!(wrong_destination
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"));
     }
 
     #[test]
