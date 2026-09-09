@@ -6400,4 +6400,163 @@ wasi = extern wasm "\q" { i32(i32, utf8) fd_write; };
             .iter()
             .any(|diagnostic| diagnostic.message == "null requires a pointer context"));
     }
+
+    #[test]
+    fn resolves_forward_struct_types_and_canonical_field_places() {
+        let result = validate_text(
+            "%%start\nstruct Outer {\n\tInner inner;\n\t*?Inner pointer;\n}\nstruct Inner {\n\tu32 value;\n}\nunsafe {\n\tOuter item = { .inner = { .value = 1; }; .pointer = null; };\n\t*?Outer address = &?item;\n\t*?u32 value_address = &?(*item.pointer).value;\n\t*?Inner pointer_value_address = &?(*address).inner;\n};\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.program.structs[0].id, ScalarStructId { index: 0 });
+        assert_eq!(result.program.structs[1].id, ScalarStructId { index: 1 });
+        assert_eq!(
+            result.program.structs[0].fields[0].ty,
+            ScalarType::Struct(ScalarStructId { index: 1 })
+        );
+        let ScalarItem::Executable(ScalarBlockItem::Expression(ScalarExpression::Block(block))) =
+            &result.program.items[0]
+        else {
+            panic!("unsafe block")
+        };
+        let ScalarBlockItem::LocalBinding(value_address) = &block.items[2] else {
+            panic!("value address binding")
+        };
+        let ScalarExpression::RawAddress { place, .. } = &value_address.value else {
+            panic!("raw value address")
+        };
+        let ScalarPlace::Field { field, base, .. } = place else {
+            panic!("nested field place")
+        };
+        assert_eq!(
+            *field,
+            ScalarStructFieldId {
+                structure: ScalarStructId { index: 1 },
+                index: 0,
+            }
+        );
+        let ScalarPlace::Dereference { .. } = base.as_ref() else {
+            panic!("pointer dereference place")
+        };
+    }
+
+    #[test]
+    fn validates_struct_literals_in_nested_positions_and_pointer_null_fields() {
+        let result = validate_text(
+            "%%start\nstruct Pair {\n\tu32 left;\n\t*?u8 right;\n}\nPair value = if (true) { { .left = 1; .right = null; } } else { { .left = 0; .right = null; } };\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(binding) = &result.program.items[0] else {
+            panic!("struct binding")
+        };
+        assert!(matches!(binding.value, ScalarExpression::If { .. }));
+        assert_eq!(
+            binding.declared_type,
+            ScalarType::Struct(ScalarStructId { index: 0 })
+        );
+    }
+
+    #[test]
+    fn reports_struct_literal_field_shape_errors_at_field_spans() {
+        let cases = [
+            (
+                ".left = 1; .left = 2; .right = null;",
+                "duplicate struct literal field",
+                ".left = 2",
+                4,
+            ),
+            (
+                ".left = 1; .unknown = 2;",
+                "unknown struct field",
+                ".unknown",
+                7,
+            ),
+            (
+                ".left = 1;",
+                "struct literal must initialize every field",
+                "{ .left",
+                0,
+            ),
+        ];
+        for (fields, message, span_text, field_length) in cases {
+            let text = format!(
+                "%%start\nstruct Pair {{\n\tu32 left;\n\tu32 right;\n}}\nPair value = {{ {fields} }};\n%%end"
+            );
+            let result = validate_text(&text);
+            let diagnostic = result
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.message == message)
+                .expect("struct literal diagnostic");
+            assert_eq!(diagnostic.labels[0].message, message);
+            if message == "struct literal must initialize every field" {
+                let ScalarItem::Binding(binding) = &result.program.items[0] else {
+                    panic!("struct binding")
+                };
+                let ScalarExpression::StructLiteral { span, .. } = &binding.value else {
+                    panic!("struct literal")
+                };
+                assert_eq!(diagnostic.labels[0].span.range, *span);
+            } else {
+                let start = text.find(span_text).expect("diagnostic span text") as u32 + 1;
+                let end = start + field_length;
+                assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(start, end));
+            }
+        }
+    }
+
+    #[test]
+    fn enforces_unsafe_raw_addresses_and_rejects_invalid_field_receivers() {
+        let safe = validate_text(
+            "%%start\nstruct Pair {\n\tu32 value;\n}\nPair item = { .value = 1; };\n*?Pair address = &?item;\n%%end",
+        );
+        let diagnostic = safe
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0012")
+            .expect("raw address safety diagnostic");
+        assert_eq!(diagnostic.message, "raw address requires an unsafe block");
+        let invalid = validate_text(
+            "%%start\ni32 value = 1;\nunsafe {\n\t*?i32 address = &?value.missing;\n};\n%%end",
+        );
+        let diagnostic = invalid
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message == "value has no field")
+            .expect("invalid field receiver diagnostic");
+        let ScalarItem::Executable(ScalarBlockItem::Expression(ScalarExpression::Block(block))) =
+            &invalid.program.items[1]
+        else {
+            panic!("unsafe block")
+        };
+        let ScalarBlockItem::LocalBinding(binding) = &block.items[0] else {
+            panic!("address binding")
+        };
+        let ScalarExpression::RawAddress { place, .. } = &binding.value else {
+            panic!("raw address")
+        };
+        assert_eq!(
+            diagnostic.labels[0].span.range,
+            match place {
+                ScalarPlace::Field { span, .. } => *span,
+                _ => panic!("field place"),
+            }
+        );
+    }
+
+    #[test]
+    fn validates_structs_through_project_modules() {
+        let source = module_source("src/main.w");
+        let program = module_from_text(
+            source.clone(),
+            "%%start\nstruct Pair {\n\tu32 value;\n}\nPair item = { .value = 1; };\n%%end",
+        );
+        let mut module = ScalarModule::new(source.clone(), program.items, Vec::new());
+        module.structs = program.structs;
+        let result = validate_scalar_project(ScalarProject::new(vec![module], vec![source]));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(
+            result.project.modules[0].structs[0].id,
+            ScalarStructId { index: 0 }
+        );
+    }
 }
