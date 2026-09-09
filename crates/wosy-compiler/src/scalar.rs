@@ -19,7 +19,7 @@ pub enum ScalarType {
     Utf8,
     RawPointer(Box<ScalarType>),
     Callable {
-        result: Box<ScalarType>,
+        outputs: ScalarOutputSequence,
         parameters: Vec<ScalarType>,
     },
     Named(String),
@@ -134,6 +134,39 @@ fn is_error_type(ty: &ScalarType) -> bool {
     matches!(ty, ScalarType::Error)
 }
 
+fn scalar_type_equal(left: &ScalarType, right: &ScalarType) -> bool {
+    match (left, right) {
+        (ScalarType::RawPointer(left), ScalarType::RawPointer(right)) => {
+            scalar_type_equal(left, right)
+        }
+        (
+            ScalarType::Callable {
+                outputs: left_outputs,
+                parameters: left_parameters,
+            },
+            ScalarType::Callable {
+                outputs: right_outputs,
+                parameters: right_parameters,
+            },
+        ) => {
+            left_outputs.outputs.len() == right_outputs.outputs.len()
+                && left_outputs
+                    .outputs
+                    .iter()
+                    .zip(&right_outputs.outputs)
+                    .all(|(left, right)| scalar_type_equal(&left.ty, &right.ty))
+                && left_parameters.len() == right_parameters.len()
+                && left_parameters
+                    .iter()
+                    .zip(right_parameters)
+                    .all(|(left, right)| scalar_type_equal(left, right))
+        }
+        (ScalarType::RawPointer(_), _) | (_, ScalarType::RawPointer(_)) => false,
+        (ScalarType::Callable { .. }, _) | (_, ScalarType::Callable { .. }) => false,
+        _ => left == right,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BinaryOperator {
     Add,
@@ -243,8 +276,17 @@ pub struct ScalarAssignment {
     pub target: String,
     pub receiver_span: Option<ByteSpan>,
     pub target_span: ByteSpan,
+    pub targets: Vec<ScalarAssignmentTarget>,
     pub value: ScalarExpression,
     pub span: ByteSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarAssignmentTarget {
+    pub receiver: Option<String>,
+    pub target: String,
+    pub receiver_span: Option<ByteSpan>,
+    pub target_span: ByteSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -282,8 +324,6 @@ pub struct ScalarFunction {
     pub parameters: Vec<String>,
     pub parameter_spans: Vec<ByteSpan>,
     pub body: ScalarBlock,
-    pub outputs: Vec<ScalarType>,
-    pub output_sequence: ScalarOutputSequence,
     pub span: ByteSpan,
 }
 
@@ -295,8 +335,6 @@ pub struct ScalarExternFunction {
     pub name_span: ByteSpan,
     pub signature_span: ByteSpan,
     pub span: ByteSpan,
-    pub outputs: Vec<ScalarType>,
-    pub output_sequence: ScalarOutputSequence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -521,20 +559,23 @@ fn resolve_program_types(program: &mut ScalarProgram) {
                 for receiver in &mut binding.receivers {
                     receiver.ty = resolve_type(&receiver.ty, &names);
                 }
+                binding.output_sequence.outputs = binding
+                    .output_sequence
+                    .outputs
+                    .iter()
+                    .map(|output| ScalarOutput {
+                        ty: resolve_type(&output.ty, &names),
+                        span: output.span,
+                    })
+                    .collect();
             }
             ScalarItem::Function(function) => {
                 function.signature = resolve_type(&function.signature, &names);
-                function.outputs = callable_outputs_from_type(&function.signature);
-                function.output_sequence =
-                    output_sequence_from_type(&function.signature, function.span);
                 resolve_block_types(&mut function.body, &names);
             }
             ScalarItem::Extern(extern_decl) => {
                 for function in &mut extern_decl.functions {
                     function.signature = resolve_type(&function.signature, &names);
-                    function.outputs = callable_outputs_from_type(&function.signature);
-                    function.output_sequence =
-                        output_sequence_from_type(&function.signature, function.span);
                 }
             }
             ScalarItem::Executable(item) => resolve_item_types(item, &names),
@@ -587,8 +628,21 @@ fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarStructId>) -> Sc
         ScalarType::RawPointer(inner) => {
             ScalarType::RawPointer(Box::new(resolve_type(inner, names)))
         }
-        ScalarType::Callable { result, parameters } => ScalarType::Callable {
-            result: Box::new(resolve_type(result, names)),
+        ScalarType::Callable {
+            outputs,
+            parameters,
+        } => ScalarType::Callable {
+            outputs: ScalarOutputSequence {
+                outputs: outputs
+                    .outputs
+                    .iter()
+                    .map(|output| ScalarOutput {
+                        ty: resolve_type(&output.ty, names),
+                        span: output.span,
+                    })
+                    .collect(),
+                span: outputs.span,
+            },
             parameters: parameters
                 .iter()
                 .map(|parameter| resolve_type(parameter, names))
@@ -754,23 +808,6 @@ fn resolve_place(
     }
 }
 
-fn callable_outputs_from_type(ty: &ScalarType) -> Vec<ScalarType> {
-    match ty {
-        ScalarType::Callable { result, .. } => vec![result.as_ref().clone()],
-        _ => Vec::new(),
-    }
-}
-
-fn output_sequence_from_type(ty: &ScalarType, span: ByteSpan) -> ScalarOutputSequence {
-    ScalarOutputSequence {
-        outputs: callable_outputs_from_type(ty)
-            .into_iter()
-            .map(|ty| ScalarOutput { ty, span })
-            .collect(),
-        span,
-    }
-}
-
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
     string_diagnostics(canonical)
 }
@@ -808,6 +845,11 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
             ) {
                 if let Some(ty) = ty {
                     declarations.insert(name.clone(), ty.clone());
+                    if let ScalarItem::Binding(binding) = item {
+                        for receiver in &binding.receivers {
+                            declarations.insert(receiver.name.clone(), receiver.ty.clone());
+                        }
+                    }
                     validate_module_type(module, ty, span, &mut diagnostics);
                 }
             }
@@ -832,6 +874,15 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         &mut diagnostics,
                         false,
                     );
+                    validate_output_receivers_in_module(
+                        &binding.value,
+                        &binding.receivers,
+                        binding.span,
+                        &declarations,
+                        module,
+                        &project.modules,
+                        &mut diagnostics,
+                    );
                     expect_module_type(
                         module,
                         &binding.declared_type,
@@ -841,9 +892,14 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                     );
                 }
                 ScalarItem::Function(function) => {
-                    let ScalarType::Callable { result, parameters } = &function.signature else {
+                    let ScalarType::Callable {
+                        outputs,
+                        parameters,
+                    } = &function.signature
+                    else {
                         continue;
                     };
+                    let output = &outputs.outputs[0];
                     if function.parameters.len() != parameters.len() {
                         diagnostics.push(module_diagnostic(
                             module,
@@ -871,7 +927,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                     }
                     let actual = block_type_in_module_expected(
                         &function.body,
-                        Some(result),
+                        Some(&output.ty),
                         &scope,
                         &visible_names,
                         &folded_names,
@@ -882,7 +938,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                     );
                     expect_module_type(
                         module,
-                        result,
+                        &output.ty,
                         &actual,
                         function.body.span,
                         &mut diagnostics,
@@ -939,20 +995,23 @@ fn resolve_module_types(module: &mut ScalarModule) {
                 for receiver in &mut binding.receivers {
                     receiver.ty = resolve_type(&receiver.ty, &names);
                 }
+                binding.output_sequence.outputs = binding
+                    .output_sequence
+                    .outputs
+                    .iter()
+                    .map(|output| ScalarOutput {
+                        ty: resolve_type(&output.ty, &names),
+                        span: output.span,
+                    })
+                    .collect();
             }
             ScalarItem::Function(function) => {
                 function.signature = resolve_type(&function.signature, &names);
-                function.outputs = callable_outputs_from_type(&function.signature);
-                function.output_sequence =
-                    output_sequence_from_type(&function.signature, function.span);
                 resolve_block_types(&mut function.body, &names);
             }
             ScalarItem::Extern(extern_decl) => {
                 for function in &mut extern_decl.functions {
                     function.signature = resolve_type(&function.signature, &names);
-                    function.outputs = callable_outputs_from_type(&function.signature);
-                    function.output_sequence =
-                        output_sequence_from_type(&function.signature, function.span);
                 }
             }
             ScalarItem::Executable(item) => resolve_item_types(item, &names),
@@ -1144,8 +1203,13 @@ fn validate_module_type(
             "unknown scalar type",
             span,
         )),
-        ScalarType::Callable { result, parameters } => {
-            validate_module_type(module, result, span, diagnostics);
+        ScalarType::Callable {
+            outputs,
+            parameters,
+        } => {
+            for output in &outputs.outputs {
+                validate_module_type(module, &output.ty, output.span, diagnostics);
+            }
             for parameter in parameters {
                 validate_module_type(module, parameter, span, diagnostics);
             }
@@ -1187,6 +1251,207 @@ fn validate_extern(
     }
     for function in &extern_decl.functions {
         let _ = function;
+    }
+}
+
+fn call_output_sequence_in_module(
+    expression: &ScalarExpression,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+) -> Option<ScalarOutputSequence> {
+    let ScalarExpression::Call { receiver, name, .. } = expression else {
+        return None;
+    };
+    let callable = match receiver {
+        None => scope.get(name),
+        Some(binding) => {
+            let namespace = module
+                .namespace_bindings
+                .iter()
+                .find(|namespace| namespace.binding == *binding);
+            if let Some(namespace) = namespace {
+                modules
+                    .iter()
+                    .find(|candidate| candidate.source == namespace.target)
+                    .and_then(|target| target.members.get(name))
+            } else {
+                module.items.iter().find_map(|item| match item {
+                    ScalarItem::Extern(extern_decl) if extern_decl.binding == *binding => {
+                        extern_decl
+                            .functions
+                            .iter()
+                            .find(|function| function.name == *name)
+                            .map(|function| &function.signature)
+                    }
+                    _ => None,
+                })
+            }
+        }
+    }?;
+    let ScalarType::Callable { outputs, .. } = callable else {
+        return None;
+    };
+    Some(outputs.clone())
+}
+
+fn call_output_sequence(
+    expression: &ScalarExpression,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+) -> Option<ScalarOutputSequence> {
+    let ScalarExpression::Call { receiver, name, .. } = expression else {
+        return None;
+    };
+    let callable = if receiver.is_none() {
+        scope.get(name)
+    } else {
+        program.items.iter().find_map(|item| match item {
+            ScalarItem::Extern(extern_decl)
+                if receiver.as_deref() == Some(extern_decl.binding.as_str()) =>
+            {
+                extern_decl
+                    .functions
+                    .iter()
+                    .find(|function| function.name == *name)
+                    .map(|function| &function.signature)
+            }
+            _ => None,
+        })
+    }?;
+    let ScalarType::Callable { outputs, .. } = callable else {
+        return None;
+    };
+    Some(outputs.clone())
+}
+
+fn validate_output_receivers_in_module(
+    expression: &ScalarExpression,
+    receivers: &[ScalarOutputReceiver],
+    binding_span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    let Some(outputs) = call_output_sequence_in_module(expression, scope, module, modules) else {
+        return;
+    };
+    if receivers.len() > outputs.outputs.len() {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            "call has fewer outputs than receivers",
+            binding_span,
+        ));
+    }
+    for (receiver, output) in receivers.iter().zip(&outputs.outputs) {
+        expect_module_type(module, &output.ty, &receiver.ty, receiver.span, diagnostics);
+    }
+}
+
+fn validate_output_receivers(
+    expression: &ScalarExpression,
+    receivers: &[ScalarOutputReceiver],
+    binding_span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    let Some(outputs) = call_output_sequence(expression, scope, program) else {
+        return;
+    };
+    if receivers.len() > outputs.outputs.len() {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            "call has fewer outputs than receivers",
+            binding_span,
+        ));
+    }
+    for (receiver, output) in receivers.iter().zip(&outputs.outputs) {
+        expect_type(
+            program,
+            &output.ty,
+            &receiver.ty,
+            receiver.span,
+            diagnostics,
+        );
+    }
+}
+
+fn validate_assignment_outputs_in_module(
+    assignment: &ScalarAssignment,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    let Some(outputs) = call_output_sequence_in_module(&assignment.value, scope, module, modules)
+    else {
+        return;
+    };
+    if assignment.targets.len() > outputs.outputs.len() {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            "call has fewer outputs than assignment targets",
+            assignment.span,
+        ));
+    }
+    for (target, output) in assignment.targets.iter().zip(&outputs.outputs) {
+        let expected = match &target.receiver {
+            None => scope.get(&target.target),
+            Some(receiver) => module
+                .namespace_bindings
+                .iter()
+                .find(|namespace| namespace.binding == *receiver)
+                .and_then(|namespace| {
+                    modules
+                        .iter()
+                        .find(|candidate| candidate.source == namespace.target)
+                })
+                .and_then(|target_module| target_module.members.get(&target.target)),
+        };
+        if let Some(expected) = expected {
+            expect_module_type(
+                module,
+                expected,
+                &output.ty,
+                target.target_span,
+                diagnostics,
+            );
+        }
+    }
+}
+
+fn validate_assignment_outputs(
+    assignment: &ScalarAssignment,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    let Some(outputs) = call_output_sequence(&assignment.value, scope, program) else {
+        return;
+    };
+    if assignment.targets.len() > outputs.outputs.len() {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            "call has fewer outputs than assignment targets",
+            assignment.span,
+        ));
+    }
+    for (target, output) in assignment.targets.iter().zip(&outputs.outputs) {
+        if let Some(expected) = scope.get(&target.target) {
+            expect_type(
+                program,
+                expected,
+                &output.ty,
+                target.target_span,
+                diagnostics,
+            );
+        }
     }
 }
 
@@ -1297,6 +1562,15 @@ fn block_item_type_in_module(
                 diagnostics,
                 unsafe_context,
             );
+            validate_output_receivers_in_module(
+                &binding.value,
+                &binding.receivers,
+                binding.span,
+                scope,
+                module,
+                modules,
+                diagnostics,
+            );
             expect_module_type(
                 module,
                 &binding.declared_type,
@@ -1313,6 +1587,9 @@ fn block_item_type_in_module(
                 diagnostics,
             ) {
                 scope.insert(binding.name.clone(), binding.declared_type.clone());
+                for receiver in &binding.receivers {
+                    scope.insert(receiver.name.clone(), receiver.ty.clone());
+                }
             }
             ScalarType::Unit
         }
@@ -1449,6 +1726,7 @@ fn assignment_type_in_module(
         diagnostics,
         unsafe_context,
     );
+    validate_assignment_outputs_in_module(assignment, scope, module, modules, diagnostics);
     expect_module_type(module, expected, &actual, assignment.span, diagnostics);
     if is_error_type(&actual) {
         ScalarType::Error
@@ -1477,7 +1755,7 @@ fn while_type_in_module(
         diagnostics,
         unsafe_context,
     );
-    if !is_error_type(&condition) && condition != ScalarType::Bool {
+    if !is_error_type(&condition) && !scalar_type_equal(&condition, &ScalarType::Bool) {
         diagnostics.push(module_diagnostic(
             module,
             "B0005",
@@ -1743,7 +2021,11 @@ fn expression_type_in_module(
                 ));
                 return ScalarType::Error;
             };
-            let ScalarType::Callable { result, parameters } = callable else {
+            let ScalarType::Callable {
+                outputs,
+                parameters,
+            } = callable
+            else {
                 diagnostics.push(module_diagnostic(
                     module,
                     "B0001",
@@ -1787,7 +2069,7 @@ fn expression_type_in_module(
             if error_argument {
                 ScalarType::Error
             } else {
-                result.as_ref().clone()
+                outputs.outputs[0].ty.clone()
             }
         }
         ScalarExpression::If {
@@ -1836,7 +2118,7 @@ fn expression_type_in_module(
             if !is_error_type(&condition_type)
                 && !is_error_type(&then_type)
                 && !is_error_type(&else_type)
-                && then_type != else_type
+                && !scalar_type_equal(&then_type, &else_type)
             {
                 diagnostics.push(module_diagnostic(
                     module,
@@ -1895,7 +2177,8 @@ fn expression_type_in_module_expected(
             diagnostics,
             unsafe_context,
         );
-        if !is_error_type(&condition_type) && condition_type != ScalarType::Bool {
+        if !is_error_type(&condition_type) && !scalar_type_equal(&condition_type, &ScalarType::Bool)
+        {
             diagnostics.push(module_diagnostic(
                 module,
                 "B0005",
@@ -1925,7 +2208,10 @@ fn expression_type_in_module_expected(
             diagnostics,
             unsafe_context,
         );
-        if !is_error_type(&then_type) && !is_error_type(&else_type) && then_type != else_type {
+        if !is_error_type(&then_type)
+            && !is_error_type(&else_type)
+            && !scalar_type_equal(&then_type, &else_type)
+        {
             diagnostics.push(module_diagnostic(
                 module,
                 "B0006",
@@ -2311,7 +2597,7 @@ fn expect_module_type(
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    if !is_error_type(expected) && !is_error_type(actual) && expected != actual {
+    if !is_error_type(expected) && !is_error_type(actual) && !scalar_type_equal(expected, actual) {
         diagnostics.push(module_diagnostic(
             module,
             "B0003",
@@ -2484,8 +2770,6 @@ fn derive_extern(node: &CstNode) -> ScalarExtern {
             name_span: token_span(&name),
             signature_span: wosy_syntax::byte_span(&signature),
             span: wosy_syntax::byte_span(&callable),
-            outputs: callable_outputs(&signature),
-            output_sequence: output_sequence(&signature),
         }],
         binding_span: token_span(&identifiers[0]),
         module_span: token_span(&module),
@@ -2623,31 +2907,27 @@ fn layout_for_type(ty: &ScalarType) -> ScalarLayout {
     }
 }
 
-fn callable_outputs(node: &CstNode) -> Vec<ScalarType> {
-    node.children()
-        .filter(|child| child.kind() == SyntaxKind::CallableOutput)
-        .flat_map(|output| {
-            let children = direct_nodes(&output);
-            if children.is_empty() {
-                vec![derive_type(&output)]
-            } else {
-                children
-                    .into_iter()
-                    .map(|child| derive_type(&child))
-                    .collect()
-            }
-        })
-        .collect()
-}
-
 fn output_sequence(node: &CstNode) -> ScalarOutputSequence {
-    let outputs = callable_outputs(node);
     ScalarOutputSequence {
-        outputs: outputs
-            .into_iter()
-            .map(|ty| ScalarOutput {
-                ty,
-                span: wosy_syntax::byte_span(node),
+        outputs: node
+            .children()
+            .filter(|child| child.kind() == SyntaxKind::CallableOutput)
+            .flat_map(|output| {
+                let children = direct_nodes(&output);
+                if children.is_empty() {
+                    vec![ScalarOutput {
+                        ty: derive_type(&output),
+                        span: wosy_syntax::byte_span(&output),
+                    }]
+                } else {
+                    children
+                        .into_iter()
+                        .map(|child| ScalarOutput {
+                            ty: derive_type(&child),
+                            span: wosy_syntax::byte_span(&child),
+                        })
+                        .collect()
+                }
             })
             .collect(),
         span: wosy_syntax::byte_span(node),
@@ -2742,18 +3022,6 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         parameters,
         parameter_spans,
         body,
-        outputs: callable_outputs(
-            children
-                .iter()
-                .find(|child| child.kind() == SyntaxKind::CallableType)
-                .expect("function signature"),
-        ),
-        output_sequence: output_sequence(
-            children
-                .iter()
-                .find(|child| child.kind() == SyntaxKind::CallableType)
-                .expect("function signature"),
-        ),
         span: wosy_syntax::byte_span(node),
     }
 }
@@ -2768,12 +3036,7 @@ fn derive_type(node: &CstNode) -> ScalarType {
         .find(|child| child.kind() == SyntaxKind::CallableType)
         .unwrap_or_else(|| node.clone());
     if actual.kind() == SyntaxKind::CallableType {
-        let output = direct_nodes(&actual)
-            .into_iter()
-            .find(|child| child.kind() == SyntaxKind::CallableOutput)
-            .expect("callable output");
-        let mut outputs = callable_output_types(&output);
-        let result = outputs.remove(0);
+        let outputs = output_sequence(&actual);
         let parameters = actual
             .children_with_tokens()
             .filter_map(|element| match element {
@@ -2787,7 +3050,7 @@ fn derive_type(node: &CstNode) -> ScalarType {
             })
             .collect();
         ScalarType::Callable {
-            result: Box::new(result),
+            outputs,
             parameters,
         }
     } else {
@@ -2798,28 +3061,6 @@ fn derive_type(node: &CstNode) -> ScalarType {
             Some(pointer) => derive_type(&pointer),
             None => type_from_name(type_text(node).as_str()),
         }
-    }
-}
-
-fn callable_output_types(node: &CstNode) -> Vec<ScalarType> {
-    let children = direct_nodes(node);
-    if children.is_empty() {
-        node.children_with_tokens()
-            .filter_map(|element| match element {
-                NodeOrToken::Node(node) if node.kind() == SyntaxKind::RawPointerType => {
-                    Some(derive_type(&node))
-                }
-                NodeOrToken::Token(token) if token.kind() == SyntaxKind::TypeName => {
-                    Some(type_from_name(token.text()))
-                }
-                _ => None,
-            })
-            .collect()
-    } else {
-        children
-            .into_iter()
-            .map(|child| derive_type(&child))
-            .collect()
     }
 }
 
@@ -3015,6 +3256,32 @@ fn derive_executable_item(node: &CstNode) -> ScalarBlockItem {
 }
 
 fn derive_assignment(node: &CstNode) -> ScalarAssignment {
+    let targets_node = direct_nodes(node)
+        .into_iter()
+        .find(|child| child.kind() == SyntaxKind::AssignmentTargets)
+        .expect("assignment targets node");
+    let targets = targets_node
+        .children()
+        .filter(|child| child.kind() == SyntaxKind::AssignmentTarget)
+        .map(|target_node| {
+            let identifiers: Vec<CstToken> = target_node
+                .descendants_with_tokens()
+                .filter_map(|element| match element {
+                    NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => {
+                        Some(token)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let target = identifiers.last().expect("assignment target name");
+            ScalarAssignmentTarget {
+                receiver: (identifiers.len() == 2).then(|| identifiers[0].text().to_owned()),
+                target: target.text().to_owned(),
+                receiver_span: (identifiers.len() == 2).then(|| token_span(&identifiers[0])),
+                target_span: token_span(target),
+            }
+        })
+        .collect::<Vec<_>>();
     let target_node = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::AssignmentTarget)
@@ -3045,6 +3312,7 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
         target: target.text().to_owned(),
         receiver_span: (identifiers.len() == 2).then(|| token_span(&identifiers[0])),
         target_span: token_span(&target),
+        targets,
         value,
         span: wosy_syntax::byte_span(node),
     }
@@ -3452,6 +3720,11 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
         ) {
             if let Some(ty) = ty {
                 declarations.insert(name.clone(), ty.clone());
+                if let ScalarItem::Binding(binding) = item {
+                    for receiver in &binding.receivers {
+                        declarations.insert(receiver.name.clone(), receiver.ty.clone());
+                    }
+                }
                 validate_type(program, ty, span, &mut diagnostics);
             }
         }
@@ -3478,6 +3751,14 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     &mut diagnostics,
                     false,
                 );
+                validate_output_receivers(
+                    &binding.value,
+                    &binding.receivers,
+                    binding.span,
+                    &declarations,
+                    program,
+                    &mut diagnostics,
+                );
                 expect_type(
                     program,
                     &binding.declared_type,
@@ -3487,7 +3768,11 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                 );
             }
             ScalarItem::Function(function) => {
-                let ScalarType::Callable { result, parameters } = &function.signature else {
+                let ScalarType::Callable {
+                    outputs,
+                    parameters,
+                } = &function.signature
+                else {
                     continue;
                 };
                 let mut scope = declarations.clone();
@@ -3507,9 +3792,10 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                         scope.insert(name.clone(), parameters[index].clone());
                     }
                 }
+                let output = &outputs.outputs[0];
                 let actual = block_type_expected(
                     &function.body,
-                    result,
+                    &output.ty,
                     &scope,
                     &visible_names,
                     &folded_names,
@@ -3519,7 +3805,7 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                 );
                 expect_type(
                     program,
-                    result,
+                    &output.ty,
                     &actual,
                     function.body.span,
                     &mut diagnostics,
@@ -3771,8 +4057,13 @@ fn validate_type(
         }
         ScalarType::Named(_) => {}
         ScalarType::Struct(_) => {}
-        ScalarType::Callable { result, parameters } => {
-            validate_type(program, result, span, diagnostics);
+        ScalarType::Callable {
+            outputs,
+            parameters,
+        } => {
+            for output in &outputs.outputs {
+                validate_type(program, &output.ty, output.span, diagnostics);
+            }
             for parameter in parameters {
                 validate_type(program, parameter, span, diagnostics);
             }
@@ -3887,6 +4178,14 @@ fn block_item_type(
                 diagnostics,
                 unsafe_context,
             );
+            validate_output_receivers(
+                &binding.value,
+                &binding.receivers,
+                binding.span,
+                scope,
+                program,
+                diagnostics,
+            );
             expect_type(
                 program,
                 &binding.declared_type,
@@ -3903,6 +4202,9 @@ fn block_item_type(
                 diagnostics,
             ) {
                 scope.insert(binding.name.clone(), binding.declared_type.clone());
+                for receiver in &binding.receivers {
+                    scope.insert(receiver.name.clone(), receiver.ty.clone());
+                }
             }
             ScalarType::Unit
         }
@@ -4005,6 +4307,7 @@ fn assignment_type(
         diagnostics,
         unsafe_context,
     );
+    validate_assignment_outputs(assignment, scope, program, diagnostics);
     expect_type(program, &expected, &actual, assignment.span, diagnostics);
     if is_error_type(&actual) {
         ScalarType::Error
@@ -4031,7 +4334,7 @@ fn while_type(
         diagnostics,
         unsafe_context,
     );
-    if !is_error_type(&condition) && condition != ScalarType::Bool {
+    if !is_error_type(&condition) && !scalar_type_equal(&condition, &ScalarType::Bool) {
         diagnostics.push(diagnostic(
             program,
             "B0005",
@@ -4220,7 +4523,11 @@ fn expression_type(
                             })
                 )
             });
-            let Some(ScalarType::Callable { result, parameters }) = callable else {
+            let Some(ScalarType::Callable {
+                outputs,
+                parameters,
+            }) = callable
+            else {
                 diagnostics.push(diagnostic(program, "B0001", "unknown callable name", *span));
                 return ScalarType::Error;
             };
@@ -4258,7 +4565,7 @@ fn expression_type(
             if error_argument {
                 ScalarType::Error
             } else {
-                (*result).clone()
+                outputs.outputs[0].ty.clone()
             }
         }
         ScalarExpression::If {
@@ -4276,7 +4583,9 @@ fn expression_type(
                 diagnostics,
                 unsafe_context,
             );
-            if !is_error_type(&condition_type) && condition_type != ScalarType::Bool {
+            if !is_error_type(&condition_type)
+                && !scalar_type_equal(&condition_type, &ScalarType::Bool)
+            {
                 diagnostics.push(diagnostic(
                     program,
                     "B0005",
@@ -4305,7 +4614,7 @@ fn expression_type(
             if !is_error_type(&condition_type)
                 && !is_error_type(&then_type)
                 && !is_error_type(&else_type)
-                && then_type != else_type
+                && !scalar_type_equal(&then_type, &else_type)
             {
                 diagnostics.push(diagnostic(
                     program,
@@ -4341,7 +4650,7 @@ fn expect_type(
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    if !is_error_type(expected) && !is_error_type(actual) && expected != actual {
+    if !is_error_type(expected) && !is_error_type(actual) && !scalar_type_equal(expected, actual) {
         diagnostics.push(diagnostic(
             program,
             "B0003",
@@ -4377,7 +4686,8 @@ fn expression_type_expected(
             diagnostics,
             unsafe_context,
         );
-        if !is_error_type(&condition_type) && condition_type != ScalarType::Bool {
+        if !is_error_type(&condition_type) && !scalar_type_equal(&condition_type, &ScalarType::Bool)
+        {
             diagnostics.push(diagnostic(
                 program,
                 "B0005",
@@ -4405,7 +4715,10 @@ fn expression_type_expected(
             diagnostics,
             unsafe_context,
         );
-        if !is_error_type(&then_type) && !is_error_type(&else_type) && then_type != else_type {
+        if !is_error_type(&then_type)
+            && !is_error_type(&else_type)
+            && !scalar_type_equal(&then_type, &else_type)
+        {
             diagnostics.push(diagnostic(
                 program,
                 "B0006",
