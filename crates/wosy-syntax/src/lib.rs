@@ -24,6 +24,8 @@ pub enum SyntaxKind {
     BindingDecl,
     Item,
     CallableType,
+    RawPointerType,
+    Unsafe,
     TypeSpec,
     TypeName,
     Identifier,
@@ -72,30 +74,32 @@ impl Language for WosyLanguage {
             11 => SyntaxKind::BindingDecl,
             12 => SyntaxKind::Item,
             13 => SyntaxKind::CallableType,
-            14 => SyntaxKind::TypeSpec,
-            15 => SyntaxKind::TypeName,
-            16 => SyntaxKind::Identifier,
-            17 => SyntaxKind::Parameters,
-            18 => SyntaxKind::Block,
-            19 => SyntaxKind::BlockItem,
-            20 => SyntaxKind::Expression,
-            21 => SyntaxKind::Call,
-            22 => SyntaxKind::IfExpr,
-            23 => SyntaxKind::Parenthesized,
-            24 => SyntaxKind::Boolean,
-            25 => SyntaxKind::Binary,
-            26 => SyntaxKind::Operator,
-            27 => SyntaxKind::Integer,
-            28 => SyntaxKind::String,
-            29 => SyntaxKind::Punctuation,
-            30 => SyntaxKind::NamespaceDecl,
-            31 => SyntaxKind::QualifiedCall,
-            32 => SyntaxKind::QualifiedMember,
-            33 => SyntaxKind::AssignmentTarget,
-            34 => SyntaxKind::LocalBinding,
-            35 => SyntaxKind::While,
-            36 => SyntaxKind::Assignment,
-            37 => SyntaxKind::TopLevelItem,
+            14 => SyntaxKind::RawPointerType,
+            15 => SyntaxKind::Unsafe,
+            16 => SyntaxKind::TypeSpec,
+            17 => SyntaxKind::TypeName,
+            18 => SyntaxKind::Identifier,
+            19 => SyntaxKind::Parameters,
+            20 => SyntaxKind::Block,
+            21 => SyntaxKind::BlockItem,
+            22 => SyntaxKind::Expression,
+            23 => SyntaxKind::Call,
+            24 => SyntaxKind::IfExpr,
+            25 => SyntaxKind::Parenthesized,
+            26 => SyntaxKind::Boolean,
+            27 => SyntaxKind::Binary,
+            28 => SyntaxKind::Operator,
+            29 => SyntaxKind::Integer,
+            30 => SyntaxKind::String,
+            31 => SyntaxKind::Punctuation,
+            32 => SyntaxKind::NamespaceDecl,
+            33 => SyntaxKind::QualifiedCall,
+            34 => SyntaxKind::QualifiedMember,
+            35 => SyntaxKind::AssignmentTarget,
+            36 => SyntaxKind::LocalBinding,
+            37 => SyntaxKind::While,
+            38 => SyntaxKind::Assignment,
+            39 => SyntaxKind::TopLevelItem,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -487,6 +491,8 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::type_spec => SyntaxKind::TypeSpec,
         Rule::callable_type => SyntaxKind::CallableType,
         Rule::type_name => SyntaxKind::TypeName,
+        Rule::raw_pointer_type => SyntaxKind::RawPointerType,
+        Rule::unsafe_marker => SyntaxKind::Unsafe,
         Rule::identifier => SyntaxKind::Identifier,
         Rule::parameters => SyntaxKind::Parameters,
         Rule::block => SyntaxKind::Block,
@@ -760,6 +766,42 @@ mod tests {
                     .children()
                     .any(|child| child.kind() == SyntaxKind::QualifiedMember)
         }));
+    }
+
+    #[test]
+    fn accepts_lossless_wasi_fd_write_declaration_and_utf8_calls() {
+        let text = "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"Olá\\n\");\ni32 err = wasi.fd_write(2, \"erro\\n\");\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert!(!result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::RawPointerType));
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Unsafe));
+        assert!(result
+            .root
+            .descendants_with_tokens()
+            .any(|element| element.kind() == SyntaxKind::String));
+    }
+
+    #[test]
+    fn preserves_raw_pointer_type_structure_and_utf8_source() {
+        let text = "%%start\nraw = extern wasm \"raw\" { unsafe *?u8(i32, *?u8) read; };\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(
+            result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::RawPointerType)
+                .count(),
+            2
+        );
     }
 
     #[test]

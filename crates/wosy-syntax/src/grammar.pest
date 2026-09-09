@@ -14,12 +14,15 @@ error_item = @{ (!(";" | "%%end") ~ ANY)+ ~ ";"? }
 top_level_item = { (assignment | expression) ~ ";" }
 namespace_decl = { identifier ~ "=" ~ "namespace" ~ identifier ~ string ~ ";" }
 extern_decl = { identifier ~ "=" ~ "extern" ~ identifier ~ string ~ "{" ~ extern_function ~ "}" ~ ";" }
-extern_function = { callable_type ~ identifier ~ ";" }
+extern_function = { unsafe_marker? ~ callable_type ~ identifier ~ ";" }
 function_decl = { callable_type ~ identifier ~ "=" ~ "fn" ~ parameters? ~ block ~ ";" }
 binding_decl = { type_spec ~ identifier ~ "=" ~ expression ~ ";" }
-type_spec = { callable_type | type_name }
-callable_type = { type_name ~ "(" ~ (type_name ~ ("," ~ type_name)*)? ~ ")" }
+type_spec = { callable_type | raw_pointer_type | type_name }
+callable_type = { (raw_pointer_type | type_name) ~ "(" ~ ((raw_pointer_type | type_name) ~ ("," ~ (raw_pointer_type | type_name))*)? ~ ")" }
+raw_pointer_type = { "*?" ~ type_name }
 type_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+unsafe_marker = { unsafe_keyword }
+unsafe_keyword = { "unsafe" }
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 parameters = { "(" ~ (identifier ~ ("," ~ identifier)*)? ~ ")" }
 block = { "{" ~ block_item* ~ "}" }
@@ -35,7 +38,7 @@ logical_and = { comparison ~ (and_operator ~ comparison)* }
 comparison = { additive ~ (comparison_operator ~ additive)* }
 additive = { multiplicative ~ (add_operator ~ multiplicative)* }
 multiplicative = { primary ~ (multiply_operator ~ primary)* }
-primary = { call | qualified_member | boolean | identifier | integer | parenthesized }
+primary = { call | qualified_member | boolean | identifier | integer | string | parenthesized }
 parenthesized = { "(" ~ expression ~ ")" }
 call = { qualified_call ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 qualified_call = { identifier ~ ("." ~ identifier)? }

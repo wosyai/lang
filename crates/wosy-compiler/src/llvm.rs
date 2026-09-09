@@ -8,6 +8,7 @@ use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, PointerValue, ValueKind,
 };
+use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,9 @@ pub enum LlvmValueType {
     Void,
     I1,
     I32,
+    I8,
+    I64,
+    Pointer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -90,7 +94,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             ScalarItem::Function(function) => {
                 Some((function.name.clone(), function.signature.clone()))
             }
-            ScalarItem::Namespace(_) | ScalarItem::Executable(_) => None,
+            ScalarItem::Namespace(_) | ScalarItem::Extern(_) | ScalarItem::Executable(_) => None,
         })
         .collect::<BTreeMap<_, _>>();
     let mut functions = BTreeMap::new();
@@ -293,6 +297,12 @@ fn function_type<'ctx>(
         ScalarType::Unit => context.void_type().fn_type(&parameters, false),
         ScalarType::Bool => context.bool_type().fn_type(&parameters, false),
         ScalarType::I32 => context.i32_type().fn_type(&parameters, false),
+        ScalarType::U8 => context.i8_type().fn_type(&parameters, false),
+        ScalarType::U32 => context.i32_type().fn_type(&parameters, false),
+        ScalarType::U64 => context.i64_type().fn_type(&parameters, false),
+        ScalarType::RawPointer(_) => context
+            .ptr_type(AddressSpace::default())
+            .fn_type(&parameters, false),
         _ => return Err("unsupported LLVM scalar type".into()),
     })
 }
@@ -304,6 +314,10 @@ fn basic_type<'ctx>(
     match ty {
         ScalarType::Bool => Ok(context.bool_type().into()),
         ScalarType::I32 => Ok(context.i32_type().into()),
+        ScalarType::U8 => Ok(context.i8_type().into()),
+        ScalarType::U32 => Ok(context.i32_type().into()),
+        ScalarType::U64 => Ok(context.i64_type().into()),
+        ScalarType::RawPointer(_) => Ok(context.ptr_type(AddressSpace::default()).into()),
         _ => Err("unit is only valid as a function result".into()),
     }
 }
@@ -312,6 +326,10 @@ fn value_type(ty: &ScalarType) -> Result<LlvmValueType, String> {
         ScalarType::Unit => Ok(LlvmValueType::Void),
         ScalarType::Bool => Ok(LlvmValueType::I1),
         ScalarType::I32 => Ok(LlvmValueType::I32),
+        ScalarType::U8 => Ok(LlvmValueType::I8),
+        ScalarType::U32 => Ok(LlvmValueType::I32),
+        ScalarType::U64 => Ok(LlvmValueType::I64),
+        ScalarType::RawPointer(_) => Ok(LlvmValueType::Pointer),
         _ => Err("unsupported LLVM scalar type".into()),
     }
 }
@@ -414,7 +432,7 @@ fn emit_main<'ctx>(
             ScalarItem::Executable(item) => {
                 emit_block_item(context, &mut state, item)?;
             }
-            ScalarItem::Namespace(_) | ScalarItem::Function(_) => {}
+            ScalarItem::Namespace(_) | ScalarItem::Extern(_) | ScalarItem::Function(_) => {}
         }
     }
     builder
@@ -557,7 +575,7 @@ fn initialize_project_module<'ctx>(
             ScalarItem::Executable(item) => {
                 emit_project_block_item(context, state, item, module, modules)?;
             }
-            ScalarItem::Function(_) => {}
+            ScalarItem::Extern(_) | ScalarItem::Function(_) => {}
         }
     }
 
@@ -972,6 +990,7 @@ fn emit_expression<'ctx>(
                 .const_int(u64::from(*value), false)
                 .into(),
         )),
+        ScalarExpression::Utf8 { .. } => Err("utf8 values require ABI lowering".to_owned()),
         ScalarExpression::Binary {
             operator,
             left,
@@ -1061,6 +1080,7 @@ fn emit_project_expression<'ctx>(
                 .const_int(u64::from(*value), false)
                 .into(),
         )),
+        ScalarExpression::Utf8 { .. } => Err("utf8 values require ABI lowering".to_owned()),
         ScalarExpression::Binary {
             operator,
             left,
@@ -1459,6 +1479,7 @@ fn project_member_global<'ctx>(
     let binding = target.items.iter().find_map(|item| match item {
         ScalarItem::Binding(binding) if binding.name == name => Some(binding),
         ScalarItem::Binding(_)
+        | ScalarItem::Extern(_)
         | ScalarItem::Namespace(_)
         | ScalarItem::Function(_)
         | ScalarItem::Executable(_) => None,
@@ -1496,7 +1517,10 @@ fn module_globals<'ctx>(
                 .get(&project_global_name(&module.source, &binding.name))
                 .cloned()
                 .map(|global| (binding.name.clone(), global)),
-            ScalarItem::Namespace(_) | ScalarItem::Function(_) | ScalarItem::Executable(_) => None,
+            ScalarItem::Namespace(_)
+            | ScalarItem::Extern(_)
+            | ScalarItem::Function(_)
+            | ScalarItem::Executable(_) => None,
         })
         .collect()
 }

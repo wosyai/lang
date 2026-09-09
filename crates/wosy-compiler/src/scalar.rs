@@ -13,6 +13,11 @@ pub enum ScalarType {
     Unit,
     Bool,
     I32,
+    U8,
+    U32,
+    U64,
+    Utf8,
+    RawPointer(Box<ScalarType>),
     Callable {
         result: Box<ScalarType>,
         parameters: Vec<ScalarType>,
@@ -64,6 +69,10 @@ pub enum ScalarExpression {
     },
     Boolean {
         value: bool,
+        span: ByteSpan,
+    },
+    Utf8 {
+        value: Vec<u8>,
         span: ByteSpan,
     },
     Binary {
@@ -152,8 +161,30 @@ pub struct ScalarFunction {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarExternFunction {
+    pub name: String,
+    pub signature: ScalarType,
+    pub unsafe_marker: bool,
+    pub name_span: ByteSpan,
+    pub signature_span: ByteSpan,
+    pub span: ByteSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarExtern {
+    pub binding: String,
+    pub actual_module: String,
+    pub kind: String,
+    pub functions: Vec<ScalarExternFunction>,
+    pub binding_span: ByteSpan,
+    pub module_span: ByteSpan,
+    pub span: ByteSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ScalarItem {
     Namespace(ScalarNamespace),
+    Extern(ScalarExtern),
     Binding(ScalarBinding),
     Function(ScalarFunction),
     Executable(ScalarBlockItem),
@@ -198,6 +229,12 @@ impl ScalarModule {
         for (item_index, item) in items.iter().enumerate() {
             let (name, ty, span) = match item {
                 ScalarItem::Namespace(_) => continue,
+                ScalarItem::Extern(extern_decl) => {
+                    for function in &extern_decl.functions {
+                        members.insert(function.name.clone(), function.signature.clone());
+                    }
+                    continue;
+                }
                 ScalarItem::Binding(binding) => {
                     (&binding.name, &binding.declared_type, binding.span)
                 }
@@ -266,6 +303,7 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
     for node in source_root.children() {
         match node.kind() {
             SyntaxKind::NamespaceDecl => items.push(ScalarItem::Namespace(derive_namespace(&node))),
+            SyntaxKind::ExternDecl => items.push(ScalarItem::Extern(derive_extern(&node))),
             SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node))),
             SyntaxKind::FunctionDecl => items.push(ScalarItem::Function(derive_function(&node))),
             SyntaxKind::Item => {
@@ -273,6 +311,9 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
                     match item.kind() {
                         SyntaxKind::NamespaceDecl => {
                             items.push(ScalarItem::Namespace(derive_namespace(&item)))
+                        }
+                        SyntaxKind::ExternDecl => {
+                            items.push(ScalarItem::Extern(derive_extern(&item)))
                         }
                         SyntaxKind::BindingDecl => {
                             items.push(ScalarItem::Binding(derive_binding(&item)))
@@ -310,6 +351,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         for item in &module.items {
             let (name, span, ty) = match item {
                 ScalarItem::Namespace(namespace) => (&namespace.binding, namespace.span, None),
+                ScalarItem::Extern(extern_decl) => (&extern_decl.binding, extern_decl.span, None),
                 ScalarItem::Binding(binding) => {
                     (&binding.name, binding.span, Some(&binding.declared_type))
                 }
@@ -333,8 +375,13 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
             }
         }
         for item in &module.items {
+            if let ScalarItem::Extern(extern_decl) = item {
+                validate_extern(module, extern_decl, &mut diagnostics);
+            }
+        }
+        for item in &module.items {
             match item {
-                ScalarItem::Namespace(_) => {}
+                ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
                 ScalarItem::Binding(binding) => {
                     let actual = expression_type_in_module(
                         &binding.value,
@@ -450,12 +497,56 @@ fn validate_module_type(
             }
         }
         ScalarType::Unit | ScalarType::Bool | ScalarType::I32 => {}
+        ScalarType::U8 | ScalarType::U32 | ScalarType::U64 | ScalarType::Utf8 => {}
+        ScalarType::RawPointer(inner) if matches!(inner.as_ref(), ScalarType::U8) => {}
+        ScalarType::RawPointer(_) => diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "unsupported raw pointer type",
+            span,
+        )),
         ScalarType::Error => diagnostics.push(module_diagnostic(
             module,
             "B0003",
             "invalid scalar type",
             span,
         )),
+    }
+}
+
+fn validate_extern(
+    module: &ScalarModule,
+    extern_decl: &ScalarExtern,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    let valid_binding = extern_decl.binding == "wasi"
+        && extern_decl.kind == "wasm"
+        && extern_decl.actual_module == "wasi_snapshot_preview1"
+        && extern_decl.functions.len() == 1;
+    if !valid_binding {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "unsupported extern declaration",
+            extern_decl.span,
+        ));
+    }
+    for function in &extern_decl.functions {
+        let valid_signature = function.name == "fd_write"
+            && function.unsafe_marker
+            && function.signature
+                == (ScalarType::Callable {
+                    result: Box::new(ScalarType::I32),
+                    parameters: vec![ScalarType::I32, ScalarType::Utf8],
+                });
+        if !valid_signature {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "unsupported extern function declaration",
+                function.span,
+            ));
+        }
     }
 }
 
@@ -756,6 +847,7 @@ fn expression_type_in_module(
             ScalarType::I32
         }
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
+        ScalarExpression::Utf8 { .. } => ScalarType::Utf8,
         ScalarExpression::Binary {
             operator,
             left,
@@ -892,6 +984,23 @@ fn expression_type_in_module(
                 );
                 expect_module_type(target, parameter, &actual, *span, diagnostics);
                 error_argument |= is_error_type(&actual);
+            }
+            if receiver.as_deref() == Some("wasi") && name == "fd_write" {
+                let valid_adapter_call = matches!(
+                    arguments.as_slice(),
+                    [
+                        ScalarExpression::Integer { value, .. },
+                        ScalarExpression::Utf8 { .. }
+                    ] if value == &BigInt::from(1) || value == &BigInt::from(2)
+                );
+                if !valid_adapter_call {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0011",
+                        "fd_write descriptor must be 1 or 2",
+                        *span,
+                    ));
+                }
             }
             if error_argument {
                 ScalarType::Error
@@ -1107,6 +1216,51 @@ fn derive_namespace(node: &CstNode) -> ScalarNamespace {
     }
 }
 
+fn derive_extern(node: &CstNode) -> ScalarExtern {
+    let identifiers: Vec<CstToken> = node
+        .children_with_tokens()
+        .filter_map(|element| match element {
+            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => Some(token),
+            _ => None,
+        })
+        .collect();
+    let module = direct_token(node, SyntaxKind::String).expect("extern module");
+    let callable = node
+        .children()
+        .find(|child| child.kind() == SyntaxKind::ExternFunction)
+        .expect("extern function");
+    let signature = callable
+        .children()
+        .find(|child| child.kind() == SyntaxKind::CallableType)
+        .expect("extern signature");
+    let name = callable
+        .children_with_tokens()
+        .filter_map(|element| match element {
+            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => Some(token),
+            _ => None,
+        })
+        .next()
+        .expect("extern symbol");
+    ScalarExtern {
+        binding: identifiers[0].text().to_owned(),
+        kind: identifiers[1].text().to_owned(),
+        actual_module: decode_string(module.text()).expect("valid extern module string"),
+        functions: vec![ScalarExternFunction {
+            name: name.text().to_owned(),
+            signature: derive_type(&signature),
+            unsafe_marker: callable
+                .children_with_tokens()
+                .any(|element| element.kind() == SyntaxKind::Unsafe),
+            name_span: token_span(&name),
+            signature_span: wosy_syntax::byte_span(&signature),
+            span: wosy_syntax::byte_span(&callable),
+        }],
+        binding_span: token_span(&identifiers[0]),
+        module_span: token_span(&module),
+        span: wosy_syntax::byte_span(node),
+    }
+}
+
 fn derive_binding(node: &CstNode) -> ScalarBinding {
     let declared_type = derive_type(
         &direct_nodes(node)
@@ -1198,24 +1352,32 @@ fn derive_type(node: &CstNode) -> ScalarType {
         .find(|child| child.kind() == SyntaxKind::CallableType)
         .unwrap_or_else(|| node.clone());
     if actual.kind() == SyntaxKind::CallableType {
-        let type_tokens: Vec<CstToken> = actual
+        let type_nodes: Vec<_> = actual
             .children_with_tokens()
             .filter_map(|element| match element {
-                NodeOrToken::Token(token) if token.kind() == SyntaxKind::TypeName => Some(token),
+                NodeOrToken::Node(node) if node.kind() == SyntaxKind::RawPointerType => {
+                    Some(derive_type(&node))
+                }
+                NodeOrToken::Token(token) if token.kind() == SyntaxKind::TypeName => {
+                    Some(type_from_name(token.text()))
+                }
                 _ => None,
             })
             .collect();
-        let result = type_from_name(type_tokens[0].text());
-        let parameters = type_tokens[1..]
-            .iter()
-            .map(|token| type_from_name(token.text()))
-            .collect();
+        let result = type_nodes[0].clone();
+        let parameters = type_nodes[1..].to_vec();
         ScalarType::Callable {
             result: Box::new(result),
             parameters,
         }
     } else {
-        type_from_name(type_text(node).as_str())
+        match direct_nodes(node)
+            .into_iter()
+            .find(|child| child.kind() == SyntaxKind::RawPointerType)
+        {
+            Some(pointer) => derive_type(&pointer),
+            None => type_from_name(type_text(node).as_str()),
+        }
     }
 }
 
@@ -1224,8 +1386,37 @@ fn type_from_name(value: &str) -> ScalarType {
         "unit" => ScalarType::Unit,
         "bool" => ScalarType::Bool,
         "i32" => ScalarType::I32,
+        "u8" => ScalarType::U8,
+        "u32" => ScalarType::U32,
+        "u64" => ScalarType::U64,
+        "utf8" => ScalarType::Utf8,
         value => ScalarType::Named(value.to_owned()),
     }
+}
+
+fn decode_string(value: &str) -> Result<String, ()> {
+    let quoted = value
+        .strip_prefix('"')
+        .ok_or(())?
+        .strip_suffix('"')
+        .ok_or(())?;
+    let mut decoded = String::new();
+    let mut chars = quoted.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        decoded.push(match chars.next().ok_or(())? {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '"' => '"',
+            '\\' => '\\',
+            _ => return Err(()),
+        });
+    }
+    Ok(decoded)
 }
 
 fn derive_block(node: &CstNode) -> ScalarBlock {
@@ -1445,6 +1636,7 @@ fn semantic_children(node: &CstNode) -> Vec<NodeOrToken<CstNode, CstToken>> {
                     | SyntaxKind::TypeName
                     | SyntaxKind::Integer
                     | SyntaxKind::Boolean
+                    | SyntaxKind::String
                     | SyntaxKind::Operator
             ),
         })
@@ -1485,6 +1677,14 @@ fn derive_element(element: &NodeOrToken<CstNode, CstToken>) -> ScalarExpression 
                     None => ScalarExpression::InvalidInteger { span },
                 }
             }
+            SyntaxKind::String => {
+                let span = token_span(token);
+                let value = decode_string(token.text()).expect("valid UTF-8 string literal");
+                ScalarExpression::Utf8 {
+                    value: value.into_bytes(),
+                    span,
+                }
+            }
             _ => panic!("expression token"),
         },
     }
@@ -1502,6 +1702,7 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::Integer { span, .. }
         | ScalarExpression::InvalidInteger { span }
         | ScalarExpression::Boolean { span, .. }
+        | ScalarExpression::Utf8 { span, .. }
         | ScalarExpression::Binary { span, .. }
         | ScalarExpression::Call { span, .. }
         | ScalarExpression::If { span, .. } => *span,
@@ -1536,6 +1737,7 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
     for item in &program.items {
         let (name, span, ty) = match item {
             ScalarItem::Namespace(namespace) => (&namespace.binding, namespace.span, None),
+            ScalarItem::Extern(extern_decl) => (&extern_decl.binding, extern_decl.span, None),
             ScalarItem::Binding(binding) => {
                 (&binding.name, binding.span, Some(&binding.declared_type))
             }
@@ -1558,10 +1760,17 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
             }
         }
     }
+    for item in &program.items {
+        if let ScalarItem::Extern(extern_decl) = item {
+            let module =
+                ScalarModule::new(program.source.clone(), program.items.clone(), Vec::new());
+            validate_extern(&module, extern_decl, &mut diagnostics);
+        }
+    }
     let mut scope = declarations.clone();
     for item in &program.items {
         match item {
-            ScalarItem::Namespace(_) => {}
+            ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
             ScalarItem::Binding(binding) => {
                 let actual = expression_type(
                     &binding.value,
@@ -1739,7 +1948,8 @@ impl StaticUseAnalyzer {
             ScalarExpression::Block(block) => self.block(block, visible),
             ScalarExpression::Integer { .. }
             | ScalarExpression::InvalidInteger { .. }
-            | ScalarExpression::Boolean { .. } => {}
+            | ScalarExpression::Boolean { .. }
+            | ScalarExpression::Utf8 { .. } => {}
         }
     }
 
@@ -1768,7 +1978,10 @@ fn unused_binding_spans(items: &[ScalarItem]) -> Vec<ByteSpan> {
                 analyzer.block(&function.body, &visible);
                 Some(analyzer.unused())
             }
-            ScalarItem::Namespace(_) | ScalarItem::Binding(_) | ScalarItem::Executable(_) => None,
+            ScalarItem::Namespace(_)
+            | ScalarItem::Extern(_)
+            | ScalarItem::Binding(_)
+            | ScalarItem::Executable(_) => None,
         })
         .flatten()
         .collect()
@@ -1791,6 +2004,14 @@ fn validate_type(
             }
         }
         ScalarType::Unit | ScalarType::Bool | ScalarType::I32 => {}
+        ScalarType::U8 | ScalarType::U32 | ScalarType::U64 | ScalarType::Utf8 => {}
+        ScalarType::RawPointer(inner) if matches!(inner.as_ref(), ScalarType::U8) => {}
+        ScalarType::RawPointer(_) => diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            "unsupported raw pointer type",
+            span,
+        )),
         ScalarType::Error => {
             diagnostics.push(diagnostic(program, "B0003", "invalid scalar type", span))
         }
@@ -2007,6 +2228,7 @@ fn expression_type(
             ScalarType::I32
         }
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
+        ScalarExpression::Utf8 { .. } => ScalarType::Utf8,
         ScalarExpression::Binary {
             operator,
             left,
@@ -2065,7 +2287,21 @@ fn expression_type(
             let lookup_name = receiver
                 .as_ref()
                 .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"));
-            let Some(ScalarType::Callable { result, parameters }) = scope.get(&lookup_name) else {
+            let callable = scope.get(&lookup_name).cloned().or_else(|| {
+                program.items.iter().find_map(|item| match item {
+                    ScalarItem::Extern(extern_decl)
+                        if receiver.as_deref() == Some(extern_decl.binding.as_str()) =>
+                    {
+                        extern_decl
+                            .functions
+                            .iter()
+                            .find(|function| function.name == *name)
+                            .map(|function| function.signature.clone())
+                    }
+                    _ => None,
+                })
+            });
+            let Some(ScalarType::Callable { result, parameters }) = callable else {
                 diagnostics.push(diagnostic(program, "B0001", "unknown callable name", *span));
                 return ScalarType::Error;
             };
@@ -2087,13 +2323,30 @@ fn expression_type(
                     program,
                     diagnostics,
                 );
-                expect_type(program, parameter, &actual, *span, diagnostics);
+                expect_type(program, &parameter, &actual, *span, diagnostics);
                 error_argument |= is_error_type(&actual);
+            }
+            if receiver.as_deref() == Some("wasi") && name == "fd_write" {
+                let valid_adapter_call = matches!(
+                    arguments.as_slice(),
+                    [
+                        ScalarExpression::Integer { value, .. },
+                        ScalarExpression::Utf8 { .. }
+                    ] if value == &BigInt::from(1) || value == &BigInt::from(2)
+                );
+                if !valid_adapter_call {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "B0011",
+                        "fd_write descriptor must be 1 or 2",
+                        *span,
+                    ));
+                }
             }
             if error_argument {
                 ScalarType::Error
             } else {
-                (**result).clone()
+                (*result).clone()
             }
         }
         ScalarExpression::If {
@@ -2325,6 +2578,50 @@ mod tests {
             parsed.diagnostics
         );
         derive_scalar_program(&parsed.result)
+    }
+
+    #[test]
+    fn derives_and_validates_wasi_fd_write_with_typed_utf8() {
+        let result = validate_text(
+            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"Olá\\n\");\ni32 err = wasi.fd_write(2, \"erro\\n\");\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Extern(extern_decl) = &result.program.items[0] else {
+            panic!("extern item");
+        };
+        assert_eq!(extern_decl.actual_module, "wasi_snapshot_preview1");
+        assert_eq!(extern_decl.functions[0].name, "fd_write");
+        assert!(extern_decl.functions[0].unsafe_marker);
+        let ScalarItem::Binding(binding) = &result.program.items[1] else {
+            panic!("binding item");
+        };
+        assert!(matches!(binding.value, ScalarExpression::Call { .. }));
+        assert!(matches!(binding.declared_type, ScalarType::I32));
+    }
+
+    #[test]
+    fn rejects_invalid_fd_write_descriptor_and_reports_missing_wasi_as_b0001() {
+        let invalid = validate_text(
+            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(0, \"x\");\n%%end",
+        );
+        assert!(invalid
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0011"));
+
+        let dynamic = validate_text(
+            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\nutf8 text = \"x\";\ni32 out = wasi.fd_write(1, text);\n%%end",
+        );
+        assert!(dynamic
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0011"));
+
+        let missing = validate_text("%%start\ni32 out = wasi.fd_write(1, \"x\");\n%%end");
+        assert!(missing
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0001"));
     }
 
     #[test]

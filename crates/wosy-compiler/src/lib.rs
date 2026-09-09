@@ -10,10 +10,10 @@ pub use llvm::{
 };
 pub use scalar::{
     derive_scalar_program, derive_scalar_program_from_cst, validate_scalar_project, BinaryOperator,
-    ScalarAssignment, ScalarBinding, ScalarBlock, ScalarBlockItem, ScalarExpression,
-    ScalarFunction, ScalarInitializationNode, ScalarItem, ScalarModule, ScalarNamespaceBinding,
-    ScalarProgram, ScalarProject, ScalarProjectValidation, ScalarType, ScalarValidation,
-    ScalarWhile,
+    ScalarAssignment, ScalarBinding, ScalarBlock, ScalarBlockItem, ScalarExpression, ScalarExtern,
+    ScalarExternFunction, ScalarFunction, ScalarInitializationNode, ScalarItem, ScalarModule,
+    ScalarNamespaceBinding, ScalarProgram, ScalarProject, ScalarProjectValidation, ScalarType,
+    ScalarValidation, ScalarWhile,
 };
 
 mod llvm;
