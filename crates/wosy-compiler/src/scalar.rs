@@ -114,6 +114,7 @@ pub struct ScalarBlock {
     pub terminated_items: Vec<bool>,
     pub expressions: Vec<ScalarExpression>,
     pub span: ByteSpan,
+    pub unsafe_context: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -408,6 +409,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         module,
                         &project.modules,
                         &mut diagnostics,
+                        false,
                     );
                     expect_module_type(
                         module,
@@ -454,6 +456,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         module,
                         &project.modules,
                         &mut diagnostics,
+                        false,
                     );
                     expect_module_type(
                         module,
@@ -475,6 +478,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         module,
                         &project.modules,
                         &mut diagnostics,
+                        false,
                     );
                 }
             }
@@ -536,11 +540,12 @@ fn validate_extern(
     extern_decl: &ScalarExtern,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    let valid_binding = extern_decl.binding == "wasi"
-        && extern_decl.kind == "wasm"
-        && extern_decl.actual_module
-            == ScalarExternModule::Valid("wasi_snapshot_preview1".to_owned())
-        && extern_decl.functions.len() == 1;
+    let valid_binding = extern_decl.kind == "wasm"
+        && matches!(extern_decl.actual_module, ScalarExternModule::Valid(_))
+        && extern_decl.functions.len() == 1
+        && (extern_decl.binding != "wasi"
+            || extern_decl.actual_module
+                == ScalarExternModule::Valid("wasi_snapshot_preview1".to_owned()));
     if !valid_binding {
         diagnostics.push(module_diagnostic(
             module,
@@ -550,13 +555,19 @@ fn validate_extern(
         ));
     }
     for function in &extern_decl.functions {
-        let valid_signature = function.name == "fd_write"
-            && function.unsafe_marker
-            && function.signature
-                == (ScalarType::Callable {
-                    result: Box::new(ScalarType::I32),
-                    parameters: vec![ScalarType::I32, ScalarType::Utf8],
-                });
+        let valid_signature = if extern_decl.binding == "wasi"
+            && extern_decl.actual_module
+                == ScalarExternModule::Valid("wasi_snapshot_preview1".to_owned())
+        {
+            function.name == "fd_write"
+                && function.signature
+                    == (ScalarType::Callable {
+                        result: Box::new(ScalarType::I32),
+                        parameters: vec![ScalarType::I32, ScalarType::Utf8],
+                    })
+        } else {
+            true
+        };
         if !valid_signature {
             diagnostics.push(module_diagnostic(
                 module,
@@ -576,10 +587,12 @@ fn block_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut visible_names = visible_names.clone();
     let mut folded_names = folded_names.clone();
+    let unsafe_context = unsafe_context || block.unsafe_context;
     let mut result = ScalarType::Unit;
     for (index, item) in block.items.iter().enumerate() {
         result = block_item_type_in_module(
@@ -590,6 +603,7 @@ fn block_type_in_module(
             module,
             modules,
             diagnostics,
+            unsafe_context,
         );
         if index + 1 == block.items.len() && block.terminated_items[index] {
             result = ScalarType::Unit;
@@ -606,6 +620,7 @@ fn block_item_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
@@ -617,6 +632,7 @@ fn block_item_type_in_module(
                 module,
                 modules,
                 diagnostics,
+                unsafe_context,
             );
             expect_module_type(
                 module,
@@ -645,6 +661,7 @@ fn block_item_type_in_module(
             module,
             modules,
             diagnostics,
+            unsafe_context,
         ),
         ScalarBlockItem::Assignment(assignment) => assignment_type_in_module(
             assignment,
@@ -654,6 +671,7 @@ fn block_item_type_in_module(
             module,
             modules,
             diagnostics,
+            unsafe_context,
         ),
         ScalarBlockItem::While(while_expression) => while_type_in_module(
             while_expression,
@@ -663,6 +681,7 @@ fn block_item_type_in_module(
             module,
             modules,
             diagnostics,
+            unsafe_context,
         ),
     }
 }
@@ -675,6 +694,7 @@ fn assignment_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
 ) -> ScalarType {
     let actual = expression_type_in_module(
         &assignment.value,
@@ -684,6 +704,7 @@ fn assignment_type_in_module(
         module,
         modules,
         diagnostics,
+        unsafe_context,
     );
     let expected = match &assignment.receiver {
         None => {
@@ -780,6 +801,7 @@ fn while_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
 ) -> ScalarType {
     let condition = expression_type_in_module(
         &while_expression.condition,
@@ -789,6 +811,7 @@ fn while_type_in_module(
         module,
         modules,
         diagnostics,
+        unsafe_context,
     );
     if !is_error_type(&condition) && condition != ScalarType::Bool {
         diagnostics.push(module_diagnostic(
@@ -806,6 +829,7 @@ fn while_type_in_module(
         module,
         modules,
         diagnostics,
+        unsafe_context,
     );
     ScalarType::Unit
 }
@@ -818,6 +842,7 @@ fn expression_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
 ) -> ScalarType {
     match expression {
         ScalarExpression::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
@@ -884,6 +909,7 @@ fn expression_type_in_module(
                 module,
                 modules,
                 diagnostics,
+                unsafe_context,
             );
             let right_type = expression_type_in_module(
                 right,
@@ -893,6 +919,7 @@ fn expression_type_in_module(
                 module,
                 modules,
                 diagnostics,
+                unsafe_context,
             );
             if is_error_type(&left_type) || is_error_type(&right_type) {
                 return ScalarType::Error;
@@ -928,8 +955,8 @@ fn expression_type_in_module(
             span,
             ..
         } => {
-            let (callable, target) = match receiver {
-                None => (scope.get(name), module),
+            let (callable, target, unsafe_callable) = match receiver {
+                None => (scope.get(name), module, false),
                 Some(binding) => {
                     let namespace = module
                         .namespace_bindings
@@ -956,7 +983,7 @@ fn expression_type_in_module(
                             ));
                             return ScalarType::Error;
                         };
-                        (Some(callable), target)
+                        (Some(callable), target, false)
                     } else {
                         let extern_decl = module.items.iter().find_map(|item| match item {
                             ScalarItem::Extern(extern_decl) if extern_decl.binding == *binding => {
@@ -986,7 +1013,12 @@ fn expression_type_in_module(
                             ));
                             return ScalarType::Error;
                         };
-                        (Some(&function.signature), module)
+                        (
+                            Some(&function.signature),
+                            module,
+                            function.unsafe_marker
+                                && !(receiver.as_deref() == Some("wasi") && name == "fd_write"),
+                        )
                     }
                 }
             };
@@ -1026,9 +1058,18 @@ fn expression_type_in_module(
                     module,
                     modules,
                     diagnostics,
+                    unsafe_context,
                 );
                 expect_module_type(target, parameter, &actual, *span, diagnostics);
                 error_argument |= is_error_type(&actual);
+            }
+            if unsafe_callable && !unsafe_context {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0012",
+                    "unsafe extern call requires an unsafe block",
+                    *span,
+                ));
             }
             if receiver.as_deref() == Some("wasi") && name == "fd_write" {
                 let valid_adapter_call = matches!(
@@ -1067,6 +1108,7 @@ fn expression_type_in_module(
                 module,
                 modules,
                 diagnostics,
+                unsafe_context,
             );
             expect_module_type(
                 module,
@@ -1083,6 +1125,7 @@ fn expression_type_in_module(
                 module,
                 modules,
                 diagnostics,
+                unsafe_context,
             );
             let else_type = block_type_in_module(
                 else_branch,
@@ -1092,6 +1135,7 @@ fn expression_type_in_module(
                 module,
                 modules,
                 diagnostics,
+                unsafe_context,
             );
             if !is_error_type(&condition_type)
                 && !is_error_type(&then_type)
@@ -1121,6 +1165,7 @@ fn expression_type_in_module(
             module,
             modules,
             diagnostics,
+            unsafe_context,
         ),
     }
 }
@@ -1550,6 +1595,10 @@ fn string_error_span(token: &CstToken, start: usize, length: usize) -> ByteSpan 
 }
 
 fn derive_block(node: &CstNode) -> ScalarBlock {
+    derive_block_with_context(node, false)
+}
+
+fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBlock {
     let items: Vec<ScalarBlockItem> = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::BlockItem)
@@ -1580,6 +1629,7 @@ fn derive_block(node: &CstNode) -> ScalarBlock {
         terminated_items,
         expressions,
         span: wosy_syntax::byte_span(node),
+        unsafe_context,
     }
 }
 
@@ -1671,6 +1721,13 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 span: wosy_syntax::byte_span(&actual),
             }
         }
+        SyntaxKind::Unsafe => ScalarExpression::Block(derive_block_with_context(
+            &direct_nodes(&actual)
+                .into_iter()
+                .find(|child| child.kind() == SyntaxKind::Block)
+                .expect("unsafe block"),
+            true,
+        )),
         SyntaxKind::Binary => {
             let children = semantic_children(&actual);
             let mut value = derive_element(&children[0]);
@@ -1917,6 +1974,7 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     &BTreeMap::new(),
                     program,
                     &mut diagnostics,
+                    false,
                 );
                 expect_type(
                     program,
@@ -1954,6 +2012,7 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     &folded_names,
                     program,
                     &mut diagnostics,
+                    false,
                 );
                 expect_type(
                     program,
@@ -1981,6 +2040,7 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     &mut folded_names,
                     program,
                     &mut diagnostics,
+                    false,
                 );
             }
         }
@@ -2163,10 +2223,12 @@ fn block_type(
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut visible_names = visible_names.clone();
     let mut folded_names = folded_names.clone();
+    let unsafe_context = unsafe_context || block.unsafe_context;
     let mut result = ScalarType::Unit;
     for (index, item) in block.items.iter().enumerate() {
         result = block_item_type(
@@ -2176,6 +2238,7 @@ fn block_type(
             &mut folded_names,
             program,
             diagnostics,
+            unsafe_context,
         );
         if index + 1 == block.items.len() && block.terminated_items[index] {
             result = ScalarType::Unit;
@@ -2191,6 +2254,7 @@ fn block_item_type(
     folded_names: &mut BTreeMap<String, (String, ByteSpan)>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
@@ -2201,6 +2265,7 @@ fn block_item_type(
                 folded_names,
                 program,
                 diagnostics,
+                unsafe_context,
             );
             expect_type(
                 program,
@@ -2228,6 +2293,7 @@ fn block_item_type(
             folded_names,
             program,
             diagnostics,
+            unsafe_context,
         ),
         ScalarBlockItem::Assignment(assignment) => assignment_type(
             assignment,
@@ -2236,6 +2302,7 @@ fn block_item_type(
             folded_names,
             program,
             diagnostics,
+            unsafe_context,
         ),
         ScalarBlockItem::While(while_expression) => while_type(
             while_expression,
@@ -2244,6 +2311,7 @@ fn block_item_type(
             folded_names,
             program,
             diagnostics,
+            unsafe_context,
         ),
     }
 }
@@ -2255,6 +2323,7 @@ fn assignment_type(
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
 ) -> ScalarType {
     let actual = expression_type(
         &assignment.value,
@@ -2263,6 +2332,7 @@ fn assignment_type(
         folded_names,
         program,
         diagnostics,
+        unsafe_context,
     );
     let Some(expected) = scope.get(&assignment.target) else {
         if is_const_binding_name(&assignment.target)
@@ -2312,6 +2382,7 @@ fn while_type(
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
 ) -> ScalarType {
     let condition = expression_type(
         &while_expression.condition,
@@ -2320,6 +2391,7 @@ fn while_type(
         folded_names,
         program,
         diagnostics,
+        unsafe_context,
     );
     if !is_error_type(&condition) && condition != ScalarType::Bool {
         diagnostics.push(diagnostic(
@@ -2336,6 +2408,7 @@ fn while_type(
         folded_names,
         program,
         diagnostics,
+        unsafe_context,
     );
     ScalarType::Unit
 }
@@ -2347,6 +2420,7 @@ fn expression_type(
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
 ) -> ScalarType {
     match expression {
         ScalarExpression::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
@@ -2384,6 +2458,7 @@ fn expression_type(
                 folded_names,
                 program,
                 diagnostics,
+                unsafe_context,
             );
             let right_type = expression_type(
                 right,
@@ -2392,6 +2467,7 @@ fn expression_type(
                 folded_names,
                 program,
                 diagnostics,
+                unsafe_context,
             );
             if is_error_type(&left_type) || is_error_type(&right_type) {
                 return ScalarType::Error;
@@ -2443,6 +2519,17 @@ fn expression_type(
                     _ => None,
                 })
             });
+            let unsafe_callable = program.items.iter().any(|item| {
+                matches!(
+                    item,
+                    ScalarItem::Extern(extern_decl)
+                        if receiver.as_deref() == Some(extern_decl.binding.as_str())
+                            && !(extern_decl.binding == "wasi" && name == "fd_write")
+                            && extern_decl.functions.iter().any(|function| {
+                                function.name == *name && function.unsafe_marker
+                            })
+                )
+            });
             let Some(ScalarType::Callable { result, parameters }) = callable else {
                 diagnostics.push(diagnostic(program, "B0001", "unknown callable name", *span));
                 return ScalarType::Error;
@@ -2464,9 +2551,18 @@ fn expression_type(
                     folded_names,
                     program,
                     diagnostics,
+                    unsafe_context,
                 );
                 expect_type(program, &parameter, &actual, *span, diagnostics);
                 error_argument |= is_error_type(&actual);
+            }
+            if unsafe_callable && !unsafe_context {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0012",
+                    "unsafe extern call requires an unsafe block",
+                    *span,
+                ));
             }
             if receiver.as_deref() == Some("wasi") && name == "fd_write" {
                 let valid_adapter_call = matches!(
@@ -2504,6 +2600,7 @@ fn expression_type(
                 folded_names,
                 program,
                 diagnostics,
+                unsafe_context,
             );
             if !is_error_type(&condition_type) && condition_type != ScalarType::Bool {
                 diagnostics.push(diagnostic(
@@ -2520,6 +2617,7 @@ fn expression_type(
                 folded_names,
                 program,
                 diagnostics,
+                unsafe_context,
             );
             let else_type = block_type(
                 else_branch,
@@ -2528,6 +2626,7 @@ fn expression_type(
                 folded_names,
                 program,
                 diagnostics,
+                unsafe_context,
             );
             if !is_error_type(&condition_type)
                 && !is_error_type(&then_type)
@@ -2556,6 +2655,7 @@ fn expression_type(
             folded_names,
             program,
             diagnostics,
+            unsafe_context,
         ),
     }
 }
@@ -2767,6 +2867,37 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "B0001"));
+    }
+
+    #[test]
+    fn ordinary_unsafe_extern_requires_structured_unsafe_block() {
+        let safe_text = "%%start\nraw = extern wasm \"env\" { unsafe i32(i32) read; };\ni32 value = raw.read(1);\n%%end";
+        let safe = validate_text(safe_text);
+        let diagnostic = safe
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0012")
+            .expect("unsafe-call diagnostic");
+        assert_eq!(
+            diagnostic.message,
+            "unsafe extern call requires an unsafe block"
+        );
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(71, 82));
+
+        let unsafe_text = "%%start\nraw = extern wasm \"env\" { unsafe i32(i32) read; };\ni32 value = unsafe { raw.read(1) };\n%%end";
+        let accepted = validate_text(unsafe_text);
+        assert!(
+            accepted.diagnostics.is_empty(),
+            "{:?}",
+            accepted.diagnostics
+        );
+        let ScalarItem::Binding(binding) = &accepted.program.items[1] else {
+            panic!("binding item");
+        };
+        let ScalarExpression::Block(block) = &binding.value else {
+            panic!("unsafe block expression");
+        };
+        assert!(block.unsafe_context);
     }
 
     #[test]
@@ -3072,7 +3203,8 @@ mod tests {
                 &BTreeSet::new(),
                 &BTreeMap::new(),
                 &result.program,
-                &mut Vec::new()
+                &mut Vec::new(),
+                false,
             ),
             ScalarType::Unit
         );

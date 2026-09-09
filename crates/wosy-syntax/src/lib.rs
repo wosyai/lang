@@ -503,6 +503,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::qualified_member => SyntaxKind::QualifiedMember,
         Rule::assignment_target => SyntaxKind::AssignmentTarget,
         Rule::if_expr => SyntaxKind::IfExpr,
+        Rule::unsafe_expr => SyntaxKind::Unsafe,
         Rule::while_expr => SyntaxKind::While,
         Rule::assignment => SyntaxKind::Assignment,
         Rule::top_level_item => SyntaxKind::TopLevelItem,
@@ -742,6 +743,23 @@ mod tests {
         assert!(call
             .children()
             .any(|node| node.kind() == SyntaxKind::QualifiedCall));
+    }
+
+    #[test]
+    fn unsafe_block_is_structured_and_lossless() {
+        let text = "%%start\nunit() main = fn {\n\tunsafe {\n\t\tenv.read();\n\t}\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let unsafe_node = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::Unsafe)
+            .expect("unsafe expression");
+        assert!(unsafe_node
+            .children()
+            .any(|node| node.kind() == SyntaxKind::Block));
+        assert_eq!(byte_span(&unsafe_node), ByteSpan::new(28, 53));
     }
 
     #[test]
