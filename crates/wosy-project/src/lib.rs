@@ -420,7 +420,11 @@ impl ProjectConfiguration {
             ("backend", &artifact_profile.backend, "llvm"),
             ("output", &artifact_profile.output, "wasm-wasip1"),
             ("builder", &artifact_profile.builder, "llvm-wasm"),
-            ("run_runner", &artifact_profile.run_runner, "wasmtime-wasip1"),
+            (
+                "run_runner",
+                &artifact_profile.run_runner,
+                "wasmtime-wasip1",
+            ),
         ] {
             if actual != expected {
                 diagnostics.push(ArtifactContractDiagnostic {
