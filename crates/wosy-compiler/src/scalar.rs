@@ -18,16 +18,11 @@ pub enum ScalarType {
         parameters: Vec<ScalarType>,
     },
     Named(String),
+    Error,
 }
 
-const POISONED_TYPE_NAME: &str = "\0wosy-internal-error";
-
-fn poisoned_type() -> ScalarType {
-    ScalarType::Named(POISONED_TYPE_NAME.to_owned())
-}
-
-fn is_poisoned_type(ty: &ScalarType) -> bool {
-    matches!(ty, ScalarType::Named(name) if name == POISONED_TYPE_NAME)
+fn is_error_type(ty: &ScalarType) -> bool {
+    matches!(ty, ScalarType::Error)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -455,6 +450,12 @@ fn validate_module_type(
             }
         }
         ScalarType::Unit | ScalarType::Bool | ScalarType::I32 => {}
+        ScalarType::Error => diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "invalid scalar type",
+            span,
+        )),
     }
 }
 
@@ -632,7 +633,7 @@ fn assignment_type_in_module(
                     assignment.target_span,
                     &target.source,
                 ));
-                return poisoned_type();
+                return ScalarType::Error;
             };
             if is_const_binding_name(&assignment.target) {
                 diagnostics.push(module_diagnostic(
@@ -655,8 +656,8 @@ fn assignment_type_in_module(
         return ScalarType::Unit;
     };
     expect_module_type(module, expected, &actual, assignment.span, diagnostics);
-    if is_poisoned_type(&actual) {
-        poisoned_type()
+    if is_error_type(&actual) {
+        ScalarType::Error
     } else {
         expected.clone()
     }
@@ -680,7 +681,7 @@ fn while_type_in_module(
         modules,
         diagnostics,
     );
-    if !is_poisoned_type(&condition) && condition != ScalarType::Bool {
+    if !is_error_type(&condition) && condition != ScalarType::Bool {
         diagnostics.push(module_diagnostic(
             module,
             "B0005",
@@ -742,7 +743,7 @@ fn expression_type_in_module(
                     *name_span,
                     &target.source,
                 ));
-                return poisoned_type();
+                return ScalarType::Error;
             };
             member.clone()
         }
@@ -779,8 +780,8 @@ fn expression_type_in_module(
                 modules,
                 diagnostics,
             );
-            if is_poisoned_type(&left_type) || is_poisoned_type(&right_type) {
-                return poisoned_type();
+            if is_error_type(&left_type) || is_error_type(&right_type) {
+                return ScalarType::Error;
             }
             let comparison = matches!(
                 operator,
@@ -847,7 +848,7 @@ fn expression_type_in_module(
                             *name_span,
                             &target.source,
                         ));
-                        return poisoned_type();
+                        return ScalarType::Error;
                     };
                     (Some(callable), target)
                 }
@@ -878,7 +879,7 @@ fn expression_type_in_module(
                     *span,
                 ));
             }
-            let mut poisoned_argument = false;
+            let mut error_argument = false;
             for (argument, parameter) in arguments.iter().zip(parameters) {
                 let actual = expression_type_in_module(
                     argument,
@@ -890,10 +891,10 @@ fn expression_type_in_module(
                     diagnostics,
                 );
                 expect_module_type(target, parameter, &actual, *span, diagnostics);
-                poisoned_argument |= is_poisoned_type(&actual);
+                error_argument |= is_error_type(&actual);
             }
-            if poisoned_argument {
-                poisoned_type()
+            if error_argument {
+                ScalarType::Error
             } else {
                 result.as_ref().clone()
             }
@@ -938,9 +939,9 @@ fn expression_type_in_module(
                 modules,
                 diagnostics,
             );
-            if !is_poisoned_type(&condition_type)
-                && !is_poisoned_type(&then_type)
-                && !is_poisoned_type(&else_type)
+            if !is_error_type(&condition_type)
+                && !is_error_type(&then_type)
+                && !is_error_type(&else_type)
                 && then_type != else_type
             {
                 diagnostics.push(module_diagnostic(
@@ -950,10 +951,10 @@ fn expression_type_in_module(
                     *span,
                 ));
             }
-            if is_poisoned_type(&condition_type) || is_poisoned_type(&then_type) {
-                poisoned_type()
-            } else if is_poisoned_type(&else_type) {
-                poisoned_type()
+            if is_error_type(&condition_type) || is_error_type(&then_type) {
+                ScalarType::Error
+            } else if is_error_type(&else_type) {
+                ScalarType::Error
             } else {
                 then_type
             }
@@ -977,7 +978,7 @@ fn expect_module_type(
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    if !is_poisoned_type(expected) && !is_poisoned_type(actual) && expected != actual {
+    if !is_error_type(expected) && !is_error_type(actual) && expected != actual {
         diagnostics.push(module_diagnostic(
             module,
             "B0003",
@@ -1790,6 +1791,9 @@ fn validate_type(
             }
         }
         ScalarType::Unit | ScalarType::Bool | ScalarType::I32 => {}
+        ScalarType::Error => {
+            diagnostics.push(diagnostic(program, "B0003", "invalid scalar type", span))
+        }
     }
 }
 
@@ -1935,7 +1939,11 @@ fn assignment_type(
         ));
     }
     expect_type(program, expected, &actual, assignment.span, diagnostics);
-    expected.clone()
+    if is_error_type(&actual) {
+        ScalarType::Error
+    } else {
+        expected.clone()
+    }
 }
 
 fn while_type(
@@ -1954,7 +1962,7 @@ fn while_type(
         program,
         diagnostics,
     );
-    if condition != ScalarType::Bool {
+    if !is_error_type(&condition) && condition != ScalarType::Bool {
         diagnostics.push(diagnostic(
             program,
             "B0005",
@@ -1988,7 +1996,7 @@ fn expression_type(
         }),
         ScalarExpression::Member { span, .. } => {
             diagnostics.push(diagnostic(program, "B0001", "unknown name", *span));
-            ScalarType::Unit
+            ScalarType::Error
         }
         ScalarExpression::Integer { value, span } => {
             validate_integer_range_program(program, value, *span, diagnostics);
@@ -2021,6 +2029,9 @@ fn expression_type(
                 program,
                 diagnostics,
             );
+            if is_error_type(&left_type) || is_error_type(&right_type) {
+                return ScalarType::Error;
+            }
             let comparison = matches!(
                 operator,
                 BinaryOperator::Equal
@@ -2066,6 +2077,7 @@ fn expression_type(
                     *span,
                 ));
             }
+            let mut error_argument = false;
             for (argument, parameter) in arguments.iter().zip(parameters) {
                 let actual = expression_type(
                     argument,
@@ -2076,8 +2088,13 @@ fn expression_type(
                     diagnostics,
                 );
                 expect_type(program, parameter, &actual, *span, diagnostics);
+                error_argument |= is_error_type(&actual);
             }
-            (**result).clone()
+            if error_argument {
+                ScalarType::Error
+            } else {
+                (**result).clone()
+            }
         }
         ScalarExpression::If {
             condition,
@@ -2093,7 +2110,7 @@ fn expression_type(
                 program,
                 diagnostics,
             );
-            if condition_type != ScalarType::Bool {
+            if !is_error_type(&condition_type) && condition_type != ScalarType::Bool {
                 diagnostics.push(diagnostic(
                     program,
                     "B0005",
@@ -2117,7 +2134,11 @@ fn expression_type(
                 program,
                 diagnostics,
             );
-            if then_type != else_type {
+            if !is_error_type(&condition_type)
+                && !is_error_type(&then_type)
+                && !is_error_type(&else_type)
+                && then_type != else_type
+            {
                 diagnostics.push(diagnostic(
                     program,
                     "B0006",
@@ -2125,7 +2146,13 @@ fn expression_type(
                     *span,
                 ));
             }
-            then_type
+            if is_error_type(&condition_type) || is_error_type(&then_type) {
+                ScalarType::Error
+            } else if is_error_type(&else_type) {
+                ScalarType::Error
+            } else {
+                then_type
+            }
         }
         ScalarExpression::Block(block) => block_type(
             block,
@@ -2145,7 +2172,7 @@ fn expect_type(
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    if expected != actual {
+    if !is_error_type(expected) && !is_error_type(actual) && expected != actual {
         diagnostics.push(diagnostic(
             program,
             "B0003",
@@ -3233,7 +3260,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_sibling_diagnostics_after_poisoned_namespace_member() {
+    fn preserves_sibling_diagnostics_after_error_namespace_member() {
         let math_source = module_source("src/math.w");
         let math = module_from_text(math_source.clone(), "%%start\ni32 value = 1;\n%%end");
         let main_source = module_source("src/main.w");
