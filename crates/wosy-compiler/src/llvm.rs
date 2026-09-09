@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::mem::ManuallyDrop;
 
 use inkwell::builder::{Builder, BuilderError};
 use inkwell::context::Context;
-use inkwell::module::Linkage;
+use inkwell::module::{Linkage, Module};
 use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, PointerValue, ValueKind,
@@ -41,7 +42,15 @@ pub struct LlvmFunction {
     pub name: String,
     pub result: LlvmValueType,
     pub parameters: Vec<(String, LlvmValueType)>,
+    pub attributes: Vec<LlvmFunctionAttributes>,
     pub body: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LlvmFunctionAttributes {
+    pub group: u32,
+    pub wasm_import_module: String,
+    pub wasm_import_name: String,
 }
 
 #[derive(Clone)]
@@ -50,13 +59,16 @@ enum EmitValue<'ctx> {
     Basic(BasicValueEnum<'ctx>),
 }
 
-struct EmitState<'ctx> {
+struct EmitState<'ctx, 'module> {
     builder: &'ctx Builder<'ctx>,
+    module: &'module Module<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
     values: BTreeMap<String, EmitValue<'ctx>>,
     storage: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
     globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     all_globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
+    scratch: GlobalValue<'ctx>,
+    next_literal: usize,
     next_block: usize,
 }
 
@@ -65,8 +77,9 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         return Err("cannot emit LLVM for an invalid scalar program".into());
     }
     let context = Context::create();
-    let module = context.create_module(&validation.program.source.path);
+    let module = ManuallyDrop::new(context.create_module(&validation.program.source.path));
     let builder = context.create_builder();
+    let scratch = add_scratch_global(&module, &context);
     let mut globals = BTreeMap::new();
     for item in &validation.program.items {
         if let ScalarItem::Binding(binding) = item {
@@ -117,6 +130,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         "main".into(),
         module.add_function("main", context.i32_type().fn_type(&[], false), None),
     );
+    add_fd_write(&module, &context, &mut functions);
     for item in &validation.program.items {
         if let ScalarItem::Function(function) = item {
             emit_function(
@@ -127,6 +141,8 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
                 function,
                 &function.name,
                 &validation.program.items,
+                &module,
+                scratch,
             )?;
         }
     }
@@ -136,11 +152,13 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         &functions,
         &globals,
         &validation.program.items,
+        &module,
+        scratch,
     )?;
     finish_partition(
-        module,
+        ManuallyDrop::into_inner(module),
         validation.program.source.path.clone(),
-        functions,
+        &functions,
         &signatures,
     )
 }
@@ -171,8 +189,9 @@ pub fn emit_scalar_project_llvm(
         .project
         .clone();
     let context = Context::create();
-    let module = context.create_module(&module_name);
+    let module = ManuallyDrop::new(context.create_module(&module_name));
     let builder = context.create_builder();
+    let scratch = add_scratch_global(&module, &context);
     let mut globals = BTreeMap::new();
     let mut functions = BTreeMap::new();
     let mut signatures = BTreeMap::new();
@@ -209,6 +228,7 @@ pub fn emit_scalar_project_llvm(
         "main".into(),
         module.add_function("main", context.i32_type().fn_type(&[], false), None),
     );
+    add_fd_write(&module, &context, &mut functions);
     for (source_module, function, name) in definitions {
         emit_project_function(
             &context,
@@ -219,10 +239,19 @@ pub fn emit_scalar_project_llvm(
             &modules,
             &globals,
             &name,
+            &module,
+            scratch,
         )?;
     }
-    emit_project_main(&context, &builder, &functions, &modules, &globals)?;
-    finish_partition(module, module_name, functions, &signatures)
+    emit_project_main(
+        &context, &builder, &functions, &modules, &globals, &module, scratch,
+    )?;
+    finish_partition(
+        ManuallyDrop::into_inner(module),
+        module_name,
+        &functions,
+        &signatures,
+    )
 }
 
 pub fn emit_scalar_llvm_text(validation: &ScalarValidation) -> Result<String, String> {
@@ -231,18 +260,89 @@ pub fn emit_scalar_llvm_text(validation: &ScalarValidation) -> Result<String, St
 
 impl LlvmPartition {
     pub fn to_text(&self) -> String {
-        self.text.clone()
+        let mut text = self.text.clone();
+        if !self.declarations.is_empty() {
+            let body = text
+                .lines()
+                .filter(|line| !line.starts_with("declare i32 @fd_write("))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut serialized = String::new();
+            for declaration in &self.declarations {
+                writeln!(
+                    serialized,
+                    "declare i32 @{}(i32, i32, i32, i32) #0",
+                    declaration.name
+                )
+                .expect("writing to a String cannot fail");
+            }
+            serialized.push('\n');
+            for attributes in declaration_attributes(&self.declarations) {
+                writeln!(
+                    serialized,
+                    "attributes #{} = {{ \"wasm-import-module\"=\"{}\" \"wasm-import-name\"=\"{}\" }}",
+                    attributes.group,
+                    attributes.wasm_import_module,
+                    attributes.wasm_import_name
+                )
+                .expect("writing to a String cannot fail");
+            }
+            serialized.push_str(&body);
+            text = serialized;
+        } else {
+            text = text
+                .lines()
+                .filter(|line| !line.contains("@wosy_fd_write_scratch"))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        text
     }
+}
+
+fn declaration_attributes(declarations: &[LlvmFunction]) -> Vec<&LlvmFunctionAttributes> {
+    let mut attributes = declarations
+        .iter()
+        .flat_map(|declaration| declaration.attributes.iter())
+        .collect::<Vec<_>>();
+    attributes.sort_by_key(|attribute| attribute.group);
+    attributes
+}
+
+fn add_scratch_global<'ctx>(module: &Module<'ctx>, context: &'ctx Context) -> GlobalValue<'ctx> {
+    let ty = context.i8_type().array_type(12);
+    let scratch = module.add_global(ty, None, "wosy_fd_write_scratch");
+    scratch.set_linkage(Linkage::Internal);
+    scratch.set_initializer(&ty.const_zero());
+    scratch.set_alignment(4);
+    scratch
+}
+
+fn add_fd_write<'ctx>(
+    module: &Module<'ctx>,
+    context: &'ctx Context,
+    functions: &mut BTreeMap<String, FunctionValue<'ctx>>,
+) {
+    let i32_type = context.i32_type();
+    let parameters = [
+        i32_type.into(),
+        i32_type.into(),
+        i32_type.into(),
+        i32_type.into(),
+    ];
+    let fd_write = module.add_function("fd_write", i32_type.fn_type(&parameters, false), None);
+    functions.insert("wasi.fd_write".into(), fd_write);
 }
 
 fn finish_partition<'ctx>(
     module: inkwell::module::Module<'ctx>,
     module_name: String,
-    functions: BTreeMap<String, FunctionValue<'ctx>>,
+    functions: &BTreeMap<String, FunctionValue<'ctx>>,
     signatures: &BTreeMap<String, ScalarType>,
 ) -> Result<LlvmPartition, String> {
     module.verify().map_err(|error| error.to_string())?;
     let text = module.print_to_string().to_string();
+    let has_fd_write = text.contains("call i32 @fd_write");
     let metadata = functions
         .iter()
         .filter_map(|(name, function)| {
@@ -270,13 +370,33 @@ fn finish_partition<'ctx>(
                 name: name.clone(),
                 result: value_type(&result).ok()?,
                 parameters,
+                attributes: Vec::new(),
                 body: String::new(),
             })
         })
         .collect();
+    let mut declarations = Vec::new();
+    if has_fd_write {
+        declarations.push(LlvmFunction {
+            name: "fd_write".into(),
+            result: LlvmValueType::I32,
+            parameters: vec![
+                ("fd".into(), LlvmValueType::I32),
+                ("iovec".into(), LlvmValueType::I32),
+                ("count".into(), LlvmValueType::I32),
+                ("nwritten".into(), LlvmValueType::I32),
+            ],
+            attributes: vec![LlvmFunctionAttributes {
+                group: 0,
+                wasm_import_module: "wasi_snapshot_preview1".into(),
+                wasm_import_name: "fd_write".into(),
+            }],
+            body: String::new(),
+        });
+    }
     Ok(LlvmPartition {
         module_name,
-        declarations: Vec::new(),
+        declarations,
         functions: metadata,
         text,
     })
@@ -343,7 +463,7 @@ fn take_basic(value: EmitValue<'_>) -> Result<BasicValueEnum<'_>, String> {
     }
 }
 
-fn emit_function<'ctx>(
+fn emit_function<'ctx, 'module>(
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -351,6 +471,8 @@ fn emit_function<'ctx>(
     function: &ScalarFunction,
     name: &str,
     items: &[ScalarItem],
+    module: &'module Module<'ctx>,
+    scratch: GlobalValue<'ctx>,
 ) -> Result<(), String> {
     let value = *functions
         .get(name)
@@ -359,11 +481,14 @@ fn emit_function<'ctx>(
     builder.position_at_end(entry);
     let mut state = EmitState {
         builder,
+        module,
         functions,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         globals: globals.clone(),
         all_globals: globals.clone(),
+        scratch,
+        next_literal: 0,
         next_block: 0,
     };
     insert_unit_values(&mut state.values, items);
@@ -390,12 +515,14 @@ fn emit_function<'ctx>(
     emit_return(&mut state, result, result_type)
 }
 
-fn emit_main<'ctx>(
+fn emit_main<'ctx, 'module>(
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     items: &[ScalarItem],
+    module: &'module Module<'ctx>,
+    scratch: GlobalValue<'ctx>,
 ) -> Result<(), String> {
     let main = *functions
         .get("main")
@@ -404,11 +531,14 @@ fn emit_main<'ctx>(
     builder.position_at_end(entry);
     let mut state = EmitState {
         builder,
+        module,
         functions,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         globals: globals.clone(),
         all_globals: globals.clone(),
+        scratch,
+        next_literal: 0,
         next_block: 0,
     };
     insert_unit_values(&mut state.values, items);
@@ -441,7 +571,7 @@ fn emit_main<'ctx>(
     Ok(())
 }
 
-fn emit_project_function<'ctx>(
+fn emit_project_function<'ctx, 'module>(
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -450,6 +580,8 @@ fn emit_project_function<'ctx>(
     modules: &[&ScalarModule],
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     name: &str,
+    module: &'module Module<'ctx>,
+    scratch: GlobalValue<'ctx>,
 ) -> Result<(), String> {
     let value = *functions
         .get(name)
@@ -458,11 +590,14 @@ fn emit_project_function<'ctx>(
     builder.position_at_end(entry);
     let mut state = EmitState {
         builder,
+        module,
         functions,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         globals: module_globals(source_module, globals),
         all_globals: globals.clone(),
+        scratch,
+        next_literal: 0,
         next_block: 0,
     };
     insert_unit_values(&mut state.values, &source_module.items);
@@ -489,12 +624,14 @@ fn emit_project_function<'ctx>(
     emit_return(&mut state, result, result_type)
 }
 
-fn emit_project_main<'ctx>(
+fn emit_project_main<'ctx, 'module>(
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
     modules: &[&ScalarModule],
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
+    module: &'module Module<'ctx>,
+    scratch: GlobalValue<'ctx>,
 ) -> Result<(), String> {
     let main = *functions
         .get("main")
@@ -503,11 +640,14 @@ fn emit_project_main<'ctx>(
     builder.position_at_end(entry);
     let mut state = EmitState {
         builder,
+        module,
         functions,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         globals: BTreeMap::new(),
         all_globals: globals.clone(),
+        scratch,
+        next_literal: 0,
         next_block: 0,
     };
     let root = modules
@@ -520,9 +660,9 @@ fn emit_project_main<'ctx>(
     Ok(())
 }
 
-fn initialize_project_module<'ctx>(
+fn initialize_project_module<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     module: &ScalarModule,
     modules: &[&ScalarModule],
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
@@ -585,9 +725,9 @@ fn initialize_project_module<'ctx>(
     Ok(())
 }
 
-fn emit_block<'ctx>(
+fn emit_block<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     block: &ScalarBlock,
 ) -> Result<EmitValue<'ctx>, String> {
     let storage = state.storage.clone();
@@ -626,9 +766,9 @@ fn emit_block<'ctx>(
     Ok(result)
 }
 
-fn emit_project_block<'ctx>(
+fn emit_project_block<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     block: &ScalarBlock,
     module: &ScalarModule,
     modules: &[&ScalarModule],
@@ -676,9 +816,9 @@ fn emit_project_block<'ctx>(
     Ok(result)
 }
 
-fn emit_assignment<'ctx>(
+fn emit_assignment<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     assignment: &ScalarAssignment,
 ) -> Result<EmitValue<'ctx>, String> {
     let value = emit_expression(context, state, &assignment.value)?;
@@ -722,9 +862,9 @@ fn emit_assignment<'ctx>(
     };
     Ok(EmitValue::Basic(old))
 }
-fn emit_project_assignment<'ctx>(
+fn emit_project_assignment<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     assignment: &ScalarAssignment,
     module: &ScalarModule,
     modules: &[&ScalarModule],
@@ -784,9 +924,9 @@ fn emit_project_assignment<'ctx>(
     Ok(EmitValue::Basic(old))
 }
 
-fn emit_block_item<'ctx>(
+fn emit_block_item<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     item: &ScalarBlockItem,
 ) -> Result<EmitValue<'ctx>, String> {
     match item {
@@ -816,9 +956,9 @@ fn emit_block_item<'ctx>(
     }
 }
 
-fn emit_project_block_item<'ctx>(
+fn emit_project_block_item<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     item: &ScalarBlockItem,
     module: &ScalarModule,
     modules: &[&ScalarModule],
@@ -856,9 +996,9 @@ fn emit_project_block_item<'ctx>(
     }
 }
 
-fn emit_while<'ctx>(
+fn emit_while<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     expression: &ScalarWhile,
 ) -> Result<EmitValue<'ctx>, String> {
     let function = state
@@ -895,9 +1035,9 @@ fn emit_while<'ctx>(
     Ok(EmitValue::Unit)
 }
 
-fn emit_project_while<'ctx>(
+fn emit_project_while<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     expression: &ScalarWhile,
     module: &ScalarModule,
     modules: &[&ScalarModule],
@@ -942,9 +1082,9 @@ fn emit_project_while<'ctx>(
     Ok(EmitValue::Unit)
 }
 
-fn emit_expression<'ctx>(
+fn emit_expression<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     expression: &ScalarExpression,
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
@@ -998,8 +1138,11 @@ fn emit_expression<'ctx>(
             ..
         } => emit_binary(context, state, operator, left, right),
         ScalarExpression::Call {
-            name, arguments, ..
-        } => emit_call(context, state, name, arguments),
+            receiver,
+            name,
+            arguments,
+            ..
+        } => emit_call(context, state, receiver.as_deref(), name, arguments),
         ScalarExpression::If {
             condition,
             then_branch,
@@ -1010,9 +1153,9 @@ fn emit_expression<'ctx>(
     }
 }
 
-fn emit_project_expression<'ctx>(
+fn emit_project_expression<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     expression: &ScalarExpression,
     module: &ScalarModule,
     modules: &[&ScalarModule],
@@ -1038,6 +1181,9 @@ fn emit_project_expression<'ctx>(
             arguments,
             ..
         } => {
+            if receiver.as_deref() == Some("wasi") && name == "fd_write" {
+                return emit_wasi_fd_write(context, state, arguments);
+            }
             let target = receiver.as_ref().map_or(module, |binding| {
                 let namespace = module
                     .namespace_bindings
@@ -1120,12 +1266,16 @@ fn emit_project_expression<'ctx>(
     }
 }
 
-fn emit_call<'ctx>(
+fn emit_call<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
+    receiver: Option<&str>,
     name: &str,
     arguments: &[ScalarExpression],
 ) -> Result<EmitValue<'ctx>, String> {
+    if receiver == Some("wasi") && name == "fd_write" {
+        return emit_wasi_fd_write(context, state, arguments);
+    }
     let values = arguments
         .iter()
         .map(|argument| emit_expression(context, state, argument))
@@ -1133,8 +1283,108 @@ fn emit_call<'ctx>(
     emit_call_values(state, name, values)
 }
 
-fn emit_call_values<'ctx>(
-    state: &mut EmitState<'ctx>,
+fn emit_wasi_fd_write<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    arguments: &[ScalarExpression],
+) -> Result<EmitValue<'ctx>, String> {
+    let [ScalarExpression::Integer { value: fd, .. }, ScalarExpression::Utf8 { value, .. }] =
+        arguments
+    else {
+        return Err("validated fd_write has an invalid argument shape".into());
+    };
+    let fd = i32::try_from(fd.clone()).map_err(|_| "invalid fd_write descriptor")?;
+    let length = u64::try_from(value.len()).map_err(|_| "utf8 literal length is not u64")?;
+    let length =
+        u32::try_from(length).map_err(|_| "utf8 literal length exceeds the fd_write u32 ABI")?;
+    let i8_type = context.i8_type();
+    let scratch_type = i8_type.array_type(12);
+    let bytes = value
+        .iter()
+        .map(|byte| i8_type.const_int(u64::from(*byte), false))
+        .collect::<Vec<_>>();
+    let literal_type =
+        i8_type.array_type(u32::try_from(bytes.len()).map_err(|_| "literal is too large")?);
+    let literal = state.module.add_global(
+        literal_type,
+        None,
+        &format!("wosy_utf8_literal_{}", state.next_literal),
+    );
+    state.next_literal += 1;
+    literal.set_linkage(Linkage::Private);
+    literal.set_constant(true);
+    literal.set_initializer(&i8_type.const_array(&bytes));
+
+    let zero = context.i32_type().const_zero();
+    let scratch = state.scratch.as_pointer_value();
+    let iovec = unsafe {
+        state.builder.build_in_bounds_gep(
+            scratch_type,
+            scratch,
+            &[zero, context.i32_type().const_zero()],
+            "fd_write.iovec",
+        )
+    }
+    .map_err(builder_error)?;
+    let nwritten = unsafe {
+        state.builder.build_in_bounds_gep(
+            scratch_type,
+            scratch,
+            &[zero, context.i32_type().const_int(8, false)],
+            "fd_write.nwritten",
+        )
+    }
+    .map_err(builder_error)?;
+    let literal_address = state
+        .builder
+        .build_ptr_to_int(
+            literal.as_pointer_value(),
+            context.i32_type(),
+            "fd_write.ptr",
+        )
+        .map_err(builder_error)?;
+    let iovec_address = state
+        .builder
+        .build_ptr_to_int(iovec, context.i32_type(), "fd_write.iovec_addr")
+        .map_err(builder_error)?;
+    let nwritten_address = state
+        .builder
+        .build_ptr_to_int(nwritten, context.i32_type(), "fd_write.nwritten_addr")
+        .map_err(builder_error)?;
+    let iovec_length = unsafe {
+        state.builder.build_in_bounds_gep(
+            scratch_type,
+            scratch,
+            &[zero, context.i32_type().const_int(4, false)],
+            "fd_write.iovec_len",
+        )
+    }
+    .map_err(builder_error)?;
+    state
+        .builder
+        .build_store(iovec, literal_address)
+        .map_err(builder_error)?;
+    state
+        .builder
+        .build_store(
+            iovec_length,
+            context.i32_type().const_int(u64::from(length), false),
+        )
+        .map_err(builder_error)?;
+    emit_call_values(
+        state,
+        "wasi.fd_write",
+        vec![
+            EmitValue::Basic(context.i32_type().const_int(fd as u64, true).into()),
+            EmitValue::Basic(iovec_address.into()),
+            EmitValue::Basic(context.i32_type().const_int(1, false).into()),
+            EmitValue::Basic(nwritten_address.into()),
+        ],
+    )
+}
+
+fn emit_call_values<'ctx, 'module>(
+    state: &mut EmitState<'ctx, 'module>,
     name: &str,
     values: Vec<EmitValue<'ctx>>,
 ) -> Result<EmitValue<'ctx>, String> {
@@ -1159,9 +1409,9 @@ fn emit_call_values<'ctx>(
     }
 }
 
-fn emit_binary<'ctx>(
+fn emit_binary<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     operator: &BinaryOperator,
     left: &ScalarExpression,
     right: &ScalarExpression,
@@ -1185,9 +1435,9 @@ enum ExpressionPath<'a> {
     },
 }
 
-fn emit_binary_with_rhs<'ctx>(
+fn emit_binary_with_rhs<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     operator: &BinaryOperator,
     left: EmitValue<'ctx>,
     right: &ScalarExpression,
@@ -1252,8 +1502,8 @@ fn emit_binary_with_rhs<'ctx>(
     Ok(EmitValue::Basic(phi.as_basic_value()))
 }
 
-fn emit_binary_values<'ctx>(
-    state: &mut EmitState<'ctx>,
+fn emit_binary_values<'ctx, 'module>(
+    state: &mut EmitState<'ctx, 'module>,
     operator: &BinaryOperator,
     left: EmitValue<'ctx>,
     right: EmitValue<'ctx>,
@@ -1323,9 +1573,9 @@ fn emit_binary_values<'ctx>(
     Ok(EmitValue::Basic(value))
 }
 
-fn emit_if<'ctx>(
+fn emit_if<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     condition: &ScalarExpression,
     then_branch: &ScalarBlock,
     else_branch: &ScalarBlock,
@@ -1340,9 +1590,9 @@ fn emit_if<'ctx>(
         |state, block| emit_block(context, state, block),
     )
 }
-fn emit_project_if<'ctx>(
+fn emit_project_if<'ctx, 'module>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     condition: EmitValue<'ctx>,
     then_branch: &ScalarBlock,
     else_branch: &ScalarBlock,
@@ -1359,16 +1609,16 @@ fn emit_project_if<'ctx>(
         |state, block| emit_project_block(context, state, block, module, modules),
     )
 }
-fn emit_if_value<'ctx, F>(
+fn emit_if_value<'ctx, 'module, F>(
     context: &'ctx Context,
-    state: &mut EmitState<'ctx>,
+    state: &mut EmitState<'ctx, 'module>,
     condition: inkwell::values::IntValue<'ctx>,
     then_branch: &ScalarBlock,
     else_branch: &ScalarBlock,
     emit: F,
 ) -> Result<EmitValue<'ctx>, String>
 where
-    F: Fn(&mut EmitState<'ctx>, &ScalarBlock) -> Result<EmitValue<'ctx>, String>,
+    F: Fn(&mut EmitState<'ctx, 'module>, &ScalarBlock) -> Result<EmitValue<'ctx>, String>,
 {
     let function = state
         .builder
@@ -1412,8 +1662,8 @@ where
     }
 }
 
-fn emit_return<'ctx>(
-    state: &mut EmitState<'ctx>,
+fn emit_return<'ctx, 'module>(
+    state: &mut EmitState<'ctx, 'module>,
     value: EmitValue<'ctx>,
     result: &ScalarType,
 ) -> Result<(), String> {
@@ -1471,8 +1721,8 @@ fn project_namespace_target<'a>(
         .ok_or_else(|| format!("missing namespace target {}", namespace.target.path))
 }
 
-fn project_member_global<'ctx>(
-    state: &EmitState<'ctx>,
+fn project_member_global<'ctx, 'module>(
+    state: &EmitState<'ctx, 'module>,
     target: &ScalarModule,
     name: &str,
 ) -> Result<(Option<GlobalValue<'ctx>>, ScalarType), String> {
@@ -1925,7 +2175,7 @@ unit() use = fn {
         let text = emit_scalar_llvm(&validation).expect("unit LLVM").to_text();
 
         assert_eq!(text.matches("call void @touch()").count(), 5);
-        assert!(!text.contains("global"));
+        assert!(!text.contains("global"), "{text}");
         assert!(!text.contains("alloca"));
         assert!(!text.contains("load"));
         assert!(!text.contains("store"));
@@ -2147,5 +2397,99 @@ child.marker = child.touch();
             "call i1 @{}",
             project_function_name(&child_source, "right")
         )));
+    }
+
+    #[test]
+    fn emits_typed_wasi_fd_write_import_and_fixed_utf8_abi() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"Olá\\n\");\ni32 err = wasi.fd_write(2, \"erro\\n\");\n%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        );
+        let partition = emit_scalar_llvm(&validation).expect("WASI LLVM");
+        assert_eq!(partition.declarations.len(), 1);
+        let import = &partition.declarations[0];
+        assert_eq!(import.name, "fd_write");
+        assert_eq!(import.result, super::LlvmValueType::I32);
+        assert_eq!(
+            import.parameters,
+            vec![
+                ("fd".into(), super::LlvmValueType::I32),
+                ("iovec".into(), super::LlvmValueType::I32),
+                ("count".into(), super::LlvmValueType::I32),
+                ("nwritten".into(), super::LlvmValueType::I32),
+            ]
+        );
+        assert_eq!(
+            import.attributes,
+            vec![super::LlvmFunctionAttributes {
+                group: 0,
+                wasm_import_module: "wasi_snapshot_preview1".into(),
+                wasm_import_name: "fd_write".into(),
+            }]
+        );
+        let text = partition.to_text();
+        assert!(text.contains("declare i32 @fd_write(i32, i32, i32, i32) #0"));
+        assert!(text.contains("attributes #0 = { \"wasm-import-module\"=\"wasi_snapshot_preview1\" \"wasm-import-name\"=\"fd_write\" }"));
+        assert!(text.contains("private constant [5 x i8] c\"Ol\\C3\\A1\\0A\""));
+        assert!(text.contains("private constant [5 x i8] c\"erro\\0A\""));
+        assert!(!text.contains("Ol\\C3\\A1\\0A\\00"));
+        assert!(text.contains(
+            "@wosy_fd_write_scratch = internal global [12 x i8] zeroinitializer, align 4"
+        ));
+        assert!(text.contains("ptrtoint (ptr @wosy_utf8_literal_0 to i32)"));
+        assert!(text.contains("ptrtoint (ptr @wosy_utf8_literal_1 to i32)"));
+        assert!(text.contains("call i32 @fd_write(i32 1"));
+        assert!(text.contains("call i32 @fd_write(i32 2"));
+        assert!(text.contains("store i32 5"));
+        assert!(text.contains("call i32 @fd_write"));
+        assert_eq!(text.matches("getelementptr").count(), 4);
+    }
+
+    #[test]
+    fn emits_matching_wasi_abi_for_project_modules() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let program = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"project\\n\");\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let validation = crate::ScalarProjectValidation {
+            project: ScalarProject::new(
+                vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+                vec![source],
+            ),
+            diagnostics: Vec::new(),
+        };
+        let partition = emit_scalar_project_llvm(&validation).unwrap_or_else(|error| {
+            panic!("project WASI LLVM: {error}; {:?}", validation.diagnostics)
+        });
+        assert_eq!(partition.declarations[0].name, "fd_write");
+        assert!(partition
+            .to_text()
+            .contains("declare i32 @fd_write(i32, i32, i32, i32) #0"));
+        assert!(partition.to_text().contains("call i32 @fd_write(i32 1"));
+        assert!(partition.to_text().contains(
+            "@wosy_fd_write_scratch = internal global [12 x i8] zeroinitializer, align 4"
+        ));
     }
 }
