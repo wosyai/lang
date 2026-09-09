@@ -611,7 +611,7 @@ fn assignment_type_in_module(
                         .receiver_span
                         .expect("qualified assignment receiver span"),
                 ));
-                return ScalarType::Unit;
+                return ScalarType::Error;
             };
             let Some(target) = modules
                 .iter()
@@ -625,7 +625,7 @@ fn assignment_type_in_module(
                         .receiver_span
                         .expect("qualified assignment receiver span"),
                 ));
-                return ScalarType::Unit;
+                return ScalarType::Error;
             };
             let Some(expected) = target.members.get(&assignment.target) else {
                 diagnostics.push(unknown_member_diagnostic(
@@ -653,7 +653,7 @@ fn assignment_type_in_module(
             "unknown assignment target",
             assignment.target_span,
         ));
-        return ScalarType::Unit;
+        return ScalarType::Error;
     };
     expect_module_type(module, expected, &actual, assignment.span, diagnostics);
     if is_error_type(&actual) {
@@ -713,7 +713,7 @@ fn expression_type_in_module(
     match expression {
         ScalarExpression::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
             diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
-            ScalarType::Unit
+            ScalarType::Error
         }),
         ScalarExpression::Member {
             receiver,
@@ -728,14 +728,14 @@ fn expression_type_in_module(
                 .find(|namespace| namespace.binding == *receiver)
             else {
                 diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
-                return ScalarType::Unit;
+                return ScalarType::Error;
             };
             let Some(target) = modules
                 .iter()
                 .find(|candidate| candidate.source == namespace.target)
             else {
                 diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
-                return ScalarType::Unit;
+                return ScalarType::Error;
             };
             let Some(member) = target.members.get(name) else {
                 diagnostics.push(unknown_member_diagnostic(
@@ -828,7 +828,7 @@ fn expression_type_in_module(
                             "unknown callable name",
                             *span,
                         ));
-                        return ScalarType::Unit;
+                        return ScalarType::Error;
                     };
                     let Some(target) = modules
                         .iter()
@@ -840,7 +840,7 @@ fn expression_type_in_module(
                             "unknown callable name",
                             *span,
                         ));
-                        return ScalarType::Unit;
+                        return ScalarType::Error;
                     };
                     let Some(callable) = target.members.get(name) else {
                         diagnostics.push(unknown_member_diagnostic(
@@ -860,7 +860,7 @@ fn expression_type_in_module(
                     "unknown callable name",
                     *span,
                 ));
-                return ScalarType::Unit;
+                return ScalarType::Error;
             };
             let ScalarType::Callable { result, parameters } = callable else {
                 diagnostics.push(module_diagnostic(
@@ -869,7 +869,7 @@ fn expression_type_in_module(
                     "unknown callable name",
                     *span,
                 ));
-                return ScalarType::Unit;
+                return ScalarType::Error;
             };
             if arguments.len() != parameters.len() {
                 diagnostics.push(module_diagnostic(
@@ -1928,7 +1928,7 @@ fn assignment_type(
             "unknown assignment target",
             assignment.target_span,
         ));
-        return ScalarType::Unit;
+        return ScalarType::Error;
     };
     if is_const_binding_name(&assignment.target) {
         diagnostics.push(diagnostic(
@@ -1992,7 +1992,7 @@ fn expression_type(
     match expression {
         ScalarExpression::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
             diagnostics.push(diagnostic(program, "B0001", "unknown name", *span));
-            ScalarType::Unit
+            ScalarType::Error
         }),
         ScalarExpression::Member { span, .. } => {
             diagnostics.push(diagnostic(program, "B0001", "unknown name", *span));
@@ -2067,7 +2067,7 @@ fn expression_type(
                 .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"));
             let Some(ScalarType::Callable { result, parameters }) = scope.get(&lookup_name) else {
                 diagnostics.push(diagnostic(program, "B0001", "unknown callable name", *span));
-                return ScalarType::Unit;
+                return ScalarType::Error;
             };
             if arguments.len() != parameters.len() {
                 diagnostics.push(diagnostic(
@@ -2755,6 +2755,141 @@ mod tests {
         assert_eq!(
             result.diagnostics[0].labels[0].span.range,
             ByteSpan::new(20, 27)
+        );
+    }
+
+    #[test]
+    fn unknown_binding_suppresses_only_its_derived_type_diagnostic() {
+        let text = "%%start\ni32 value = missing;\nbool sibling = 1;\n%%end";
+        let single = validate_text(text);
+        assert_eq!(
+            single
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0001")
+                .count(),
+            1
+        );
+        assert_eq!(
+            single
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0003")
+                .count(),
+            1
+        );
+
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert_eq!(
+            project
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0001")
+                .count(),
+            1
+        );
+        assert_eq!(
+            project
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0003")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unknown_namespace_receiver_suppresses_only_its_derived_type_diagnostic() {
+        let text = "%%start\ni32 value = missing.value;\nbool sibling = 1;\n%%end";
+        let single = validate_text(text);
+        assert_eq!(
+            single
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0001")
+                .count(),
+            1
+        );
+        assert_eq!(
+            single
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0003")
+                .count(),
+            1
+        );
+
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert_eq!(
+            project
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0001")
+                .count(),
+            1
+        );
+        assert_eq!(
+            project
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0003")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unknown_callable_suppresses_only_its_derived_type_diagnostic() {
+        let text = "%%start\ni32 value = missing();\nbool sibling = 1;\n%%end";
+        let single = validate_text(text);
+        assert_eq!(
+            single
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0001")
+                .count(),
+            1
+        );
+        assert_eq!(
+            single
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0003")
+                .count(),
+            1
+        );
+
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert_eq!(
+            project
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0001")
+                .count(),
+            1
+        );
+        assert_eq!(
+            project
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "B0003")
+                .count(),
+            1
         );
     }
 
