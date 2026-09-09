@@ -63,6 +63,8 @@ pub enum SyntaxKind {
     DereferencedField,
     Dereference,
     RawAddress,
+    GenericTypeArguments,
+    GenericTypeArgument,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -126,6 +128,8 @@ impl Language for WosyLanguage {
             50 => SyntaxKind::DereferencedField,
             51 => SyntaxKind::Dereference,
             52 => SyntaxKind::RawAddress,
+            53 => SyntaxKind::GenericTypeArguments,
+            54 => SyntaxKind::GenericTypeArgument,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -526,6 +530,8 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::expression => SyntaxKind::Expression,
         Rule::call => SyntaxKind::Call,
         Rule::qualified_call => SyntaxKind::QualifiedCall,
+        Rule::generic_type_arguments => SyntaxKind::GenericTypeArguments,
+        Rule::generic_type_argument => SyntaxKind::GenericTypeArgument,
         Rule::qualified_member => SyntaxKind::QualifiedMember,
         Rule::assignment_target => SyntaxKind::AssignmentTarget,
         Rule::if_expr => SyntaxKind::IfExpr,
@@ -753,6 +759,8 @@ mod tests {
             SyntaxKind::DereferencedField,
             SyntaxKind::Dereference,
             SyntaxKind::RawAddress,
+            SyntaxKind::GenericTypeArguments,
+            SyntaxKind::GenericTypeArgument,
         ];
         for kind in kinds {
             assert_eq!(
@@ -795,6 +803,64 @@ mod tests {
         assert!(call
             .children()
             .any(|node| node.kind() == SyntaxKind::QualifiedCall));
+    }
+
+    #[test]
+    fn generic_call_arguments_are_structural_lossless_and_ordered() {
+        let text = "%%start\nu32 result = core.cast<u32>(value, \"exact\");\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let call = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::Call)
+            .expect("generic call");
+        assert_eq!(call.text(), "core.cast<u32>(value, \"exact\")");
+        let generic = call
+            .children()
+            .find(|node| node.kind() == SyntaxKind::GenericTypeArguments)
+            .expect("generic type arguments");
+        assert_eq!(generic.text(), "<u32>");
+        assert_eq!(byte_span(&generic), ByteSpan::new(30, 35));
+        let argument = generic
+            .children()
+            .find(|node| node.kind() == SyntaxKind::GenericTypeArgument)
+            .expect("generic type argument");
+        assert_eq!(argument.text(), "u32");
+        assert_eq!(byte_span(&argument), ByteSpan::new(31, 34));
+        let children: Vec<_> = call
+            .children_with_tokens()
+            .filter_map(|element| match element {
+                rowan::NodeOrToken::Node(node) => Some(node.kind()),
+                rowan::NodeOrToken::Token(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            children,
+            vec![
+                SyntaxKind::QualifiedCall,
+                SyntaxKind::GenericTypeArguments,
+                SyntaxKind::Expression,
+                SyntaxKind::Expression,
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_generic_call_recovers_losslessly() {
+        let text = "%%start\nu32 result = core.cast<$>(value, \"exact\");\nu32 after = 1;\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(!result.is_valid());
+        assert_eq!(result.reconstruct(), text);
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Error));
+        assert!(result
+            .errors
+            .iter()
+            .any(|error| { error.span.start <= text.find("core.cast").expect("call") as u32 }));
     }
 
     #[test]
