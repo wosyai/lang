@@ -306,14 +306,6 @@ pub struct ArtifactProfile {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ArtifactContractDiagnostic {
-    pub code: String,
-    pub field: String,
-    pub actual: String,
-    pub expected: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactConfig {
     pub artifact: String,
     pub profiles: std::collections::BTreeMap<String, ArtifactProfile>,
@@ -409,33 +401,6 @@ impl ProjectConfiguration {
             .get(profile)
             .ok_or_else(|| format!("artifact profile {profile} is missing"))?;
         Ok((target_config, artifact, artifact_profile, target_profile))
-    }
-
-    pub fn validate_artifact_profile(
-        &self,
-        artifact_profile: &ArtifactProfile,
-    ) -> Vec<ArtifactContractDiagnostic> {
-        let mut diagnostics = Vec::new();
-        for (field, actual, expected) in [
-            ("backend", &artifact_profile.backend, "llvm"),
-            ("output", &artifact_profile.output, "wasm-wasip1"),
-            ("builder", &artifact_profile.builder, "llvm-wasm"),
-            (
-                "run_runner",
-                &artifact_profile.run_runner,
-                "wasmtime-wasip1",
-            ),
-        ] {
-            if actual != expected {
-                diagnostics.push(ArtifactContractDiagnostic {
-                    code: "C0001".to_owned(),
-                    field: field.to_owned(),
-                    actual: actual.to_owned(),
-                    expected: expected.to_owned(),
-                });
-            }
-        }
-        diagnostics
     }
 }
 
@@ -793,129 +758,6 @@ mod tests {
         assert_eq!(profile.output, "wasm-wasip1");
         assert_eq!(profile.builder, "llvm-wasm");
         assert_eq!(profile.run_runner, "wasmtime-wasip1");
-    }
-
-    fn contract_configuration() -> ProjectConfiguration {
-        ProjectConfiguration {
-            builders: BTreeMap::new(),
-            runners: BTreeMap::new(),
-            targets: BTreeMap::new(),
-        }
-    }
-
-    fn contract_profile() -> ArtifactProfile {
-        ArtifactProfile {
-            backend: "llvm".to_owned(),
-            output: "wasm-wasip1".to_owned(),
-            builder: "llvm-wasm".to_owned(),
-            run_runner: "wasmtime-wasip1".to_owned(),
-        }
-    }
-
-    #[test]
-    fn artifact_contract_rejects_backend() {
-        let configuration = contract_configuration();
-        let mut profile = contract_profile();
-        profile.backend = "cranelift".to_owned();
-
-        assert_eq!(
-            configuration.validate_artifact_profile(&profile),
-            vec![ArtifactContractDiagnostic {
-                code: "C0001".to_owned(),
-                field: "backend".to_owned(),
-                actual: "cranelift".to_owned(),
-                expected: "llvm".to_owned(),
-            }]
-        );
-    }
-
-    #[test]
-    fn artifact_contract_rejects_output() {
-        let configuration = contract_configuration();
-        let mut profile = contract_profile();
-        profile.output = "wasm-wasip2".to_owned();
-
-        assert_eq!(
-            configuration.validate_artifact_profile(&profile),
-            vec![ArtifactContractDiagnostic {
-                code: "C0001".to_owned(),
-                field: "output".to_owned(),
-                actual: "wasm-wasip2".to_owned(),
-                expected: "wasm-wasip1".to_owned(),
-            }]
-        );
-    }
-
-    #[test]
-    fn artifact_contract_rejects_builder() {
-        let configuration = contract_configuration();
-        let mut profile = contract_profile();
-        profile.builder = "other-builder".to_owned();
-
-        assert_eq!(
-            configuration.validate_artifact_profile(&profile),
-            vec![ArtifactContractDiagnostic {
-                code: "C0001".to_owned(),
-                field: "builder".to_owned(),
-                actual: "other-builder".to_owned(),
-                expected: "llvm-wasm".to_owned(),
-            }]
-        );
-    }
-
-    #[test]
-    fn artifact_contract_rejects_run_runner() {
-        let configuration = contract_configuration();
-        let mut profile = contract_profile();
-        profile.run_runner = "wasmtime-wasip2".to_owned();
-
-        assert_eq!(
-            configuration.validate_artifact_profile(&profile),
-            vec![ArtifactContractDiagnostic {
-                code: "C0001".to_owned(),
-                field: "run_runner".to_owned(),
-                actual: "wasmtime-wasip2".to_owned(),
-                expected: "wasmtime-wasip1".to_owned(),
-            }]
-        );
-    }
-
-    #[test]
-    fn artifact_contract_accepts_valid_profile() {
-        let configuration = contract_configuration();
-
-        assert!(configuration
-            .validate_artifact_profile(&contract_profile())
-            .is_empty());
-    }
-
-    #[test]
-    fn artifact_contract_reports_all_mismatches_in_field_order() {
-        let configuration = contract_configuration();
-        let profile = ArtifactProfile {
-            backend: "cranelift".to_owned(),
-            output: "wasm-wasip2".to_owned(),
-            builder: "other-builder".to_owned(),
-            run_runner: "wasmtime-wasip2".to_owned(),
-        };
-
-        assert_eq!(
-            configuration
-                .validate_artifact_profile(&profile)
-                .iter()
-                .map(|diagnostic| (
-                    diagnostic.field.as_str(),
-                    diagnostic.actual.as_str(),
-                    diagnostic.expected.as_str(),
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                ("backend", "cranelift", "llvm"),
-                ("output", "wasm-wasip2", "wasm-wasip1"),
-                ("builder", "other-builder", "llvm-wasm"),
-                ("run_runner", "wasmtime-wasip2", "wasmtime-wasip1"),
-            ]
-        );
     }
 
     #[test]
