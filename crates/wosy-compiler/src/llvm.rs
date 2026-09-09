@@ -262,12 +262,16 @@ impl LlvmPartition {
     pub fn to_text(&self) -> String {
         let mut text = self.text.clone();
         if !self.declarations.is_empty() {
+            let module_directives = text.lines().take(2).collect::<Vec<_>>().join("\n");
             let body = text
                 .lines()
+                .skip(2)
                 .filter(|line| !line.starts_with("declare i32 @fd_write("))
                 .collect::<Vec<_>>()
                 .join("\n");
             let mut serialized = String::new();
+            serialized.push_str(&module_directives);
+            serialized.push_str("\n\n");
             for declaration in &self.declarations {
                 writeln!(
                     serialized,
@@ -2441,6 +2445,18 @@ child.marker = child.touch();
         let text = partition.to_text();
         assert!(text.contains("declare i32 @fd_write(i32, i32, i32, i32) #0"));
         assert!(text.contains("attributes #0 = { \"wasm-import-module\"=\"wasi_snapshot_preview1\" \"wasm-import-name\"=\"fd_write\" }"));
+        assert!(
+            text.find("; ModuleID").expect("module identification")
+                < text.find("source_filename").expect("source directive")
+        );
+        assert!(
+            text.find("source_filename").expect("source directive")
+                < text.find("declare i32 @fd_write").expect("declaration")
+        );
+        assert!(
+            text.find("declare i32 @fd_write").expect("declaration")
+                < text.find("attributes #0").expect("attribute group")
+        );
         assert!(text.contains("private constant [5 x i8] c\"Ol\\C3\\A1\\0A\""));
         assert!(text.contains("private constant [5 x i8] c\"erro\\0A\""));
         assert!(!text.contains("Ol\\C3\\A1\\0A\\00"));
