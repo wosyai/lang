@@ -50,6 +50,19 @@ pub enum SyntaxKind {
     While,
     Assignment,
     TopLevelItem,
+    StructDecl,
+    StructField,
+    CallableOutput,
+    ReceiverList,
+    Receiver,
+    OutputList,
+    AssignmentTargets,
+    StructLiteral,
+    StructLiteralField,
+    FieldAccess,
+    DereferencedField,
+    Dereference,
+    RawAddress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -100,6 +113,19 @@ impl Language for WosyLanguage {
             37 => SyntaxKind::While,
             38 => SyntaxKind::Assignment,
             39 => SyntaxKind::TopLevelItem,
+            40 => SyntaxKind::StructDecl,
+            41 => SyntaxKind::StructField,
+            42 => SyntaxKind::CallableOutput,
+            43 => SyntaxKind::ReceiverList,
+            44 => SyntaxKind::Receiver,
+            45 => SyntaxKind::OutputList,
+            46 => SyntaxKind::AssignmentTargets,
+            47 => SyntaxKind::StructLiteral,
+            48 => SyntaxKind::StructLiteralField,
+            49 => SyntaxKind::FieldAccess,
+            50 => SyntaxKind::DereferencedField,
+            51 => SyntaxKind::Dereference,
+            52 => SyntaxKind::RawAddress,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -507,6 +533,19 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::while_expr => SyntaxKind::While,
         Rule::assignment => SyntaxKind::Assignment,
         Rule::top_level_item => SyntaxKind::TopLevelItem,
+        Rule::struct_decl => SyntaxKind::StructDecl,
+        Rule::struct_field => SyntaxKind::StructField,
+        Rule::callable_output => SyntaxKind::CallableOutput,
+        Rule::receiver_list => SyntaxKind::ReceiverList,
+        Rule::receiver => SyntaxKind::Receiver,
+        Rule::output_list => SyntaxKind::OutputList,
+        Rule::assignment_targets => SyntaxKind::AssignmentTargets,
+        Rule::struct_literal => SyntaxKind::StructLiteral,
+        Rule::struct_literal_field => SyntaxKind::StructLiteralField,
+        Rule::field_access => SyntaxKind::FieldAccess,
+        Rule::dereferenced_field => SyntaxKind::DereferencedField,
+        Rule::dereference => SyntaxKind::Dereference,
+        Rule::raw_address => SyntaxKind::RawAddress,
         Rule::error_item => SyntaxKind::Error,
         Rule::parenthesized => SyntaxKind::Parenthesized,
         Rule::boolean => SyntaxKind::Boolean,
@@ -701,6 +740,19 @@ mod tests {
             SyntaxKind::Integer,
             SyntaxKind::String,
             SyntaxKind::Punctuation,
+            SyntaxKind::StructDecl,
+            SyntaxKind::StructField,
+            SyntaxKind::CallableOutput,
+            SyntaxKind::ReceiverList,
+            SyntaxKind::Receiver,
+            SyntaxKind::OutputList,
+            SyntaxKind::AssignmentTargets,
+            SyntaxKind::StructLiteral,
+            SyntaxKind::StructLiteralField,
+            SyntaxKind::FieldAccess,
+            SyntaxKind::DereferencedField,
+            SyntaxKind::Dereference,
+            SyntaxKind::RawAddress,
         ];
         for kind in kinds {
             assert_eq!(
@@ -869,5 +921,76 @@ mod tests {
         assert_eq!(items[0].text(), "value = 1;");
         assert_eq!(items[1].text(), "value;");
         assert!(byte_span(&items[0]).start < byte_span(&items[1]).start);
+    }
+
+    #[test]
+    fn structured_values_and_raw_addresses_are_lossless() {
+        let text = "%%start\nstruct WasiIovec {\n\t*?u8 buf;\n\tu32 len;\n}\n\nWasiIovec item = {\n\t.buf = null;\n\t.len = 0;\n};\n\nunsafe {\n\t*?WasiIovec address = &?item;\n\t*?u8 bytes = (*address).buf;\n\titem.len = 4;\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+
+        let struct_decl = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::StructDecl)
+            .expect("struct declaration");
+        assert_eq!(byte_span(&struct_decl), ByteSpan::new(8, 49));
+        let fields: Vec<_> = struct_decl
+            .children()
+            .filter(|node| node.kind() == SyntaxKind::StructField)
+            .map(|node| node.text().to_string())
+            .collect();
+        assert_eq!(fields, vec!["*?u8 buf;", "u32 len;"]);
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::StructLiteral));
+        assert_eq!(
+            result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::StructLiteralField)
+                .count(),
+            2
+        );
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::DereferencedField));
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::RawAddress));
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::AssignmentTarget));
+    }
+
+    #[test]
+    fn typed_multiple_output_receivers_are_structural_and_lossless() {
+        let text = "%%start\nunsafe {\n\t*?u8 bytes, u64 length = core.utf8_view(text);\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let receiver_list = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ReceiverList)
+            .expect("receiver list");
+        assert_eq!(
+            receiver_list
+                .children()
+                .filter(|node| node.kind() == SyntaxKind::Receiver)
+                .count(),
+            2
+        );
+        let output_list = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::OutputList)
+            .expect("output list");
+        assert_eq!(byte_span(&output_list), ByteSpan::new(43, 63));
     }
 }

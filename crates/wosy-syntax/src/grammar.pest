@@ -9,16 +9,19 @@ comment_scan = ${ SOI ~ (string | comment | (!("\"" | "#") ~ ANY))* ~ EOI }
 source = { SOI ~ boundary_start ~ (item | error_item)+ ~ boundary_end ~ EOI }
 boundary_start = { "%%start" }
 boundary_end = { "%%end" }
-item = { namespace_decl | extern_decl | function_decl | binding_decl | top_level_item }
+item = { struct_decl | namespace_decl | extern_decl | function_decl | binding_decl | top_level_item }
 error_item = @{ (!(";" | "%%end") ~ ANY)+ ~ ";"? }
 top_level_item = { (assignment | expression) ~ ";" }
+struct_decl = { "struct" ~ identifier ~ "{" ~ struct_field* ~ "}" }
+struct_field = { type_spec ~ identifier ~ ";" }
 namespace_decl = { identifier ~ "=" ~ "namespace" ~ identifier ~ string ~ ";" }
 extern_decl = { identifier ~ "=" ~ "extern" ~ identifier ~ string ~ "{" ~ extern_function ~ "}" ~ ";" }
 extern_function = { unsafe_marker? ~ callable_type ~ identifier ~ ";" }
 function_decl = { callable_type ~ identifier ~ "=" ~ "fn" ~ parameters? ~ block ~ ";" }
-binding_decl = { type_spec ~ identifier ~ "=" ~ expression ~ ";" }
+binding_decl = { receiver_list ~ "=" ~ output_list ~ ";" }
 type_spec = { callable_type | raw_pointer_type | type_name }
-callable_type = { (raw_pointer_type | type_name) ~ "(" ~ ((raw_pointer_type | type_name) ~ ("," ~ (raw_pointer_type | type_name))*)? ~ ")" }
+callable_type = { callable_output ~ "(" ~ ((raw_pointer_type | type_name) ~ ("," ~ (raw_pointer_type | type_name))*)? ~ ")" }
+callable_output = { raw_pointer_type | type_name | "(" ~ (raw_pointer_type | type_name) ~ ("," ~ (raw_pointer_type | type_name))* ~ ")" }
 raw_pointer_type = { "*?" ~ type_name }
 type_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 unsafe_marker = { unsafe_keyword }
@@ -27,20 +30,30 @@ identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 parameters = { "(" ~ (identifier ~ ("," ~ identifier)*)? ~ ")" }
 block = { "{" ~ block_item* ~ "}" }
 block_item = { local_binding | while_expr | expression ~ ";"? }
-local_binding = { type_spec ~ identifier ~ "=" ~ expression ~ ";" }
+local_binding = { receiver_list ~ "=" ~ output_list ~ ";" }
 expression = { if_expr | unsafe_expr | assignment | logical_or }
 if_expr = { "if" ~ "(" ~ expression ~ ")" ~ block ~ "else" ~ block }
 unsafe_expr = { unsafe_keyword ~ block }
 while_expr = { "while" ~ "(" ~ expression ~ ")" ~ block }
-assignment = { assignment_target ~ "=" ~ expression }
-assignment_target = { qualified_member | identifier }
+assignment = { assignment_targets ~ "=" ~ output_list }
+assignment_targets = { assignment_target ~ ("," ~ assignment_target)* }
+assignment_target = { qualified_member | dereferenced_field | identifier }
+receiver_list = { receiver ~ ("," ~ receiver)* }
+receiver = { type_spec ~ identifier }
+output_list = { expression ~ ("," ~ expression)* }
 logical_or = { logical_and ~ (or_operator ~ logical_and)* }
 logical_and = { comparison ~ (and_operator ~ comparison)* }
 comparison = { additive ~ (comparison_operator ~ additive)* }
 additive = { multiplicative ~ (add_operator ~ multiplicative)* }
 multiplicative = { primary ~ (multiply_operator ~ primary)* }
-primary = { call | qualified_member | boolean | identifier | integer | string | parenthesized }
+primary = { call | raw_address | field_access | dereference | struct_literal | boolean | identifier | integer | string | parenthesized }
 parenthesized = { "(" ~ expression ~ ")" }
+struct_literal = { "{" ~ struct_literal_field* ~ "}" }
+struct_literal_field = { "." ~ identifier ~ "=" ~ expression ~ ";" }
+raw_address = { "&?" ~ assignment_target }
+dereference = { "*" ~ primary }
+field_access = { qualified_member | dereferenced_field }
+dereferenced_field = { parenthesized ~ "." ~ identifier }
 call = { qualified_call ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 qualified_call = { identifier ~ ("." ~ identifier)? }
 qualified_member = { identifier ~ "." ~ identifier }
