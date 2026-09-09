@@ -788,7 +788,7 @@ mod tests {
 
     #[test]
     fn accepts_lossless_wasi_fd_write_declaration_and_utf8_calls() {
-        let text = "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"Olá\\n\");\ni32 err = wasi.fd_write(2, \"erro\\n\");\n%%end";
+        let text = "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"Olá\\n\");\ni32 err = wasi.fd_write(2, \"erro\\n\");\n%%end";
         let result = parse(identity(), text.into(), &[]);
         assert!(result.is_valid(), "{:?}", result.errors);
         assert_eq!(result.reconstruct(), text);
@@ -796,7 +796,7 @@ mod tests {
             .root
             .descendants()
             .any(|node| node.kind() == SyntaxKind::RawPointerType));
-        assert!(result
+        assert!(!result
             .root
             .descendants()
             .any(|node| node.kind() == SyntaxKind::Unsafe));

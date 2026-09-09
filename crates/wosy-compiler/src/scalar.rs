@@ -2825,7 +2825,7 @@ mod tests {
     #[test]
     fn derives_and_validates_wasi_fd_write_with_typed_utf8() {
         let result = validate_text(
-            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"Olá\\n\");\ni32 err = wasi.fd_write(2, \"erro\\n\");\n%%end",
+            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"Olá\\n\");\ni32 err = wasi.fd_write(2, \"erro\\n\");\n%%end",
         );
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         let ScalarItem::Extern(extern_decl) = &result.program.items[0] else {
@@ -2836,7 +2836,7 @@ mod tests {
             ScalarExternModule::Valid("wasi_snapshot_preview1".to_owned())
         );
         assert_eq!(extern_decl.functions[0].name, "fd_write");
-        assert!(extern_decl.functions[0].unsafe_marker);
+        assert!(!extern_decl.functions[0].unsafe_marker);
         let ScalarItem::Binding(binding) = &result.program.items[1] else {
             panic!("binding item");
         };
@@ -2847,7 +2847,7 @@ mod tests {
     #[test]
     fn rejects_invalid_fd_write_descriptor_and_reports_missing_wasi_as_b0001() {
         let invalid = validate_text(
-            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(0, \"x\");\n%%end",
+            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(0, \"x\");\n%%end",
         );
         assert!(invalid
             .diagnostics
@@ -2855,7 +2855,7 @@ mod tests {
             .any(|diagnostic| diagnostic.code == "B0011"));
 
         let dynamic = validate_text(
-            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\nutf8 text = \"x\";\ni32 out = wasi.fd_write(1, text);\n%%end",
+            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, utf8) fd_write; };\nutf8 text = \"x\";\ni32 out = wasi.fd_write(1, text);\n%%end",
         );
         assert!(dynamic
             .diagnostics
@@ -3655,7 +3655,7 @@ utf8 value = "\\\"\'\n\r\t\0\u{0}\u{41}\u{1F600}";
     #[test]
     fn reports_malformed_extern_module_string_without_panicking() {
         let text = r##"%%start
-wasi = extern wasm "\q" { unsafe i32(i32, utf8) fd_write; };
+wasi = extern wasm "\q" { i32(i32, utf8) fd_write; };
 %%end"##;
         let parsed = parse_source(source(), text.to_owned(), &[]);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -3822,7 +3822,7 @@ wasi = extern wasm "\q" { unsafe i32(i32, utf8) fd_write; };
         let main_source = module_source("src/main.w");
         let main = module_from_text(
             main_source.clone(),
-            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\nlocal = namespace app \"src/local.w\";\ni32 value = local.value;\ni32 out = wasi.fd_write(1, \"direct root\\n\");\n%%end",
+            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, utf8) fd_write; };\nlocal = namespace app \"src/local.w\";\ni32 value = local.value;\ni32 out = wasi.fd_write(1, \"direct root\\n\");\n%%end",
         );
         let namespace_span = match &main.items[1] {
             ScalarItem::Namespace(namespace) => namespace.span,

@@ -2438,7 +2438,7 @@ child.marker = child.touch();
         let validation = derive_scalar_program(
             &parse_source(
                 source,
-                "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"Olá\\n\");\ni32 err = wasi.fd_write(2, \"erro\\n\");\n%%end"
+                "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"Olá\\n\");\ni32 err = wasi.fd_write(2, \"erro\\n\");\n%%end"
                     .into(),
                 &[],
             )
@@ -2507,7 +2507,7 @@ child.marker = child.touch();
         let program = derive_scalar_program(
             &parse_source(
                 source.clone(),
-                "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"project\\n\");\n%%end".into(),
+                "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"project\\n\");\n%%end".into(),
                 &[],
             )
             .result,
