@@ -25,6 +25,19 @@ stderr = "expected/stderr"
 exact = true
 
 [[steps]]
+source = "project/src/direct_root.w"
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+source = "project/src/direct_root.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/direct-root"
+stderr = "expected/empty"
+exact = true
+
+[[steps]]
 source = "project/src/missing_extern.w"
 command = ["wosy", "build", "app"]
 exit = 1
