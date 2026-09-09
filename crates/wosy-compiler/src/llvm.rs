@@ -371,15 +371,26 @@ fn finish_partition<'ctx>(
         .filter_map(|(name, function)| {
             let signature = if name == "main" {
                 ScalarType::Callable {
-                    result: Box::new(ScalarType::I32),
+                    outputs: crate::ScalarOutputSequence {
+                        outputs: vec![crate::ScalarOutput {
+                            ty: ScalarType::I32,
+                            span: wosy_syntax::ByteSpan::new(0, 0),
+                        }],
+                        span: wosy_syntax::ByteSpan::new(0, 0),
+                    },
                     parameters: Vec::new(),
                 }
             } else {
                 signatures.get(name)?.clone()
             };
-            let ScalarType::Callable { result, parameters } = signature else {
+            let ScalarType::Callable {
+                outputs,
+                parameters,
+            } = signature
+            else {
                 return None;
             };
+            let result = callable_result(&outputs).ok()?;
             let parameters = parameters
                 .iter()
                 .enumerate()
@@ -391,7 +402,7 @@ fn finish_partition<'ctx>(
                 .collect::<Option<Vec<_>>>()?;
             Some(LlvmFunction {
                 name: name.clone(),
-                result: value_type(&result).ok()?,
+                result: value_type(result).ok()?,
                 parameters,
                 attributes: Vec::new(),
                 body: String::new(),
@@ -429,14 +440,19 @@ fn function_type<'ctx>(
     context: &'ctx Context,
     signature: &ScalarType,
 ) -> Result<FunctionType<'ctx>, String> {
-    let ScalarType::Callable { result, parameters } = signature else {
+    let ScalarType::Callable {
+        outputs,
+        parameters,
+    } = signature
+    else {
         return Err("function has no callable signature".into());
     };
+    let result = callable_result(outputs)?;
     let parameters = parameters
         .iter()
         .map(|ty| basic_type(context, ty).map(Into::into))
         .collect::<Result<Vec<BasicMetadataTypeEnum>, _>>()?;
-    Ok(match result.as_ref() {
+    Ok(match result {
         ScalarType::Unit => context.void_type().fn_type(&parameters, false),
         ScalarType::Bool => context.bool_type().fn_type(&parameters, false),
         ScalarType::I32 => context.i32_type().fn_type(&parameters, false),
@@ -476,6 +492,17 @@ fn value_type(ty: &ScalarType) -> Result<LlvmValueType, String> {
         _ => Err("unsupported LLVM scalar type".into()),
     }
 }
+
+fn callable_result(outputs: &crate::ScalarOutputSequence) -> Result<&ScalarType, String> {
+    match outputs.outputs.as_slice() {
+        [output] => Ok(&output.ty),
+        _ => Err(format!(
+            "structured scalar expression lowering is pending at {}..{}",
+            outputs.span.start, outputs.span.end
+        )),
+    }
+}
+
 fn builder_error(error: BuilderError) -> String {
     error.to_string()
 }
@@ -532,7 +559,7 @@ fn emit_function<'ctx, 'module>(
     }
     let result = emit_block(context, &mut state, &function.body)?;
     let result_type = match &function.signature {
-        ScalarType::Callable { result, .. } => result.as_ref(),
+        ScalarType::Callable { outputs, .. } => callable_result(outputs)?,
         _ => return Err("function has no callable signature".into()),
     };
     emit_return(&mut state, result, result_type)
@@ -641,7 +668,7 @@ fn emit_project_function<'ctx, 'module>(
     }
     let result = emit_project_block(context, &mut state, &function.body, source_module, modules)?;
     let result_type = match &function.signature {
-        ScalarType::Callable { result, .. } => result.as_ref(),
+        ScalarType::Callable { outputs, .. } => callable_result(outputs)?,
         _ => return Err("function has no callable signature".into()),
     };
     emit_return(&mut state, result, result_type)
@@ -1828,6 +1855,32 @@ mod tests {
         assert!(text.contains("call i1 @flag"));
         assert!(text.contains("call void @touch"));
         assert!(text.contains("call i32 @count"));
+    }
+
+    #[test]
+    fn reports_unsupported_multi_output_lowering_with_output_span() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\n(i32, u64)() pair = fn { 1 };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let error = emit_scalar_llvm(&validation).expect_err("multi-output LLVM");
+        assert!(error.contains("structured scalar expression lowering is pending"));
+        assert!(error.contains("at 8..20"), "{error}");
     }
 
     #[test]

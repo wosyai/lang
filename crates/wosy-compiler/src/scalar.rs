@@ -1337,11 +1337,15 @@ fn validate_output_receivers_in_module(
     let Some(outputs) = call_output_sequence_in_module(expression, scope, module, modules) else {
         return;
     };
-    if receivers.len() > outputs.outputs.len() {
+    if receivers.len() != outputs.outputs.len() {
         diagnostics.push(module_diagnostic(
             module,
             "B0004",
-            "call has fewer outputs than receivers",
+            if receivers.len() > outputs.outputs.len() {
+                "call has fewer outputs than receivers"
+            } else {
+                "call has more outputs than receivers"
+            },
             binding_span,
         ));
     }
@@ -1361,11 +1365,15 @@ fn validate_output_receivers(
     let Some(outputs) = call_output_sequence(expression, scope, program) else {
         return;
     };
-    if receivers.len() > outputs.outputs.len() {
+    if receivers.len() != outputs.outputs.len() {
         diagnostics.push(diagnostic(
             program,
             "B0004",
-            "call has fewer outputs than receivers",
+            if receivers.len() > outputs.outputs.len() {
+                "call has fewer outputs than receivers"
+            } else {
+                "call has more outputs than receivers"
+            },
             binding_span,
         ));
     }
@@ -1391,11 +1399,15 @@ fn validate_assignment_outputs_in_module(
     else {
         return;
     };
-    if assignment.targets.len() > outputs.outputs.len() {
+    if assignment.targets.len() != outputs.outputs.len() {
         diagnostics.push(module_diagnostic(
             module,
             "B0004",
-            "call has fewer outputs than assignment targets",
+            if assignment.targets.len() > outputs.outputs.len() {
+                "call has fewer outputs than assignment targets"
+            } else {
+                "call has more outputs than assignment targets"
+            },
             assignment.span,
         ));
     }
@@ -1434,11 +1446,15 @@ fn validate_assignment_outputs(
     let Some(outputs) = call_output_sequence(&assignment.value, scope, program) else {
         return;
     };
-    if assignment.targets.len() > outputs.outputs.len() {
+    if assignment.targets.len() != outputs.outputs.len() {
         diagnostics.push(diagnostic(
             program,
             "B0004",
-            "call has fewer outputs than assignment targets",
+            if assignment.targets.len() > outputs.outputs.len() {
+                "call has fewer outputs than assignment targets"
+            } else {
+                "call has more outputs than assignment targets"
+            },
             assignment.span,
         ));
     }
@@ -2915,10 +2931,26 @@ fn output_sequence(node: &CstNode) -> ScalarOutputSequence {
             .flat_map(|output| {
                 let children = direct_nodes(&output);
                 if children.is_empty() {
-                    vec![ScalarOutput {
-                        ty: derive_type(&output),
-                        span: wosy_syntax::byte_span(&output),
-                    }]
+                    output
+                        .children_with_tokens()
+                        .filter_map(|element| match element {
+                            NodeOrToken::Node(node)
+                                if node.kind() == SyntaxKind::RawPointerType =>
+                            {
+                                Some(ScalarOutput {
+                                    ty: derive_type(&node),
+                                    span: wosy_syntax::byte_span(&node),
+                                })
+                            }
+                            NodeOrToken::Token(token) if token.kind() == SyntaxKind::TypeName => {
+                                Some(ScalarOutput {
+                                    ty: type_from_name(token.text()),
+                                    span: token_span(&token),
+                                })
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
                 } else {
                     children
                         .into_iter()
@@ -6578,6 +6610,36 @@ wasi = extern wasm "\q" { i32(i32, utf8) fd_write; };
             ScalarType::RawPointer(Box::new(ScalarType::U8))
         );
         assert_eq!(binding.receivers[1].ty, ScalarType::U64);
+    }
+
+    #[test]
+    fn validates_multiple_output_calls_and_output_arity() {
+        let valid = validate_text(
+            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first, u64 second = pair();\n%%end",
+        );
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+
+        let wrong_type = validate_text(
+            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first, i32 second = pair();\n%%end",
+        );
+        assert!(wrong_type.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "expression type does not match expected type"
+        }));
+
+        let wrong_arity =
+            validate_text("%%start\n(i32, u64)() pair = fn { 1 };\ni32 first = pair();\n%%end");
+        assert!(wrong_arity
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "call has more outputs than receivers"));
+    }
+
+    #[test]
+    fn preserves_one_output_call_contexts_for_strict_integers_and_null() {
+        let result = validate_text(
+            "%%start\nu32(u32) identity = fn(value) { value };\nu32 number = identity(1);\nu32(*?u8) keep = fn(value) { if (value == null) { 1 } else { 1 } };\nu32 result = keep(null);\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     }
 
     #[test]
