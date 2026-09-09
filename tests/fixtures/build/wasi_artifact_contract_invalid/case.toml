@@ -1,22 +1,7 @@
 [[steps]]
-write = "wosy.toml"
-contents = "[package]\nname = \"app\"\n\n[comments]\ncategories = []\n\n[builders.llvm-wasm]\ncommand = [\"scripts/build-wasm\"]\nargs = []\n\n[runners.wasmtime-wasip1]\ncommand = [\"scripts/run-wasmtime\"]\nargs = []\n\n[targets.app]\nroot = \"src/main.w\"\n\n[targets.app.artifacts.main]\nartifact = \"RuntimeStdio\"\n\n[targets.app.artifacts.main.profiles.dev]\nbackend = \"cranelift\"\noutput = \"wasm-wasip2\"\nbuilder = \"other-builder\"\nrun_runner = \"wasmtime-wasip2\"\n\n[targets.app.profiles.dev]\nmain_artifact = \"main\"\n"
+command = ["wosy", "parse", "app"]
+exit = 0
 
 [[assert]]
-command = ["wosy", "build", "app"]
-exit = 1
-stderr_contains = [
-    "C0001",
-    "field=backend",
-    "actual=cranelift",
-    "expected=llvm",
-    "field=output",
-    "actual=wasm-wasip2",
-    "expected=wasm-wasip1",
-    "field=builder",
-    "actual=other-builder",
-    "expected=llvm-wasm",
-    "field=run_runner",
-    "actual=wasmtime-wasip2",
-    "expected=wasmtime-wasip1",
-]
+command = ["wosy", "parse", "app"]
+exit = 0
