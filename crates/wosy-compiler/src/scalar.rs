@@ -355,6 +355,10 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
     }
 }
 
+pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
+    string_diagnostics(canonical)
+}
+
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
     let mut diagnostics = Vec::new();
     for module in &project.modules {
