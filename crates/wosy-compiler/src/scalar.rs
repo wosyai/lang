@@ -779,6 +779,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
     let mut project = project;
     for module in &mut project.modules {
         resolve_module_types(module);
+        resolve_module_places(module);
     }
     let mut diagnostics = Vec::new();
     for module in &project.modules {
@@ -971,6 +972,161 @@ fn resolve_module_types(module: &mut ScalarModule) {
                     .insert(function.name.clone(), function.signature.clone());
             }
             _ => {}
+        }
+    }
+}
+
+fn resolve_module_places(module: &mut ScalarModule) {
+    let context = module.clone();
+    let declarations = module
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarItem::Binding(binding) => {
+                Some((binding.name.clone(), binding.declared_type.clone()))
+            }
+            ScalarItem::Function(function) => {
+                Some((function.name.clone(), function.signature.clone()))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    for item in &mut module.items {
+        match item {
+            ScalarItem::Binding(binding) => {
+                resolve_expression_module_places(&mut binding.value, &declarations, &context);
+            }
+            ScalarItem::Function(function) => {
+                let mut scope = declarations.clone();
+                if let ScalarType::Callable { parameters, .. } = &function.signature {
+                    for (name, ty) in function.parameters.iter().zip(parameters) {
+                        scope.insert(name.clone(), ty.clone());
+                    }
+                }
+                resolve_block_module_places(&mut function.body, &mut scope, &context);
+            }
+            ScalarItem::Executable(item) => {
+                let mut scope = declarations.clone();
+                resolve_item_module_places(item, &mut scope, &context);
+            }
+            ScalarItem::Extern(_) | ScalarItem::Namespace(_) => {}
+        }
+    }
+}
+
+fn resolve_item_module_places(
+    item: &mut ScalarBlockItem,
+    scope: &mut BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+) {
+    match item {
+        ScalarBlockItem::LocalBinding(binding) => {
+            resolve_expression_module_places(&mut binding.value, scope, module);
+            scope.insert(binding.name.clone(), binding.declared_type.clone());
+        }
+        ScalarBlockItem::Expression(expression) => {
+            resolve_expression_module_places(expression, scope, module)
+        }
+        ScalarBlockItem::Assignment(assignment) => {
+            resolve_expression_module_places(&mut assignment.value, scope, module)
+        }
+        ScalarBlockItem::While(while_expression) => {
+            resolve_expression_module_places(&mut while_expression.condition, scope, module);
+            resolve_block_module_places(&mut while_expression.body, scope, module);
+        }
+    }
+}
+
+fn resolve_block_module_places(
+    block: &mut ScalarBlock,
+    scope: &mut BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+) {
+    for item in &mut block.items {
+        resolve_item_module_places(item, scope, module);
+    }
+}
+
+fn resolve_expression_module_places(
+    expression: &mut ScalarExpression,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+) {
+    match expression {
+        ScalarExpression::RawAddress { place, .. } => resolve_module_place(place, scope, module),
+        ScalarExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                resolve_expression_module_places(&mut field.value, scope, module);
+            }
+        }
+        ScalarExpression::Binary { left, right, .. } => {
+            resolve_expression_module_places(left, scope, module);
+            resolve_expression_module_places(right, scope, module);
+        }
+        ScalarExpression::Call { arguments, .. } => {
+            for argument in arguments {
+                resolve_expression_module_places(argument, scope, module);
+            }
+        }
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            resolve_expression_module_places(condition, scope, module);
+            let mut then_scope = scope.clone();
+            resolve_block_module_places(then_branch, &mut then_scope, module);
+            let mut else_scope = scope.clone();
+            resolve_block_module_places(else_branch, &mut else_scope, module);
+        }
+        ScalarExpression::Block(block) => {
+            let mut scope = scope.clone();
+            resolve_block_module_places(block, &mut scope, module);
+        }
+        ScalarExpression::Name { .. }
+        | ScalarExpression::Member { .. }
+        | ScalarExpression::Integer { .. }
+        | ScalarExpression::InvalidInteger { .. }
+        | ScalarExpression::Boolean { .. }
+        | ScalarExpression::Utf8 { .. } => {}
+    }
+}
+
+fn resolve_module_place(
+    place: &mut ScalarPlace,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+) {
+    match place {
+        ScalarPlace::Name { .. } => {}
+        ScalarPlace::Dereference { pointer, .. } => {
+            resolve_expression_module_places(pointer, scope, module)
+        }
+        ScalarPlace::Field {
+            base,
+            field,
+            field_name,
+            ..
+        } => {
+            resolve_module_place(base, scope, module);
+            let base_type = place_type_in_module(base, scope, module, &mut Vec::new());
+            let structure = match base_type {
+                ScalarType::Struct(id) => module.structs.get(id.index),
+                ScalarType::RawPointer(inner) => match inner.as_ref() {
+                    ScalarType::Struct(id) => module.structs.get(id.index),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(declared) = structure.and_then(|structure| {
+                structure
+                    .fields
+                    .iter()
+                    .find(|candidate| candidate.name == *field_name)
+            }) {
+                *field = declared.id;
+            }
         }
     }
 }
@@ -1793,6 +1949,75 @@ fn expression_type_in_module_expected(
             return ScalarType::Error;
         }
     }
+    if let ScalarExpression::StructLiteral { fields, span } = expression {
+        let Some(ScalarType::Struct(id)) = expected else {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "struct literal requires a struct context",
+                *span,
+            ));
+            return ScalarType::Error;
+        };
+        let Some(structure) = module
+            .structs
+            .get(id.index)
+            .filter(|structure| structure.id == *id)
+        else {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "invalid struct type",
+                *span,
+            ));
+            return ScalarType::Error;
+        };
+        let mut seen = BTreeSet::new();
+        let mut initialized = BTreeSet::new();
+        for field in fields {
+            if !seen.insert(field.name.clone()) {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0002",
+                    "duplicate struct literal field",
+                    field.name_span,
+                ));
+                continue;
+            }
+            let Some(declared) = structure.fields.iter().find(|item| item.name == field.name)
+            else {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "M0002",
+                    "unknown struct field",
+                    field.name_span,
+                ));
+                continue;
+            };
+            initialized.insert(field.name.clone());
+            let actual = expression_type_in_module_expected(
+                &field.value,
+                Some(&declared.ty),
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            );
+            expect_module_type(module, &declared.ty, &actual, field.span, diagnostics);
+        }
+        if initialized.len() != structure.fields.len() {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "struct literal must initialize every field",
+                *span,
+            ));
+        }
+        return ScalarType::Struct(*id);
+    }
     if let ScalarExpression::Integer { value, span } = expression {
         if let Some(
             expected @ (ScalarType::I32 | ScalarType::U8 | ScalarType::U32 | ScalarType::U64),
@@ -1967,7 +2192,9 @@ fn place_type(
             let Some(resolved_field) = program
                 .structs
                 .get(id.index)
+                .filter(|structure| field.structure == structure.id)
                 .and_then(|structure| structure.fields.get(field.index))
+                .filter(|resolved_field| resolved_field.id == *field)
             else {
                 diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
                 return ScalarType::Error;
@@ -2033,21 +2260,46 @@ fn place_type_in_module(
             base, field, span, ..
         } => {
             let base_type = place_type_in_module(base, scope, module, diagnostics);
-            let ScalarType::Struct(id) = base_type else {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0003",
-                    "value has no field",
-                    *span,
-                ));
-                return ScalarType::Error;
+            let id = match base_type {
+                ScalarType::Struct(id) => id,
+                ScalarType::RawPointer(inner) => match inner.as_ref() {
+                    ScalarType::Struct(id) => *id,
+                    _ => {
+                        diagnostics.push(module_diagnostic(
+                            module,
+                            "B0003",
+                            "value has no field",
+                            *span,
+                        ));
+                        return ScalarType::Error;
+                    }
+                },
+                _ => {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0003",
+                        "value has no field",
+                        *span,
+                    ));
+                    return ScalarType::Error;
+                }
             };
             module
                 .structs
                 .get(id.index)
+                .filter(|structure| field.structure == structure.id)
                 .and_then(|structure| structure.fields.get(field.index))
+                .filter(|resolved_field| resolved_field.id == *field)
                 .map(|field| field.ty.clone())
-                .unwrap_or(ScalarType::Error)
+                .unwrap_or_else(|| {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0003",
+                        "value has no field",
+                        *span,
+                    ));
+                    ScalarType::Error
+                })
         }
     }
 }
@@ -3321,6 +3573,7 @@ fn validate_struct_literal(
         return;
     };
     let mut seen = BTreeSet::new();
+    let mut initialized = BTreeSet::new();
     for field in &literal.fields {
         if !seen.insert(field.name.clone()) {
             diagnostics.push(diagnostic(
@@ -3340,6 +3593,7 @@ fn validate_struct_literal(
             ));
             continue;
         };
+        initialized.insert(field.name.clone());
         let actual = expression_type_expected(
             &field.value,
             &declared.ty,
@@ -3352,7 +3606,7 @@ fn validate_struct_literal(
         );
         expect_type(program, &declared.ty, &actual, field.span, diagnostics);
     }
-    if seen.len() != structure.fields.len() {
+    if initialized.len() != structure.fields.len() {
         diagnostics.push(diagnostic(
             program,
             "B0003",
@@ -4323,8 +4577,16 @@ fn expression_type_expected(
             ));
             return ScalarType::Error;
         };
-        let structure = &program.structs[id.index];
+        let Some(structure) = program
+            .structs
+            .get(id.index)
+            .filter(|structure| structure.id == *id)
+        else {
+            diagnostics.push(diagnostic(program, "B0003", "invalid struct type", *span));
+            return ScalarType::Error;
+        };
         let mut seen = BTreeSet::new();
+        let mut initialized = BTreeSet::new();
         for field in fields {
             if !seen.insert(field.name.clone()) {
                 diagnostics.push(diagnostic(
@@ -4345,6 +4607,7 @@ fn expression_type_expected(
                 ));
                 continue;
             };
+            initialized.insert(field.name.clone());
             let actual = expression_type_expected(
                 &field.value,
                 &declared.ty,
@@ -4357,7 +4620,7 @@ fn expression_type_expected(
             );
             expect_type(program, &declared.ty, &actual, field.span, diagnostics);
         }
-        if seen.len() != structure.fields.len() {
+        if initialized.len() != structure.fields.len() {
             diagnostics.push(diagnostic(
                 program,
                 "B0003",
