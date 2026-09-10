@@ -32,8 +32,9 @@ parameters = { "(" ~ (identifier ~ ("," ~ identifier)*)? ~ ")" }
 block = { "{" ~ block_item* ~ "}" }
 block_item = { local_binding | while_expr | expression ~ ";"? }
 local_binding = { receiver_list ~ "=" ~ output_list ~ ";" }
-expression = { if_expr | unsafe_expr | assignment | logical_or }
+expression = { if_expr | unit_if_expr | unsafe_expr | assignment | logical_or }
 if_expr = { "if" ~ "(" ~ expression ~ ")" ~ block ~ "else" ~ block }
+unit_if_expr = { "if" ~ "(" ~ expression ~ ")" ~ block }
 unsafe_expr = { unsafe_keyword ~ block }
 while_expr = { "while" ~ "(" ~ expression ~ ")" ~ block }
 assignment = { assignment_targets ~ "=" ~ output_list }

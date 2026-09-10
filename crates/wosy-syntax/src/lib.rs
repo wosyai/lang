@@ -68,6 +68,7 @@ pub enum SyntaxKind {
     GenericTypeArguments,
     GenericTypeArgument,
     QualifiedType,
+    UnitIfExpr,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -136,6 +137,7 @@ impl Language for WosyLanguage {
             55 => SyntaxKind::GenericTypeArguments,
             56 => SyntaxKind::GenericTypeArgument,
             57 => SyntaxKind::QualifiedType,
+            58 => SyntaxKind::UnitIfExpr,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -542,6 +544,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::qualified_member => SyntaxKind::QualifiedMember,
         Rule::assignment_target => SyntaxKind::AssignmentTarget,
         Rule::if_expr => SyntaxKind::IfExpr,
+        Rule::unit_if_expr => SyntaxKind::UnitIfExpr,
         Rule::unsafe_expr => SyntaxKind::Unsafe,
         Rule::while_expr => SyntaxKind::While,
         Rule::assignment => SyntaxKind::Assignment,
@@ -921,6 +924,21 @@ mod tests {
             .children()
             .any(|node| node.kind() == SyntaxKind::Block));
         assert_eq!(byte_span(&unsafe_node), ByteSpan::new(28, 53));
+    }
+
+    #[test]
+    fn unit_if_is_structured_lossless_and_span_exact() {
+        let text = "%%start\nunit() main = fn {\n\tif (true) {\n\t\tprint();\n\t}\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let conditional = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::UnitIfExpr)
+            .expect("unit if expression");
+        assert_eq!(conditional.text(), "if (true) {\n\t\tprint();\n\t}");
+        assert_eq!(byte_span(&conditional), ByteSpan::new(28, 53));
     }
 
     #[test]

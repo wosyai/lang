@@ -312,6 +312,11 @@ pub enum ScalarExpression {
         else_branch: ScalarBlock,
         span: ByteSpan,
     },
+    UnitIf {
+        condition: Box<ScalarExpression>,
+        then_branch: ScalarBlock,
+        span: ByteSpan,
+    },
     Block(ScalarBlock),
 }
 
@@ -854,6 +859,15 @@ fn resolve_expression_places(
             let mut else_scope = scope.clone();
             resolve_block_places(else_branch, &mut else_scope, program);
         }
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => {
+            resolve_expression_places(condition, scope, program);
+            let mut then_scope = scope.clone();
+            resolve_block_places(then_branch, &mut then_scope, program);
+        }
         ScalarExpression::Block(block) => {
             let mut scope = scope.clone();
             resolve_block_places(block, &mut scope, program);
@@ -931,6 +945,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
     }
     let mut diagnostics = Vec::new();
     for module in &project.modules {
+        validate_unit_if_positions_in_module(module, &mut diagnostics);
         let mut declarations = BTreeMap::new();
         let mut declaration_names = BTreeSet::new();
         let mut folded_declarations = BTreeMap::new();
@@ -1424,6 +1439,15 @@ fn resolve_expression_module_places(
             let mut else_scope = scope.clone();
             resolve_block_module_places(else_branch, &mut else_scope, module, modules);
         }
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => {
+            resolve_expression_module_places(condition, scope, module, modules);
+            let mut then_scope = scope.clone();
+            resolve_block_module_places(then_branch, &mut then_scope, module, modules);
+        }
         ScalarExpression::Block(block) => {
             let mut scope = scope.clone();
             resolve_block_module_places(block, &mut scope, module, modules);
@@ -1653,7 +1677,8 @@ fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::Binary { span, .. }
         | ScalarExpression::Call { span, .. }
-        | ScalarExpression::If { span, .. } => *span,
+        | ScalarExpression::If { span, .. }
+        | ScalarExpression::UnitIf { span, .. } => *span,
         ScalarExpression::Member { span, .. } => *span,
         ScalarExpression::Block(block) => block.span,
     }
@@ -2763,6 +2788,40 @@ fn expression_type_in_module(
                 then_type
             }
         }
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => {
+            let condition_type = expression_type_in_module(
+                condition,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            );
+            expect_module_type(
+                module,
+                &ScalarType::Bool,
+                &condition_type,
+                expression_span(condition),
+                diagnostics,
+            );
+            block_type_in_module(
+                then_branch,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            );
+            ScalarType::Unit
+        }
         ScalarExpression::Block(block) => block_type_in_module(
             block,
             scope,
@@ -2773,7 +2832,6 @@ fn expression_type_in_module(
             diagnostics,
             unsafe_context,
         ),
-        _ => ScalarType::Error,
     }
 }
 
@@ -4291,6 +4349,14 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 span: wosy_syntax::byte_span(&actual),
             }
         }
+        SyntaxKind::UnitIfExpr => {
+            let children = direct_nodes(&actual);
+            ScalarExpression::UnitIf {
+                condition: Box::new(derive_expression(&children[0])),
+                then_branch: derive_block(&children[1]),
+                span: wosy_syntax::byte_span(&actual),
+            }
+        }
         SyntaxKind::Unsafe => ScalarExpression::Block(derive_block_with_context(
             &direct_nodes(&actual)
                 .into_iter()
@@ -4677,10 +4743,163 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::Utf8 { span, .. }
         | ScalarExpression::Binary { span, .. }
         | ScalarExpression::Call { span, .. }
-        | ScalarExpression::If { span, .. } => *span,
+        | ScalarExpression::If { span, .. }
+        | ScalarExpression::UnitIf { span, .. } => *span,
         ScalarExpression::RawAddress { span, .. }
         | ScalarExpression::StructLiteral { span, .. } => *span,
         ScalarExpression::Block(block) => block.span,
+    }
+}
+
+fn validate_unit_if_positions(program: &ScalarProgram, diagnostics: &mut Vec<super::Diagnostic>) {
+    validate_unit_if_positions_in_items(&program.items, &program.source, diagnostics);
+}
+
+fn validate_unit_if_positions_in_module(
+    module: &ScalarModule,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    validate_unit_if_positions_in_items(&module.items, &module.source, diagnostics);
+}
+
+fn validate_unit_if_positions_in_items(
+    items: &[ScalarItem],
+    source: &SourceIdentity,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    for item in items {
+        match item {
+            ScalarItem::Binding(binding) => {
+                validate_unit_if_position(&binding.value, false, source, diagnostics)
+            }
+            ScalarItem::Function(function) => {
+                validate_unit_if_positions_in_block(&function.body, source, diagnostics)
+            }
+            ScalarItem::Executable(item) => {
+                validate_unit_if_positions_in_item(item, true, source, diagnostics)
+            }
+            ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
+        }
+    }
+}
+
+fn validate_unit_if_positions_in_block(
+    block: &ScalarBlock,
+    source: &SourceIdentity,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    for (index, item) in block.items.iter().enumerate() {
+        let statement = index + 1 != block.items.len() || block.terminated_items[index];
+        validate_unit_if_positions_in_item(item, statement, source, diagnostics);
+    }
+}
+
+fn validate_unit_if_positions_in_item(
+    item: &ScalarBlockItem,
+    statement: bool,
+    source: &SourceIdentity,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    match item {
+        ScalarBlockItem::LocalBinding(binding) => {
+            validate_unit_if_position(&binding.value, false, source, diagnostics)
+        }
+        ScalarBlockItem::Expression(expression) => {
+            validate_unit_if_position(expression, statement, source, diagnostics)
+        }
+        ScalarBlockItem::Assignment(assignment) => {
+            validate_unit_if_position(&assignment.value, false, source, diagnostics)
+        }
+        ScalarBlockItem::While(while_expression) => {
+            validate_unit_if_position(&while_expression.condition, false, source, diagnostics);
+            validate_unit_if_positions_in_block(&while_expression.body, source, diagnostics);
+        }
+    }
+}
+
+fn validate_unit_if_position(
+    expression: &ScalarExpression,
+    statement: bool,
+    source: &SourceIdentity,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    match expression {
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            span,
+        } => {
+            if !statement {
+                diagnostics.push(super::Diagnostic {
+                    code: "B0003".to_owned(),
+                    severity: super::DiagnosticSeverity::Error,
+                    message: "if without else is only valid as a unit statement".to_owned(),
+                    labels: vec![super::DiagnosticLabel {
+                        kind: super::DiagnosticLabelKind::Primary,
+                        span: SourceSpan::new(source.clone(), *span),
+                        message: "if without else is only valid as a unit statement".to_owned(),
+                    }],
+                    notes: Vec::new(),
+                });
+            }
+            validate_unit_if_position(condition, false, source, diagnostics);
+            validate_unit_if_positions_in_block(then_branch, source, diagnostics);
+        }
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            validate_unit_if_position(condition, false, source, diagnostics);
+            validate_unit_if_positions_in_block(then_branch, source, diagnostics);
+            validate_unit_if_positions_in_block(else_branch, source, diagnostics);
+        }
+        ScalarExpression::Binary { left, right, .. } => {
+            validate_unit_if_position(left, false, source, diagnostics);
+            validate_unit_if_position(right, false, source, diagnostics);
+        }
+        ScalarExpression::Call { arguments, .. } => {
+            for argument in arguments {
+                validate_unit_if_position(argument, false, source, diagnostics);
+            }
+        }
+        ScalarExpression::RawAddress { place, .. } => {
+            validate_unit_if_position_in_place(place, source, diagnostics)
+        }
+        ScalarExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                validate_unit_if_position(&field.value, false, source, diagnostics);
+            }
+        }
+        ScalarExpression::Block(block) => {
+            validate_unit_if_positions_in_block(block, source, diagnostics)
+        }
+        ScalarExpression::Name { .. }
+        | ScalarExpression::Member { .. }
+        | ScalarExpression::Integer { .. }
+        | ScalarExpression::InvalidInteger { .. }
+        | ScalarExpression::Float { .. }
+        | ScalarExpression::InvalidFloat { .. }
+        | ScalarExpression::Boolean { .. }
+        | ScalarExpression::Char { .. }
+        | ScalarExpression::Utf8 { .. } => {}
+    }
+}
+
+fn validate_unit_if_position_in_place(
+    place: &ScalarPlace,
+    source: &SourceIdentity,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    match place {
+        ScalarPlace::Dereference { pointer, .. } => {
+            validate_unit_if_position(pointer, false, source, diagnostics)
+        }
+        ScalarPlace::Field { base, .. } => {
+            validate_unit_if_position_in_place(base, source, diagnostics)
+        }
+        ScalarPlace::Name { .. } => {}
     }
 }
 
@@ -4705,6 +4924,7 @@ fn operator(value: &str) -> BinaryOperator {
 
 fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
     let mut diagnostics = Vec::new();
+    validate_unit_if_positions(program, &mut diagnostics);
     let mut declarations = BTreeMap::new();
     let mut declaration_names = BTreeSet::new();
     let mut folded_declarations = BTreeMap::new();
@@ -5024,6 +5244,14 @@ impl StaticUseAnalyzer {
                 self.expression(condition, visible);
                 self.block(then_branch, visible);
                 self.block(else_branch, visible);
+            }
+            ScalarExpression::UnitIf {
+                condition,
+                then_branch,
+                ..
+            } => {
+                self.expression(condition, visible);
+                self.block(then_branch, visible);
             }
             ScalarExpression::Block(block) => self.block(block, visible),
             ScalarExpression::RawAddress { place, .. } => self.place(place, visible),
@@ -5771,6 +5999,38 @@ fn expression_type(
                 then_type
             }
         }
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => {
+            let condition_type = expression_type(
+                condition,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            expect_type(
+                program,
+                &ScalarType::Bool,
+                &condition_type,
+                expression_span(condition),
+                diagnostics,
+            );
+            block_type(
+                then_branch,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            ScalarType::Unit
+        }
         ScalarExpression::Block(block) => block_type(
             block,
             scope,
@@ -6428,6 +6688,56 @@ mod tests {
             parsed.diagnostics
         );
         derive_scalar_program(&parsed.result)
+    }
+
+    #[test]
+    fn derives_unit_if_statement_and_requires_bool_condition_span() {
+        let text =
+            "%%start\nunit() touch = fn { 1; };\nunit() run = fn { if (true) { touch(); }; };\n%%end";
+        let result = validate_text(text);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Function(function) = &result.program.items[1] else {
+            panic!("unit conditional function")
+        };
+        assert!(matches!(
+            function.body.items[0],
+            ScalarBlockItem::Expression(ScalarExpression::UnitIf { .. })
+        ));
+
+        let invalid = validate_text(
+            "%%start\nunit() touch = fn { 1; };\nunit() run = fn { if (1) { touch(); }; };\n%%end",
+        );
+        let condition = invalid
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message == "expression type does not match expected type")
+            .expect("bool condition diagnostic");
+        let start = "%%start\nunit() touch = fn { 1; };\nunit() run = fn { if (".len() as u32;
+        assert_eq!(
+            condition.labels[0].span.range,
+            ByteSpan::new(start, start + 1)
+        );
+    }
+
+    #[test]
+    fn rejects_unit_if_in_value_contexts_at_the_conditional_span() {
+        let cases = [
+            "%%start\nunit() touch = fn { 1; };\nunit value = if (true) { touch(); };\n%%end",
+            "%%start\nunit() touch = fn { 1; };\nunit() value = fn { if (true) { touch(); } };\n%%end",
+            "%%start\nunit() touch = fn { 1; };\nunit(unit) accept = fn(value) { touch(); };\naccept(if (true) { touch(); });\n%%end",
+            "%%start\nunit() touch = fn { 1; };\nunit target = touch();\ntarget = if (true) { touch(); };\n%%end",
+            "%%start\nunit() touch = fn { 1; };\ni32 value = (if (true) { touch(); }) + 1;\n%%end",
+        ];
+        for text in cases {
+            let result = validate_text(text);
+            let start = text.find("if (true)").expect("conditional") as u32;
+            let end = start + "if (true) { touch(); }".len() as u32;
+            assert!(result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "if without else is only valid as a unit statement"
+                    && diagnostic.labels[0].span.range == ByteSpan::new(start, end)
+            }));
+        }
     }
 
     #[test]

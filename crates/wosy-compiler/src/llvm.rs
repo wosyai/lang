@@ -1943,6 +1943,11 @@ fn emit_expression<'ctx, 'module>(
             else_branch,
             ..
         } => emit_if(context, state, condition, then_branch, else_branch),
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => emit_unit_if(context, state, condition, then_branch),
         ScalarExpression::Block(block) => emit_block(context, state, block),
         ScalarExpression::RawAddress { place, .. } => Ok(EmitValue::Basic(
             state
@@ -2164,6 +2169,14 @@ fn emit_project_expression<'ctx, 'module>(
                 module,
                 modules,
             )
+        }
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => {
+            let condition = emit_project_expression(context, state, condition, module, modules)?;
+            emit_project_unit_if(context, state, condition, then_branch, module, modules)
         }
         ScalarExpression::Block(block) => {
             emit_project_block(context, state, block, module, modules)
@@ -2671,6 +2684,67 @@ fn emit_project_if<'ctx, 'module>(
         |state, block| emit_project_block(context, state, block, module, modules),
     )
 }
+
+fn emit_unit_if<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    condition: &ScalarExpression,
+    then_branch: &ScalarBlock,
+) -> Result<EmitValue<'ctx>, String> {
+    let condition = take_basic(emit_expression(context, state, condition)?)?.into_int_value();
+    let function = state
+        .builder
+        .get_insert_block()
+        .ok_or_else(|| "missing insertion block".to_owned())?
+        .get_parent()
+        .ok_or_else(|| "missing function".to_owned())?;
+    let then_block = context.append_basic_block(function, "if.then");
+    let merge = context.append_basic_block(function, "if.merge");
+    state
+        .builder
+        .build_conditional_branch(condition, then_block, merge)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(then_block);
+    emit_block(context, state, then_branch)?;
+    state
+        .builder
+        .build_unconditional_branch(merge)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(merge);
+    Ok(EmitValue::Unit)
+}
+
+fn emit_project_unit_if<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    condition: EmitValue<'ctx>,
+    then_branch: &ScalarBlock,
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    let condition = take_basic(condition)?.into_int_value();
+    let function = state
+        .builder
+        .get_insert_block()
+        .ok_or_else(|| "missing insertion block".to_owned())?
+        .get_parent()
+        .ok_or_else(|| "missing function".to_owned())?;
+    let then_block = context.append_basic_block(function, "if.then");
+    let merge = context.append_basic_block(function, "if.merge");
+    state
+        .builder
+        .build_conditional_branch(condition, then_block, merge)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(then_block);
+    emit_project_block(context, state, then_branch, module, modules)?;
+    state
+        .builder
+        .build_unconditional_branch(merge)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(merge);
+    Ok(EmitValue::Unit)
+}
+
 fn emit_if_value<'ctx, 'module, F>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -2883,6 +2957,41 @@ mod tests {
         assert!(text.contains("call i1 @flag"));
         assert!(text.contains("call void @touch"));
         assert!(text.contains("call i32 @count"));
+    }
+
+    #[test]
+    fn emits_unit_if_with_then_and_merge_blocks_without_phi() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/unit_if.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\nunit() touch = fn { 1; };\nunit() run = fn { if (true) { touch(); }; };\n%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_llvm(&validation)
+            .expect("unit conditional LLVM")
+            .to_text();
+        let run = text.split("define void @run").nth(1).expect("run function");
+        assert!(
+            run.contains("br i1 true, label %if.then, label %if.merge"),
+            "{run}"
+        );
+        assert!(run.contains("if.then:"), "{run}");
+        assert!(run.contains("if.merge:"), "{run}");
+        assert!(!run.contains(" phi "), "{run}");
     }
 
     #[test]
