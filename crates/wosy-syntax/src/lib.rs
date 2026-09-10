@@ -65,6 +65,7 @@ pub enum SyntaxKind {
     RawAddress,
     GenericTypeArguments,
     GenericTypeArgument,
+    QualifiedType,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -130,6 +131,7 @@ impl Language for WosyLanguage {
             52 => SyntaxKind::RawAddress,
             53 => SyntaxKind::GenericTypeArguments,
             54 => SyntaxKind::GenericTypeArgument,
+            55 => SyntaxKind::QualifiedType,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -521,6 +523,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::type_spec => SyntaxKind::TypeSpec,
         Rule::callable_type => SyntaxKind::CallableType,
         Rule::type_name => SyntaxKind::TypeName,
+        Rule::qualified_type => SyntaxKind::QualifiedType,
         Rule::raw_pointer_type => SyntaxKind::RawPointerType,
         Rule::unsafe_marker => SyntaxKind::Unsafe,
         Rule::identifier => SyntaxKind::Identifier,
@@ -761,6 +764,7 @@ mod tests {
             SyntaxKind::RawAddress,
             SyntaxKind::GenericTypeArguments,
             SyntaxKind::GenericTypeArgument,
+            SyntaxKind::QualifiedType,
         ];
         for kind in kinds {
             assert_eq!(
@@ -843,6 +847,38 @@ mod tests {
                 SyntaxKind::GenericTypeArguments,
                 SyntaxKind::Expression,
                 SyntaxKind::Expression,
+            ]
+        );
+    }
+
+    #[test]
+    fn qualified_types_preserve_tokens_and_spans_in_every_type_position() {
+        let text = "%%start\nchild = namespace app \"src/child.w\";\n*?child.Pair(child.Pair) convert = fn(value) { value };\nchild.Pair item = { .value = 1; };\ncore.cast<child.Pair>(item, \"exact\");\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let qualified = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::QualifiedType)
+            .collect::<Vec<_>>();
+        assert_eq!(qualified.len(), 4);
+        assert!(qualified.iter().all(|node| node.text() == "child.Pair"));
+        let first = &qualified[0];
+        assert_eq!(byte_span(first), ByteSpan::new(47, 57));
+        let tokens = first
+            .children_with_tokens()
+            .filter_map(|element| match element {
+                rowan::NodeOrToken::Token(token) => Some((token.kind(), token.text().to_string())),
+                rowan::NodeOrToken::Node(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tokens,
+            vec![
+                (SyntaxKind::Identifier, "child".to_owned()),
+                (SyntaxKind::Punctuation, ".".to_owned()),
+                (SyntaxKind::Identifier, "Pair".to_owned()),
             ]
         );
     }

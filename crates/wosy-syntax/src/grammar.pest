@@ -19,11 +19,12 @@ extern_decl = { identifier ~ "=" ~ "extern" ~ identifier ~ string ~ "{" ~ extern
 extern_function = { unsafe_marker? ~ callable_type ~ identifier ~ ";" }
 function_decl = { callable_type ~ identifier ~ "=" ~ "fn" ~ parameters? ~ block ~ ";" }
 binding_decl = { receiver_list ~ "=" ~ output_list ~ ";" }
-type_spec = { callable_type | raw_pointer_type | type_name }
-callable_type = { callable_output ~ "(" ~ ((raw_pointer_type | type_name) ~ ("," ~ (raw_pointer_type | type_name))*)? ~ ")" }
-callable_output = { raw_pointer_type | type_name | "(" ~ (raw_pointer_type | type_name) ~ ("," ~ (raw_pointer_type | type_name))* ~ ")" }
-raw_pointer_type = { "*?" ~ type_name }
+type_spec = { callable_type | raw_pointer_type | qualified_type | type_name }
+callable_type = { callable_output ~ "(" ~ ((raw_pointer_type | qualified_type | type_name) ~ ("," ~ (raw_pointer_type | qualified_type | type_name))*)? ~ ")" }
+callable_output = { raw_pointer_type | qualified_type | type_name | "(" ~ (raw_pointer_type | qualified_type | type_name) ~ ("," ~ (raw_pointer_type | qualified_type | type_name))* ~ ")" }
+raw_pointer_type = { "*?" ~ (qualified_type | type_name) }
 type_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+qualified_type = { identifier ~ "." ~ identifier }
 unsafe_marker = { unsafe_keyword }
 unsafe_keyword = { "unsafe" }
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
