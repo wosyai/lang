@@ -40,6 +40,7 @@ pub enum SyntaxKind {
     Binary,
     Operator,
     Integer,
+    Float,
     Char,
     String,
     Punctuation,
@@ -107,33 +108,34 @@ impl Language for WosyLanguage {
             27 => SyntaxKind::Binary,
             28 => SyntaxKind::Operator,
             29 => SyntaxKind::Integer,
-            30 => SyntaxKind::Char,
-            31 => SyntaxKind::String,
-            32 => SyntaxKind::Punctuation,
-            33 => SyntaxKind::NamespaceDecl,
-            34 => SyntaxKind::QualifiedCall,
-            35 => SyntaxKind::QualifiedMember,
-            36 => SyntaxKind::AssignmentTarget,
-            37 => SyntaxKind::LocalBinding,
-            38 => SyntaxKind::While,
-            39 => SyntaxKind::Assignment,
-            40 => SyntaxKind::TopLevelItem,
-            41 => SyntaxKind::StructDecl,
-            42 => SyntaxKind::StructField,
-            43 => SyntaxKind::CallableOutput,
-            44 => SyntaxKind::ReceiverList,
-            45 => SyntaxKind::Receiver,
-            46 => SyntaxKind::OutputList,
-            47 => SyntaxKind::AssignmentTargets,
-            48 => SyntaxKind::StructLiteral,
-            49 => SyntaxKind::StructLiteralField,
-            50 => SyntaxKind::FieldAccess,
-            51 => SyntaxKind::DereferencedField,
-            52 => SyntaxKind::Dereference,
-            53 => SyntaxKind::RawAddress,
-            54 => SyntaxKind::GenericTypeArguments,
-            55 => SyntaxKind::GenericTypeArgument,
-            56 => SyntaxKind::QualifiedType,
+            30 => SyntaxKind::Float,
+            31 => SyntaxKind::Char,
+            32 => SyntaxKind::String,
+            33 => SyntaxKind::Punctuation,
+            34 => SyntaxKind::NamespaceDecl,
+            35 => SyntaxKind::QualifiedCall,
+            36 => SyntaxKind::QualifiedMember,
+            37 => SyntaxKind::AssignmentTarget,
+            38 => SyntaxKind::LocalBinding,
+            39 => SyntaxKind::While,
+            40 => SyntaxKind::Assignment,
+            41 => SyntaxKind::TopLevelItem,
+            42 => SyntaxKind::StructDecl,
+            43 => SyntaxKind::StructField,
+            44 => SyntaxKind::CallableOutput,
+            45 => SyntaxKind::ReceiverList,
+            46 => SyntaxKind::Receiver,
+            47 => SyntaxKind::OutputList,
+            48 => SyntaxKind::AssignmentTargets,
+            49 => SyntaxKind::StructLiteral,
+            50 => SyntaxKind::StructLiteralField,
+            51 => SyntaxKind::FieldAccess,
+            52 => SyntaxKind::DereferencedField,
+            53 => SyntaxKind::Dereference,
+            54 => SyntaxKind::RawAddress,
+            55 => SyntaxKind::GenericTypeArguments,
+            56 => SyntaxKind::GenericTypeArgument,
+            57 => SyntaxKind::QualifiedType,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -572,6 +574,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         | Rule::multiply_operator
         | Rule::operator => SyntaxKind::Operator,
         Rule::integer => SyntaxKind::Integer,
+        Rule::float => SyntaxKind::Float,
         Rule::char => SyntaxKind::Char,
         Rule::string => SyntaxKind::String,
         Rule::comment => SyntaxKind::TypedComment,
@@ -1143,5 +1146,28 @@ mod tests {
         assert_eq!(literals[0].0, "'\\u{1F600}'");
         assert_eq!(literals[0].1, ByteSpan::new(21, 32));
         assert_eq!(literals[1].0, "'\\n'");
+    }
+
+    #[test]
+    fn floating_literals_are_lossless_and_span_exact() {
+        let text = "%%start\nf32 a = 1_2.3_4e-1_0;\nf64 b = 2E+3;\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let literals = result
+            .root
+            .descendants_with_tokens()
+            .filter_map(|element| match element {
+                rowan::NodeOrToken::Token(token) if token.kind() == SyntaxKind::Float => Some((
+                    token.text().to_owned(),
+                    byte_span(&token.parent().expect("parent")),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(literals[0].0, "1_2.3_4e-1_0");
+        assert_eq!(literals[1].0, "2E+3");
+        assert_eq!(literals[0].1, ByteSpan::new(16, 28));
+        assert_eq!(literals[1].1, ByteSpan::new(38, 42));
     }
 }

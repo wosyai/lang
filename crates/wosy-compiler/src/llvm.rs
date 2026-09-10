@@ -11,7 +11,7 @@ use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, PointerValue, ValueKind,
 };
 use inkwell::AddressSpace;
-use inkwell::IntPredicate;
+use inkwell::{FloatPredicate, IntPredicate};
 use serde::{Deserialize, Serialize};
 
 use crate::scalar::ScalarFieldReference;
@@ -30,6 +30,8 @@ pub enum LlvmValueType {
     I8,
     I64,
     I128,
+    F32,
+    F64,
     Char,
     ArtifactId,
     Pointer,
@@ -399,6 +401,8 @@ fn llvm_text_type(ty: LlvmValueType) -> &'static str {
         LlvmValueType::I32 => "i32",
         LlvmValueType::I64 => "i64",
         LlvmValueType::I128 => "i128",
+        LlvmValueType::F32 => "float",
+        LlvmValueType::F64 => "double",
         LlvmValueType::Char => "i32",
         LlvmValueType::ArtifactId => "ptr",
         LlvmValueType::Pointer => "ptr",
@@ -546,6 +550,8 @@ fn function_type<'ctx>(
         | ScalarType::U32
         | ScalarType::U64
         | ScalarType::U128 => integer_type(context, result)?.fn_type(&parameters, false),
+        ScalarType::F32 => context.f32_type().fn_type(&parameters, false),
+        ScalarType::F64 => context.f64_type().fn_type(&parameters, false),
         _ => return Err("unsupported LLVM scalar type".into()),
     })
 }
@@ -580,6 +586,8 @@ fn basic_type<'ctx>(
         ty if integer_width(ty).is_some() => Ok(integer_type(context, ty)?.into()),
         ScalarType::Utf8 => Ok(context.i32_type().into()),
         ScalarType::Char => Ok(context.i32_type().into()),
+        ScalarType::F32 => Ok(context.f32_type().into()),
+        ScalarType::F64 => Ok(context.f64_type().into()),
         ScalarType::ArtifactId => Ok(context.ptr_type(AddressSpace::default()).into()),
         ScalarType::RawPointer(_) => Ok(context.i32_type().into()),
         ScalarType::Struct(_) => Ok(context.ptr_type(AddressSpace::default()).into()),
@@ -614,6 +622,8 @@ fn value_type(ty: &ScalarType) -> Result<LlvmValueType, String> {
         ScalarType::I32 | ScalarType::U32 => Ok(LlvmValueType::I32),
         ScalarType::I64 | ScalarType::U64 => Ok(LlvmValueType::I64),
         ScalarType::I128 | ScalarType::U128 => Ok(LlvmValueType::I128),
+        ScalarType::F32 => Ok(LlvmValueType::F32),
+        ScalarType::F64 => Ok(LlvmValueType::F64),
         ScalarType::Char => Ok(LlvmValueType::Char),
         ScalarType::ArtifactId => Ok(LlvmValueType::ArtifactId),
         ScalarType::RawPointer(_) => Ok(LlvmValueType::Pointer),
@@ -639,6 +649,18 @@ fn integer_constant<'ctx>(
         });
     }
     Ok(integer.const_int_arbitrary_precision(&words))
+}
+
+fn float_constant<'ctx>(
+    context: &'ctx Context,
+    ty: &ScalarType,
+    value: f64,
+) -> Result<inkwell::values::FloatValue<'ctx>, String> {
+    match ty {
+        ScalarType::F32 => Ok(context.f32_type().const_float(value)),
+        ScalarType::F64 => Ok(context.f64_type().const_float(value)),
+        _ => Err("expected floating-point type".to_owned()),
+    }
 }
 
 fn callable_result(outputs: &crate::ScalarOutputSequence) -> Result<&ScalarType, String> {
@@ -861,6 +883,9 @@ fn emit_typed_expression<'ctx, 'module>(
         (ScalarExpression::Integer { value, .. }, ty) if integer_width(ty).is_some() => Ok(
             EmitValue::Basic(integer_constant(context, ty, value)?.into()),
         ),
+        (ScalarExpression::Float { value, .. }, ty) => Ok(EmitValue::Basic(
+            float_constant(context, ty, *value)?.into(),
+        )),
         _ => emit_expression(context, state, expression),
     }
 }
@@ -1877,6 +1902,10 @@ fn emit_expression<'ctx, 'module>(
                 .into(),
         )),
         ScalarExpression::InvalidInteger { .. } => Err("invalid integer literal".to_owned()),
+        ScalarExpression::Float { .. } => {
+            Err("floating-point literal requires an expected type".to_owned())
+        }
+        ScalarExpression::InvalidFloat { .. } => Err("invalid floating-point literal".to_owned()),
         ScalarExpression::Boolean { value, .. } => Ok(EmitValue::Basic(
             context
                 .bool_type()
@@ -1944,6 +1973,9 @@ fn emit_project_typed_expression<'ctx, 'module>(
         ScalarExpression::Integer { value, .. } if integer_width(expected).is_some() => Ok(
             EmitValue::Basic(integer_constant(context, expected, value)?.into()),
         ),
+        ScalarExpression::Float { value, .. } => Ok(EmitValue::Basic(
+            float_constant(context, expected, *value)?.into(),
+        )),
         ScalarExpression::StructLiteral { fields, .. } => {
             emit_struct_literal(context, state, expected, fields)
         }
@@ -2035,9 +2067,31 @@ fn emit_project_expression<'ctx, 'module>(
                     .unwrap_or(module)
             });
             let qualified = project_function_name(&target.source, name);
+            let function = *state
+                .functions
+                .get(&qualified)
+                .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?;
             let values = arguments
                 .iter()
-                .map(|argument| emit_project_expression(context, state, argument, module, modules))
+                .zip(function.get_type().get_param_types())
+                .map(|(argument, parameter)| match (argument, parameter) {
+                    (
+                        ScalarExpression::Float { value, .. },
+                        BasicMetadataTypeEnum::FloatType(ty),
+                    ) if ty == context.f32_type() => Ok(EmitValue::Basic(
+                        context.f32_type().const_float(*value).into(),
+                    )),
+                    (
+                        ScalarExpression::Float { value, .. },
+                        BasicMetadataTypeEnum::FloatType(ty),
+                    ) if ty == context.f64_type() => Ok(EmitValue::Basic(
+                        context.f64_type().const_float(*value).into(),
+                    )),
+                    (ScalarExpression::Float { .. }, BasicMetadataTypeEnum::FloatType(_)) => {
+                        Err("unsupported LLVM floating-point parameter type".to_owned())
+                    }
+                    _ => emit_project_expression(context, state, argument, module, modules),
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             emit_call_values(state, &qualified, values)
         }
@@ -2059,6 +2113,10 @@ fn emit_project_expression<'ctx, 'module>(
                 .into(),
         )),
         ScalarExpression::InvalidInteger { .. } => Err("invalid integer literal".to_owned()),
+        ScalarExpression::Float { .. } => {
+            Err("floating-point literal requires an expected type".to_owned())
+        }
+        ScalarExpression::InvalidFloat { .. } => Err("invalid floating-point literal".to_owned()),
         ScalarExpression::Boolean { value, .. } => Ok(EmitValue::Basic(
             context
                 .bool_type()
@@ -2145,12 +2203,36 @@ fn emit_call<'ctx, 'module>(
             _ => Err("core.utf8_view requires a UTF-8 value with known storage".to_owned()),
         };
     }
-    let values = arguments
-        .iter()
-        .map(|argument| emit_expression(context, state, argument))
-        .collect::<Result<Vec<_>, _>>()?;
     let qualified =
         receiver.map_or_else(|| name.to_owned(), |receiver| format!("{receiver}.{name}"));
+    let function = *state
+        .functions
+        .get(&qualified)
+        .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?;
+    let values = arguments
+        .iter()
+        .zip(function.get_type().get_param_types())
+        .map(|(argument, parameter)| match (argument, parameter) {
+            (ScalarExpression::Float { value, .. }, BasicMetadataTypeEnum::FloatType(ty))
+                if ty == context.f32_type() =>
+            {
+                Ok(EmitValue::Basic(
+                    context.f32_type().const_float(*value).into(),
+                ))
+            }
+            (ScalarExpression::Float { value, .. }, BasicMetadataTypeEnum::FloatType(ty))
+                if ty == context.f64_type() =>
+            {
+                Ok(EmitValue::Basic(
+                    context.f64_type().const_float(*value).into(),
+                ))
+            }
+            (ScalarExpression::Float { .. }, BasicMetadataTypeEnum::FloatType(_)) => {
+                Err("unsupported LLVM floating-point parameter type".to_owned())
+            }
+            _ => emit_expression(context, state, argument),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     emit_call_values(state, &qualified, values)
 }
 
@@ -2305,10 +2387,34 @@ fn emit_binary_with_rhs<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     if !matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
         let right = match path {
-            ExpressionPath::Single => emit_expression(context, state, right)?,
-            ExpressionPath::Project { module, modules } => {
-                emit_project_expression(context, state, right, module, modules)?
-            }
+            ExpressionPath::Single => match right {
+                ScalarExpression::Float { .. } => match &left {
+                    EmitValue::Basic(BasicValueEnum::FloatValue(value)) => {
+                        let ty = if value.get_type() == context.f32_type() {
+                            ScalarType::F32
+                        } else {
+                            ScalarType::F64
+                        };
+                        emit_typed_expression(context, state, right, &ty)?
+                    }
+                    _ => emit_expression(context, state, right)?,
+                },
+                _ => emit_expression(context, state, right)?,
+            },
+            ExpressionPath::Project { module, modules } => match right {
+                ScalarExpression::Float { .. } => match &left {
+                    EmitValue::Basic(BasicValueEnum::FloatValue(value)) => {
+                        let ty = if value.get_type() == context.f32_type() {
+                            ScalarType::F32
+                        } else {
+                            ScalarType::F64
+                        };
+                        emit_project_typed_expression(context, state, right, &ty, module, modules)?
+                    }
+                    _ => emit_project_expression(context, state, right, module, modules)?,
+                },
+                _ => emit_project_expression(context, state, right, module, modules)?,
+            },
         };
         return emit_binary_values(state, operator, left, right, unsigned);
     }
@@ -2369,8 +2475,63 @@ fn emit_binary_values<'ctx, 'module>(
     right: EmitValue<'ctx>,
     unsigned: bool,
 ) -> Result<EmitValue<'ctx>, String> {
-    let left = take_basic(left)?.into_int_value();
-    let right = take_basic(right)?.into_int_value();
+    let left = take_basic(left)?;
+    let right = take_basic(right)?;
+    if let (BasicValueEnum::FloatValue(left), BasicValueEnum::FloatValue(right)) = (left, right) {
+        if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
+            return Err("short-circuit operators require expression lowering".to_owned());
+        }
+        return match operator {
+            BinaryOperator::Add => state
+                .builder
+                .build_float_add(left, right, "add")
+                .map(|value| EmitValue::Basic(value.into())),
+            BinaryOperator::Subtract => state
+                .builder
+                .build_float_sub(left, right, "sub")
+                .map(|value| EmitValue::Basic(value.into())),
+            BinaryOperator::Multiply => state
+                .builder
+                .build_float_mul(left, right, "mul")
+                .map(|value| EmitValue::Basic(value.into())),
+            BinaryOperator::Divide => state
+                .builder
+                .build_float_div(left, right, "div")
+                .map(|value| EmitValue::Basic(value.into())),
+            BinaryOperator::Remainder => state
+                .builder
+                .build_float_rem(left, right, "rem")
+                .map(|value| EmitValue::Basic(value.into())),
+            BinaryOperator::Equal => state
+                .builder
+                .build_float_compare(FloatPredicate::OEQ, left, right, "eq")
+                .map(|value| EmitValue::Basic(value.into())),
+            BinaryOperator::NotEqual => state
+                .builder
+                .build_float_compare(FloatPredicate::ONE, left, right, "ne")
+                .map(|value| EmitValue::Basic(value.into())),
+            BinaryOperator::Less => state
+                .builder
+                .build_float_compare(FloatPredicate::OLT, left, right, "lt")
+                .map(|value| EmitValue::Basic(value.into())),
+            BinaryOperator::LessEqual => state
+                .builder
+                .build_float_compare(FloatPredicate::OLE, left, right, "le")
+                .map(|value| EmitValue::Basic(value.into())),
+            BinaryOperator::Greater => state
+                .builder
+                .build_float_compare(FloatPredicate::OGT, left, right, "gt")
+                .map(|value| EmitValue::Basic(value.into())),
+            BinaryOperator::GreaterEqual => state
+                .builder
+                .build_float_compare(FloatPredicate::OGE, left, right, "ge")
+                .map(|value| EmitValue::Basic(value.into())),
+            BinaryOperator::And | BinaryOperator::Or => unreachable!(),
+        }
+        .map_err(builder_error);
+    }
+    let left = left.into_int_value();
+    let right = right.into_int_value();
     let value = match operator {
         BinaryOperator::Add => state
             .builder
@@ -2584,6 +2745,8 @@ fn emit_return<'ctx, 'module>(
         | ScalarType::U32
         | ScalarType::U64
         | ScalarType::U128
+        | ScalarType::F32
+        | ScalarType::F64
         | ScalarType::RawPointer(_)
         | ScalarType::ArtifactId
         | ScalarType::Struct(_) => {
@@ -2720,6 +2883,35 @@ mod tests {
         assert!(text.contains("call i1 @flag"));
         assert!(text.contains("call void @touch"));
         assert!(text.contains("call i32 @count"));
+    }
+
+    #[test]
+    fn emits_float_types_literals_operations_and_comparisons() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/floats.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\nf32(f32) identity = fn(value) { value };\nf32 a = 1.25;\nf64 b = 2e1;\nf32 sum = a + 2.5;\nf32 echoed = identity(4e-1);\nb < 3e1;\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_llvm(&validation).expect("float LLVM").to_text();
+        assert!(text.contains("global float"), "{text}");
+        assert!(text.contains("global double"), "{text}");
+        assert!(text.contains("fadd float"), "{text}");
+        assert!(text.contains("fcmp olt double"), "{text}");
+        assert!(text.contains("call float @identity(float"), "{text}");
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub enum ScalarType {
     U32,
     U64,
     U128,
+    F32,
+    F64,
     Char,
     Utf8,
     ArtifactId,
@@ -239,7 +241,7 @@ pub enum BinaryOperator {
     Or,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ScalarExpression {
     Name {
         name: String,
@@ -259,6 +261,14 @@ pub enum ScalarExpression {
     InvalidInteger {
         span: ByteSpan,
         error_span: Option<ByteSpan>,
+    },
+    Float {
+        value: f64,
+        spelling: String,
+        span: ByteSpan,
+    },
+    InvalidFloat {
+        span: ByteSpan,
     },
     Boolean {
         value: bool,
@@ -304,6 +314,8 @@ pub enum ScalarExpression {
     },
     Block(ScalarBlock),
 }
+
+impl Eq for ScalarExpression {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ScalarExternModule {
@@ -539,6 +551,7 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
     let mut diagnostics = string_diagnostics(canonical);
     diagnostics.extend(char_diagnostics(canonical));
     diagnostics.extend(integer_diagnostics(canonical));
+    diagnostics.extend(float_diagnostics(canonical));
     let source_root = canonical
         .root
         .children()
@@ -849,6 +862,8 @@ fn resolve_expression_places(
         | ScalarExpression::Member { .. }
         | ScalarExpression::Integer { .. }
         | ScalarExpression::InvalidInteger { .. }
+        | ScalarExpression::Float { .. }
+        | ScalarExpression::InvalidFloat { .. }
         | ScalarExpression::Boolean { .. }
         | ScalarExpression::Char { .. }
         | ScalarExpression::Utf8 { .. } => {}
@@ -896,6 +911,7 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
     let mut diagnostics = string_diagnostics(canonical);
     diagnostics.extend(char_diagnostics(canonical));
     diagnostics.extend(integer_diagnostics(canonical));
+    diagnostics.extend(float_diagnostics(canonical));
     diagnostics
 }
 
@@ -1416,6 +1432,8 @@ fn resolve_expression_module_places(
         | ScalarExpression::Member { .. }
         | ScalarExpression::Integer { .. }
         | ScalarExpression::InvalidInteger { .. }
+        | ScalarExpression::Float { .. }
+        | ScalarExpression::InvalidFloat { .. }
         | ScalarExpression::Boolean { .. }
         | ScalarExpression::Char { .. }
         | ScalarExpression::Utf8 { .. } => {}
@@ -1495,6 +1513,8 @@ fn validate_module_type(
         | ScalarType::U32
         | ScalarType::U64
         | ScalarType::U128
+        | ScalarType::F32
+        | ScalarType::F64
         | ScalarType::Char
         | ScalarType::ArtifactId
         | ScalarType::Utf8 => {}
@@ -1624,6 +1644,8 @@ fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         ScalarExpression::Name { span, .. }
         | ScalarExpression::Integer { span, .. }
         | ScalarExpression::InvalidInteger { span, .. }
+        | ScalarExpression::Float { span, .. }
+        | ScalarExpression::InvalidFloat { span }
         | ScalarExpression::Boolean { span, .. }
         | ScalarExpression::Char { span, .. }
         | ScalarExpression::Utf8 { span, .. }
@@ -2376,6 +2398,8 @@ fn expression_type_in_module(
             validate_integer_range(module, value, *span, diagnostics);
             ScalarType::I32
         }
+        ScalarExpression::Float { .. } => ScalarType::Error,
+        ScalarExpression::InvalidFloat { .. } => ScalarType::Error,
         ScalarExpression::InvalidInteger {
             span: _,
             error_span,
@@ -2926,6 +2950,22 @@ fn expression_type_in_module_expected(
             return expected.clone();
         }
     }
+    if let ScalarExpression::Float { .. } = expression {
+        if matches!(expected, Some(ScalarType::F32 | ScalarType::F64)) {
+            if let ScalarExpression::Float { value, span, .. } = expression {
+                if matches!(expected, Some(ScalarType::F32)) && !(*value as f32).is_finite() {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0010",
+                        "floating-point literal is outside the f32 range",
+                        *span,
+                    ));
+                    return ScalarType::Error;
+                }
+            }
+            return expected.cloned().expect("float context");
+        }
+    }
     if let ScalarExpression::Block(block) = expression {
         return block_type_in_module_expected(
             block,
@@ -2969,6 +3009,8 @@ fn expression_type_in_module_expected(
                     | ScalarType::U32
                     | ScalarType::U64
                     | ScalarType::U128
+                    | ScalarType::F32
+                    | ScalarType::F64
             )
         });
         let bool_context = ScalarType::Bool;
@@ -2987,6 +3029,52 @@ fn expression_type_in_module_expected(
             let left_type = expression_type_in_module_expected(
                 left,
                 Some(&right_type),
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            );
+            (left_type, right_type)
+        } else if comparison && matches!(left.as_ref(), ScalarExpression::Float { .. }) {
+            let right_type = expression_type_in_module(
+                right,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            );
+            let left_type = expression_type_in_module_expected(
+                left,
+                Some(&right_type),
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            );
+            (left_type, right_type)
+        } else if comparison && matches!(right.as_ref(), ScalarExpression::Float { .. }) {
+            let left_type = expression_type_in_module(
+                left,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            );
+            let right_type = expression_type_in_module_expected(
+                right,
+                Some(&left_type),
                 scope,
                 visible_names,
                 folded_names,
@@ -3557,6 +3645,14 @@ fn layout_for_type(ty: &ScalarType) -> ScalarLayout {
             size: 16,
             alignment: 16,
         },
+        ScalarType::F32 => ScalarLayout {
+            size: 4,
+            alignment: 4,
+        },
+        ScalarType::F64 => ScalarLayout {
+            size: 8,
+            alignment: 8,
+        },
         ScalarType::RawPointer(_) | ScalarType::ArtifactId => ScalarLayout {
             size: ScalarTargetLayout::WASM32.pointer_size,
             alignment: ScalarTargetLayout::WASM32.pointer_alignment,
@@ -3800,6 +3896,8 @@ fn type_from_name(value: &str, span: ByteSpan) -> ScalarType {
         "u32" => ScalarType::U32,
         "u64" => ScalarType::U64,
         "u128" => ScalarType::U128,
+        "f32" => ScalarType::F32,
+        "f64" => ScalarType::F64,
         "char" => ScalarType::Char,
         "utf8" => ScalarType::Utf8,
         "artifact_id" => ScalarType::ArtifactId,
@@ -3972,6 +4070,51 @@ fn integer_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
                 } else {
                     None
                 }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn parse_float(text: &str) -> Option<f64> {
+    if text.starts_with('_') || text.ends_with('_') || text.contains("__") {
+        return None;
+    }
+    let mut previous = None;
+    for character in text.chars() {
+        if character == '_'
+            && matches!(
+                previous,
+                None | Some('.') | Some('e') | Some('E') | Some('+') | Some('-')
+            )
+        {
+            return None;
+        }
+        previous = Some(character);
+    }
+    let value = text.replace('_', "").parse::<f64>().ok()?;
+    value.is_finite().then_some(value)
+}
+
+fn float_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
+    canonical
+        .root
+        .descendants_with_tokens()
+        .filter_map(|element| match element {
+            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Float => {
+                parse_float(token.text())
+                    .is_none()
+                    .then(|| super::Diagnostic {
+                        code: "B0010".to_owned(),
+                        severity: super::DiagnosticSeverity::Error,
+                        message: "invalid finite floating-point literal".to_owned(),
+                        labels: vec![super::DiagnosticLabel {
+                            kind: super::DiagnosticLabelKind::Primary,
+                            span: SourceSpan::new(canonical.source.clone(), token_span(&token)),
+                            message: "invalid finite floating-point literal".to_owned(),
+                        }],
+                        notes: Vec::new(),
+                    })
             }
             _ => None,
         })
@@ -4386,6 +4529,7 @@ fn semantic_children(node: &CstNode) -> Vec<NodeOrToken<CstNode, CstToken>> {
                 SyntaxKind::Identifier
                     | SyntaxKind::TypeName
                     | SyntaxKind::Integer
+                    | SyntaxKind::Float
                     | SyntaxKind::Char
                     | SyntaxKind::Boolean
                     | SyntaxKind::String
@@ -4430,6 +4574,17 @@ fn derive_element(element: &NodeOrToken<CstNode, CstToken>) -> ScalarExpression 
                         span,
                         error_span: None,
                     },
+                }
+            }
+            SyntaxKind::Float => {
+                let span = token_span(token);
+                match parse_float(token.text()) {
+                    Some(value) => ScalarExpression::Float {
+                        value,
+                        spelling: token.text().to_owned(),
+                        span,
+                    },
+                    None => ScalarExpression::InvalidFloat { span },
                 }
             }
             SyntaxKind::Char => {
@@ -4514,6 +4669,8 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
         ScalarExpression::Name { span, .. }
         | ScalarExpression::Member { span, .. }
         | ScalarExpression::Integer { span, .. }
+        | ScalarExpression::Float { span, .. }
+        | ScalarExpression::InvalidFloat { span }
         | ScalarExpression::InvalidInteger { span, .. }
         | ScalarExpression::Boolean { span, .. }
         | ScalarExpression::Char { span, .. }
@@ -4877,6 +5034,8 @@ impl StaticUseAnalyzer {
             }
             ScalarExpression::Integer { .. }
             | ScalarExpression::InvalidInteger { .. }
+            | ScalarExpression::Float { .. }
+            | ScalarExpression::InvalidFloat { .. }
             | ScalarExpression::Boolean { .. }
             | ScalarExpression::Char { .. }
             | ScalarExpression::Utf8 { .. } => {}
@@ -4962,6 +5121,8 @@ fn validate_type(
         | ScalarType::U32
         | ScalarType::U64
         | ScalarType::U128
+        | ScalarType::F32
+        | ScalarType::F64
         | ScalarType::Char
         | ScalarType::ArtifactId
         | ScalarType::Utf8 => {}
@@ -5302,6 +5463,8 @@ fn expression_type(
             validate_integer_range_program(program, value, *span, diagnostics);
             ScalarType::I32
         }
+        ScalarExpression::Float { .. } => ScalarType::Error,
+        ScalarExpression::InvalidFloat { .. } => ScalarType::Error,
         ScalarExpression::InvalidInteger {
             span: _,
             error_span,
@@ -5730,6 +5893,22 @@ fn expression_type_expected(
         }
         return expected.clone();
     }
+    if matches!(expression, ScalarExpression::Float { .. })
+        && matches!(expected, ScalarType::F32 | ScalarType::F64)
+    {
+        if let ScalarExpression::Float { value, span, .. } = expression {
+            if *expected == ScalarType::F32 && !(*value as f32).is_finite() {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0010",
+                    "floating-point literal is outside the f32 range",
+                    *span,
+                ));
+                return ScalarType::Error;
+            }
+        }
+        return expected.clone();
+    }
     if let ScalarExpression::Block(block) = expression {
         return block_type_expected(
             block,
@@ -5771,6 +5950,8 @@ fn expression_type_expected(
                 | ScalarType::U32
                 | ScalarType::U64
                 | ScalarType::U128
+                | ScalarType::F32
+                | ScalarType::F64
         );
         let bool_context = ScalarType::Bool;
         let (left_type, right_type) = if comparison && is_null_expression(left) {
@@ -5786,6 +5967,48 @@ fn expression_type_expected(
             let left_type = expression_type_expected(
                 left,
                 &right_type,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            (left_type, right_type)
+        } else if comparison && matches!(left.as_ref(), ScalarExpression::Float { .. }) {
+            let right_type = expression_type(
+                right,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            let left_type = expression_type_expected(
+                left,
+                &right_type,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            (left_type, right_type)
+        } else if comparison && matches!(right.as_ref(), ScalarExpression::Float { .. }) {
+            let left_type = expression_type(
+                left,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            let right_type = expression_type_expected(
+                right,
+                &left_type,
                 scope,
                 visible_names,
                 folded_names,
@@ -8311,5 +8534,64 @@ u128 j = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
             }
             _ => true,
         }));
+    }
+
+    #[test]
+    fn derives_contextual_finite_float_literals_across_scalar_positions() {
+        let text = "%%start\nf32(f32) narrow = fn(value) { value };\nf64(f64) wide = fn(value) { value };\nenv = extern wasm \"env\" { unit(f32, f64) consume; };\nf32 first = 1_2.5e-1;\nf64 second = 2E+3;\nf32 sum = first + 2.5;\nbool ordered = second < 3e3;\nf32 echoed = narrow(4e-1);\nf64 widened = wide(5.0);\nenv.consume(6.0, 7e1);\n%%end";
+        let result = validate_text(text);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(first) = &result.program.items[3] else {
+            panic!("first float binding")
+        };
+        let ScalarExpression::Float { spelling, span, .. } = &first.value else {
+            panic!("first float literal")
+        };
+        assert_eq!(spelling, "1_2.5e-1");
+        let start = text.find(spelling).expect("float literal") as u32;
+        assert_eq!(*span, ByteSpan::new(start, start + spelling.len() as u32));
+        assert_eq!(first.declared_type, ScalarType::F32);
+        let ScalarItem::Binding(second) = &result.program.items[4] else {
+            panic!("second float binding")
+        };
+        assert_eq!(second.declared_type, ScalarType::F64);
+    }
+
+    #[test]
+    fn rejects_invalid_and_out_of_range_float_literals_at_literal_spans() {
+        for literal in ["1__2.0", "1._2", "1e_2", "1e400"] {
+            let text = format!("%%start\nf64 value = {literal};\n%%end");
+            let result = validate_text(&text);
+            let diagnostic = result
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "B0010")
+                .expect("float diagnostic");
+            let start = text.find(literal).expect("float literal") as u32;
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(start, start + literal.len() as u32)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_float_width_and_integer_float_mismatches() {
+        for text in [
+            "%%start\nf32 narrow = 1.0;\nf64 wide = narrow;\n%%end",
+            "%%start\nf64 wide = 1.0;\nf32 narrow = wide;\n%%end",
+            "%%start\ni32 integer = 1;\nf32 decimal = integer;\n%%end",
+            "%%start\nf64 decimal = 1.0;\ni32 integer = decimal;\n%%end",
+        ] {
+            let result = validate_text(text);
+            assert!(
+                result
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003"),
+                "{text}: {:?}",
+                result.diagnostics
+            );
+        }
     }
 }

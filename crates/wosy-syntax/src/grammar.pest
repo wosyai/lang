@@ -47,7 +47,7 @@ logical_and = { comparison ~ (and_operator ~ comparison)* }
 comparison = { additive ~ (comparison_operator ~ additive)* }
 additive = { multiplicative ~ (add_operator ~ multiplicative)* }
 multiplicative = { primary ~ (multiply_operator ~ primary)* }
-primary = { call | raw_address | field_access | dereference | struct_literal | boolean | identifier | integer | char | string | parenthesized }
+primary = { call | raw_address | field_access | dereference | struct_literal | boolean | identifier | float | integer | char | string | parenthesized }
 parenthesized = { "(" ~ expression ~ ")" }
 struct_literal = { "{" ~ struct_literal_field* ~ "}" }
 struct_literal_field = { "." ~ identifier ~ "=" ~ expression ~ ";" }
@@ -68,6 +68,7 @@ multiply_operator = { "*" | "/" | "%" }
 operator = { or_operator | and_operator | comparison_operator | add_operator | multiply_operator }
 boolean = { "true" | "false" }
 integer = @{ ("0x" | "0X") ~ (ASCII_ALPHANUMERIC | "_")* | ("0b" | "0B") ~ (ASCII_ALPHANUMERIC | "_")* | ("0o" | "0O") ~ (ASCII_ALPHANUMERIC | "_")* | ASCII_DIGIT ~ (ASCII_ALPHANUMERIC | "_")* }
+float = @{ ((ASCII_DIGIT | "_")+ ~ "." ~ (ASCII_DIGIT | "_")* ~ (("e" | "E") ~ ("+" | "-")? ~ (ASCII_ALPHANUMERIC | "_")*)?) | ((ASCII_DIGIT | "_")+ ~ ("e" | "E") ~ ("+" | "-")? ~ (ASCII_ALPHANUMERIC | "_")*) }
 string = @{ "\"" ~ (string_escape | malformed_string_escape | ! ("\"" | "\\" | "\r" | "\n") ~ ANY)* ~ "\"" }
 string_escape = { "\\" ~ ("\\" | "\"" | "'" | "n" | "r" | "t" | "0" | ("u{" ~ ASCII_HEX_DIGIT+ ~ "}")) }
 malformed_string_escape = { "\\" ~ (! ("\"" | "\\" | "\r" | "\n") ~ ANY)+ }
