@@ -1,5 +1,6 @@
 [package]
 name = "scalar_base_invalid_type"
+default_target = "app"
 
 [comments]
 categories = []

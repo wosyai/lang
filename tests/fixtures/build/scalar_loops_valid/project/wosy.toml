@@ -1,5 +1,6 @@
 [package]
 name = "scalar_loops_valid"
+default_target = "app"
 
 [comments]
 categories = []

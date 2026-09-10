@@ -1,5 +1,6 @@
 [package]
 name = "visible_binding_collisions_valid"
+default_target = "app"
 
 [comments]
 categories = []

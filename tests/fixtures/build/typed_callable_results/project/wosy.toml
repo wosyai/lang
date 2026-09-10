@@ -1,5 +1,6 @@
 [package]
 name = "typed_callable_results"
+default_target = "app"
 
 [comments]
 categories = []

@@ -1,5 +1,6 @@
 [package]
 name = "top_level_storage"
+default_target = "app"
 
 [comments]
 categories = []

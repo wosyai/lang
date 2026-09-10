@@ -1,5 +1,6 @@
 [package]
 name = "module_unit_effects"
+default_target = "app"
 
 [comments]
 categories = []

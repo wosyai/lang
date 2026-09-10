@@ -96,7 +96,7 @@ fn run_case(case: &Path) -> Result<(), String> {
             && has_source_selector
         {
             let status = Command::new(&binary)
-                .args(["build", "app"])
+                .args(["build"])
                 .current_dir(&temporary)
                 .status()
                 .map_err(|error| error.to_string())?;

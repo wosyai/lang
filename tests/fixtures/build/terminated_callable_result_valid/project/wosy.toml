@@ -1,5 +1,6 @@
 [package]
 name = "terminated_callable_result_valid"
+default_target = "app"
 
 [comments]
 categories = []

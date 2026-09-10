@@ -1,15 +1,15 @@
 [[steps]]
-command = ["wosy", "build", "app"]
+command = ["wosy", "build"]
 exit = 0
 
 [[assert]]
-command = ["wosy", "run", "app"]
+command = ["wosy", "run"]
 exit = 0
 stdout = "expected/empty"
 stderr = "expected/empty"
 
 [[assert]]
-command = ["wosy", "run", "app"]
+command = ["wosy", "run"]
 exit = 0
 file = ".wosy/artifacts/app/dev/main/partition.ll"
 contents = "expected/partition.ll"

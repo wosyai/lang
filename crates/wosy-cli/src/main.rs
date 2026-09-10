@@ -86,8 +86,9 @@ fn main() -> ExitCode {
 fn parse_command(target: Option<&str>) -> Result<bool, String> {
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
-    let target_name = target.unwrap_or("app");
-    let project = ProjectContext::load(&root, target_name)?;
+    let configuration = ProjectConfiguration::load(&root)?;
+    let target_name = configuration.resolve_target(target)?;
+    let project = ProjectContext::load(&root, &target_name)?;
     let source_path = project.source_path();
     let text = fs::read_to_string(&source_path)
         .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
@@ -123,16 +124,16 @@ fn parse_command(target: Option<&str>) -> Result<bool, String> {
 fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
-    let target_name = target.unwrap_or("app");
-    let project = ProjectContext::load(&root, target_name)?;
     let configuration = ProjectConfiguration::load(&root)?;
+    let target_name = configuration.resolve_target(target)?;
+    let project = ProjectContext::load(&root, &target_name)?;
     let (_target_config, artifact, artifact_profile, target_profile) =
-        configuration.artifact_profile(target_name, profile)?;
+        configuration.artifact_profile(&target_name, profile)?;
     let (llvm, source_identity) = compile_project(&root, &project)?;
     let artifact_name = &target_profile.main_artifact;
     let output_dir = root
         .join(".wosy/artifacts")
-        .join(target_name)
+        .join(&target_name)
         .join(profile)
         .join(artifact_name);
     fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
@@ -141,7 +142,7 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let identity = artifact_identity(
         &root,
         &configuration,
-        target_name,
+        &target_name,
         profile,
         artifact,
         artifact_profile,
@@ -178,19 +179,19 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
 fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Result<u8, String> {
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
-    let target_name = target.unwrap_or("app");
-    let project = ProjectContext::load(&root, target_name)?;
     let configuration = ProjectConfiguration::load(&root)?;
+    let target_name = configuration.resolve_target(target)?;
+    let project = ProjectContext::load(&root, &target_name)?;
     let (_target_config, artifact, artifact_profile, target_profile) =
-        configuration.artifact_profile(target_name, profile)?;
+        configuration.artifact_profile(&target_name, profile)?;
     let manifest_path =
-        artifact_manifest_path(&root, target_name, profile, &target_profile.main_artifact);
+        artifact_manifest_path(&root, &target_name, profile, &target_profile.main_artifact);
     let manifest = load_artifact_manifest(&manifest_path)?;
     let (llvm, source_identity) = compile_project(&root, &project)?;
     let expected = artifact_identity(
         &root,
         &configuration,
-        target_name,
+        &target_name,
         profile,
         artifact,
         artifact_profile,

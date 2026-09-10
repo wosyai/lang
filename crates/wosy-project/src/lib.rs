@@ -325,6 +325,7 @@ pub struct TargetConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProjectConfiguration {
+    pub default_target: String,
     pub builders: std::collections::BTreeMap<String, BuilderConfig>,
     pub runners: std::collections::BTreeMap<String, RunnerConfig>,
     pub targets: std::collections::BTreeMap<String, TargetConfig>,
@@ -337,6 +338,11 @@ impl ProjectConfiguration {
         let document = content
             .parse::<DocumentMut>()
             .map_err(|error| error.to_string())?;
+        let package = document
+            .get("package")
+            .and_then(Item::as_table)
+            .ok_or_else(|| "package is missing".to_owned())?;
+        let default_target = scalar_string(package, "default_target")?;
         let builders = named_commands(document.get("builders"), "builder")?;
         let runners = named_runners(document.get("runners"))?;
         let targets_table = document
@@ -365,10 +371,23 @@ impl ProjectConfiguration {
             );
         }
         Ok(Self {
+            default_target,
             builders,
             runners,
             targets,
         })
+    }
+
+    pub fn resolve_target(&self, target: Option<&str>) -> Result<String, String> {
+        let target = target.unwrap_or(self.default_target.as_str());
+        self.target_config(target)?;
+        Ok(target.to_owned())
+    }
+
+    fn target_config(&self, target: &str) -> Result<&TargetConfig, String> {
+        self.targets
+            .get(target)
+            .ok_or_else(|| format!("target {target} is missing from wosy.toml"))
     }
 
     pub fn artifact_profile(
@@ -384,10 +403,7 @@ impl ProjectConfiguration {
         ),
         String,
     > {
-        let target_config = self
-            .targets
-            .get(target)
-            .ok_or_else(|| format!("target {target} is missing from wosy.toml"))?;
+        let target_config = self.target_config(target)?;
         let target_profile = target_config
             .profiles
             .get(profile)
@@ -731,6 +747,34 @@ mod tests {
 
         assert_eq!(value["package"], "app");
         assert_eq!(value["comment_categories"][0], "INTENT");
+    }
+
+    #[test]
+    fn configuration_resolves_required_default_target() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/build/scalar_base/project");
+        let configuration = ProjectConfiguration::load(&root).expect("project configuration");
+
+        assert_eq!(configuration.default_target, "app");
+        assert_eq!(configuration.resolve_target(None), Ok("app".to_owned()));
+        assert_eq!(
+            configuration.resolve_target(Some("app")),
+            Ok("app".to_owned())
+        );
+        assert_eq!(
+            configuration.resolve_target(Some("missing")),
+            Err("target missing is missing from wosy.toml".to_owned())
+        );
+        let invalid = ProjectConfiguration {
+            default_target: "missing".to_owned(),
+            builders: BTreeMap::new(),
+            runners: BTreeMap::new(),
+            targets: BTreeMap::new(),
+        };
+        assert_eq!(
+            invalid.resolve_target(None),
+            Err("target missing is missing from wosy.toml".to_owned())
+        );
     }
 
     #[test]

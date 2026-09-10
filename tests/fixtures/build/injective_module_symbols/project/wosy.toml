@@ -1,5 +1,6 @@
 [package]
 name = "injective_module_symbols"
+default_target = "app"
 
 [comments]
 categories = []

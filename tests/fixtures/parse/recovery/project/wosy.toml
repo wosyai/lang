@@ -1,8 +1,25 @@
 [package]
 name = "fixture-recovery"
+default_target = "app"
 
 [comments]
 categories = ["INTENT"]
 
+[builders]
+
+[runners]
+
 [targets.app]
 root = "src/main.w"
+
+[targets.app.artifacts.main]
+artifact = "Parse"
+
+[targets.app.artifacts.main.profiles.dev]
+backend = "parse"
+output = "none"
+builder = "none"
+run_runner = "none"
+
+[targets.app.profiles.dev]
+main_artifact = "main"

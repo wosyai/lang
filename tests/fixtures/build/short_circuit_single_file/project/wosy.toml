@@ -1,5 +1,6 @@
 [package]
 name = "short_circuit_single_file"
+default_target = "app"
 
 [comments]
 categories = []

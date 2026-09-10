@@ -1,5 +1,5 @@
 [[steps]]
-command = ["wosy", "parse", "app"]
+command = ["wosy", "parse"]
 exit = 0
 
 [[assert]]

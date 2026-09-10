@@ -1,5 +1,6 @@
 [package]
 name = "unused_binding_invalid"
+default_target = "app"
 
 [comments]
 categories = []

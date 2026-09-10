@@ -1,5 +1,6 @@
 [package]
 name = "local_namespace_initialization_order"
+default_target = "app"
 
 [comments]
 categories = []

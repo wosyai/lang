@@ -1,5 +1,6 @@
 [package]
 name = "app"
+default_target = "app"
 
 [comments]
 categories = []

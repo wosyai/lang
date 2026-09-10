@@ -1,5 +1,6 @@
 [package]
 name = "scalar_case_collisions_invalid"
+default_target = "app"
 
 [comments]
 categories = []

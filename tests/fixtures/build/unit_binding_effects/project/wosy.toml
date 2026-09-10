@@ -1,5 +1,6 @@
 [package]
 name = "unit_binding_effects"
+default_target = "app"
 
 [comments]
 categories = []
