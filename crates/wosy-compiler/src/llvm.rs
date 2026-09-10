@@ -13,6 +13,7 @@ use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 use serde::{Deserialize, Serialize};
 
+use crate::scalar::ScalarFieldReference;
 use crate::{
     BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarExpression,
     ScalarFunction, ScalarItem, ScalarModule, ScalarProjectValidation, ScalarStruct, ScalarType,
@@ -214,6 +215,10 @@ pub fn emit_scalar_project_llvm(
                 .ok_or_else(|| format!("missing module {}", source.path))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let all_structs = modules
+        .iter()
+        .flat_map(|module| module.structs.iter().cloned())
+        .collect::<Vec<_>>();
     let module_name = modules
         .first()
         .ok_or_else(|| "project has no reachable modules".to_owned())?
@@ -235,7 +240,7 @@ pub fn emit_scalar_project_llvm(
                     continue;
                 }
                 let name = project_global_name(&source_module.source, &binding.name);
-                let ty = storage_type(&context, &binding.declared_type, &source_module.structs)?;
+                let ty = storage_type(&context, &binding.declared_type, &all_structs)?;
                 let global = module.add_global(ty, None, &name);
                 global.set_linkage(Linkage::Internal);
                 global.set_initializer(&ty.const_zero());
@@ -292,7 +297,7 @@ pub fn emit_scalar_project_llvm(
             &globals,
             &name,
             &module,
-            &source_module.structs,
+            &all_structs,
         )?;
     }
     emit_project_main(
@@ -302,7 +307,7 @@ pub fn emit_scalar_project_llvm(
         &modules,
         &globals,
         &module,
-        &modules.first().expect("project has a root module").structs,
+        &all_structs,
     )?;
     finish_partition(
         ManuallyDrop::into_inner(module),
@@ -550,8 +555,8 @@ fn storage_type<'ctx>(
     match ty {
         ScalarType::Struct(id) => {
             let structure = structs
-                .get(id.index)
-                .filter(|structure| structure.id == *id)
+                .iter()
+                .find(|structure| structure.id == *id)
                 .ok_or_else(|| format!("unknown LLVM struct {}", id.index))?;
             let size = u32::try_from(structure.layout.size)
                 .map_err(|_| "struct layout exceeds LLVM array size")?;
@@ -593,27 +598,9 @@ fn structure<'a>(
     id: crate::ScalarStructId,
 ) -> Result<&'a ScalarStruct, String> {
     structs
-        .get(id.index)
-        .filter(|structure| structure.id == id)
-        .ok_or_else(|| format!("unknown LLVM struct {}", id.index))
-}
-
-fn struct_for_literal<'a>(
-    structs: &'a [ScalarStruct],
-    fields: &[crate::ScalarStructLiteralField],
-) -> Result<&'a ScalarStruct, String> {
-    structs
         .iter()
-        .find(|structure| {
-            structure.fields.len() == fields.len()
-                && fields.iter().all(|field| {
-                    structure
-                        .fields
-                        .iter()
-                        .any(|candidate| candidate.name == field.name)
-                })
-        })
-        .ok_or_else(|| "cannot resolve LLVM struct literal layout".to_owned())
+        .find(|structure| structure.id == id)
+        .ok_or_else(|| format!("unknown LLVM struct {}", id.index))
 }
 
 fn place_pointer<'ctx, 'module>(
@@ -641,7 +628,10 @@ fn place_pointer<'ctx, 'module>(
         }
         crate::ScalarPlace::Field { base, field, .. } => {
             let base = place_pointer(context, state, base)?;
-            let structure = structure(state.structs, field.structure)?;
+            let ScalarFieldReference::Resolved(field) = field else {
+                return Err("unresolved LLVM struct field".to_owned());
+            };
+            let structure = structure(state.structs, field.structure.clone())?;
             let resolved = structure
                 .fields
                 .get(field.index)
@@ -669,13 +659,18 @@ fn emit_place_value<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     let pointer = place_pointer(context, state, place)?;
     let ty = match place {
-        crate::ScalarPlace::Field { field, .. } => structure(state.structs, field.structure)?
-            .fields
-            .get(field.index)
-            .filter(|candidate| candidate.id == *field)
-            .ok_or_else(|| format!("unknown LLVM struct field {}", field.index))?
-            .ty
-            .clone(),
+        crate::ScalarPlace::Field { field, .. } => {
+            let ScalarFieldReference::Resolved(field) = field else {
+                return Err("unresolved LLVM struct field".to_owned());
+            };
+            structure(state.structs, field.structure.clone())?
+                .fields
+                .get(field.index)
+                .filter(|candidate| candidate.id == *field)
+                .ok_or_else(|| format!("unknown LLVM struct field {}", field.index))?
+                .ty
+                .clone()
+        }
         crate::ScalarPlace::Name { name, .. } => state
             .storage
             .get(name)
@@ -723,7 +718,7 @@ fn struct_member_place<'ctx, 'module>(
     let Some(ScalarType::Struct(id)) = ty else {
         return Ok(None);
     };
-    let field = structure(state.structs, *id)?
+    let field = structure(state.structs, id.clone())?
         .fields
         .iter()
         .find(|field| field.name == name)
@@ -733,8 +728,7 @@ fn struct_member_place<'ctx, 'module>(
             name: receiver.to_owned(),
             span: wosy_syntax::ByteSpan::new(0, 0),
         }),
-        field: field.id,
-        field_name: name.to_owned(),
+        field: ScalarFieldReference::Resolved(field.id.clone()),
         span: wosy_syntax::ByteSpan::new(0, 0),
     }))
 }
@@ -742,9 +736,13 @@ fn struct_member_place<'ctx, 'module>(
 fn emit_struct_literal<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
+    expected: &crate::ScalarType,
     fields: &[crate::ScalarStructLiteralField],
 ) -> Result<EmitValue<'ctx>, String> {
-    let structure = struct_for_literal(state.structs, fields)?;
+    let crate::ScalarType::Struct(id) = expected else {
+        return Err("struct literal requires a resolved struct type".to_owned());
+    };
+    let structure = structure(state.structs, id.clone())?;
     let storage = context.i8_type().array_type(
         u32::try_from(structure.layout.size)
             .map_err(|_| "struct layout exceeds LLVM array size")?,
@@ -795,6 +793,9 @@ fn emit_typed_expression<'ctx, 'module>(
     expected: &ScalarType,
 ) -> Result<EmitValue<'ctx>, String> {
     match (expression, expected) {
+        (ScalarExpression::StructLiteral { fields, .. }, ScalarType::Struct(_)) => {
+            emit_struct_literal(context, state, expected, fields)
+        }
         (ScalarExpression::Integer { value, .. }, ScalarType::U8) => Ok(EmitValue::Basic(
             context
                 .i8_type()
@@ -967,7 +968,7 @@ fn store_value<'ctx, 'module>(
     value: EmitValue<'ctx>,
 ) -> Result<(), String> {
     if let ScalarType::Struct(id) = ty {
-        let structure = structure(state.structs, *id)?;
+        let structure = structure(state.structs, id.clone())?;
         let source = take_basic(value)?.into_pointer_value();
         let aggregate = context.i8_type().array_type(
             u32::try_from(structure.layout.size)
@@ -1094,7 +1095,12 @@ fn emit_main<'ctx, 'module>(
     for item in items {
         match item {
             ScalarItem::Binding(binding) => {
-                let value = emit_expression(context, &mut state, &binding.value)?;
+                let value = emit_typed_expression(
+                    context,
+                    &mut state,
+                    &binding.value,
+                    &binding.declared_type,
+                )?;
                 if binding.receivers.len() == 2 {
                     materialize_utf8_view(context, &mut state, &binding.receivers, value)?;
                     continue;
@@ -1249,8 +1255,6 @@ fn initialize_project_module<'ctx, 'module>(
     let values = state.values.clone();
     let storage = state.storage.clone();
     let utf8_lengths = state.utf8_lengths.clone();
-    let current_structs = state.structs;
-    state.structs = &module.structs;
     let current_module_globals = module_globals(module, globals);
     let current_globals = std::mem::replace(&mut state.globals, current_module_globals);
     state.values.clear();
@@ -1275,8 +1279,14 @@ fn initialize_project_module<'ctx, 'module>(
                 state.globals = module_globals(module, globals);
             }
             ScalarItem::Binding(binding) => {
-                let value =
-                    emit_project_expression(context, state, &binding.value, module, modules)?;
+                let value = emit_project_typed_expression(
+                    context,
+                    state,
+                    &binding.value,
+                    &binding.declared_type,
+                    module,
+                    modules,
+                )?;
                 if binding.receivers.len() == 2 {
                     materialize_utf8_view(context, state, &binding.receivers, value)?;
                     continue;
@@ -1310,7 +1320,6 @@ fn initialize_project_module<'ctx, 'module>(
     }
 
     state.globals = current_globals;
-    state.structs = current_structs;
     state.values = values;
     state.storage = storage;
     state.utf8_lengths = utf8_lengths;
@@ -1329,7 +1338,8 @@ fn emit_block<'ctx, 'module>(
     for item in &block.items {
         result = match item {
             ScalarBlockItem::LocalBinding(binding) => {
-                let value = emit_expression(context, state, &binding.value)?;
+                let value =
+                    emit_typed_expression(context, state, &binding.value, &binding.declared_type)?;
                 if binding.declared_type == ScalarType::Unit {
                     state.values.insert(binding.name.clone(), EmitValue::Unit);
                     EmitValue::Unit
@@ -1387,8 +1397,14 @@ fn emit_project_block<'ctx, 'module>(
     for item in &block.items {
         result = match item {
             ScalarBlockItem::LocalBinding(binding) => {
-                let value =
-                    emit_project_expression(context, state, &binding.value, module, modules)?;
+                let value = emit_project_typed_expression(
+                    context,
+                    state,
+                    &binding.value,
+                    &binding.declared_type,
+                    module,
+                    modules,
+                )?;
                 if binding.declared_type == ScalarType::Unit {
                     state.values.insert(binding.name.clone(), EmitValue::Unit);
                     EmitValue::Unit
@@ -1559,7 +1575,8 @@ fn emit_block_item<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            let value = emit_expression(context, state, &binding.value)?;
+            let value =
+                emit_typed_expression(context, state, &binding.value, &binding.declared_type)?;
             if binding.declared_type == ScalarType::Unit {
                 state.values.insert(binding.name.clone(), EmitValue::Unit);
                 return Ok(EmitValue::Unit);
@@ -1602,7 +1619,14 @@ fn emit_project_block_item<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            let value = emit_project_expression(context, state, &binding.value, module, modules)?;
+            let value = emit_project_typed_expression(
+                context,
+                state,
+                &binding.value,
+                &binding.declared_type,
+                module,
+                modules,
+            )?;
             if binding.declared_type == ScalarType::Unit {
                 state.values.insert(binding.name.clone(), EmitValue::Unit);
                 return Ok(EmitValue::Unit);
@@ -1829,9 +1853,25 @@ fn emit_expression<'ctx, 'module>(
                 .map_err(builder_error)?
                 .into(),
         )),
-        ScalarExpression::StructLiteral { fields, .. } => {
-            emit_struct_literal(context, state, fields)
+        ScalarExpression::StructLiteral { .. } => {
+            return Err("struct literal requires an expected struct type".to_owned())
         }
+    }
+}
+
+fn emit_project_typed_expression<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
+    expected: &ScalarType,
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    match expression {
+        ScalarExpression::StructLiteral { fields, .. } => {
+            emit_struct_literal(context, state, expected, fields)
+        }
+        _ => emit_project_expression(context, state, expression, module, modules),
     }
 }
 
@@ -1853,6 +1893,9 @@ fn emit_project_expression<'ctx, 'module>(
                 return Ok(EmitValue::Unit);
             }
             let global = global.ok_or_else(|| format!("unknown LLVM member storage {name}"))?;
+            if matches!(ty, ScalarType::Struct(_)) {
+                return Ok(EmitValue::Basic(global.as_pointer_value().into()));
+            }
             Ok(EmitValue::Basic(
                 state
                     .builder
@@ -1994,8 +2037,8 @@ fn emit_project_expression<'ctx, 'module>(
                 .map_err(builder_error)?
                 .into(),
         )),
-        ScalarExpression::StructLiteral { fields, .. } => {
-            emit_struct_literal(context, state, fields)
+        ScalarExpression::StructLiteral { .. } => {
+            return Err("struct literal requires an expected struct type".to_owned())
         }
     }
 }
@@ -3222,6 +3265,64 @@ child.marker = child.touch();
             "{text}"
         );
         assert!(text.contains("ptrtoint"), "{text}");
+    }
+
+    #[test]
+    fn emits_imported_struct_layout_and_field_address() {
+        let child_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/child.w".into(),
+            "r1".into(),
+        );
+        let child = derive_scalar_program(
+            &parse_source(
+                child_source.clone(),
+                "%%start\nstruct Pair {\n\tu8 first;\n\tu32 second;\n}\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let root_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let root = derive_scalar_program(
+            &parse_source(
+                root_source.clone(),
+                "%%start\nchild = namespace package \"src/child.w\";\nchild.Pair item = { .first = 1; .second = 2; };\nunsafe { *?child.Pair pointer = &?item; *?u32 address = &?(*pointer).second; };\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let namespace = match &root.items[0] {
+            crate::ScalarItem::Namespace(namespace) => (namespace.binding.clone(), namespace.span),
+            _ => panic!("namespace item"),
+        };
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    root,
+                    vec![crate::ScalarNamespaceBinding {
+                        binding: namespace.0,
+                        target: child_source.clone(),
+                        span: namespace.1,
+                    }],
+                ),
+                ScalarModule::from_program(child, Vec::new()),
+            ],
+            vec![root_source, child_source],
+        ));
+        let text = emit_scalar_project_llvm(&validation)
+            .expect("imported struct LLVM")
+            .to_text();
+        assert!(text.contains("[8 x i8]"), "{text}");
+        assert!(text.contains("getelementptr inbounds i8"), "{text}");
+        assert!(text.contains("i8 4"), "{text}");
     }
 
     #[test]
