@@ -30,6 +30,8 @@ pub enum LlvmValueType {
     I8,
     I64,
     I128,
+    Char,
+    ArtifactId,
     Pointer,
 }
 
@@ -397,6 +399,8 @@ fn llvm_text_type(ty: LlvmValueType) -> &'static str {
         LlvmValueType::I32 => "i32",
         LlvmValueType::I64 => "i64",
         LlvmValueType::I128 => "i128",
+        LlvmValueType::Char => "i32",
+        LlvmValueType::ArtifactId => "ptr",
         LlvmValueType::Pointer => "ptr",
     }
 }
@@ -528,6 +532,10 @@ fn function_type<'ctx>(
         ScalarType::Utf8 | ScalarType::RawPointer(_) => {
             context.i32_type().fn_type(&parameters, false)
         }
+        ScalarType::Char => context.i32_type().fn_type(&parameters, false),
+        ScalarType::ArtifactId => context
+            .ptr_type(AddressSpace::default())
+            .fn_type(&parameters, false),
         ScalarType::I8
         | ScalarType::I16
         | ScalarType::I32
@@ -571,6 +579,8 @@ fn basic_type<'ctx>(
         ScalarType::Bool => Ok(context.bool_type().into()),
         ty if integer_width(ty).is_some() => Ok(integer_type(context, ty)?.into()),
         ScalarType::Utf8 => Ok(context.i32_type().into()),
+        ScalarType::Char => Ok(context.i32_type().into()),
+        ScalarType::ArtifactId => Ok(context.ptr_type(AddressSpace::default()).into()),
         ScalarType::RawPointer(_) => Ok(context.i32_type().into()),
         ScalarType::Struct(_) => Ok(context.ptr_type(AddressSpace::default()).into()),
         _ => Err("unit is only valid as a function result".into()),
@@ -604,6 +614,8 @@ fn value_type(ty: &ScalarType) -> Result<LlvmValueType, String> {
         ScalarType::I32 | ScalarType::U32 => Ok(LlvmValueType::I32),
         ScalarType::I64 | ScalarType::U64 => Ok(LlvmValueType::I64),
         ScalarType::I128 | ScalarType::U128 => Ok(LlvmValueType::I128),
+        ScalarType::Char => Ok(LlvmValueType::Char),
+        ScalarType::ArtifactId => Ok(LlvmValueType::ArtifactId),
         ScalarType::RawPointer(_) => Ok(LlvmValueType::Pointer),
         ScalarType::Struct(_) => Ok(LlvmValueType::Pointer),
         _ => Err("unsupported LLVM scalar type".into()),
@@ -1871,6 +1883,12 @@ fn emit_expression<'ctx, 'module>(
                 .const_int(u64::from(*value), false)
                 .into(),
         )),
+        ScalarExpression::Char { value, .. } => Ok(EmitValue::Basic(
+            context
+                .i32_type()
+                .const_int(u64::from(*value as u32), false)
+                .into(),
+        )),
         ScalarExpression::Utf8 { value, .. } => emit_utf8_literal(context, state, value),
         ScalarExpression::Binary {
             operator,
@@ -2045,6 +2063,12 @@ fn emit_project_expression<'ctx, 'module>(
             context
                 .bool_type()
                 .const_int(u64::from(*value), false)
+                .into(),
+        )),
+        ScalarExpression::Char { value, .. } => Ok(EmitValue::Basic(
+            context
+                .i32_type()
+                .const_int(u64::from(*value as u32), false)
                 .into(),
         )),
         ScalarExpression::Utf8 { value, .. } => emit_utf8_literal(context, state, value),
@@ -2549,6 +2573,7 @@ fn emit_return<'ctx, 'module>(
             state.builder.build_return(None).map_err(builder_error)?;
         }
         ScalarType::Bool
+        | ScalarType::Char
         | ScalarType::I8
         | ScalarType::I16
         | ScalarType::I32
@@ -2560,6 +2585,7 @@ fn emit_return<'ctx, 'module>(
         | ScalarType::U64
         | ScalarType::U128
         | ScalarType::RawPointer(_)
+        | ScalarType::ArtifactId
         | ScalarType::Struct(_) => {
             let value = take_basic(value)?;
             state
@@ -2694,6 +2720,33 @@ mod tests {
         assert!(text.contains("call i1 @flag"));
         assert!(text.contains("call void @touch"));
         assert!(text.contains("call i32 @count"));
+    }
+
+    #[test]
+    fn emits_distinct_char_and_artifact_id_primitive_signatures() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\nenv = extern wasm \"primitive\" { char() read_char; artifact_id() read_artifact; };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let partition = emit_scalar_llvm(&validation).expect("primitive LLVM");
+        let text = partition.to_text();
+        assert!(text.contains("declare i32 @read_char() #0"));
+        assert!(text.contains("declare ptr @read_artifact() #0"));
     }
 
     #[test]

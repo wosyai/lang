@@ -40,6 +40,7 @@ pub enum SyntaxKind {
     Binary,
     Operator,
     Integer,
+    Char,
     String,
     Punctuation,
     NamespaceDecl,
@@ -106,32 +107,33 @@ impl Language for WosyLanguage {
             27 => SyntaxKind::Binary,
             28 => SyntaxKind::Operator,
             29 => SyntaxKind::Integer,
-            30 => SyntaxKind::String,
-            31 => SyntaxKind::Punctuation,
-            32 => SyntaxKind::NamespaceDecl,
-            33 => SyntaxKind::QualifiedCall,
-            34 => SyntaxKind::QualifiedMember,
-            35 => SyntaxKind::AssignmentTarget,
-            36 => SyntaxKind::LocalBinding,
-            37 => SyntaxKind::While,
-            38 => SyntaxKind::Assignment,
-            39 => SyntaxKind::TopLevelItem,
-            40 => SyntaxKind::StructDecl,
-            41 => SyntaxKind::StructField,
-            42 => SyntaxKind::CallableOutput,
-            43 => SyntaxKind::ReceiverList,
-            44 => SyntaxKind::Receiver,
-            45 => SyntaxKind::OutputList,
-            46 => SyntaxKind::AssignmentTargets,
-            47 => SyntaxKind::StructLiteral,
-            48 => SyntaxKind::StructLiteralField,
-            49 => SyntaxKind::FieldAccess,
-            50 => SyntaxKind::DereferencedField,
-            51 => SyntaxKind::Dereference,
-            52 => SyntaxKind::RawAddress,
-            53 => SyntaxKind::GenericTypeArguments,
-            54 => SyntaxKind::GenericTypeArgument,
-            55 => SyntaxKind::QualifiedType,
+            30 => SyntaxKind::Char,
+            31 => SyntaxKind::String,
+            32 => SyntaxKind::Punctuation,
+            33 => SyntaxKind::NamespaceDecl,
+            34 => SyntaxKind::QualifiedCall,
+            35 => SyntaxKind::QualifiedMember,
+            36 => SyntaxKind::AssignmentTarget,
+            37 => SyntaxKind::LocalBinding,
+            38 => SyntaxKind::While,
+            39 => SyntaxKind::Assignment,
+            40 => SyntaxKind::TopLevelItem,
+            41 => SyntaxKind::StructDecl,
+            42 => SyntaxKind::StructField,
+            43 => SyntaxKind::CallableOutput,
+            44 => SyntaxKind::ReceiverList,
+            45 => SyntaxKind::Receiver,
+            46 => SyntaxKind::OutputList,
+            47 => SyntaxKind::AssignmentTargets,
+            48 => SyntaxKind::StructLiteral,
+            49 => SyntaxKind::StructLiteralField,
+            50 => SyntaxKind::FieldAccess,
+            51 => SyntaxKind::DereferencedField,
+            52 => SyntaxKind::Dereference,
+            53 => SyntaxKind::RawAddress,
+            54 => SyntaxKind::GenericTypeArguments,
+            55 => SyntaxKind::GenericTypeArgument,
+            56 => SyntaxKind::QualifiedType,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -570,6 +572,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         | Rule::multiply_operator
         | Rule::operator => SyntaxKind::Operator,
         Rule::integer => SyntaxKind::Integer,
+        Rule::char => SyntaxKind::Char,
         Rule::string => SyntaxKind::String,
         Rule::comment => SyntaxKind::TypedComment,
         _ => SyntaxKind::Punctuation,
@@ -747,6 +750,7 @@ mod tests {
             SyntaxKind::Binary,
             SyntaxKind::Operator,
             SyntaxKind::Integer,
+            SyntaxKind::Char,
             SyntaxKind::String,
             SyntaxKind::Punctuation,
             SyntaxKind::StructDecl,
@@ -1117,5 +1121,27 @@ mod tests {
         assert_eq!(integers[0].0, "0xAB_CD");
         assert_eq!(integers[1].0, "0b1010_0011");
         assert_eq!(integers[2].0, "0o7_1");
+    }
+
+    #[test]
+    fn character_literals_are_structural_lossless_and_span_exact() {
+        let text = "%%start\nchar value = '\\u{1F600}';\nchar newline = '\\n';\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let literals = result
+            .root
+            .descendants_with_tokens()
+            .filter_map(|element| match element {
+                rowan::NodeOrToken::Token(token) if token.kind() == SyntaxKind::Char => Some((
+                    token.text().to_owned(),
+                    byte_span(&token.parent().expect("parent")),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(literals[0].0, "'\\u{1F600}'");
+        assert_eq!(literals[0].1, ByteSpan::new(21, 32));
+        assert_eq!(literals[1].0, "'\\n'");
     }
 }

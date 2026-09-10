@@ -22,7 +22,9 @@ pub enum ScalarType {
     U32,
     U64,
     U128,
+    Char,
     Utf8,
+    ArtifactId,
     RawPointer(Box<ScalarType>),
     Callable {
         outputs: ScalarOutputSequence,
@@ -260,6 +262,11 @@ pub enum ScalarExpression {
     },
     Boolean {
         value: bool,
+        span: ByteSpan,
+    },
+    Char {
+        value: char,
+        spelling: String,
         span: ByteSpan,
     },
     Utf8 {
@@ -530,6 +537,7 @@ pub fn derive_scalar_program(parse: &ParseResult) -> ScalarValidation {
 pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarValidation {
     let mut items = Vec::new();
     let mut diagnostics = string_diagnostics(canonical);
+    diagnostics.extend(char_diagnostics(canonical));
     diagnostics.extend(integer_diagnostics(canonical));
     let source_root = canonical
         .root
@@ -842,6 +850,7 @@ fn resolve_expression_places(
         | ScalarExpression::Integer { .. }
         | ScalarExpression::InvalidInteger { .. }
         | ScalarExpression::Boolean { .. }
+        | ScalarExpression::Char { .. }
         | ScalarExpression::Utf8 { .. } => {}
     }
 }
@@ -885,6 +894,7 @@ fn resolve_place(
 
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
     let mut diagnostics = string_diagnostics(canonical);
+    diagnostics.extend(char_diagnostics(canonical));
     diagnostics.extend(integer_diagnostics(canonical));
     diagnostics
 }
@@ -1407,6 +1417,7 @@ fn resolve_expression_module_places(
         | ScalarExpression::Integer { .. }
         | ScalarExpression::InvalidInteger { .. }
         | ScalarExpression::Boolean { .. }
+        | ScalarExpression::Char { .. }
         | ScalarExpression::Utf8 { .. } => {}
     }
 }
@@ -1484,6 +1495,8 @@ fn validate_module_type(
         | ScalarType::U32
         | ScalarType::U64
         | ScalarType::U128
+        | ScalarType::Char
+        | ScalarType::ArtifactId
         | ScalarType::Utf8 => {}
         ScalarType::RawPointer(inner)
             if matches!(inner.as_ref(), ScalarType::U8 | ScalarType::Struct(_)) => {}
@@ -1612,6 +1625,7 @@ fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::Integer { span, .. }
         | ScalarExpression::InvalidInteger { span, .. }
         | ScalarExpression::Boolean { span, .. }
+        | ScalarExpression::Char { span, .. }
         | ScalarExpression::Utf8 { span, .. }
         | ScalarExpression::RawAddress { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
@@ -2373,6 +2387,7 @@ fn expression_type_in_module(
             }
         }
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
+        ScalarExpression::Char { .. } => ScalarType::Char,
         ScalarExpression::Utf8 { .. } => ScalarType::Utf8,
         ScalarExpression::Binary {
             operator,
@@ -2457,6 +2472,46 @@ fn expression_type_in_module(
             type_arguments,
             ..
         } => {
+            if receiver.as_deref() == Some("core") && name == "this_artifact_id" {
+                if !arguments.is_empty() {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0004",
+                        "call argument arity does not match callable type",
+                        *span,
+                    ));
+                    return ScalarType::Error;
+                }
+                return ScalarType::ArtifactId;
+            }
+            if receiver.as_deref() == Some("core") && name == "declare_artifact" {
+                if arguments.len() != 1 {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0004",
+                        "call argument arity does not match callable type",
+                        *span,
+                    ));
+                    return ScalarType::Error;
+                }
+                let actual = expression_type_in_module_expected(
+                    &arguments[0],
+                    Some(&ScalarType::Utf8),
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+                expect_module_type(module, &ScalarType::Utf8, &actual, *span, diagnostics);
+                return if is_error_type(&actual) {
+                    ScalarType::Error
+                } else {
+                    ScalarType::ArtifactId
+                };
+            }
             if receiver.as_deref() == Some("core") && name == "cast" {
                 return type_core_cast_in_module(
                     type_arguments,
@@ -3490,7 +3545,7 @@ fn layout_for_type(ty: &ScalarType) -> ScalarLayout {
             size: 2,
             alignment: 2,
         },
-        ScalarType::I32 | ScalarType::U32 => ScalarLayout {
+        ScalarType::I32 | ScalarType::U32 | ScalarType::Char => ScalarLayout {
             size: 4,
             alignment: 4,
         },
@@ -3502,7 +3557,7 @@ fn layout_for_type(ty: &ScalarType) -> ScalarLayout {
             size: 16,
             alignment: 16,
         },
-        ScalarType::RawPointer(_) => ScalarLayout {
+        ScalarType::RawPointer(_) | ScalarType::ArtifactId => ScalarLayout {
             size: ScalarTargetLayout::WASM32.pointer_size,
             alignment: ScalarTargetLayout::WASM32.pointer_alignment,
         },
@@ -3745,7 +3800,9 @@ fn type_from_name(value: &str, span: ByteSpan) -> ScalarType {
         "u32" => ScalarType::U32,
         "u64" => ScalarType::U64,
         "u128" => ScalarType::U128,
+        "char" => ScalarType::Char,
         "utf8" => ScalarType::Utf8,
+        "artifact_id" => ScalarType::ArtifactId,
         value => ScalarType::Named {
             name: value.to_owned(),
             span,
@@ -3821,6 +3878,23 @@ fn decode_string(value: &str) -> Result<String, (usize, usize)> {
     Ok(decoded)
 }
 
+fn decode_char(value: &str) -> Result<char, (usize, usize)> {
+    let decoded = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .ok_or((0, value.len()))?;
+    let decoded = decode_string(&format!("\"{}\"", decoded))
+        .map_err(|(start, length)| (start.saturating_sub(1), length))?;
+    let mut characters = decoded.chars();
+    let character = characters
+        .next()
+        .ok_or((1, value.len().saturating_sub(2)))?;
+    if characters.next().is_some() {
+        return Err((1, value.len().saturating_sub(2)));
+    }
+    Ok(character)
+}
+
 fn string_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
     canonical
         .root
@@ -3840,6 +3914,34 @@ fn string_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
                                 string_error_span(&token, start, length),
                             ),
                             message: "invalid string literal".to_owned(),
+                        }],
+                        notes: Vec::new(),
+                    })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn char_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
+    canonical
+        .root
+        .descendants_with_tokens()
+        .filter_map(|element| match element {
+            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Char => {
+                decode_char(token.text())
+                    .err()
+                    .map(|(start, length)| super::Diagnostic {
+                        code: "B0003".to_owned(),
+                        severity: super::DiagnosticSeverity::Error,
+                        message: "invalid character literal".to_owned(),
+                        labels: vec![super::DiagnosticLabel {
+                            kind: super::DiagnosticLabelKind::Primary,
+                            span: SourceSpan::new(
+                                canonical.source.clone(),
+                                string_error_span(&token, start, length),
+                            ),
+                            message: "invalid character literal".to_owned(),
                         }],
                         notes: Vec::new(),
                     })
@@ -4284,6 +4386,7 @@ fn semantic_children(node: &CstNode) -> Vec<NodeOrToken<CstNode, CstToken>> {
                 SyntaxKind::Identifier
                     | SyntaxKind::TypeName
                     | SyntaxKind::Integer
+                    | SyntaxKind::Char
                     | SyntaxKind::Boolean
                     | SyntaxKind::String
                     | SyntaxKind::Operator
@@ -4326,6 +4429,20 @@ fn derive_element(element: &NodeOrToken<CstNode, CstToken>) -> ScalarExpression 
                     None => ScalarExpression::InvalidInteger {
                         span,
                         error_span: None,
+                    },
+                }
+            }
+            SyntaxKind::Char => {
+                let span = token_span(token);
+                match decode_char(token.text()) {
+                    Ok(value) => ScalarExpression::Char {
+                        value,
+                        spelling: token.text().to_owned(),
+                        span,
+                    },
+                    Err((start, length)) => ScalarExpression::InvalidInteger {
+                        span,
+                        error_span: Some(string_error_span(token, start, length)),
                     },
                 }
             }
@@ -4399,6 +4516,7 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::Integer { span, .. }
         | ScalarExpression::InvalidInteger { span, .. }
         | ScalarExpression::Boolean { span, .. }
+        | ScalarExpression::Char { span, .. }
         | ScalarExpression::Utf8 { span, .. }
         | ScalarExpression::Binary { span, .. }
         | ScalarExpression::Call { span, .. }
@@ -4760,6 +4878,7 @@ impl StaticUseAnalyzer {
             ScalarExpression::Integer { .. }
             | ScalarExpression::InvalidInteger { .. }
             | ScalarExpression::Boolean { .. }
+            | ScalarExpression::Char { .. }
             | ScalarExpression::Utf8 { .. } => {}
         }
     }
@@ -4843,6 +4962,8 @@ fn validate_type(
         | ScalarType::U32
         | ScalarType::U64
         | ScalarType::U128
+        | ScalarType::Char
+        | ScalarType::ArtifactId
         | ScalarType::Utf8 => {}
         ScalarType::RawPointer(inner) if matches!(inner.as_ref(), ScalarType::U8) => {}
         ScalarType::RawPointer(inner) => validate_type(program, inner, span, diagnostics),
@@ -5192,6 +5313,7 @@ fn expression_type(
             }
         }
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
+        ScalarExpression::Char { .. } => ScalarType::Char,
         ScalarExpression::Utf8 { .. } => ScalarType::Utf8,
         ScalarExpression::Binary {
             operator,
@@ -5272,6 +5394,45 @@ fn expression_type(
             type_arguments,
             ..
         } => {
+            if receiver.as_deref() == Some("core") && name == "this_artifact_id" {
+                if !arguments.is_empty() {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "B0004",
+                        "call argument arity does not match callable type",
+                        *span,
+                    ));
+                    return ScalarType::Error;
+                }
+                return ScalarType::ArtifactId;
+            }
+            if receiver.as_deref() == Some("core") && name == "declare_artifact" {
+                if arguments.len() != 1 {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "B0004",
+                        "call argument arity does not match callable type",
+                        *span,
+                    ));
+                    return ScalarType::Error;
+                }
+                let actual = expression_type_expected(
+                    &arguments[0],
+                    &ScalarType::Utf8,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                expect_type(program, &ScalarType::Utf8, &actual, *span, diagnostics);
+                return if is_error_type(&actual) {
+                    ScalarType::Error
+                } else {
+                    ScalarType::ArtifactId
+                };
+            }
             if receiver.as_deref() == Some("core") && name == "cast" {
                 return type_core_cast(
                     type_arguments,
@@ -6940,6 +7101,50 @@ utf8 value = "\\\"\'\n\r\t\0\u{0}\u{41}\u{1F600}";
             value,
             &vec![b'\\', b'"', b'\'', b'\n', b'\r', b'\t', 0, 0, b'A', 0xF0, 0x9F, 0x98, 0x80]
         );
+    }
+
+    #[test]
+    fn derives_char_and_artifact_id_with_exact_contextual_types() {
+        let result = validate_text(
+            r##"%%start
+char(char) echo = fn(value) { value };
+char initial = '\u{1F600}';
+char copied = echo(initial);
+artifact_id current = core.this_artifact_id();
+artifact_id declared = core.declare_artifact("worker");
+bool same = current == declared;
+%%end"##,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(initial) = &result.program.items[1] else {
+            panic!("char binding");
+        };
+        assert_eq!(initial.declared_type, ScalarType::Char);
+        assert!(matches!(
+            initial.value,
+            ScalarExpression::Char { value: '😀', .. }
+        ));
+        let ScalarItem::Binding(current) = &result.program.items[3] else {
+            panic!("artifact binding");
+        };
+        assert_eq!(current.declared_type, ScalarType::ArtifactId);
+    }
+
+    #[test]
+    fn rejects_invalid_character_shapes_at_literal_spans() {
+        for literal in ["''", "'ab'", "'\\q'", "'\\u{D800}'", "'\\u{110000}'"] {
+            let text = format!("%%start\nchar value = {literal};\n%%end");
+            let literal_start = text.find(literal).expect("literal") as u32;
+            let literal_end = literal_start + literal.len() as u32;
+            let result = validate_text(&text);
+            let diagnostic = result
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.message == "invalid character literal")
+                .expect("character diagnostic");
+            assert!(diagnostic.labels[0].span.range.start >= literal_start);
+            assert!(diagnostic.labels[0].span.range.end <= literal_end);
+        }
     }
 
     #[test]
