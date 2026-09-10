@@ -336,14 +336,8 @@ fn compile_project(
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        modules.push(ScalarModule::new(
-            source_by_path
-                .get(&node.source.path)
-                .cloned()
-                .ok_or_else(|| {
-                    format!("missing module {}", node.source.path.as_path().display())
-                })?,
-            validation.program.items,
+        modules.push(ScalarModule::from_program(
+            validation.program,
             namespace_bindings,
         ));
     }
