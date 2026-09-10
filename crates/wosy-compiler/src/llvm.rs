@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::mem::ManuallyDrop;
+use std::num::NonZeroU32;
 
 use inkwell::builder::{Builder, BuilderError};
 use inkwell::context::Context;
@@ -24,9 +25,11 @@ use crate::{
 pub enum LlvmValueType {
     Void,
     I1,
+    I16,
     I32,
     I8,
     I64,
+    I128,
     Pointer,
 }
 
@@ -389,9 +392,11 @@ fn llvm_text_type(ty: LlvmValueType) -> &'static str {
     match ty {
         LlvmValueType::Void => "void",
         LlvmValueType::I1 => "i1",
+        LlvmValueType::I16 => "i16",
         LlvmValueType::I8 => "i8",
         LlvmValueType::I32 => "i32",
         LlvmValueType::I64 => "i64",
+        LlvmValueType::I128 => "i128",
         LlvmValueType::Pointer => "ptr",
     }
 }
@@ -520,14 +525,42 @@ fn function_type<'ctx>(
     Ok(match result {
         ScalarType::Unit => context.void_type().fn_type(&parameters, false),
         ScalarType::Bool => context.bool_type().fn_type(&parameters, false),
-        ScalarType::I32 => context.i32_type().fn_type(&parameters, false),
-        ScalarType::U8 => context.i8_type().fn_type(&parameters, false),
-        ScalarType::U32 => context.i32_type().fn_type(&parameters, false),
-        ScalarType::U64 => context.i64_type().fn_type(&parameters, false),
-        ScalarType::Utf8 => context.i32_type().fn_type(&parameters, false),
-        ScalarType::RawPointer(_) => context.i32_type().fn_type(&parameters, false),
+        ScalarType::Utf8 | ScalarType::RawPointer(_) => {
+            context.i32_type().fn_type(&parameters, false)
+        }
+        ScalarType::I8
+        | ScalarType::I16
+        | ScalarType::I32
+        | ScalarType::I64
+        | ScalarType::I128
+        | ScalarType::U8
+        | ScalarType::U16
+        | ScalarType::U32
+        | ScalarType::U64
+        | ScalarType::U128 => integer_type(context, result)?.fn_type(&parameters, false),
         _ => return Err("unsupported LLVM scalar type".into()),
     })
+}
+
+fn integer_width(ty: &ScalarType) -> Option<u32> {
+    match ty {
+        ScalarType::I8 | ScalarType::U8 => Some(8),
+        ScalarType::I16 | ScalarType::U16 => Some(16),
+        ScalarType::I32 | ScalarType::U32 => Some(32),
+        ScalarType::I64 | ScalarType::U64 => Some(64),
+        ScalarType::I128 | ScalarType::U128 => Some(128),
+        _ => None,
+    }
+}
+
+fn integer_type<'ctx>(
+    context: &'ctx Context,
+    ty: &ScalarType,
+) -> Result<inkwell::types::IntType<'ctx>, String> {
+    let width = integer_width(ty).ok_or_else(|| "expected integer type".to_owned())?;
+    context
+        .custom_width_int_type(NonZeroU32::new(width).expect("integer width is nonzero"))
+        .map_err(str::to_owned)
 }
 
 fn basic_type<'ctx>(
@@ -536,10 +569,7 @@ fn basic_type<'ctx>(
 ) -> Result<BasicTypeEnum<'ctx>, String> {
     match ty {
         ScalarType::Bool => Ok(context.bool_type().into()),
-        ScalarType::I32 => Ok(context.i32_type().into()),
-        ScalarType::U8 => Ok(context.i8_type().into()),
-        ScalarType::U32 => Ok(context.i32_type().into()),
-        ScalarType::U64 => Ok(context.i64_type().into()),
+        ty if integer_width(ty).is_some() => Ok(integer_type(context, ty)?.into()),
         ScalarType::Utf8 => Ok(context.i32_type().into()),
         ScalarType::RawPointer(_) => Ok(context.i32_type().into()),
         ScalarType::Struct(_) => Ok(context.ptr_type(AddressSpace::default()).into()),
@@ -569,14 +599,34 @@ fn value_type(ty: &ScalarType) -> Result<LlvmValueType, String> {
     match ty {
         ScalarType::Unit => Ok(LlvmValueType::Void),
         ScalarType::Bool => Ok(LlvmValueType::I1),
-        ScalarType::I32 => Ok(LlvmValueType::I32),
-        ScalarType::U8 => Ok(LlvmValueType::I8),
-        ScalarType::U32 => Ok(LlvmValueType::I32),
-        ScalarType::U64 => Ok(LlvmValueType::I64),
+        ScalarType::I8 | ScalarType::U8 => Ok(LlvmValueType::I8),
+        ScalarType::I16 | ScalarType::U16 => Ok(LlvmValueType::I16),
+        ScalarType::I32 | ScalarType::U32 => Ok(LlvmValueType::I32),
+        ScalarType::I64 | ScalarType::U64 => Ok(LlvmValueType::I64),
+        ScalarType::I128 | ScalarType::U128 => Ok(LlvmValueType::I128),
         ScalarType::RawPointer(_) => Ok(LlvmValueType::Pointer),
         ScalarType::Struct(_) => Ok(LlvmValueType::Pointer),
         _ => Err("unsupported LLVM scalar type".into()),
     }
+}
+
+fn integer_constant<'ctx>(
+    context: &'ctx Context,
+    ty: &ScalarType,
+    value: &num_bigint::BigInt,
+) -> Result<inkwell::values::IntValue<'ctx>, String> {
+    let integer = integer_type(context, ty)?;
+    let (sign, words) = value.to_u64_digits();
+    if sign == num_bigint::Sign::Minus {
+        return Err("negative integer literal is invalid".to_owned());
+    }
+    if integer.get_bit_width() <= 64 {
+        return Ok(match words.first() {
+            Some(word) => integer.const_int(*word, false),
+            None => integer.const_zero(),
+        });
+    }
+    Ok(integer.const_int_arbitrary_precision(&words))
 }
 
 fn callable_result(outputs: &crate::ScalarOutputSequence) -> Result<&ScalarType, String> {
@@ -796,24 +846,9 @@ fn emit_typed_expression<'ctx, 'module>(
         (ScalarExpression::StructLiteral { fields, .. }, ScalarType::Struct(_)) => {
             emit_struct_literal(context, state, expected, fields)
         }
-        (ScalarExpression::Integer { value, .. }, ScalarType::U8) => Ok(EmitValue::Basic(
-            context
-                .i8_type()
-                .const_int(
-                    u64::try_from(value.clone()).map_err(|_| "invalid u8 literal")?,
-                    false,
-                )
-                .into(),
-        )),
-        (ScalarExpression::Integer { value, .. }, ScalarType::U32) => Ok(EmitValue::Basic(
-            context
-                .i32_type()
-                .const_int(
-                    u64::try_from(value.clone()).map_err(|_| "invalid u32 literal")?,
-                    false,
-                )
-                .into(),
-        )),
+        (ScalarExpression::Integer { value, .. }, ty) if integer_width(ty).is_some() => Ok(
+            EmitValue::Basic(integer_constant(context, ty, value)?.into()),
+        ),
         _ => emit_expression(context, state, expression),
     }
 }
@@ -1056,10 +1091,15 @@ fn emit_function<'ctx, 'module>(
             );
         }
     }
-    let result = emit_block(context, &mut state, &function.body)?;
     let result_type = match &function.signature {
         ScalarType::Callable { outputs, .. } => callable_result(outputs)?,
         _ => return Err("function has no callable signature".into()),
+    };
+    let result = match function.body.items.as_slice() {
+        [ScalarBlockItem::Expression(expression)] => {
+            emit_typed_expression(context, &mut state, expression, result_type)?
+        }
+        _ => emit_block(context, &mut state, &function.body)?,
     };
     emit_return(&mut state, result, result_type)
 }
@@ -1194,10 +1234,20 @@ fn emit_project_function<'ctx, 'module>(
             );
         }
     }
-    let result = emit_project_block(context, &mut state, &function.body, source_module, modules)?;
     let result_type = match &function.signature {
         ScalarType::Callable { outputs, .. } => callable_result(outputs)?,
         _ => return Err("function has no callable signature".into()),
+    };
+    let result = match function.body.items.as_slice() {
+        [ScalarBlockItem::Expression(expression)] => emit_project_typed_expression(
+            context,
+            &mut state,
+            expression,
+            result_type,
+            source_module,
+            modules,
+        )?,
+        _ => emit_project_block(context, &mut state, &function.body, source_module, modules)?,
     };
     emit_return(&mut state, result, result_type)
 }
@@ -1451,7 +1501,20 @@ fn emit_assignment<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     assignment: &ScalarAssignment,
 ) -> Result<EmitValue<'ctx>, String> {
-    let value = emit_expression(context, state, &assignment.value)?;
+    let expected = state
+        .storage
+        .get(&assignment.target)
+        .map(|(_, ty)| ty.clone())
+        .or_else(|| {
+            state
+                .globals
+                .get(&assignment.target)
+                .map(|(_, ty)| ty.clone())
+        });
+    let value = match expected {
+        Some(ty) => emit_typed_expression(context, state, &assignment.value, &ty)?,
+        None => emit_expression(context, state, &assignment.value)?,
+    };
     let old = if assignment.receiver.is_some() {
         return Err(format!(
             "unknown LLVM storage {}.{}",
@@ -1860,6 +1923,9 @@ fn emit_project_typed_expression<'ctx, 'module>(
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::Integer { value, .. } if integer_width(expected).is_some() => Ok(
+            EmitValue::Basic(integer_constant(context, expected, value)?.into()),
+        ),
         ScalarExpression::StructLiteral { fields, .. } => {
             emit_struct_literal(context, state, expected, fields)
         }
@@ -1988,6 +2054,7 @@ fn emit_project_expression<'ctx, 'module>(
             right,
             ..
         } => {
+            let unsigned = expression_is_unsigned(state, left);
             let left = emit_project_expression(context, state, left, module, modules)?;
             emit_binary_with_rhs(
                 context,
@@ -1996,6 +2063,7 @@ fn emit_project_expression<'ctx, 'module>(
                 left,
                 right,
                 ExpressionPath::Project { module, modules },
+                unsigned,
             )
         }
         ScalarExpression::If {
@@ -2151,6 +2219,7 @@ fn emit_binary<'ctx, 'module>(
     left: &ScalarExpression,
     right: &ScalarExpression,
 ) -> Result<EmitValue<'ctx>, String> {
+    let unsigned = expression_is_unsigned(state, left);
     let left = emit_expression(context, state, left)?;
     emit_binary_with_rhs(
         context,
@@ -2159,7 +2228,38 @@ fn emit_binary<'ctx, 'module>(
         left,
         right,
         ExpressionPath::Single,
+        unsigned,
     )
+}
+
+fn expression_is_unsigned<'ctx, 'module>(
+    state: &EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
+) -> bool {
+    match expression {
+        ScalarExpression::Name { name, .. } => match state.storage.get(name) {
+            Some((_, ty)) => matches!(
+                ty,
+                ScalarType::U8
+                    | ScalarType::U16
+                    | ScalarType::U32
+                    | ScalarType::U64
+                    | ScalarType::U128
+            ),
+            None => match state.globals.get(name) {
+                Some((_, ty)) => matches!(
+                    ty,
+                    ScalarType::U8
+                        | ScalarType::U16
+                        | ScalarType::U32
+                        | ScalarType::U64
+                        | ScalarType::U128
+                ),
+                None => false,
+            },
+        },
+        _ => false,
+    }
 }
 
 enum ExpressionPath<'a> {
@@ -2177,6 +2277,7 @@ fn emit_binary_with_rhs<'ctx, 'module>(
     left: EmitValue<'ctx>,
     right: &ScalarExpression,
     path: ExpressionPath<'_>,
+    unsigned: bool,
 ) -> Result<EmitValue<'ctx>, String> {
     if !matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
         let right = match path {
@@ -2185,7 +2286,7 @@ fn emit_binary_with_rhs<'ctx, 'module>(
                 emit_project_expression(context, state, right, module, modules)?
             }
         };
-        return emit_binary_values(state, operator, left, right);
+        return emit_binary_values(state, operator, left, right, unsigned);
     }
 
     let left = take_basic(left)?.into_int_value();
@@ -2242,6 +2343,7 @@ fn emit_binary_values<'ctx, 'module>(
     operator: &BinaryOperator,
     left: EmitValue<'ctx>,
     right: EmitValue<'ctx>,
+    unsigned: bool,
 ) -> Result<EmitValue<'ctx>, String> {
     let left = take_basic(left)?.into_int_value();
     let right = take_basic(right)?.into_int_value();
@@ -2261,16 +2363,20 @@ fn emit_binary_values<'ctx, 'module>(
             .build_int_mul(left, right, "mul")
             .map_err(builder_error)?
             .into(),
-        BinaryOperator::Divide => state
-            .builder
-            .build_int_signed_div(left, right, "div")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::Remainder => state
-            .builder
-            .build_int_signed_rem(left, right, "rem")
-            .map_err(builder_error)?
-            .into(),
+        BinaryOperator::Divide => if unsigned {
+            state.builder.build_int_unsigned_div(left, right, "div")
+        } else {
+            state.builder.build_int_signed_div(left, right, "div")
+        }
+        .map_err(builder_error)?
+        .into(),
+        BinaryOperator::Remainder => if unsigned {
+            state.builder.build_int_unsigned_rem(left, right, "rem")
+        } else {
+            state.builder.build_int_signed_rem(left, right, "rem")
+        }
+        .map_err(builder_error)?
+        .into(),
         BinaryOperator::And | BinaryOperator::Or => {
             return Err("short-circuit operators require expression lowering".to_owned())
         }
@@ -2286,22 +2392,58 @@ fn emit_binary_values<'ctx, 'module>(
             .into(),
         BinaryOperator::Less => state
             .builder
-            .build_int_compare(IntPredicate::SLT, left, right, "lt")
+            .build_int_compare(
+                if unsigned {
+                    IntPredicate::ULT
+                } else {
+                    IntPredicate::SLT
+                },
+                left,
+                right,
+                "lt",
+            )
             .map_err(builder_error)?
             .into(),
         BinaryOperator::LessEqual => state
             .builder
-            .build_int_compare(IntPredicate::SLE, left, right, "le")
+            .build_int_compare(
+                if unsigned {
+                    IntPredicate::ULE
+                } else {
+                    IntPredicate::SLE
+                },
+                left,
+                right,
+                "le",
+            )
             .map_err(builder_error)?
             .into(),
         BinaryOperator::Greater => state
             .builder
-            .build_int_compare(IntPredicate::SGT, left, right, "gt")
+            .build_int_compare(
+                if unsigned {
+                    IntPredicate::UGT
+                } else {
+                    IntPredicate::SGT
+                },
+                left,
+                right,
+                "gt",
+            )
             .map_err(builder_error)?
             .into(),
         BinaryOperator::GreaterEqual => state
             .builder
-            .build_int_compare(IntPredicate::SGE, left, right, "ge")
+            .build_int_compare(
+                if unsigned {
+                    IntPredicate::UGE
+                } else {
+                    IntPredicate::SGE
+                },
+                left,
+                right,
+                "ge",
+            )
             .map_err(builder_error)?
             .into(),
     };
@@ -2406,7 +2548,19 @@ fn emit_return<'ctx, 'module>(
         ScalarType::Unit => {
             state.builder.build_return(None).map_err(builder_error)?;
         }
-        ScalarType::Bool | ScalarType::I32 | ScalarType::RawPointer(_) | ScalarType::Struct(_) => {
+        ScalarType::Bool
+        | ScalarType::I8
+        | ScalarType::I16
+        | ScalarType::I32
+        | ScalarType::I64
+        | ScalarType::I128
+        | ScalarType::U8
+        | ScalarType::U16
+        | ScalarType::U32
+        | ScalarType::U64
+        | ScalarType::U128
+        | ScalarType::RawPointer(_)
+        | ScalarType::Struct(_) => {
             let value = take_basic(value)?;
             state
                 .builder
@@ -3002,6 +3156,30 @@ unit() use = fn {
         assert!(!text.contains("alloca"));
         assert!(!text.contains("load"));
         assert!(!text.contains("store"));
+    }
+
+    #[test]
+    fn emits_all_integer_widths_in_textual_llvm() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/integers.w".into(),
+            "r1".into(),
+        );
+        let validation = crate::derive_scalar_program(
+            &crate::parse_source(
+                source,
+                "%%start\ni8 a = 1;\ni16 b = 2;\ni32 c = 3;\ni64 d = 4;\ni128 e = 5;\nu8 f = 6;\nu16 g = 7;\nu32 h = 8;\nu64 i = 9;\nu128 j = 10;\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        let text = emit_scalar_llvm(&validation)
+            .expect("integer LLVM")
+            .to_text();
+        for ty in ["i8", "i16", "i32", "i64", "i128"] {
+            assert!(text.contains(&format!("global {ty}")), "{ty}: {text}");
+        }
     }
 
     #[test]

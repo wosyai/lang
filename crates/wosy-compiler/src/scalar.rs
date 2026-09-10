@@ -12,10 +12,16 @@ use wosy_syntax::{
 pub enum ScalarType {
     Unit,
     Bool,
+    I8,
+    I16,
     I32,
+    I64,
+    I128,
     U8,
+    U16,
     U32,
     U64,
+    U128,
     Utf8,
     RawPointer(Box<ScalarType>),
     Callable {
@@ -523,7 +529,8 @@ pub fn derive_scalar_program(parse: &ParseResult) -> ScalarValidation {
 
 pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarValidation {
     let mut items = Vec::new();
-    let diagnostics = string_diagnostics(canonical);
+    let mut diagnostics = string_diagnostics(canonical);
+    diagnostics.extend(integer_diagnostics(canonical));
     let source_root = canonical
         .root
         .children()
@@ -877,7 +884,9 @@ fn resolve_place(
 }
 
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    string_diagnostics(canonical)
+    let mut diagnostics = string_diagnostics(canonical);
+    diagnostics.extend(integer_diagnostics(canonical));
+    diagnostics
 }
 
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
@@ -1463,8 +1472,19 @@ fn validate_module_type(
                 validate_module_type(module, parameter, span, diagnostics);
             }
         }
-        ScalarType::Unit | ScalarType::Bool | ScalarType::I32 => {}
-        ScalarType::U8 | ScalarType::U32 | ScalarType::U64 | ScalarType::Utf8 => {}
+        ScalarType::Unit
+        | ScalarType::Bool
+        | ScalarType::I8
+        | ScalarType::I16
+        | ScalarType::I32
+        | ScalarType::I64
+        | ScalarType::I128
+        | ScalarType::U8
+        | ScalarType::U16
+        | ScalarType::U32
+        | ScalarType::U64
+        | ScalarType::U128
+        | ScalarType::Utf8 => {}
         ScalarType::RawPointer(inner)
             if matches!(inner.as_ref(), ScalarType::U8 | ScalarType::Struct(_)) => {}
         ScalarType::RawPointer(_) => diagnostics.push(module_diagnostic(
@@ -2342,11 +2362,13 @@ fn expression_type_in_module(
             validate_integer_range(module, value, *span, diagnostics);
             ScalarType::I32
         }
-        ScalarExpression::InvalidInteger { span, error_span } => {
+        ScalarExpression::InvalidInteger {
+            span: _,
+            error_span,
+        } => {
             if error_span.is_some() {
                 ScalarType::Error
             } else {
-                invalid_integer_diagnostic(module, *span, diagnostics);
                 ScalarType::I32
             }
         }
@@ -2833,7 +2855,16 @@ fn expression_type_in_module_expected(
     }
     if let ScalarExpression::Integer { value, span } = expression {
         if let Some(
-            expected @ (ScalarType::I32 | ScalarType::U8 | ScalarType::U32 | ScalarType::U64),
+            expected @ (ScalarType::I8
+            | ScalarType::I16
+            | ScalarType::I32
+            | ScalarType::I64
+            | ScalarType::I128
+            | ScalarType::U8
+            | ScalarType::U16
+            | ScalarType::U32
+            | ScalarType::U64
+            | ScalarType::U128),
         ) = expected
         {
             validate_integer_range_for_type(module, value, *span, expected, diagnostics);
@@ -2873,7 +2904,16 @@ fn expression_type_in_module_expected(
         let arithmetic_context = expected.filter(|ty| {
             matches!(
                 ty,
-                ScalarType::I32 | ScalarType::U8 | ScalarType::U32 | ScalarType::U64
+                ScalarType::I8
+                    | ScalarType::I16
+                    | ScalarType::I32
+                    | ScalarType::I64
+                    | ScalarType::I128
+                    | ScalarType::U8
+                    | ScalarType::U16
+                    | ScalarType::U32
+                    | ScalarType::U64
+                    | ScalarType::U128
             )
         });
         let bool_context = ScalarType::Bool;
@@ -3442,17 +3482,25 @@ fn align_offset(offset: u64, alignment: u64) -> u64 {
 
 fn layout_for_type(ty: &ScalarType) -> ScalarLayout {
     match ty {
-        ScalarType::Bool | ScalarType::U8 => ScalarLayout {
+        ScalarType::Bool | ScalarType::I8 | ScalarType::U8 => ScalarLayout {
             size: 1,
             alignment: 1,
+        },
+        ScalarType::I16 | ScalarType::U16 => ScalarLayout {
+            size: 2,
+            alignment: 2,
         },
         ScalarType::I32 | ScalarType::U32 => ScalarLayout {
             size: 4,
             alignment: 4,
         },
-        ScalarType::U64 => ScalarLayout {
+        ScalarType::I64 | ScalarType::U64 => ScalarLayout {
             size: 8,
             alignment: 8,
+        },
+        ScalarType::I128 | ScalarType::U128 => ScalarLayout {
+            size: 16,
+            alignment: 16,
         },
         ScalarType::RawPointer(_) => ScalarLayout {
             size: ScalarTargetLayout::WASM32.pointer_size,
@@ -3687,10 +3735,16 @@ fn type_from_name(value: &str, span: ByteSpan) -> ScalarType {
     match value {
         "unit" => ScalarType::Unit,
         "bool" => ScalarType::Bool,
+        "i8" => ScalarType::I8,
+        "i16" => ScalarType::I16,
         "i32" => ScalarType::I32,
+        "i64" => ScalarType::I64,
+        "i128" => ScalarType::I128,
         "u8" => ScalarType::U8,
+        "u16" => ScalarType::U16,
         "u32" => ScalarType::U32,
         "u64" => ScalarType::U64,
+        "u128" => ScalarType::U128,
         "utf8" => ScalarType::Utf8,
         value => ScalarType::Named {
             name: value.to_owned(),
@@ -3789,6 +3843,33 @@ fn string_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
                         }],
                         notes: Vec::new(),
                     })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn integer_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
+    canonical
+        .root
+        .descendants_with_tokens()
+        .filter_map(|element| match element {
+            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Integer => {
+                if parse_integer(token.text()).is_none() {
+                    Some(super::Diagnostic {
+                        code: "B0010".to_owned(),
+                        severity: super::DiagnosticSeverity::Error,
+                        message: "invalid integer literal".to_owned(),
+                        labels: vec![super::DiagnosticLabel {
+                            kind: super::DiagnosticLabelKind::Primary,
+                            span: SourceSpan::new(canonical.source.clone(), token_span(&token)),
+                            message: "invalid integer literal".to_owned(),
+                        }],
+                        notes: Vec::new(),
+                    })
+                } else {
+                    None
+                }
             }
             _ => None,
         })
@@ -4240,7 +4321,7 @@ fn derive_element(element: &NodeOrToken<CstNode, CstToken>) -> ScalarExpression 
             },
             SyntaxKind::Integer => {
                 let span = token_span(token);
-                match BigInt::parse_bytes(token.text().as_bytes(), 10) {
+                match parse_integer(token.text()) {
                     Some(value) => ScalarExpression::Integer { value, span },
                     None => ScalarExpression::InvalidInteger {
                         span,
@@ -4264,6 +4345,46 @@ fn derive_element(element: &NodeOrToken<CstNode, CstToken>) -> ScalarExpression 
             _ => panic!("expression token"),
         },
     }
+}
+
+fn parse_integer(text: &str) -> Option<BigInt> {
+    let (digits, radix) = if text.starts_with("0x") || text.starts_with("0X") {
+        (&text[2..], 16)
+    } else if text.starts_with("0b") || text.starts_with("0B") {
+        (&text[2..], 2)
+    } else if text.starts_with("0o") || text.starts_with("0O") {
+        (&text[2..], 8)
+    } else {
+        (text, 10)
+    };
+    if digits.is_empty() || digits.starts_with('_') || digits.ends_with('_') {
+        return None;
+    }
+    let mut previous_underscore = false;
+    for character in digits.chars() {
+        if character == '_' {
+            if previous_underscore {
+                return None;
+            }
+            previous_underscore = true;
+        } else {
+            let valid = character.to_digit(radix).is_some();
+            if !valid {
+                return None;
+            }
+            previous_underscore = false;
+        }
+    }
+    BigInt::parse_bytes(
+        digits
+            .as_bytes()
+            .iter()
+            .filter(|byte| **byte != b'_')
+            .copied()
+            .collect::<Vec<_>>()
+            .as_slice(),
+        radix,
+    )
 }
 
 fn token_span(token: &CstToken) -> ByteSpan {
@@ -4710,8 +4831,19 @@ fn validate_type(
                 validate_type(program, parameter, span, diagnostics);
             }
         }
-        ScalarType::Unit | ScalarType::Bool | ScalarType::I32 => {}
-        ScalarType::U8 | ScalarType::U32 | ScalarType::U64 | ScalarType::Utf8 => {}
+        ScalarType::Unit
+        | ScalarType::Bool
+        | ScalarType::I8
+        | ScalarType::I16
+        | ScalarType::I32
+        | ScalarType::I64
+        | ScalarType::I128
+        | ScalarType::U8
+        | ScalarType::U16
+        | ScalarType::U32
+        | ScalarType::U64
+        | ScalarType::U128
+        | ScalarType::Utf8 => {}
         ScalarType::RawPointer(inner) if matches!(inner.as_ref(), ScalarType::U8) => {}
         ScalarType::RawPointer(inner) => validate_type(program, inner, span, diagnostics),
         ScalarType::Error => {
@@ -5049,11 +5181,13 @@ fn expression_type(
             validate_integer_range_program(program, value, *span, diagnostics);
             ScalarType::I32
         }
-        ScalarExpression::InvalidInteger { span, error_span } => {
+        ScalarExpression::InvalidInteger {
+            span: _,
+            error_span,
+        } => {
             if error_span.is_some() {
                 ScalarType::Error
             } else {
-                invalid_integer_diagnostic_program(program, *span, diagnostics);
                 ScalarType::I32
             }
         }
@@ -5418,7 +5552,16 @@ fn expression_type_expected(
     if matches!(expression, ScalarExpression::Integer { .. })
         && matches!(
             expected,
-            ScalarType::I32 | ScalarType::U8 | ScalarType::U32 | ScalarType::U64
+            ScalarType::I8
+                | ScalarType::I16
+                | ScalarType::I32
+                | ScalarType::I64
+                | ScalarType::I128
+                | ScalarType::U8
+                | ScalarType::U16
+                | ScalarType::U32
+                | ScalarType::U64
+                | ScalarType::U128
         )
     {
         if let ScalarExpression::Integer { value, span } = expression {
@@ -5457,7 +5600,16 @@ fn expression_type_expected(
         let boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
         let arithmetic_context = matches!(
             expected,
-            ScalarType::I32 | ScalarType::U8 | ScalarType::U32 | ScalarType::U64
+            ScalarType::I8
+                | ScalarType::I16
+                | ScalarType::I32
+                | ScalarType::I64
+                | ScalarType::I128
+                | ScalarType::U8
+                | ScalarType::U16
+                | ScalarType::U32
+                | ScalarType::U64
+                | ScalarType::U128
         );
         let bool_context = ScalarType::Bool;
         let (left_type, right_type) = if comparison && is_null_expression(left) {
@@ -5712,14 +5864,20 @@ fn validate_integer_range_for_type(
     ty: &ScalarType,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    let maximum = match ty {
-        ScalarType::U8 => BigInt::from(u8::MAX),
-        ScalarType::U32 => BigInt::from(u32::MAX),
-        ScalarType::U64 => BigInt::from(u64::MAX),
-        ScalarType::I32 => BigInt::from(i32::MAX),
+    let (minimum, maximum) = match ty {
+        ScalarType::I8 => (BigInt::from(i8::MIN), BigInt::from(i8::MAX)),
+        ScalarType::I16 => (BigInt::from(i16::MIN), BigInt::from(i16::MAX)),
+        ScalarType::I32 => (BigInt::from(i32::MIN), BigInt::from(i32::MAX)),
+        ScalarType::I64 => (BigInt::from(i64::MIN), BigInt::from(i64::MAX)),
+        ScalarType::I128 => (BigInt::from(i128::MIN), BigInt::from(i128::MAX)),
+        ScalarType::U8 => (BigInt::from(0), BigInt::from(u8::MAX)),
+        ScalarType::U16 => (BigInt::from(0), BigInt::from(u16::MAX)),
+        ScalarType::U32 => (BigInt::from(0), BigInt::from(u32::MAX)),
+        ScalarType::U64 => (BigInt::from(0), BigInt::from(u64::MAX)),
+        ScalarType::U128 => (BigInt::from(0), BigInt::from(u128::MAX)),
         _ => return,
     };
-    if value > &maximum {
+    if value < &minimum || value > &maximum {
         diagnostics.push(module_diagnostic(
             module,
             "B0010",
@@ -5752,14 +5910,20 @@ fn validate_integer_range_for_type_program(
     ty: &ScalarType,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    let maximum = match ty {
-        ScalarType::U8 => BigInt::from(u8::MAX),
-        ScalarType::U32 => BigInt::from(u32::MAX),
-        ScalarType::U64 => BigInt::from(u64::MAX),
-        ScalarType::I32 => BigInt::from(i32::MAX),
+    let (minimum, maximum) = match ty {
+        ScalarType::I8 => (BigInt::from(i8::MIN), BigInt::from(i8::MAX)),
+        ScalarType::I16 => (BigInt::from(i16::MIN), BigInt::from(i16::MAX)),
+        ScalarType::I32 => (BigInt::from(i32::MIN), BigInt::from(i32::MAX)),
+        ScalarType::I64 => (BigInt::from(i64::MIN), BigInt::from(i64::MAX)),
+        ScalarType::I128 => (BigInt::from(i128::MIN), BigInt::from(i128::MAX)),
+        ScalarType::U8 => (BigInt::from(0), BigInt::from(u8::MAX)),
+        ScalarType::U16 => (BigInt::from(0), BigInt::from(u16::MAX)),
+        ScalarType::U32 => (BigInt::from(0), BigInt::from(u32::MAX)),
+        ScalarType::U64 => (BigInt::from(0), BigInt::from(u64::MAX)),
+        ScalarType::U128 => (BigInt::from(0), BigInt::from(u128::MAX)),
         _ => return,
     };
-    if value > &maximum {
+    if value < &minimum || value > &maximum {
         diagnostics.push(diagnostic(
             program,
             "B0010",
@@ -7912,5 +8076,35 @@ wasi = extern wasm "\q" { i32(i32, utf8) fd_write; };
         assert_ne!(first.structs[0].id, second.structs[0].id);
         assert_eq!(first.structs[0].id.source, first_source);
         assert_eq!(second.structs[0].id.source, second_source);
+    }
+
+    #[test]
+    fn derives_the_complete_integer_surface_and_radix_values() {
+        let program = module_from_text(
+            module_source("src/integers.w"),
+            r#"%%start
+i8 a = 127;
+i16 b = 0x7fff;
+i32 c = 2_147_483_647;
+i64 d = 0x7fff_ffff_ffff_ffff;
+i128 e = 0x7fff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
+u8 f = 255;
+u16 g = 0xffff;
+u32 h = 0xffff_ffff;
+u64 i = 0xffff_ffff_ffff_ffff;
+u128 j = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
+%%end"#,
+        );
+        assert!(program.items.iter().all(|item| match item {
+            ScalarItem::Binding(binding) =>
+                !matches!(binding.declared_type, ScalarType::Named { .. }),
+            _ => true,
+        }));
+        assert!(program.items.iter().all(|item| match item {
+            ScalarItem::Binding(binding) => {
+                matches!(binding.value, ScalarExpression::Integer { .. })
+            }
+            _ => true,
+        }));
     }
 }

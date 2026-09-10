@@ -1095,4 +1095,27 @@ mod tests {
             .expect("output list");
         assert_eq!(byte_span(&output_list), ByteSpan::new(43, 63));
     }
+
+    #[test]
+    fn integer_radix_spellings_are_lossless_and_span_exact() {
+        let text = "%%start\ni128 value = 0xAB_CD + 0b1010_0011 + 0o7_1;\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let integers = result
+            .root
+            .descendants_with_tokens()
+            .filter_map(|element| match element {
+                rowan::NodeOrToken::Token(token) if token.kind() == SyntaxKind::Integer => Some((
+                    token.text().to_owned(),
+                    byte_span(&token.parent().expect("integer parent")),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(integers.len(), 3);
+        assert_eq!(integers[0].0, "0xAB_CD");
+        assert_eq!(integers[1].0, "0b1010_0011");
+        assert_eq!(integers[2].0, "0o7_1");
+    }
 }
