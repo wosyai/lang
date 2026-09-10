@@ -7785,20 +7785,53 @@ wasi = extern wasm "\q" { i32(i32, utf8) fd_write; };
         let source = module_source("src/main.w");
         let program = module_from_text(
             source.clone(),
-            "%%start\nstruct Pair {\n\tu32 value;\n}\nPair item = { .value = 1; };\n%%end",
+            "%%start\nstruct Outer {\n\tPair pair;\n}\nstruct Pair {\n\tu32 value;\n}\nraw = extern wasm \"env\" { unit(*?Pair) touch; };\nunit(Outer) consume = fn(value) { unsafe { *?Outer pointer = &?value; *?Pair field_address = &?(*pointer).pair; raw.touch(field_address); }; };\nOuter item = { .pair = { .value = 1; }; };\n%%end",
         );
-        let mut module = ScalarModule::new(source.clone(), program.items, Vec::new());
-        module.structs = program.structs;
-        let result =
-            validate_scalar_project(ScalarProject::new(vec![module], vec![source.clone()]));
+        let struct_id = program.structs[0].id.clone();
+        let pair_id = program.structs[1].id.clone();
+        let struct_layout = program.structs[0].layout.clone();
+        let result = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(program, Vec::new())],
+            vec![source.clone()],
+        ));
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-        assert_eq!(
-            result.project.modules[0].structs[0].id,
-            ScalarStructId {
-                source: source.clone(),
-                index: 0
-            }
+        assert_eq!(result.project.modules[0].structs[0].id, struct_id.clone());
+        assert_eq!(result.project.modules[0].structs[0].layout, struct_layout);
+        let ScalarItem::Extern(extern_decl) = &result.project.modules[0].items[0] else {
+            panic!("extern declaration");
+        };
+        let ScalarType::Callable { parameters, .. } = &extern_decl.functions[0].signature else {
+            panic!("extern signature");
+        };
+        assert!(
+            matches!(parameters[0], ScalarType::RawPointer(ref inner) if inner.as_ref() == &ScalarType::Struct(pair_id.clone()))
         );
+        let ScalarItem::Function(function) = &result.project.modules[0].items[1] else {
+            panic!("callable declaration");
+        };
+        let ScalarType::Callable { parameters, .. } = &function.signature else {
+            panic!("callable signature");
+        };
+        assert_eq!(parameters, &[ScalarType::Struct(struct_id.clone())]);
+        let ScalarBlockItem::Expression(ScalarExpression::Block(block)) = &function.body.items[0]
+        else {
+            panic!("unsafe block");
+        };
+        let ScalarBlockItem::LocalBinding(binding) = &block.items[1] else {
+            panic!("field address binding");
+        };
+        let ScalarExpression::RawAddress {
+            place: ScalarPlace::Field { field, .. },
+            ..
+        } = &binding.value
+        else {
+            panic!("field address");
+        };
+        assert!(matches!(field, ScalarFieldReference::Resolved(id) if id.structure == struct_id));
+        let ScalarItem::Binding(binding) = &result.project.modules[0].items[2] else {
+            panic!("struct binding");
+        };
+        assert_eq!(binding.declared_type, ScalarType::Struct(struct_id));
     }
 
     #[test]
