@@ -1347,7 +1347,6 @@ fn emit_block<'ctx, 'module>(
                     materialize_utf8_view(context, state, &binding.receivers, value)?;
                     EmitValue::Unit
                 } else {
-                    let value = take_basic(value)?;
                     let slot = state
                         .builder
                         .build_alloca(
@@ -1355,10 +1354,7 @@ fn emit_block<'ctx, 'module>(
                             &binding.name,
                         )
                         .map_err(builder_error)?;
-                    state
-                        .builder
-                        .build_store(slot, value)
-                        .map_err(builder_error)?;
+                    store_value(context, state, slot, &binding.declared_type, value)?;
                     state
                         .storage
                         .insert(binding.name.clone(), (slot, binding.declared_type.clone()));
@@ -1412,7 +1408,6 @@ fn emit_project_block<'ctx, 'module>(
                     materialize_utf8_view(context, state, &binding.receivers, value)?;
                     EmitValue::Unit
                 } else {
-                    let value = take_basic(value)?;
                     let slot = state
                         .builder
                         .build_alloca(
@@ -1420,10 +1415,7 @@ fn emit_project_block<'ctx, 'module>(
                             &binding.name,
                         )
                         .map_err(builder_error)?;
-                    state
-                        .builder
-                        .build_store(slot, value)
-                        .map_err(builder_error)?;
+                    store_value(context, state, slot, &binding.declared_type, value)?;
                     state
                         .storage
                         .insert(binding.name.clone(), (slot, binding.declared_type.clone()));
@@ -3323,6 +3315,116 @@ child.marker = child.touch();
         assert!(text.contains("[8 x i8]"), "{text}");
         assert!(text.contains("getelementptr inbounds i8"), "{text}");
         assert!(text.contains("i8 4"), "{text}");
+    }
+
+    #[test]
+    fn emits_direct_local_struct_addresses_and_loaded_pointer_bindings_for_externs() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let program = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\nstruct Outer {\n\tPair pair;\n}\nstruct Pair {\n\tu32 value;\n\tu8 tag;\n}\nraw = extern wasm \"env\" { unit(*?Pair) touch; unit(*?u8) inspect; };\nunit(Outer) forward = fn(value) {\n\tOuter local = { .pair = { .value = 2; .tag = 1; }; };\n\tlocal;\n\tunsafe {\n\t\t*?Outer outer = &?value;\n\t\t*?Pair pointer = &?(*outer).pair;\n\t\traw.touch(pointer);\n\t\t*?u8 field = &?(*pointer).tag;\n\t\traw.inspect(field);\n\t};\n};\n%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(program, Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_project_llvm(&validation)
+            .expect("raw struct pointer LLVM")
+            .to_text();
+        let forward = text
+            .split(&format!(
+                "define void @{}",
+                project_function_name(&source, "forward")
+            ))
+            .nth(1)
+            .expect("forward");
+
+        assert!(text.contains("declare void @touch(ptr) #0"), "{text}");
+        assert!(text.contains("declare void @inspect(ptr) #0"), "{text}");
+        assert!(forward.contains("alloca [8 x i8]"), "{forward}");
+        assert!(forward.contains("store [8 x i8]"), "{forward}");
+        assert!(forward.contains("%local = alloca [8 x i8]"), "{forward}");
+        assert!(
+            forward.contains("store [8 x i8] %struct_value") && forward.contains("ptr %local"),
+            "{forward}"
+        );
+        assert!(forward.contains("ptrtoint ptr %pair"), "{forward}");
+        assert!(
+            forward.contains("getelementptr inbounds i8, ptr %deref") && forward.contains("i8 4"),
+            "{forward}"
+        );
+        assert!(forward.contains("load i32, ptr %pointer"), "{forward}");
+        assert!(
+            forward.contains("call void @touch(i32 %pointer"),
+            "{forward}"
+        );
+        assert!(forward.contains("load i32, ptr %field"), "{forward}");
+        assert!(
+            forward.contains("call void @inspect(i32 %field"),
+            "{forward}"
+        );
+    }
+
+    #[test]
+    fn emits_project_struct_storage_address_for_generic_extern() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let program = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\nstruct Outer {\n\tPair pair;\n}\nstruct Pair {\n\tu8 tag;\n\tu32 value;\n}\nraw = extern wasm \"env\" { unit(*?Pair) touch; };\nOuter value = { .pair = { .tag = 1; .value = 2; }; };\nunsafe { *?Pair pointer = &?value.pair; raw.touch(pointer); };\n%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(program, Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_project_llvm(&validation)
+            .expect("project raw struct pointer LLVM")
+            .to_text();
+        let main = text.split("define i32 @main").nth(1).expect("main");
+        let value = project_global_name(&source, "value");
+
+        assert!(text.contains("declare void @touch(ptr) #0"), "{text}");
+        assert!(
+            text.contains(&format!("@{value} = internal global [8 x i8]")),
+            "{text}"
+        );
+        assert!(
+            main.contains(&format!("ptrtoint (ptr @{value} to i32)")),
+            "{main}"
+        );
+        assert!(main.contains("load i32, ptr %pointer"), "{main}");
+        assert!(main.contains("call void @touch(i32 %pointer"), "{main}");
     }
 
     #[test]
