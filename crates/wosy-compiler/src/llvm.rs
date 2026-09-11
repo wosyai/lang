@@ -880,6 +880,16 @@ fn emit_typed_expression<'ctx, 'module>(
         (ScalarExpression::StructLiteral { fields, .. }, ScalarType::Struct(_)) => {
             emit_struct_literal(context, state, expected, fields)
         }
+        (
+            ScalarExpression::Unary {
+                operator, operand, ..
+            },
+            ty,
+        ) if integer_width(ty).is_some() || *ty == ScalarType::Bool => {
+            let value =
+                take_basic(emit_typed_expression(context, state, operand, ty)?)?.into_int_value();
+            emit_unary_value(state, operator, value)
+        }
         (ScalarExpression::Integer { value, .. }, ty) if integer_width(ty).is_some() => Ok(
             EmitValue::Basic(integer_constant(context, ty, value)?.into()),
         ),
@@ -1981,6 +1991,15 @@ fn emit_project_typed_expression<'ctx, 'module>(
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::Unary {
+            operator, operand, ..
+        } if integer_width(expected).is_some() || *expected == ScalarType::Bool => {
+            let value = take_basic(emit_project_typed_expression(
+                context, state, operand, expected, module, modules,
+            )?)?
+            .into_int_value();
+            emit_unary_value(state, operator, value)
+        }
         ScalarExpression::Integer { value, .. } if integer_width(expected).is_some() => Ok(
             EmitValue::Basic(integer_constant(context, expected, value)?.into()),
         ),
@@ -2768,6 +2787,11 @@ fn emit_unary_value<'ctx, 'module>(
                 .map(|value| EmitValue::Basic(value.into()))
                 .map_err(builder_error)
         }
+        crate::scalar::UnaryOperator::Negate => state
+            .builder
+            .build_int_sub(value.get_type().const_zero(), value, "neg")
+            .map(|value| EmitValue::Basic(value.into()))
+            .map_err(builder_error),
     }
 }
 
@@ -3113,6 +3137,39 @@ mod tests {
         assert!(text.contains("shl i32"), "{text}");
         assert!(text.contains("ashr i32"), "{text}");
         assert!(text.contains("lshr i32"), "{text}");
+    }
+
+    #[test]
+    fn emits_typed_integer_negation_and_signed_division_remainder() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/negate.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\ni32(i32) negate = fn(value) { -value };\ni8(i8) negate_narrow = fn(value) { -value };\ni32 quotient = -7 / 3;\ni32 remainder = -7 % 3;\ni32 computed_quotient = negate(7) / 3;\ni32 computed_remainder = negate(7) % 3;\ni8 seed = 7;\ni8 signed = negate_narrow(seed);\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_llvm(&validation)
+            .expect("negation LLVM")
+            .to_text();
+        assert!(text.contains("store i32 -2"), "{text}");
+        assert!(text.contains("store i32 -1"), "{text}");
+        assert!(text.contains("sub i32 0, %value"), "{text}");
+        assert!(text.contains("sdiv i32 %call, 3"), "{text}");
+        assert!(text.contains("srem i32 %call1, 3"), "{text}");
+        assert!(text.contains("sub i8 0, %value"), "{text}");
+        assert!(text.contains("store i8 %call2"), "{text}");
     }
 
     #[test]
