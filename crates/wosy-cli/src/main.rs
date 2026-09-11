@@ -183,25 +183,45 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
     let root = discover_root(&current)?;
     let configuration = ProjectConfiguration::load(&root)?;
     let target_name = configuration.resolve_target(target)?;
-    let project = ProjectContext::load(&root, &target_name)?;
     let (_target_config, artifact, artifact_profile, target_profile) =
         configuration.artifact_profile(&target_name, profile)?;
     let manifest_path =
         artifact_manifest_path(&root, &target_name, profile, &target_profile.main_artifact);
-    let manifest = load_artifact_manifest(&manifest_path)?;
-    let (llvm, source_observations) = compile_project(&root, &project)?;
-    let source_identity = wosy_project::source_identity(&source_observations);
-    let expected = artifact_identity(
-        &root,
-        &configuration,
-        &target_name,
-        profile,
-        artifact,
-        artifact_profile,
-        &source_identity,
-        &llvm,
-    )?;
-    if manifest.identity != expected {
+    let manifest = load_artifact_manifest(&manifest_path)
+        .map_err(|error| format!("artifact manifest error: {error}"))?;
+    let current_observations = manifest
+        .source_observations
+        .iter()
+        .map(|observation| {
+            let path = root.join(observation.source.path.as_path());
+            let bytes = fs::read(&path)
+                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+            Ok(SourceObservation {
+                source: observation.source.clone(),
+                content_revision: ContentRevision(blake3::hash(&bytes).to_hex().to_string()),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let config = fs::read(root.join("wosy.toml")).map_err(|error| error.to_string())?;
+    let builder = configuration
+        .builders
+        .get(&artifact_profile.builder)
+        .ok_or_else(|| format!("builder {} is missing", artifact_profile.builder))?;
+    let runner = configuration
+        .runners
+        .get(&artifact_profile.run_runner)
+        .ok_or_else(|| format!("runner {} is missing", artifact_profile.run_runner))?;
+    let identity = &manifest.identity;
+    if identity.source_identity != wosy_project::source_identity(&current_observations)
+        || identity.configuration_identity != blake3::hash(&config).to_hex().to_string()
+        || identity.artifact_identity != format!("{target_name}:{profile}:{}", artifact.artifact)
+        || identity.backend != artifact_profile.backend
+        || identity.output != artifact_profile.output
+        || identity.builder_identity
+            != serde_json::to_string(builder).map_err(|error| error.to_string())?
+        || identity.runner_identity
+            != serde_json::to_string(runner).map_err(|error| error.to_string())?
+    {
         return Err("artifact manifest is stale".to_owned());
     }
     if !manifest.executable.is_file() {
