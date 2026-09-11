@@ -24,6 +24,27 @@ impl SourceIdentity {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ContentRevision(pub String);
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceObservation {
+    pub source: SourceIdentity,
+    pub content_revision: ContentRevision,
+}
+
+pub fn source_identity(observations: &[SourceObservation]) -> String {
+    observations
+        .iter()
+        .map(|observation| {
+            format!(
+                "{}:{}:{}",
+                observation.source.package,
+                observation.source.path.as_path().display(),
+                observation.content_revision.0
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct PackageRelativePath(PathBuf);
 
@@ -579,6 +600,7 @@ pub struct ArtifactIdentity {
 pub struct ArtifactManifest {
     pub identity: ArtifactIdentity,
     pub executable: PathBuf,
+    pub source_observations: Vec<SourceObservation>,
 }
 
 pub fn load_artifact_manifest(path: &Path) -> Result<ArtifactManifest, String> {
@@ -600,6 +622,7 @@ pub fn publish_artifact(
     output_dir: &Path,
     executable: PathBuf,
     identity: ArtifactIdentity,
+    source_observations: Vec<SourceObservation>,
 ) -> Result<ArtifactManifest, String> {
     if !executable.is_file() {
         return Err(format!("builder did not produce {}", executable.display()));
@@ -608,6 +631,7 @@ pub fn publish_artifact(
     let manifest = ArtifactManifest {
         identity,
         executable,
+        source_observations,
     };
     let manifest_path = output_dir.join("artifact-manifest.json");
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
@@ -747,6 +771,56 @@ mod tests {
 
         assert_eq!(value["package"], "app");
         assert_eq!(value["comment_categories"][0], "INTENT");
+    }
+
+    #[test]
+    fn source_identity_preserves_observation_order_and_revisions() {
+        let observations = vec![
+            SourceObservation {
+                source: SourceIdentity::new(
+                    "project".to_owned(),
+                    "app".to_owned(),
+                    path("src/main.w"),
+                ),
+                content_revision: ContentRevision("main-revision".to_owned()),
+            },
+            SourceObservation {
+                source: SourceIdentity::new(
+                    "project".to_owned(),
+                    "app".to_owned(),
+                    path("src/math.w"),
+                ),
+                content_revision: ContentRevision("math-revision".to_owned()),
+            },
+        ];
+
+        assert_eq!(
+            source_identity(&observations),
+            "app:src/main.w:main-revision,app:src/math.w:math-revision"
+        );
+        let serialized = serde_json::to_value(&ArtifactManifest {
+            identity: ArtifactIdentity {
+                source_identity: source_identity(&observations),
+                configuration_identity: "configuration".to_owned(),
+                artifact_identity: "artifact".to_owned(),
+                backend: "backend".to_owned(),
+                output: "output".to_owned(),
+                builder_identity: "builder".to_owned(),
+                runner_identity: "runner".to_owned(),
+                llvm_input_identity: "llvm".to_owned(),
+            },
+            executable: PathBuf::from("main"),
+            source_observations: observations,
+        })
+        .expect("artifact manifest serialization");
+        assert_eq!(
+            serialized["source_observations"][0]["source"]["path"],
+            "src/main.w"
+        );
+        assert_eq!(
+            serialized["source_observations"][1]["content_revision"],
+            "math-revision"
+        );
     }
 
     #[test]
