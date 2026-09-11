@@ -1,0 +1,8 @@
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 1
+
+[[assert]]
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["B0010", "integer literal is outside the resolved target type range", "src/main.w"]
