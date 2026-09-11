@@ -7495,7 +7495,7 @@ bool disjunction = false || true;
                 operator: UnaryOperator::Negate,
                 span,
                 operand,
-            } if *span == ByteSpan::new(20, 31)
+            } if *span == ByteSpan::new(22, 33)
                 && matches!(operand.as_ref(), ScalarExpression::Integer { value, .. } if value == &BigInt::from(2147483648u32))
         ));
 
