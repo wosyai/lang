@@ -250,6 +250,7 @@ pub enum BinaryOperator {
 pub enum UnaryOperator {
     LogicalNot,
     BitwiseNot,
+    Negate,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2466,6 +2467,13 @@ fn expression_type_in_module(
             operand,
             span,
         } => {
+            if matches!(operator, UnaryOperator::Negate) {
+                if let ScalarExpression::Integer { value, .. } = operand.as_ref() {
+                    let value = -value;
+                    validate_integer_range(module, &value, *span, diagnostics);
+                    return ScalarType::I32;
+                }
+            }
             let operand_type = expression_type_in_module(
                 operand,
                 scope,
@@ -2488,6 +2496,10 @@ fn expression_type_in_module(
                     ScalarType::Bool
                 }
                 UnaryOperator::BitwiseNot => {
+                    expect_module_integer(module, &operand_type, *span, diagnostics);
+                    operand_type
+                }
+                UnaryOperator::Negate => {
                     expect_module_integer(module, &operand_type, *span, diagnostics);
                     operand_type
                 }
@@ -2914,6 +2926,32 @@ fn expression_type_in_module_expected(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
+    if let ScalarExpression::Unary {
+        operator: UnaryOperator::Negate,
+        operand,
+        span,
+    } = expression
+    {
+        if let ScalarExpression::Integer { value, .. } = operand.as_ref() {
+            if let Some(
+                expected @ (ScalarType::I8
+                | ScalarType::I16
+                | ScalarType::I32
+                | ScalarType::I64
+                | ScalarType::I128
+                | ScalarType::U8
+                | ScalarType::U16
+                | ScalarType::U32
+                | ScalarType::U64
+                | ScalarType::U128),
+            ) = expected
+            {
+                let value = -value;
+                validate_integer_range_for_type(module, &value, *span, expected, diagnostics);
+                return expected.clone();
+            }
+        }
+    }
     if let ScalarExpression::If {
         condition,
         then_branch,
@@ -4510,6 +4548,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             let operator = match operator_token.text() {
                 "!" => UnaryOperator::LogicalNot,
                 "~" => UnaryOperator::BitwiseNot,
+                "-" => UnaryOperator::Negate,
                 _ => panic!("unary operator grammar"),
             };
             let operand = derive_element(children.get(1).expect("unary operand"));
@@ -5858,6 +5897,13 @@ fn expression_type(
             operand,
             span,
         } => {
+            if matches!(operator, UnaryOperator::Negate) {
+                if let ScalarExpression::Integer { value, .. } = operand.as_ref() {
+                    let value = -value;
+                    validate_integer_range_program(program, &value, *span, diagnostics);
+                    return ScalarType::I32;
+                }
+            }
             let operand_type = expression_type(
                 operand,
                 scope,
@@ -5879,6 +5925,10 @@ fn expression_type(
                     ScalarType::Bool
                 }
                 UnaryOperator::BitwiseNot => {
+                    expect_integer(program, &operand_type, *span, diagnostics);
+                    operand_type
+                }
+                UnaryOperator::Negate => {
                     expect_integer(program, &operand_type, *span, diagnostics);
                     operand_type
                 }
@@ -6283,6 +6333,21 @@ fn expression_type_expected(
         span,
     } = expression
     {
+        if matches!(operator, UnaryOperator::Negate) {
+            if let ScalarExpression::Integer { value, .. } = operand.as_ref() {
+                let value = -value;
+                if is_integer_type(expected) {
+                    validate_integer_range_for_type_program(
+                        program,
+                        &value,
+                        *span,
+                        expected,
+                        diagnostics,
+                    );
+                    return expected.clone();
+                }
+            }
+        }
         let operand_type = expression_type_expected(
             operand,
             if matches!(operator, UnaryOperator::LogicalNot) {
@@ -6309,6 +6374,11 @@ fn expression_type_expected(
                 ScalarType::Bool
             }
             UnaryOperator::BitwiseNot => {
+                expect_integer(program, &operand_type, *span, diagnostics);
+                expect_type(program, expected, &operand_type, *span, diagnostics);
+                operand_type
+            }
+            UnaryOperator::Negate => {
                 expect_integer(program, &operand_type, *span, diagnostics);
                 expect_type(program, expected, &operand_type, *span, diagnostics);
                 operand_type
@@ -7408,6 +7478,59 @@ bool disjunction = false || true;
                 ..
             } if matches!(operand.as_ref(), ScalarExpression::Unary { .. })
         ));
+    }
+
+    #[test]
+    fn derives_structural_negation_and_contextually_validates_integer_ranges() {
+        let text = "%%start\ni32 minimum = -2147483648;\ni32 quotient = -7 / 3;\ni32 remainder = -7 % 3;\n%%end";
+        let result = validate_text(text);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let ScalarItem::Binding(binding) = &result.program.items[0] else {
+            panic!("minimum binding");
+        };
+        assert!(matches!(
+            &binding.value,
+            ScalarExpression::Unary {
+                operator: UnaryOperator::Negate,
+                span,
+                operand,
+            } if *span == ByteSpan::new(20, 31)
+                && matches!(operand.as_ref(), ScalarExpression::Integer { value, .. } if value == &BigInt::from(2147483648u32))
+        ));
+
+        for name in ["quotient", "remainder"] {
+            let ScalarItem::Binding(binding) = result
+                .program
+                .items
+                .iter()
+                .find(|item| matches!(item, ScalarItem::Binding(binding) if binding.name == name))
+                .expect("arithmetic binding")
+            else {
+                panic!("arithmetic binding");
+            };
+            assert!(matches!(binding.declared_type, ScalarType::I32));
+            assert!(matches!(binding.value, ScalarExpression::Binary { .. }));
+        }
+
+        let invalid = validate_text("%%start\ni32 value = -2147483649;\n%%end");
+        let diagnostic = invalid
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0010")
+            .expect("negative range diagnostic");
+        assert_eq!(
+            diagnostic.message,
+            "integer literal is outside the resolved target type range"
+        );
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(20, 31));
+
+        let unsigned = validate_text("%%start\nu32 value = -1;\n%%end");
+        assert!(unsigned.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0010"
+                && diagnostic.message == "integer literal is outside the resolved target type range"
+                && diagnostic.labels[0].span.range == ByteSpan::new(20, 22)
+        }));
     }
 
     #[test]
