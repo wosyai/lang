@@ -75,6 +75,7 @@ struct EmitState<'ctx, 'module> {
     builder: &'ctx Builder<'ctx>,
     module: &'module Module<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
+    call_targets: &'ctx BTreeMap<String, String>,
     values: BTreeMap<String, EmitValue<'ctx>>,
     storage: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
     globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
@@ -83,6 +84,13 @@ struct EmitState<'ctx, 'module> {
     utf8_lengths: BTreeMap<String, u64>,
     next_literal: usize,
     next_block: usize,
+}
+
+struct LlvmExternIdentity {
+    internal_name: String,
+    import_module: String,
+    import_name: String,
+    signature: ScalarType,
 }
 
 pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, String> {
@@ -128,6 +136,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         .collect::<BTreeMap<_, _>>();
     let mut externs = Vec::new();
     let mut functions = BTreeMap::new();
+    let mut call_targets = BTreeMap::new();
     for item in &validation.program.items {
         if let ScalarItem::Function(function) = item {
             let value = module.add_function(
@@ -141,28 +150,34 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
                 }
             }
             functions.insert(function.name.clone(), value);
+            call_targets.insert(function.name.clone(), function.name.clone());
         }
     }
     for item in &validation.program.items {
         if let ScalarItem::Extern(extern_decl) = item {
             for function in &extern_decl.functions {
                 let key = format!("{}.{}", extern_decl.binding, function.name);
-                let value = module.add_function(
+                let crate::scalar::ScalarExternModule::Valid(import_module) =
+                    &extern_decl.actual_module
+                else {
+                    continue;
+                };
+                let identity = llvm_extern_identity(
+                    &validation.program.source,
+                    &extern_decl.binding,
+                    import_module,
                     &function.name,
+                    &function.signature,
+                );
+                let value = module.add_function(
+                    &identity.internal_name,
                     function_type(&context, &function.signature)?,
                     None,
                 );
-                functions.insert(key.clone(), value);
-                signatures.insert(key, function.signature.clone());
-                if let crate::scalar::ScalarExternModule::Valid(module_name) =
-                    &extern_decl.actual_module
-                {
-                    externs.push((
-                        format!("{}.{}", extern_decl.binding, function.name),
-                        module_name.clone(),
-                        function.signature.clone(),
-                    ));
-                }
+                call_targets.insert(key, identity.internal_name.clone());
+                signatures.insert(identity.internal_name.clone(), function.signature.clone());
+                functions.insert(identity.internal_name.clone(), value);
+                externs.push(identity);
             }
         }
     }
@@ -176,6 +191,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
                 &context,
                 &builder,
                 &functions,
+                &call_targets,
                 &globals,
                 function,
                 &function.name,
@@ -189,6 +205,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         &context,
         &builder,
         &functions,
+        &call_targets,
         &globals,
         &validation.program.items,
         &module,
@@ -239,6 +256,7 @@ pub fn emit_scalar_project_llvm(
     let mut functions = BTreeMap::new();
     let mut signatures = BTreeMap::new();
     let mut externs = Vec::new();
+    let mut call_targets = BTreeMap::new();
     let mut definitions = Vec::new();
     for source_module in &modules {
         for item in &source_module.items {
@@ -263,6 +281,7 @@ pub fn emit_scalar_project_llvm(
                     }
                 }
                 functions.insert(name.clone(), value);
+                call_targets.insert(name.clone(), name.clone());
                 signatures.insert(name.clone(), function.signature.clone());
                 definitions.push((source_module, function, name));
             }
@@ -272,19 +291,27 @@ pub fn emit_scalar_project_llvm(
                     crate::scalar::ScalarExternModule::Invalid { .. } => continue,
                 };
                 for function in &extern_decl.functions {
-                    let name = project_function_name(&source_module.source, &function.name);
-                    let value = module.add_function(
+                    let identity = llvm_extern_identity(
+                        &source_module.source,
+                        &extern_decl.binding,
+                        module_name,
                         &function.name,
+                        &function.signature,
+                    );
+                    let value = module.add_function(
+                        &identity.internal_name,
                         function_type(&context, &function.signature)?,
                         None,
                     );
-                    functions.insert(name.clone(), value);
-                    signatures.insert(name, function.signature.clone());
-                    externs.push((
-                        project_function_name(&source_module.source, &function.name),
-                        module_name.clone(),
-                        function.signature.clone(),
-                    ));
+                    let key = project_extern_lookup_key(
+                        &source_module.source,
+                        &extern_decl.binding,
+                        &function.name,
+                    );
+                    call_targets.insert(key, identity.internal_name.clone());
+                    signatures.insert(identity.internal_name.clone(), function.signature.clone());
+                    functions.insert(identity.internal_name.clone(), value);
+                    externs.push(identity);
                 }
             }
         }
@@ -298,6 +325,7 @@ pub fn emit_scalar_project_llvm(
             &context,
             &builder,
             &functions,
+            &call_targets,
             function,
             source_module,
             &modules,
@@ -311,6 +339,7 @@ pub fn emit_scalar_project_llvm(
         &context,
         &builder,
         &functions,
+        &call_targets,
         &modules,
         &globals,
         &module,
@@ -423,7 +452,7 @@ fn finish_partition<'ctx>(
     module_name: String,
     functions: &BTreeMap<String, FunctionValue<'ctx>>,
     signatures: &BTreeMap<String, ScalarType>,
-    externs: &[(String, String, ScalarType)],
+    externs: &[LlvmExternIdentity],
 ) -> Result<LlvmPartition, String> {
     module.verify().map_err(|error| error.to_string())?;
     let text = module.print_to_string().to_string();
@@ -472,12 +501,12 @@ fn finish_partition<'ctx>(
         .collect();
     let declarations = externs
         .iter()
-        .filter_map(|(key, module, signature)| {
-            let function = functions.get(key)?;
+        .filter_map(|extern_identity| {
+            let function = functions.get(&extern_identity.internal_name)?;
             let ScalarType::Callable {
                 outputs,
                 parameters,
-            } = signature
+            } = &extern_identity.signature
             else {
                 return None;
             };
@@ -494,13 +523,13 @@ fn finish_partition<'ctx>(
                 })
                 .collect::<Option<Vec<_>>>()?;
             Some(LlvmFunction {
-                name: function.get_name().to_string_lossy().to_string(),
+                name: extern_identity.internal_name.clone(),
                 result: value_type(result).ok()?,
                 parameters,
                 attributes: vec![LlvmFunctionAttributes {
                     group: 0,
-                    wasm_import_module: module.clone(),
-                    wasm_import_name: function.get_name().to_string_lossy().to_string(),
+                    wasm_import_module: extern_identity.import_module.clone(),
+                    wasm_import_name: extern_identity.import_name.clone(),
                 }],
                 body: String::new(),
             })
@@ -1088,6 +1117,7 @@ fn emit_function<'ctx, 'module>(
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
+    call_targets: &'ctx BTreeMap<String, String>,
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     function: &ScalarFunction,
     name: &str,
@@ -1104,6 +1134,7 @@ fn emit_function<'ctx, 'module>(
         builder,
         module,
         functions,
+        call_targets,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         globals: globals.clone(),
@@ -1155,6 +1186,7 @@ fn emit_main<'ctx, 'module>(
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
+    call_targets: &'ctx BTreeMap<String, String>,
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     items: &[ScalarItem],
     module: &'module Module<'ctx>,
@@ -1169,6 +1201,7 @@ fn emit_main<'ctx, 'module>(
         builder,
         module,
         functions,
+        call_targets,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         globals: globals.clone(),
@@ -1229,6 +1262,7 @@ fn emit_project_function<'ctx, 'module>(
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
+    call_targets: &'ctx BTreeMap<String, String>,
     function: &ScalarFunction,
     source_module: &ScalarModule,
     modules: &[&'module ScalarModule],
@@ -1246,6 +1280,7 @@ fn emit_project_function<'ctx, 'module>(
         builder,
         module,
         functions,
+        call_targets,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         globals: module_globals(source_module, globals),
@@ -1303,6 +1338,7 @@ fn emit_project_main<'ctx, 'module>(
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
+    call_targets: &'ctx BTreeMap<String, String>,
     modules: &[&ScalarModule],
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     module: &'module Module<'ctx>,
@@ -1317,6 +1353,7 @@ fn emit_project_main<'ctx, 'module>(
         builder,
         module,
         functions,
+        call_targets,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         globals: BTreeMap::new(),
@@ -2096,10 +2133,30 @@ fn emit_project_expression<'ctx, 'module>(
                     })
                     .unwrap_or(module)
             });
-            let qualified = project_function_name(&target.source, name);
+            let qualified = receiver
+                .as_deref()
+                .filter(|binding| {
+                    target.items.iter().any(|item| {
+                        matches!(
+                            item,
+                            ScalarItem::Extern(extern_decl)
+                                if extern_decl.binding == *binding
+                                    && extern_decl.functions.iter().any(|function| function.name == *name)
+                        )
+                    })
+                })
+                .map_or_else(
+                    || project_function_name(&target.source, name),
+                    |binding| project_extern_lookup_key(&target.source, binding, name),
+                );
             let function = *state
                 .functions
-                .get(&qualified)
+                .get(
+                    state
+                        .call_targets
+                        .get(&qualified)
+                        .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?,
+                )
                 .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?;
             let values = arguments
                 .iter()
@@ -2123,7 +2180,12 @@ fn emit_project_expression<'ctx, 'module>(
                     _ => emit_project_expression(context, state, argument, module, modules),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            emit_call_values(state, &qualified, values)
+            let target = state
+                .call_targets
+                .get(&qualified)
+                .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?
+                .clone();
+            emit_call_values(state, &target, values)
         }
         ScalarExpression::Name { name, .. } => emit_expression(
             context,
@@ -2252,9 +2314,14 @@ fn emit_call<'ctx, 'module>(
     }
     let qualified =
         receiver.map_or_else(|| name.to_owned(), |receiver| format!("{receiver}.{name}"));
+    let target = state
+        .call_targets
+        .get(&qualified)
+        .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?
+        .clone();
     let function = *state
         .functions
-        .get(&qualified)
+        .get(&target)
         .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?;
     let values = arguments
         .iter()
@@ -2280,7 +2347,7 @@ fn emit_call<'ctx, 'module>(
             _ => emit_expression(context, state, argument),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    emit_call_values(state, &qualified, values)
+    emit_call_values(state, &target, values)
 }
 
 fn emit_cast<'ctx, 'module>(
@@ -2999,6 +3066,62 @@ fn project_function_name(source: &wosy_syntax::SourceIdentity, name: &str) -> St
     symbol
 }
 
+fn llvm_extern_identity(
+    source: &wosy_syntax::SourceIdentity,
+    binding: &str,
+    import_module: &str,
+    import_name: &str,
+    signature: &ScalarType,
+) -> LlvmExternIdentity {
+    let internal_name = encoded_llvm_name(
+        "wosy_extern",
+        [
+            source.project.as_str(),
+            source.package.as_str(),
+            source.path.as_str(),
+            source.revision.as_str(),
+            binding,
+            import_module,
+            import_name,
+        ],
+    );
+    LlvmExternIdentity {
+        internal_name,
+        import_module: import_module.to_owned(),
+        import_name: import_name.to_owned(),
+        signature: signature.clone(),
+    }
+}
+
+fn project_extern_lookup_key(
+    source: &wosy_syntax::SourceIdentity,
+    binding: &str,
+    name: &str,
+) -> String {
+    encoded_llvm_name(
+        "wosy_extern_lookup",
+        [
+            source.project.as_str(),
+            source.package.as_str(),
+            source.path.as_str(),
+            source.revision.as_str(),
+            binding,
+            name,
+        ],
+    )
+}
+
+fn encoded_llvm_name<'a>(prefix: &str, components: impl IntoIterator<Item = &'a str>) -> String {
+    let mut symbol = prefix.to_owned();
+    for component in components {
+        symbol.push_str("__");
+        for byte in component.as_bytes() {
+            write!(symbol, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+    }
+    symbol
+}
+
 fn project_global_name(source: &wosy_syntax::SourceIdentity, name: &str) -> String {
     project_function_name(source, &format!("global_{name}"))
 }
@@ -3259,8 +3382,10 @@ mod tests {
         );
         let partition = emit_scalar_llvm(&validation).expect("primitive LLVM");
         let text = partition.to_text();
-        assert!(text.contains("declare i32 @read_char() #0"));
-        assert!(text.contains("declare ptr @read_artifact() #0"));
+        assert!(text.contains("declare i32 @wosy_extern__"));
+        assert!(text.contains("declare ptr @wosy_extern__"));
+        assert!(text.contains("wasm-import-name\"=\"read_char"));
+        assert!(text.contains("wasm-import-name\"=\"read_artifact"));
     }
 
     #[test]
@@ -3281,15 +3406,69 @@ mod tests {
         );
         let partition = emit_scalar_llvm(&validation).expect("generic extern LLVM");
         assert_eq!(partition.declarations.len(), 2);
-        assert_eq!(partition.declarations[0].name, "read");
+        assert!(partition.declarations[0].name.starts_with("wosy_extern__"));
         assert_eq!(
             partition.declarations[0].attributes[0].wasm_import_module,
             "helper"
         );
-        assert_eq!(partition.declarations[1].name, "flush");
-        assert!(partition.to_text().contains("declare i32 @read(i32) #0"));
-        assert!(partition.to_text().contains("declare void @flush() #0"));
-        assert!(partition.to_text().contains("call i32 @read(i32 7)"));
+        assert!(partition.declarations[1].name.starts_with("wosy_extern__"));
+        assert!(partition.to_text().contains("declare i32 @wosy_extern__"));
+        assert!(partition.to_text().contains("declare void @wosy_extern__"));
+        assert!(partition.to_text().contains("call i32 @wosy_extern__"));
+    }
+
+    #[test]
+    fn emits_injective_extern_identity_for_same_symbols() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\nleft = extern wasm \"shared\" { i32() same; };\nright = extern wasm \"shared\" { i32() same; };\nother = extern wasm \"other\" { i32() same; };\ni32 first = left.same();\ni32 second = right.same();\ni32 third = other.same();\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let partition = emit_scalar_llvm(&validation).expect("colliding extern LLVM");
+        assert_eq!(partition.declarations.len(), 3, "{}", partition.to_text());
+        assert_eq!(
+            partition
+                .declarations
+                .iter()
+                .map(|declaration| declaration.name.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        assert_eq!(
+            partition
+                .declarations
+                .iter()
+                .map(|declaration| declaration.attributes[0].wasm_import_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["same", "same", "same"]
+        );
+        assert_eq!(
+            partition
+                .declarations
+                .iter()
+                .map(|declaration| declaration.attributes[0].wasm_import_module.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared", "shared", "other"]
+        );
+        let text = partition.to_text();
+        for declaration in &partition.declarations {
+            assert!(text.contains(&format!("call i32 @{}()", declaration.name)));
+        }
     }
 
     #[test]
@@ -4100,8 +4279,9 @@ child.marker = child.touch();
             .nth(1)
             .expect("forward");
 
-        assert!(text.contains("declare void @touch(ptr) #0"), "{text}");
-        assert!(text.contains("declare void @inspect(ptr) #0"), "{text}");
+        assert!(text.contains("declare void @wosy_extern__"), "{text}");
+        assert!(text.contains("wasm-import-name\"=\"touch"), "{text}");
+        assert!(text.contains("wasm-import-name\"=\"inspect"), "{text}");
         assert!(forward.contains("alloca [8 x i8]"), "{forward}");
         assert!(forward.contains("store [8 x i8]"), "{forward}");
         assert!(forward.contains("%local = alloca [8 x i8]"), "{forward}");
@@ -4115,15 +4295,9 @@ child.marker = child.touch();
             "{forward}"
         );
         assert!(forward.contains("load i32, ptr %pointer"), "{forward}");
-        assert!(
-            forward.contains("call void @touch(i32 %pointer"),
-            "{forward}"
-        );
+        assert!(forward.contains("call void @wosy_extern__"), "{forward}");
         assert!(forward.contains("load i32, ptr %field"), "{forward}");
-        assert!(
-            forward.contains("call void @inspect(i32 %field"),
-            "{forward}"
-        );
+        assert!(forward.contains("call void @wosy_extern__"), "{forward}");
     }
 
     #[test]
@@ -4159,7 +4333,8 @@ child.marker = child.touch();
         let main = text.split("define i32 @main").nth(1).expect("main");
         let value = project_global_name(&source, "value");
 
-        assert!(text.contains("declare void @touch(ptr) #0"), "{text}");
+        assert!(text.contains("declare void @wosy_extern__"), "{text}");
+        assert!(text.contains("wasm-import-name\"=\"touch"), "{text}");
         assert!(
             text.contains(&format!("@{value} = internal global [8 x i8]")),
             "{text}"
@@ -4169,7 +4344,7 @@ child.marker = child.touch();
             "{main}"
         );
         assert!(main.contains("load i32, ptr %pointer"), "{main}");
-        assert!(main.contains("call void @touch(i32 %pointer"), "{main}");
+        assert!(main.contains("call void @wosy_extern__"), "{main}");
     }
 
     #[test]
