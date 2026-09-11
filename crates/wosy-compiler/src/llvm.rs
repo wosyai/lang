@@ -306,6 +306,7 @@ pub fn emit_scalar_project_llvm(
                     let key = project_extern_lookup_key(
                         &source_module.source,
                         &extern_decl.binding,
+                        module_name,
                         &function.name,
                     );
                     call_targets.insert(key, identity.internal_name.clone());
@@ -2147,7 +2148,32 @@ fn emit_project_expression<'ctx, 'module>(
                 })
                 .map_or_else(
                     || project_function_name(&target.source, name),
-                    |binding| project_extern_lookup_key(&target.source, binding, name),
+                    |binding| {
+                        let import_module = target
+                            .items
+                            .iter()
+                            .find_map(|item| match item {
+                                ScalarItem::Extern(extern_decl)
+                                    if extern_decl.binding == binding
+                                        && extern_decl.functions.iter().any(|function| function.name == *name) =>
+                                {
+                                    match &extern_decl.actual_module {
+                                        crate::scalar::ScalarExternModule::Valid(import_module) => {
+                                            Some(import_module.as_str())
+                                        }
+                                        crate::scalar::ScalarExternModule::Invalid { .. } => None,
+                                    }
+                                }
+                                _ => None,
+                            })
+                            .expect("validated extern module");
+                        project_extern_lookup_key(
+                            &target.source,
+                            binding,
+                            import_module,
+                            name,
+                        )
+                    },
                 );
             let function = *state
                 .functions
@@ -3076,7 +3102,6 @@ fn llvm_extern_identity(
     let internal_name = encoded_llvm_name(
         "wosy_extern",
         [
-            source.project.as_str(),
             source.package.as_str(),
             source.path.as_str(),
             source.revision.as_str(),
@@ -3096,16 +3121,17 @@ fn llvm_extern_identity(
 fn project_extern_lookup_key(
     source: &wosy_syntax::SourceIdentity,
     binding: &str,
+    import_module: &str,
     name: &str,
 ) -> String {
     encoded_llvm_name(
         "wosy_extern_lookup",
         [
-            source.project.as_str(),
             source.package.as_str(),
             source.path.as_str(),
             source.revision.as_str(),
             binding,
+            import_module,
             name,
         ],
     )
