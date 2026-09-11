@@ -239,6 +239,17 @@ pub enum BinaryOperator {
     GreaterEqual,
     And,
     Or,
+    BitAnd,
+    BitOr,
+    BitXor,
+    ShiftLeft,
+    ShiftRight,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum UnaryOperator {
+    LogicalNot,
+    BitwiseNot,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -295,6 +306,11 @@ pub enum ScalarExpression {
         operator: BinaryOperator,
         left: Box<ScalarExpression>,
         right: Box<ScalarExpression>,
+        span: ByteSpan,
+    },
+    Unary {
+        operator: UnaryOperator,
+        operand: Box<ScalarExpression>,
         span: ByteSpan,
     },
     Call {
@@ -841,6 +857,9 @@ fn resolve_expression_places(
         ScalarExpression::Binary { left, right, .. } => {
             resolve_expression_places(left, scope, program);
             resolve_expression_places(right, scope, program);
+        }
+        ScalarExpression::Unary { operand, .. } => {
+            resolve_expression_places(operand, scope, program);
         }
         ScalarExpression::Call { arguments, .. } => {
             for argument in arguments {
@@ -1422,6 +1441,9 @@ fn resolve_expression_module_places(
             resolve_expression_module_places(left, scope, module, modules);
             resolve_expression_module_places(right, scope, module, modules);
         }
+        ScalarExpression::Unary { operand, .. } => {
+            resolve_expression_module_places(operand, scope, module, modules);
+        }
         ScalarExpression::Call { arguments, .. } => {
             for argument in arguments {
                 resolve_expression_module_places(argument, scope, module, modules);
@@ -1676,6 +1698,7 @@ fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::RawAddress { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::Binary { span, .. }
+        | ScalarExpression::Unary { span, .. }
         | ScalarExpression::Call { span, .. }
         | ScalarExpression::If { span, .. }
         | ScalarExpression::UnitIf { span, .. } => *span,
@@ -2438,6 +2461,38 @@ fn expression_type_in_module(
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
         ScalarExpression::Char { .. } => ScalarType::Char,
         ScalarExpression::Utf8 { .. } => ScalarType::Utf8,
+        ScalarExpression::Unary {
+            operator,
+            operand,
+            span,
+        } => {
+            let operand_type = expression_type_in_module(
+                operand,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            );
+            match operator {
+                UnaryOperator::LogicalNot => {
+                    expect_module_type(
+                        module,
+                        &ScalarType::Bool,
+                        &operand_type,
+                        *span,
+                        diagnostics,
+                    );
+                    ScalarType::Bool
+                }
+                UnaryOperator::BitwiseNot => {
+                    expect_module_integer(module, &operand_type, *span, diagnostics);
+                    operand_type
+                }
+            }
+        }
         ScalarExpression::Binary {
             operator,
             left,
@@ -2499,6 +2554,14 @@ fn expression_type_in_module(
                     | BinaryOperator::GreaterEqual
             );
             let boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
+            let bitwise = matches!(
+                operator,
+                BinaryOperator::BitAnd
+                    | BinaryOperator::BitOr
+                    | BinaryOperator::BitXor
+                    | BinaryOperator::ShiftLeft
+                    | BinaryOperator::ShiftRight
+            );
             if boolean {
                 expect_module_type(module, &ScalarType::Bool, &left_type, *span, diagnostics);
                 expect_module_type(module, &ScalarType::Bool, &right_type, *span, diagnostics);
@@ -2506,6 +2569,11 @@ fn expression_type_in_module(
             } else if comparison {
                 expect_module_type(module, &left_type, &right_type, *span, diagnostics);
                 ScalarType::Bool
+            } else if bitwise {
+                expect_module_integer(module, &left_type, *span, diagnostics);
+                expect_module_integer(module, &right_type, *span, diagnostics);
+                expect_module_type(module, &left_type, &right_type, *span, diagnostics);
+                left_type
             } else {
                 expect_module_type(module, &ScalarType::I32, &left_type, *span, diagnostics);
                 expect_module_type(module, &left_type, &right_type, *span, diagnostics);
@@ -3054,6 +3122,14 @@ fn expression_type_in_module_expected(
                 | BinaryOperator::GreaterEqual
         );
         let boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
+        let bitwise = matches!(
+            operator,
+            BinaryOperator::BitAnd
+                | BinaryOperator::BitOr
+                | BinaryOperator::BitXor
+                | BinaryOperator::ShiftLeft
+                | BinaryOperator::ShiftRight
+        );
         let arithmetic_context = expected.filter(|ty| {
             matches!(
                 ty,
@@ -3188,6 +3264,12 @@ fn expression_type_in_module_expected(
         if comparison {
             expect_module_type(module, &left_type, &right_type, *span, diagnostics);
             return ScalarType::Bool;
+        }
+        if bitwise {
+            expect_module_integer(module, &left_type, *span, diagnostics);
+            expect_module_integer(module, &right_type, *span, diagnostics);
+            expect_module_type(module, &left_type, &right_type, *span, diagnostics);
+            return left_type;
         }
         expect_module_type(
             module,
@@ -3396,6 +3478,38 @@ fn expect_module_type(
             module,
             "B0003",
             "expression type does not match expected type",
+            span,
+        ));
+    }
+}
+
+fn is_integer_type(ty: &ScalarType) -> bool {
+    matches!(
+        ty,
+        ScalarType::I8
+            | ScalarType::I16
+            | ScalarType::I32
+            | ScalarType::I64
+            | ScalarType::I128
+            | ScalarType::U8
+            | ScalarType::U16
+            | ScalarType::U32
+            | ScalarType::U64
+            | ScalarType::U128
+    )
+}
+
+fn expect_module_integer(
+    module: &ScalarModule,
+    actual: &ScalarType,
+    span: ByteSpan,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    if !is_error_type(actual) && !is_integer_type(actual) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "integer operation requires integer operands",
             span,
         ));
     }
@@ -4385,6 +4499,29 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             }
             value
         }
+        SyntaxKind::Unary => {
+            let children = semantic_children(&actual);
+            let Some(first) = children.first() else {
+                panic!("unary expression children")
+            };
+            let NodeOrToken::Token(operator_token) = first else {
+                return derive_element(first);
+            };
+            let operator = match operator_token.text() {
+                "!" => UnaryOperator::LogicalNot,
+                "~" => UnaryOperator::BitwiseNot,
+                _ => panic!("unary operator grammar"),
+            };
+            let operand = derive_element(children.get(1).expect("unary operand"));
+            ScalarExpression::Unary {
+                operator,
+                span: ByteSpan::new(
+                    operator_token.text_range().start().into(),
+                    span_of(&operand).end,
+                ),
+                operand: Box::new(operand),
+            }
+        }
         SyntaxKind::Call => {
             let qualified = direct_nodes(&actual)
                 .into_iter()
@@ -4742,6 +4879,7 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::Char { span, .. }
         | ScalarExpression::Utf8 { span, .. }
         | ScalarExpression::Binary { span, .. }
+        | ScalarExpression::Unary { span, .. }
         | ScalarExpression::Call { span, .. }
         | ScalarExpression::If { span, .. }
         | ScalarExpression::UnitIf { span, .. } => *span,
@@ -4859,6 +4997,9 @@ fn validate_unit_if_position(
             validate_unit_if_position(left, false, source, diagnostics);
             validate_unit_if_position(right, false, source, diagnostics);
         }
+        ScalarExpression::Unary { operand, .. } => {
+            validate_unit_if_position(operand, false, source, diagnostics);
+        }
         ScalarExpression::Call { arguments, .. } => {
             for argument in arguments {
                 validate_unit_if_position(argument, false, source, diagnostics);
@@ -4918,6 +5059,11 @@ fn operator(value: &str) -> BinaryOperator {
         ">=" => BinaryOperator::GreaterEqual,
         "&&" => BinaryOperator::And,
         "||" => BinaryOperator::Or,
+        "&" => BinaryOperator::BitAnd,
+        "|" => BinaryOperator::BitOr,
+        "^" => BinaryOperator::BitXor,
+        "<<" => BinaryOperator::ShiftLeft,
+        ">>" => BinaryOperator::ShiftRight,
         _ => panic!("operator grammar"),
     }
 }
@@ -5216,6 +5362,7 @@ impl StaticUseAnalyzer {
         match expression {
             ScalarExpression::Name { name, .. } => self.use_name(name, visible),
             ScalarExpression::Member { receiver, .. } => self.use_name(receiver, visible),
+            ScalarExpression::Unary { operand, .. } => self.expression(operand, visible),
             ScalarExpression::Binary { left, right, .. } => {
                 self.expression(left, visible);
                 self.expression(right, visible);
@@ -5706,6 +5853,37 @@ fn expression_type(
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
         ScalarExpression::Char { .. } => ScalarType::Char,
         ScalarExpression::Utf8 { .. } => ScalarType::Utf8,
+        ScalarExpression::Unary {
+            operator,
+            operand,
+            span,
+        } => {
+            let operand_type = expression_type(
+                operand,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            match operator {
+                UnaryOperator::LogicalNot => {
+                    expect_type(
+                        program,
+                        &ScalarType::Bool,
+                        &operand_type,
+                        *span,
+                        diagnostics,
+                    );
+                    ScalarType::Bool
+                }
+                UnaryOperator::BitwiseNot => {
+                    expect_integer(program, &operand_type, *span, diagnostics);
+                    operand_type
+                }
+            }
+        }
         ScalarExpression::Binary {
             operator,
             left,
@@ -5764,6 +5942,14 @@ fn expression_type(
                     | BinaryOperator::GreaterEqual
             );
             let boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
+            let bitwise = matches!(
+                operator,
+                BinaryOperator::BitAnd
+                    | BinaryOperator::BitOr
+                    | BinaryOperator::BitXor
+                    | BinaryOperator::ShiftLeft
+                    | BinaryOperator::ShiftRight
+            );
             if boolean {
                 expect_type(program, &ScalarType::Bool, &left_type, *span, diagnostics);
                 expect_type(program, &ScalarType::Bool, &right_type, *span, diagnostics);
@@ -5771,6 +5957,11 @@ fn expression_type(
             } else if comparison {
                 expect_type(program, &left_type, &right_type, *span, diagnostics);
                 ScalarType::Bool
+            } else if bitwise {
+                expect_integer(program, &left_type, *span, diagnostics);
+                expect_integer(program, &right_type, *span, diagnostics);
+                expect_type(program, &left_type, &right_type, *span, diagnostics);
+                left_type
             } else {
                 expect_type(program, &ScalarType::I32, &left_type, *span, diagnostics);
                 expect_type(program, &left_type, &right_type, *span, diagnostics);
@@ -6060,6 +6251,22 @@ fn expect_type(
     }
 }
 
+fn expect_integer(
+    program: &ScalarProgram,
+    actual: &ScalarType,
+    span: ByteSpan,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    if !is_error_type(actual) && !is_integer_type(actual) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            "integer operation requires integer operands",
+            span,
+        ));
+    }
+}
+
 fn expression_type_expected(
     expression: &ScalarExpression,
     expected: &ScalarType,
@@ -6070,366 +6277,426 @@ fn expression_type_expected(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
-    if let ScalarExpression::If {
-        condition,
-        then_branch,
-        else_branch,
+    if let ScalarExpression::Unary {
+        operator,
+        operand,
         span,
     } = expression
     {
-        let condition_type = expression_type(
+        let operand_type = expression_type_expected(
+            operand,
+            if matches!(operator, UnaryOperator::LogicalNot) {
+                &ScalarType::Bool
+            } else {
+                expected
+            },
+            scope,
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+            unsafe_context,
+        );
+        match operator {
+            UnaryOperator::LogicalNot => {
+                expect_type(
+                    program,
+                    &ScalarType::Bool,
+                    &operand_type,
+                    *span,
+                    diagnostics,
+                );
+                ScalarType::Bool
+            }
+            UnaryOperator::BitwiseNot => {
+                expect_integer(program, &operand_type, *span, diagnostics);
+                expect_type(program, expected, &operand_type, *span, diagnostics);
+                operand_type
+            }
+        }
+    } else {
+        if let ScalarExpression::If {
             condition,
-            scope,
-            visible_names,
-            folded_names,
-            program,
-            diagnostics,
-            unsafe_context,
-        );
-        if !is_error_type(&condition_type) && !scalar_type_equal(&condition_type, &ScalarType::Bool)
-        {
-            diagnostics.push(diagnostic(
-                program,
-                "B0005",
-                "conditional expression requires bool",
-                *span,
-            ));
-        }
-        let then_type = block_type_expected(
             then_branch,
-            expected,
-            scope,
-            visible_names,
-            folded_names,
-            program,
-            diagnostics,
-            unsafe_context,
-        );
-        let else_type = block_type_expected(
             else_branch,
-            expected,
-            scope,
-            visible_names,
-            folded_names,
-            program,
-            diagnostics,
-            unsafe_context,
-        );
-        if !is_error_type(&then_type)
-            && !is_error_type(&else_type)
-            && !scalar_type_equal(&then_type, &else_type)
+            span,
+        } = expression
         {
-            diagnostics.push(diagnostic(
+            let condition_type = expression_type(
+                condition,
+                scope,
+                visible_names,
+                folded_names,
                 program,
-                "B0006",
-                "conditional branches must have equal types",
-                *span,
-            ));
-        }
-        return then_type;
-    }
-    if matches!(expression, ScalarExpression::Name { name, .. } if name == "null")
-        && matches!(expected, ScalarType::RawPointer(_))
-    {
-        return expected.clone();
-    }
-    if matches!(expression, ScalarExpression::Integer { .. })
-        && matches!(
-            expected,
-            ScalarType::I8
-                | ScalarType::I16
-                | ScalarType::I32
-                | ScalarType::I64
-                | ScalarType::I128
-                | ScalarType::U8
-                | ScalarType::U16
-                | ScalarType::U32
-                | ScalarType::U64
-                | ScalarType::U128
-        )
-    {
-        if let ScalarExpression::Integer { value, span } = expression {
-            validate_integer_range_for_type_program(program, value, *span, expected, diagnostics);
-        }
-        return expected.clone();
-    }
-    if matches!(expression, ScalarExpression::Float { .. })
-        && matches!(expected, ScalarType::F32 | ScalarType::F64)
-    {
-        if let ScalarExpression::Float { value, span, .. } = expression {
-            if *expected == ScalarType::F32 && !(*value as f32).is_finite() {
+                diagnostics,
+                unsafe_context,
+            );
+            if !is_error_type(&condition_type)
+                && !scalar_type_equal(&condition_type, &ScalarType::Bool)
+            {
                 diagnostics.push(diagnostic(
                     program,
-                    "B0010",
-                    "floating-point literal is outside the f32 range",
+                    "B0005",
+                    "conditional expression requires bool",
+                    *span,
+                ));
+            }
+            let then_type = block_type_expected(
+                then_branch,
+                expected,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            let else_type = block_type_expected(
+                else_branch,
+                expected,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            if !is_error_type(&then_type)
+                && !is_error_type(&else_type)
+                && !scalar_type_equal(&then_type, &else_type)
+            {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0006",
+                    "conditional branches must have equal types",
+                    *span,
+                ));
+            }
+            return then_type;
+        }
+        if matches!(expression, ScalarExpression::Name { name, .. } if name == "null")
+            && matches!(expected, ScalarType::RawPointer(_))
+        {
+            return expected.clone();
+        }
+        if matches!(expression, ScalarExpression::Integer { .. })
+            && matches!(
+                expected,
+                ScalarType::I8
+                    | ScalarType::I16
+                    | ScalarType::I32
+                    | ScalarType::I64
+                    | ScalarType::I128
+                    | ScalarType::U8
+                    | ScalarType::U16
+                    | ScalarType::U32
+                    | ScalarType::U64
+                    | ScalarType::U128
+            )
+        {
+            if let ScalarExpression::Integer { value, span } = expression {
+                validate_integer_range_for_type_program(
+                    program,
+                    value,
+                    *span,
+                    expected,
+                    diagnostics,
+                );
+            }
+            return expected.clone();
+        }
+        if matches!(expression, ScalarExpression::Float { .. })
+            && matches!(expected, ScalarType::F32 | ScalarType::F64)
+        {
+            if let ScalarExpression::Float { value, span, .. } = expression {
+                if *expected == ScalarType::F32 && !(*value as f32).is_finite() {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "B0010",
+                        "floating-point literal is outside the f32 range",
+                        *span,
+                    ));
+                    return ScalarType::Error;
+                }
+            }
+            return expected.clone();
+        }
+        if let ScalarExpression::Block(block) = expression {
+            return block_type_expected(
+                block,
+                expected,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+        }
+        if let ScalarExpression::Binary {
+            operator,
+            left,
+            right,
+            span,
+        } = expression
+        {
+            let comparison = matches!(
+                operator,
+                BinaryOperator::Equal
+                    | BinaryOperator::NotEqual
+                    | BinaryOperator::Less
+                    | BinaryOperator::LessEqual
+                    | BinaryOperator::Greater
+                    | BinaryOperator::GreaterEqual
+            );
+            let boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
+            let arithmetic_context = matches!(
+                expected,
+                ScalarType::I8
+                    | ScalarType::I16
+                    | ScalarType::I32
+                    | ScalarType::I64
+                    | ScalarType::I128
+                    | ScalarType::U8
+                    | ScalarType::U16
+                    | ScalarType::U32
+                    | ScalarType::U64
+                    | ScalarType::U128
+                    | ScalarType::F32
+                    | ScalarType::F64
+            );
+            let bitwise = matches!(
+                operator,
+                BinaryOperator::BitAnd
+                    | BinaryOperator::BitOr
+                    | BinaryOperator::BitXor
+                    | BinaryOperator::ShiftLeft
+                    | BinaryOperator::ShiftRight
+            );
+            let bool_context = ScalarType::Bool;
+            let (left_type, right_type) = if comparison && is_null_expression(left) {
+                let right_type = expression_type(
+                    right,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                let left_type = expression_type_expected(
+                    left,
+                    &right_type,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                (left_type, right_type)
+            } else if comparison && matches!(left.as_ref(), ScalarExpression::Float { .. }) {
+                let right_type = expression_type(
+                    right,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                let left_type = expression_type_expected(
+                    left,
+                    &right_type,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                (left_type, right_type)
+            } else if comparison && matches!(right.as_ref(), ScalarExpression::Float { .. }) {
+                let left_type = expression_type(
+                    left,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                let right_type = expression_type_expected(
+                    right,
+                    &left_type,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                (left_type, right_type)
+            } else {
+                let left_type = if boolean {
+                    expression_type_expected(
+                        left,
+                        &bool_context,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                    )
+                } else if comparison {
+                    expression_type(
+                        left,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                    )
+                } else {
+                    expression_type_expected(
+                        left,
+                        expected,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                    )
+                };
+                let right_type = expression_type_expected(
+                    right,
+                    if boolean {
+                        &bool_context
+                    } else if comparison && is_null_expression(right) {
+                        &left_type
+                    } else {
+                        expected
+                    },
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                (left_type, right_type)
+            };
+            if boolean {
+                expect_type(program, &bool_context, &left_type, *span, diagnostics);
+                expect_type(program, &bool_context, &right_type, *span, diagnostics);
+                return ScalarType::Bool;
+            }
+            if is_error_type(&left_type) || is_error_type(&right_type) {
+                return ScalarType::Error;
+            }
+            if comparison {
+                expect_type(program, &left_type, &right_type, *span, diagnostics);
+                return ScalarType::Bool;
+            }
+            if bitwise {
+                expect_integer(program, &left_type, *span, diagnostics);
+                expect_integer(program, &right_type, *span, diagnostics);
+                expect_type(program, &left_type, &right_type, *span, diagnostics);
+                return left_type;
+            }
+            expect_type(
+                program,
+                if arithmetic_context {
+                    expected
+                } else {
+                    &ScalarType::I32
+                },
+                &left_type,
+                *span,
+                diagnostics,
+            );
+            expect_type(program, &left_type, &right_type, *span, diagnostics);
+            if arithmetic_context {
+                return expected.clone();
+            }
+            return ScalarType::I32;
+        }
+        if let ScalarExpression::StructLiteral { fields, span } = expression {
+            let ScalarType::Struct(id) = expected else {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "struct literal requires a struct context",
                     *span,
                 ));
                 return ScalarType::Error;
+            };
+            let Some(structure) = program
+                .structs
+                .get(id.index)
+                .filter(|structure| structure.id == *id)
+            else {
+                diagnostics.push(diagnostic(program, "B0003", "invalid struct type", *span));
+                return ScalarType::Error;
+            };
+            let mut seen = BTreeSet::new();
+            let mut initialized = BTreeSet::new();
+            for field in fields {
+                if !seen.insert(field.name.clone()) {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "B0002",
+                        "duplicate struct literal field",
+                        field.name_span,
+                    ));
+                    continue;
+                }
+                let Some(declared) = structure.fields.iter().find(|item| item.name == field.name)
+                else {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "M0002",
+                        "unknown struct field",
+                        field.name_span,
+                    ));
+                    continue;
+                };
+                initialized.insert(field.name.clone());
+                let actual = expression_type_expected(
+                    &field.value,
+                    &declared.ty,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                expect_type(program, &declared.ty, &actual, field.span, diagnostics);
             }
+            if initialized.len() != structure.fields.len() {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "struct literal must initialize every field",
+                    *span,
+                ));
+            }
+            return expected.clone();
         }
-        return expected.clone();
-    }
-    if let ScalarExpression::Block(block) = expression {
-        return block_type_expected(
-            block,
-            expected,
+        expression_type(
+            expression,
             scope,
             visible_names,
             folded_names,
             program,
             diagnostics,
             unsafe_context,
-        );
+        )
     }
-    if let ScalarExpression::Binary {
-        operator,
-        left,
-        right,
-        span,
-    } = expression
-    {
-        let comparison = matches!(
-            operator,
-            BinaryOperator::Equal
-                | BinaryOperator::NotEqual
-                | BinaryOperator::Less
-                | BinaryOperator::LessEqual
-                | BinaryOperator::Greater
-                | BinaryOperator::GreaterEqual
-        );
-        let boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
-        let arithmetic_context = matches!(
-            expected,
-            ScalarType::I8
-                | ScalarType::I16
-                | ScalarType::I32
-                | ScalarType::I64
-                | ScalarType::I128
-                | ScalarType::U8
-                | ScalarType::U16
-                | ScalarType::U32
-                | ScalarType::U64
-                | ScalarType::U128
-                | ScalarType::F32
-                | ScalarType::F64
-        );
-        let bool_context = ScalarType::Bool;
-        let (left_type, right_type) = if comparison && is_null_expression(left) {
-            let right_type = expression_type(
-                right,
-                scope,
-                visible_names,
-                folded_names,
-                program,
-                diagnostics,
-                unsafe_context,
-            );
-            let left_type = expression_type_expected(
-                left,
-                &right_type,
-                scope,
-                visible_names,
-                folded_names,
-                program,
-                diagnostics,
-                unsafe_context,
-            );
-            (left_type, right_type)
-        } else if comparison && matches!(left.as_ref(), ScalarExpression::Float { .. }) {
-            let right_type = expression_type(
-                right,
-                scope,
-                visible_names,
-                folded_names,
-                program,
-                diagnostics,
-                unsafe_context,
-            );
-            let left_type = expression_type_expected(
-                left,
-                &right_type,
-                scope,
-                visible_names,
-                folded_names,
-                program,
-                diagnostics,
-                unsafe_context,
-            );
-            (left_type, right_type)
-        } else if comparison && matches!(right.as_ref(), ScalarExpression::Float { .. }) {
-            let left_type = expression_type(
-                left,
-                scope,
-                visible_names,
-                folded_names,
-                program,
-                diagnostics,
-                unsafe_context,
-            );
-            let right_type = expression_type_expected(
-                right,
-                &left_type,
-                scope,
-                visible_names,
-                folded_names,
-                program,
-                diagnostics,
-                unsafe_context,
-            );
-            (left_type, right_type)
-        } else {
-            let left_type = if boolean {
-                expression_type_expected(
-                    left,
-                    &bool_context,
-                    scope,
-                    visible_names,
-                    folded_names,
-                    program,
-                    diagnostics,
-                    unsafe_context,
-                )
-            } else if comparison {
-                expression_type(
-                    left,
-                    scope,
-                    visible_names,
-                    folded_names,
-                    program,
-                    diagnostics,
-                    unsafe_context,
-                )
-            } else {
-                expression_type_expected(
-                    left,
-                    expected,
-                    scope,
-                    visible_names,
-                    folded_names,
-                    program,
-                    diagnostics,
-                    unsafe_context,
-                )
-            };
-            let right_type = expression_type_expected(
-                right,
-                if boolean {
-                    &bool_context
-                } else if comparison && is_null_expression(right) {
-                    &left_type
-                } else {
-                    expected
-                },
-                scope,
-                visible_names,
-                folded_names,
-                program,
-                diagnostics,
-                unsafe_context,
-            );
-            (left_type, right_type)
-        };
-        if boolean {
-            expect_type(program, &bool_context, &left_type, *span, diagnostics);
-            expect_type(program, &bool_context, &right_type, *span, diagnostics);
-            return ScalarType::Bool;
-        }
-        if is_error_type(&left_type) || is_error_type(&right_type) {
-            return ScalarType::Error;
-        }
-        if comparison {
-            expect_type(program, &left_type, &right_type, *span, diagnostics);
-            return ScalarType::Bool;
-        }
-        expect_type(
-            program,
-            if arithmetic_context {
-                expected
-            } else {
-                &ScalarType::I32
-            },
-            &left_type,
-            *span,
-            diagnostics,
-        );
-        expect_type(program, &left_type, &right_type, *span, diagnostics);
-        if arithmetic_context {
-            return expected.clone();
-        }
-        return ScalarType::I32;
-    }
-    if let ScalarExpression::StructLiteral { fields, span } = expression {
-        let ScalarType::Struct(id) = expected else {
-            diagnostics.push(diagnostic(
-                program,
-                "B0003",
-                "struct literal requires a struct context",
-                *span,
-            ));
-            return ScalarType::Error;
-        };
-        let Some(structure) = program
-            .structs
-            .get(id.index)
-            .filter(|structure| structure.id == *id)
-        else {
-            diagnostics.push(diagnostic(program, "B0003", "invalid struct type", *span));
-            return ScalarType::Error;
-        };
-        let mut seen = BTreeSet::new();
-        let mut initialized = BTreeSet::new();
-        for field in fields {
-            if !seen.insert(field.name.clone()) {
-                diagnostics.push(diagnostic(
-                    program,
-                    "B0002",
-                    "duplicate struct literal field",
-                    field.name_span,
-                ));
-                continue;
-            }
-            let Some(declared) = structure.fields.iter().find(|item| item.name == field.name)
-            else {
-                diagnostics.push(diagnostic(
-                    program,
-                    "M0002",
-                    "unknown struct field",
-                    field.name_span,
-                ));
-                continue;
-            };
-            initialized.insert(field.name.clone());
-            let actual = expression_type_expected(
-                &field.value,
-                &declared.ty,
-                scope,
-                visible_names,
-                folded_names,
-                program,
-                diagnostics,
-                unsafe_context,
-            );
-            expect_type(program, &declared.ty, &actual, field.span, diagnostics);
-        }
-        if initialized.len() != structure.fields.len() {
-            diagnostics.push(diagnostic(
-                program,
-                "B0003",
-                "struct literal must initialize every field",
-                *span,
-            ));
-        }
-        return expected.clone();
-    }
-    expression_type(
-        expression,
-        scope,
-        visible_names,
-        folded_names,
-        program,
-        diagnostics,
-        unsafe_context,
-    )
 }
 
 fn is_null_expression(expression: &ScalarExpression) -> bool {
@@ -7100,6 +7367,123 @@ mod tests {
                 .range,
             ByteSpan::new(28, 37)
         );
+    }
+
+    #[test]
+    fn validates_unary_nesting_bitwise_types_and_short_circuit_booleans() {
+        let result = validate_text(
+            "%%start
+i32 complemented = ~~~1;
+bool inverted = !!!true;
+i32 bit_and = 7 & 3;
+i32 bit_or = 7 | 3;
+i32 bit_xor = 7 ^ 3;
+i32 shifted_left = 7 << 1;
+i32 shifted_right = 7 >> 1;
+bool conjunction = true && false;
+bool disjunction = false || true;
+%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let ScalarItem::Binding(binding) = &result.program.items[0] else {
+            panic!("complement binding");
+        };
+        assert!(matches!(
+            &binding.value,
+            ScalarExpression::Unary {
+                operator: UnaryOperator::BitwiseNot,
+                operand,
+                ..
+            } if matches!(operand.as_ref(), ScalarExpression::Unary { .. })
+        ));
+        let ScalarItem::Binding(binding) = &result.program.items[1] else {
+            panic!("inversion binding");
+        };
+        assert!(matches!(
+            &binding.value,
+            ScalarExpression::Unary {
+                operator: UnaryOperator::LogicalNot,
+                operand,
+                ..
+            } if matches!(operand.as_ref(), ScalarExpression::Unary { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_integer_boolean_and_equal_type_operands_at_expression_spans() {
+        let text = "%%start
+i32 signed = 1;
+u32 unsigned = 1;
+i32 mismatch = signed & unsigned;
+i32 bool_bitwise = true | false;
+i32 bool_complement = ~true;
+bool integer_inversion = !1;
+%%end";
+        let result = validate_text(text);
+        let diagnostics: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "B0003")
+            .collect();
+        assert!(diagnostics.len() >= 4, "{:?}", result.diagnostics);
+        for expression in ["signed & unsigned", "true | false", "~true", "!1"] {
+            let start = text.find(expression).expect("expression") as u32;
+            let end = start + expression.len() as u32;
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.labels[0].span.range == ByteSpan::new(start, end)),
+                "missing diagnostic span for {expression}: {:?}",
+                diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_scalar_precedence_and_left_associativity() {
+        let result = validate_text(
+            "%%start\ni32 value = 1 | 2 ^ 3 & 4 << 1 + 2 * 3;\ni32 shifts = 8 >> 1 >> 1;\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(binding) = &result.program.items[0] else {
+            panic!("value binding");
+        };
+        let ScalarExpression::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } = &binding.value
+        else {
+            panic!("outer binary expression");
+        };
+        assert_eq!(*operator, BinaryOperator::BitOr);
+        assert!(
+            matches!(
+                right.as_ref(),
+                ScalarExpression::Binary {
+                    operator: BinaryOperator::BitXor,
+                    ..
+                }
+            ),
+            "{binding:?}"
+        );
+        assert!(matches!(left.as_ref(), ScalarExpression::Integer { .. }));
+        let ScalarItem::Binding(binding) = &result.program.items[1] else {
+            panic!("shift binding");
+        };
+        assert!(matches!(
+            &binding.value,
+            ScalarExpression::Binary {
+                operator: BinaryOperator::ShiftRight,
+                left,
+                ..
+            } if matches!(left.as_ref(), ScalarExpression::Binary {
+                operator: BinaryOperator::ShiftRight,
+                ..
+            })
+        ));
     }
 
     #[test]

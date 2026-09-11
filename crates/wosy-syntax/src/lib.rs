@@ -69,6 +69,7 @@ pub enum SyntaxKind {
     GenericTypeArgument,
     QualifiedType,
     UnitIfExpr,
+    Unary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -138,6 +139,7 @@ impl Language for WosyLanguage {
             56 => SyntaxKind::GenericTypeArgument,
             57 => SyntaxKind::QualifiedType,
             58 => SyntaxKind::UnitIfExpr,
+            59 => SyntaxKind::Unary,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -569,9 +571,19 @@ fn kind(rule: Rule) -> SyntaxKind {
         | Rule::logical_and
         | Rule::comparison
         | Rule::additive
-        | Rule::multiplicative => SyntaxKind::Binary,
+        | Rule::multiplicative
+        | Rule::bit_or
+        | Rule::bit_xor
+        | Rule::bit_and
+        | Rule::shift => SyntaxKind::Binary,
+        Rule::unary => SyntaxKind::Unary,
         Rule::or_operator
         | Rule::and_operator
+        | Rule::bit_or_operator
+        | Rule::bit_xor_operator
+        | Rule::bit_and_operator
+        | Rule::shift_operator
+        | Rule::unary_operator
         | Rule::comparison_operator
         | Rule::add_operator
         | Rule::multiply_operator
@@ -775,6 +787,7 @@ mod tests {
             SyntaxKind::GenericTypeArguments,
             SyntaxKind::GenericTypeArgument,
             SyntaxKind::QualifiedType,
+            SyntaxKind::Unary,
         ];
         for kind in kinds {
             assert_eq!(
@@ -793,6 +806,78 @@ mod tests {
         assert!(result.root.descendants_with_tokens().any(|element| {
             element.kind() == SyntaxKind::TypedComment && element.to_string().starts_with('#')
         }));
+    }
+
+    #[test]
+    fn expression_operators_have_structural_precedence_and_lossless_tokens() {
+        let text = "%%start\ni32 value = 1 | 2 ^ 3 & 4 << 1 + 2 * 3;\nbool flags = !!!true && false || true;\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+
+        let binary = result
+            .root
+            .descendants()
+            .find(|node| {
+                node.kind() == SyntaxKind::Binary && node.text().to_string().contains("1 |")
+            })
+            .expect("outer bitwise-or node");
+        assert_eq!(binary.text(), "1 | 2 ^ 3 & 4 << 1 + 2 * 3");
+        assert!(binary.children().any(|node| {
+            node.kind() == SyntaxKind::Binary && node.text().to_string().contains("2 ^")
+        }));
+        assert!(result.root.descendants().any(|node| {
+            node.kind() == SyntaxKind::Unary && node.text().to_string() == "!!!true"
+        }));
+        assert!(result.root.descendants().any(|node| {
+            node.kind() == SyntaxKind::Unary && node.text().to_string() == "!!true"
+        }));
+        assert!(result.root.descendants().any(|node| {
+            node.kind() == SyntaxKind::Unary && node.text().to_string() == "!true"
+        }));
+        for operator in ["|", "^", "&", "<<", "+", "*", "&&", "||", "!"] {
+            assert!(
+                result.root.descendants_with_tokens().any(|element| {
+                    matches!(
+                        element,
+                        rowan::NodeOrToken::Token(token)
+                            if token.kind() == SyntaxKind::Operator && token.text() == operator
+                    )
+                }),
+                "missing operator token {operator}"
+            );
+        }
+    }
+
+    #[test]
+    fn binary_tiers_are_left_associative_and_parentheses_override_them() {
+        let text = "%%start\ni32 value = 8 >> 1 >> 1;\ni32 grouped = 8 >> (1 >> 1);\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        let outer_shift = result
+            .root
+            .descendants()
+            .find(|node| {
+                node.kind() == SyntaxKind::Binary && node.text().to_string() == "8 >> 1 >> 1"
+            })
+            .expect("left-associative shift node");
+        assert_eq!(
+            outer_shift
+                .descendants_with_tokens()
+                .filter(|element| {
+                    matches!(
+                        element,
+                        rowan::NodeOrToken::Token(token)
+                            if token.kind() == SyntaxKind::Operator && token.text() == ">>"
+                    )
+                })
+                .count(),
+            2
+        );
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Parenthesized && node.text() == "(1 >> 1)"));
     }
 
     #[test]

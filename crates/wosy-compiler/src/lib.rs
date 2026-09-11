@@ -12,8 +12,11 @@ pub use scalar::{
     derive_scalar_diagnostics_from_cst, derive_scalar_program, derive_scalar_program_from_cst,
     validate_scalar_project, BinaryOperator, ScalarAssignment, ScalarBinding, ScalarBlock,
     ScalarBlockItem, ScalarExpression, ScalarExtern, ScalarExternFunction, ScalarFunction,
-    ScalarInitializationNode, ScalarItem, ScalarModule, ScalarNamespaceBinding, ScalarProgram,
-    ScalarProject, ScalarProjectValidation, ScalarType, ScalarValidation, ScalarWhile,
+    ScalarInitializationNode, ScalarItem, ScalarLayout, ScalarModule, ScalarNamespaceBinding,
+    ScalarOutput, ScalarOutputReceiver, ScalarOutputSequence, ScalarPlace, ScalarProgram,
+    ScalarProject, ScalarProjectValidation, ScalarStruct, ScalarStructField, ScalarStructFieldId,
+    ScalarStructId, ScalarStructLiteral, ScalarStructLiteralField, ScalarTargetLayout, ScalarType,
+    ScalarValidation, ScalarWhile, UnaryOperator,
 };
 
 mod llvm;
