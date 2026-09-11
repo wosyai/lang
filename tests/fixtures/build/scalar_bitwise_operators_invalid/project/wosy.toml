@@ -1,0 +1,19 @@
+[package]
+name = "scalar_bitwise_operators_invalid"
+default_target = "app"
+
+[comments]
+categories = []
+
+[targets.app]
+root = "src/main.w"
+
+[targets.app.artifacts.main]
+artifact = "Main"
+
+[targets.app.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+
+[targets.app.profiles.dev]
+main_artifact = "main"

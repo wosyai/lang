@@ -1919,6 +1919,12 @@ fn emit_expression<'ctx, 'module>(
                 .into(),
         )),
         ScalarExpression::Utf8 { value, .. } => emit_utf8_literal(context, state, value),
+        ScalarExpression::Unary {
+            operator, operand, ..
+        } => {
+            let value = take_basic(emit_expression(context, state, operand)?)?.into_int_value();
+            emit_unary_value(state, operator, value)
+        }
         ScalarExpression::Binary {
             operator,
             left,
@@ -2135,13 +2141,22 @@ fn emit_project_expression<'ctx, 'module>(
                 .into(),
         )),
         ScalarExpression::Utf8 { value, .. } => emit_utf8_literal(context, state, value),
+        ScalarExpression::Unary {
+            operator, operand, ..
+        } => {
+            let value = take_basic(emit_project_expression(
+                context, state, operand, module, modules,
+            )?)?
+            .into_int_value();
+            emit_unary_value(state, operator, value)
+        }
         ScalarExpression::Binary {
             operator,
             left,
             right,
             ..
         } => {
-            let unsigned = expression_is_unsigned(state, left);
+            let unsigned = project_expression_is_unsigned(state, left, module, modules);
             let left = emit_project_expression(context, state, left, module, modules)?;
             emit_binary_with_rhs(
                 context,
@@ -2356,6 +2371,27 @@ fn expression_is_unsigned<'ctx, 'module>(
     expression: &ScalarExpression,
 ) -> bool {
     match expression {
+        ScalarExpression::Member { receiver, name, .. } => {
+            if let Ok(Some(crate::ScalarPlace::Field { field, .. })) =
+                struct_member_place(state, receiver, name)
+            {
+                if let ScalarFieldReference::Resolved(field) = field {
+                    if let Ok(structure) = structure(state.structs, field.structure.clone()) {
+                        if let Some(field) = structure.fields.get(field.index) {
+                            return matches!(
+                                &field.ty,
+                                ScalarType::U8
+                                    | ScalarType::U16
+                                    | ScalarType::U32
+                                    | ScalarType::U64
+                                    | ScalarType::U128
+                            );
+                        }
+                    }
+                }
+            }
+            false
+        }
         ScalarExpression::Name { name, .. } => match state.storage.get(name) {
             Some((_, ty)) => matches!(
                 ty,
@@ -2377,7 +2413,45 @@ fn expression_is_unsigned<'ctx, 'module>(
                 None => false,
             },
         },
+        ScalarExpression::Unary { operand, .. } => expression_is_unsigned(state, operand),
+        ScalarExpression::Binary { left, .. } => expression_is_unsigned(state, left),
         _ => false,
+    }
+}
+
+fn project_expression_is_unsigned<'ctx, 'module>(
+    state: &EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> bool {
+    match expression {
+        ScalarExpression::Member { receiver, name, .. } => {
+            if let Ok(target) = project_namespace_target(module, modules, receiver) {
+                return target.items.iter().any(|item| {
+                    matches!(
+                        item,
+                        ScalarItem::Binding(binding)
+                            if binding.name == *name && matches!(
+                                &binding.declared_type,
+                                ScalarType::U8
+                                    | ScalarType::U16
+                                    | ScalarType::U32
+                                    | ScalarType::U64
+                                    | ScalarType::U128
+                            )
+                    )
+                });
+            }
+            expression_is_unsigned(state, expression)
+        }
+        ScalarExpression::Unary { operand, .. } => {
+            project_expression_is_unsigned(state, operand, module, modules)
+        }
+        ScalarExpression::Binary { left, .. } => {
+            project_expression_is_unsigned(state, left, module, modules)
+        }
+        _ => expression_is_unsigned(state, expression),
     }
 }
 
@@ -2539,7 +2613,15 @@ fn emit_binary_values<'ctx, 'module>(
                 .builder
                 .build_float_compare(FloatPredicate::OGE, left, right, "ge")
                 .map(|value| EmitValue::Basic(value.into())),
-            BinaryOperator::And | BinaryOperator::Or => unreachable!(),
+            BinaryOperator::And
+            | BinaryOperator::Or
+            | BinaryOperator::BitAnd
+            | BinaryOperator::BitOr
+            | BinaryOperator::BitXor
+            | BinaryOperator::ShiftLeft
+            | BinaryOperator::ShiftRight => {
+                return Err("integer operator used with floating-point values".to_owned())
+            }
         }
         .map_err(builder_error);
     }
@@ -2644,8 +2726,49 @@ fn emit_binary_values<'ctx, 'module>(
             )
             .map_err(builder_error)?
             .into(),
+        BinaryOperator::BitAnd => state
+            .builder
+            .build_and(left, right, "and")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::BitOr => state
+            .builder
+            .build_or(left, right, "or")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::BitXor => state
+            .builder
+            .build_xor(left, right, "xor")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::ShiftLeft => state
+            .builder
+            .build_left_shift(left, right, "shl")
+            .map_err(builder_error)?
+            .into(),
+        BinaryOperator::ShiftRight => state
+            .builder
+            .build_right_shift(left, right, !unsigned, "shr")
+            .map_err(builder_error)?
+            .into(),
     };
     Ok(EmitValue::Basic(value))
+}
+
+fn emit_unary_value<'ctx, 'module>(
+    state: &EmitState<'ctx, 'module>,
+    operator: &crate::scalar::UnaryOperator,
+    value: inkwell::values::IntValue<'ctx>,
+) -> Result<EmitValue<'ctx>, String> {
+    match operator {
+        crate::scalar::UnaryOperator::LogicalNot | crate::scalar::UnaryOperator::BitwiseNot => {
+            state
+                .builder
+                .build_not(value, "not")
+                .map(|value| EmitValue::Basic(value.into()))
+                .map_err(builder_error)
+        }
+    }
 }
 
 fn emit_if<'ctx, 'module>(
@@ -2957,6 +3080,39 @@ mod tests {
         assert!(text.contains("call i1 @flag"));
         assert!(text.contains("call void @touch"));
         assert!(text.contains("call i32 @count"));
+    }
+
+    #[test]
+    fn emits_unary_bitwise_and_shift_instructions() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/operators.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\nbool(bool) logical_not = fn(value) { !value };\ni32(i32) bitwise_not = fn(value) { ~value };\ni32(i32, i32) bitwise = fn(left, right) { (left & right) | (left ^ right) };\ni32(i32, i32) signed_shift = fn(value, count) { (value << count) >> count };\nu32(u32, u32) unsigned_shift = fn(value, count) { value >> count };\nbool inverted = logical_not(true);\ni32 complemented = bitwise_not(1);\ni32 combined = bitwise(7, 3);\ni32 shifted = signed_shift(8, 1);\nu32 logical_shifted = unsigned_shift(8, 1);\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_llvm(&validation)
+            .expect("operator LLVM")
+            .to_text();
+        assert!(text.contains("xor i1"), "{text}");
+        assert!(text.contains("xor i32"), "{text}");
+        assert!(text.contains("and i32"), "{text}");
+        assert!(text.contains("or i32"), "{text}");
+        assert!(text.contains("shl i32"), "{text}");
+        assert!(text.contains("ashr i32"), "{text}");
+        assert!(text.contains("lshr i32"), "{text}");
     }
 
     #[test]

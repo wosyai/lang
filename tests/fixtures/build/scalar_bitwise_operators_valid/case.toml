@@ -1,0 +1,9 @@
+[[steps]]
+command = ["wosy", "build"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"

@@ -1,0 +1,8 @@
+[[steps]]
+command = ["wosy", "build"]
+exit = 1
+
+[[assert]]
+command = ["wosy", "build"]
+exit = 1
+stderr_contains = ["integer operation requires integer operands"]
