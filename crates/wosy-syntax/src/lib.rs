@@ -373,6 +373,26 @@ fn build_pair(
         );
         return;
     }
+    if is_empty_operator_tier(&pair) {
+        let span = pair.as_span();
+        let mut inner = pair.into_inner();
+        let Some(first) = inner.next() else {
+            builder.token(
+                WosyLanguage::kind_to_raw(SyntaxKind::Punctuation),
+                span.as_str(),
+            );
+            return;
+        };
+        let mut cursor = span.start();
+        for child in std::iter::once(first).chain(inner) {
+            let child_span = child.as_span();
+            add_gap(builder, &text[cursor..child_span.start()], cursor, comments);
+            build_pair(builder, child, text, comments, errors);
+            cursor = child_span.end();
+        }
+        add_gap(builder, &text[cursor..span.end()], cursor, comments);
+        return;
+    }
     let kind = kind(pair.as_rule());
     let mut inner = pair.into_inner();
     let Some(first) = inner.next() else {
@@ -389,6 +409,27 @@ fn build_pair(
     }
     add_gap(builder, &text[cursor..span.end()], cursor, comments);
     builder.finish_node();
+}
+
+fn is_empty_operator_tier(pair: &Pair<'_, Rule>) -> bool {
+    matches!(
+        pair.as_rule(),
+        Rule::bit_or | Rule::bit_xor | Rule::bit_and | Rule::shift | Rule::unary
+    ) && !pair.clone().into_inner().any(|child| {
+        matches!(
+            child.as_rule(),
+            Rule::or_operator
+                | Rule::and_operator
+                | Rule::bit_or_operator
+                | Rule::bit_xor_operator
+                | Rule::bit_and_operator
+                | Rule::comparison_operator
+                | Rule::shift_operator
+                | Rule::add_operator
+                | Rule::multiply_operator
+                | Rule::unary_operator
+        )
+    })
 }
 
 fn add_gap(
