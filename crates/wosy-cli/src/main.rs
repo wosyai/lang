@@ -16,7 +16,7 @@ use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest, load_reachable_source_graph,
     publish_artifact, ArtifactIdentity, ContentRevision, NamespaceEdgeInput, PackageRelativePath,
     ProjectConfiguration, ProjectContext, SourceIdentity as ProjectSourceIdentity, SourceNodeInput,
-    SourceSpan as ProjectSourceSpan,
+    SourceObservation, SourceSpan as ProjectSourceSpan,
 };
 use wosy_syntax::SourceIdentity;
 
@@ -129,7 +129,8 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let project = ProjectContext::load(&root, &target_name)?;
     let (_target_config, artifact, artifact_profile, target_profile) =
         configuration.artifact_profile(&target_name, profile)?;
-    let (llvm, source_identity) = compile_project(&root, &project)?;
+    let (llvm, source_observations) = compile_project(&root, &project)?;
+    let source_identity = wosy_project::source_identity(&source_observations);
     let artifact_name = &target_profile.main_artifact;
     let output_dir = root
         .join(".wosy/artifacts")
@@ -154,6 +155,7 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let pending = wosy_project::ArtifactManifest {
         identity: identity.clone(),
         executable: executable.clone(),
+        source_observations: source_observations.clone(),
     };
     let pending_bytes = serde_json::to_vec_pretty(&pending).map_err(|error| error.to_string())?;
     fs::write(&pending_manifest, pending_bytes).map_err(|error| error.to_string())?;
@@ -171,7 +173,7 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
             pending_manifest.to_string_lossy().as_ref(),
         ],
     )?;
-    publish_artifact(&output_dir, executable, identity)?;
+    publish_artifact(&output_dir, executable, identity, source_observations)?;
     fs::remove_file(pending_manifest).map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -187,7 +189,8 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
     let manifest_path =
         artifact_manifest_path(&root, &target_name, profile, &target_profile.main_artifact);
     let manifest = load_artifact_manifest(&manifest_path)?;
-    let (llvm, source_identity) = compile_project(&root, &project)?;
+    let (llvm, source_observations) = compile_project(&root, &project)?;
+    let source_identity = wosy_project::source_identity(&source_observations);
     let expected = artifact_identity(
         &root,
         &configuration,
@@ -223,7 +226,7 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
 fn compile_project(
     root: &std::path::Path,
     project: &ProjectContext,
-) -> Result<(String, String), String> {
+) -> Result<(String, Vec<SourceObservation>), String> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
     let mut pending = vec![root_path.clone()];
     let mut index = 0;
@@ -375,20 +378,15 @@ fn compile_project(
         let partition = emit_scalar_project_llvm(&validation)?;
         partition.to_text()
     };
-    let source_identity = graph
+    let source_observations = graph
         .nodes
         .iter()
-        .map(|node| {
-            format!(
-                "{}:{}:{}",
-                node.source.package,
-                node.source.path.as_path().display(),
-                node.content_revision.0
-            )
+        .map(|node| SourceObservation {
+            source: node.source.clone(),
+            content_revision: node.content_revision.clone(),
         })
-        .collect::<Vec<_>>()
-        .join(",");
-    Ok((llvm, source_identity))
+        .collect();
+    Ok((llvm, source_observations))
 }
 
 fn persist_cst(
