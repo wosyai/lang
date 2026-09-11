@@ -72,7 +72,7 @@ bit_or_operator = { "|" }
 bit_xor_operator = { "^" }
 bit_and_operator = { "&" }
 shift_operator = { "<<" | ">>" }
-unary_operator = { "!" | "~" }
+unary_operator = { "!" | "~" | "-" }
 comparison_operator = { "==" | "!=" | "<=" | ">=" | "<" | ">" }
 add_operator = { "+" | "-" }
 multiply_operator = { "*" | "/" | "%" }

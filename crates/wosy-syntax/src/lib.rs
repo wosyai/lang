@@ -891,6 +891,72 @@ mod tests {
     }
 
     #[test]
+    fn unary_negation_is_structural_lossless_and_span_exact() {
+        let text = "%%start\ni32 negative = -7;\ni32 grouped = -(7);\ni32 nested = -~-!7;\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+
+        let unary_nodes = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::Unary)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unary_nodes
+                .iter()
+                .map(|node| node.text().to_string())
+                .collect::<Vec<_>>(),
+            vec!["-7", "-(7)", "-~-!7", "~-!7", "-!7", "!7"]
+        );
+        assert_eq!(byte_span(&unary_nodes[0]), ByteSpan::new(23, 25));
+        assert_eq!(byte_span(&unary_nodes[1]), ByteSpan::new(41, 45));
+        assert_eq!(byte_span(&unary_nodes[2]), ByteSpan::new(60, 65));
+
+        let nested = &unary_nodes[2];
+        assert_eq!(
+            nested
+                .descendants_with_tokens()
+                .filter_map(|element| match element {
+                    rowan::NodeOrToken::Token(token) if token.kind() == SyntaxKind::Operator => {
+                        Some((token.text().to_owned(), token.text_range()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|(text, range)| {
+                    (
+                        text.clone(),
+                        ByteSpan::new(u32::from(range.start()), u32::from(range.end())),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("-".to_owned(), ByteSpan::new(60, 61)),
+                ("~".to_owned(), ByteSpan::new(61, 62)),
+                ("-".to_owned(), ByteSpan::new(62, 63)),
+                ("!".to_owned(), ByteSpan::new(63, 64)),
+            ]
+        );
+
+        let integer = result
+            .root
+            .descendants_with_tokens()
+            .find_map(|element| match element {
+                rowan::NodeOrToken::Token(token)
+                    if token.kind() == SyntaxKind::Integer && token.text() == "7" =>
+                {
+                    Some(token)
+                }
+                _ => None,
+            })
+            .expect("negative integer token");
+        assert_eq!(u32::from(integer.text_range().start()), 24);
+        assert_eq!(u32::from(integer.text_range().end()), 25);
+    }
+
+    #[test]
     fn binary_tiers_are_left_associative_and_parentheses_override_them() {
         let text = "%%start\ni32 value = 8 >> 1 >> 1;\ni32 grouped = 8 >> (1 >> 1);\n%%end";
         let result = parse(identity(), text.into(), &[]);
