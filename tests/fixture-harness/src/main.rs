@@ -42,6 +42,34 @@ fn run_case(case: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("{} has no [[steps]]", case.display()))?;
     for step in steps.iter() {
         if let Some(path) = step
+            .get("remove")
+            .and_then(Item::as_value)
+            .and_then(|value| value.as_str())
+        {
+            fs::remove_file(temporary.join(path)).map_err(|error| error.to_string())?;
+            continue;
+        }
+        if let Some(path) = step
+            .get("remove_manifest_field")
+            .and_then(Item::as_value)
+            .and_then(|value| value.as_str())
+        {
+            let manifest_path = temporary.join(path);
+            let bytes = fs::read(&manifest_path).map_err(|error| error.to_string())?;
+            let mut manifest = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map_err(|error| error.to_string())?;
+            manifest
+                .as_object_mut()
+                .ok_or_else(|| "manifest must be a JSON object".to_owned())?
+                .remove("source_observations");
+            fs::write(
+                manifest_path,
+                serde_json::to_vec(&manifest).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            continue;
+        }
+        if let Some(path) = step
             .get("write")
             .and_then(Item::as_value)
             .and_then(|value| value.as_str())

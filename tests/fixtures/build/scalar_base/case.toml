@@ -1,4 +1,72 @@
 [[steps]]
+remove = ".wosy/artifacts/app/dev/main/artifact-manifest.json"
+exit = 0
+
+[[steps]]
+command = ["wosy", "run"]
+exit = 1
+
+[[steps]]
+command = ["wosy", "build"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "run"]
+exit = 0
+
+[[steps]]
+remove_manifest_field = ".wosy/artifacts/app/dev/main/artifact-manifest.json"
+exit = 0
+
+[[steps]]
+command = ["wosy", "run"]
+exit = 1
+
+[[steps]]
+command = ["wosy", "build"]
+exit = 0
+
+[[steps]]
+remove = ".wosy/artifacts/app/dev/main/main"
+exit = 0
+
+[[steps]]
+command = ["wosy", "run"]
+exit = 1
+
+[[steps]]
+command = ["wosy", "build"]
+exit = 0
+
+[[steps]]
+write = "src/main.w"
+contents = "%%start\ni32 result = 2;\n%%end\n"
+
+[[steps]]
+command = ["wosy", "run"]
+exit = 1
+
+[[steps]]
+write = "src/main.w"
+contents = "%%start\ni32(i32, i32) add = fn(left, right) {\n\tleft + right\n};\n\ni32 seed = 20;\ni32 increment = 22;\nbool choose_sum = true;\ni32 result = if (choose_sum) {\n\tadd(seed, increment)\n} else {\n\t0\n};\n%%end\n"
+
+[[steps]]
+command = ["wosy", "build"]
+exit = 0
+
+[[steps]]
+write = "wosy.toml"
+contents = "[package]\nname = \"scalar_base\"\ndefault_target = \"app\"\n\n[comments]\ncategories = [\"changed\"]\n\n[builders.native]\ncommand = [\"scripts/build-native\"]\nargs = []\n\n[runners.native]\ncommand = [\"scripts/run-native\"]\nargs = []\n\n[targets.app]\nroot = \"src/main.w\"\n\n[targets.app.artifacts.main]\nartifact = \"Main\"\n\n[targets.app.artifacts.main.profiles.dev]\nbackend = \"llvm\"\noutput = \"native\"\nbuilder = \"native\"\nrun_runner = \"native\"\n\n[targets.app.profiles.dev]\nmain_artifact = \"main\"\n"
+
+[[steps]]
+command = ["wosy", "run"]
+exit = 1
+
+[[steps]]
+write = "wosy.toml"
+contents = "[package]\nname = \"scalar_base\"\ndefault_target = \"app\"\n\n[comments]\ncategories = []\n\n[builders.native]\ncommand = [\"scripts/build-native\"]\nargs = []\n\n[runners.native]\ncommand = [\"scripts/run-native\"]\nargs = []\n\n[targets.app]\nroot = \"src/main.w\"\n\n[targets.app.artifacts.main]\nartifact = \"Main\"\n\n[targets.app.artifacts.main.profiles.dev]\nbackend = \"llvm\"\noutput = \"native\"\nbuilder = \"native\"\nrun_runner = \"native\"\n\n[targets.app.profiles.dev]\nmain_artifact = \"main\"\n"
+
+[[steps]]
 command = ["wosy", "build"]
 exit = 0
 

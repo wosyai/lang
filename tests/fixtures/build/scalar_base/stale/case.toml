@@ -1,17 +1,11 @@
 [[steps]]
-command = ["wosy", "run", "app"]
-exit = 1
-
-[[steps]]
 command = ["wosy", "build", "app"]
 exit = 0
 
-write = "src/main.w"
-contents = "%%start\ni32 result = 2;\n%%end\n"
-
 [[steps]]
-command = ["wosy", "run", "app"]
-exit = 1
+write = "src/main.w"
+contents = "%%start\ni32 result = ;\n%%end\n"
+
 
 [[assert]]
 command = ["wosy", "run", "app"]
