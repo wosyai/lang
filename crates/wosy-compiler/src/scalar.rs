@@ -167,6 +167,14 @@ pub struct ScalarOutputReceiver {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarOutputValue {
+    pub position: usize,
+    pub ty: ScalarType,
+    pub span: ByteSpan,
+    pub value: ScalarExpression,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarStructLiteral {
     pub fields: Vec<ScalarStructLiteralField>,
     pub span: ByteSpan,
@@ -397,6 +405,7 @@ pub struct ScalarBinding {
     pub value: ScalarExpression,
     pub receivers: Vec<ScalarOutputReceiver>,
     pub output_sequence: ScalarOutputSequence,
+    pub output_values: Vec<ScalarOutputValue>,
     pub span: ByteSpan,
 }
 
@@ -3900,15 +3909,31 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         .collect::<Vec<_>>();
     let value = outputs[0].clone();
     let name = receivers[0].name.clone();
+    let output_values = receivers
+        .iter()
+        .enumerate()
+        .map(|(position, receiver)| ScalarOutputValue {
+            position,
+            ty: receiver.ty.clone(),
+            span: span_of(if outputs.len() == 1 {
+                &value
+            } else {
+                &outputs[position]
+            }),
+            value: if outputs.len() == 1 {
+                value.clone()
+            } else {
+                outputs[position].clone()
+            },
+        })
+        .collect::<Vec<_>>();
     let output_sequence = ScalarOutputSequence {
-        outputs: outputs
+        outputs: receivers
             .iter()
             .enumerate()
-            .map(|(index, value)| ScalarOutput {
-                ty: receivers
-                    .get(index)
-                    .map_or(ScalarType::Error, |receiver| receiver.ty.clone()),
-                span: span_of(value),
+            .map(|(position, receiver)| ScalarOutput {
+                ty: receiver.ty.clone(),
+                span: output_values[position].span,
             })
             .collect(),
         span: wosy_syntax::byte_span(&output_list),
@@ -3919,6 +3944,7 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         value,
         receivers,
         output_sequence,
+        output_values,
         span: wosy_syntax::byte_span(node),
     }
 }
@@ -7245,7 +7271,7 @@ mod tests {
             .any(|diagnostic| diagnostic.code == "B0001"));
 
         let multiple = validate_text(
-            "%%start\nenv = extern wasm \"helper\" { (i32, bool)() read; };\ni32 first, bool second = env.read<u32>();\n%%end",
+            "%%start\nenv = extern wasm \"helper\" { (u64, bool)() read; };\nu64 first, bool second = env.read<u32>();\n%%end",
         );
         assert!(
             multiple.diagnostics.is_empty(),
@@ -7256,6 +7282,18 @@ mod tests {
             panic!("generic extern binding")
         };
         assert_eq!(binding.receivers.len(), 2);
+        assert_eq!(binding.output_sequence.outputs.len(), 2);
+        assert_eq!(binding.output_sequence.outputs[0].ty, ScalarType::U64);
+        assert_eq!(binding.output_sequence.outputs[1].ty, ScalarType::Bool);
+        let call_span = expression_span(&binding.value);
+        assert_eq!(binding.output_sequence.outputs[0].span, call_span);
+        assert_eq!(binding.output_sequence.outputs[1].span, call_span);
+        assert_eq!(binding.output_values[0].position, 0);
+        assert_eq!(binding.output_values[1].position, 1);
+        assert_eq!(binding.output_values[0].ty, ScalarType::U64);
+        assert_eq!(binding.output_values[1].ty, ScalarType::Bool);
+        assert_eq!(binding.output_values[0].span, call_span);
+        assert_eq!(binding.output_values[1].span, call_span);
         let ScalarItem::Extern(extern_decl) = &multiple.program.items[0] else {
             panic!("generic extern item")
         };
@@ -8159,6 +8197,25 @@ bool integer_inversion = !1;
     }
 
     #[test]
+    fn validates_generic_ordinary_two_output_call_in_order() {
+        let result = validate_text(
+            "%%start\n(u64, bool)() pair = fn { 1 };\nu64 first, bool second = pair<u32>();\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(binding) = &result.program.items[1] else {
+            panic!("generic binding");
+        };
+        assert_eq!(binding.output_sequence.outputs.len(), 2);
+        assert_eq!(binding.output_sequence.outputs[0].ty, ScalarType::U64);
+        assert_eq!(binding.output_sequence.outputs[1].ty, ScalarType::Bool);
+        assert_eq!(binding.output_values[0].position, 0);
+        assert_eq!(binding.output_values[1].position, 1);
+        let call_span = expression_span(&binding.value);
+        assert_eq!(binding.output_values[0].span, call_span);
+        assert_eq!(binding.output_values[1].span, call_span);
+    }
+
+    #[test]
     fn reports_exact_cast_range_at_value_span() {
         let text = "%%start\nu32 result = core.cast<u32>(4294967296, \"exact\");\n%%end";
         let result = validate_text(text);
@@ -8527,12 +8584,12 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         let math_source = module_source("src/math.w");
         let math = module_from_text(
             math_source.clone(),
-            "%%start\n(i32, bool)() pair = fn { 1 };\n%%end",
+            "%%start\n(u64, bool)() pair = fn { 1 };\n%%end",
         );
         let main_source = module_source("src/main.w");
         let main = module_from_text(
             main_source.clone(),
-            "%%start\nmath = namespace app \"src/math.w\";\ni32 first, bool second = math.pair();\n%%end",
+            "%%start\nmath = namespace app \"src/math.w\";\nu64 first, bool second = math.pair();\n%%end",
         );
         let namespace_span = match &main.items[0] {
             ScalarItem::Namespace(namespace) => namespace.span,
@@ -8558,9 +8615,19 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         let ScalarItem::Binding(binding) = &result.project.modules[0].items[1] else {
             panic!("namespace binding")
         };
-        assert_eq!(binding.output_sequence.outputs.len(), 1);
-        assert!(binding.output_sequence.outputs[0].span.start > 0);
-        assert_eq!(binding.receivers[0].ty, ScalarType::I32);
+        assert_eq!(binding.output_sequence.outputs.len(), 2);
+        let call_span = expression_span(&binding.value);
+        assert_eq!(binding.output_sequence.outputs[0].ty, ScalarType::U64);
+        assert_eq!(binding.output_sequence.outputs[0].span, call_span);
+        assert_eq!(binding.output_sequence.outputs[1].ty, ScalarType::Bool);
+        assert_eq!(binding.output_sequence.outputs[1].span, call_span);
+        assert_eq!(binding.output_values[0].position, 0);
+        assert_eq!(binding.output_values[1].position, 1);
+        assert_eq!(binding.output_values[0].ty, ScalarType::U64);
+        assert_eq!(binding.output_values[1].ty, ScalarType::Bool);
+        assert_eq!(expression_span(&binding.output_values[0].value), call_span);
+        assert_eq!(expression_span(&binding.output_values[1].value), call_span);
+        assert_eq!(binding.receivers[0].ty, ScalarType::U64);
         assert_eq!(binding.receivers[1].ty, ScalarType::Bool);
     }
 
@@ -8995,23 +9062,33 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
     #[test]
     fn validates_multiple_output_calls_and_output_arity() {
         let valid = validate_text(
-            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first, u64 second = pair<u32>();\n%%end",
+            "%%start\n(u64, bool)() pair = fn { 1 };\nu64 first, bool second = pair<u32>();\n%%end",
         );
         assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
         let ScalarItem::Binding(binding) = &valid.program.items[1] else {
             panic!("multi-output binding")
         };
-        assert_eq!(binding.output_sequence.outputs.len(), 1);
-        assert_eq!(
-            binding.output_sequence.outputs[0].span,
-            ByteSpan::new(62, 73)
-        );
-
-        let wrong_type = validate_text(
-            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first, i32 second = pair();\n%%end",
-        );
+        assert_eq!(binding.output_sequence.outputs.len(), 2);
+        assert_eq!(binding.output_sequence.outputs[0].ty, ScalarType::U64);
+        assert_eq!(binding.output_sequence.outputs[1].ty, ScalarType::Bool);
+        let call_span = expression_span(&binding.value);
+        assert_eq!(binding.output_sequence.outputs[0].span, call_span);
+        assert_eq!(binding.output_sequence.outputs[1].span, call_span);
+        assert_eq!(binding.output_values[0].position, 0);
+        assert_eq!(binding.output_values[1].position, 1);
+        assert_eq!(binding.output_values[0].ty, ScalarType::U64);
+        assert_eq!(binding.output_values[1].ty, ScalarType::Bool);
+        let wrong_type_text =
+            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first, i32 second = pair();\n%%end";
+        let wrong_type = validate_text(wrong_type_text);
+        let second_receiver_start =
+            wrong_type_text.find("i32 second").expect("second receiver") as u32;
+        let second_receiver_end = second_receiver_start + "i32 second".len() as u32;
         assert!(wrong_type.diagnostics.iter().any(|diagnostic| {
             diagnostic.message == "expression type does not match expected type"
+                && diagnostic.labels.iter().any(|label| {
+                    label.span.range == ByteSpan::new(second_receiver_start, second_receiver_end)
+                })
         }));
 
         let wrong_arity =
@@ -9021,12 +9098,45 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             .iter()
             .any(|diagnostic| diagnostic.message == "call has more outputs than receivers"));
 
+        let too_many_text =
+            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first, u64 second, bool third = pair();\n%%end";
+        let too_many = validate_text(too_many_text);
+        let too_many_start = too_many_text.find("i32 first").expect("binding start") as u32;
+        let too_many_end = too_many_text.find(";\n%%end").expect("binding end") as u32 + 1;
+        assert!(too_many.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "call has fewer outputs than receivers"
+                && diagnostic.labels[0].span.range == ByteSpan::new(too_many_start, too_many_end)
+        }));
+
         let scalar = validate_text("%%start\n(i32, u64)() pair = fn { 1 };\npair();\n%%end");
         let output_span = ByteSpan::new(8, 20);
         assert!(scalar.diagnostics.iter().any(|diagnostic| {
             diagnostic.message == "multi-output call requires output receivers"
                 && diagnostic.labels[0].span.range == output_span
         }));
+    }
+
+    #[test]
+    fn preserves_independent_output_expression_spans() {
+        let result = validate_text("%%start\nu64 first, bool second = 1, true;\n%%end");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(binding) = &result.program.items[0] else {
+            panic!("output binding");
+        };
+        assert_eq!(binding.output_values[0].position, 0);
+        assert_eq!(binding.output_values[1].position, 1);
+        assert_ne!(
+            expression_span(&binding.output_values[0].value),
+            expression_span(&binding.output_values[1].value)
+        );
+        assert_eq!(
+            binding.output_sequence.outputs[0].span,
+            binding.output_values[0].span
+        );
+        assert_eq!(
+            binding.output_sequence.outputs[1].span,
+            binding.output_values[1].span
+        );
     }
 
     #[test]
