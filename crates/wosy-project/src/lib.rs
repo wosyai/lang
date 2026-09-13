@@ -93,6 +93,33 @@ pub struct SourceSpan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DependencyDeclaration {
+    pub name: String,
+    pub path: PathBuf,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedPackage {
+    pub name: String,
+    pub project_root: PathBuf,
+    pub source_root: PathBuf,
+    pub identity: SourceIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DependencyDiagnostic {
+    pub code: String,
+    pub message: String,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DependencyResolutionError {
+    pub diagnostics: Vec<DependencyDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NamespaceEdgeInput {
     pub origin: String,
     pub path: PackageRelativePath,
@@ -350,6 +377,8 @@ pub struct ProjectConfiguration {
     pub builders: std::collections::BTreeMap<String, BuilderConfig>,
     pub runners: std::collections::BTreeMap<String, RunnerConfig>,
     pub targets: std::collections::BTreeMap<String, TargetConfig>,
+    pub dependencies: BTreeMap<String, DependencyDeclaration>,
+    pub resolved_packages: BTreeMap<String, ResolvedPackage>,
 }
 
 impl ProjectConfiguration {
@@ -363,6 +392,12 @@ impl ProjectConfiguration {
             .get("package")
             .and_then(Item::as_table)
             .ok_or_else(|| "package is missing".to_owned())?;
+        let package_name = scalar_string(package, "name")?;
+        let dependencies =
+            parse_local_dependencies(root, &package_name, document.get("dependencies"))
+                .map_err(|error| error.diagnostics[0].message.clone())?;
+        let resolved_packages = resolve_local_packages(root, &package_name, &dependencies)
+            .map_err(|error| error.diagnostics[0].message.clone())?;
         let default_target = scalar_string(package, "default_target")?;
         let builders = named_commands(document.get("builders"), "builder")?;
         let runners = named_runners(document.get("runners"))?;
@@ -396,6 +431,8 @@ impl ProjectConfiguration {
             builders,
             runners,
             targets,
+            dependencies,
+            resolved_packages,
         })
     }
 
@@ -438,6 +475,224 @@ impl ProjectConfiguration {
             .get(profile)
             .ok_or_else(|| format!("artifact profile {profile} is missing"))?;
         Ok((target_config, artifact, artifact_profile, target_profile))
+    }
+}
+
+pub fn parse_local_dependencies(
+    root: &Path,
+    package: &str,
+    item: Option<&Item>,
+) -> Result<BTreeMap<String, DependencyDeclaration>, DependencyResolutionError> {
+    let Some(item) = item else {
+        return Ok(BTreeMap::new());
+    };
+    let table = item.as_table().ok_or_else(|| DependencyResolutionError {
+        diagnostics: vec![dependency_diagnostic(
+            root,
+            package,
+            "P0001",
+            "dependencies must be a table",
+            item.span().expect("dependencies item span"),
+        )],
+    })?;
+    let mut dependencies = BTreeMap::new();
+    for (name, item) in table {
+        let dependency = item.as_table().ok_or_else(|| DependencyResolutionError {
+            diagnostics: vec![dependency_diagnostic(
+                root,
+                package,
+                "P0001",
+                format!("dependency {name} must be a table"),
+                item.span().expect("dependency item span"),
+            )],
+        })?;
+        if dependency.iter().any(|(key, _)| key != "path") {
+            return Err(DependencyResolutionError {
+                diagnostics: vec![dependency_diagnostic(
+                    root,
+                    package,
+                    "P0001",
+                    format!("dependency {name} contains an unsupported field"),
+                    item.span().expect("dependency item span"),
+                )],
+            });
+        }
+        let path_item = dependency
+            .get("path")
+            .ok_or_else(|| DependencyResolutionError {
+                diagnostics: vec![dependency_diagnostic(
+                    root,
+                    package,
+                    "P0001",
+                    format!("dependency {name} must declare path"),
+                    table
+                        .key(name)
+                        .expect("dependency key")
+                        .span()
+                        .expect("dependency key span"),
+                )],
+            })?;
+        let path = path_item
+            .as_value()
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from)
+            .ok_or_else(|| DependencyResolutionError {
+                diagnostics: vec![dependency_diagnostic(
+                    root,
+                    package,
+                    "P0001",
+                    format!("dependency {name} path must be a string"),
+                    path_item.span().expect("dependency path span"),
+                )],
+            })?;
+        if path.as_os_str().is_empty() {
+            return Err(DependencyResolutionError {
+                diagnostics: vec![dependency_diagnostic(
+                    root,
+                    package,
+                    "P0001",
+                    format!("dependency {name} path must be non-empty"),
+                    path_item.span().expect("dependency path span"),
+                )],
+            });
+        }
+        dependencies.insert(
+            name.to_owned(),
+            DependencyDeclaration {
+                name: name.to_owned(),
+                path,
+                span: dependency_diagnostic(
+                    root,
+                    package,
+                    "P0001",
+                    String::new(),
+                    path_item.span().expect("dependency path span"),
+                )
+                .span,
+            },
+        );
+    }
+    Ok(dependencies)
+}
+
+pub fn resolve_local_packages(
+    root: &Path,
+    _package: &str,
+    dependencies: &BTreeMap<String, DependencyDeclaration>,
+) -> Result<BTreeMap<String, ResolvedPackage>, DependencyResolutionError> {
+    let mut resolved = BTreeMap::new();
+    for (name, declaration) in dependencies {
+        let package_root = root.join(&declaration.path);
+        let manifest_path = package_root.join("wosy.toml");
+        let content =
+            fs::read_to_string(&manifest_path).map_err(|_| DependencyResolutionError {
+                diagnostics: vec![DependencyDiagnostic {
+                    code: "P0002".to_owned(),
+                    message: format!("dependency {name} package manifest is missing"),
+                    span: declaration.span.clone(),
+                }],
+            })?;
+        let document = content
+            .parse::<toml_edit::ImDocument<String>>()
+            .map_err(|_| DependencyResolutionError {
+                diagnostics: vec![DependencyDiagnostic {
+                    code: "P0002".to_owned(),
+                    message: format!("dependency {name} package manifest is invalid"),
+                    span: declaration.span.clone(),
+                }],
+            })?;
+        let package_table = document
+            .get("package")
+            .and_then(Item::as_table)
+            .ok_or_else(|| DependencyResolutionError {
+                diagnostics: vec![DependencyDiagnostic {
+                    code: "P0002".to_owned(),
+                    message: format!("dependency {name} package manifest has no package table"),
+                    span: declaration.span.clone(),
+                }],
+            })?;
+        let resolved_name =
+            scalar_string(package_table, "name").map_err(|_| DependencyResolutionError {
+                diagnostics: vec![DependencyDiagnostic {
+                    code: "P0002".to_owned(),
+                    message: format!("dependency {name} package manifest has no package name"),
+                    span: declaration.span.clone(),
+                }],
+            })?;
+        if resolved_name != *name {
+            return Err(DependencyResolutionError {
+                diagnostics: vec![DependencyDiagnostic {
+                    code: "P0002".to_owned(),
+                    message: format!("dependency {name} package name is {resolved_name}"),
+                    span: declaration.span.clone(),
+                }],
+            });
+        }
+        let source_root = package_table
+            .get("source_root")
+            .and_then(Item::as_value)
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from)
+            .ok_or_else(|| DependencyResolutionError {
+                diagnostics: vec![DependencyDiagnostic {
+                    code: "P0002".to_owned(),
+                    message: format!("dependency {name} package manifest has no source root"),
+                    span: declaration.span.clone(),
+                }],
+            })?;
+        let source_path = PackageRelativePath::new(source_root.clone()).map_err(|_| {
+            DependencyResolutionError {
+                diagnostics: vec![DependencyDiagnostic {
+                    code: "P0002".to_owned(),
+                    message: format!("dependency {name} source root must be package-relative"),
+                    span: declaration.span.clone(),
+                }],
+            }
+        })?;
+        if !package_root.join(&source_root).is_dir() {
+            return Err(DependencyResolutionError {
+                diagnostics: vec![DependencyDiagnostic {
+                    code: "P0002".to_owned(),
+                    message: format!("dependency {name} source root is missing"),
+                    span: declaration.span.clone(),
+                }],
+            });
+        }
+        resolved.insert(
+            name.to_owned(),
+            ResolvedPackage {
+                name: resolved_name.clone(),
+                project_root: package_root.clone(),
+                source_root: package_root.join(&source_root),
+                identity: SourceIdentity::new(
+                    package_root.to_string_lossy().into_owned(),
+                    resolved_name,
+                    source_path,
+                ),
+            },
+        );
+    }
+    Ok(resolved)
+}
+
+fn dependency_diagnostic(
+    root: &Path,
+    package: &str,
+    code: &str,
+    message: impl Into<String>,
+    span: std::ops::Range<usize>,
+) -> DependencyDiagnostic {
+    DependencyDiagnostic {
+        code: code.to_owned(),
+        message: message.into(),
+        span: SourceSpan {
+            source: SourceIdentity::new(
+                root.to_string_lossy().into_owned(),
+                package.to_owned(),
+                PackageRelativePath::new(PathBuf::from("wosy.toml")).expect("manifest path"),
+            ),
+            range: ByteSpan::new(span.start as u32, span.end as u32),
+        },
     }
 }
 
@@ -844,6 +1099,8 @@ mod tests {
             builders: BTreeMap::new(),
             runners: BTreeMap::new(),
             targets: BTreeMap::new(),
+            dependencies: BTreeMap::new(),
+            resolved_packages: BTreeMap::new(),
         };
         assert_eq!(
             invalid.resolve_target(None),
@@ -937,5 +1194,111 @@ mod tests {
             }
             GraphDiagnostic::MissingModule(_) => panic!("expected cycle"),
         }
+    }
+
+    fn dependency_document(value: &str) -> toml_edit::ImDocument<String> {
+        value.parse().expect("dependency configuration")
+    }
+
+    fn dependency_test_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "wosy-project-dependency-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
+
+    #[test]
+    fn local_dependency_preserves_declaration_and_package_identity() {
+        let root = dependency_test_root().join("valid");
+        let package_root = root.join("../stdlib");
+        fs::create_dir_all(package_root.join("src")).expect("package source root");
+        fs::write(
+            package_root.join("wosy.toml"),
+            "[package]\nname = \"std\"\nsource_root = \"src\"\n",
+        )
+        .expect("package manifest");
+        let document = dependency_document("[dependencies.std]\npath = \"../stdlib\"\n");
+        let dependencies = parse_local_dependencies(&root, "app", document.get("dependencies"))
+            .expect("local dependency");
+        let declaration = dependencies.get("std").expect("std declaration");
+        assert_eq!(declaration.name, "std");
+        assert_eq!(declaration.path, PathBuf::from("../stdlib"));
+        assert!(declaration.span.range.end > declaration.span.range.start);
+        let resolved =
+            resolve_local_packages(&root, "app", &dependencies).expect("resolved package");
+        let package = resolved.get("std").expect("resolved std package");
+        assert_eq!(package.name, "std");
+        assert_eq!(package.project_root, package_root);
+        assert_eq!(package.source_root, package_root.join("src"));
+        assert_eq!(package.identity.package, "std");
+        assert_eq!(package.identity.path, path("src"));
+    }
+
+    #[test]
+    fn malformed_local_dependency_has_structured_diagnostic() {
+        let root = dependency_test_root().join("malformed");
+        let document = dependency_document("[dependencies]\nstd = \"../stdlib\"\n");
+        let error = parse_local_dependencies(&root, "app", document.get("dependencies"))
+            .expect_err("malformed dependency");
+        assert_eq!(error.diagnostics[0].code, "P0001");
+        assert_eq!(error.diagnostics[0].span.source.path, path("wosy.toml"));
+        assert!(error.diagnostics[0].span.range.end > error.diagnostics[0].span.range.start);
+    }
+
+    #[test]
+    fn missing_local_dependency_manifest_has_structured_diagnostic() {
+        let root = dependency_test_root().join("missing");
+        fs::create_dir_all(&root).expect("project root");
+        let document = dependency_document("[dependencies.std]\npath = \"../stdlib\"\n");
+        let dependencies = parse_local_dependencies(&root, "app", document.get("dependencies"))
+            .expect("local dependency");
+        let error = resolve_local_packages(&root, "app", &dependencies)
+            .expect_err("missing package manifest");
+        assert_eq!(error.diagnostics[0].code, "P0002");
+        assert!(error.diagnostics[0].message.contains("manifest is missing"));
+        assert_eq!(error.diagnostics[0].span.source.package, "app");
+    }
+
+    #[test]
+    fn invalid_local_dependency_manifest_has_structured_diagnostic() {
+        let root = dependency_test_root().join("invalid");
+        let package_root = root.join("../stdlib");
+        fs::create_dir_all(&package_root).expect("package root");
+        fs::write(package_root.join("wosy.toml"), "[package").expect("invalid manifest");
+        let document = dependency_document("[dependencies.std]\npath = \"../stdlib\"\n");
+        let dependencies = parse_local_dependencies(&root, "app", document.get("dependencies"))
+            .expect("local dependency");
+
+        let error =
+            resolve_local_packages(&root, "app", &dependencies).expect_err("invalid manifest");
+
+        assert_eq!(error.diagnostics[0].code, "P0002");
+        assert!(error.diagnostics[0].message.contains("manifest is invalid"));
+        assert!(error.diagnostics[0].span.range.end > error.diagnostics[0].span.range.start);
+    }
+
+    #[test]
+    fn local_dependency_manifest_identity_must_match_declaration() {
+        let root = dependency_test_root().join("identity");
+        let package_root = root.join("../stdlib");
+        fs::create_dir_all(package_root.join("src")).expect("package source root");
+        fs::write(
+            package_root.join("wosy.toml"),
+            "[package]\nname = \"different\"\nsource_root = \"src\"\n",
+        )
+        .expect("package manifest");
+        let document = dependency_document("[dependencies.std]\npath = \"../stdlib\"\n");
+        let dependencies = parse_local_dependencies(&root, "app", document.get("dependencies"))
+            .expect("local dependency");
+
+        let error =
+            resolve_local_packages(&root, "app", &dependencies).expect_err("identity mismatch");
+
+        assert_eq!(error.diagnostics[0].code, "P0002");
+        assert!(error.diagnostics[0]
+            .message
+            .contains("package name is different"));
+        assert_eq!(error.diagnostics[0].span.source.path, path("wosy.toml"));
     }
 }
