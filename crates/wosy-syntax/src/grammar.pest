@@ -30,7 +30,8 @@ unsafe_keyword = { "unsafe" }
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 parameters = { "(" ~ (identifier ~ ("," ~ identifier)*)? ~ ")" }
 block = { "{" ~ block_item* ~ final_output_list? ~ "}" }
-block_item = { local_binding | while_expr | expression ~ ";" }
+block_item = { local_binding | if_block_item | while_expr | expression ~ ";" }
+if_block_item = { (if_expr | unit_if_expr) ~ !";" ~ !"}" }
 final_output_list = { output_list }
 local_binding = { receiver_list ~ "=" ~ output_list ~ ";" }
 expression = { if_expr | unit_if_expr | unsafe_expr | assignment | logical_or }

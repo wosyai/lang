@@ -581,6 +581,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::parameters => SyntaxKind::Parameters,
         Rule::block => SyntaxKind::Block,
         Rule::block_item => SyntaxKind::BlockItem,
+        Rule::if_block_item => SyntaxKind::Expression,
         Rule::final_output_list => SyntaxKind::FinalOutputList,
         Rule::expression => SyntaxKind::Expression,
         Rule::call => SyntaxKind::Call,
@@ -1307,6 +1308,48 @@ mod tests {
                 .filter(|node| node.kind() == SyntaxKind::BlockItem)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn unterminated_control_flow_precedes_final_output_list() {
+        let text = "%%start\ni32(i32, i32) f = fn(input) {\n\twhile (input < 2) {\n\t\tinput = input + 1;\n\t}\n\tif (input == 2) {\n\t\tinput;\n\t} else {\n\t\tinput;\n\t}\n\tinput, input + 1\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+
+        let function = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::FunctionDecl)
+            .expect("function declaration");
+        let block = function
+            .children()
+            .find(|node| node.kind() == SyntaxKind::Block)
+            .expect("function block");
+        assert_eq!(
+            block.children().map(|node| node.kind()).collect::<Vec<_>>(),
+            vec![
+                SyntaxKind::BlockItem,
+                SyntaxKind::BlockItem,
+                SyntaxKind::FinalOutputList,
+            ]
+        );
+
+        let final_list = block
+            .children()
+            .find(|node| node.kind() == SyntaxKind::FinalOutputList)
+            .expect("final output list");
+        let start = text.find("input, input + 1").expect("final list") as u32;
+        let end = text.find("\n};").expect("function close") as u32 + 1;
+        assert_eq!(byte_span(&final_list), ByteSpan::new(start, end));
+        assert_eq!(
+            final_list
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::Expression)
+                .map(|node| node.text().to_string().trim().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["input", "input + 1"]
         );
     }
 
