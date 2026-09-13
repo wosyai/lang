@@ -1124,6 +1124,35 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_helper_preserves_unterminated_final_expression() {
+        let text = "%%start\nunsafe i32(i32, *?Iovec, *?i32) fd_write_once = fn(\n\tdescriptor,\n\tiovec_address,\n\tbyte_count_address\n) {\n\twasi.fd_write(descriptor, iovec_address, 1, byte_count_address)\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Unsafe));
+        let final_list = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::FinalOutputList)
+            .expect("unsafe helper final output list");
+        let output_list = final_list
+            .children()
+            .find(|node| node.kind() == SyntaxKind::OutputList)
+            .expect("unsafe helper output list");
+        assert_eq!(
+            output_list
+                .children()
+                .filter(|node| node.kind() == SyntaxKind::Expression)
+                .map(|node| node.text().to_string().trim().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["wasi.fd_write(descriptor, iovec_address, 1, byte_count_address)"]
+        );
+    }
+
+    #[test]
     fn unit_if_is_structured_lossless_and_span_exact() {
         let text = "%%start\nunit() main = fn {\n\tif (true) {\n\t\tprint();\n\t}\n};\n%%end";
         let result = parse(identity(), text.into(), &[]);
