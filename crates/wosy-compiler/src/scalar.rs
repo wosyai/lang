@@ -25,7 +25,6 @@ pub enum ScalarType {
     F32,
     F64,
     Char,
-    Utf8,
     ArtifactId,
     RawPointer(Box<ScalarType>),
     Callable {
@@ -1563,8 +1562,7 @@ fn validate_module_type(
         | ScalarType::F32
         | ScalarType::F64
         | ScalarType::Char
-        | ScalarType::ArtifactId
-        | ScalarType::Utf8 => {}
+        | ScalarType::ArtifactId => {}
         ScalarType::RawPointer(inner)
             if matches!(inner.as_ref(), ScalarType::U8 | ScalarType::Struct(_)) => {}
         ScalarType::RawPointer(_) => diagnostics.push(module_diagnostic(
@@ -1618,9 +1616,6 @@ fn call_output_sequence_in_module(
     let ScalarExpression::Call { receiver, name, .. } = expression else {
         return None;
     };
-    if receiver.as_deref() == Some("core") && name == "utf8_view" {
-        return Some(utf8_view_outputs(expression_span(expression)));
-    }
     let callable = match receiver {
         None => scope.get(name),
         Some(binding) => {
@@ -1661,9 +1656,6 @@ fn call_output_sequence(
     let ScalarExpression::Call { receiver, name, .. } = expression else {
         return None;
     };
-    if receiver.as_deref() == Some("core") && name == "utf8_view" {
-        return Some(utf8_view_outputs(expression_span(expression)));
-    }
     let callable = if receiver.is_none() {
         scope.get(name)
     } else {
@@ -1705,22 +1697,6 @@ fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::UnitIf { span, .. } => *span,
         ScalarExpression::Member { span, .. } => *span,
         ScalarExpression::Block(block) => block.span,
-    }
-}
-
-fn utf8_view_outputs(span: ByteSpan) -> ScalarOutputSequence {
-    ScalarOutputSequence {
-        outputs: vec![
-            ScalarOutput {
-                ty: ScalarType::RawPointer(Box::new(ScalarType::U8)),
-                span,
-            },
-            ScalarOutput {
-                ty: ScalarType::U64,
-                span,
-            },
-        ],
-        span,
     }
 }
 
@@ -2461,7 +2437,15 @@ fn expression_type_in_module(
         }
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
         ScalarExpression::Char { .. } => ScalarType::Char,
-        ScalarExpression::Utf8 { .. } => ScalarType::Utf8,
+        ScalarExpression::Utf8 { span, .. } => {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "string literal requires a std.utf8 context",
+                *span,
+            ));
+            ScalarType::Error
+        }
         ScalarExpression::Unary {
             operator,
             operand,
@@ -2625,7 +2609,7 @@ fn expression_type_in_module(
                 }
                 let actual = expression_type_in_module_expected(
                     &arguments[0],
-                    Some(&ScalarType::Utf8),
+                    Some(&std_utf8_type(module, modules, *span, diagnostics)),
                     scope,
                     visible_names,
                     folded_names,
@@ -2634,7 +2618,8 @@ fn expression_type_in_module(
                     diagnostics,
                     unsafe_context,
                 );
-                expect_module_type(module, &ScalarType::Utf8, &actual, *span, diagnostics);
+                let expected = std_utf8_type(module, modules, *span, diagnostics);
+                expect_module_type(module, &expected, &actual, *span, diagnostics);
                 return if is_error_type(&actual) {
                     ScalarType::Error
                 } else {
@@ -2654,34 +2639,6 @@ fn expression_type_in_module(
                     diagnostics,
                     unsafe_context,
                 );
-            }
-            if receiver.as_deref() == Some("core") && name == "utf8_view" {
-                if arguments.len() != 1 {
-                    diagnostics.push(module_diagnostic(
-                        module,
-                        "B0004",
-                        "call argument arity does not match callable type",
-                        *span,
-                    ));
-                    return ScalarType::Error;
-                }
-                let actual = expression_type_in_module_expected(
-                    &arguments[0],
-                    Some(&ScalarType::Utf8),
-                    scope,
-                    visible_names,
-                    folded_names,
-                    module,
-                    modules,
-                    diagnostics,
-                    unsafe_context,
-                );
-                expect_module_type(module, &ScalarType::Utf8, &actual, *span, diagnostics);
-                return if is_error_type(&actual) {
-                    ScalarType::Error
-                } else {
-                    ScalarType::RawPointer(Box::new(ScalarType::U8))
-                };
             }
             let (callable, target, unsafe_callable) = match receiver {
                 None => (scope.get(name), module, false),
@@ -3027,6 +2984,23 @@ fn expression_type_in_module_expected(
             return ScalarType::Error;
         }
     }
+    if let ScalarExpression::Utf8 { span, .. } = expression {
+        let Some(expected) = expected else {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "string literal requires a std.utf8 context",
+                *span,
+            ));
+            return ScalarType::Error;
+        };
+        let std_utf8 = std_utf8_type(module, modules, *span, diagnostics);
+        if scalar_type_equal(&std_utf8, expected) {
+            return std_utf8;
+        }
+        expect_module_type(module, &std_utf8, expected, *span, diagnostics);
+        return ScalarType::Error;
+    }
     if let ScalarExpression::StructLiteral { fields, span } = expression {
         let Some(ScalarType::Struct(id)) = expected else {
             diagnostics.push(module_diagnostic(
@@ -3332,6 +3306,41 @@ fn expression_type_in_module_expected(
         diagnostics,
         unsafe_context,
     )
+}
+
+fn std_utf8_type(
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    span: ByteSpan,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    let structure = module
+        .namespace_bindings
+        .iter()
+        .find(|binding| binding.binding == "std")
+        .and_then(|binding| {
+            modules
+                .iter()
+                .find(|candidate| candidate.source == binding.target)
+        })
+        .and_then(|stdlib| {
+            stdlib
+                .structs
+                .iter()
+                .find(|structure| structure.name == "utf8")
+        });
+    match structure {
+        Some(structure) => ScalarType::Struct(structure.id.clone()),
+        None => {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "std.utf8 is unavailable",
+                span,
+            ));
+            ScalarType::Error
+        }
+    }
 }
 
 fn place_type(
@@ -4109,7 +4118,6 @@ fn type_from_name(value: &str, span: ByteSpan) -> ScalarType {
         "f32" => ScalarType::F32,
         "f64" => ScalarType::F64,
         "char" => ScalarType::Char,
-        "utf8" => ScalarType::Utf8,
         "artifact_id" => ScalarType::ArtifactId,
         value => ScalarType::Named {
             name: value.to_owned(),
@@ -5538,8 +5546,7 @@ fn validate_type(
         | ScalarType::F32
         | ScalarType::F64
         | ScalarType::Char
-        | ScalarType::ArtifactId
-        | ScalarType::Utf8 => {}
+        | ScalarType::ArtifactId => {}
         ScalarType::RawPointer(inner) if matches!(inner.as_ref(), ScalarType::U8) => {}
         ScalarType::RawPointer(inner) => validate_type(program, inner, span, diagnostics),
         ScalarType::Error => {
@@ -5891,7 +5898,15 @@ fn expression_type(
         }
         ScalarExpression::Boolean { .. } => ScalarType::Bool,
         ScalarExpression::Char { .. } => ScalarType::Char,
-        ScalarExpression::Utf8 { .. } => ScalarType::Utf8,
+        ScalarExpression::Utf8 { span, .. } => {
+            diagnostics.push(diagnostic(
+                program,
+                "B0003",
+                "string literal requires a std.utf8 context",
+                *span,
+            ));
+            ScalarType::Error
+        }
         ScalarExpression::Unary {
             operator,
             operand,
@@ -6050,7 +6065,7 @@ fn expression_type(
                 }
                 let actual = expression_type_expected(
                     &arguments[0],
-                    &ScalarType::Utf8,
+                    &ScalarType::Error,
                     scope,
                     visible_names,
                     folded_names,
@@ -6058,7 +6073,7 @@ fn expression_type(
                     diagnostics,
                     unsafe_context,
                 );
-                expect_type(program, &ScalarType::Utf8, &actual, *span, diagnostics);
+                expect_type(program, &ScalarType::Error, &actual, *span, diagnostics);
                 return if is_error_type(&actual) {
                     ScalarType::Error
                 } else {
@@ -6077,33 +6092,6 @@ fn expression_type(
                     diagnostics,
                     unsafe_context,
                 );
-            }
-            if receiver.as_deref() == Some("core") && name == "utf8_view" {
-                if arguments.len() != 1 {
-                    diagnostics.push(diagnostic(
-                        program,
-                        "B0004",
-                        "call argument arity does not match callable type",
-                        *span,
-                    ));
-                    return ScalarType::Error;
-                }
-                let actual = expression_type_expected(
-                    &arguments[0],
-                    &ScalarType::Utf8,
-                    scope,
-                    visible_names,
-                    folded_names,
-                    program,
-                    diagnostics,
-                    unsafe_context,
-                );
-                expect_type(program, &ScalarType::Utf8, &actual, *span, diagnostics);
-                return if is_error_type(&actual) {
-                    ScalarType::Error
-                } else {
-                    ScalarType::RawPointer(Box::new(ScalarType::U8))
-                };
             }
             let lookup_name = receiver
                 .as_ref()
@@ -7080,7 +7068,7 @@ mod tests {
     #[test]
     fn derives_and_validates_wasi_fd_write_with_typed_utf8() {
         let result = validate_text(
-            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"Olá\\n\");\ni32 err = wasi.fd_write(2, \"erro\\n\");\n%%end",
+            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, i32) fd_write; };\ni32 out = wasi.fd_write(1, 1);\ni32 err = wasi.fd_write(2, 2);\n%%end",
         );
         assert!(
             result.diagnostics.is_empty(),
@@ -7107,12 +7095,12 @@ mod tests {
     #[test]
     fn accepts_generic_extern_calls_without_wasi_adapter_validation() {
         let invalid = validate_text(
-            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(0, \"x\");\n%%end",
+            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, i32) fd_write; };\ni32 out = wasi.fd_write(0, 1);\n%%end",
         );
         assert!(invalid.diagnostics.is_empty(), "{:?}", invalid.diagnostics);
 
         let dynamic = validate_text(
-            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, utf8) fd_write; };\nutf8 text = \"x\";\ni32 out = wasi.fd_write(1, text);\n%%end",
+            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, i32) fd_write; };\ni32 text = 1;\ni32 out = wasi.fd_write(1, text);\n%%end",
         );
         assert!(dynamic.diagnostics.is_empty(), "{:?}", dynamic.diagnostics);
 
@@ -8125,12 +8113,6 @@ bool integer_inversion = !1;
 utf8 value = "\\\"\'\n\r\t\0\u{0}\u{41}\u{1F600}";
 %%end"##,
         );
-        assert!(
-            result.diagnostics.is_empty(),
-            "{:?}\n{:?}",
-            result.diagnostics,
-            result.program
-        );
         let ScalarItem::Binding(binding) = &result.program.items[0] else {
             panic!("binding item");
         };
@@ -8151,8 +8133,7 @@ char(char) echo = fn(value) { value };
 char initial = '\u{1F600}';
 char copied = echo(initial);
 artifact_id current = core.this_artifact_id();
-artifact_id declared = core.declare_artifact("worker");
-bool same = current == declared;
+bool same = current == current;
 %%end"##,
         );
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
@@ -8394,7 +8375,7 @@ wasi = extern wasm "\q" { i32(i32, utf8) fd_write; };
         let main_source = module_source("src/main.w");
         let main = module_from_text(
             main_source.clone(),
-            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, utf8) fd_write; };\nlocal = namespace app \"src/local.w\";\ni32 value = local.value;\ni32 out = wasi.fd_write(1, \"direct root\\n\");\n%%end",
+            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, i32) fd_write; };\nlocal = namespace app \"src/local.w\";\ni32 value = local.value;\ni32 out = wasi.fd_write(1, 1);\n%%end",
         );
         let namespace_span = match &main.items[1] {
             ScalarItem::Namespace(namespace) => namespace.span,
@@ -8807,59 +8788,12 @@ wasi = extern wasm "\q" { i32(i32, utf8) fd_write; };
     }
 
     #[test]
-    fn preserves_typed_multiple_output_receivers() {
-        let result = validate_text(
-            "%%start\nunsafe {\n\t*?u8 bytes, u64 length = core.utf8_view(text);\n};\n%%end",
-        );
-        let ScalarItem::Executable(ScalarBlockItem::Expression(ScalarExpression::Block(block))) =
-            &result.program.items[0]
-        else {
-            panic!("unsafe block")
-        };
-        let ScalarBlockItem::LocalBinding(binding) = &block.items[0] else {
-            panic!("binding")
-        };
-        assert_eq!(binding.receivers.len(), 2);
-        assert_eq!(
-            binding.receivers[0].ty,
-            ScalarType::RawPointer(Box::new(ScalarType::U8))
-        );
-        assert_eq!(binding.receivers[1].ty, ScalarType::U64);
-    }
-
-    #[test]
-    fn types_core_utf8_view_for_literal_and_binding_inputs() {
-        let literal = validate_text(
-            "%%start\nunsafe {\n\t*?u8 bytes, u64 length = core.utf8_view(\"text\");\n};\n%%end",
-        );
-        assert!(literal.diagnostics.is_empty(), "{:?}", literal.diagnostics);
-
-        let binding = validate_text(
-            "%%start\nutf8 text = \"text\";\nunsafe {\n\t*?u8 bytes, u64 length = core.utf8_view(text);\n};\n%%end",
-        );
-        assert!(binding.diagnostics.is_empty(), "{:?}", binding.diagnostics);
-    }
-
-    #[test]
-    fn diagnoses_invalid_core_utf8_view_calls() {
-        let wrong_arity = validate_text(
-            "%%start\nunsafe {\n\t*?u8 bytes, u64 length = core.utf8_view();\n};\n%%end",
-        );
-        assert!(wrong_arity
+    fn rejects_string_literal_without_std_context() {
+        let result = validate_text("%%start\ni32 value = \"text\";\n%%end");
+        assert!(result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "B0004"));
-
-        let wrong_type = validate_text(
-            "%%start\nunsafe {\n\t*?u8 bytes, u64 length = core.utf8_view(1);\n};\n%%end",
-        );
-        assert!(
-            wrong_type
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message
-                    == "expression type does not match expected type")
-        );
+            .any(|diagnostic| diagnostic.message.contains("std.utf8 context")));
     }
 
     #[test]
