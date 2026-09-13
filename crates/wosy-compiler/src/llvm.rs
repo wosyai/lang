@@ -1509,7 +1509,8 @@ fn emit_block<'ctx, 'module>(
     let storage = state.storage.clone();
     let values = state.values.clone();
     let mut result = EmitValue::Unit;
-    for item in &block.items {
+    let final_start = block.items.len() - block.final_output_values.len();
+    for item in &block.items[..final_start] {
         result = match item {
             ScalarBlockItem::LocalBinding(binding) => {
                 let value = emit_binding_value(context, state, binding)?;
@@ -1520,6 +1521,9 @@ fn emit_block<'ctx, 'module>(
             ScalarBlockItem::Assignment(assignment) => emit_assignment(context, state, assignment)?,
             ScalarBlockItem::While(expression) => emit_while(context, state, expression)?,
         };
+    }
+    if !block.final_output_values.is_empty() {
+        result = emit_final_outputs(context, state, block)?;
     }
     state.storage = storage;
     state.values = values;
@@ -1536,7 +1540,8 @@ fn emit_project_block<'ctx, 'module>(
     let storage = state.storage.clone();
     let values = state.values.clone();
     let mut result = EmitValue::Unit;
-    for item in &block.items {
+    let final_start = block.items.len() - block.final_output_values.len();
+    for item in &block.items[..final_start] {
         result = match item {
             ScalarBlockItem::LocalBinding(binding) => {
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
@@ -1554,9 +1559,92 @@ fn emit_project_block<'ctx, 'module>(
             }
         };
     }
+    if !block.final_output_values.is_empty() {
+        result = emit_project_final_outputs(context, state, block, module, modules)?;
+    }
     state.storage = storage;
     state.values = values;
     Ok(result)
+}
+
+fn emit_final_outputs<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    block: &ScalarBlock,
+) -> Result<EmitValue<'ctx>, String> {
+    if block.final_output_values.len() == 1 {
+        let output = &block.final_output_values[0];
+        if matches!(&output.value, ScalarExpression::Call { .. }) {
+            return emit_expression(context, state, &output.value);
+        }
+        return emit_typed_expression(context, state, &output.value, &output.ty);
+    }
+    let outputs = crate::ScalarOutputSequence {
+        outputs: block
+            .final_output_values
+            .iter()
+            .map(|value| crate::ScalarOutput {
+                ty: value.ty.clone(),
+                span: value.span,
+            })
+            .collect(),
+        span: block.span,
+    };
+    let values = block
+        .final_output_values
+        .iter()
+        .map(|output| emit_typed_expression(context, state, &output.value, &output.ty))
+        .collect::<Result<Vec<_>, _>>()?;
+    build_aggregate(context, state, &outputs, values)
+}
+
+fn emit_project_final_outputs<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    block: &ScalarBlock,
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    if block.final_output_values.len() == 1 {
+        let output = &block.final_output_values[0];
+        if matches!(&output.value, ScalarExpression::Call { .. }) {
+            return emit_project_expression(context, state, &output.value, module, modules);
+        }
+        return emit_project_typed_expression(
+            context,
+            state,
+            &output.value,
+            &output.ty,
+            module,
+            modules,
+        );
+    }
+    let outputs = crate::ScalarOutputSequence {
+        outputs: block
+            .final_output_values
+            .iter()
+            .map(|value| crate::ScalarOutput {
+                ty: value.ty.clone(),
+                span: value.span,
+            })
+            .collect(),
+        span: block.span,
+    };
+    let values = block
+        .final_output_values
+        .iter()
+        .map(|output| {
+            emit_project_typed_expression(
+                context,
+                state,
+                &output.value,
+                &output.ty,
+                module,
+                modules,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    build_aggregate(context, state, &outputs, values)
 }
 
 fn emit_assignment<'ctx, 'module>(
@@ -3545,6 +3633,111 @@ mod tests {
             .to_text();
         assert!(text.contains("store i32 1"), "{text}");
         assert!(text.contains("store i64 2"), "{text}");
+    }
+
+    #[test]
+    fn emits_function_final_outputs_from_locals_in_order() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\n(i32, u64)() pair = fn { i32 local = 1; local, 2 };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_llvm(&validation)
+            .expect("final output LLVM")
+            .to_text();
+        let pair = text
+            .split("define { i32, i64 } @pair")
+            .nth(1)
+            .expect("pair");
+        assert!(pair.contains("load i32"), "{pair}");
+        assert!(pair.contains("insertvalue { i32, i64 }"), "{pair}");
+        assert!(
+            pair.contains("insertvalue { i32, i64 } %output, i64 2, 1"),
+            "{pair}"
+        );
+    }
+
+    #[test]
+    fn emits_project_final_outputs_with_single_file_parity() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let program = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\n(i32, u64)() pair = fn { i32 local = 1; local, 2 };\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_project_llvm(&validation)
+            .expect("project final output LLVM")
+            .to_text();
+        let pair = text
+            .split(&format!(
+                "define {{ i32, i64 }} @{}",
+                project_function_name(&source, "pair")
+            ))
+            .nth(1)
+            .expect("project pair");
+        assert!(pair.contains("load i32"), "{pair}");
+        assert!(
+            pair.contains("insertvalue { i32, i64 } %output, i64 2, 1"),
+            "{pair}"
+        );
+    }
+
+    #[test]
+    fn preserves_direct_one_output_and_void_zero_output_function_abis() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\ni32() one = fn { i32 local = 1; local };\nunit() zero = fn { i32 local = 1; local; };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_llvm(&validation).expect("arity LLVM").to_text();
+        assert!(text.contains("define i32 @one"), "{text}");
+        assert!(text.contains("define void @zero"), "{text}");
     }
 
     #[test]
