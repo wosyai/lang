@@ -2394,6 +2394,25 @@ fn expression_type_in_module(
             span,
             ..
         } => {
+            if let Some(receiver_type) = scope.get(receiver) {
+                if matches!(receiver_type, ScalarType::Struct(_))
+                    || matches!(
+                        receiver_type,
+                        ScalarType::RawPointer(inner)
+                            if matches!(inner.as_ref(), ScalarType::Struct(_))
+                    )
+                {
+                    return field_type_in_module(
+                        receiver_type,
+                        name,
+                        *name_span,
+                        *span,
+                        module,
+                        modules,
+                        diagnostics,
+                    );
+                }
+            }
             let Some(namespace) = module
                 .namespace_bindings
                 .iter()
@@ -3341,6 +3360,56 @@ fn std_utf8_type(
             ScalarType::Error
         }
     }
+}
+
+fn field_type_in_module(
+    receiver: &ScalarType,
+    name: &str,
+    name_span: ByteSpan,
+    span: ByteSpan,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    let structure_id = match receiver {
+        ScalarType::Struct(id) => id,
+        ScalarType::RawPointer(inner) => match inner.as_ref() {
+            ScalarType::Struct(id) => id,
+            _ => {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "value has no field",
+                    span,
+                ));
+                return ScalarType::Error;
+            }
+        },
+        _ => unreachable!("field receiver must be a struct or pointer to a struct"),
+    };
+    let Some(structure) = modules
+        .iter()
+        .flat_map(|module| module.structs.iter())
+        .find(|structure| structure.id == *structure_id)
+    else {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "value has no field",
+            span,
+        ));
+        return ScalarType::Error;
+    };
+    let Some(field) = structure.fields.iter().find(|field| field.name == name) else {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "value has no field",
+            name_span,
+        ));
+        return ScalarType::Error;
+    };
+    field.ty.clone()
 }
 
 fn place_type(
@@ -8110,7 +8179,7 @@ bool integer_inversion = !1;
     fn decodes_all_scalar_string_escapes_and_unicode_values() {
         let result = validate_text(
             r##"%%start
-utf8 value = "\\\"\'\n\r\t\0\u{0}\u{41}\u{1F600}";
+std.utf8 value = "\\\"\'\n\r\t\0\u{0}\u{41}\u{1F600}";
 %%end"##,
         );
         let ScalarItem::Binding(binding) = &result.program.items[0] else {
@@ -8178,7 +8247,7 @@ bool same = current == current;
             (r##"\u{110000}"##, 1, 11),
         ];
         for (literal, relative_start, relative_end) in cases {
-            let text = format!("%%start\nutf8 value = \"{}\";\n%%end", literal);
+            let text = format!("%%start\nstd.utf8 value = \"{}\";\n%%end", literal);
             let parsed = parse_source(source(), text.clone(), &[]);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
             let result = derive_scalar_program(&parsed.result);
@@ -8208,7 +8277,7 @@ bool same = current == current;
     #[test]
     fn reports_malformed_extern_module_string_without_panicking() {
         let text = r##"%%start
-wasi = extern wasm "\q" { i32(i32, utf8) fd_write; };
+wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
 %%end"##;
         let parsed = parse_source(source(), text.to_owned(), &[]);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -9237,6 +9306,72 @@ wasi = extern wasm "\q" { i32(i32, utf8) fd_write; };
             panic!("field address")
         };
         assert!(matches!(field, ScalarFieldReference::Resolved(id) if id.structure == imported_id));
+    }
+
+    #[test]
+    fn resolves_imported_struct_field_reads_and_preserves_namespace_members() {
+        let std_source = module_source("src/bootstrap.w");
+        let std = module_from_text(
+            std_source.clone(),
+            "%%start\nstruct utf8 {\n\t*?u8 data;\n\tu64 length;\n}\ni32 value = 80;\n%%end",
+        );
+        let imported_id = std.structs[0].id.clone();
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nstd = namespace std \"src/bootstrap.w\";\ni32 observed = std.value;\nstd.utf8 text = \"hé\";\n*?u8 data = text.data;\nu64 length = text.length;\nunsafe { *?std.utf8 pointer = &?text; *?u8 pointer_data = pointer.data; u64 pointer_length = pointer.length; };\n%%end",
+        );
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source,
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "std".to_owned(),
+                        target: std_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::from_program(std, Vec::new()),
+            ],
+            Vec::new(),
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let ScalarItem::Binding(observed) = &validation.project.modules[0].items[1] else {
+            panic!("namespace member binding")
+        };
+        assert!(matches!(
+            observed.value,
+            ScalarExpression::Member { ref receiver, ref name, .. }
+                if receiver == "std" && name == "value"
+        ));
+        let ScalarItem::Binding(text) = &validation.project.modules[0].items[2] else {
+            panic!("utf8 binding")
+        };
+        assert_eq!(text.declared_type, ScalarType::Struct(imported_id.clone()));
+        assert!(matches!(
+            text.value,
+            ScalarExpression::Utf8 { ref value, .. } if value == b"h\xc3\xa9"
+        ));
+        let ScalarItem::Binding(data) = &validation.project.modules[0].items[3] else {
+            panic!("data binding")
+        };
+        assert_eq!(
+            data.declared_type,
+            ScalarType::RawPointer(Box::new(ScalarType::U8))
+        );
+        let ScalarItem::Binding(length) = &validation.project.modules[0].items[4] else {
+            panic!("length binding")
+        };
+        assert_eq!(length.declared_type, ScalarType::U64);
     }
 
     #[test]
