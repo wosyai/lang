@@ -138,10 +138,7 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
             .is_some();
         select_source(assertion, &temporary, &case)?;
         let command = command_values(assertion)?;
-        if command.first().map(String::as_str) == Some("wosy")
-            && command.get(1).map(String::as_str) == Some("run")
-            && has_source_selector
-        {
+        if requires_selected_source_build(has_source_selector, &command) {
             let status = Command::new(&binary)
                 .args(["build"])
                 .current_dir(&temporary)
@@ -240,6 +237,12 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
     fs::remove_dir_all(&temporary).map_err(|error| error.to_string())?;
     println!("passed {}", case.display());
     Ok(())
+}
+
+fn requires_selected_source_build(has_source_selector: bool, command: &[String]) -> bool {
+    has_source_selector
+        && command.first().map(String::as_str) == Some("wosy")
+        && command.get(1).map(String::as_str) == Some("run")
 }
 
 fn assert_source_observations(
@@ -457,4 +460,23 @@ fn collect_cases(directory: &Path, cases: &mut Vec<PathBuf>) -> Result<(), Strin
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::requires_selected_source_build;
+
+    #[test]
+    fn selected_source_negative_build_assertion_runs_directly() {
+        let command = vec!["wosy".to_owned(), "build".to_owned()];
+
+        assert!(!requires_selected_source_build(true, &command));
+    }
+
+    #[test]
+    fn selected_source_runtime_assertion_builds_first() {
+        let command = vec!["wosy".to_owned(), "run".to_owned()];
+
+        assert!(requires_selected_source_build(true, &command));
+    }
 }
