@@ -129,7 +129,7 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let project = ProjectContext::load(&root, &target_name)?;
     let (_target_config, artifact, artifact_profile, target_profile) =
         configuration.artifact_profile(&target_name, profile)?;
-    let (llvm, source_observations) = compile_project(&root, &project)?;
+    let (llvm, source_observations) = compile_project(&root, &project, &configuration)?;
     let source_identity = wosy_project::source_identity(&source_observations);
     let artifact_name = &target_profile.main_artifact;
     let output_dir = root
@@ -246,34 +246,47 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
 fn compile_project(
     root: &std::path::Path,
     project: &ProjectContext,
+    configuration: &ProjectConfiguration,
 ) -> Result<(String, Vec<SourceObservation>), String> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
-    let mut pending = vec![root_path.clone()];
+    let root_project = root.to_string_lossy().into_owned();
+    let mut pending = vec![(project.package.clone(), root_path.clone())];
     let mut index = 0;
     let mut nodes = Vec::new();
     let mut canonical = BTreeMap::new();
     let mut texts = BTreeMap::new();
 
     while index < pending.len() {
-        let path = pending[index].clone();
+        let (package, path) = pending[index].clone();
         index += 1;
-        if nodes
-            .iter()
-            .any(|node: &SourceNodeInput| node.source.path == path)
-        {
+        if nodes.iter().any(|node: &SourceNodeInput| {
+            node.source.package == package && node.source.path == path
+        }) {
             continue;
         }
-        let source_path = root.join(path.as_path());
+        let (package_root, project_identity) = if package == project.package {
+            (root.to_path_buf(), root_project.clone())
+        } else {
+            let resolved = configuration
+                .resolved_packages
+                .get(&package)
+                .ok_or_else(|| format!("dependency package {package} is missing"))?;
+            (
+                resolved.project_root.clone(),
+                resolved.identity.project.clone(),
+            )
+        };
+        let source_path = package_root.join(path.as_path());
         let text = fs::read_to_string(&source_path)
             .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
         let revision = blake3::hash(text.as_bytes()).to_hex().to_string();
         let source = SourceIdentity::new(
-            root.to_string_lossy().into_owned(),
-            project.package.clone(),
+            project_identity,
+            package.clone(),
             path.as_path().to_string_lossy().replace('\\', "/"),
             revision.clone(),
         );
-        let output = parse_source(source, text.clone(), &project.comment_categories);
+        let output = parse_source(source.clone(), text.clone(), &project.comment_categories);
         render_diagnostics(&text, &output.diagnostics, &output.result.source);
         if !output.diagnostics.is_empty() {
             return Err("build rejected by syntax diagnostics".to_owned());
@@ -289,8 +302,31 @@ fn compile_project(
             let module_path = serde_json::from_str::<String>(&namespace.path)
                 .map_err(|error| format!("invalid namespace path: {error}"))?;
             let module_path = PackageRelativePath::new(module_path.into())?;
-            if root.join(module_path.as_path()).is_file() {
-                pending.push(module_path.clone());
+            let target_path = if namespace.package == project.package {
+                module_path.clone()
+            } else {
+                let resolved = configuration
+                    .resolved_packages
+                    .get(&namespace.package)
+                    .ok_or_else(|| {
+                        format!("dependency package {} is missing", namespace.package)
+                    })?;
+                PackageRelativePath::new(
+                    resolved.identity.path.as_path().join(module_path.as_path()),
+                )?
+            };
+            let target_root = if namespace.package == project.package {
+                root.to_path_buf()
+            } else {
+                configuration
+                    .resolved_packages
+                    .get(&namespace.package)
+                    .ok_or_else(|| format!("dependency package {} is missing", namespace.package))?
+                    .project_root
+                    .clone()
+            };
+            if target_root.join(target_path.as_path()).is_file() {
+                pending.push((namespace.package.clone(), target_path.clone()));
             }
             namespace_edges.push(NamespaceEdgeInput {
                 origin: namespace.package.clone(),
@@ -298,8 +334,8 @@ fn compile_project(
                 binding: namespace.binding.clone(),
                 span: ProjectSourceSpan {
                     source: ProjectSourceIdentity::new(
-                        root.to_string_lossy().into_owned(),
-                        project.package.clone(),
+                        source.project.clone(),
+                        source.package.clone(),
                         path.clone(),
                     ),
                     range: wosy_project::ByteSpan::new(namespace.span.start, namespace.span.end),
@@ -307,44 +343,53 @@ fn compile_project(
             });
         }
         let graph_source = ProjectSourceIdentity::new(
-            root.to_string_lossy().into_owned(),
-            project.package.clone(),
+            source.project.clone(),
+            source.package.clone(),
             path.clone(),
         );
         nodes.push(SourceNodeInput {
-            source: graph_source,
+            source: graph_source.clone(),
             content_revision: ContentRevision(revision),
             namespace_edges,
         });
-        canonical.insert(path.clone(), cst);
-        texts.insert(path, text);
+        canonical.insert((package.clone(), path.clone()), cst);
+        texts.insert(graph_source, text);
     }
 
     let root_node = nodes
         .iter()
-        .find(|node| node.source.path == root_path)
+        .find(|node| node.source.package == project.package && node.source.path == root_path)
         .cloned()
         .ok_or_else(|| "project root source is missing".to_owned())?;
-    let graph =
-        load_reachable_source_graph(&project.package, root_node, nodes).map_err(|error| {
-            render_graph_diagnostics(&error);
-            format_graph_error(error)
-        })?;
+    let graph = load_reachable_source_graph(
+        &project.package,
+        root_node,
+        nodes,
+        &configuration.resolved_packages,
+    )
+    .map_err(|error| {
+        render_graph_diagnostics(&error, &texts);
+        format_graph_error(error)
+    })?;
     let mut modules = Vec::new();
     let mut source_by_path = BTreeMap::new();
     let mut derivation_diagnostics = Vec::new();
     for node in &graph.nodes {
-        let source =
-            compiler_source_identity(root, project, &node.source.path, &node.content_revision);
-        source_by_path.insert(node.source.path.clone(), source);
+        let source = compiler_source_identity(&node.source, &node.content_revision);
+        source_by_path.insert(
+            (node.source.package.clone(), node.source.path.clone()),
+            source,
+        );
     }
     for node in &graph.nodes {
-        let cst = canonical.get(&node.source.path).ok_or_else(|| {
-            format!(
-                "missing canonical CST for {}",
-                node.source.path.as_path().display()
-            )
-        })?;
+        let cst = canonical
+            .get(&(node.source.package.clone(), node.source.path.clone()))
+            .ok_or_else(|| {
+                format!(
+                    "missing canonical CST for {}",
+                    node.source.path.as_path().display()
+                )
+            })?;
         derivation_diagnostics.extend(derive_scalar_diagnostics_from_cst(cst));
         let validation = derive_scalar_program_from_cst(cst);
         let namespace_bindings = node
@@ -353,9 +398,12 @@ fn compile_project(
             .map(|edge| {
                 Ok(ScalarNamespaceBinding {
                     binding: edge.binding.clone(),
-                    target: source_by_path.get(&edge.path).cloned().ok_or_else(|| {
-                        format!("missing module {}", edge.path.as_path().display())
-                    })?,
+                    target: source_by_path
+                        .get(&(edge.origin.clone(), edge.path.clone()))
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!("missing module {}", edge.path.as_path().display())
+                        })?,
                     span: wosy_syntax::ByteSpan::new(edge.span.range.start, edge.span.range.end),
                 })
             })
@@ -378,7 +426,7 @@ fn compile_project(
                 .get(id.0)
                 .ok_or_else(|| format!("missing initialization node {}", id.0))?;
             source_by_path
-                .get(&node.source.path)
+                .get(&(node.source.package.clone(), node.source.path.clone()))
                 .cloned()
                 .ok_or_else(|| format!("missing module {}", node.source.path.as_path().display()))
         })
@@ -391,7 +439,7 @@ fn compile_project(
     let llvm = if graph.nodes.len() == 1 {
         emit_scalar_llvm_text(&derive_scalar_program_from_cst(
             canonical
-                .get(&root_path)
+                .get(&(project.package.clone(), root_path.clone()))
                 .ok_or_else(|| "missing canonical CST for project root".to_owned())?,
         ))?
     } else {
@@ -432,15 +480,13 @@ fn load_canonical_cst(path: &std::path::Path) -> Result<wosy_syntax::CanonicalCs
 }
 
 fn compiler_source_identity(
-    root: &std::path::Path,
-    project: &ProjectContext,
-    path: &PackageRelativePath,
+    source: &ProjectSourceIdentity,
     revision: &ContentRevision,
 ) -> SourceIdentity {
     SourceIdentity::new(
-        root.to_string_lossy().into_owned(),
-        project.package.clone(),
-        path.as_path().to_string_lossy().replace('\\', "/"),
+        source.project.clone(),
+        source.package.clone(),
+        source.path.as_path().to_string_lossy().replace('\\', "/"),
         revision.0.clone(),
     )
 }
@@ -451,8 +497,9 @@ fn format_graph_error(error: wosy_project::GraphLoadError) -> String {
         .into_iter()
         .map(|diagnostic| match diagnostic {
             wosy_project::GraphDiagnostic::MissingModule(diagnostic) => format!(
-                "{}: missing module {}",
+                "{}: missing module {}::{}",
                 diagnostic.code,
+                diagnostic.requested_package,
                 diagnostic.requested_path.as_path().display()
             ),
             wosy_project::GraphDiagnostic::Cycle(diagnostic) => {
@@ -463,17 +510,37 @@ fn format_graph_error(error: wosy_project::GraphLoadError) -> String {
         .join("\n")
 }
 
-fn render_graph_diagnostics(error: &wosy_project::GraphLoadError) {
+fn render_graph_diagnostics(
+    error: &wosy_project::GraphLoadError,
+    texts: &BTreeMap<ProjectSourceIdentity, String>,
+) {
     for diagnostic in &error.diagnostics {
         match diagnostic {
-            wosy_project::GraphDiagnostic::MissingModule(diagnostic) => eprintln!(
-                "{}: {}:{}..{} requests {}",
-                diagnostic.code,
-                diagnostic.edge.source.path.as_path().display(),
-                diagnostic.edge.range.start,
-                diagnostic.edge.range.end,
-                diagnostic.requested_path.as_path().display()
-            ),
+            wosy_project::GraphDiagnostic::MissingModule(diagnostic) => {
+                let mut files = SimpleFiles::new();
+                let Some(text) = texts.get(&diagnostic.edge.source) else {
+                    continue;
+                };
+                let file_id = files.add(
+                    diagnostic.edge.source.path.as_path().display().to_string(),
+                    text.clone(),
+                );
+                let report = Report::error()
+                    .with_code(diagnostic.code.clone())
+                    .with_message(format!(
+                        "missing module {}::{}",
+                        diagnostic.requested_package,
+                        diagnostic.requested_path.as_path().display()
+                    ))
+                    .with_labels(vec![Label::primary(
+                        file_id,
+                        diagnostic.edge.range.start as usize..diagnostic.edge.range.end as usize,
+                    )]);
+                let config = term::Config::default();
+                let stream = StandardStream::stderr(ColorChoice::Auto);
+                let mut stream_lock = stream.lock();
+                let _ = term::emit(&mut stream_lock, &config, &files, &report);
+            }
             wosy_project::GraphDiagnostic::Cycle(diagnostic) => {
                 eprintln!(
                     "{}: {}:{}..{} is part of an import cycle",
@@ -498,7 +565,7 @@ fn render_graph_diagnostics(error: &wosy_project::GraphLoadError) {
 
 fn render_project_diagnostics(
     diagnostics: &[wosy_compiler::Diagnostic],
-    texts: &BTreeMap<PackageRelativePath, String>,
+    texts: &BTreeMap<ProjectSourceIdentity, String>,
 ) {
     for diagnostic in diagnostics {
         let mut files = SimpleFiles::new();
@@ -506,8 +573,12 @@ fn render_project_diagnostics(
             .labels
             .iter()
             .filter_map(|label| {
-                let path = PackageRelativePath::new(label.span.source.path.clone().into()).ok()?;
-                let text = texts.get(&path)?;
+                let source = ProjectSourceIdentity::new(
+                    label.span.source.project.clone(),
+                    label.span.source.package.clone(),
+                    PackageRelativePath::new(label.span.source.path.clone().into()).ok()?,
+                );
+                let text = texts.get(&source)?;
                 let file_id = files.add(label.span.source.path.clone(), text.clone());
                 let range = label.span.range.start as usize..label.span.range.end as usize;
                 Some(
@@ -644,5 +715,25 @@ fn render_diagnostics(
             .with_labels(labels)
             .with_notes(diagnostic.notes.clone());
         let _ = term::emit(&mut stream_lock, &config, &files, &report);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compiler_namespace_target_retains_dependency_identity() {
+        let source = ProjectSourceIdentity::new(
+            "/workspace/stdlib".to_owned(),
+            "std".to_owned(),
+            PackageRelativePath::new("src/math.w".into()).expect("module path"),
+        );
+        let target = compiler_source_identity(&source, &ContentRevision("rev".to_owned()));
+
+        assert_eq!(target.project, "/workspace/stdlib");
+        assert_eq!(target.package, "std");
+        assert_eq!(target.path, "src/math.w");
+        assert_eq!(target.revision, "rev");
     }
 }
