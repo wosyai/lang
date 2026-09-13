@@ -15,7 +15,7 @@ use inkwell::AddressSpace;
 use inkwell::{FloatPredicate, IntPredicate};
 use serde::{Deserialize, Serialize};
 
-use crate::scalar::ScalarFieldReference;
+use crate::scalar::{ScalarBindingOutputOrigin, ScalarFieldReference};
 use crate::{
     BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarExpression,
     ScalarFunction, ScalarItem, ScalarModule, ScalarProjectValidation, ScalarStruct, ScalarType,
@@ -1090,19 +1090,19 @@ fn emit_binding_value<'ctx, 'module>(
     if binding.output_sequence.outputs.len() == 1 {
         return emit_typed_expression(context, state, &binding.value, &binding.declared_type);
     }
-    if binding
-        .output_values
-        .windows(2)
-        .all(|values| values[0].value == values[1].value)
-    {
-        return emit_expression(context, state, &binding.value);
+    match binding.output_origin {
+        ScalarBindingOutputOrigin::SingleExpression => {
+            emit_expression(context, state, &binding.value)
+        }
+        ScalarBindingOutputOrigin::IndependentExpressions => {
+            let values = binding
+                .output_values
+                .iter()
+                .map(|output| emit_typed_expression(context, state, &output.value, &output.ty))
+                .collect::<Result<Vec<_>, _>>()?;
+            build_aggregate(context, state, &binding.output_sequence, values)
+        }
     }
-    let values = binding
-        .output_values
-        .iter()
-        .map(|output| emit_typed_expression(context, state, &output.value, &output.ty))
-        .collect::<Result<Vec<_>, _>>()?;
-    build_aggregate(context, state, &binding.output_sequence, values)
 }
 
 fn store_binding_outputs<'ctx, 'module>(
@@ -1157,28 +1157,28 @@ fn emit_project_binding_value<'ctx, 'module>(
             modules,
         );
     }
-    if binding
-        .output_values
-        .windows(2)
-        .all(|values| values[0].value == values[1].value)
-    {
-        return emit_project_expression(context, state, &binding.value, module, modules);
+    match binding.output_origin {
+        ScalarBindingOutputOrigin::SingleExpression => {
+            emit_project_expression(context, state, &binding.value, module, modules)
+        }
+        ScalarBindingOutputOrigin::IndependentExpressions => {
+            let values = binding
+                .output_values
+                .iter()
+                .map(|output| {
+                    emit_project_typed_expression(
+                        context,
+                        state,
+                        &output.value,
+                        &output.ty,
+                        module,
+                        modules,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            build_aggregate(context, state, &binding.output_sequence, values)
+        }
     }
-    let values = binding
-        .output_values
-        .iter()
-        .map(|output| {
-            emit_project_typed_expression(
-                context,
-                state,
-                &output.value,
-                &output.ty,
-                module,
-                modules,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    build_aggregate(context, state, &binding.output_sequence, values)
 }
 
 fn emit_function<'ctx, 'module>(
@@ -3517,6 +3517,66 @@ mod tests {
             text.contains("extractvalue { i32, i64 } %call, 1"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn emits_distinct_independent_output_values_in_source_order() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\ni32 first, u64 second = 1, 2;\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_llvm(&validation)
+            .expect("independent output LLVM")
+            .to_text();
+        assert!(text.contains("store i32 1"), "{text}");
+        assert!(text.contains("store i64 2"), "{text}");
+    }
+
+    #[test]
+    fn emits_equal_independent_output_values_with_typed_receivers() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let mut validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\ni32 first, u64 second = 1, 1;\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let crate::ScalarItem::Binding(binding) = &mut validation.program.items[0] else {
+            panic!("output binding");
+        };
+        binding.output_values[1].value = binding.output_values[0].value.clone();
+        let text = emit_scalar_llvm(&validation)
+            .expect("equal independent output LLVM")
+            .to_text();
+        assert!(text.contains("store i32 1"), "{text}");
+        assert!(text.contains("store i64 1"), "{text}");
     }
 
     #[test]
