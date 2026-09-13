@@ -193,7 +193,7 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
         .source_observations
         .iter()
         .map(|observation| {
-            let path = root.join(observation.source.path.as_path());
+            let path = source_observation_path(observation);
             let bytes = fs::read(&path)
                 .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
             Ok(SourceObservation {
@@ -241,6 +241,10 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
         &manifest_path,
         arguments,
     )
+}
+
+fn source_observation_path(observation: &SourceObservation) -> std::path::PathBuf {
+    std::path::Path::new(&observation.source.project).join(observation.source.path.as_path())
 }
 
 fn compile_project(
@@ -735,5 +739,22 @@ mod tests {
         assert_eq!(target.package, "std");
         assert_eq!(target.path, "src/math.w");
         assert_eq!(target.revision, "rev");
+    }
+
+    #[test]
+    fn dependency_observation_lookup_uses_source_project_root() {
+        let observation = SourceObservation {
+            source: ProjectSourceIdentity::new(
+                "/workspace/stdlib".to_owned(),
+                "std".to_owned(),
+                PackageRelativePath::new("src/math.w".into()).expect("module path"),
+            ),
+            content_revision: ContentRevision("rev".to_owned()),
+        };
+
+        assert_eq!(
+            source_observation_path(&observation),
+            std::path::PathBuf::from("/workspace/stdlib/src/math.w")
+        );
     }
 }
