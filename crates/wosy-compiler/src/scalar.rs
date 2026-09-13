@@ -366,6 +366,7 @@ pub struct ScalarBlock {
     pub items: Vec<ScalarBlockItem>,
     pub terminated_items: Vec<bool>,
     pub expressions: Vec<ScalarExpression>,
+    pub final_output_values: Vec<ScalarOutputValue>,
     pub span: ByteSpan,
     pub unsafe_context: bool,
 }
@@ -704,6 +705,16 @@ fn resolve_program_types(program: &mut ScalarProgram) {
             }
             ScalarItem::Function(function) => {
                 function.signature = resolve_type(&function.signature, &names);
+                if let ScalarType::Callable { outputs, .. } = &function.signature {
+                    for (value, output) in function
+                        .body
+                        .final_output_values
+                        .iter_mut()
+                        .zip(&outputs.outputs)
+                    {
+                        value.ty = output.ty.clone();
+                    }
+                }
                 resolve_block_types(&mut function.body, &names);
             }
             ScalarItem::Extern(extern_decl) => {
@@ -1060,7 +1071,6 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                     else {
                         continue;
                     };
-                    let output = &outputs.outputs[0];
                     if function.parameters.len() != parameters.len() {
                         diagnostics.push(module_diagnostic(
                             module,
@@ -1086,24 +1096,140 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                             scope.insert(name.clone(), parameters[index].clone());
                         }
                     }
-                    let actual = block_type_in_module_expected(
-                        &function.body,
-                        Some(&output.ty),
-                        &scope,
-                        &visible_names,
-                        &folded_names,
-                        module,
-                        &project.modules,
-                        &mut diagnostics,
-                        false,
-                    );
-                    expect_module_type(
-                        module,
-                        &output.ty,
-                        &actual,
-                        function.body.span,
-                        &mut diagnostics,
-                    );
+                    if outputs.outputs.len() > 1 && !function.body.final_output_values.is_empty() {
+                        let final_start =
+                            function.body.items.len() - function.body.final_output_values.len();
+                        for item in &function.body.items[..final_start] {
+                            let _ = block_item_type_in_module(
+                                item,
+                                &mut scope,
+                                &mut visible_names,
+                                &mut folded_names,
+                                module,
+                                &project.modules,
+                                &mut diagnostics,
+                                false,
+                            );
+                        }
+                        if function.body.final_output_values.len() == 1
+                            && matches!(
+                                &function.body.final_output_values[0].value,
+                                ScalarExpression::Call { .. }
+                            )
+                        {
+                            let value = &function.body.final_output_values[0];
+                            if let Some(actual_outputs) = call_output_sequence_in_module(
+                                &value.value,
+                                &scope,
+                                module,
+                                &project.modules,
+                            ) {
+                                expression_type_in_module_expected(
+                                    &value.value,
+                                    actual_outputs.outputs.first().map(|output| &output.ty),
+                                    &scope,
+                                    &visible_names,
+                                    &folded_names,
+                                    module,
+                                    &project.modules,
+                                    &mut diagnostics,
+                                    false,
+                                );
+                                if actual_outputs.outputs.len() != outputs.outputs.len() {
+                                    diagnostics.push(module_diagnostic(
+                                        module,
+                                        "B0004",
+                                        "function output arity does not match its final output list",
+                                        value.span,
+                                    ));
+                                }
+                                for (actual, expected) in
+                                    actual_outputs.outputs.iter().zip(&outputs.outputs)
+                                {
+                                    expect_module_type(
+                                        module,
+                                        &expected.ty,
+                                        &actual.ty,
+                                        value.span,
+                                        &mut diagnostics,
+                                    );
+                                }
+                            }
+                        } else {
+                            if function.body.final_output_values.len() > 1
+                                && function.body.final_output_values.len() != outputs.outputs.len()
+                            {
+                                diagnostics.push(module_diagnostic(
+                                    module,
+                                    "B0004",
+                                    "function output arity does not match its final output list",
+                                    function.body.span,
+                                ));
+                            }
+                            for (value, output) in function
+                                .body
+                                .final_output_values
+                                .iter()
+                                .zip(&outputs.outputs)
+                            {
+                                let actual = expression_type_in_module_expected(
+                                    &value.value,
+                                    Some(&output.ty),
+                                    &scope,
+                                    &visible_names,
+                                    &folded_names,
+                                    module,
+                                    &project.modules,
+                                    &mut diagnostics,
+                                    false,
+                                );
+                                expect_module_type(
+                                    module,
+                                    &output.ty,
+                                    &actual,
+                                    value.span,
+                                    &mut diagnostics,
+                                );
+                            }
+                        }
+                    } else if let Some(output) = outputs.outputs.first() {
+                        let actual = block_type_in_module_expected(
+                            &function.body,
+                            Some(&output.ty),
+                            &scope,
+                            &visible_names,
+                            &folded_names,
+                            module,
+                            &project.modules,
+                            &mut diagnostics,
+                            false,
+                        );
+                        expect_module_type(
+                            module,
+                            &output.ty,
+                            &actual,
+                            function.body.span,
+                            &mut diagnostics,
+                        );
+                    } else {
+                        let actual = block_type_in_module(
+                            &function.body,
+                            &scope,
+                            &visible_names,
+                            &folded_names,
+                            module,
+                            &project.modules,
+                            &mut diagnostics,
+                            false,
+                        );
+                        expect_module_type(
+                            module,
+                            &ScalarType::Unit,
+                            &actual,
+                            function.body.span,
+                            &mut diagnostics,
+                        );
+                    }
                 }
                 ScalarItem::Executable(executable) => {
                     let mut scope = declarations.clone();
@@ -1161,6 +1287,16 @@ fn resolve_module_types_in_project(module: &mut ScalarModule, modules: &[ScalarM
             ScalarItem::Function(function) => {
                 function.signature =
                     resolve_type_in_project(&function.signature, &names, &context, modules);
+                if let ScalarType::Callable { outputs, .. } = &function.signature {
+                    for (value, output) in function
+                        .body
+                        .final_output_values
+                        .iter_mut()
+                        .zip(&outputs.outputs)
+                    {
+                        value.ty = output.ty.clone();
+                    }
+                }
                 resolve_block_types_project(&mut function.body, &names, &context, modules);
             }
             ScalarItem::Extern(extern_decl) => {
@@ -4178,11 +4314,17 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
                 })
                 .collect()
         });
-    let body = children
+    let mut body = children
         .iter()
         .find(|child| child.kind() == SyntaxKind::Block)
         .map(|node| derive_block(node))
         .expect("function block");
+    if let ScalarType::Callable { outputs, .. } = &signature {
+        expand_conditional_final_outputs(&mut body, outputs.outputs.len());
+        for (value, output) in body.final_output_values.iter_mut().zip(&outputs.outputs) {
+            value.ty = output.ty.clone();
+        }
+    }
     ScalarFunction {
         name,
         signature,
@@ -4191,6 +4333,86 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         body,
         span: wosy_syntax::byte_span(node),
     }
+}
+
+fn expand_conditional_final_outputs(block: &mut ScalarBlock, output_count: usize) {
+    if block.final_output_values.len() != 1 || output_count < 2 {
+        return;
+    }
+    let ScalarExpression::If {
+        condition,
+        then_branch,
+        else_branch,
+        ..
+    } = &block.final_output_values[0].value
+    else {
+        return;
+    };
+    if then_branch.final_output_values.len() != output_count
+        || else_branch.final_output_values.len() != output_count
+    {
+        return;
+    }
+    let then_branch = then_branch.clone();
+    let else_branch = else_branch.clone();
+    let condition = condition.clone();
+    let conditional_span = span_of(&block.final_output_values[0].value);
+    block.final_output_values = (0..output_count)
+        .map(|position| {
+            let value = ScalarExpression::If {
+                condition: condition.clone(),
+                then_branch: select_final_output(&then_branch, position),
+                else_branch: select_final_output(&else_branch, position),
+                span: conditional_span,
+            };
+            ScalarOutputValue {
+                position,
+                ty: ScalarType::Error,
+                span: span_of(&value),
+                value,
+            }
+        })
+        .collect();
+    let final_items = block
+        .final_output_values
+        .iter()
+        .map(|output| ScalarBlockItem::Expression(output.value.clone()));
+    let final_start = block.items.len() - 1;
+    block.items.truncate(final_start);
+    block.terminated_items.truncate(final_start);
+    block.items.extend(final_items);
+    block
+        .terminated_items
+        .extend((0..output_count).map(|_| false));
+    block.expressions = block
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarBlockItem::Expression(expression) => Some(expression.clone()),
+            _ => None,
+        })
+        .collect();
+}
+
+fn select_final_output(block: &ScalarBlock, position: usize) -> ScalarBlock {
+    let mut selected = block.clone();
+    let final_start = selected.items.len() - selected.final_output_values.len();
+    selected.items.truncate(final_start);
+    selected.terminated_items.truncate(final_start);
+    selected.final_output_values = vec![block.final_output_values[position].clone()];
+    selected.items.push(ScalarBlockItem::Expression(
+        selected.final_output_values[0].value.clone(),
+    ));
+    selected.terminated_items.push(false);
+    selected.expressions = selected
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarBlockItem::Expression(expression) => Some(expression.clone()),
+            _ => None,
+        })
+        .collect();
+    selected
 }
 
 fn derive_type(node: &CstNode) -> ScalarType {
@@ -4521,11 +4743,40 @@ fn derive_block(node: &CstNode) -> ScalarBlock {
 }
 
 fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBlock {
-    let items: Vec<ScalarBlockItem> = node
+    let mut items: Vec<ScalarBlockItem> = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::BlockItem)
         .map(|item| derive_block_item(&item))
         .collect();
+    let final_output_values = direct_nodes(node)
+        .into_iter()
+        .find(|child| child.kind() == SyntaxKind::FinalOutputList)
+        .map(|final_list| {
+            let output_list = direct_nodes(&final_list)
+                .into_iter()
+                .find(|child| child.kind() == SyntaxKind::OutputList)
+                .expect("final output list");
+            output_list
+                .children()
+                .filter(|child| child.kind() == SyntaxKind::Expression)
+                .enumerate()
+                .map(|(position, child)| {
+                    let value = derive_expression(&child);
+                    ScalarOutputValue {
+                        position,
+                        ty: ScalarType::Error,
+                        span: span_of(&value),
+                        value,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    items.extend(
+        final_output_values
+            .iter()
+            .map(|output| ScalarBlockItem::Expression(output.value.clone())),
+    );
     let terminated_items = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::BlockItem)
@@ -4538,6 +4789,7 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
                 )
             })
         })
+        .chain(final_output_values.iter().map(|_| false))
         .collect();
     let expressions = items
         .iter()
@@ -4550,6 +4802,7 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
         items,
         terminated_items,
         expressions,
+        final_output_values,
         span: wosy_syntax::byte_span(node),
         unsafe_context,
     }
@@ -5410,24 +5663,130 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                         scope.insert(name.clone(), parameters[index].clone());
                     }
                 }
-                let output = &outputs.outputs[0];
-                let actual = block_type_expected(
-                    &function.body,
-                    &output.ty,
-                    &scope,
-                    &visible_names,
-                    &folded_names,
-                    program,
-                    &mut diagnostics,
-                    false,
-                );
-                expect_type(
-                    program,
-                    &output.ty,
-                    &actual,
-                    function.body.span,
-                    &mut diagnostics,
-                );
+                if outputs.outputs.len() > 1 && !function.body.final_output_values.is_empty() {
+                    let final_start =
+                        function.body.items.len() - function.body.final_output_values.len();
+                    for item in &function.body.items[..final_start] {
+                        let _ = block_item_type(
+                            item,
+                            &mut scope,
+                            &mut visible_names,
+                            &mut folded_names,
+                            program,
+                            &mut diagnostics,
+                            false,
+                        );
+                    }
+                    if function.body.final_output_values.len() == 1
+                        && matches!(
+                            &function.body.final_output_values[0].value,
+                            ScalarExpression::Call { .. }
+                        )
+                    {
+                        let value = &function.body.final_output_values[0];
+                        if let Some(actual_outputs) =
+                            call_output_sequence(&value.value, &scope, program)
+                        {
+                            expression_type_expected(
+                                &value.value,
+                                &actual_outputs
+                                    .outputs
+                                    .first()
+                                    .map(|output| &output.ty)
+                                    .expect("multi-output final call has an output"),
+                                &scope,
+                                &visible_names,
+                                &folded_names,
+                                program,
+                                &mut diagnostics,
+                                false,
+                            );
+                            if actual_outputs.outputs.len() != outputs.outputs.len() {
+                                diagnostics.push(diagnostic(
+                                    program,
+                                    "B0004",
+                                    "function output arity does not match its final output list",
+                                    value.span,
+                                ));
+                            }
+                            for (actual, expected) in
+                                actual_outputs.outputs.iter().zip(&outputs.outputs)
+                            {
+                                expect_type(
+                                    program,
+                                    &expected.ty,
+                                    &actual.ty,
+                                    value.span,
+                                    &mut diagnostics,
+                                );
+                            }
+                        }
+                    } else {
+                        if function.body.final_output_values.len() > 1
+                            && function.body.final_output_values.len() != outputs.outputs.len()
+                        {
+                            diagnostics.push(diagnostic(
+                                program,
+                                "B0004",
+                                "function output arity does not match its final output list",
+                                function.body.span,
+                            ));
+                        }
+                        for (value, output) in function
+                            .body
+                            .final_output_values
+                            .iter()
+                            .zip(&outputs.outputs)
+                        {
+                            let actual = expression_type_expected(
+                                &value.value,
+                                &output.ty,
+                                &scope,
+                                &visible_names,
+                                &folded_names,
+                                program,
+                                &mut diagnostics,
+                                false,
+                            );
+                            expect_type(program, &output.ty, &actual, value.span, &mut diagnostics);
+                        }
+                    }
+                } else if let Some(output) = outputs.outputs.first() {
+                    let actual = block_type_expected(
+                        &function.body,
+                        &output.ty,
+                        &scope,
+                        &visible_names,
+                        &folded_names,
+                        program,
+                        &mut diagnostics,
+                        false,
+                    );
+                    expect_type(
+                        program,
+                        &output.ty,
+                        &actual,
+                        function.body.span,
+                        &mut diagnostics,
+                    );
+                } else {
+                    let actual = block_type(
+                        &function.body,
+                        &scope,
+                        &visible_names,
+                        &folded_names,
+                        program,
+                        &mut diagnostics,
+                        false,
+                    );
+                    expect_type(
+                        program,
+                        &ScalarType::Unit,
+                        &actual,
+                        function.body.span,
+                        &mut diagnostics,
+                    );
+                }
                 if function.parameters.len() != parameters.len() {
                     diagnostics.push(diagnostic(
                         program,
@@ -9797,5 +10156,84 @@ u128 j = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
                 result.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn derives_local_pair_returns_in_source_order() {
+        let result = validate_text(
+            "%%start\n(i32, bool)() pair = fn { i32 local = 1; local, true };\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Function(function) = &result.program.items[0] else {
+            panic!("pair function")
+        };
+        assert_eq!(function.body.final_output_values.len(), 2);
+        assert_eq!(function.body.final_output_values[0].position, 0);
+        assert_eq!(function.body.final_output_values[0].ty, ScalarType::I32);
+        assert_eq!(function.body.final_output_values[1].position, 1);
+        assert_eq!(function.body.final_output_values[1].ty, ScalarType::Bool);
+        assert!(matches!(
+            &function.body.final_output_values[0].value,
+            ScalarExpression::Name { ref name, .. } if name == "local"
+        ));
+        assert!(matches!(
+            &function.body.final_output_values[1].value,
+            ScalarExpression::Boolean { value: true, .. }
+        ));
+    }
+
+    #[test]
+    fn derives_conditional_output_lists_by_position() {
+        let result = validate_text(
+            "%%start\n(i32, bool)() pair = fn { if (true) { 1, true } else { 2, false } };\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Function(function) = &result.program.items[0] else {
+            panic!("conditional pair function")
+        };
+        assert_eq!(function.body.final_output_values.len(), 2);
+        assert_eq!(function.body.final_output_values[0].ty, ScalarType::I32);
+        assert_eq!(function.body.final_output_values[1].ty, ScalarType::Bool);
+        assert!(matches!(
+            &function.body.final_output_values[0].value,
+            ScalarExpression::If { .. }
+        ));
+    }
+
+    #[test]
+    fn reports_final_output_list_type_and_arity_diagnostics() {
+        let wrong_type = validate_text("%%start\n(i32, bool)() pair = fn { true, 1 };\n%%end");
+        assert!(wrong_type
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"));
+
+        let wrong_arity =
+            validate_text("%%start\n(i32, bool)() pair = fn { 1, true, false };\n%%end");
+        assert!(wrong_arity.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0004"
+                && diagnostic.message
+                    == "function output arity does not match its final output list"
+        }));
+    }
+
+    #[test]
+    fn preserves_final_output_expression_spans() {
+        let text = "%%start\n(i32, bool)() pair = fn { 12, false };\n%%end";
+        let result = validate_text(text);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Function(function) = &result.program.items[0] else {
+            panic!("pair function")
+        };
+        let first_start = text.find("12").expect("first output") as u32;
+        let second_start = text.find("false").expect("second output") as u32;
+        assert_eq!(
+            function.body.final_output_values[0].span,
+            ByteSpan::new(first_start, first_start + 2)
+        );
+        assert_eq!(
+            function.body.final_output_values[1].span,
+            ByteSpan::new(second_start, second_start + 5)
+        );
     }
 }
