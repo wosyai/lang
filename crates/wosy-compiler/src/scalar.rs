@@ -1100,16 +1100,32 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         let final_start =
                             function.body.items.len() - function.body.final_output_values.len();
                         for item in &function.body.items[..final_start] {
-                            let _ = block_item_type_in_module(
-                                item,
-                                &mut scope,
-                                &mut visible_names,
-                                &mut folded_names,
-                                module,
-                                &project.modules,
-                                &mut diagnostics,
-                                false,
-                            );
+                            let _ = match item {
+                                ScalarBlockItem::Expression(
+                                    expression @ (ScalarExpression::If { .. }
+                                    | ScalarExpression::UnitIf { .. }),
+                                ) => expression_type_in_module_expected(
+                                    expression,
+                                    Some(&ScalarType::Unit),
+                                    &scope,
+                                    &visible_names,
+                                    &folded_names,
+                                    module,
+                                    &project.modules,
+                                    &mut diagnostics,
+                                    false,
+                                ),
+                                _ => block_item_type_in_module(
+                                    item,
+                                    &mut scope,
+                                    &mut visible_names,
+                                    &mut folded_names,
+                                    module,
+                                    &project.modules,
+                                    &mut diagnostics,
+                                    false,
+                                ),
+                            };
                         }
                         if function.body.final_output_values.len() == 1
                             && matches!(
@@ -5822,15 +5838,30 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     let final_start =
                         function.body.items.len() - function.body.final_output_values.len();
                     for item in &function.body.items[..final_start] {
-                        let _ = block_item_type(
-                            item,
-                            &mut scope,
-                            &mut visible_names,
-                            &mut folded_names,
-                            program,
-                            &mut diagnostics,
-                            false,
-                        );
+                        let _ = match item {
+                            ScalarBlockItem::Expression(
+                                expression @ (ScalarExpression::If { .. }
+                                | ScalarExpression::UnitIf { .. }),
+                            ) => expression_type_expected(
+                                expression,
+                                &ScalarType::Unit,
+                                &scope,
+                                &visible_names,
+                                &folded_names,
+                                program,
+                                &mut diagnostics,
+                                false,
+                            ),
+                            _ => block_item_type(
+                                item,
+                                &mut scope,
+                                &mut visible_names,
+                                &mut folded_names,
+                                program,
+                                &mut diagnostics,
+                                false,
+                            ),
+                        };
                     }
                     if function.body.final_output_values.len() == 1
                         && matches!(
@@ -10408,6 +10439,21 @@ u128 j = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
                 && diagnostic.message
                     == "function output arity does not match its final output list"
         }));
+    }
+
+    #[test]
+    fn validates_control_flow_prefix_before_final_output_list_as_unit() {
+        let text = "%%start\n(i32, bool)() pair = fn { if (true) { 1; } else { 2; } while (false) { 3; } 7, true };\n%%end";
+        let result = validate_text(text);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let source = source();
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
     }
 
     #[test]
