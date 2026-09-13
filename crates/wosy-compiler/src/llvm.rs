@@ -375,8 +375,17 @@ impl LlvmPartition {
             let mut serialized = String::new();
             serialized.push_str(&module_directives);
             serialized.push_str("\n\n");
-            for line in text.lines().filter(|line| line.starts_with("declare ")) {
+            for declaration in &self.declarations {
+                let line = text
+                    .lines()
+                    .find(|line| {
+                        line.starts_with("declare ")
+                            && line.contains(&format!("@{}(", declaration.name))
+                    })
+                    .expect("LLVM extern declaration is present in module text");
                 serialized.push_str(line);
+                write!(serialized, " #{}", declaration.attributes[0].group,)
+                    .expect("writing to a String cannot fail");
                 serialized.push('\n');
             }
             serialized.push('\n');
@@ -475,7 +484,8 @@ fn finish_partition<'ctx>(
         .collect();
     let declarations = externs
         .iter()
-        .filter_map(|extern_identity| {
+        .enumerate()
+        .filter_map(|(group, extern_identity)| {
             let function = functions.get(&extern_identity.internal_name)?;
             let ScalarType::Callable {
                 outputs,
@@ -501,7 +511,7 @@ fn finish_partition<'ctx>(
                 result: value_type(&result).ok()?,
                 parameters,
                 attributes: vec![LlvmFunctionAttributes {
-                    group: 0,
+                    group: group as u32,
                     wasm_import_module: extern_identity.import_module.clone(),
                     wasm_import_name: extern_identity.import_name.clone(),
                 }],
@@ -3367,10 +3377,61 @@ mod tests {
     use super::emit_scalar_project_llvm;
     use super::project_function_name;
     use super::project_global_name;
+    use super::{LlvmFunction, LlvmFunctionAttributes, LlvmPartition, LlvmValueType};
     use crate::{
         derive_scalar_program, parse_source, validate_scalar_project, ScalarModule, ScalarProject,
     };
     use wosy_syntax::SourceIdentity;
+
+    #[test]
+    fn serializes_each_extern_with_its_wasm_import_attribute_group() {
+        let partition = LlvmPartition {
+            module_name: "test".into(),
+            declarations: vec![
+                LlvmFunction {
+                    name: "first".into(),
+                    result: LlvmValueType::I32,
+                    parameters: Vec::new(),
+                    attributes: vec![LlvmFunctionAttributes {
+                        group: 3,
+                        wasm_import_module: "one".into(),
+                        wasm_import_name: "first_import".into(),
+                    }],
+                    body: String::new(),
+                },
+                LlvmFunction {
+                    name: "second".into(),
+                    result: LlvmValueType::Void,
+                    parameters: Vec::new(),
+                    attributes: vec![LlvmFunctionAttributes {
+                        group: 7,
+                        wasm_import_module: "two".into(),
+                        wasm_import_name: "second_import".into(),
+                    }],
+                    body: String::new(),
+                },
+            ],
+            functions: Vec::new(),
+            text: "; ModuleID = 'test'\nsource_filename = \"test\"\n\ndeclare i32 @first()\ndeclare void @second()\n".into(),
+        };
+
+        let text = partition.to_text();
+
+        assert!(text.contains("declare i32 @first() #3"), "{text}");
+        assert!(text.contains("declare void @second() #7"), "{text}");
+        assert!(
+            text.contains(
+                "attributes #3 = { \"wasm-import-module\"=\"one\" \"wasm-import-name\"=\"first_import\" }"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "attributes #7 = { \"wasm-import-module\"=\"two\" \"wasm-import-name\"=\"second_import\" }"
+            ),
+            "{text}"
+        );
+    }
 
     #[test]
     fn emits_typed_scalar_calls_and_verified_module() {
@@ -3674,6 +3735,21 @@ mod tests {
         let text = partition.to_text();
         for declaration in &partition.declarations {
             assert!(text.contains(&format!("call i32 @{}()", declaration.name)));
+            let attributes = &declaration.attributes[0];
+            assert!(
+                text.contains(&format!(
+                    "declare i32 @{}() #{}",
+                    declaration.name, attributes.group
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "attributes #{} = {{ \"wasm-import-module\"=\"{}\" \"wasm-import-name\"=\"{}\" }}",
+                    attributes.group, attributes.wasm_import_module, attributes.wasm_import_name
+                )),
+                "{text}"
+            );
         }
     }
 
