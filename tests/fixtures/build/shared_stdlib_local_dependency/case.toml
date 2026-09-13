@@ -1,0 +1,15 @@
+shared_stdlib = true
+
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+source_observations = [
+    { package = "app", path = "src/main.w" },
+    { package = "std", path = "src/bootstrap.w" },
+]

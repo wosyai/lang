@@ -17,12 +17,12 @@ fn main() -> Result<(), String> {
     }
     cases.sort();
     for case in cases {
-        run_case(&case)?;
+        run_case(&case, &root)?;
     }
     Ok(())
 }
 
-fn run_case(case: &Path) -> Result<(), String> {
+fn run_case(case: &Path, root: &Path) -> Result<(), String> {
     let document = fs::read_to_string(case.join("case.toml"))
         .map_err(|error| format!("{}: {error}", case.display()))?
         .parse::<DocumentMut>()
@@ -33,9 +33,28 @@ fn run_case(case: &Path) -> Result<(), String> {
         case.file_name().expect("fixture name").to_string_lossy()
     ));
     copy_tree(&case.join("project"), &temporary)?;
+    if document
+        .get("shared_stdlib")
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_bool())
+        .is_some_and(|enabled| enabled)
+    {
+        let repository_root = root.join("../..");
+        let stdlib = fs::canonicalize(repository_root.join("stdlib"))
+            .map_err(|error| error.to_string())?;
+        std::os::unix::fs::symlink(&stdlib, temporary.join("stdlib"))
+            .map_err(|error| error.to_string())?;
+    }
     let binary = env::var("WOSY_BIN")
         .map(PathBuf::from)
         .map_err(|_| "WOSY_BIN must point to the wosy executable".to_owned())?;
+    let binary = if binary.is_absolute() {
+        binary
+    } else {
+        env::current_dir()
+            .map_err(|error| error.to_string())?
+            .join(binary)
+    };
     let steps = document
         .get("steps")
         .and_then(Item::as_array_of_tables)
@@ -216,9 +235,66 @@ fn run_case(case: &Path) -> Result<(), String> {
                 }
             }
         }
+        assert_source_observations(assertion, &temporary, &case)?;
     }
     fs::remove_dir_all(&temporary).map_err(|error| error.to_string())?;
     println!("passed {}", case.display());
+    Ok(())
+}
+
+fn assert_source_observations(
+    assertion: &toml_edit::Table,
+    temporary: &Path,
+    case: &Path,
+) -> Result<(), String> {
+    let Some(expected) = assertion
+        .get("source_observations")
+        .and_then(Item::as_array_of_tables)
+    else {
+        return Ok(());
+    };
+    let manifest = fs::read(temporary.join(
+        ".wosy/artifacts/app/dev/main/artifact-manifest.json",
+    ))
+    .map_err(|error| error.to_string())?;
+    let manifest = serde_json::from_slice::<serde_json::Value>(&manifest)
+        .map_err(|error| format!("{}: manifest is not JSON: {error}", case.display()))?;
+    let observations = manifest
+        .get("source_observations")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{}: source observations are missing", case.display()))?;
+    if observations.len() != expected.len() {
+        return Err(format!(
+            "{}: source observation count differs",
+            case.display()
+        ));
+    }
+    for (index, expected) in expected.iter().enumerate() {
+        let observed = observations
+            .get(index)
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| format!("{}: source observation is not an object", case.display()))?;
+        let source = observed
+            .get("source")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| format!("{}: source identity is missing", case.display()))?;
+        for (field, item) in expected {
+            let value = item
+                .as_value()
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "source observation fields must be strings".to_owned())?;
+            let observed_value = source
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("{}: source field {field} is missing", case.display()))?;
+            if observed_value != value {
+                return Err(format!(
+                    "{}: source observation {index} has unexpected {field}",
+                    case.display()
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
