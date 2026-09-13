@@ -581,6 +581,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::parameters => SyntaxKind::Parameters,
         Rule::block => SyntaxKind::Block,
         Rule::block_item => SyntaxKind::BlockItem,
+        Rule::unsafe_block_item => SyntaxKind::Expression,
         Rule::if_block_item => SyntaxKind::Expression,
         Rule::final_output_list => SyntaxKind::FinalOutputList,
         Rule::expression => SyntaxKind::Expression,
@@ -1125,23 +1126,45 @@ mod tests {
 
     #[test]
     fn unsafe_helper_preserves_unterminated_final_expression() {
-        let text = "%%start\nunsafe i32(i32, *?Iovec, *?i32) fd_write_once = fn(\n\tdescriptor,\n\tiovec_address,\n\tbyte_count_address\n) {\n\twasi.fd_write(descriptor, iovec_address, 1, byte_count_address)\n};\n%%end";
+        let text = "%%start\ni32(i32, *?Iovec, *?u32) fd_write_once = fn(\n\tdescriptor,\n\tiovec_address,\n\tbyte_count_address\n) {\n\tunsafe {\n\t\twasi.fd_write(descriptor, iovec_address, 1, byte_count_address)\n\t}\n};\n%%end";
         let result = parse(identity(), text.into(), &[]);
         assert!(result.is_valid(), "{:?}", result.errors);
         assert_eq!(result.reconstruct(), text);
-        assert!(result
+        let block = result
             .root
             .descendants()
-            .any(|node| node.kind() == SyntaxKind::Unsafe));
-        let final_list = result
-            .root
-            .descendants()
-            .find(|node| node.kind() == SyntaxKind::FinalOutputList)
-            .expect("unsafe helper final output list");
-        let output_list = final_list
+            .find(|node| node.kind() == SyntaxKind::Block)
+            .expect("unsafe helper block");
+        assert_eq!(
+            block.children().map(|node| node.kind()).collect::<Vec<_>>(),
+            vec![SyntaxKind::BlockItem]
+        );
+        let block_item = block.children().next().expect("unsafe helper block item");
+        let expression = block_item
             .children()
-            .find(|node| node.kind() == SyntaxKind::OutputList)
-            .expect("unsafe helper output list");
+            .find(|node| node.kind() == SyntaxKind::Expression)
+            .expect("unsafe block item expression");
+        let unsafe_node = expression
+            .children()
+            .find(|node| node.kind() == SyntaxKind::Unsafe)
+            .expect("nested unsafe expression");
+        let unsafe_start = text.find("unsafe {").expect("unsafe block") as u32;
+        let unsafe_end = text.find("\n\t}\n};").expect("unsafe close") as u32 + 4;
+        assert_eq!(
+            byte_span(&block_item),
+            ByteSpan::new(unsafe_start, unsafe_end)
+        );
+        assert_eq!(byte_span(&expression), byte_span(&unsafe_node));
+        let output_list = unsafe_node
+            .children()
+            .find_map(|node| {
+                (node.kind() == SyntaxKind::Block).then(|| {
+                    node.descendants()
+                        .find(|descendant| descendant.kind() == SyntaxKind::OutputList)
+                        .expect("unsafe helper output list")
+                })
+            })
+            .expect("unsafe helper unsafe block");
         assert_eq!(
             output_list
                 .children()
