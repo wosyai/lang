@@ -2523,6 +2523,144 @@ fn type_core_cast(
     }
 }
 
+fn type_core_int_conversion_in_module(
+    operation: &str,
+    type_arguments: &[ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if type_arguments.len() != 1 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            &format!("core.{operation} requires one destination type argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let (source, destination) = match operation {
+        "int_trunc" => (ScalarType::U64, ScalarType::U32),
+        "int_extend" => (ScalarType::U32, ScalarType::U64),
+        _ => unreachable!(),
+    };
+    if type_arguments[0].ty != destination {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            &format!("core.{operation} has an invalid integer destination type"),
+            type_arguments[0].span,
+        ));
+        return ScalarType::Error;
+    }
+    if arguments.len() != 1 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            &format!("core.{operation} requires one value argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let actual = expression_type_in_module_expected(
+        &arguments[0],
+        Some(&source),
+        scope,
+        visible_names,
+        folded_names,
+        module,
+        modules,
+        diagnostics,
+        unsafe_context,
+    );
+    expect_module_type(
+        module,
+        &source,
+        &actual,
+        expression_span(&arguments[0]),
+        diagnostics,
+    );
+    if is_error_type(&actual) {
+        ScalarType::Error
+    } else {
+        destination
+    }
+}
+
+fn type_core_int_conversion(
+    operation: &str,
+    type_arguments: &[ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if type_arguments.len() != 1 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            &format!("core.{operation} requires one destination type argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let (source, destination) = match operation {
+        "int_trunc" => (ScalarType::U64, ScalarType::U32),
+        "int_extend" => (ScalarType::U32, ScalarType::U64),
+        _ => unreachable!(),
+    };
+    if type_arguments[0].ty != destination {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            &format!("core.{operation} has an invalid integer destination type"),
+            type_arguments[0].span,
+        ));
+        return ScalarType::Error;
+    }
+    if arguments.len() != 1 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            &format!("core.{operation} requires one value argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let actual = expression_type_expected(
+        &arguments[0],
+        &source,
+        scope,
+        visible_names,
+        folded_names,
+        program,
+        diagnostics,
+        unsafe_context,
+    );
+    expect_type(
+        program,
+        &source,
+        &actual,
+        expression_span(&arguments[0]),
+        diagnostics,
+    );
+    if is_error_type(&actual) {
+        ScalarType::Error
+    } else {
+        destination
+    }
+}
+
 fn validate_exact_u32_source_in_module(
     expression: &ScalarExpression,
     module: &ScalarModule,
@@ -2859,6 +2997,23 @@ fn expression_type_in_module(
             }
             if receiver.as_deref() == Some("core") && name == "cast" {
                 return type_core_cast_in_module(
+                    type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
+            if receiver.as_deref() == Some("core")
+                && matches!(name.as_str(), "int_trunc" | "int_extend")
+            {
+                return type_core_int_conversion_in_module(
+                    name,
                     type_arguments,
                     arguments,
                     *span,
@@ -6624,6 +6779,22 @@ fn expression_type(
                     unsafe_context,
                 );
             }
+            if receiver.as_deref() == Some("core")
+                && matches!(name.as_str(), "int_trunc" | "int_extend")
+            {
+                return type_core_int_conversion(
+                    name,
+                    type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
             let lookup_name = receiver
                 .as_ref()
                 .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"));
@@ -8569,6 +8740,28 @@ bool integer_inversion = !1;
             panic!("cast binding");
         };
         assert_eq!(binding.declared_type, ScalarType::U32);
+    }
+
+    #[test]
+    fn validates_integer_conversions_in_single_file_and_project() {
+        let text = "%%start\nu64 source = 42;\nu32 narrow = core.int_trunc<u32>(source);\nu64 wide = core.int_extend<u64>(narrow);\n%%end";
+        let single = validate_text(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+
+        let invalid = validate_text(
+            "%%start\nu32 source = 1;\nu64 value = core.int_trunc<u64>(source);\n%%end",
+        );
+        assert!(invalid
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"));
     }
 
     #[test]

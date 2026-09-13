@@ -2037,6 +2037,11 @@ fn emit_expression<'ctx, 'module>(
             if receiver.as_deref() == Some("core") && name == "cast" {
                 return emit_cast(context, state, type_arguments, arguments);
             }
+            if receiver.as_deref() == Some("core")
+                && matches!(name.as_str(), "int_trunc" | "int_extend")
+            {
+                return emit_int_conversion(context, state, name, type_arguments, arguments);
+            }
             emit_call(context, state, receiver.as_deref(), name, arguments)
         }
         ScalarExpression::If {
@@ -2149,6 +2154,19 @@ fn emit_project_expression<'ctx, 'module>(
                     modules,
                 )?;
                 return Ok(values);
+            }
+            if receiver.as_deref() == Some("core")
+                && matches!(name.as_str(), "int_trunc" | "int_extend")
+            {
+                return emit_int_conversion_project(
+                    context,
+                    state,
+                    name,
+                    type_arguments,
+                    arguments,
+                    module,
+                    modules,
+                );
             }
             let target = receiver.as_ref().map_or(module, |binding| {
                 module
@@ -2421,6 +2439,43 @@ fn emit_cast<'ctx, 'module>(
     ))
 }
 
+fn emit_int_conversion<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    operation: &str,
+    type_arguments: &[crate::scalar::ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+) -> Result<EmitValue<'ctx>, String> {
+    let [type_argument] = type_arguments else {
+        return Err(format!("core.{operation} has invalid type argument arity"));
+    };
+    let [value] = arguments else {
+        return Err(format!("core.{operation} has invalid argument arity"));
+    };
+    let (source, destination) = match operation {
+        "int_trunc" if type_argument.ty == ScalarType::U32 => (ScalarType::U64, ScalarType::U32),
+        "int_extend" if type_argument.ty == ScalarType::U64 => (ScalarType::U32, ScalarType::U64),
+        _ => {
+            return Err(format!(
+                "core.{operation} has an invalid integer conversion"
+            ))
+        }
+    };
+    let value =
+        take_basic(emit_typed_expression(context, state, value, &source)?)?.into_int_value();
+    let converted = if operation == "int_trunc" {
+        state
+            .builder
+            .build_int_truncate(value, integer_type(context, &destination)?, "int_trunc")
+    } else {
+        state
+            .builder
+            .build_int_z_extend(value, integer_type(context, &destination)?, "int_extend")
+    }
+    .map_err(builder_error)?;
+    Ok(EmitValue::Basic(converted.into()))
+}
+
 fn emit_cast_project_values<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -2449,6 +2504,47 @@ fn emit_cast_project_values<'ctx, 'module>(
             .map_err(builder_error)?
             .into(),
     ))
+}
+
+fn emit_int_conversion_project<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    operation: &str,
+    type_arguments: &[crate::scalar::ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    let [type_argument] = type_arguments else {
+        return Err(format!("core.{operation} has invalid type argument arity"));
+    };
+    let [value] = arguments else {
+        return Err(format!("core.{operation} has invalid argument arity"));
+    };
+    let (source, destination) = match operation {
+        "int_trunc" if type_argument.ty == ScalarType::U32 => (ScalarType::U64, ScalarType::U32),
+        "int_extend" if type_argument.ty == ScalarType::U64 => (ScalarType::U32, ScalarType::U64),
+        _ => {
+            return Err(format!(
+                "core.{operation} has an invalid integer conversion"
+            ))
+        }
+    };
+    let value = take_basic(emit_project_typed_expression(
+        context, state, value, &source, module, modules,
+    )?)?
+    .into_int_value();
+    let converted = if operation == "int_trunc" {
+        state
+            .builder
+            .build_int_truncate(value, integer_type(context, &destination)?, "int_trunc")
+    } else {
+        state
+            .builder
+            .build_int_z_extend(value, integer_type(context, &destination)?, "int_extend")
+    }
+    .map_err(builder_error)?;
+    Ok(EmitValue::Basic(converted.into()))
 }
 
 fn emit_call_values<'ctx, 'module>(
@@ -3295,6 +3391,48 @@ mod tests {
         assert!(text.contains("call i1 @flag"));
         assert!(text.contains("call void @touch"));
         assert!(text.contains("call i32 @count"));
+    }
+
+    #[test]
+    fn emits_integer_conversions_for_single_file_and_project() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let program = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\nu64 source = 42;\nu32 narrow = core.int_trunc<u32>(source);\nu64 wide = core.int_extend<u64>(narrow);\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        let single = emit_scalar_llvm(&program)
+            .expect("single-file conversion LLVM")
+            .to_text();
+        assert!(single.contains("trunc i64"), "{single}");
+        assert!(single.contains("zext i32"), "{single}");
+
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(
+                source.clone(),
+                program.program.items,
+                Vec::new(),
+            )],
+            vec![source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let project = emit_scalar_project_llvm(&validation)
+            .expect("project conversion LLVM")
+            .to_text();
+        assert!(project.contains("trunc i64"), "{project}");
+        assert!(project.contains("zext i32"), "{project}");
     }
 
     #[test]
