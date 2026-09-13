@@ -1678,6 +1678,57 @@ fn call_output_sequence(
     Some(outputs.clone())
 }
 
+fn scalar_call_result(outputs: &ScalarOutputSequence) -> ScalarType {
+    outputs
+        .outputs
+        .first()
+        .map_or(ScalarType::Unit, |output| output.ty.clone())
+}
+
+fn scalar_call_result_in_module(outputs: &ScalarOutputSequence) -> ScalarType {
+    outputs
+        .outputs
+        .first()
+        .map_or(ScalarType::Unit, |output| output.ty.clone())
+}
+
+fn reject_multi_output_statement_in_module(
+    expression: &ScalarExpression,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    if let Some(outputs) = call_output_sequence_in_module(expression, scope, module, modules) {
+        if outputs.outputs.len() > 1 {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "multi-output call requires output receivers",
+                outputs.span,
+            ));
+        }
+    }
+}
+
+fn reject_multi_output_statement(
+    expression: &ScalarExpression,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    if let Some(outputs) = call_output_sequence(expression, scope, program) {
+        if outputs.outputs.len() > 1 {
+            diagnostics.push(diagnostic(
+                program,
+                "B0003",
+                "multi-output call requires output receivers",
+                outputs.span,
+            ));
+        }
+    }
+}
+
 fn expression_span(expression: &ScalarExpression) -> ByteSpan {
     match expression {
         ScalarExpression::Name { span, .. }
@@ -1984,16 +2035,25 @@ fn block_item_type_in_module(
             }
             ScalarType::Unit
         }
-        ScalarBlockItem::Expression(expression) => expression_type_in_module(
-            expression,
-            scope,
-            visible_names,
-            folded_names,
-            module,
-            modules,
-            diagnostics,
-            unsafe_context,
-        ),
+        ScalarBlockItem::Expression(expression) => {
+            reject_multi_output_statement_in_module(
+                expression,
+                scope,
+                module,
+                modules,
+                diagnostics,
+            );
+            expression_type_in_module(
+                expression,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            )
+        }
         ScalarBlockItem::Assignment(assignment) => assignment_type_in_module(
             assignment,
             scope,
@@ -2778,7 +2838,7 @@ fn expression_type_in_module(
             if error_argument {
                 ScalarType::Error
             } else {
-                outputs.outputs[0].ty.clone()
+                scalar_call_result_in_module(outputs)
             }
         }
         ScalarExpression::If {
@@ -3841,11 +3901,13 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
     let value = outputs[0].clone();
     let name = receivers[0].name.clone();
     let output_sequence = ScalarOutputSequence {
-        outputs: receivers
+        outputs: outputs
             .iter()
-            .zip(outputs.iter())
-            .map(|(receiver, value)| ScalarOutput {
-                ty: receiver.ty.clone(),
+            .enumerate()
+            .map(|(index, value)| ScalarOutput {
+                ty: receivers
+                    .get(index)
+                    .map_or(ScalarType::Error, |receiver| receiver.ty.clone()),
                 span: span_of(value),
             })
             .collect(),
@@ -5754,15 +5816,18 @@ fn block_item_type(
             }
             ScalarType::Unit
         }
-        ScalarBlockItem::Expression(expression) => expression_type(
-            expression,
-            scope,
-            visible_names,
-            folded_names,
-            program,
-            diagnostics,
-            unsafe_context,
-        ),
+        ScalarBlockItem::Expression(expression) => {
+            reject_multi_output_statement(expression, scope, program, diagnostics);
+            expression_type(
+                expression,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            )
+        }
         ScalarBlockItem::Assignment(assignment) => assignment_type(
             assignment,
             scope,
@@ -6231,7 +6296,7 @@ fn expression_type(
             if error_argument {
                 ScalarType::Error
             } else {
-                outputs.outputs[0].ty.clone()
+                scalar_call_result(&outputs)
             }
         }
         ScalarExpression::If {
@@ -7178,6 +7243,26 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "B0001"));
+
+        let multiple = validate_text(
+            "%%start\nenv = extern wasm \"helper\" { (i32, bool)() read; };\ni32 first, bool second = env.read<u32>();\n%%end",
+        );
+        assert!(
+            multiple.diagnostics.is_empty(),
+            "{:?}",
+            multiple.diagnostics
+        );
+        let ScalarItem::Binding(binding) = &multiple.program.items[1] else {
+            panic!("generic extern binding")
+        };
+        assert_eq!(binding.receivers.len(), 2);
+        let ScalarItem::Extern(extern_decl) = &multiple.program.items[0] else {
+            panic!("generic extern item")
+        };
+        let ScalarType::Callable { outputs, .. } = &extern_decl.functions[0].signature else {
+            panic!("generic extern signature")
+        };
+        assert_eq!(outputs.outputs.len(), 2);
     }
 
     #[test]
@@ -8438,6 +8523,48 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
     }
 
     #[test]
+    fn validates_two_output_namespace_call_and_receiver_order() {
+        let math_source = module_source("src/math.w");
+        let math = module_from_text(
+            math_source.clone(),
+            "%%start\n(i32, bool)() pair = fn { 1 };\n%%end",
+        );
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nmath = namespace app \"src/math.w\";\ni32 first, bool second = math.pair();\n%%end",
+        );
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let project = ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source.clone(),
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "math".to_owned(),
+                        target: math_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(math_source.clone(), math.items, Vec::new()),
+            ],
+            vec![main_source.clone(), math_source],
+        );
+        let result = validate_scalar_project(project);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(binding) = &result.project.modules[0].items[1] else {
+            panic!("namespace binding")
+        };
+        assert_eq!(binding.output_sequence.outputs.len(), 1);
+        assert!(binding.output_sequence.outputs[0].span.start > 0);
+        assert_eq!(binding.receivers[0].ty, ScalarType::I32);
+        assert_eq!(binding.receivers[1].ty, ScalarType::Bool);
+    }
+
+    #[test]
     fn resolves_direct_root_extern_with_local_namespace_present() {
         let local_source = module_source("src/local.w");
         let local = module_from_text(local_source.clone(), "%%start\ni32 value = 7;\n%%end");
@@ -8868,9 +8995,17 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
     #[test]
     fn validates_multiple_output_calls_and_output_arity() {
         let valid = validate_text(
-            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first, u64 second = pair();\n%%end",
+            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first, u64 second = pair<u32>();\n%%end",
         );
         assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+        let ScalarItem::Binding(binding) = &valid.program.items[1] else {
+            panic!("multi-output binding")
+        };
+        assert_eq!(binding.output_sequence.outputs.len(), 1);
+        assert_eq!(
+            binding.output_sequence.outputs[0].span,
+            ByteSpan::new(62, 73)
+        );
 
         let wrong_type = validate_text(
             "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first, i32 second = pair();\n%%end",
@@ -8885,6 +9020,13 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message == "call has more outputs than receivers"));
+
+        let scalar = validate_text("%%start\n(i32, u64)() pair = fn { 1 };\npair();\n%%end");
+        let output_span = ByteSpan::new(8, 20);
+        assert!(scalar.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "multi-output call requires output receivers"
+                && diagnostic.labels[0].span.range == output_span
+        }));
     }
 
     #[test]
