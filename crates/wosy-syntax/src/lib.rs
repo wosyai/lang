@@ -32,6 +32,7 @@ pub enum SyntaxKind {
     Parameters,
     Block,
     BlockItem,
+    FinalOutputList,
     Expression,
     Call,
     IfExpr,
@@ -102,44 +103,45 @@ impl Language for WosyLanguage {
             19 => SyntaxKind::Parameters,
             20 => SyntaxKind::Block,
             21 => SyntaxKind::BlockItem,
-            22 => SyntaxKind::Expression,
-            23 => SyntaxKind::Call,
-            24 => SyntaxKind::IfExpr,
-            25 => SyntaxKind::Parenthesized,
-            26 => SyntaxKind::Boolean,
-            27 => SyntaxKind::Binary,
-            28 => SyntaxKind::Operator,
-            29 => SyntaxKind::Integer,
-            30 => SyntaxKind::Float,
-            31 => SyntaxKind::Char,
-            32 => SyntaxKind::String,
-            33 => SyntaxKind::Punctuation,
-            34 => SyntaxKind::NamespaceDecl,
-            35 => SyntaxKind::QualifiedCall,
-            36 => SyntaxKind::QualifiedMember,
-            37 => SyntaxKind::AssignmentTarget,
-            38 => SyntaxKind::LocalBinding,
-            39 => SyntaxKind::While,
-            40 => SyntaxKind::Assignment,
-            41 => SyntaxKind::TopLevelItem,
-            42 => SyntaxKind::StructDecl,
-            43 => SyntaxKind::StructField,
-            44 => SyntaxKind::CallableOutput,
-            45 => SyntaxKind::ReceiverList,
-            46 => SyntaxKind::Receiver,
-            47 => SyntaxKind::OutputList,
-            48 => SyntaxKind::AssignmentTargets,
-            49 => SyntaxKind::StructLiteral,
-            50 => SyntaxKind::StructLiteralField,
-            51 => SyntaxKind::FieldAccess,
-            52 => SyntaxKind::DereferencedField,
-            53 => SyntaxKind::Dereference,
-            54 => SyntaxKind::RawAddress,
-            55 => SyntaxKind::GenericTypeArguments,
-            56 => SyntaxKind::GenericTypeArgument,
-            57 => SyntaxKind::QualifiedType,
-            58 => SyntaxKind::UnitIfExpr,
-            59 => SyntaxKind::Unary,
+            22 => SyntaxKind::FinalOutputList,
+            23 => SyntaxKind::Expression,
+            24 => SyntaxKind::Call,
+            25 => SyntaxKind::IfExpr,
+            26 => SyntaxKind::Parenthesized,
+            27 => SyntaxKind::Boolean,
+            28 => SyntaxKind::Binary,
+            29 => SyntaxKind::Operator,
+            30 => SyntaxKind::Integer,
+            31 => SyntaxKind::Float,
+            32 => SyntaxKind::Char,
+            33 => SyntaxKind::String,
+            34 => SyntaxKind::Punctuation,
+            35 => SyntaxKind::NamespaceDecl,
+            36 => SyntaxKind::QualifiedCall,
+            37 => SyntaxKind::QualifiedMember,
+            38 => SyntaxKind::AssignmentTarget,
+            39 => SyntaxKind::LocalBinding,
+            40 => SyntaxKind::While,
+            41 => SyntaxKind::Assignment,
+            42 => SyntaxKind::TopLevelItem,
+            43 => SyntaxKind::StructDecl,
+            44 => SyntaxKind::StructField,
+            45 => SyntaxKind::CallableOutput,
+            46 => SyntaxKind::ReceiverList,
+            47 => SyntaxKind::Receiver,
+            48 => SyntaxKind::OutputList,
+            49 => SyntaxKind::AssignmentTargets,
+            50 => SyntaxKind::StructLiteral,
+            51 => SyntaxKind::StructLiteralField,
+            52 => SyntaxKind::FieldAccess,
+            53 => SyntaxKind::DereferencedField,
+            54 => SyntaxKind::Dereference,
+            55 => SyntaxKind::RawAddress,
+            56 => SyntaxKind::GenericTypeArguments,
+            57 => SyntaxKind::GenericTypeArgument,
+            58 => SyntaxKind::QualifiedType,
+            59 => SyntaxKind::UnitIfExpr,
+            60 => SyntaxKind::Unary,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -579,6 +581,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::parameters => SyntaxKind::Parameters,
         Rule::block => SyntaxKind::Block,
         Rule::block_item => SyntaxKind::BlockItem,
+        Rule::final_output_list => SyntaxKind::FinalOutputList,
         Rule::expression => SyntaxKind::Expression,
         Rule::call => SyntaxKind::Call,
         Rule::qualified_call => SyntaxKind::QualifiedCall,
@@ -804,6 +807,7 @@ mod tests {
             SyntaxKind::Parameters,
             SyntaxKind::Block,
             SyntaxKind::Expression,
+            SyntaxKind::FinalOutputList,
             SyntaxKind::Call,
             SyntaxKind::QualifiedCall,
             SyntaxKind::Binary,
@@ -1224,6 +1228,86 @@ mod tests {
 
         let expression_statement = "%%start\nunit() main = fn {\n\tprint();\n};\n%%end";
         assert!(parse(identity(), expression_statement.into(), &[]).is_valid());
+    }
+
+    #[test]
+    fn final_output_list_preserves_order_and_spans() {
+        let text = "%%start\n(i32, i32)(i32) pair = fn(value) {\n\tprint(value);\n\tvalue, value + 1\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+
+        let final_list = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::FinalOutputList)
+            .expect("final output list");
+        let start = text.find("value, value + 1").expect("final list") as u32;
+        let end = text.find("\n};").expect("function close") as u32 + 1;
+        assert_eq!(byte_span(&final_list), ByteSpan::new(start, end));
+        let output_list = final_list
+            .children()
+            .find(|node| node.kind() == SyntaxKind::OutputList)
+            .expect("output list child");
+        assert_eq!(
+            output_list
+                .children()
+                .filter(|node| node.kind() == SyntaxKind::Expression)
+                .map(|node| node.text().to_string().trim().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["value", "value + 1"]
+        );
+        assert_eq!(
+            output_list
+                .children()
+                .filter(|node| node.kind() == SyntaxKind::Expression)
+                .map(|node| byte_span(&node))
+                .collect::<Vec<_>>(),
+            vec![
+                ByteSpan::new(start, start + 5),
+                ByteSpan::new(start + 7, end)
+            ]
+        );
+        assert_eq!(byte_span(&output_list), byte_span(&final_list));
+    }
+
+    #[test]
+    fn final_single_expression_and_terminated_items_keep_distinct_forms() {
+        let single = "%%start\ni32() one = fn {\n\t1\n};\n%%end";
+        let single_result = parse(identity(), single.into(), &[]);
+        assert!(single_result.is_valid(), "{:?}", single_result.errors);
+        assert_eq!(
+            single_result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::FinalOutputList)
+                .count(),
+            1
+        );
+
+        let terminated = "%%start\nunit() many = fn {\n\tprint();\n\tlog();\n};\n%%end";
+        let terminated_result = parse(identity(), terminated.into(), &[]);
+        assert!(
+            terminated_result.is_valid(),
+            "{:?}",
+            terminated_result.errors
+        );
+        assert_eq!(
+            terminated_result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::FinalOutputList)
+                .count(),
+            0
+        );
+        assert_eq!(
+            terminated_result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::BlockItem)
+                .count(),
+            2
+        );
     }
 
     #[test]

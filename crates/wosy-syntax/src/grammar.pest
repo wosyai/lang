@@ -29,8 +29,9 @@ unsafe_marker = { unsafe_keyword }
 unsafe_keyword = { "unsafe" }
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 parameters = { "(" ~ (identifier ~ ("," ~ identifier)*)? ~ ")" }
-block = { "{" ~ block_item* ~ "}" }
-block_item = { local_binding | while_expr | expression ~ ";"? }
+block = { "{" ~ block_item* ~ final_output_list? ~ "}" }
+block_item = { local_binding | while_expr | expression ~ ";" }
+final_output_list = { output_list }
 local_binding = { receiver_list ~ "=" ~ output_list ~ ";" }
 expression = { if_expr | unit_if_expr | unsafe_expr | assignment | logical_or }
 if_expr = { "if" ~ "(" ~ expression ~ ")" ~ block ~ "else" ~ block }
