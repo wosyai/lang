@@ -175,6 +175,12 @@ pub struct ScalarOutputValue {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarBindingOutputOrigin {
+    SingleExpression,
+    IndependentExpressions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarStructLiteral {
     pub fields: Vec<ScalarStructLiteralField>,
     pub span: ByteSpan,
@@ -406,6 +412,7 @@ pub struct ScalarBinding {
     pub receivers: Vec<ScalarOutputReceiver>,
     pub output_sequence: ScalarOutputSequence,
     pub output_values: Vec<ScalarOutputValue>,
+    pub output_origin: ScalarBindingOutputOrigin,
     pub span: ByteSpan,
 }
 
@@ -3903,7 +3910,7 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         .find(|child| child.kind() == SyntaxKind::OutputList)
         .expect("output list");
     let outputs = output_list
-        .descendants()
+        .children()
         .filter(|child| child.kind() == SyntaxKind::Expression)
         .map(|child| derive_expression(&child))
         .collect::<Vec<_>>();
@@ -3927,6 +3934,10 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
             },
         })
         .collect::<Vec<_>>();
+    let output_origin = match outputs.len() {
+        1 => ScalarBindingOutputOrigin::SingleExpression,
+        _ => ScalarBindingOutputOrigin::IndependentExpressions,
+    };
     let output_sequence = ScalarOutputSequence {
         outputs: receivers
             .iter()
@@ -3945,6 +3956,7 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         receivers,
         output_sequence,
         output_values,
+        output_origin,
         span: wosy_syntax::byte_span(node),
     }
 }
@@ -7281,6 +7293,10 @@ mod tests {
         let ScalarItem::Binding(binding) = &multiple.program.items[1] else {
             panic!("generic extern binding")
         };
+        assert_eq!(
+            binding.output_origin,
+            ScalarBindingOutputOrigin::SingleExpression
+        );
         assert_eq!(binding.receivers.len(), 2);
         assert_eq!(binding.output_sequence.outputs.len(), 2);
         assert_eq!(binding.output_sequence.outputs[0].ty, ScalarType::U64);
@@ -8205,6 +8221,10 @@ bool integer_inversion = !1;
         let ScalarItem::Binding(binding) = &result.program.items[1] else {
             panic!("generic binding");
         };
+        assert_eq!(
+            binding.output_origin,
+            ScalarBindingOutputOrigin::SingleExpression
+        );
         assert_eq!(binding.output_sequence.outputs.len(), 2);
         assert_eq!(binding.output_sequence.outputs[0].ty, ScalarType::U64);
         assert_eq!(binding.output_sequence.outputs[1].ty, ScalarType::Bool);
@@ -8615,6 +8635,10 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         let ScalarItem::Binding(binding) = &result.project.modules[0].items[1] else {
             panic!("namespace binding")
         };
+        assert_eq!(
+            binding.output_origin,
+            ScalarBindingOutputOrigin::SingleExpression
+        );
         assert_eq!(binding.output_sequence.outputs.len(), 2);
         let call_span = expression_span(&binding.value);
         assert_eq!(binding.output_sequence.outputs[0].ty, ScalarType::U64);
@@ -9068,6 +9092,10 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         let ScalarItem::Binding(binding) = &valid.program.items[1] else {
             panic!("multi-output binding")
         };
+        assert_eq!(
+            binding.output_origin,
+            ScalarBindingOutputOrigin::SingleExpression
+        );
         assert_eq!(binding.output_sequence.outputs.len(), 2);
         assert_eq!(binding.output_sequence.outputs[0].ty, ScalarType::U64);
         assert_eq!(binding.output_sequence.outputs[1].ty, ScalarType::Bool);
@@ -9123,6 +9151,10 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         let ScalarItem::Binding(binding) = &result.program.items[0] else {
             panic!("output binding");
         };
+        assert_eq!(
+            binding.output_origin,
+            ScalarBindingOutputOrigin::IndependentExpressions
+        );
         assert_eq!(binding.output_values[0].position, 0);
         assert_eq!(binding.output_values[1].position, 1);
         assert_ne!(
@@ -9140,11 +9172,45 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
     }
 
     #[test]
+    fn marks_equal_independent_output_expressions_independently() {
+        let result = validate_text("%%start\nu64 first, u64 second = 1, 1;\n%%end");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(binding) = &result.program.items[0] else {
+            panic!("output binding");
+        };
+        assert_eq!(
+            binding.output_origin,
+            ScalarBindingOutputOrigin::IndependentExpressions
+        );
+        assert!(matches!(
+            (
+                &binding.output_values[0].value,
+                &binding.output_values[1].value
+            ),
+            (
+                ScalarExpression::Integer { value: first, .. },
+                ScalarExpression::Integer { value: second, .. }
+            ) if first == second
+        ));
+        assert_ne!(
+            expression_span(&binding.output_values[0].value),
+            expression_span(&binding.output_values[1].value)
+        );
+    }
+
+    #[test]
     fn preserves_one_output_call_contexts_for_strict_integers_and_null() {
         let result = validate_text(
             "%%start\nu32(u32) identity = fn(value) { value };\nu32 number = identity(1);\nu32(*?u8) keep = fn(value) { if (value == null) { 1 } else { 1 } };\nu32 result = keep(null);\n%%end",
         );
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(binding) = &result.program.items[1] else {
+            panic!("one-output binding");
+        };
+        assert_eq!(
+            binding.output_origin,
+            ScalarBindingOutputOrigin::SingleExpression
+        );
     }
 
     #[test]
