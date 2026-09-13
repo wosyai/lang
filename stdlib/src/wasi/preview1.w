@@ -1,3 +1,4 @@
+%%start
 struct Iovec {
 	*?u8 data;
 	u32 length;
@@ -14,3 +15,4 @@ unsafe i32(i32, *?Iovec, *?i32) fd_write_once = fn(
 ) {
 	wasi.fd_write(descriptor, iovec_address, 1, byte_count_address)
 };
+%%end
