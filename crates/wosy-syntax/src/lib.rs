@@ -1159,7 +1159,7 @@ mod tests {
 
     #[test]
     fn accepts_lossless_wasi_fd_write_declaration_and_utf8_calls() {
-        let text = "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, utf8) fd_write; };\ni32 out = wasi.fd_write(1, \"Olá\\n\");\ni32 err = wasi.fd_write(2, \"erro\\n\");\n%%end";
+        let text = "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, i32) fd_write; };\ni32 out = wasi.fd_write(1, \"Olá\\n\");\ni32 err = wasi.fd_write(2, \"erro\\n\");\n%%end";
         let result = parse(identity(), text.into(), &[]);
         assert!(result.is_valid(), "{:?}", result.errors);
         assert_eq!(result.reconstruct(), text);
@@ -1289,7 +1289,7 @@ mod tests {
 
     #[test]
     fn typed_multiple_output_receivers_are_structural_and_lossless() {
-        let text = "%%start\nunsafe {\n\t*?u8 bytes, u64 length = core.utf8_view(text);\n};\n%%end";
+        let text = "%%start\nunsafe {\n\ti32 first, i32 second = pair();\n};\n%%end";
         let result = parse(identity(), text.into(), &[]);
         assert!(result.is_valid(), "{:?}", result.errors);
         assert_eq!(result.reconstruct(), text);
@@ -1310,7 +1310,7 @@ mod tests {
             .descendants()
             .find(|node| node.kind() == SyntaxKind::OutputList)
             .expect("output list");
-        assert_eq!(byte_span(&output_list), ByteSpan::new(43, 63));
+        assert_eq!(byte_span(&output_list), ByteSpan::new(42, 48));
     }
 
     #[test]

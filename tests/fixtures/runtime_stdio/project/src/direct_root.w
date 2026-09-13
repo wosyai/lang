@@ -1,4 +1,7 @@
 %%start
+std = namespace std "bootstrap.w";
+std.utf8 text = "direct root\n";
+
 struct WasiIovec {
 	*?u8 buf;
 	u32 len;
@@ -15,7 +18,8 @@ wasi = extern wasm "wasi_snapshot_preview1" {
 local = namespace app "src/local.w";
 i32 value = local.value;
 unsafe {
-	*?u8 bytes, u64 length = core.utf8_view("direct root\n");
+	*?u8 bytes = text.data;
+	u64 length = text.length;
 	WasiIovec iovec = {
 		.buf = bytes;
 		.len = core.cast<u32>(length, "exact");

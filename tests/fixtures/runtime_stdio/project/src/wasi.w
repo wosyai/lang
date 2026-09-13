@@ -1,4 +1,8 @@
 %%start
+std = namespace std "bootstrap.w";
+std.utf8 stdout_text = "runtime stdout\n";
+std.utf8 stderr_text = "runtime stderr\n";
+
 struct WasiIovec {
 	*?u8 buf;
 	u32 len;
@@ -14,7 +18,8 @@ wasi = extern wasm "wasi_snapshot_preview1" {
 
 unit() write_stdout = fn {
 	unsafe {
-		*?u8 bytes, u64 length = core.utf8_view("runtime stdout\n");
+		*?u8 bytes = stdout_text.data;
+		u64 length = stdout_text.length;
 		WasiIovec iovec = {
 			.buf = bytes;
 			.len = core.cast<u32>(length, "exact");
@@ -28,7 +33,8 @@ unit() write_stdout = fn {
 
 unit() write_stderr = fn {
 	unsafe {
-		*?u8 bytes, u64 length = core.utf8_view("runtime stderr\n");
+		*?u8 bytes = stderr_text.data;
+		u64 length = stderr_text.length;
 		WasiIovec iovec = {
 			.buf = bytes;
 			.len = core.cast<u32>(length, "exact");

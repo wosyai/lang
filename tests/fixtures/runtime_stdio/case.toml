@@ -1,3 +1,5 @@
+shared_stdlib = true
+
 [[steps]]
 source = "project/src/stdout.w"
 command = ["wosy", "build"]
