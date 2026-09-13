@@ -420,7 +420,7 @@ impl ProjectConfiguration {
         let path = root.join("wosy.toml");
         let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
         let document = content
-            .parse::<DocumentMut>()
+            .parse::<toml_edit::ImDocument<String>>()
             .map_err(|error| error.to_string())?;
         let package = document
             .get("package")
@@ -428,8 +428,15 @@ impl ProjectConfiguration {
             .ok_or_else(|| "package is missing".to_owned())?;
         let package_name = scalar_string(package, "name")?;
         let dependencies =
-            parse_local_dependencies(root, &package_name, document.get("dependencies"))
-                .map_err(|error| error.diagnostics[0].message.clone())?;
+            parse_local_dependencies(root, &package_name, document.get("dependencies")).map_err(
+                |error| {
+                    let diagnostic = &error.diagnostics[0];
+                    format!(
+                        "{} at {}..{}",
+                        diagnostic.message, diagnostic.span.range.start, diagnostic.span.range.end
+                    )
+                },
+            )?;
         let resolved_packages = resolve_local_packages(root, &package_name, &dependencies)
             .map_err(|error| error.diagnostics[0].message.clone())?;
         let default_target = scalar_string(package, "default_target")?;
@@ -576,7 +583,7 @@ pub fn parse_local_dependencies(
                     package,
                     "P0001",
                     format!("dependency {name} path must be a string"),
-                    path_item.span().expect("dependency path span"),
+                    item.span().expect("dependency item span"),
                 )],
             })?;
         if path.as_os_str().is_empty() {
@@ -586,7 +593,7 @@ pub fn parse_local_dependencies(
                     package,
                     "P0001",
                     format!("dependency {name} path must be non-empty"),
-                    path_item.span().expect("dependency path span"),
+                    item.span().expect("dependency item span"),
                 )],
             });
         }
@@ -600,7 +607,7 @@ pub fn parse_local_dependencies(
                     package,
                     "P0001",
                     String::new(),
-                    path_item.span().expect("dependency path span"),
+                    item.span().expect("dependency item span"),
                 )
                 .span,
             },
@@ -1336,6 +1343,18 @@ mod tests {
         assert_eq!(error.diagnostics[0].code, "P0001");
         assert_eq!(error.diagnostics[0].span.source.path, path("wosy.toml"));
         assert!(error.diagnostics[0].span.range.end > error.diagnostics[0].span.range.start);
+    }
+
+    #[test]
+    fn project_configuration_load_reports_malformed_dependency_declaration_span() {
+        let root = dependency_test_root().join("load-malformed");
+        fs::create_dir_all(&root).expect("project root");
+        let content = "[package]\nname = \"app\"\n\n[dependencies]\nstd = 42\n";
+        fs::write(root.join("wosy.toml"), content).expect("project manifest");
+
+        let error = ProjectConfiguration::load(&root).expect_err("malformed dependency");
+
+        assert_eq!(error, "dependency std must be a table at 45..47");
     }
 
     #[test]
