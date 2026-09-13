@@ -5,4 +5,4 @@ exit = 1
 [[assert]]
 command = ["wosy", "build", "app"]
 exit = 1
-stderr_contains = ["M0001", "src/main.w", "src/math.w", "8..42"]
+stderr_contains = ["M0001", "src/main.w", "src/math.w", "missing module app::src/math.w"]
