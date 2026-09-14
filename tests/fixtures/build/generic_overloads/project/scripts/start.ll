@@ -1,9 +1,9 @@
 target triple = "wasm32-wasi"
 
-declare void @wosy_start()
+declare i32 @main()
 
 define void @_start() {
 entry:
-  call void @wosy_start()
+  call i32 @main()
   ret void
 }
