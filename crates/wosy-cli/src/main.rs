@@ -8,9 +8,10 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 use wosy_compiler::{
-    derive_scalar_diagnostics_from_cst, derive_scalar_program_from_cst, emit_scalar_llvm_text,
-    emit_scalar_project_llvm, parse_source, publication, serialize_publication,
-    validate_scalar_project, ScalarModule, ScalarNamespaceBinding, ScalarProject,
+    derive_scalar_diagnostics_from_cst, derive_scalar_program_from_cst_with_layout,
+    emit_scalar_llvm_text, emit_scalar_project_llvm, parse_source, publication,
+    serialize_publication, validate_scalar_project, ScalarModule, ScalarNamespaceBinding,
+    ScalarProject, ScalarTargetLayout,
 };
 use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest, load_reachable_source_graph,
@@ -129,7 +130,9 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let project = ProjectContext::load(&root, &target_name)?;
     let (_target_config, artifact, artifact_profile, target_profile) =
         configuration.artifact_profile(&target_name, profile)?;
-    let (llvm, source_observations) = compile_project(&root, &project, &configuration)?;
+    let target_layout = artifact_profile.target_layout().map(scalar_target_layout)?;
+    let (llvm, source_observations) =
+        compile_project(&root, &project, &configuration, target_layout)?;
     let source_identity = wosy_project::source_identity(&source_observations);
     let artifact_name = &target_profile.main_artifact;
     let output_dir = root
@@ -254,6 +257,7 @@ fn compile_project(
     root: &std::path::Path,
     project: &ProjectContext,
     configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
 ) -> Result<(String, Vec<SourceObservation>), String> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
     let root_project = root.to_string_lossy().into_owned();
@@ -300,7 +304,7 @@ fn compile_project(
         }
         let snapshot_path = persist_cst(root, &output)?;
         let cst = load_canonical_cst(&snapshot_path)?;
-        let validation = derive_scalar_program_from_cst(&cst);
+        let validation = derive_scalar_program_from_cst_with_layout(&cst, target_layout);
         let mut namespace_edges = Vec::new();
         for item in &validation.program.items {
             let wosy_compiler::ScalarItem::Namespace(namespace) = item else {
@@ -398,7 +402,7 @@ fn compile_project(
                 )
             })?;
         derivation_diagnostics.extend(derive_scalar_diagnostics_from_cst(cst));
-        let validation = derive_scalar_program_from_cst(cst);
+        let validation = derive_scalar_program_from_cst_with_layout(cst, target_layout);
         let namespace_bindings = node
             .namespace_edges
             .iter()
@@ -444,10 +448,11 @@ fn compile_project(
         return Err("build rejected by semantic diagnostics".to_owned());
     }
     let llvm = if graph.nodes.len() == 1 {
-        emit_scalar_llvm_text(&derive_scalar_program_from_cst(
+        emit_scalar_llvm_text(&derive_scalar_program_from_cst_with_layout(
             canonical
                 .get(&(project.package.clone(), root_path.clone()))
                 .ok_or_else(|| "missing canonical CST for project root".to_owned())?,
+            target_layout,
         ))?
     } else {
         let partition = emit_scalar_project_llvm(&validation)?;
@@ -462,6 +467,14 @@ fn compile_project(
         })
         .collect();
     Ok((llvm, source_observations))
+}
+
+fn scalar_target_layout(layout: wosy_project::TargetLayout) -> ScalarTargetLayout {
+    match (layout.pointer_size, layout.pointer_alignment) {
+        (4, 4) => ScalarTargetLayout::WASM32,
+        (8, 8) => ScalarTargetLayout::NATIVE64,
+        _ => unreachable!("project target layouts are supported"),
+    }
 }
 
 fn persist_cst(

@@ -100,6 +100,11 @@ impl ScalarTargetLayout {
         pointer_size: 4,
         pointer_alignment: 4,
     };
+
+    pub const NATIVE64: Self = Self {
+        pointer_size: 8,
+        pointer_alignment: 8,
+    };
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -783,6 +788,7 @@ pub struct ScalarModule {
     pub members: BTreeMap<String, ScalarType>,
     pub initialization_nodes: Vec<ScalarInitializationNode>,
     pub structs: Vec<ScalarStruct>,
+    pub target_layout: ScalarTargetLayout,
 }
 
 impl ScalarModule {
@@ -820,6 +826,7 @@ impl ScalarModule {
             members,
             initialization_nodes,
             structs: Vec::new(),
+            target_layout: ScalarTargetLayout::WASM32,
         }
     }
 
@@ -829,6 +836,7 @@ impl ScalarModule {
     ) -> Self {
         let mut module = Self::new(program.source, program.items, namespace_bindings);
         module.structs = program.structs;
+        module.target_layout = program.target_layout;
         module
     }
 }
@@ -867,10 +875,24 @@ pub struct ScalarValidation {
 }
 
 pub fn derive_scalar_program(parse: &ParseResult) -> ScalarValidation {
-    derive_scalar_program_from_cst(parse.canonical_cst())
+    derive_scalar_program_with_layout(parse, ScalarTargetLayout::WASM32)
+}
+
+pub fn derive_scalar_program_with_layout(
+    parse: &ParseResult,
+    target_layout: ScalarTargetLayout,
+) -> ScalarValidation {
+    derive_scalar_program_from_cst_with_layout(parse.canonical_cst(), target_layout)
 }
 
 pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarValidation {
+    derive_scalar_program_from_cst_with_layout(canonical, ScalarTargetLayout::WASM32)
+}
+
+pub fn derive_scalar_program_from_cst_with_layout(
+    canonical: &CanonicalCstRoot,
+    target_layout: ScalarTargetLayout,
+) -> ScalarValidation {
     let mut items = Vec::new();
     let mut diagnostics = string_diagnostics(canonical);
     diagnostics.extend(char_diagnostics(canonical));
@@ -893,6 +915,7 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
                     source: canonical.source.clone(),
                     index,
                 },
+                target_layout,
             )
         })
         .collect();
@@ -952,7 +975,7 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
         source: canonical.source.clone(),
         items,
         structs,
-        target_layout: ScalarTargetLayout::WASM32,
+        target_layout,
     };
     resolve_program_types(&mut program);
     resolve_program_places(&mut program);
@@ -1168,7 +1191,7 @@ fn resolve_program_types(program: &mut ScalarProgram) {
     for structure in &mut program.structs {
         for field in &mut structure.fields {
             field.ty = resolve_type(&field.ty, &names);
-            field.layout = layout_for_type(&field.ty);
+            field.layout = layout_for_type(&field.ty, program.target_layout);
         }
         let mut offset = 0;
         let mut alignment = 1;
@@ -1185,7 +1208,7 @@ fn resolve_program_types(program: &mut ScalarProgram) {
     }
     let structs = program.structs.clone();
     for structure in &mut program.structs {
-        recompute_struct_layout(structure, &structs);
+        recompute_struct_layout(structure, &structs, program.target_layout);
     }
     for item in &mut program.items {
         match item {
@@ -1492,7 +1515,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
     }
     for module in &mut project.modules {
         for structure in &mut module.structs {
-            recompute_struct_layout_project(structure, &struct_lookup);
+            recompute_struct_layout_project(structure, &struct_lookup, module.target_layout);
         }
     }
     for module in &mut project.modules {
@@ -2087,11 +2110,15 @@ fn resolve_type_in_project(
     }
 }
 
-fn recompute_struct_layout(structure: &mut ScalarStruct, structs: &[ScalarStruct]) {
+fn recompute_struct_layout(
+    structure: &mut ScalarStruct,
+    structs: &[ScalarStruct],
+    target_layout: ScalarTargetLayout,
+) {
     let mut offset = 0;
     let mut alignment = 1;
     for field in &mut structure.fields {
-        field.layout = layout_for_type_in_structs(&field.ty, structs);
+        field.layout = layout_for_type_in_structs(&field.ty, structs, target_layout);
         alignment = alignment.max(field.layout.alignment);
         offset = align_offset(offset, field.layout.alignment);
         field.offset = offset;
@@ -2103,11 +2130,15 @@ fn recompute_struct_layout(structure: &mut ScalarStruct, structs: &[ScalarStruct
     };
 }
 
-fn recompute_struct_layout_project(structure: &mut ScalarStruct, modules: &[ScalarModule]) {
+fn recompute_struct_layout_project(
+    structure: &mut ScalarStruct,
+    modules: &[ScalarModule],
+    target_layout: ScalarTargetLayout,
+) {
     let mut offset = 0;
     let mut alignment = 1;
     for field in &mut structure.fields {
-        field.layout = layout_for_type_in_modules(&field.ty, modules);
+        field.layout = layout_for_type_in_modules(&field.ty, modules, target_layout);
         alignment = alignment.max(field.layout.alignment);
         offset = align_offset(offset, field.layout.alignment);
         field.offset = offset;
@@ -2119,18 +2150,26 @@ fn recompute_struct_layout_project(structure: &mut ScalarStruct, modules: &[Scal
     };
 }
 
-fn layout_for_type_in_structs(ty: &ScalarType, structs: &[ScalarStruct]) -> ScalarLayout {
+fn layout_for_type_in_structs(
+    ty: &ScalarType,
+    structs: &[ScalarStruct],
+    target_layout: ScalarTargetLayout,
+) -> ScalarLayout {
     match ty {
         ScalarType::Struct(id) => structs
             .iter()
             .find(|structure| structure.id == *id)
             .map(|structure| structure.layout.clone())
             .expect("resolved local struct layout"),
-        _ => layout_for_type(ty),
+        _ => layout_for_type(ty, target_layout),
     }
 }
 
-fn layout_for_type_in_modules(ty: &ScalarType, modules: &[ScalarModule]) -> ScalarLayout {
+fn layout_for_type_in_modules(
+    ty: &ScalarType,
+    modules: &[ScalarModule],
+    target_layout: ScalarTargetLayout,
+) -> ScalarLayout {
     match ty {
         ScalarType::Struct(id) => modules
             .iter()
@@ -2138,7 +2177,7 @@ fn layout_for_type_in_modules(ty: &ScalarType, modules: &[ScalarModule]) -> Scal
             .find(|structure| structure.id == *id)
             .map(|structure| structure.layout.clone())
             .expect("resolved project struct layout"),
-        _ => layout_for_type(ty),
+        _ => layout_for_type(ty, target_layout),
     }
 }
 
@@ -5390,7 +5429,11 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
     }
 }
 
-fn derive_struct(node: CstNode, id: ScalarStructId) -> ScalarStruct {
+fn derive_struct(
+    node: CstNode,
+    id: ScalarStructId,
+    target_layout: ScalarTargetLayout,
+) -> ScalarStruct {
     let name = direct_token(&node, SyntaxKind::Identifier).expect("struct name");
     let fields = node
         .children()
@@ -5406,7 +5449,7 @@ fn derive_struct(node: CstNode, id: ScalarStructId) -> ScalarStruct {
                 },
                 name: field_name.text().to_owned(),
                 name_span: token_span(&field_name),
-                layout: layout_for_type(&ty),
+                layout: layout_for_type(&ty, target_layout),
                 ty,
                 declaration_index: index,
                 offset: 0,
@@ -5440,7 +5483,7 @@ fn align_offset(offset: u64, alignment: u64) -> u64 {
     (offset + alignment - 1) / alignment * alignment
 }
 
-fn layout_for_type(ty: &ScalarType) -> ScalarLayout {
+fn layout_for_type(ty: &ScalarType, target_layout: ScalarTargetLayout) -> ScalarLayout {
     match ty {
         ScalarType::Bool | ScalarType::I8 | ScalarType::U8 => ScalarLayout {
             size: 1,
@@ -5471,8 +5514,8 @@ fn layout_for_type(ty: &ScalarType) -> ScalarLayout {
             alignment: 8,
         },
         ScalarType::RawPointer(_) | ScalarType::ArtifactId => ScalarLayout {
-            size: ScalarTargetLayout::WASM32.pointer_size,
-            alignment: ScalarTargetLayout::WASM32.pointer_alignment,
+            size: target_layout.pointer_size,
+            alignment: target_layout.pointer_alignment,
         },
         _ => ScalarLayout {
             size: 0,
@@ -9213,6 +9256,33 @@ mod tests {
             parsed.diagnostics
         );
         derive_scalar_program(&parsed.result)
+    }
+
+    #[test]
+    fn derives_pointer_struct_layouts_from_the_target() {
+        let text = "%%start\nstruct Pair {\n\t*?u8 address;\n\tu32 count;\n}\n%%end";
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+
+        let wasm = derive_scalar_program_with_layout(&parsed.result, ScalarTargetLayout::WASM32);
+        let native =
+            derive_scalar_program_with_layout(&parsed.result, ScalarTargetLayout::NATIVE64);
+
+        assert_eq!(
+            wasm.program.structs[0].layout,
+            ScalarLayout {
+                size: 8,
+                alignment: 4
+            }
+        );
+        assert_eq!(wasm.program.structs[0].fields[1].offset, 4);
+        assert_eq!(
+            native.program.structs[0].layout,
+            ScalarLayout {
+                size: 16,
+                alignment: 8
+            }
+        );
+        assert_eq!(native.program.structs[0].fields[1].offset, 8);
     }
 
     #[test]

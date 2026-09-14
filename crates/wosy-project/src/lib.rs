@@ -388,6 +388,30 @@ pub struct ArtifactProfile {
     pub run_runner: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TargetLayout {
+    pub pointer_size: u64,
+    pub pointer_alignment: u64,
+}
+
+impl ArtifactProfile {
+    pub fn target_layout(&self) -> Result<TargetLayout, String> {
+        match (self.backend.as_str(), self.output.as_str()) {
+            ("llvm", "wasm-wasip1" | "wasm-wasip2") => Ok(TargetLayout {
+                pointer_size: 4,
+                pointer_alignment: 4,
+            }),
+            ("llvm", "native") => Ok(TargetLayout {
+                pointer_size: 8,
+                pointer_alignment: 8,
+            }),
+            (backend, output) => Err(format!(
+                "unsupported artifact profile backend {backend} with output {output}"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactConfig {
     pub artifact: String,
@@ -1182,6 +1206,48 @@ mod tests {
         assert_eq!(profile.output, "wasm-wasip1");
         assert_eq!(profile.builder, "llvm-wasm");
         assert_eq!(profile.run_runner, "wasmtime-wasip1");
+    }
+
+    #[test]
+    fn artifact_profile_derives_documented_llvm_target_layouts() {
+        for output in ["wasm-wasip1", "wasm-wasip2"] {
+            let profile = ArtifactProfile {
+                backend: "llvm".to_owned(),
+                output: output.to_owned(),
+                builder: "builder".to_owned(),
+                run_runner: "runner".to_owned(),
+            };
+            assert_eq!(
+                profile.target_layout(),
+                Ok(TargetLayout {
+                    pointer_size: 4,
+                    pointer_alignment: 4,
+                })
+            );
+        }
+        let native = ArtifactProfile {
+            backend: "llvm".to_owned(),
+            output: "native".to_owned(),
+            builder: "builder".to_owned(),
+            run_runner: "runner".to_owned(),
+        };
+        assert_eq!(
+            native.target_layout(),
+            Ok(TargetLayout {
+                pointer_size: 8,
+                pointer_alignment: 8,
+            })
+        );
+        let unsupported = ArtifactProfile {
+            backend: "other".to_owned(),
+            output: "custom".to_owned(),
+            builder: "builder".to_owned(),
+            run_runner: "runner".to_owned(),
+        };
+        assert_eq!(
+            unsupported.target_layout(),
+            Err("unsupported artifact profile backend other with output custom".to_owned())
+        );
     }
 
     #[test]

@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::scalar::{ScalarBindingOutputOrigin, ScalarFieldReference, ScalarOverloadSelection};
 use crate::{
     BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarExpression,
-    ScalarFunction, ScalarItem, ScalarModule, ScalarProjectValidation, ScalarStruct, ScalarType,
-    ScalarValidation, ScalarWhile,
+    ScalarFunction, ScalarItem, ScalarModule, ScalarProjectValidation, ScalarStruct,
+    ScalarTargetLayout, ScalarType, ScalarValidation, ScalarWhile,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -84,6 +84,7 @@ struct EmitState<'ctx, 'module> {
     globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     all_globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     structs: &'module [ScalarStruct],
+    target_layout: ScalarTargetLayout,
     next_literal: usize,
     next_block: usize,
 }
@@ -102,6 +103,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     let context = Context::create();
     let module = ManuallyDrop::new(context.create_module(&validation.program.source.path));
     let builder = context.create_builder();
+    let target_layout = validation.program.target_layout;
     let mut globals = BTreeMap::new();
     for item in &validation.program.items {
         if let ScalarItem::Binding(binding) = item {
@@ -109,7 +111,8 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
                 if *ty == ScalarType::Unit {
                     continue;
                 }
-                let llvm_ty = storage_type(&context, ty, &validation.program.structs)?;
+                let llvm_ty =
+                    storage_type(&context, ty, &validation.program.structs, target_layout)?;
                 let global = module.add_global(llvm_ty, None, name);
                 global.set_linkage(Linkage::Internal);
                 global.set_initializer(&llvm_ty.const_zero());
@@ -149,7 +152,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     {
         let value = module.add_function(
             &function.name,
-            function_type(&context, &function.signature)?.0,
+            function_type(&context, &function.signature, target_layout)?.0,
             None,
         );
         for (index, name) in function.parameters.iter().enumerate() {
@@ -171,8 +174,11 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         |name| name.to_owned(),
     )?;
     for (lookup, function, name) in &specializations {
-        let value =
-            module.add_function(name, function_type(&context, &function.signature)?.0, None);
+        let value = module.add_function(
+            name,
+            function_type(&context, &function.signature, target_layout)?.0,
+            None,
+        );
         for (index, parameter) in function.parameters.iter().enumerate() {
             if let Some(argument) = value.get_nth_param(index as u32) {
                 argument.set_name(parameter);
@@ -192,8 +198,11 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             }),
     );
     for (lookup, function, name) in &overloads {
-        let value =
-            module.add_function(name, function_type(&context, &function.signature)?.0, None);
+        let value = module.add_function(
+            name,
+            function_type(&context, &function.signature, target_layout)?.0,
+            None,
+        );
         for (index, parameter) in function.parameters.iter().enumerate() {
             if let Some(argument) = value.get_nth_param(index as u32) {
                 argument.set_name(parameter);
@@ -221,7 +230,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
                 );
                 let value = module.add_function(
                     &identity.internal_name,
-                    function_type(&context, &function.signature)?.0,
+                    function_type(&context, &function.signature, target_layout)?.0,
                     None,
                 );
                 call_targets.insert(key, identity.internal_name.clone());
@@ -260,6 +269,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &validation.program.items,
             &module,
             &validation.program.structs,
+            target_layout,
         )?;
     }
     for (_, function, name) in &specializations {
@@ -275,6 +285,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &validation.program.items,
             &module,
             &validation.program.structs,
+            target_layout,
         )?;
     }
     for (_, function, name) in &overloads {
@@ -290,6 +301,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &validation.program.items,
             &module,
             &validation.program.structs,
+            target_layout,
         )?;
     }
     emit_main(
@@ -302,6 +314,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         &validation.program.items,
         &module,
         &validation.program.structs,
+        target_layout,
     )?;
     finish_partition(
         ManuallyDrop::into_inner(module),
@@ -310,6 +323,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         &functions,
         &signatures,
         &externs,
+        target_layout,
     )
 }
 
@@ -345,6 +359,12 @@ pub fn emit_scalar_project_llvm(
     let context = Context::create();
     let module = ManuallyDrop::new(context.create_module(&module_name));
     let builder = context.create_builder();
+    let target_layout = validation
+        .project
+        .modules
+        .first()
+        .ok_or_else(|| "project has no reachable modules".to_owned())?
+        .target_layout;
     let mut globals = BTreeMap::new();
     let mut functions = BTreeMap::new();
     let mut signatures = BTreeMap::new();
@@ -359,7 +379,7 @@ pub fn emit_scalar_project_llvm(
                         continue;
                     }
                     let name = project_global_name(&source_module.source, name);
-                    let llvm_ty = storage_type(&context, ty, &all_structs)?;
+                    let llvm_ty = storage_type(&context, ty, &all_structs, target_layout)?;
                     let global = module.add_global(llvm_ty, None, &name);
                     global.set_linkage(Linkage::Internal);
                     global.set_initializer(&llvm_ty.const_zero());
@@ -373,7 +393,7 @@ pub fn emit_scalar_project_llvm(
                 let name = project_function_name(&source_module.source, &function.name);
                 let value = module.add_function(
                     &name,
-                    function_type(&context, &function.signature)?.0,
+                    function_type(&context, &function.signature, target_layout)?.0,
                     None,
                 );
                 for (index, parameter) in function.parameters.iter().enumerate() {
@@ -401,7 +421,7 @@ pub fn emit_scalar_project_llvm(
                     );
                     let value = module.add_function(
                         &identity.internal_name,
-                        function_type(&context, &function.signature)?.0,
+                        function_type(&context, &function.signature, target_layout)?.0,
                         None,
                     );
                     let key = project_extern_lookup_key(
@@ -431,8 +451,11 @@ pub fn emit_scalar_project_llvm(
             |name| project_function_name(&source_module.source, name),
         )?;
         for (lookup, function, name) in specializations {
-            let value =
-                module.add_function(&name, function_type(&context, &function.signature)?.0, None);
+            let value = module.add_function(
+                &name,
+                function_type(&context, &function.signature, target_layout)?.0,
+                None,
+            );
             for (index, parameter) in function.parameters.iter().enumerate() {
                 if let Some(argument) = value.get_nth_param(index as u32) {
                     argument.set_name(parameter);
@@ -467,8 +490,11 @@ pub fn emit_scalar_project_llvm(
             |name| project_function_name(&source_module.source, name),
             selections,
         ) {
-            let value =
-                module.add_function(&name, function_type(&context, &function.signature)?.0, None);
+            let value = module.add_function(
+                &name,
+                function_type(&context, &function.signature, target_layout)?.0,
+                None,
+            );
             for (index, parameter) in function.parameters.iter().enumerate() {
                 if let Some(argument) = value.get_nth_param(index as u32) {
                     argument.set_name(parameter);
@@ -498,6 +524,7 @@ pub fn emit_scalar_project_llvm(
             &name,
             &module,
             &all_structs,
+            target_layout,
         )?;
     }
     for (source_module, function, name) in &project_specializations {
@@ -514,6 +541,7 @@ pub fn emit_scalar_project_llvm(
             name,
             &module,
             &all_structs,
+            target_layout,
         )?;
     }
     for (source_module, function, name) in &project_overloads {
@@ -530,6 +558,7 @@ pub fn emit_scalar_project_llvm(
             name,
             &module,
             &all_structs,
+            target_layout,
         )?;
     }
     emit_project_main(
@@ -542,6 +571,7 @@ pub fn emit_scalar_project_llvm(
         &globals,
         &module,
         &all_structs,
+        target_layout,
     )?;
     finish_partition(
         ManuallyDrop::into_inner(module),
@@ -550,6 +580,7 @@ pub fn emit_scalar_project_llvm(
         &functions,
         &signatures,
         &externs,
+        target_layout,
     )
 }
 
@@ -633,6 +664,7 @@ fn finish_partition<'ctx>(
     functions: &BTreeMap<String, FunctionValue<'ctx>>,
     signatures: &BTreeMap<String, ScalarType>,
     externs: &[LlvmExternIdentity],
+    target_layout: ScalarTargetLayout,
 ) -> Result<LlvmPartition, String> {
     module.verify().map_err(|error| error.to_string())?;
     let text = module.print_to_string().to_string();
@@ -653,7 +685,7 @@ fn finish_partition<'ctx>(
             } else {
                 signatures.get(name)?.clone()
             };
-            let (_, result) = function_type(context, &signature).ok()?;
+            let (_, result) = function_type(context, &signature, target_layout).ok()?;
             let ScalarType::Callable {
                 outputs: _,
                 parameters,
@@ -691,7 +723,8 @@ fn finish_partition<'ctx>(
             else {
                 return None;
             };
-            let (_, result) = function_type(context, &extern_identity.signature).ok()?;
+            let (_, result) =
+                function_type(context, &extern_identity.signature, target_layout).ok()?;
             let parameters = parameters
                 .iter()
                 .enumerate()
@@ -727,6 +760,7 @@ fn finish_partition<'ctx>(
 fn function_type<'ctx>(
     context: &'ctx Context,
     signature: &ScalarType,
+    target_layout: ScalarTargetLayout,
 ) -> Result<(FunctionType<'ctx>, LlvmValueType), String> {
     let ScalarType::Callable {
         outputs,
@@ -737,7 +771,7 @@ fn function_type<'ctx>(
     };
     let parameters = parameters
         .iter()
-        .map(|ty| basic_type(context, ty).map(Into::into))
+        .map(|ty| basic_type(context, ty, target_layout).map(Into::into))
         .collect::<Result<Vec<BasicMetadataTypeEnum>, _>>()?;
     match outputs.outputs.as_slice() {
         [] => Ok((
@@ -749,11 +783,11 @@ fn function_type<'ctx>(
             LlvmValueType::Void,
         )),
         [output] => Ok((
-            basic_type(context, &output.ty)?.fn_type(&parameters, false),
+            basic_type(context, &output.ty, target_layout)?.fn_type(&parameters, false),
             value_type(&output.ty)?,
         )),
         _ => Ok((
-            aggregate_type(context, outputs)?.fn_type(&parameters, false),
+            aggregate_type(context, outputs, target_layout)?.fn_type(&parameters, false),
             LlvmValueType::Aggregate(
                 outputs
                     .outputs
@@ -792,9 +826,22 @@ fn integer_type<'ctx>(
         .map_err(str::to_owned)
 }
 
+fn pointer_integer_type<'ctx>(
+    context: &'ctx Context,
+    target_layout: ScalarTargetLayout,
+) -> inkwell::types::IntType<'ctx> {
+    context
+        .custom_width_int_type(
+            NonZeroU32::new((target_layout.pointer_size * 8) as u32)
+                .expect("pointer width is nonzero"),
+        )
+        .expect("supported pointer width")
+}
+
 fn basic_type<'ctx>(
     context: &'ctx Context,
     ty: &ScalarType,
+    target_layout: ScalarTargetLayout,
 ) -> Result<BasicTypeEnum<'ctx>, String> {
     match ty {
         ScalarType::Bool => Ok(context.bool_type().into()),
@@ -803,7 +850,7 @@ fn basic_type<'ctx>(
         ScalarType::F32 => Ok(context.f32_type().into()),
         ScalarType::F64 => Ok(context.f64_type().into()),
         ScalarType::ArtifactId => Ok(context.ptr_type(AddressSpace::default()).into()),
-        ScalarType::RawPointer(_) => Ok(context.i32_type().into()),
+        ScalarType::RawPointer(_) => Ok(pointer_integer_type(context, target_layout).into()),
         ScalarType::Struct(_) => Ok(context.ptr_type(AddressSpace::default()).into()),
         _ => Err("unit is only valid as a function result".into()),
     }
@@ -813,6 +860,7 @@ fn storage_type<'ctx>(
     context: &'ctx Context,
     ty: &ScalarType,
     structs: &[ScalarStruct],
+    target_layout: ScalarTargetLayout,
 ) -> Result<BasicTypeEnum<'ctx>, String> {
     match ty {
         ScalarType::Struct(id) => {
@@ -824,7 +872,7 @@ fn storage_type<'ctx>(
                 .map_err(|_| "struct layout exceeds LLVM array size")?;
             Ok(context.i8_type().array_type(size).into())
         }
-        _ => basic_type(context, ty),
+        _ => basic_type(context, ty, target_layout),
     }
 }
 fn value_type(ty: &ScalarType) -> Result<LlvmValueType, String> {
@@ -880,11 +928,12 @@ fn float_constant<'ctx>(
 fn aggregate_type<'ctx>(
     context: &'ctx Context,
     outputs: &crate::ScalarOutputSequence,
+    target_layout: ScalarTargetLayout,
 ) -> Result<StructType<'ctx>, String> {
     let fields = outputs
         .outputs
         .iter()
-        .map(|output| output_basic_type(context, &output.ty))
+        .map(|output| output_basic_type(context, &output.ty, target_layout))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(context.struct_type(&fields, false))
 }
@@ -892,11 +941,12 @@ fn aggregate_type<'ctx>(
 fn output_basic_type<'ctx>(
     context: &'ctx Context,
     ty: &ScalarType,
+    target_layout: ScalarTargetLayout,
 ) -> Result<BasicTypeEnum<'ctx>, String> {
     if *ty == ScalarType::Unit {
         Ok(context.i8_type().into())
     } else {
-        basic_type(context, ty)
+        basic_type(context, ty, target_layout)
     }
 }
 
@@ -1011,7 +1061,11 @@ fn emit_place_value<'ctx, 'module>(
     Ok(EmitValue::Basic(
         state
             .builder
-            .build_load(basic_type(context, &ty)?, pointer, "place")
+            .build_load(
+                basic_type(context, &ty, state.target_layout)?,
+                pointer,
+                "place",
+            )
             .map_err(builder_error)?,
     ))
 }
@@ -1165,7 +1219,7 @@ fn emit_utf8_literal<'ctx, 'module>(
     let destination = state
         .builder
         .build_alloca(
-            storage_type(context, expected, state.structs)?,
+            storage_type(context, expected, state.structs, state.target_layout)?,
             "utf8_literal",
         )
         .map_err(builder_error)?;
@@ -1182,7 +1236,7 @@ fn emit_utf8_literal<'ctx, 'module>(
         .builder
         .build_ptr_to_int(
             literal.as_pointer_value(),
-            context.i32_type(),
+            pointer_integer_type(context, state.target_layout),
             "utf8_address",
         )
         .map_err(builder_error)?;
@@ -1257,7 +1311,7 @@ fn build_aggregate<'ctx, 'module>(
     outputs: &crate::ScalarOutputSequence,
     values: Vec<EmitValue<'ctx>>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let ty = aggregate_type(context, outputs)?;
+    let ty = aggregate_type(context, outputs, state.target_layout)?;
     let mut aggregate = ty.const_zero();
     for (index, (output, value)) in outputs.outputs.iter().zip(values).enumerate() {
         let value = if output.ty == ScalarType::Unit {
@@ -1342,7 +1396,10 @@ fn store_binding_outputs<'ctx, 'module>(
         }
         let slot = state
             .builder
-            .build_alloca(storage_type(context, ty, state.structs)?, name)
+            .build_alloca(
+                storage_type(context, ty, state.structs, state.target_layout)?,
+                name,
+            )
             .map_err(builder_error)?;
         store_value(context, state, slot, ty, value)?;
         state.storage.insert(name.clone(), (slot, ty.clone()));
@@ -1415,6 +1472,7 @@ fn emit_function<'ctx, 'module>(
     items: &[ScalarItem],
     module: &'module Module<'ctx>,
     structs: &'module [ScalarStruct],
+    target_layout: ScalarTargetLayout,
 ) -> Result<(), String> {
     let value = *functions
         .get(name)
@@ -1432,6 +1490,7 @@ fn emit_function<'ctx, 'module>(
         globals: globals.clone(),
         all_globals: globals.clone(),
         structs,
+        target_layout,
         next_literal: 0,
         next_block: 0,
     };
@@ -1443,7 +1502,7 @@ fn emit_function<'ctx, 'module>(
                 .ok_or_else(|| "missing function parameter".to_owned())?;
             let slot = builder
                 .build_alloca(
-                    storage_type(context, parameter, structs)?,
+                    storage_type(context, parameter, structs, target_layout)?,
                     &function.parameters[index],
                 )
                 .map_err(builder_error)?;
@@ -1501,6 +1560,7 @@ fn emit_main<'ctx, 'module>(
     items: &[ScalarItem],
     module: &'module Module<'ctx>,
     structs: &'module [ScalarStruct],
+    target_layout: ScalarTargetLayout,
 ) -> Result<(), String> {
     let main = *functions
         .get("main")
@@ -1518,6 +1578,7 @@ fn emit_main<'ctx, 'module>(
         globals: globals.clone(),
         all_globals: globals.clone(),
         structs,
+        target_layout,
         next_literal: 0,
         next_block: 0,
     };
@@ -1564,6 +1625,7 @@ fn emit_project_function<'ctx, 'module>(
     name: &str,
     module: &'module Module<'ctx>,
     structs: &'module [ScalarStruct],
+    target_layout: ScalarTargetLayout,
 ) -> Result<(), String> {
     let value = *functions
         .get(name)
@@ -1581,6 +1643,7 @@ fn emit_project_function<'ctx, 'module>(
         globals: module_globals(source_module, globals),
         all_globals: globals.clone(),
         structs,
+        target_layout,
         next_literal: 0,
         next_block: 0,
     };
@@ -1592,7 +1655,7 @@ fn emit_project_function<'ctx, 'module>(
                 .ok_or_else(|| "missing function parameter".to_owned())?;
             let slot = builder
                 .build_alloca(
-                    storage_type(context, parameter, structs)?,
+                    storage_type(context, parameter, structs, target_layout)?,
                     &function.parameters[index],
                 )
                 .map_err(builder_error)?;
@@ -1663,6 +1726,7 @@ fn emit_project_main<'ctx, 'module>(
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     module: &'module Module<'ctx>,
     structs: &'module [ScalarStruct],
+    target_layout: ScalarTargetLayout,
 ) -> Result<(), String> {
     let main = *functions
         .get("main")
@@ -1680,6 +1744,7 @@ fn emit_project_main<'ctx, 'module>(
         globals: BTreeMap::new(),
         all_globals: globals.clone(),
         structs,
+        target_layout,
         next_literal: 0,
         next_block: 0,
     };
@@ -1947,7 +2012,10 @@ fn emit_assignment<'ctx, 'module>(
                     None => {
                         let slot = state
                             .builder
-                            .build_alloca(storage_type(context, &ty, state.structs)?, name)
+                            .build_alloca(
+                                storage_type(context, &ty, state.structs, state.target_layout)?,
+                                name,
+                            )
                             .map_err(builder_error)?;
                         state.storage.insert(name.clone(), (slot, ty.clone()));
                         slot
@@ -2015,7 +2083,10 @@ fn emit_project_assignment<'ctx, 'module>(
                         None => {
                             let slot = state
                                 .builder
-                                .build_alloca(storage_type(context, &ty, state.structs)?, name)
+                                .build_alloca(
+                                    storage_type(context, &ty, state.structs, state.target_layout)?,
+                                    name,
+                                )
                                 .map_err(builder_error)?;
                             state.storage.insert(name.clone(), (slot, ty.clone()));
                             slot
@@ -2120,7 +2191,7 @@ fn materialize_assignment_values<'ctx, 'module>(
             let temporary = state
                 .builder
                 .build_alloca(
-                    storage_type(context, &ty, state.structs)?,
+                    storage_type(context, &ty, state.structs, state.target_layout)?,
                     "assignment_value",
                 )
                 .map_err(builder_error)?;
@@ -2131,7 +2202,11 @@ fn materialize_assignment_values<'ctx, 'module>(
                 EmitValue::Basic(
                     state
                         .builder
-                        .build_load(basic_type(context, &ty)?, temporary, "assignment_value")
+                        .build_load(
+                            basic_type(context, &ty, state.target_layout)?,
+                            temporary,
+                            "assignment_value",
+                        )
                         .map_err(builder_error)?,
                 )
             };
@@ -2185,7 +2260,12 @@ fn emit_block_item<'ctx, 'module>(
             let slot = state
                 .builder
                 .build_alloca(
-                    storage_type(context, &binding.declared_type, state.structs)?,
+                    storage_type(
+                        context,
+                        &binding.declared_type,
+                        state.structs,
+                        state.target_layout,
+                    )?,
                     &binding.name,
                 )
                 .map_err(builder_error)?;
@@ -2225,7 +2305,12 @@ fn emit_project_block_item<'ctx, 'module>(
             let slot = state
                 .builder
                 .build_alloca(
-                    storage_type(context, &binding.declared_type, state.structs)?,
+                    storage_type(
+                        context,
+                        &binding.declared_type,
+                        state.structs,
+                        state.target_layout,
+                    )?,
                     &binding.name,
                 )
                 .map_err(builder_error)?;
@@ -2341,7 +2426,11 @@ fn emit_expression<'ctx, 'module>(
     match expression {
         ScalarExpression::Name { name, .. } => {
             if name == "null" {
-                return Ok(EmitValue::Basic(context.i32_type().const_zero().into()));
+                return Ok(EmitValue::Basic(
+                    pointer_integer_type(context, state.target_layout)
+                        .const_zero()
+                        .into(),
+                ));
             }
             if let Some((slot, ty)) = state.storage.get(name).cloned() {
                 if matches!(ty, ScalarType::Struct(_)) {
@@ -2350,7 +2439,11 @@ fn emit_expression<'ctx, 'module>(
                 return Ok(EmitValue::Basic(
                     state
                         .builder
-                        .build_load(storage_type(context, &ty, state.structs)?, slot, name)
+                        .build_load(
+                            storage_type(context, &ty, state.structs, state.target_layout)?,
+                            slot,
+                            name,
+                        )
                         .map_err(builder_error)?,
                 ));
             }
@@ -2362,7 +2455,7 @@ fn emit_expression<'ctx, 'module>(
                     state
                         .builder
                         .build_load(
-                            storage_type(context, &ty, state.structs)?,
+                            storage_type(context, &ty, state.structs, state.target_layout)?,
                             global.as_pointer_value(),
                             name,
                         )
@@ -2465,7 +2558,7 @@ fn emit_expression<'ctx, 'module>(
                 .builder
                 .build_ptr_to_int(
                     place_pointer(context, state, place)?,
-                    context.i32_type(),
+                    pointer_integer_type(context, state.target_layout),
                     "address",
                 )
                 .map_err(builder_error)?
@@ -2534,7 +2627,7 @@ fn emit_project_expression<'ctx, 'module>(
                 state
                     .builder
                     .build_load(
-                        storage_type(context, &ty, state.structs)?,
+                        storage_type(context, &ty, state.structs, state.target_layout)?,
                         global.as_pointer_value(),
                         name,
                     )
@@ -2758,7 +2851,7 @@ fn emit_project_expression<'ctx, 'module>(
                 .builder
                 .build_ptr_to_int(
                     place_pointer(context, state, place)?,
-                    context.i32_type(),
+                    pointer_integer_type(context, state.target_layout),
                     "address",
                 )
                 .map_err(builder_error)?
@@ -4305,7 +4398,7 @@ mod tests {
     use crate::scalar::ScalarOverloadSelection;
     use crate::{
         derive_scalar_program, parse_source, validate_scalar_project, ScalarModule, ScalarOutput,
-        ScalarOutputSequence, ScalarProject, ScalarType,
+        ScalarOutputSequence, ScalarProject, ScalarTargetLayout, ScalarType,
     };
     use wosy_syntax::SourceIdentity;
 
@@ -4378,21 +4471,30 @@ mod tests {
         };
 
         assert_eq!(
-            function_type(&context, &callable(sequence(Vec::new())))
-                .expect("zero-output function type")
-                .1,
+            function_type(
+                &context,
+                &callable(sequence(Vec::new())),
+                ScalarTargetLayout::WASM32,
+            )
+            .expect("zero-output function type")
+            .1,
             LlvmValueType::Void
         );
         assert_eq!(
-            function_type(&context, &callable(sequence(vec![ScalarType::I32])))
-                .expect("direct function type")
-                .1,
+            function_type(
+                &context,
+                &callable(sequence(vec![ScalarType::I32])),
+                ScalarTargetLayout::WASM32,
+            )
+            .expect("direct function type")
+            .1,
             LlvmValueType::I32
         );
         assert_eq!(
             function_type(
                 &context,
                 &callable(sequence(vec![ScalarType::I32, ScalarType::Bool])),
+                ScalarTargetLayout::WASM32,
             )
             .expect("aggregate function type")
             .1,
@@ -4402,6 +4504,7 @@ mod tests {
             function_type(
                 &context,
                 &callable(sequence(vec![ScalarType::Unit, ScalarType::I32])),
+                ScalarTargetLayout::WASM32,
             )
             .expect("unit aggregate function type")
             .1,
@@ -6316,6 +6419,81 @@ child.marker = child.touch();
             "{text}"
         );
         assert!(text.contains("ptrtoint"), "{text}");
+    }
+
+    #[test]
+    fn emits_wasm32_pointer_struct_layout_for_wasi_iovec() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/wasi.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\nstruct WasiIovec {\n\t*?u8 buf;\n\tu32 len;\n}\nWasiIovec iovec = { .buf = null; .len = 2; };\nunsafe { *?u32 len_address = &?iovec.len; };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_llvm(&validation)
+            .expect("WASI iovec LLVM")
+            .to_text();
+        assert!(
+            text.contains("@iovec = internal global [8 x i8] zeroinitializer"),
+            "{text}"
+        );
+        assert!(text.contains("store i32 0"), "{text}");
+        assert!(
+            text.contains("getelementptr inbounds i8, ptr %struct_literal, i8 4"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn emits_native64_pointer_struct_layout_literals_and_field_addresses() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let parsed = parse_source(
+            source,
+            "%%start\nstruct Pair {\n\t*?u8 address;\n\tu32 count;\n}\nPair item = { .address = null; .count = 2; };\nunsafe { *?u32 count_address = &?item.count; };\n%%end".into(),
+            &[],
+        );
+        let validation =
+            crate::derive_scalar_program_with_layout(&parsed.result, ScalarTargetLayout::NATIVE64);
+
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_llvm(&validation)
+            .expect("native struct LLVM")
+            .to_text();
+        assert!(
+            text.contains("@item = internal global [16 x i8] zeroinitializer"),
+            "{text}"
+        );
+        assert!(text.contains("store i64 0"), "{text}");
+        assert!(
+            text.contains("getelementptr inbounds i8, ptr %struct_literal, i8 8"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ptrtoint (ptr getelementptr inbounds (i8, ptr @item, i8 8) to i64)"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 ; ModuleID = 'src/main.w'
 source_filename = "src/main.w"
 
+@pair = internal global [16 x i8] zeroinitializer
 @quotient = internal global i32 0
 @remainder = internal global i32 0
 @computed_quotient = internal global i32 0
@@ -17,6 +18,13 @@ entry:
 
 define i32 @main() {
 entry:
+  %struct_literal = alloca [16 x i8], align 1
+  %address = getelementptr inbounds i8, ptr %struct_literal, i8 0
+  store i64 0, ptr %address, align 4
+  %count = getelementptr inbounds i8, ptr %struct_literal, i8 8
+  store i32 42, ptr %count, align 4
+  %struct_value = load [16 x i8], ptr %struct_literal, align 1
+  store [16 x i8] %struct_value, ptr @pair, align 1
   store i32 -2, ptr @quotient, align 4
   store i32 -1, ptr @remainder, align 4
   %call = call i32 @negate(i32 7)
