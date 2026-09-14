@@ -209,6 +209,9 @@ fn scalar_type_equal(left: &ScalarType, right: &ScalarType) -> bool {
         (ScalarType::RawPointer(left), ScalarType::RawPointer(right)) => {
             scalar_type_equal(left, right)
         }
+        (ScalarType::Named { name: left, .. }, ScalarType::Named { name: right, .. }) => {
+            left == right
+        }
         (
             ScalarType::Callable {
                 outputs: left_outputs,
@@ -235,6 +238,58 @@ fn scalar_type_equal(left: &ScalarType, right: &ScalarType) -> bool {
         (ScalarType::Callable { .. }, _) | (_, ScalarType::Callable { .. }) => false,
         _ => left == right,
     }
+}
+
+fn substitute_type(ty: &ScalarType, substitutions: &BTreeMap<String, ScalarType>) -> ScalarType {
+    match ty {
+        ScalarType::Named { name, .. } => substitutions
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| ty.clone()),
+        ScalarType::RawPointer(inner) => {
+            ScalarType::RawPointer(Box::new(substitute_type(inner, substitutions)))
+        }
+        ScalarType::Callable {
+            outputs,
+            parameters,
+        } => ScalarType::Callable {
+            outputs: ScalarOutputSequence {
+                outputs: outputs
+                    .outputs
+                    .iter()
+                    .map(|output| ScalarOutput {
+                        ty: substitute_type(&output.ty, substitutions),
+                        span: output.span,
+                    })
+                    .collect(),
+                span: outputs.span,
+            },
+            parameters: parameters
+                .iter()
+                .map(|parameter| substitute_type(parameter, substitutions))
+                .collect(),
+        },
+        _ => ty.clone(),
+    }
+}
+
+fn substitute_generic_callable(
+    signature: &ScalarType,
+    parameters: &[ScalarGenericParameter],
+    type_arguments: &[ScalarTypeArgument],
+) -> Option<ScalarType> {
+    if parameters.is_empty() {
+        return Some(signature.clone());
+    }
+    if parameters.len() != type_arguments.len() {
+        return None;
+    }
+    let substitutions = parameters
+        .iter()
+        .zip(type_arguments)
+        .map(|(parameter, argument)| (parameter.name.clone(), argument.ty.clone()))
+        .collect();
+    Some(substitute_type(signature, &substitutions))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -438,6 +493,13 @@ pub struct ScalarFunction {
     pub parameter_spans: Vec<ByteSpan>,
     pub body: ScalarBlock,
     pub span: ByteSpan,
+    pub generic_parameters: Vec<ScalarGenericParameter>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarGenericParameter {
+    pub name: String,
+    pub span: ByteSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -612,14 +674,25 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
             )
         })
         .collect();
+    let mut generic_function = false;
     for node in source_root.children() {
         match node.kind() {
             SyntaxKind::NamespaceDecl => items.push(ScalarItem::Namespace(derive_namespace(&node))),
             SyntaxKind::ExternDecl => items.push(ScalarItem::Extern(derive_extern(&node))),
             SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node))),
-            SyntaxKind::FunctionDecl => items.push(ScalarItem::Function(derive_function(&node))),
+            SyntaxKind::FunctionDecl if !generic_function => {
+                items.push(ScalarItem::Function(derive_function(&node)))
+            }
+            SyntaxKind::GenericFunctionDecl => {
+                items.push(ScalarItem::Function(derive_generic_function(&node)));
+                generic_function = true;
+            }
             SyntaxKind::Item => {
-                for item in node.children() {
+                let item_children = node.children().collect::<Vec<_>>();
+                let has_generic_function = item_children
+                    .iter()
+                    .any(|item| item.kind() == SyntaxKind::GenericFunctionDecl);
+                for item in item_children {
                     match item.kind() {
                         SyntaxKind::NamespaceDecl => {
                             items.push(ScalarItem::Namespace(derive_namespace(&item)))
@@ -630,8 +703,11 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
                         SyntaxKind::BindingDecl => {
                             items.push(ScalarItem::Binding(derive_binding(&item)))
                         }
-                        SyntaxKind::FunctionDecl => {
+                        SyntaxKind::FunctionDecl if !has_generic_function => {
                             items.push(ScalarItem::Function(derive_function(&item)))
+                        }
+                        SyntaxKind::GenericFunctionDecl => {
+                            items.push(ScalarItem::Function(derive_generic_function(&item)))
                         }
                         SyntaxKind::TopLevelItem => {
                             items.push(ScalarItem::Executable(derive_executable_item(&item)))
@@ -641,6 +717,9 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
                 }
             }
             _ => {}
+        }
+        if node.kind() != SyntaxKind::GenericFunctionDecl {
+            generic_function = false;
         }
     }
     let mut program = ScalarProgram {
@@ -706,7 +785,9 @@ fn resolve_program_types(program: &mut ScalarProgram) {
                     .collect();
             }
             ScalarItem::Function(function) => {
-                function.signature = resolve_type(&function.signature, &names);
+                if function.generic_parameters.is_empty() {
+                    function.signature = resolve_type(&function.signature, &names);
+                }
                 if let ScalarType::Callable { outputs, .. } = &function.signature {
                     for (value, output) in function
                         .body
@@ -1054,7 +1135,21 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                             declarations.insert(receiver.name.clone(), receiver.ty.clone());
                         }
                     }
-                    validate_module_type(module, ty, span, &mut diagnostics);
+                    if let ScalarItem::Function(function) = item {
+                        if function.generic_parameters.is_empty() {
+                            validate_module_type(module, ty, span, &mut diagnostics);
+                        } else {
+                            validate_module_generic_type(
+                                module,
+                                ty,
+                                span,
+                                &function.generic_parameters,
+                                &mut diagnostics,
+                            );
+                        }
+                    } else {
+                        validate_module_type(module, ty, span, &mut diagnostics);
+                    }
                 }
             }
         }
@@ -1339,8 +1434,10 @@ fn resolve_module_types_in_project(module: &mut ScalarModule, modules: &[ScalarM
                 }
             }
             ScalarItem::Function(function) => {
-                function.signature =
-                    resolve_type_in_project(&function.signature, &names, &context, modules);
+                if function.generic_parameters.is_empty() {
+                    function.signature =
+                        resolve_type_in_project(&function.signature, &names, &context, modules);
+                }
                 if let ScalarType::Callable { outputs, .. } = &function.signature {
                     for (value, output) in function
                         .body
@@ -1787,6 +1884,48 @@ fn validate_module_type(
     }
 }
 
+fn validate_module_generic_type(
+    module: &ScalarModule,
+    ty: &ScalarType,
+    span: ByteSpan,
+    generic_parameters: &[ScalarGenericParameter],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    match ty {
+        ScalarType::Named { name, .. }
+            if generic_parameters
+                .iter()
+                .any(|parameter| parameter.name == *name) => {}
+        ScalarType::RawPointer(inner) => {
+            validate_module_generic_type(module, inner, span, generic_parameters, diagnostics)
+        }
+        ScalarType::Callable {
+            outputs,
+            parameters,
+        } => {
+            for output in &outputs.outputs {
+                validate_module_generic_type(
+                    module,
+                    &output.ty,
+                    output.span,
+                    generic_parameters,
+                    diagnostics,
+                );
+            }
+            for parameter in parameters {
+                validate_module_generic_type(
+                    module,
+                    parameter,
+                    span,
+                    generic_parameters,
+                    diagnostics,
+                );
+            }
+        }
+        _ => validate_module_type(module, ty, span, diagnostics),
+    }
+}
+
 fn validate_extern(
     module: &ScalarModule,
     extern_decl: &ScalarExtern,
@@ -1820,39 +1959,60 @@ fn call_output_sequence_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
 ) -> Option<ScalarOutputSequence> {
-    let ScalarExpression::Call { receiver, name, .. } = expression else {
+    let ScalarExpression::Call {
+        receiver,
+        name,
+        type_arguments,
+        ..
+    } = expression
+    else {
         return None;
     };
-    let callable = match receiver {
-        None => scope.get(name),
+    let (callable, target) = match receiver {
+        None => (scope.get(name), module),
         Some(binding) => {
             let namespace = module
                 .namespace_bindings
                 .iter()
                 .find(|namespace| namespace.binding == *binding);
             if let Some(namespace) = namespace {
-                modules
+                let target = modules
                     .iter()
-                    .find(|candidate| candidate.source == namespace.target)
-                    .and_then(|target| target.members.get(name))
+                    .find(|candidate| candidate.source == namespace.target)?;
+                (target.members.get(name), target)
             } else {
-                module.items.iter().find_map(|item| match item {
-                    ScalarItem::Extern(extern_decl) if extern_decl.binding == *binding => {
-                        extern_decl
-                            .functions
-                            .iter()
-                            .find(|function| function.name == *name)
-                            .map(|function| &function.signature)
-                    }
-                    _ => None,
-                })
+                (
+                    module.items.iter().find_map(|item| match item {
+                        ScalarItem::Extern(extern_decl) if extern_decl.binding == *binding => {
+                            extern_decl
+                                .functions
+                                .iter()
+                                .find(|function| function.name == *name)
+                                .map(|function| &function.signature)
+                        }
+                        _ => None,
+                    }),
+                    module,
+                )
             }
         }
-    }?;
+    };
+    let callable = callable?;
+    let generic_parameters = target.items.iter().find_map(|item| match item {
+        ScalarItem::Function(function) if function.name == *name => {
+            Some(&function.generic_parameters)
+        }
+        _ => None,
+    });
+    let callable = if let Some(parameters) = generic_parameters {
+        substitute_generic_callable(callable, parameters, type_arguments)?
+    } else {
+        callable.clone()
+    };
     let ScalarType::Callable { outputs, .. } = callable else {
         return None;
     };
-    Some(outputs.clone())
+    Some(outputs)
 }
 
 fn call_output_sequence(
@@ -1860,7 +2020,13 @@ fn call_output_sequence(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
 ) -> Option<ScalarOutputSequence> {
-    let ScalarExpression::Call { receiver, name, .. } = expression else {
+    let ScalarExpression::Call {
+        receiver,
+        name,
+        type_arguments,
+        ..
+    } = expression
+    else {
         return None;
     };
     let callable = if receiver.is_none() {
@@ -1879,10 +2045,23 @@ fn call_output_sequence(
             _ => None,
         })
     }?;
+    let generic_parameters = receiver.is_none().then(|| {
+        program.items.iter().find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == *name => {
+                Some(&function.generic_parameters)
+            }
+            _ => None,
+        })
+    });
+    let callable = if let Some(Some(parameters)) = generic_parameters {
+        substitute_generic_callable(callable, parameters, type_arguments)?
+    } else {
+        callable.clone()
+    };
     let ScalarType::Callable { outputs, .. } = callable else {
         return None;
     };
-    Some(outputs.clone())
+    Some(outputs)
 }
 
 fn scalar_call_result(outputs: &ScalarOutputSequence) -> ScalarType {
@@ -3160,10 +3339,32 @@ fn expression_type_in_module(
                 ));
                 return ScalarType::Error;
             };
+            let generic_parameters = target.items.iter().find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == *name => {
+                    Some(&function.generic_parameters)
+                }
+                _ => None,
+            });
+            let callable = if let Some(generic_parameters) = generic_parameters {
+                let Some(callable) =
+                    substitute_generic_callable(&callable, generic_parameters, type_arguments)
+                else {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0004",
+                        "generic argument arity does not match callable declaration",
+                        *span,
+                    ));
+                    return ScalarType::Error;
+                };
+                callable
+            } else {
+                callable.clone()
+            };
             let ScalarType::Callable {
                 outputs,
                 parameters,
-            } = callable
+            } = &callable
             else {
                 diagnostics.push(module_diagnostic(
                     module,
@@ -4578,7 +4779,34 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         parameter_spans,
         body,
         span: wosy_syntax::byte_span(node),
+        generic_parameters: Vec::new(),
     }
+}
+
+fn derive_generic_parameters(node: &CstNode) -> Vec<ScalarGenericParameter> {
+    direct_token(node, SyntaxKind::Identifier)
+        .map(|token| {
+            vec![ScalarGenericParameter {
+                name: token.text().to_owned(),
+                span: token_span(&token),
+            }]
+        })
+        .unwrap_or_default()
+}
+
+fn derive_generic_function(node: &CstNode) -> ScalarFunction {
+    let generic = direct_nodes(node)
+        .into_iter()
+        .find(|child| child.kind() == SyntaxKind::GenericDecl)
+        .expect("generic declaration");
+    let function = direct_nodes(node)
+        .into_iter()
+        .find(|child| child.kind() == SyntaxKind::FunctionDecl)
+        .expect("generic function declaration");
+    let mut function = derive_function(&function);
+    function.generic_parameters = derive_generic_parameters(&generic);
+    function.span = wosy_syntax::byte_span(node);
+    function
 }
 
 fn expand_conditional_final_outputs(block: &mut ScalarBlock, output_count: usize) {
@@ -5865,7 +6093,21 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                         declarations.insert(receiver.name.clone(), receiver.ty.clone());
                     }
                 }
-                validate_type(program, ty, span, &mut diagnostics);
+                if let ScalarItem::Function(function) = item {
+                    if function.generic_parameters.is_empty() {
+                        validate_type(program, ty, span, &mut diagnostics);
+                    } else {
+                        validate_generic_type(
+                            program,
+                            ty,
+                            span,
+                            &function.generic_parameters,
+                            &mut diagnostics,
+                        );
+                    }
+                } else {
+                    validate_type(program, ty, span, &mut diagnostics);
+                }
             }
         }
     }
@@ -6313,6 +6555,42 @@ fn validate_type(
         ScalarType::Error => {
             diagnostics.push(diagnostic(program, "B0003", "invalid scalar type", span))
         }
+    }
+}
+
+fn validate_generic_type(
+    program: &ScalarProgram,
+    ty: &ScalarType,
+    span: ByteSpan,
+    generic_parameters: &[ScalarGenericParameter],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    match ty {
+        ScalarType::Named { name, .. }
+            if generic_parameters
+                .iter()
+                .any(|parameter| parameter.name == *name) => {}
+        ScalarType::RawPointer(inner) => {
+            validate_generic_type(program, inner, span, generic_parameters, diagnostics)
+        }
+        ScalarType::Callable {
+            outputs,
+            parameters,
+        } => {
+            for output in &outputs.outputs {
+                validate_generic_type(
+                    program,
+                    &output.ty,
+                    output.span,
+                    generic_parameters,
+                    diagnostics,
+                );
+            }
+            for parameter in parameters {
+                validate_generic_type(program, parameter, span, generic_parameters, diagnostics);
+            }
+        }
+        _ => validate_type(program, ty, span, diagnostics),
     }
 }
 
@@ -6908,10 +7186,38 @@ fn expression_type(
                             })
                 )
             });
-            let Some(ScalarType::Callable {
+            let Some(callable) = callable else {
+                diagnostics.push(diagnostic(program, "B0001", "unknown callable name", *span));
+                return ScalarType::Error;
+            };
+            let generic_parameters = (receiver.is_none()).then(|| {
+                program.items.iter().find_map(|item| match item {
+                    ScalarItem::Function(function) if function.name == *name => {
+                        Some(&function.generic_parameters)
+                    }
+                    _ => None,
+                })
+            });
+            let callable = if let Some(Some(generic_parameters)) = generic_parameters {
+                let Some(callable) =
+                    substitute_generic_callable(&callable, generic_parameters, type_arguments)
+                else {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "B0004",
+                        "generic argument arity does not match callable declaration",
+                        *span,
+                    ));
+                    return ScalarType::Error;
+                };
+                callable
+            } else {
+                callable
+            };
+            let ScalarType::Callable {
                 outputs,
                 parameters,
-            }) = callable
+            } = callable
             else {
                 diagnostics.push(diagnostic(program, "B0001", "unknown callable name", *span));
                 return ScalarType::Error;
@@ -8845,6 +9151,43 @@ bool integer_inversion = !1;
         let call_span = expression_span(&binding.value);
         assert_eq!(binding.output_values[0].span, call_span);
         assert_eq!(binding.output_values[1].span, call_span);
+    }
+
+    #[test]
+    fn derives_and_substitutes_scoped_generic_function_parameters() {
+        let result = validate_text(
+            "%%start\ngeneric T;\nT(T) identity = fn(value) { value };\ni64 result = identity<i64>(1);\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Function(function) = &result.program.items[0] else {
+            panic!("generic function");
+        };
+        assert_eq!(function.generic_parameters.len(), 1);
+        assert_eq!(function.generic_parameters[0].name, "T");
+        let ScalarItem::Binding(binding) = &result.program.items[1] else {
+            panic!("generic call binding");
+        };
+        assert_eq!(binding.declared_type, ScalarType::I64);
+    }
+
+    #[test]
+    fn substitutes_generic_zero_one_and_multiple_outputs_in_single_file_and_project() {
+        let text = "%%start\ngeneric T;\nT(T) identity = fn(value) { value };\ngeneric T;\nunit(T) discard = fn(value) { value; };\ngeneric T;\n(T, T)(T) pair = fn(value) { value };\ni64 one = identity<i64>(1);\ndiscard<i64>(1);\ni64 first, i64 second = pair<i64>(1);\n%%end";
+        let single = validate_text(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let ScalarItem::Binding(binding) = &single.program.items[5] else {
+            panic!("multiple-output binding");
+        };
+        assert_eq!(binding.output_sequence.outputs[0].ty, ScalarType::I64);
+        assert_eq!(binding.output_sequence.outputs[1].ty, ScalarType::I64);
+
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
     }
 
     #[test]
