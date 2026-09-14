@@ -1884,62 +1884,48 @@ fn emit_assignment<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     assignment: &ScalarAssignment,
 ) -> Result<EmitValue<'ctx>, String> {
-    let expected = state
-        .storage
-        .get(&assignment.target)
-        .map(|(_, ty)| ty.clone())
-        .or_else(|| {
-            state
-                .globals
-                .get(&assignment.target)
-                .map(|(_, ty)| ty.clone())
-        });
+    let expected = assignment_target_type(state, &assignment.targets[0]);
     let value = match expected {
-        Some(ty) => emit_typed_expression(context, state, &assignment.value, &ty)?,
+        Some(ref ty) => emit_typed_expression(context, state, &assignment.value, ty)?,
         None => emit_expression(context, state, &assignment.value)?,
     };
-    let old = if assignment.receiver.is_some() {
-        return Err(format!(
-            "unknown LLVM storage {}.{}",
-            assignment.receiver.as_deref().expect("assignment receiver"),
-            assignment.target
-        ));
-    } else if let Some((slot, ty)) = state.storage.get(&assignment.target).cloned() {
-        let value = take_basic(value)?;
-        let old = state
-            .builder
-            .build_load(storage_type(context, &ty, state.structs)?, slot, "old")
-            .map_err(builder_error)?;
-        state
-            .builder
-            .build_store(slot, value)
-            .map_err(builder_error)?;
-        old
-    } else if let Some((global, ty)) = state.globals.get(&assignment.target).cloned() {
-        let value = take_basic(value)?;
-        let slot = global.as_pointer_value();
-        let old = state
-            .builder
-            .build_load(storage_type(context, &ty, state.structs)?, slot, "old")
-            .map_err(builder_error)?;
-        state
-            .builder
-            .build_store(slot, value)
-            .map_err(builder_error)?;
-        old
-    } else {
-        match state.values.get(&assignment.target) {
-            Some(EmitValue::Unit) => return Ok(EmitValue::Unit),
-            Some(EmitValue::Basic(_)) => {
-                return Err(format!("unknown LLVM storage {}", assignment.target))
-            }
-            Some(EmitValue::Aggregate { .. }) => {
-                return Err(format!("unknown LLVM storage {}", assignment.target))
-            }
-            None => return Err(format!("unknown LLVM storage {}", assignment.target)),
+    let values = materialize_assignment_values(context, state, assignment, value, expected)?;
+    for (target, (value, ty)) in assignment.targets.iter().zip(values) {
+        if target.receiver.is_some() {
+            return Err(format!(
+                "unknown LLVM storage {}.{}",
+                target.receiver.as_deref().expect("assignment receiver"),
+                target.target
+            ));
         }
-    };
-    Ok(EmitValue::Basic(old))
+        if ty == ScalarType::Unit {
+            state.values.insert(target.target.clone(), EmitValue::Unit);
+            continue;
+        }
+        let destination = match &target.place {
+            crate::ScalarPlace::Name { name, .. } => {
+                match state.storage.get(name).map(|(slot, _)| *slot).or_else(|| {
+                    state
+                        .globals
+                        .get(name)
+                        .map(|(global, _)| global.as_pointer_value())
+                }) {
+                    Some(destination) => destination,
+                    None => {
+                        let slot = state
+                            .builder
+                            .build_alloca(storage_type(context, &ty, state.structs)?, name)
+                            .map_err(builder_error)?;
+                        state.storage.insert(name.clone(), (slot, ty.clone()));
+                        slot
+                    }
+                }
+            }
+            place => place_pointer(context, state, place)?,
+        };
+        store_value(context, state, destination, &ty, value)?;
+    }
+    Ok(EmitValue::Unit)
 }
 fn emit_project_assignment<'ctx, 'module>(
     context: &'ctx Context,
@@ -1948,62 +1934,182 @@ fn emit_project_assignment<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
-    let value = emit_project_expression(context, state, &assignment.value, module, modules)?;
-    let old = if let Some(receiver) = &assignment.receiver {
+    let expected = if let Some(receiver) = &assignment.targets[0].receiver {
         let target = project_namespace_target(module, modules, receiver)?;
-        let (global, ty) = project_member_global(state, target, &assignment.target)?;
-        if ty == ScalarType::Unit {
-            return Ok(EmitValue::Unit);
-        }
-        let value = take_basic(value)?;
-        let global =
-            global.ok_or_else(|| format!("unknown LLVM member storage {}", assignment.target))?;
-        let slot = global.as_pointer_value();
-        let old = state
-            .builder
-            .build_load(storage_type(context, &ty, state.structs)?, slot, "old")
-            .map_err(builder_error)?;
-        state
-            .builder
-            .build_store(slot, value)
-            .map_err(builder_error)?;
-        old
-    } else if let Some((slot, ty)) = state.storage.get(&assignment.target).cloned() {
-        let value = take_basic(value)?;
-        let old = state
-            .builder
-            .build_load(storage_type(context, &ty, state.structs)?, slot, "old")
-            .map_err(builder_error)?;
-        state
-            .builder
-            .build_store(slot, value)
-            .map_err(builder_error)?;
-        old
-    } else if let Some((global, ty)) = state.globals.get(&assignment.target).cloned() {
-        let value = take_basic(value)?;
-        let slot = global.as_pointer_value();
-        let old = state
-            .builder
-            .build_load(storage_type(context, &ty, state.structs)?, slot, "old")
-            .map_err(builder_error)?;
-        state
-            .builder
-            .build_store(slot, value)
-            .map_err(builder_error)?;
-        old
+        Some(project_member_global(state, target, &assignment.targets[0].target)?.1)
     } else {
-        match state.values.get(&assignment.target) {
-            Some(EmitValue::Unit) => return Ok(EmitValue::Unit),
-            Some(EmitValue::Basic(_)) => {
-                return Err(format!("unknown LLVM storage {}", assignment.target))
-            }
-            Some(EmitValue::Aggregate { .. }) => {
-                return Err(format!("unknown LLVM storage {}", assignment.target))
-            }
-            None => return Err(format!("unknown LLVM storage {}", assignment.target)),
-        }
+        assignment_target_type(state, &assignment.targets[0])
     };
-    Ok(EmitValue::Basic(old))
+    let value = match expected {
+        Some(ref ty) => {
+            emit_project_typed_expression(context, state, &assignment.value, ty, module, modules)?
+        }
+        None => emit_project_expression(context, state, &assignment.value, module, modules)?,
+    };
+    let values = materialize_assignment_values(context, state, assignment, value, expected)?;
+    for (target, (value, ty)) in assignment.targets.iter().zip(values) {
+        if ty == ScalarType::Unit {
+            state.values.insert(target.target.clone(), EmitValue::Unit);
+            continue;
+        }
+        let destination = if let Some(receiver) = &target.receiver {
+            let target_module = project_namespace_target(module, modules, receiver)?;
+            let (global, _) = project_member_global(state, target_module, &target.target)?;
+            global
+                .ok_or_else(|| format!("unknown LLVM member storage {}", target.target))?
+                .as_pointer_value()
+        } else {
+            match &target.place {
+                crate::ScalarPlace::Name { name, .. } => {
+                    match state.storage.get(name).map(|(slot, _)| *slot).or_else(|| {
+                        state
+                            .globals
+                            .get(name)
+                            .map(|(global, _)| global.as_pointer_value())
+                    }) {
+                        Some(destination) => destination,
+                        None => {
+                            let slot = state
+                                .builder
+                                .build_alloca(storage_type(context, &ty, state.structs)?, name)
+                                .map_err(builder_error)?;
+                            state.storage.insert(name.clone(), (slot, ty.clone()));
+                            slot
+                        }
+                    }
+                }
+                place => place_pointer(context, state, place)?,
+            }
+        };
+        store_value(context, state, destination, &ty, value)?;
+    }
+    Ok(EmitValue::Unit)
+}
+
+fn assignment_target_type<'ctx, 'module>(
+    state: &EmitState<'ctx, 'module>,
+    target: &crate::scalar::ScalarAssignmentTarget,
+) -> Option<ScalarType> {
+    assignment_place_type(state, &target.place)
+}
+
+fn assignment_place_type<'ctx, 'module>(
+    state: &EmitState<'ctx, 'module>,
+    place: &crate::ScalarPlace,
+) -> Option<ScalarType> {
+    match place {
+        crate::ScalarPlace::Name { name, .. } => state
+            .storage
+            .get(name.as_str())
+            .map(|(_, ty)| ty.clone())
+            .or_else(|| state.globals.get(name.as_str()).map(|(_, ty)| ty.clone())),
+        crate::ScalarPlace::Field { field, .. } => match field {
+            ScalarFieldReference::Resolved(field) => {
+                structure(state.structs, field.structure.clone())
+                    .ok()?
+                    .fields
+                    .get(field.index)
+                    .filter(|candidate| candidate.id == *field)
+                    .map(|field| field.ty.clone())
+            }
+            ScalarFieldReference::Unresolved { .. } => None,
+        },
+        crate::ScalarPlace::Dereference { pointer, .. } => raw_pointer_target_type(state, pointer),
+    }
+}
+
+fn raw_pointer_target_type<'ctx, 'module>(
+    state: &EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
+) -> Option<ScalarType> {
+    match expression {
+        ScalarExpression::Name { name, .. } => state
+            .storage
+            .get(name)
+            .map(|(_, ty)| ty)
+            .or_else(|| state.globals.get(name).map(|(_, ty)| ty))
+            .and_then(|ty| match ty {
+                ScalarType::RawPointer(inner) => Some(*inner.clone()),
+                _ => None,
+            }),
+        ScalarExpression::RawAddress { place, .. } => assignment_place_type(state, place),
+        _ => None,
+    }
+}
+
+fn materialize_assignment_values<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    assignment: &ScalarAssignment,
+    value: EmitValue<'ctx>,
+    expected: Option<ScalarType>,
+) -> Result<Vec<(EmitValue<'ctx>, ScalarType)>, String> {
+    let output_types = match &value {
+        EmitValue::Aggregate { outputs, .. } => outputs.clone(),
+        EmitValue::Unit => vec![ScalarType::Unit],
+        EmitValue::Basic(value) => vec![expected
+            .or_else(|| assignment_target_type(state, &assignment.targets[0]))
+            .unwrap_or_else(|| basic_value_type(*value))],
+    };
+    assignment
+        .targets
+        .iter()
+        .enumerate()
+        .zip(output_types)
+        .map(|((position, target), ty)| {
+            let value = extract_output(state, value.clone(), position)?;
+            if ty == ScalarType::Unit {
+                return Ok((EmitValue::Unit, ty));
+            }
+            let temporary = state
+                .builder
+                .build_alloca(
+                    storage_type(context, &ty, state.structs)?,
+                    "assignment_value",
+                )
+                .map_err(builder_error)?;
+            store_value(context, state, temporary, &ty, value)?;
+            let value = if matches!(ty, ScalarType::Struct(_)) {
+                EmitValue::Basic(temporary.into())
+            } else {
+                EmitValue::Basic(
+                    state
+                        .builder
+                        .build_load(basic_type(context, &ty)?, temporary, "assignment_value")
+                        .map_err(builder_error)?,
+                )
+            };
+            let ty = assignment_target_type(state, target).unwrap_or(ty);
+            Ok((value, ty))
+        })
+        .collect()
+}
+
+fn basic_value_type(value: BasicValueEnum<'_>) -> ScalarType {
+    match value {
+        BasicValueEnum::IntValue(value) => match value.get_type().get_bit_width() {
+            1 => ScalarType::Bool,
+            8 => ScalarType::I8,
+            16 => ScalarType::I16,
+            32 => ScalarType::I32,
+            64 => ScalarType::I64,
+            128 => ScalarType::I128,
+            width => panic!("unsupported LLVM integer width {width}"),
+        },
+        BasicValueEnum::FloatValue(value)
+            if value.get_type() == value.get_type().get_context().f32_type() =>
+        {
+            ScalarType::F32
+        }
+        BasicValueEnum::FloatValue(_) => ScalarType::F64,
+        BasicValueEnum::PointerValue(_) => ScalarType::RawPointer(Box::new(ScalarType::I8)),
+        BasicValueEnum::ArrayValue(_)
+        | BasicValueEnum::StructValue(_)
+        | BasicValueEnum::VectorValue(_)
+        | BasicValueEnum::ScalableVectorValue(_) => {
+            panic!("unsupported inferred LLVM assignment value")
+        }
+    }
 }
 
 fn emit_block_item<'ctx, 'module>(
@@ -4953,6 +5059,50 @@ u64 reported, bool complete = text.print(\"\");
     }
 
     #[test]
+    fn materializes_multi_output_assignments_before_ordered_writes() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\n(i32, i32)(i32, i32) pair = fn(first, second) { first, second };\ni32() swap = fn { i32 left = 1; i32 right = 2; right, left = pair(left, right); left };\ni32() inferred = fn { first, second = pair(3, 4); first + second };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_llvm(&validation)
+            .expect("ordered assignment LLVM")
+            .to_text();
+        let swap = text.split("define i32 @swap").nth(1).expect("swap");
+        let call = swap.find("call { i32, i32 } @pair").expect("pair call");
+        let first_output = swap
+            .find("extractvalue { i32, i32 } %call, 0")
+            .expect("first output");
+        let second_output = swap
+            .find("extractvalue { i32, i32 } %call, 1")
+            .expect("second output");
+        let right_store = swap.rfind("ptr %right").expect("right store");
+        let left_store = swap.rfind("ptr %left").expect("left store");
+        assert!(call < first_output, "{swap}");
+        assert!(first_output < second_output, "{swap}");
+        assert!(second_output < right_store, "{swap}");
+        assert!(right_store < left_store, "{swap}");
+
+        let inferred = text.split("define i32 @inferred").nth(1).expect("inferred");
+        assert!(inferred.contains("%first = alloca i32"), "{inferred}");
+        assert!(inferred.contains("%second = alloca i32"), "{inferred}");
+    }
+
+    #[test]
     fn emits_distinct_independent_output_values_in_source_order() {
         let source = SourceIdentity::new(
             "project".into(),
@@ -5487,7 +5637,11 @@ u64 reported, bool complete = text.print(\"\");
             .to_text();
         let global = project_global_name(&child_source, "value");
         let main = text.split("define i32 @main").nth(1).expect("main");
-        assert!(main.contains(&format!("store i32 %add, ptr @{global}")));
+        let temporary_store = main.find("store i32 %add, ptr %assignment_value");
+        let member_store = main.rfind(&format!("ptr @{global}"));
+        assert!(temporary_store.is_some(), "{main}");
+        assert!(member_store.is_some(), "{main}");
+        assert!(temporary_store < member_store, "{main}");
         let read = text
             .split(&format!(
                 "define i32 @{}",
