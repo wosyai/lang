@@ -3036,7 +3036,12 @@ fn expression_type_in_module(
                 }
                 let actual = expression_type_in_module_expected(
                     &arguments[0],
-                    Some(&std_utf8_type(module, modules, *span, diagnostics)),
+                    Some(&utf8_type_from_namespace_target(
+                        module,
+                        modules,
+                        *span,
+                        diagnostics,
+                    )),
                     scope,
                     visible_names,
                     folded_names,
@@ -3045,7 +3050,7 @@ fn expression_type_in_module(
                     diagnostics,
                     unsafe_context,
                 );
-                let expected = std_utf8_type(module, modules, *span, diagnostics);
+                let expected = utf8_type_from_namespace_target(module, modules, *span, diagnostics);
                 expect_module_type(module, &expected, &actual, *span, diagnostics);
                 return if is_error_type(&actual) {
                     ScalarType::Error
@@ -3438,11 +3443,11 @@ fn expression_type_in_module_expected(
             ));
             return ScalarType::Error;
         };
-        let std_utf8 = std_utf8_type(module, modules, *span, diagnostics);
-        if scalar_type_equal(&std_utf8, expected) {
-            return std_utf8;
+        if let Some(utf8) = utf8_type_from_context(module, modules, expected) {
+            return utf8;
         }
-        expect_module_type(module, &std_utf8, expected, *span, diagnostics);
+        let utf8 = utf8_type_from_namespace_target(module, modules, *span, diagnostics);
+        expect_module_type(module, &utf8, expected, *span, diagnostics);
         return ScalarType::Error;
     }
     if let ScalarExpression::StructLiteral { fields, span } = expression {
@@ -3752,7 +3757,7 @@ fn expression_type_in_module_expected(
     )
 }
 
-fn std_utf8_type(
+fn utf8_type_from_namespace_target(
     module: &ScalarModule,
     modules: &[ScalarModule],
     span: ByteSpan,
@@ -3761,18 +3766,13 @@ fn std_utf8_type(
     let structure = module
         .namespace_bindings
         .iter()
-        .find(|binding| binding.binding == "std")
-        .and_then(|binding| {
+        .filter_map(|binding| {
             modules
                 .iter()
                 .find(|candidate| candidate.source == binding.target)
         })
-        .and_then(|stdlib| {
-            stdlib
-                .structs
-                .iter()
-                .find(|structure| structure.name == "utf8")
-        });
+        .flat_map(|target| target.structs.iter())
+        .find(|structure| structure.name == "utf8");
     match structure {
         Some(structure) => ScalarType::Struct(structure.id.clone()),
         None => {
@@ -3785,6 +3785,28 @@ fn std_utf8_type(
             ScalarType::Error
         }
     }
+}
+
+fn utf8_type_from_context(
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    expected: &ScalarType,
+) -> Option<ScalarType> {
+    let ScalarType::Struct(expected_id) = expected else {
+        return None;
+    };
+    module
+        .namespace_bindings
+        .iter()
+        .filter(|binding| binding.target == expected_id.source)
+        .filter_map(|binding| {
+            modules
+                .iter()
+                .find(|candidate| candidate.source == binding.target)
+        })
+        .flat_map(|target| target.structs.iter())
+        .find(|structure| structure.id == *expected_id && structure.name == "utf8")
+        .map(|structure| ScalarType::Struct(structure.id.clone()))
 }
 
 fn field_type_in_module(
@@ -10323,7 +10345,7 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
     }
 
     #[test]
-    fn resolves_imported_struct_field_reads_and_preserves_namespace_members() {
+    fn resolves_utf8_literals_through_aliased_namespace_targets() {
         let std_source = module_source("src/bootstrap.w");
         let std = module_from_text(
             std_source.clone(),
@@ -10333,7 +10355,7 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         let main_source = module_source("src/main.w");
         let main = module_from_text(
             main_source.clone(),
-            "%%start\nstd = namespace std \"src/bootstrap.w\";\ni32 observed = std.value;\nstd.utf8 text = \"hé\";\n*?u8 data = text.data;\nu64 length = text.length;\nunsafe { *?std.utf8 pointer = &?text; *?u8 pointer_data = pointer.data; u64 pointer_length = pointer.length; };\n%%end",
+            "%%start\ntext = namespace std \"src/bootstrap.w\";\nstd = namespace std \"src/bootstrap.w\";\ni32 observed = text.value;\nstd.utf8 standard = \"\";\ntext.utf8 literal = \"hé\";\n*?u8 data = literal.data;\nu64 length = literal.length;\nunsafe { *?text.utf8 pointer = &?literal; *?u8 pointer_data = pointer.data; u64 pointer_length = pointer.length; };\n%%end",
         );
         let namespace_span = match &main.items[0] {
             ScalarItem::Namespace(namespace) => namespace.span,
@@ -10344,11 +10366,18 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
                 ScalarModule::new(
                     main_source,
                     main.items,
-                    vec![ScalarNamespaceBinding {
-                        binding: "std".to_owned(),
-                        target: std_source.clone(),
-                        span: namespace_span,
-                    }],
+                    vec![
+                        ScalarNamespaceBinding {
+                            binding: "text".to_owned(),
+                            target: std_source.clone(),
+                            span: namespace_span,
+                        },
+                        ScalarNamespaceBinding {
+                            binding: "std".to_owned(),
+                            target: std_source.clone(),
+                            span: namespace_span,
+                        },
+                    ],
                 ),
                 ScalarModule::from_program(std, Vec::new()),
             ],
@@ -10359,15 +10388,22 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             "{:?}",
             validation.diagnostics
         );
-        let ScalarItem::Binding(observed) = &validation.project.modules[0].items[1] else {
+        let ScalarItem::Binding(observed) = &validation.project.modules[0].items[2] else {
             panic!("namespace member binding")
         };
         assert!(matches!(
             observed.value,
             ScalarExpression::Member { ref receiver, ref name, .. }
-                if receiver == "std" && name == "value"
+                if receiver == "text" && name == "value"
         ));
-        let ScalarItem::Binding(text) = &validation.project.modules[0].items[2] else {
+        let ScalarItem::Binding(standard) = &validation.project.modules[0].items[3] else {
+            panic!("conventional utf8 binding")
+        };
+        assert_eq!(
+            standard.declared_type,
+            ScalarType::Struct(imported_id.clone())
+        );
+        let ScalarItem::Binding(text) = &validation.project.modules[0].items[4] else {
             panic!("utf8 binding")
         };
         assert_eq!(text.declared_type, ScalarType::Struct(imported_id.clone()));
@@ -10375,14 +10411,14 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             text.value,
             ScalarExpression::Utf8 { ref value, .. } if value == b"h\xc3\xa9"
         ));
-        let ScalarItem::Binding(data) = &validation.project.modules[0].items[3] else {
+        let ScalarItem::Binding(data) = &validation.project.modules[0].items[5] else {
             panic!("data binding")
         };
         assert_eq!(
             data.declared_type,
             ScalarType::RawPointer(Box::new(ScalarType::U8))
         );
-        let ScalarItem::Binding(length) = &validation.project.modules[0].items[4] else {
+        let ScalarItem::Binding(length) = &validation.project.modules[0].items[6] else {
             panic!("length binding")
         };
         assert_eq!(length.declared_type, ScalarType::U64);

@@ -3512,8 +3512,8 @@ struct utf8 {
             &parse_source(
                 source.clone(),
                 "%%start
-std = namespace stdlib \"src/bootstrap.w\";
-u64 reported, bool complete = std.print(\"\");
+text = namespace stdlib \"src/bootstrap.w\";
+u64 reported, bool complete = text.print(\"\");
 %%end"
                     .into(),
                 &[],
@@ -3526,7 +3526,7 @@ u64 reported, bool complete = std.print(\"\");
                 ScalarModule::from_program(
                     root,
                     vec![crate::ScalarNamespaceBinding {
-                        binding: "std".into(),
+                        binding: "text".into(),
                         target: std_source.clone(),
                         span: wosy_syntax::ByteSpan::new(0, 0),
                     }],
@@ -5050,8 +5050,8 @@ struct utf8 {
             &parse_source(
                 source.clone(),
                 "%%start
-std = namespace stdlib \"src/bootstrap.w\";
-std.utf8 text = \"hé\";
+text = namespace stdlib \"src/bootstrap.w\";
+text.utf8 value = \"hé\";
 %%end"
                     .into(),
                 &[],
@@ -5064,7 +5064,7 @@ std.utf8 text = \"hé\";
                 ScalarModule::from_program(
                     root,
                     vec![crate::ScalarNamespaceBinding {
-                        binding: "std".into(),
+                        binding: "text".into(),
                         target: std_source.clone(),
                         span: wosy_syntax::ByteSpan::new(0, 0),
                     }],
