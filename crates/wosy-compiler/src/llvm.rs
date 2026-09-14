@@ -2956,6 +2956,19 @@ fn integer_conversion_source_type(
             .get(name)
             .map(|(_, ty)| ty.clone())
             .or_else(|| state.globals.get(name).map(|(_, ty)| ty.clone())),
+        ScalarExpression::Member { receiver, name, .. } => {
+            match struct_member_place(state, receiver, name)? {
+                Some(crate::ScalarPlace::Field {
+                    field: ScalarFieldReference::Resolved(field),
+                    ..
+                }) => structure(state.structs, field.structure.clone())?
+                    .fields
+                    .get(field.index)
+                    .filter(|candidate| candidate.id == field)
+                    .map(|field| field.ty.clone()),
+                Some(_) | None => None,
+            }
+        }
         ScalarExpression::Integer { .. } => Some(ScalarType::I32),
         ScalarExpression::Unary { operand, .. } => {
             integer_conversion_source_type(state, operand, project_module).ok()
@@ -4951,11 +4964,7 @@ u64 reported, bool complete = text.print(\"\");
         assert!(single.contains("trunc i128"), "{single}");
 
         let validation = validate_scalar_project(ScalarProject::new(
-            vec![ScalarModule::new(
-                source.clone(),
-                program.program.items,
-                Vec::new(),
-            )],
+            vec![ScalarModule::from_program(program.program, Vec::new())],
             vec![source],
         ));
         assert!(
@@ -4969,6 +4978,43 @@ u64 reported, bool complete = text.print(\"\");
         assert!(project.contains("sext i64"), "{project}");
         assert!(project.contains("zext i64"), "{project}");
         assert!(project.contains("trunc i128"), "{project}");
+    }
+
+    #[test]
+    fn emits_generic_integer_conversion_for_struct_member_source() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let program = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\nstruct utf8 {\n\tu64 length;\n}\nu32(utf8) truncate = fn(text) { core.int_trunc<u32>(text.length) };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+        let single = emit_scalar_llvm(&program)
+            .expect("single-file member conversion LLVM")
+            .to_text();
+        assert!(single.contains("trunc i64"), "{single}");
+
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(program.program, Vec::new())],
+            vec![source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let project = emit_scalar_project_llvm(&validation)
+            .expect("project member conversion LLVM")
+            .to_text();
+        assert!(project.contains("trunc i64"), "{project}");
     }
 
     #[test]

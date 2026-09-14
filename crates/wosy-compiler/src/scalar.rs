@@ -3340,9 +3340,10 @@ fn type_core_int_conversion_in_module(
         ));
         return ScalarType::Error;
     }
+    let source_context = integer_conversion_source_context(operation, destination, &arguments[0]);
     let actual = expression_type_in_module_expected(
         &arguments[0],
-        None,
+        source_context.as_ref(),
         scope,
         visible_names,
         folded_names,
@@ -3422,16 +3423,28 @@ fn type_core_int_conversion(
         ));
         return ScalarType::Error;
     }
-    let actual = expression_type_expected(
-        &arguments[0],
-        &ScalarType::Error,
-        scope,
-        visible_names,
-        folded_names,
-        program,
-        diagnostics,
-        unsafe_context,
-    );
+    let source_context = integer_conversion_source_context(operation, destination, &arguments[0]);
+    let actual = match source_context {
+        Some(source) => expression_type_expected(
+            &arguments[0],
+            &source,
+            scope,
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+            unsafe_context,
+        ),
+        None => expression_type(
+            &arguments[0],
+            scope,
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+            unsafe_context,
+        ),
+    };
     let source_width = integer_width(&actual);
     let destination_width = integer_width(destination);
     if !is_error_type(&actual) && (source_width.is_none() || destination_width.is_none()) {
@@ -3461,6 +3474,76 @@ fn type_core_int_conversion(
     } else {
         destination.clone()
     }
+}
+
+fn integer_conversion_source_context(
+    operation: &str,
+    destination: &ScalarType,
+    expression: &ScalarExpression,
+) -> Option<ScalarType> {
+    let value = match expression {
+        ScalarExpression::Integer { value, .. } => value.clone(),
+        ScalarExpression::Unary {
+            operator: UnaryOperator::Negate,
+            operand,
+            ..
+        } => match operand.as_ref() {
+            ScalarExpression::Integer { value, .. } => -value,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let source_types: &[ScalarType] = match operation {
+        "int_trunc" => &[
+            ScalarType::I64,
+            ScalarType::U64,
+            ScalarType::I128,
+            ScalarType::U128,
+        ],
+        "int_extend" => &[
+            ScalarType::I32,
+            ScalarType::U32,
+            ScalarType::I64,
+            ScalarType::U64,
+            ScalarType::I128,
+            ScalarType::U128,
+        ],
+        _ => unreachable!(),
+    };
+    source_types
+        .iter()
+        .find(|source| {
+            let Some(source_width) = integer_width(source) else {
+                return false;
+            };
+            let Some(destination_width) = integer_width(destination) else {
+                return false;
+            };
+            let width_matches = match operation {
+                "int_trunc" => source_width > destination_width,
+                "int_extend" => source_width < destination_width,
+                _ => unreachable!(),
+            };
+            width_matches && integer_literal_fits_type(&value, source)
+        })
+        .cloned()
+}
+
+fn integer_literal_fits_type(value: &BigInt, ty: &ScalarType) -> bool {
+    let (minimum, maximum) = match ty {
+        ScalarType::I8 => (BigInt::from(i8::MIN), BigInt::from(i8::MAX)),
+        ScalarType::I16 => (BigInt::from(i16::MIN), BigInt::from(i16::MAX)),
+        ScalarType::I32 => (BigInt::from(i32::MIN), BigInt::from(i32::MAX)),
+        ScalarType::I64 => (BigInt::from(i64::MIN), BigInt::from(i64::MAX)),
+        ScalarType::I128 => (BigInt::from(i128::MIN), BigInt::from(i128::MAX)),
+        ScalarType::U8 => (BigInt::from(0), BigInt::from(u8::MAX)),
+        ScalarType::U16 => (BigInt::from(0), BigInt::from(u16::MAX)),
+        ScalarType::U32 => (BigInt::from(0), BigInt::from(u32::MAX)),
+        ScalarType::U64 => (BigInt::from(0), BigInt::from(u64::MAX)),
+        ScalarType::U128 => (BigInt::from(0), BigInt::from(u128::MAX)),
+        _ => return false,
+    };
+    value >= &minimum && value <= &maximum
 }
 
 fn validate_exact_u32_source_in_module(
@@ -10223,6 +10306,40 @@ bool integer_inversion = !1;
             panic!("cast binding");
         };
         assert_eq!(binding.declared_type, ScalarType::U32);
+    }
+
+    #[test]
+    fn derives_u32_literal_context_for_generic_integer_extension() {
+        let text = "%%start\nu64 result = core.int_extend<u64>(4294967295);\n%%end";
+        let single = validate_text(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let ScalarItem::Binding(binding) = &single.program.items[0] else {
+            panic!("extension binding");
+        };
+        assert_eq!(binding.declared_type, ScalarType::U64);
+
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn resolves_member_expression_sources_for_generic_integer_conversions() {
+        let text = "%%start\nstruct utf8 {\n\tu64 length;\n}\nu32(utf8) truncate = fn(text) { core.int_trunc<u32>(text.length) };\n%%end";
+        let single = validate_text(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(program, Vec::new())],
+            vec![source],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
     }
 
     #[test]
