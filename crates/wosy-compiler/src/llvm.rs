@@ -2232,42 +2232,29 @@ fn emit_project_expression<'ctx, 'module>(
                         )
                     },
                 );
-            let function = *state
-                .functions
-                .get(
-                    state
-                        .call_targets
-                        .get(&qualified)
-                        .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?,
-                )
-                .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?;
-            let values = arguments
-                .iter()
-                .zip(function.get_type().get_param_types())
-                .map(|(argument, parameter)| match (argument, parameter) {
-                    (
-                        ScalarExpression::Float { value, .. },
-                        BasicMetadataTypeEnum::FloatType(ty),
-                    ) if ty == context.f32_type() => Ok(EmitValue::Basic(
-                        context.f32_type().const_float(*value).into(),
-                    )),
-                    (
-                        ScalarExpression::Float { value, .. },
-                        BasicMetadataTypeEnum::FloatType(ty),
-                    ) if ty == context.f64_type() => Ok(EmitValue::Basic(
-                        context.f64_type().const_float(*value).into(),
-                    )),
-                    (ScalarExpression::Float { .. }, BasicMetadataTypeEnum::FloatType(_)) => {
-                        Err("unsupported LLVM floating-point parameter type".to_owned())
-                    }
-                    _ => emit_project_expression(context, state, argument, module, modules),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
             let target = state
                 .call_targets
                 .get(&qualified)
                 .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?
                 .clone();
+            let ScalarType::Callable { parameters, .. } = state
+                .signatures
+                .get(&target)
+                .ok_or_else(|| format!("unknown LLVM callable signature {qualified}"))?
+            else {
+                return Err(format!(
+                    "LLVM callable {qualified} has no callable signature"
+                ));
+            };
+            let values = arguments
+                .iter()
+                .zip(parameters)
+                .map(|(argument, parameter)| {
+                    emit_project_typed_expression(
+                        context, state, argument, parameter, module, modules,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             emit_call_values(state, &target, values)
         }
         ScalarExpression::Name { name, .. } => emit_expression(
@@ -2393,33 +2380,19 @@ fn emit_call<'ctx, 'module>(
         .get(&qualified)
         .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?
         .clone();
-    let function = *state
-        .functions
+    let ScalarType::Callable { parameters, .. } = state
+        .signatures
         .get(&target)
-        .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?;
+        .ok_or_else(|| format!("unknown LLVM callable signature {qualified}"))?
+    else {
+        return Err(format!(
+            "LLVM callable {qualified} has no callable signature"
+        ));
+    };
     let values = arguments
         .iter()
-        .zip(function.get_type().get_param_types())
-        .map(|(argument, parameter)| match (argument, parameter) {
-            (ScalarExpression::Float { value, .. }, BasicMetadataTypeEnum::FloatType(ty))
-                if ty == context.f32_type() =>
-            {
-                Ok(EmitValue::Basic(
-                    context.f32_type().const_float(*value).into(),
-                ))
-            }
-            (ScalarExpression::Float { value, .. }, BasicMetadataTypeEnum::FloatType(ty))
-                if ty == context.f64_type() =>
-            {
-                Ok(EmitValue::Basic(
-                    context.f64_type().const_float(*value).into(),
-                ))
-            }
-            (ScalarExpression::Float { .. }, BasicMetadataTypeEnum::FloatType(_)) => {
-                Err("unsupported LLVM floating-point parameter type".to_owned())
-            }
-            _ => emit_expression(context, state, argument),
-        })
+        .zip(parameters)
+        .map(|(argument, parameter)| emit_typed_expression(context, state, argument, parameter))
         .collect::<Result<Vec<_>, _>>()?;
     emit_call_values(state, &target, values)
 }
@@ -3452,6 +3425,137 @@ mod tests {
         assert!(text.contains("call i1 @flag"));
         assert!(text.contains("call void @touch"));
         assert!(text.contains("call i32 @count"));
+    }
+
+    #[test]
+    fn emits_empty_utf8_call_arguments_with_resolved_parameter_types() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let mut program = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start
+struct utf8 {
+    *?u8 data;
+    u64 length;
+}
+u64(utf8) print = fn(text) { text.length };
+utf8 value = { .data = null; .length = 0; };
+u64 reported = print(value);
+%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+        let crate::ScalarItem::Binding(binding) = &mut program.program.items[2] else {
+            panic!("call binding");
+        };
+        let crate::ScalarExpression::Call { arguments, .. } = &mut binding.value else {
+            panic!("call expression");
+        };
+        arguments[0] = crate::ScalarExpression::Utf8 {
+            value: Vec::new(),
+            span: wosy_syntax::ByteSpan::new(0, 0),
+        };
+        let text = emit_scalar_llvm(&program)
+            .expect("empty UTF-8 call LLVM")
+            .to_text();
+
+        assert!(
+            text.contains("@wosy_utf8_literal_0 = private constant [0 x i8]"),
+            "{text}"
+        );
+        assert!(text.contains("store i64 0"), "{text}");
+        assert!(
+            text.contains("call i64 @print(ptr %utf8_literal)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn emits_project_public_empty_utf8_output_call() {
+        let std_source = SourceIdentity::new(
+            "project".into(),
+            "stdlib".into(),
+            "src/bootstrap.w".into(),
+            "r1".into(),
+        );
+        let std = derive_scalar_program(
+            &parse_source(
+                std_source.clone(),
+                "%%start
+struct utf8 {
+    *?u8 data;
+    u64 length;
+}
+(u64, bool)(utf8) print = fn(text) { text.length, true };
+%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let root = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start
+std = namespace stdlib \"src/bootstrap.w\";
+u64 reported, bool complete = std.print(\"\");
+%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    root,
+                    vec![crate::ScalarNamespaceBinding {
+                        binding: "std".into(),
+                        target: std_source.clone(),
+                        span: wosy_syntax::ByteSpan::new(0, 0),
+                    }],
+                ),
+                ScalarModule::from_program(std, Vec::new()),
+            ],
+            vec![source, std_source.clone()],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_project_llvm(&validation)
+            .expect("project public empty UTF-8 output LLVM")
+            .to_text();
+
+        assert!(
+            text.contains("@wosy_utf8_literal_0 = private constant [0 x i8]"),
+            "{text}"
+        );
+        assert!(text.contains("store i64 0"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "call {{ i64, i1 }} @{}(ptr %utf8_literal)",
+                project_function_name(&std_source, "print")
+            )),
+            "{text}"
+        );
     }
 
     #[test]
