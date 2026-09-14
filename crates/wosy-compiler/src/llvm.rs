@@ -15,7 +15,7 @@ use inkwell::AddressSpace;
 use inkwell::{FloatPredicate, IntPredicate};
 use serde::{Deserialize, Serialize};
 
-use crate::scalar::{ScalarBindingOutputOrigin, ScalarFieldReference};
+use crate::scalar::{ScalarBindingOutputOrigin, ScalarFieldReference, ScalarOverloadSelection};
 use crate::{
     BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarExpression,
     ScalarFunction, ScalarItem, ScalarModule, ScalarProjectValidation, ScalarStruct, ScalarType,
@@ -138,7 +138,9 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         .items
         .iter()
         .filter_map(|item| match item {
-            ScalarItem::Function(function) if function.generic_parameters.is_empty() => {
+            ScalarItem::Function(function)
+                if function.generic_parameters.is_empty() && function.overload_arms.is_empty() =>
+            {
                 Some(function)
             }
             _ => None,
@@ -168,6 +170,26 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         |name| name.to_owned(),
     )?;
     for (lookup, function, name) in &specializations {
+        let value = module.add_function(name, function_type(&context, &function.signature)?, None);
+        for (index, parameter) in function.parameters.iter().enumerate() {
+            if let Some(argument) = value.get_nth_param(index as u32) {
+                argument.set_name(parameter);
+            }
+        }
+        call_targets.insert(lookup.clone(), name.clone());
+        signatures.insert(name.clone(), function.signature.clone());
+        functions.insert(name.clone(), value);
+    }
+    let overloads = selected_overload_specializations(
+        &validation.program.items,
+        |name| name.to_owned(),
+        selected_overload_selections(&validation.program.items)
+            .into_iter()
+            .filter_map(|(receiver, name, selection)| {
+                receiver.is_none().then_some((name, selection))
+            }),
+    );
+    for (lookup, function, name) in &overloads {
         let value = module.add_function(name, function_type(&context, &function.signature)?, None);
         for (index, parameter) in function.parameters.iter().enumerate() {
             if let Some(argument) = value.get_nth_param(index as u32) {
@@ -215,7 +237,9 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         .items
         .iter()
         .filter_map(|item| match item {
-            ScalarItem::Function(function) if function.generic_parameters.is_empty() => {
+            ScalarItem::Function(function)
+                if function.generic_parameters.is_empty() && function.overload_arms.is_empty() =>
+            {
                 Some(function)
             }
             _ => None,
@@ -236,6 +260,21 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         )?;
     }
     for (_, function, name) in &specializations {
+        emit_function(
+            &context,
+            &builder,
+            &functions,
+            &call_targets,
+            &signatures,
+            &globals,
+            function,
+            name,
+            &validation.program.items,
+            &module,
+            &validation.program.structs,
+        )?;
+    }
+    for (_, function, name) in &overloads {
         emit_function(
             &context,
             &builder,
@@ -324,7 +363,7 @@ pub fn emit_scalar_project_llvm(
                 }
             }
             if let ScalarItem::Function(function) = item {
-                if !function.generic_parameters.is_empty() {
+                if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
                     continue;
                 }
                 let name = project_function_name(&source_module.source, &function.name);
@@ -398,6 +437,42 @@ pub fn emit_scalar_project_llvm(
             project_specializations.push((source_module, function, name));
         }
     }
+    let mut project_overloads = Vec::new();
+    for source_module in &modules {
+        let selections = modules.iter().flat_map(|calling_module| {
+            selected_overload_selections(&calling_module.items)
+                .into_iter()
+                .filter_map(|(receiver, name, selection)| match receiver {
+                    None if calling_module.source == source_module.source => {
+                        Some((name, selection))
+                    }
+                    Some(binding)
+                        if project_namespace_target(calling_module, &modules, &binding)
+                            .is_ok_and(|target| target.source == source_module.source) =>
+                    {
+                        Some((name, selection))
+                    }
+                    _ => None,
+                })
+        });
+        for (lookup, function, name) in selected_overload_specializations(
+            &source_module.items,
+            |name| project_function_name(&source_module.source, name),
+            selections,
+        ) {
+            let value =
+                module.add_function(&name, function_type(&context, &function.signature)?, None);
+            for (index, parameter) in function.parameters.iter().enumerate() {
+                if let Some(argument) = value.get_nth_param(index as u32) {
+                    argument.set_name(parameter);
+                }
+            }
+            call_targets.insert(lookup, name.clone());
+            signatures.insert(name.clone(), function.signature.clone());
+            functions.insert(name.clone(), value);
+            project_overloads.push((source_module, function, name));
+        }
+    }
     functions.insert(
         "main".into(),
         module.add_function("main", context.i32_type().fn_type(&[], false), None),
@@ -419,6 +494,22 @@ pub fn emit_scalar_project_llvm(
         )?;
     }
     for (source_module, function, name) in &project_specializations {
+        emit_project_function(
+            &context,
+            &builder,
+            &functions,
+            &call_targets,
+            &signatures,
+            function,
+            source_module,
+            &modules,
+            &globals,
+            name,
+            &module,
+            &all_structs,
+        )?;
+    }
+    for (source_module, function, name) in &project_overloads {
         emit_project_function(
             &context,
             &builder,
@@ -2173,6 +2264,7 @@ fn emit_expression<'ctx, 'module>(
             name,
             type_arguments,
             arguments,
+            overload_selection,
             ..
         } => {
             if receiver.as_deref() == Some("core") && name == "cast" {
@@ -2190,6 +2282,7 @@ fn emit_expression<'ctx, 'module>(
                 name,
                 type_arguments,
                 arguments,
+                overload_selection.as_ref(),
             )
         }
         ScalarExpression::If {
@@ -2290,6 +2383,7 @@ fn emit_project_expression<'ctx, 'module>(
             name,
             type_arguments,
             arguments,
+            overload_selection,
             ..
         } => {
             if receiver.as_deref() == Some("core") && name == "cast" {
@@ -2370,10 +2464,17 @@ fn emit_project_expression<'ctx, 'module>(
                         )
                     },
                 );
-            let lookup = specialization_lookup_key(&qualified, type_arguments);
+            let lookup = overload_selection
+                .as_ref()
+                .map(|selection| selected_overload_lookup_key(&qualified, selection));
             let target = state
                 .call_targets
-                .get(&lookup)
+                .get(lookup.as_ref().unwrap_or(&qualified))
+                .or_else(|| {
+                    state
+                        .call_targets
+                        .get(&specialization_lookup_key(&qualified, type_arguments))
+                })
                 .or_else(|| state.call_targets.get(&qualified))
                 .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?
                 .clone();
@@ -2513,13 +2614,20 @@ fn emit_call<'ctx, 'module>(
     name: &str,
     type_arguments: &[crate::scalar::ScalarTypeArgument],
     arguments: &[ScalarExpression],
+    overload_selection: Option<&ScalarOverloadSelection>,
 ) -> Result<EmitValue<'ctx>, String> {
     let qualified =
         receiver.map_or_else(|| name.to_owned(), |receiver| format!("{receiver}.{name}"));
-    let lookup = specialization_lookup_key(&qualified, type_arguments);
+    let lookup =
+        overload_selection.map(|selection| selected_overload_lookup_key(&qualified, selection));
     let target = state
         .call_targets
-        .get(&lookup)
+        .get(lookup.as_ref().unwrap_or(&qualified))
+        .or_else(|| {
+            state
+                .call_targets
+                .get(&specialization_lookup_key(&qualified, type_arguments))
+        })
         .or_else(|| state.call_targets.get(&qualified))
         .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?
         .clone();
@@ -3443,6 +3551,347 @@ fn generic_specializations<'a>(
         .collect())
 }
 
+fn selected_overload_specializations(
+    items: &[ScalarItem],
+    symbol: impl Fn(&str) -> String,
+    selections: impl IntoIterator<Item = (String, ScalarOverloadSelection)>,
+) -> Vec<(String, ScalarFunction, String)> {
+    let overloads = items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarItem::Function(function) if !function.overload_arms.is_empty() => {
+                Some((function.name.as_str(), function))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut selections = selections.into_iter().collect::<Vec<_>>();
+    let mut specializations = BTreeMap::new();
+    for (name, overload) in &overloads {
+        for (arm_index, arm) in overload.overload_arms.iter().enumerate() {
+            if arm.generic_parameters.is_empty() {
+                selections.push((
+                    (*name).to_owned(),
+                    ScalarOverloadSelection {
+                        arm_index,
+                        substitutions: BTreeMap::new(),
+                    },
+                ));
+            }
+        }
+    }
+    for (name, selection) in selections {
+        let Some(overload) = overloads.get(name.as_str()) else {
+            continue;
+        };
+        let Some(arm) = overload.overload_arms.get(selection.arm_index) else {
+            continue;
+        };
+        let base = symbol(&overload.name);
+        let arguments = arm
+            .generic_parameters
+            .iter()
+            .map(|parameter| selection.substitutions[&parameter.name].clone())
+            .collect::<Vec<_>>();
+        let mut arm = arm.clone();
+        arm.signature = substitute_generic_signature(&arm, &arguments);
+        arm.generic_parameters.clear();
+        let lookup = selected_overload_lookup_key(&base, &selection);
+        let name = generic_specialization_name(
+            &encoded_llvm_name(
+                "wosy_overload",
+                [base.as_str(), &selection.arm_index.to_string()],
+            ),
+            &arguments,
+        );
+        specializations.entry(lookup).or_insert((arm, name));
+    }
+    specializations
+        .into_iter()
+        .map(|(lookup, (function, name))| (lookup, function, name))
+        .collect()
+}
+
+fn selected_overload_selections(
+    items: &[ScalarItem],
+) -> Vec<(Option<String>, String, ScalarOverloadSelection)> {
+    let mut selections = Vec::new();
+    for item in items {
+        match item {
+            ScalarItem::Binding(binding) => {
+                collect_selected_overloads(&binding.value, &mut selections)
+            }
+            ScalarItem::Function(function) => {
+                collect_selected_overloads_in_block(&function.body, &mut selections)
+            }
+            ScalarItem::Executable(item) => {
+                collect_selected_overloads_in_item(item, &mut selections)
+            }
+            ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
+        }
+    }
+    selections
+}
+
+fn collect_selected_overloads(
+    expression: &ScalarExpression,
+    selections: &mut Vec<(Option<String>, String, ScalarOverloadSelection)>,
+) {
+    match expression {
+        ScalarExpression::Call {
+            receiver,
+            name,
+            arguments,
+            overload_selection: Some(selection),
+            ..
+        } => {
+            selections.push((receiver.clone(), name.clone(), selection.clone()));
+            for argument in arguments {
+                collect_selected_overloads(argument, selections);
+            }
+        }
+        ScalarExpression::Call { arguments, .. } => {
+            for argument in arguments {
+                collect_selected_overloads(argument, selections);
+            }
+        }
+        ScalarExpression::Binary { left, right, .. } => {
+            collect_selected_overloads(left, selections);
+            collect_selected_overloads(right, selections);
+        }
+        ScalarExpression::Unary { operand, .. } => collect_selected_overloads(operand, selections),
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_selected_overloads(condition, selections);
+            collect_selected_overloads_in_block(then_branch, selections);
+            collect_selected_overloads_in_block(else_branch, selections);
+        }
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => {
+            collect_selected_overloads(condition, selections);
+            collect_selected_overloads_in_block(then_branch, selections);
+        }
+        ScalarExpression::Block(block) => collect_selected_overloads_in_block(block, selections),
+        ScalarExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_selected_overloads(&field.value, selections);
+            }
+        }
+        ScalarExpression::RawAddress { .. }
+        | ScalarExpression::Name { .. }
+        | ScalarExpression::Member { .. }
+        | ScalarExpression::Integer { .. }
+        | ScalarExpression::InvalidInteger { .. }
+        | ScalarExpression::Float { .. }
+        | ScalarExpression::InvalidFloat { .. }
+        | ScalarExpression::Boolean { .. }
+        | ScalarExpression::Char { .. }
+        | ScalarExpression::Utf8 { .. } => {}
+    }
+}
+
+fn collect_selected_overloads_in_block(
+    block: &ScalarBlock,
+    selections: &mut Vec<(Option<String>, String, ScalarOverloadSelection)>,
+) {
+    for item in &block.items {
+        collect_selected_overloads_in_item(item, selections);
+    }
+}
+
+fn collect_selected_overloads_in_item(
+    item: &ScalarBlockItem,
+    selections: &mut Vec<(Option<String>, String, ScalarOverloadSelection)>,
+) {
+    match item {
+        ScalarBlockItem::LocalBinding(binding) => {
+            collect_selected_overloads(&binding.value, selections)
+        }
+        ScalarBlockItem::Expression(expression) => {
+            collect_selected_overloads(expression, selections)
+        }
+        ScalarBlockItem::Assignment(assignment) => {
+            collect_selected_overloads(&assignment.value, selections)
+        }
+        ScalarBlockItem::While(while_expression) => {
+            collect_selected_overloads(&while_expression.condition, selections);
+            collect_selected_overloads_in_block(&while_expression.body, selections);
+        }
+    }
+}
+
+fn concrete_types(items: &[ScalarItem]) -> Vec<ScalarType> {
+    let mut types = vec![ScalarType::I32, ScalarType::Bool, ScalarType::Char];
+    for item in items {
+        match item {
+            ScalarItem::Binding(binding) => {
+                types.extend(binding_receivers(binding).into_iter().map(|(_, ty)| ty));
+                collect_expression_types(&binding.value, &mut types);
+            }
+            ScalarItem::Function(function) => {
+                if let ScalarType::Callable { parameters, .. } = &function.signature {
+                    types.extend(
+                        parameters
+                            .iter()
+                            .filter(|ty| !matches!(ty, ScalarType::Named { .. }))
+                            .cloned(),
+                    );
+                }
+                for arm in &function.overload_arms {
+                    if let ScalarType::Callable { parameters, .. } = &arm.signature {
+                        types.extend(
+                            parameters
+                                .iter()
+                                .filter(|ty| !matches!(ty, ScalarType::Named { .. }))
+                                .cloned(),
+                        );
+                    }
+                }
+            }
+            ScalarItem::Executable(item) => collect_expression_types_in_item(item, &mut types),
+            ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
+        }
+    }
+    types.sort_by_key(generic_type_name);
+    types.dedup();
+    types
+}
+
+fn collect_expression_types(expression: &ScalarExpression, types: &mut Vec<ScalarType>) {
+    match expression {
+        ScalarExpression::Call { arguments, .. } => {
+            for argument in arguments {
+                collect_expression_types(argument, types);
+            }
+        }
+        ScalarExpression::Integer { .. } | ScalarExpression::InvalidInteger { .. } => {
+            types.push(ScalarType::I32)
+        }
+        ScalarExpression::Boolean { .. } => types.push(ScalarType::Bool),
+        ScalarExpression::Char { .. } => types.push(ScalarType::Char),
+        ScalarExpression::Binary { left, right, .. } => {
+            collect_expression_types(left, types);
+            collect_expression_types(right, types);
+        }
+        ScalarExpression::Unary { operand, .. } => collect_expression_types(operand, types),
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_expression_types(condition, types);
+            collect_expression_types_in_block(then_branch, types);
+            collect_expression_types_in_block(else_branch, types);
+        }
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => {
+            collect_expression_types(condition, types);
+            collect_expression_types_in_block(then_branch, types);
+        }
+        ScalarExpression::Block(block) => collect_expression_types_in_block(block, types),
+        ScalarExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_expression_types(&field.value, types);
+            }
+        }
+        ScalarExpression::Name { .. }
+        | ScalarExpression::Member { .. }
+        | ScalarExpression::Float { .. }
+        | ScalarExpression::InvalidFloat { .. }
+        | ScalarExpression::Utf8 { .. }
+        | ScalarExpression::RawAddress { .. } => {}
+    }
+}
+
+fn collect_expression_types_in_block(block: &ScalarBlock, types: &mut Vec<ScalarType>) {
+    for item in &block.items {
+        collect_expression_types_in_item(item, types);
+    }
+    for output in &block.final_output_values {
+        types.push(output.ty.clone());
+        collect_expression_types(&output.value, types);
+    }
+}
+
+fn collect_expression_types_in_item(item: &ScalarBlockItem, types: &mut Vec<ScalarType>) {
+    match item {
+        ScalarBlockItem::LocalBinding(binding) => {
+            types.extend(binding_receivers(binding).into_iter().map(|(_, ty)| ty));
+            collect_expression_types(&binding.value, types);
+        }
+        ScalarBlockItem::Expression(expression) => collect_expression_types(expression, types),
+        ScalarBlockItem::Assignment(assignment) => {
+            collect_expression_types(&assignment.value, types)
+        }
+        ScalarBlockItem::While(while_expression) => {
+            collect_expression_types(&while_expression.condition, types);
+            collect_expression_types_in_block(&while_expression.body, types);
+        }
+    }
+}
+
+fn generic_argument_sets(count: usize, types: &[ScalarType]) -> Vec<Vec<ScalarType>> {
+    if count == 0 {
+        return vec![Vec::new()];
+    }
+    let tails = generic_argument_sets(count - 1, types);
+    types
+        .iter()
+        .flat_map(|ty| {
+            tails.iter().map(move |tail| {
+                let mut arguments = Vec::with_capacity(count);
+                arguments.push(ty.clone());
+                arguments.extend(tail.clone());
+                arguments
+            })
+        })
+        .collect()
+}
+
+fn selected_overload_lookup_key(name: &str, selection: &ScalarOverloadSelection) -> String {
+    let substitutions = selection
+        .substitutions
+        .values()
+        .map(generic_type_name)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{name}<arm:{},{}>", selection.arm_index, substitutions)
+}
+
+fn call_argument_types<'ctx, 'module>(
+    state: &EmitState<'ctx, 'module>,
+    arguments: &[ScalarExpression],
+) -> Result<Vec<ScalarType>, String> {
+    arguments
+        .iter()
+        .map(|argument| match argument {
+            ScalarExpression::Name { name, .. } => state
+                .storage
+                .get(name)
+                .map(|(_, ty)| ty.clone())
+                .or_else(|| state.globals.get(name).map(|(_, ty)| ty.clone()))
+                .ok_or_else(|| format!("unknown LLVM value {name}")),
+            ScalarExpression::Integer { .. } | ScalarExpression::InvalidInteger { .. } => {
+                Ok(ScalarType::I32)
+            }
+            ScalarExpression::Boolean { .. } => Ok(ScalarType::Bool),
+            ScalarExpression::Char { .. } => Ok(ScalarType::Char),
+            _ => Ok(ScalarType::Error),
+        })
+        .collect()
+}
+
 fn collect_generic_calls(
     expression: &ScalarExpression,
     calls: &mut Vec<(String, Vec<ScalarType>)>,
@@ -3752,11 +4201,14 @@ fn module_globals<'ctx>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::emit_scalar_llvm;
     use super::emit_scalar_project_llvm;
     use super::project_function_name;
     use super::project_global_name;
     use super::{LlvmFunction, LlvmFunctionAttributes, LlvmPartition, LlvmValueType};
+    use crate::scalar::ScalarOverloadSelection;
     use crate::{
         derive_scalar_program, parse_source, validate_scalar_project, ScalarModule, ScalarProject,
     };
@@ -3912,6 +4364,249 @@ mod tests {
         );
         assert!(text.contains("call { i64, i64 } @wosy_generic__"), "{text}");
         assert!(text.contains("extractvalue { i64, i64 }"), "{text}");
+    }
+
+    #[test]
+    fn lowers_ordinary_and_generic_overload_arms_with_ordered_outputs() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\ncast = overload {\n    i32(i64) => fn(value) { 1 };\n    generic T;\n    T(T) => fn(value) { value };\n};\npair = overload {\n    generic T;\n    (T, T)(T) => fn(value) { value };\n};\ni64 wide = 1;\ni32 narrow = cast(wide);\nbool flag = true;\nbool copied = cast(flag);\ni64 first, i64 second = pair(wide);\n%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+
+        let text = emit_scalar_llvm(&validation)
+            .expect("overload LLVM")
+            .to_text();
+
+        assert!(text.contains("define i32 @wosy_generic__"), "{text}");
+        assert!(text.contains("define i1 @wosy_generic__"), "{text}");
+        assert!(
+            text.contains("define { i64, i64 } @wosy_generic__"),
+            "{text}"
+        );
+        assert!(text.contains("call i32 @wosy_generic__"), "{text}");
+        assert!(text.contains("call i1 @wosy_generic__"), "{text}");
+        assert!(text.contains("call { i64, i64 } @wosy_generic__"), "{text}");
+        assert!(
+            text.contains("extractvalue { i64, i64 } %call3, 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("extractvalue { i64, i64 } %call3, 1"),
+            "{text}"
+        );
+
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                validation.program.clone(),
+                Vec::new(),
+            )],
+            vec![source],
+        ));
+        let project_text = emit_scalar_project_llvm(&project)
+            .expect("project overload LLVM")
+            .to_text();
+        assert!(
+            project_text.contains("call { i64, i64 } @wosy_generic__"),
+            "{project_text}"
+        );
+    }
+
+    #[test]
+    fn emits_distinct_overload_arms_for_shared_input_types() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\nselect = overload {\n    (i32, bool)(i64) => fn(value) { 1, true };\n    (bool, i32)(i64) => fn(value) { true, 1 };\n};\ni64 input = 1;\ni32 integer, bool flag = select(input);\nbool boolean, i32 number = select(input);\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+
+        let text = emit_scalar_llvm(&validation)
+            .expect("selected overload LLVM")
+            .to_text();
+        assert!(
+            text.contains("define { i32, i1 } @wosy_generic__"),
+            "{text}"
+        );
+        assert!(
+            text.contains("define { i1, i32 } @wosy_generic__"),
+            "{text}"
+        );
+        assert!(text.contains("call { i32, i1 } @wosy_generic__"), "{text}");
+        assert!(text.contains("call { i1, i32 } @wosy_generic__"), "{text}");
+    }
+
+    #[test]
+    fn lowers_overload_arms_through_project_namespaces() {
+        let child_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/child.w".into(),
+            "r1".into(),
+        );
+        let child = derive_scalar_program(
+            &parse_source(
+                child_source.clone(),
+                "%%start\nidentity = overload {\n    i64(i64) => fn(value) { value };\n};\n%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let root_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let root = derive_scalar_program(
+            &parse_source(
+                root_source.clone(),
+                "%%start\nchild = namespace package \"src/child.w\";\ni64 value = 1;\ni64 copied = child.identity(value);\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let namespace_bindings = root
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::ScalarItem::Namespace(namespace) => Some(crate::ScalarNamespaceBinding {
+                    binding: namespace.binding.clone(),
+                    target: child_source.clone(),
+                    span: namespace.span,
+                }),
+                _ => None,
+            })
+            .collect();
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(root_source.clone(), root.items, namespace_bindings),
+                ScalarModule::new(child_source.clone(), child.items, Vec::new()),
+            ],
+            vec![root_source, child_source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+
+        let text = emit_scalar_project_llvm(&validation)
+            .expect("namespaced overload LLVM")
+            .to_text();
+        assert!(text.contains("define i64 @wosy_generic__"), "{text}");
+        assert!(text.contains("call i64 @wosy_generic__"), "{text}");
+    }
+
+    #[test]
+    fn lowers_generic_overload_arms_through_project_namespaces() {
+        let child_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/child.w".into(),
+            "r1".into(),
+        );
+        let child = derive_scalar_program(
+            &parse_source(
+                child_source.clone(),
+                "%%start\nidentity = overload {\n    i32(i64) => fn(value) { 1 };\n    generic T;\n    T(T) => fn(value) { value };\n};\nbool initial = true;\nbool copied = identity(initial);\n%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let root_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let mut root = derive_scalar_program(
+            &parse_source(
+                root_source.clone(),
+                "%%start\nchild = namespace package \"src/child.w\";\nchar value = 'a';\nchar copied = child.identity(value);\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let crate::ScalarItem::Binding(binding) = root
+            .items
+            .last_mut()
+            .expect("qualified generic overload binding")
+        else {
+            panic!("qualified generic overload binding");
+        };
+        let crate::ScalarExpression::Call {
+            overload_selection, ..
+        } = &mut binding.value
+        else {
+            panic!("qualified generic overload call");
+        };
+        *overload_selection = Some(ScalarOverloadSelection {
+            arm_index: 1,
+            substitutions: BTreeMap::from([("T".into(), crate::ScalarType::Char)]),
+        });
+        let namespace_bindings = root
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::ScalarItem::Namespace(namespace) => Some(crate::ScalarNamespaceBinding {
+                    binding: namespace.binding.clone(),
+                    target: child_source.clone(),
+                    span: namespace.span,
+                }),
+                _ => None,
+            })
+            .collect();
+        let validation = crate::ScalarProjectValidation {
+            project: ScalarProject::new(
+                vec![
+                    ScalarModule::new(root_source.clone(), root.items, namespace_bindings),
+                    ScalarModule::new(child_source.clone(), child.items, Vec::new()),
+                ],
+                vec![root_source, child_source],
+            ),
+            diagnostics: Vec::new(),
+        };
+
+        let text = emit_scalar_project_llvm(&validation)
+            .expect("namespaced generic overload LLVM")
+            .to_text();
+        assert!(text.contains("define i32 @wosy_generic__"), "{text}");
+        assert!(text.contains("call i32 @wosy_generic__"), "{text}");
     }
 
     #[test]

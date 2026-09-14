@@ -350,11 +350,11 @@ fn resolve_overload_candidate(
     overload: &ScalarFunction,
     arguments: &[ScalarType],
     expected: Option<&ScalarType>,
-) -> Result<ScalarType, &'static str> {
+) -> Result<(ScalarType, ScalarOverloadSelection), &'static str> {
     let mut matches = Vec::new();
     let mut inconsistent = false;
     let mut output_mismatch = false;
-    for arm in &overload.overload_arms {
+    for (arm_index, arm) in overload.overload_arms.iter().enumerate() {
         let ScalarType::Callable {
             outputs,
             parameters,
@@ -413,7 +413,13 @@ fn resolve_overload_candidate(
                 continue;
             }
         }
-        matches.push(callable);
+        matches.push((
+            callable,
+            ScalarOverloadSelection {
+                arm_index,
+                substitutions,
+            },
+        ));
     }
     match matches.len() {
         1 => Ok(matches.pop().expect("one overload candidate")),
@@ -536,6 +542,7 @@ pub enum ScalarExpression {
         name_span: ByteSpan,
         type_arguments: Vec<ScalarTypeArgument>,
         arguments: Vec<ScalarExpression>,
+        overload_selection: Option<ScalarOverloadSelection>,
         span: ByteSpan,
     },
     If {
@@ -550,6 +557,12 @@ pub enum ScalarExpression {
         span: ByteSpan,
     },
     Block(ScalarBlock),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarOverloadSelection {
+    pub arm_index: usize,
+    pub substitutions: BTreeMap<String, ScalarType>,
 }
 
 impl Eq for ScalarExpression {}
@@ -885,9 +898,193 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
     let mut validation_diagnostics = validate(&program);
     let mut diagnostics = diagnostics;
     diagnostics.append(&mut validation_diagnostics);
+    if diagnostics.is_empty() {
+        record_overload_selections(&mut program);
+    }
     ScalarValidation {
         program,
         diagnostics,
+    }
+}
+
+fn record_overload_selections(program: &mut ScalarProgram) {
+    let scope = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarItem::Binding(binding) => {
+                Some((binding.name.clone(), binding.declared_type.clone()))
+            }
+            ScalarItem::Function(function) => {
+                Some((function.name.clone(), function.signature.clone()))
+            }
+            ScalarItem::Namespace(_) | ScalarItem::Extern(_) | ScalarItem::Executable(_) => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let overloads = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarItem::Function(function) if !function.overload_arms.is_empty() => {
+                Some((function.name.clone(), function.clone()))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    for item in &mut program.items {
+        if let ScalarItem::Binding(binding) = item {
+            let expected = binding
+                .receivers
+                .first()
+                .map(|receiver| &receiver.ty)
+                .unwrap_or(&binding.declared_type);
+            record_expression_overload_selection(
+                &mut binding.value,
+                Some(expected),
+                &scope,
+                &overloads,
+            );
+        }
+    }
+}
+
+fn record_expression_overload_selection(
+    expression: &mut ScalarExpression,
+    expected: Option<&ScalarType>,
+    scope: &BTreeMap<String, ScalarType>,
+    overloads: &BTreeMap<String, ScalarFunction>,
+) {
+    match expression {
+        ScalarExpression::Call {
+            receiver,
+            name,
+            arguments,
+            overload_selection,
+            ..
+        } => {
+            for argument in arguments.iter_mut() {
+                record_expression_overload_selection(argument, None, scope, overloads);
+            }
+            if let (Some(overload), Some(argument_types)) = (
+                overloads.get(
+                    &receiver
+                        .as_ref()
+                        .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}")),
+                ),
+                arguments
+                    .iter()
+                    .map(|argument| overload_argument_type(argument, scope))
+                    .collect::<Option<Vec<_>>>(),
+            ) {
+                if let Ok((_, selection)) =
+                    resolve_overload_candidate(overload, &argument_types, expected)
+                {
+                    *overload_selection = Some(selection);
+                }
+            }
+        }
+        ScalarExpression::Binary { left, right, .. } => {
+            record_expression_overload_selection(left, None, scope, overloads);
+            record_expression_overload_selection(right, None, scope, overloads);
+        }
+        ScalarExpression::Unary { operand, .. } => {
+            record_expression_overload_selection(operand, expected, scope, overloads)
+        }
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            record_expression_overload_selection(
+                condition,
+                Some(&ScalarType::Bool),
+                scope,
+                overloads,
+            );
+            record_block_overload_selections(then_branch, scope, overloads);
+            record_block_overload_selections(else_branch, scope, overloads);
+        }
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => {
+            record_expression_overload_selection(
+                condition,
+                Some(&ScalarType::Bool),
+                scope,
+                overloads,
+            );
+            record_block_overload_selections(then_branch, scope, overloads);
+        }
+        ScalarExpression::Block(block) => record_block_overload_selections(block, scope, overloads),
+        ScalarExpression::RawAddress { place, .. } => match place {
+            ScalarPlace::Dereference { pointer, .. } => {
+                record_expression_overload_selection(pointer, None, scope, overloads)
+            }
+            ScalarPlace::Field { base, .. } => {
+                if let ScalarPlace::Dereference { pointer, .. } = base.as_mut() {
+                    record_expression_overload_selection(pointer, None, scope, overloads);
+                }
+            }
+            ScalarPlace::Name { .. } => {}
+        },
+        ScalarExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                record_expression_overload_selection(&mut field.value, None, scope, overloads);
+            }
+        }
+        ScalarExpression::Name { .. }
+        | ScalarExpression::Member { .. }
+        | ScalarExpression::Integer { .. }
+        | ScalarExpression::InvalidInteger { .. }
+        | ScalarExpression::Float { .. }
+        | ScalarExpression::InvalidFloat { .. }
+        | ScalarExpression::Boolean { .. }
+        | ScalarExpression::Char { .. }
+        | ScalarExpression::Utf8 { .. } => {}
+    }
+}
+
+fn record_block_overload_selections(
+    block: &mut ScalarBlock,
+    scope: &BTreeMap<String, ScalarType>,
+    overloads: &BTreeMap<String, ScalarFunction>,
+) {
+    let mut scope = scope.clone();
+    for item in &mut block.items {
+        match item {
+            ScalarBlockItem::LocalBinding(binding) => {
+                let expected = binding
+                    .receivers
+                    .first()
+                    .map(|receiver| &receiver.ty)
+                    .unwrap_or(&binding.declared_type);
+                record_expression_overload_selection(
+                    &mut binding.value,
+                    Some(expected),
+                    &scope,
+                    overloads,
+                );
+                scope.insert(binding.name.clone(), binding.declared_type.clone());
+                for receiver in &binding.receivers {
+                    scope.insert(receiver.name.clone(), receiver.ty.clone());
+                }
+            }
+            ScalarBlockItem::Expression(expression) => {
+                record_expression_overload_selection(expression, None, &scope, overloads)
+            }
+            ScalarBlockItem::Assignment(assignment) => record_expression_overload_selection(
+                &mut assignment.value,
+                scope.get(&assignment.target),
+                &scope,
+                overloads,
+            ),
+            ScalarBlockItem::While(while_expression) => {
+                record_block_overload_selections(&mut while_expression.body, &scope, overloads)
+            }
+        }
     }
 }
 
@@ -1580,9 +1777,61 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
             ));
         }
     }
+    if diagnostics.is_empty() {
+        record_project_overload_selections(&mut project);
+    }
     ScalarProjectValidation {
         project,
         diagnostics,
+    }
+}
+
+fn record_project_overload_selections(project: &mut ScalarProject) {
+    let modules = project.modules.clone();
+    for module in &mut project.modules {
+        let scope = module.members.clone();
+        let mut overloads = module
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ScalarItem::Function(function) if !function.overload_arms.is_empty() => {
+                    Some((function.name.clone(), function.clone()))
+                }
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        for namespace in &module.namespace_bindings {
+            if let Some(target) = modules
+                .iter()
+                .find(|candidate| candidate.source == namespace.target)
+            {
+                for item in &target.items {
+                    if let ScalarItem::Function(function) = item {
+                        if !function.overload_arms.is_empty() {
+                            overloads.insert(
+                                format!("{}.{}", namespace.binding, function.name),
+                                function.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for item in &mut module.items {
+            if let ScalarItem::Binding(binding) = item {
+                let expected = binding
+                    .receivers
+                    .first()
+                    .map(|receiver| &receiver.ty)
+                    .unwrap_or(&binding.declared_type);
+                record_expression_overload_selection(
+                    &mut binding.value,
+                    Some(expected),
+                    &scope,
+                    &overloads,
+                );
+            }
+        }
     }
 }
 
@@ -2185,7 +2434,9 @@ fn call_output_sequence_in_module(
             .map(|argument| overload_argument_type(argument, scope))
             .collect::<Option<Vec<_>>>()?;
         let ScalarType::Callable { outputs, .. } =
-            resolve_overload_candidate(overload, &argument_types, None).ok()?
+            resolve_overload_candidate(overload, &argument_types, None)
+                .ok()?
+                .0
         else {
             return None;
         };
@@ -2259,7 +2510,9 @@ fn call_output_sequence(
             .map(|argument| overload_argument_type(argument, scope))
             .collect::<Option<Vec<_>>>()?;
         let ScalarType::Callable { outputs, .. } =
-            resolve_overload_candidate(overload, &argument_types, None).ok()?
+            resolve_overload_candidate(overload, &argument_types, None)
+                .ok()?
+                .0
         else {
             return None;
         };
@@ -3795,7 +4048,7 @@ fn expression_type_in_module_expected(
                 })
                 .collect::<Vec<_>>();
             let callable = match resolve_overload_candidate(overload, &argument_types, expected) {
-                Ok(callable) => callable,
+                Ok((callable, _)) => callable,
                 Err(message) => {
                     diagnostics.push(module_diagnostic(module, "B0004", message, *name_span));
                     return ScalarType::Error;
@@ -5907,6 +6160,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 name_span: token_span(name_token),
                 type_arguments,
                 arguments,
+                overload_selection: None,
                 span: wosy_syntax::byte_span(&actual),
             }
         }
@@ -7857,7 +8111,7 @@ fn expression_type_expected(
                 .collect::<Vec<_>>();
             let callable =
                 match resolve_overload_candidate(overload, &argument_types, Some(expected)) {
-                    Ok(callable) => callable,
+                    Ok((callable, _)) => callable,
                     Err(message) => {
                         diagnostics.push(diagnostic(program, "B0004", message, *name_span));
                         return ScalarType::Error;
@@ -9670,6 +9924,36 @@ bool integer_inversion = !1;
             vec![source],
         ));
         assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn records_distinct_overload_arms_for_shared_input_types() {
+        let result = validate_text(
+            "%%start\nselect = overload {\n    (i32, bool)(i64) => fn(value) { 1, true };\n    (bool, i32)(i64) => fn(value) { true, 1 };\n};\ni64 input = 1;\ni32 integer, bool flag = select(input);\nbool boolean, i32 number = select(input);\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(integer) = &result.program.items[2] else {
+            panic!("integer overload call");
+        };
+        let ScalarExpression::Call {
+            overload_selection: Some(integer_selection),
+            ..
+        } = &integer.value
+        else {
+            panic!("integer overload selection");
+        };
+        assert_eq!(integer_selection.arm_index, 0);
+        let ScalarItem::Binding(boolean) = &result.program.items[3] else {
+            panic!("boolean overload call");
+        };
+        let ScalarExpression::Call {
+            overload_selection: Some(boolean_selection),
+            ..
+        } = &boolean.value
+        else {
+            panic!("boolean overload selection");
+        };
+        assert_eq!(boolean_selection.arm_index, 1);
     }
 
     #[test]
