@@ -408,6 +408,7 @@ pub struct ScalarWhile {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarBinding {
     pub name: String,
+    pub name_span: ByteSpan,
     pub declared_type: ScalarType,
     pub value: ScalarExpression,
     pub receivers: Vec<ScalarOutputReceiver>,
@@ -431,6 +432,7 @@ pub struct ScalarNamespace {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarFunction {
     pub name: String,
+    pub name_span: ByteSpan,
     pub signature: ScalarType,
     pub parameters: Vec<String>,
     pub parameter_spans: Vec<ByteSpan>,
@@ -997,12 +999,42 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         let mut folded_declarations = BTreeMap::new();
         for item in &module.items {
             let (name, span, ty) = match item {
-                ScalarItem::Namespace(namespace) => (&namespace.binding, namespace.span, None),
-                ScalarItem::Extern(extern_decl) => (&extern_decl.binding, extern_decl.span, None),
+                ScalarItem::Namespace(namespace) => {
+                    validate_identifier_style(
+                        module,
+                        &namespace.binding,
+                        namespace.binding_span,
+                        &mut diagnostics,
+                    );
+                    (&namespace.binding, namespace.span, None)
+                }
+                ScalarItem::Extern(extern_decl) => {
+                    validate_identifier_style(
+                        module,
+                        &extern_decl.binding,
+                        extern_decl.binding_span,
+                        &mut diagnostics,
+                    );
+                    (&extern_decl.binding, extern_decl.span, None)
+                }
                 ScalarItem::Binding(binding) => {
+                    for receiver in &binding.receivers {
+                        validate_identifier_style(
+                            module,
+                            &receiver.name,
+                            receiver.name_span,
+                            &mut diagnostics,
+                        );
+                    }
                     (&binding.name, binding.span, Some(&binding.declared_type))
                 }
                 ScalarItem::Function(function) => {
+                    validate_identifier_style(
+                        module,
+                        &function.name,
+                        function.name_span,
+                        &mut diagnostics,
+                    );
                     (&function.name, function.span, Some(&function.signature))
                 }
                 ScalarItem::Executable(_) => continue,
@@ -1083,6 +1115,12 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                     let mut visible_names = declaration_names.clone();
                     let mut folded_names = folded_declarations.clone();
                     for (index, name) in function.parameters.iter().enumerate() {
+                        validate_identifier_style(
+                            module,
+                            name,
+                            function.parameter_spans[index],
+                            &mut diagnostics,
+                        );
                         if index < parameters.len()
                             && declare_module_name(
                                 module,
@@ -1766,6 +1804,7 @@ fn validate_extern(
         ));
     }
     for function in &extern_decl.functions {
+        validate_identifier_style(module, &function.name, function.name_span, diagnostics);
         validate_module_type(
             module,
             &function.signature,
@@ -2161,6 +2200,9 @@ fn block_item_type_in_module(
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
+            for receiver in &binding.receivers {
+                validate_identifier_style(module, &receiver.name, receiver.name_span, diagnostics);
+            }
             let actual = expression_type_in_module_expected(
                 &binding.value,
                 Some(&binding.declared_type),
@@ -4069,6 +4111,55 @@ fn declare_module_name(
     true
 }
 
+fn validate_identifier_style(
+    module: &ScalarModule,
+    name: &str,
+    span: ByteSpan,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    if !is_declared_identifier_style(name) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "identifier must use snake_case, PascalCase, or SCREAMING_SNAKE_CASE",
+            span,
+        ));
+    }
+}
+
+fn validate_program_identifier_style(
+    program: &ScalarProgram,
+    name: &str,
+    span: ByteSpan,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    if !is_declared_identifier_style(name) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            "identifier must use snake_case, PascalCase, or SCREAMING_SNAKE_CASE",
+            span,
+        ));
+    }
+}
+
+fn is_declared_identifier_style(name: &str) -> bool {
+    if name == "_" {
+        return true;
+    }
+    let bytes = name.as_bytes();
+    let snake_case = bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_');
+    let pascal_case =
+        bytes[0].is_ascii_uppercase() && bytes[1..].iter().all(|byte| byte.is_ascii_alphanumeric());
+    let screaming_snake_case = bytes.iter().any(|byte| byte.is_ascii_uppercase())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_');
+    snake_case || pascal_case || screaming_snake_case
+}
+
 fn module_collision_diagnostic(
     module: &ScalarModule,
     span: ByteSpan,
@@ -4258,6 +4349,7 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
     };
     ScalarBinding {
         name,
+        name_span: receivers[0].name_span,
         declared_type,
         value,
         receivers,
@@ -4416,10 +4508,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
             .find(|child| child.kind() == SyntaxKind::CallableType)
             .expect("function signature"),
     );
-    let name = direct_token(node, SyntaxKind::Identifier)
-        .expect("function name")
-        .text()
-        .to_owned();
+    let name = direct_token(node, SyntaxKind::Identifier).expect("function name");
     let parameters = children
         .iter()
         .find(|child| child.kind() == SyntaxKind::Parameters)
@@ -4460,7 +4549,8 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         }
     }
     ScalarFunction {
-        name,
+        name: name.text().to_owned(),
+        name_span: token_span(&name),
         signature,
         parameters,
         parameter_spans,
@@ -5698,12 +5788,42 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
     }
     for item in &program.items {
         let (name, span, ty) = match item {
-            ScalarItem::Namespace(namespace) => (&namespace.binding, namespace.span, None),
-            ScalarItem::Extern(extern_decl) => (&extern_decl.binding, extern_decl.span, None),
+            ScalarItem::Namespace(namespace) => {
+                validate_program_identifier_style(
+                    program,
+                    &namespace.binding,
+                    namespace.binding_span,
+                    &mut diagnostics,
+                );
+                (&namespace.binding, namespace.span, None)
+            }
+            ScalarItem::Extern(extern_decl) => {
+                validate_program_identifier_style(
+                    program,
+                    &extern_decl.binding,
+                    extern_decl.binding_span,
+                    &mut diagnostics,
+                );
+                (&extern_decl.binding, extern_decl.span, None)
+            }
             ScalarItem::Binding(binding) => {
+                for receiver in &binding.receivers {
+                    validate_program_identifier_style(
+                        program,
+                        &receiver.name,
+                        receiver.name_span,
+                        &mut diagnostics,
+                    );
+                }
                 (&binding.name, binding.span, Some(&binding.declared_type))
             }
             ScalarItem::Function(function) => {
+                validate_program_identifier_style(
+                    program,
+                    &function.name,
+                    function.name_span,
+                    &mut diagnostics,
+                );
                 (&function.name, function.span, Some(&function.signature))
             }
             ScalarItem::Executable(_) => continue,
@@ -5777,6 +5897,12 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                 let mut visible_names = declaration_names.clone();
                 let mut folded_names = folded_declarations.clone();
                 for (index, name) in function.parameters.iter().enumerate() {
+                    validate_program_identifier_style(
+                        program,
+                        name,
+                        function.parameter_spans[index],
+                        &mut diagnostics,
+                    );
                     if index < parameters.len()
                         && declare_program_name(
                             program,
@@ -6258,6 +6384,14 @@ fn block_item_type(
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
+            for receiver in &binding.receivers {
+                validate_program_identifier_style(
+                    program,
+                    &receiver.name,
+                    receiver.name_span,
+                    diagnostics,
+                );
+            }
             let actual = expression_type_expected(
                 &binding.value,
                 &binding.declared_type,
@@ -8975,6 +9109,112 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             "diagnostics: {:?}",
             result.diagnostics
         );
+    }
+
+    #[test]
+    fn accepts_documented_declared_identifier_styles_in_single_file() {
+        let result = validate_text(
+            "%%start\nsnake_namespace = namespace app \"src/library.w\";\nextern_binding = extern wasm \"env\" { i32(i32) extern_function; };\ni32 snake_case = 1;\ni32 PascalCase = 2;\ni32 SCREAMING_SNAKE_CASE = 3;\ni32 _ = 4;\ni32(i32) function_name = fn(_name) { i32 _local = _name; _local };\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_camel_case_declarations_at_identifier_spans_in_single_file() {
+        let text = "%%start\ncamelNamespace = namespace app \"src/library.w\";\ncamelExternBinding = extern wasm \"env\" { i32(i32) camelExternFunction; };\ni32 camelBinding = 1;\ni32(i32) camelFunction = fn(camelParameter) { i32 camelLocal = camelParameter; camelLocal };\n%%end";
+        let result = validate_text(text);
+        let diagnostics: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message
+                        == "identifier must use snake_case, PascalCase, or SCREAMING_SNAKE_CASE"
+            })
+            .collect();
+        let identifiers = [
+            "camelNamespace",
+            "camelExternBinding",
+            "camelExternFunction",
+            "camelBinding",
+            "camelFunction",
+            "camelParameter",
+            "camelLocal",
+        ];
+        assert_eq!(diagnostics.len(), identifiers.len());
+        for identifier in identifiers {
+            let start = text.find(identifier).expect("identifier") as u32;
+            let span = ByteSpan::new(start, start + identifier.len() as u32);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.labels[0].span.range == span),
+                "missing diagnostic for {identifier}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_declared_identifier_styles_in_project() {
+        let source = module_source("src/main.w");
+        let accepted = module_from_text(
+            source.clone(),
+            "%%start\nsnake_namespace = namespace app \"src/library.w\";\nextern_binding = extern wasm \"env\" { i32(i32) extern_function; };\ni32 snake_case = 1;\ni32 PascalCase = 2;\ni32 SCREAMING_SNAKE_CASE = 3;\ni32 _ = 4;\ni32(i32) function_name = fn(_name) { i32 _local = _name; _local };\n%%end",
+        );
+        let accepted = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(
+                source.clone(),
+                accepted.items,
+                Vec::new(),
+            )],
+            vec![source.clone()],
+        ));
+        assert!(
+            accepted.diagnostics.is_empty(),
+            "{:?}",
+            accepted.diagnostics
+        );
+
+        let text = "%%start\ncamelNamespace = namespace app \"src/library.w\";\ncamelExternBinding = extern wasm \"env\" { i32(i32) camelExternFunction; };\ni32 camelBinding = 1;\ni32(i32) camelFunction = fn(camelParameter) { i32 camelLocal = camelParameter; camelLocal };\n%%end";
+        let rejected = module_from_text(source.clone(), text);
+        let rejected = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(
+                source.clone(),
+                rejected.items,
+                Vec::new(),
+            )],
+            vec![source.clone()],
+        ));
+        let diagnostics: Vec<_> = rejected
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message
+                        == "identifier must use snake_case, PascalCase, or SCREAMING_SNAKE_CASE"
+            })
+            .collect();
+        let identifiers = [
+            "camelNamespace",
+            "camelExternBinding",
+            "camelExternFunction",
+            "camelBinding",
+            "camelFunction",
+            "camelParameter",
+            "camelLocal",
+        ];
+        assert_eq!(diagnostics.len(), identifiers.len());
+        for identifier in identifiers {
+            let start = text.find(identifier).expect("identifier") as u32;
+            let span = ByteSpan::new(start, start + identifier.len() as u32);
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.labels[0].span.source == source
+                        && diagnostic.labels[0].span.range == span
+                }),
+                "missing diagnostic for {identifier}"
+            );
+        }
     }
 
     #[test]
