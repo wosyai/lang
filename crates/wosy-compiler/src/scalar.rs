@@ -346,14 +346,38 @@ fn infer_overload_substitutions(
     }
 }
 
+#[derive(Clone, Debug)]
+enum ScalarOverloadArgument {
+    IntegerLiteral,
+    Typed(ScalarType),
+}
+
+fn infer_overload_argument(
+    pattern: &ScalarType,
+    argument: &ScalarOverloadArgument,
+    parameters: &[ScalarGenericParameter],
+    substitutions: &mut BTreeMap<String, ScalarType>,
+) -> bool {
+    match argument {
+        ScalarOverloadArgument::Typed(actual) => {
+            infer_overload_substitutions(pattern, actual, parameters, substitutions)
+        }
+        ScalarOverloadArgument::IntegerLiteral => {
+            matches!(pattern, ScalarType::Named { name, .. } if parameters.iter().any(|parameter| parameter.name == *name))
+                || is_integer_type(pattern)
+        }
+    }
+}
+
 fn resolve_overload_candidate(
     overload: &ScalarFunction,
-    arguments: &[ScalarType],
+    arguments: &[ScalarOverloadArgument],
     expected: Option<&ScalarType>,
 ) -> Result<(ScalarType, ScalarOverloadSelection), &'static str> {
     let mut matches = Vec::new();
     let mut inconsistent = false;
     let mut output_mismatch = false;
+    let mut unresolved_integer_literal = false;
     for (arm_index, arm) in overload.overload_arms.iter().enumerate() {
         let ScalarType::Callable {
             outputs,
@@ -366,10 +390,10 @@ fn resolve_overload_candidate(
             continue;
         }
         let mut substitutions = BTreeMap::new();
-        let inputs_match = parameters.iter().zip(arguments).all(|(pattern, actual)| {
-            infer_overload_substitutions(
+        let inputs_match = parameters.iter().zip(arguments).all(|(pattern, argument)| {
+            infer_overload_argument(
                 pattern,
-                actual,
+                argument,
                 &arm.generic_parameters,
                 &mut substitutions,
             )
@@ -399,6 +423,9 @@ fn resolve_overload_candidate(
             .iter()
             .any(|parameter| !substitutions.contains_key(&parameter.name))
         {
+            unresolved_integer_literal |= arguments
+                .iter()
+                .any(|argument| matches!(argument, ScalarOverloadArgument::IntegerLiteral));
             continue;
         }
         let callable = substitute_type(&arm.signature, &substitutions);
@@ -413,6 +440,19 @@ fn resolve_overload_candidate(
                 continue;
             }
         }
+        let ScalarType::Callable { parameters, .. } = &callable else {
+            unreachable!("overload arms are callable")
+        };
+        if !parameters
+            .iter()
+            .zip(arguments)
+            .all(|(parameter, argument)| {
+                !matches!(argument, ScalarOverloadArgument::IntegerLiteral)
+                    || is_integer_type(parameter)
+            })
+        {
+            continue;
+        }
         matches.push((
             callable,
             ScalarOverloadSelection {
@@ -425,6 +465,9 @@ fn resolve_overload_candidate(
         1 => Ok(matches.pop().expect("one overload candidate")),
         0 if output_mismatch => Err("overload output does not match the expected receiver"),
         0 if inconsistent => Err("overload generic substitution is inconsistent"),
+        0 if unresolved_integer_literal => {
+            Err("integer literal requires a unique overload parameter or output context")
+        }
         0 => Err("no overload candidate matches this call"),
         _ => Err("overload call is ambiguous"),
     }
@@ -433,15 +476,31 @@ fn resolve_overload_candidate(
 fn overload_argument_type(
     expression: &ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
-) -> Option<ScalarType> {
+) -> Option<ScalarOverloadArgument> {
     match expression {
-        ScalarExpression::Name { name, .. } => scope.get(name).cloned(),
-        ScalarExpression::Integer { .. } | ScalarExpression::InvalidInteger { .. } => {
-            Some(ScalarType::I32)
+        ScalarExpression::Name { name, .. } => {
+            scope.get(name).cloned().map(ScalarOverloadArgument::Typed)
         }
-        ScalarExpression::Boolean { .. } => Some(ScalarType::Bool),
-        ScalarExpression::Char { .. } => Some(ScalarType::Char),
+        ScalarExpression::Integer { .. } | ScalarExpression::InvalidInteger { .. } => {
+            Some(ScalarOverloadArgument::IntegerLiteral)
+        }
+        ScalarExpression::Boolean { .. } => Some(ScalarOverloadArgument::Typed(ScalarType::Bool)),
+        ScalarExpression::Char { .. } => Some(ScalarOverloadArgument::Typed(ScalarType::Char)),
         _ => None,
+    }
+}
+
+fn overload_argument_from_actual(
+    expression: &ScalarExpression,
+    actual: &ScalarType,
+) -> ScalarOverloadArgument {
+    if matches!(
+        expression,
+        ScalarExpression::Integer { .. } | ScalarExpression::InvalidInteger { .. }
+    ) {
+        ScalarOverloadArgument::IntegerLiteral
+    } else {
+        ScalarOverloadArgument::Typed(actual.clone())
     }
 }
 
@@ -3741,6 +3800,48 @@ fn expression_type_in_module(
                     unsafe_context,
                 );
             }
+            let overload = match receiver {
+                None => module.items.iter().find_map(|item| match item {
+                    ScalarItem::Function(function)
+                        if function.name == *name && !function.overload_arms.is_empty() =>
+                    {
+                        Some(function)
+                    }
+                    _ => None,
+                }),
+                Some(binding) => module
+                    .namespace_bindings
+                    .iter()
+                    .find(|namespace| namespace.binding == *binding)
+                    .and_then(|namespace| {
+                        modules
+                            .iter()
+                            .find(|candidate| candidate.source == namespace.target)
+                    })
+                    .and_then(|target| {
+                        target.items.iter().find_map(|item| match item {
+                            ScalarItem::Function(function)
+                                if function.name == *name && !function.overload_arms.is_empty() =>
+                            {
+                                Some(function)
+                            }
+                            _ => None,
+                        })
+                    }),
+            };
+            if overload.is_some() {
+                return expression_type_in_module_expected(
+                    expression,
+                    None,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
             let (callable, target, unsafe_callable) = match receiver {
                 None => (scope.get(name), module, false),
                 Some(binding) => {
@@ -4069,7 +4170,13 @@ fn expression_type_in_module_expected(
                     )
                 })
                 .collect::<Vec<_>>();
-            let callable = match resolve_overload_candidate(overload, &argument_types, expected) {
+            let overload_arguments = arguments
+                .iter()
+                .zip(&argument_types)
+                .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
+                .collect::<Vec<_>>();
+            let callable = match resolve_overload_candidate(overload, &overload_arguments, expected)
+            {
                 Ok((callable, _)) => callable,
                 Err(message) => {
                     diagnostics.push(module_diagnostic(module, "B0004", message, *name_span));
@@ -7768,6 +7875,7 @@ fn expression_type(
         ScalarExpression::Call {
             receiver,
             name,
+            name_span,
             arguments,
             span,
             type_arguments,
@@ -7840,6 +7948,71 @@ fn expression_type(
                     diagnostics,
                     unsafe_context,
                 );
+            }
+            if let Some(overload) = program.items.iter().find_map(|item| match item {
+                ScalarItem::Function(function)
+                    if receiver.is_none()
+                        && function.name == *name
+                        && !function.overload_arms.is_empty() =>
+                {
+                    Some(function)
+                }
+                _ => None,
+            }) {
+                let argument_types = arguments
+                    .iter()
+                    .map(|argument| {
+                        expression_type(
+                            argument,
+                            scope,
+                            visible_names,
+                            folded_names,
+                            program,
+                            diagnostics,
+                            unsafe_context,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let overload_arguments = arguments
+                    .iter()
+                    .zip(&argument_types)
+                    .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
+                    .collect::<Vec<_>>();
+                let callable = match resolve_overload_candidate(overload, &overload_arguments, None)
+                {
+                    Ok((callable, _)) => callable,
+                    Err(message) => {
+                        diagnostics.push(diagnostic(program, "B0004", message, *name_span));
+                        return ScalarType::Error;
+                    }
+                };
+                let ScalarType::Callable {
+                    outputs,
+                    parameters,
+                } = callable
+                else {
+                    unreachable!("overload arms are callable")
+                };
+                for (argument, parameter) in arguments.iter().zip(&parameters) {
+                    let actual = expression_type_expected(
+                        argument,
+                        parameter,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                    );
+                    expect_type(
+                        program,
+                        parameter,
+                        &actual,
+                        expression_span(argument),
+                        diagnostics,
+                    );
+                }
+                return scalar_call_result(&outputs);
             }
             let lookup_name = receiver
                 .as_ref()
@@ -8131,8 +8304,13 @@ fn expression_type_expected(
                     )
                 })
                 .collect::<Vec<_>>();
+            let overload_arguments = arguments
+                .iter()
+                .zip(&argument_types)
+                .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
+                .collect::<Vec<_>>();
             let callable =
-                match resolve_overload_candidate(overload, &argument_types, Some(expected)) {
+                match resolve_overload_candidate(overload, &overload_arguments, Some(expected)) {
                     Ok((callable, _)) => callable,
                     Err(message) => {
                         diagnostics.push(diagnostic(program, "B0004", message, *name_span));
@@ -10036,6 +10214,57 @@ bool integer_inversion = !1;
             "%%start\nselect = overload { i32(i32) => fn(value) { value }; i32(i32) => fn(value) { value }; };\ni32 value = select(1);\n%%end",
         );
         assert!(ambiguous
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "overload call is ambiguous"));
+    }
+
+    #[test]
+    fn infers_integer_literal_overloads_only_from_unique_parameter_or_output_context() {
+        let constrained = "%%start\nidentity = overload { generic T; T(T) => fn(value) { value }; };\ni64 value = identity(1);\n%%end";
+        let single = validate_text(constrained);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), constrained);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+
+        let unconstrained = "%%start\nidentity = overload { generic T; T(T) => fn(value) { value }; };\nidentity(1);\n%%end";
+        let single = validate_text(unconstrained);
+        assert!(single.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message
+                == "integer literal requires a unique overload parameter or output context"
+        }));
+
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), unconstrained);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(project.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message
+                == "integer literal requires a unique overload parameter or output context"
+        }));
+
+        let ambiguous = "%%start\nselect = overload { i32(i32) => fn(value) { value }; i64(i64) => fn(value) { value }; };\nselect(1);\n%%end";
+        let single = validate_text(ambiguous);
+        assert!(single
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "overload call is ambiguous"));
+
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), ambiguous);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(project
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message == "overload call is ambiguous"));
