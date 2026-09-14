@@ -4408,43 +4408,6 @@ fn output_sequence(node: &CstNode) -> ScalarOutputSequence {
     }
 }
 
-fn derive_struct_literal(node: CstNode) -> Option<ScalarStructLiteral> {
-    let literal = direct_nodes(&node)
-        .into_iter()
-        .find(|child| child.kind() == SyntaxKind::StructLiteral)
-        .or_else(|| {
-            node.descendants()
-                .find(|child| child.kind() == SyntaxKind::StructLiteral)
-        })?;
-    let fields = literal
-        .children()
-        .filter(|child| child.kind() == SyntaxKind::StructLiteralField)
-        .map(|field| {
-            let name = direct_token(&field, SyntaxKind::Identifier).expect("literal field name");
-            let value = direct_nodes(&field)
-                .into_iter()
-                .find(|child| child.kind() == SyntaxKind::Expression)
-                .or_else(|| {
-                    field
-                        .descendants()
-                        .find(|child| child.kind() == SyntaxKind::Expression)
-                })
-                .map(|child| derive_expression(&child))
-                .expect("literal field value");
-            ScalarStructLiteralField {
-                name: name.text().to_owned(),
-                name_span: token_span(&name),
-                value,
-                span: wosy_syntax::byte_span(&field),
-            }
-        })
-        .collect();
-    Some(ScalarStructLiteral {
-        fields,
-        span: wosy_syntax::byte_span(&literal),
-    })
-}
-
 fn derive_function(node: &CstNode) -> ScalarFunction {
     let children = direct_nodes(node);
     let signature = derive_type(
@@ -5390,13 +5353,6 @@ fn direct_token(node: &CstNode, kind: SyntaxKind) -> Option<CstToken> {
         })
 }
 
-fn type_text(node: &CstNode) -> String {
-    direct_token(node, SyntaxKind::TypeName)
-        .expect("type token")
-        .text()
-        .to_owned()
-}
-
 fn derive_element(element: &NodeOrToken<CstNode, CstToken>) -> ScalarExpression {
     match element {
         NodeOrToken::Node(node) => derive_expression(node),
@@ -6006,63 +5962,6 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
         ));
     }
     diagnostics
-}
-
-fn validate_struct_literal(
-    literal: &ScalarStructLiteral,
-    expected: &ScalarType,
-    declarations: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
-    diagnostics: &mut Vec<super::Diagnostic>,
-) {
-    let ScalarType::Struct(id) = expected else {
-        return;
-    };
-    let Some(structure) = program.structs.iter().find(|item| item.id == *id) else {
-        return;
-    };
-    let mut seen = BTreeSet::new();
-    let mut initialized = BTreeSet::new();
-    for field in &literal.fields {
-        if !seen.insert(field.name.clone()) {
-            diagnostics.push(diagnostic(
-                program,
-                "B0002",
-                "duplicate struct literal field",
-                field.name_span,
-            ));
-            continue;
-        }
-        let Some(declared) = structure.fields.iter().find(|item| item.name == field.name) else {
-            diagnostics.push(diagnostic(
-                program,
-                "M0002",
-                "unknown struct field",
-                field.name_span,
-            ));
-            continue;
-        };
-        initialized.insert(field.name.clone());
-        let actual = expression_type_expected(
-            &field.value,
-            &declared.ty,
-            declarations,
-            &BTreeSet::new(),
-            &BTreeMap::new(),
-            program,
-            diagnostics,
-            false,
-        );
-        expect_type(program, &declared.ty, &actual, field.span, diagnostics);
-    }
-    if initialized.len() != structure.fields.len() {
-        diagnostics.push(diagnostic(
-            program,
-            "B0003",
-            "struct literal must initialize every field",
-            literal.span,
-        ));
-    }
 }
 
 struct StaticUseAnalyzer {
@@ -7633,32 +7532,6 @@ fn validate_integer_range_for_type_program(
             span,
         ));
     }
-}
-
-fn invalid_integer_diagnostic(
-    module: &ScalarModule,
-    span: ByteSpan,
-    diagnostics: &mut Vec<super::Diagnostic>,
-) {
-    diagnostics.push(module_diagnostic(
-        module,
-        "B0010",
-        "invalid integer literal",
-        span,
-    ));
-}
-
-fn invalid_integer_diagnostic_program(
-    program: &ScalarProgram,
-    span: ByteSpan,
-    diagnostics: &mut Vec<super::Diagnostic>,
-) {
-    diagnostics.push(diagnostic(
-        program,
-        "B0010",
-        "invalid integer literal",
-        span,
-    ));
 }
 
 fn is_const_binding_name(name: &str) -> bool {
