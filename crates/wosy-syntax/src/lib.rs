@@ -71,6 +71,10 @@ pub enum SyntaxKind {
     QualifiedType,
     UnitIfExpr,
     Unary,
+    GenericDecl,
+    GenericFunctionDecl,
+    OverloadDecl,
+    OverloadArm,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -142,6 +146,10 @@ impl Language for WosyLanguage {
             58 => SyntaxKind::QualifiedType,
             59 => SyntaxKind::UnitIfExpr,
             60 => SyntaxKind::Unary,
+            61 => SyntaxKind::GenericDecl,
+            62 => SyntaxKind::GenericFunctionDecl,
+            63 => SyntaxKind::OverloadDecl,
+            64 => SyntaxKind::OverloadArm,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -357,7 +365,10 @@ fn build_pair(
     errors: &mut Vec<SyntaxError>,
 ) {
     let span = pair.as_span();
-    if pair.as_rule() == Rule::error_item {
+    if matches!(
+        pair.as_rule(),
+        Rule::error_item | Rule::malformed_generic_decl
+    ) {
         let range = ByteSpan::new(span.start() as u32, span.end() as u32);
         builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Error));
         add_gap(builder, span.as_str(), span.start(), comments);
@@ -567,6 +578,10 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::extern_decl => SyntaxKind::ExternDecl,
         Rule::extern_function => SyntaxKind::ExternFunction,
         Rule::function_decl => SyntaxKind::FunctionDecl,
+        Rule::generic_decl => SyntaxKind::GenericDecl,
+        Rule::generic_function_decl => SyntaxKind::GenericFunctionDecl,
+        Rule::overload_decl => SyntaxKind::OverloadDecl,
+        Rule::overload_arm => SyntaxKind::OverloadArm,
         Rule::binding_decl => SyntaxKind::BindingDecl,
         Rule::local_binding => SyntaxKind::LocalBinding,
         Rule::namespace_decl => SyntaxKind::NamespaceDecl,
@@ -835,6 +850,10 @@ mod tests {
             SyntaxKind::GenericTypeArgument,
             SyntaxKind::QualifiedType,
             SyntaxKind::Unary,
+            SyntaxKind::GenericDecl,
+            SyntaxKind::GenericFunctionDecl,
+            SyntaxKind::OverloadDecl,
+            SyntaxKind::OverloadArm,
         ];
         for kind in kinds {
             assert_eq!(
@@ -1057,6 +1076,128 @@ mod tests {
                 SyntaxKind::Expression,
             ]
         );
+    }
+
+    #[test]
+    fn generic_function_declaration_is_structural_lossless_and_span_exact() {
+        let text = "%%start\ngeneric T;\nT(T) identity = fn(value) {\n\tvalue\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let declaration = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::GenericFunctionDecl)
+            .expect("generic function declaration");
+        assert_eq!(byte_span(&declaration), ByteSpan::new(8, 56));
+        assert_eq!(
+            declaration
+                .children()
+                .map(|node| node.kind())
+                .collect::<Vec<_>>(),
+            vec![SyntaxKind::GenericDecl, SyntaxKind::FunctionDecl]
+        );
+        let generic = declaration.children().next().expect("generic declaration");
+        assert_eq!(generic.text(), "generic T;");
+        assert_eq!(byte_span(&generic), ByteSpan::new(8, 18));
+        assert!(generic.descendants_with_tokens().any(|element| {
+            element.kind() == SyntaxKind::Identifier && element.to_string() == "T"
+        }));
+    }
+
+    #[test]
+    fn overload_declaration_retains_ordinary_and_generic_arms_in_source_order() {
+        let text = "%%start\ncast = overload {\n\ti32(i64) => fn(value) {\n\t\tvalue\n\t};\n\n\tgeneric T;\n\tT(T) => fn(value) {\n\t\tvalue\n\t};\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let overload = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::OverloadDecl)
+            .expect("overload declaration");
+        let arms = overload
+            .children()
+            .filter(|node| node.kind() == SyntaxKind::OverloadArm)
+            .collect::<Vec<_>>();
+        assert_eq!(arms.len(), 2);
+        assert_eq!(arms[0].text(), "i32(i64) => fn(value) {\n\t\tvalue\n\t};");
+        assert_eq!(
+            arms[1]
+                .children()
+                .map(|node| node.kind())
+                .collect::<Vec<_>>(),
+            vec![
+                SyntaxKind::GenericDecl,
+                SyntaxKind::CallableType,
+                SyntaxKind::Parameters,
+                SyntaxKind::Block
+            ]
+        );
+        assert_eq!(
+            arms[1].text(),
+            "generic T;\n\tT(T) => fn(value) {\n\t\tvalue\n\t};"
+        );
+        assert!(byte_span(&arms[0]).end < byte_span(&arms[1]).start);
+        assert_eq!(
+            byte_span(&arms[0]),
+            ByteSpan::new(
+                text.find("i32(i64)").expect("ordinary arm") as u32,
+                text.find("\n\n\tgeneric T;").expect("ordinary arm end") as u32
+            )
+        );
+        assert_eq!(
+            byte_span(&arms[1]),
+            ByteSpan::new(
+                text.find("generic T;").expect("generic arm") as u32,
+                text.find("\n};\n%%end").expect("generic arm end") as u32
+            )
+        );
+        let generic = arms[1].children().next().expect("arm generic declaration");
+        assert_eq!(
+            byte_span(&generic),
+            ByteSpan::new(
+                text.find("generic T;").expect("generic declaration") as u32,
+                text.find("generic T;").expect("generic declaration") as u32 + 10
+            )
+        );
+    }
+
+    #[test]
+    fn consecutive_and_malformed_generic_declarations_recover_losslessly() {
+        let consecutive =
+            "%%start\ngeneric T;\ngeneric U;\nU(U) identity = fn(value) { value };\n%%end";
+        let consecutive_result = parse(identity(), consecutive.into(), &[]);
+        assert!(!consecutive_result.is_valid());
+        assert_eq!(consecutive_result.reconstruct(), consecutive);
+        assert!(consecutive_result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Error));
+
+        let malformed = "%%start\ngeneric ;\ni32() after = fn { 1 };\n%%end";
+        let malformed_result = parse(identity(), malformed.into(), &[]);
+        assert!(!malformed_result.is_valid());
+        assert_eq!(malformed_result.reconstruct(), malformed);
+        assert!(malformed_result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::FunctionDecl));
+    }
+
+    #[test]
+    fn malformed_overload_arm_recovers_losslessly() {
+        let text = "%%start\ncast = overload {\n\tgeneric T;\n\tT(T) => fn(value) { value }\n};\ni32() after = fn { 1 };\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(!result.is_valid());
+        assert_eq!(result.reconstruct(), text);
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Error));
+        assert!(result.root.descendants().any(|node| {
+            node.kind() == SyntaxKind::FunctionDecl && node.text().to_string().contains("after")
+        }));
     }
 
     #[test]

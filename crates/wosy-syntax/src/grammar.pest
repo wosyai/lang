@@ -9,8 +9,10 @@ comment_scan = ${ SOI ~ (string | comment | (!("\"" | "#") ~ ANY))* ~ EOI }
 source = { SOI ~ boundary_start ~ (item | error_item)+ ~ boundary_end ~ EOI }
 boundary_start = { "%%start" }
 boundary_end = { "%%end" }
-item = { struct_decl | namespace_decl | extern_decl | function_decl | binding_decl | top_level_item }
-error_item = @{ (!(";" | "%%end") ~ ANY)+ ~ ";"? }
+item = { struct_decl | namespace_decl | extern_decl | generic_function_decl | malformed_generic_decl | function_decl | overload_decl | binding_decl | top_level_item }
+error_item = @{ generic_error | (!(";" | "%%end") ~ ANY)+ ~ ";"? }
+generic_error = { "generic" ~ (!(";") ~ ANY)* ~ ";" }
+malformed_generic_decl = @{ "generic" ~ (!(";") ~ ANY)* ~ ";" }
 top_level_item = { (assignment | expression) ~ ";" }
 struct_decl = { "struct" ~ identifier ~ "{" ~ struct_field* ~ "}" }
 struct_field = { type_spec ~ identifier ~ ";" }
@@ -18,6 +20,10 @@ namespace_decl = { identifier ~ "=" ~ "namespace" ~ identifier ~ string ~ ";" }
 extern_decl = { identifier ~ "=" ~ "extern" ~ identifier ~ string ~ "{" ~ extern_function+ ~ "}" ~ ";" }
 extern_function = { unsafe_marker? ~ callable_type ~ identifier ~ ";" }
 function_decl = { unsafe_marker? ~ callable_type ~ identifier ~ "=" ~ "fn" ~ parameters? ~ block ~ ";" }
+generic_decl = { "generic" ~ identifier ~ ";" }
+generic_function_decl = { generic_decl ~ function_decl }
+overload_decl = { identifier ~ "=" ~ "overload" ~ "{" ~ overload_arm+ ~ "}" ~ ";" }
+overload_arm = { generic_decl? ~ callable_type ~ "=>" ~ "fn" ~ parameters? ~ block ~ ";" }
 binding_decl = { receiver_list ~ "=" ~ output_list ~ ";" }
 type_spec = { callable_type | raw_pointer_type | qualified_type | type_name }
 callable_type = { callable_output ~ "(" ~ ((raw_pointer_type | qualified_type | type_name) ~ ("," ~ (raw_pointer_type | qualified_type | type_name))*)? ~ ")" }
