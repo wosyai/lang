@@ -4007,7 +4007,7 @@ fn expression_type_in_module_expected(
     unsafe_context: bool,
 ) -> ScalarType {
     if let ScalarExpression::Call {
-        receiver: None,
+        receiver,
         name,
         name_span,
         type_arguments,
@@ -4015,14 +4015,36 @@ fn expression_type_in_module_expected(
         ..
     } = expression
     {
-        if let Some(overload) = module.items.iter().find_map(|item| match item {
-            ScalarItem::Function(function)
-                if function.name == *name && !function.overload_arms.is_empty() =>
-            {
-                Some(function)
-            }
-            _ => None,
-        }) {
+        let overload = match receiver {
+            None => module.items.iter().find_map(|item| match item {
+                ScalarItem::Function(function)
+                    if function.name == *name && !function.overload_arms.is_empty() =>
+                {
+                    Some(function)
+                }
+                _ => None,
+            }),
+            Some(binding) => module
+                .namespace_bindings
+                .iter()
+                .find(|namespace| namespace.binding == *binding)
+                .and_then(|namespace| {
+                    modules
+                        .iter()
+                        .find(|candidate| candidate.source == namespace.target)
+                })
+                .and_then(|target| {
+                    target.items.iter().find_map(|item| match item {
+                        ScalarItem::Function(function)
+                            if function.name == *name && !function.overload_arms.is_empty() =>
+                        {
+                            Some(function)
+                        }
+                        _ => None,
+                    })
+                }),
+        };
+        if let Some(overload) = overload {
             if let Some(type_argument) = type_arguments.first() {
                 diagnostics.push(module_diagnostic(
                     module,
@@ -9924,6 +9946,52 @@ bool integer_inversion = !1;
             vec![source],
         ));
         assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn resolves_qualified_generic_overload_from_value_argument_and_records_selection() {
+        let child_source = module_source("src/child.w");
+        let child = module_from_text(
+            child_source.clone(),
+            "%%start\nidentity = overload {\n    i32(i64) => fn(value) { 7 };\n    generic T;\n    T(T) => fn(value) { value };\n};\n%%end",
+        );
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nchild = namespace app \"src/child.w\";\nchar copied = child.identity('g');\n%%end",
+        );
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let result = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source.clone(),
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "child".to_owned(),
+                        target: child_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(child_source.clone(), child.items, Vec::new()),
+            ],
+            vec![main_source, child_source],
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(binding) = &result.project.modules[0].items[1] else {
+            panic!("qualified overload binding");
+        };
+        let ScalarExpression::Call {
+            overload_selection: Some(selection),
+            ..
+        } = &binding.value
+        else {
+            panic!("qualified overload selection");
+        };
+        assert_eq!(selection.arm_index, 1);
+        assert_eq!(selection.substitutions.get("T"), Some(&ScalarType::Char));
     }
 
     #[test]
