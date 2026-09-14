@@ -133,21 +133,50 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     let mut externs = Vec::new();
     let mut functions = BTreeMap::new();
     let mut call_targets = BTreeMap::new();
-    for item in &validation.program.items {
-        if let ScalarItem::Function(function) = item {
-            let value = module.add_function(
-                &function.name,
-                function_type(&context, &function.signature)?,
-                None,
-            );
-            for (index, name) in function.parameters.iter().enumerate() {
-                if let Some(parameter) = value.get_nth_param(index as u32) {
-                    parameter.set_name(name);
-                }
+    for function in validation
+        .program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarItem::Function(function) if function.generic_parameters.is_empty() => {
+                Some(function)
             }
-            functions.insert(function.name.clone(), value);
-            call_targets.insert(function.name.clone(), function.name.clone());
+            _ => None,
+        })
+    {
+        let value = module.add_function(
+            &function.name,
+            function_type(&context, &function.signature)?,
+            None,
+        );
+        for (index, name) in function.parameters.iter().enumerate() {
+            if let Some(parameter) = value.get_nth_param(index as u32) {
+                parameter.set_name(name);
+            }
         }
+        functions.insert(function.name.clone(), value);
+        call_targets.insert(function.name.clone(), function.name.clone());
+    }
+    let specializations = generic_specializations(
+        &validation.program.items,
+        |name| {
+            validation.program.items.iter().find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == name => Some(function),
+                _ => None,
+            })
+        },
+        |name| name.to_owned(),
+    )?;
+    for (lookup, function, name) in &specializations {
+        let value = module.add_function(name, function_type(&context, &function.signature)?, None);
+        for (index, parameter) in function.parameters.iter().enumerate() {
+            if let Some(argument) = value.get_nth_param(index as u32) {
+                argument.set_name(parameter);
+            }
+        }
+        call_targets.insert(lookup.clone(), name.clone());
+        signatures.insert(name.clone(), function.signature.clone());
+        functions.insert(name.clone(), value);
     }
     for item in &validation.program.items {
         if let ScalarItem::Extern(extern_decl) = item {
@@ -181,22 +210,45 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         "main".into(),
         module.add_function("main", context.i32_type().fn_type(&[], false), None),
     );
-    for item in &validation.program.items {
-        if let ScalarItem::Function(function) = item {
-            emit_function(
-                &context,
-                &builder,
-                &functions,
-                &call_targets,
-                &signatures,
-                &globals,
-                function,
-                &function.name,
-                &validation.program.items,
-                &module,
-                &validation.program.structs,
-            )?;
-        }
+    for function in validation
+        .program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarItem::Function(function) if function.generic_parameters.is_empty() => {
+                Some(function)
+            }
+            _ => None,
+        })
+    {
+        emit_function(
+            &context,
+            &builder,
+            &functions,
+            &call_targets,
+            &signatures,
+            &globals,
+            function,
+            &function.name,
+            &validation.program.items,
+            &module,
+            &validation.program.structs,
+        )?;
+    }
+    for (_, function, name) in &specializations {
+        emit_function(
+            &context,
+            &builder,
+            &functions,
+            &call_targets,
+            &signatures,
+            &globals,
+            function,
+            name,
+            &validation.program.items,
+            &module,
+            &validation.program.structs,
+        )?;
     }
     emit_main(
         &context,
@@ -272,6 +324,9 @@ pub fn emit_scalar_project_llvm(
                 }
             }
             if let ScalarItem::Function(function) = item {
+                if !function.generic_parameters.is_empty() {
+                    continue;
+                }
                 let name = project_function_name(&source_module.source, &function.name);
                 let value =
                     module.add_function(&name, function_type(&context, &function.signature)?, None);
@@ -317,6 +372,32 @@ pub fn emit_scalar_project_llvm(
             }
         }
     }
+    let mut project_specializations = Vec::new();
+    for source_module in &modules {
+        let specializations = generic_specializations(
+            &source_module.items,
+            |name| {
+                source_module.items.iter().find_map(|item| match item {
+                    ScalarItem::Function(function) if function.name == name => Some(function),
+                    _ => None,
+                })
+            },
+            |name| project_function_name(&source_module.source, name),
+        )?;
+        for (lookup, function, name) in specializations {
+            let value =
+                module.add_function(&name, function_type(&context, &function.signature)?, None);
+            for (index, parameter) in function.parameters.iter().enumerate() {
+                if let Some(argument) = value.get_nth_param(index as u32) {
+                    argument.set_name(parameter);
+                }
+            }
+            call_targets.insert(lookup, name.clone());
+            signatures.insert(name.clone(), function.signature.clone());
+            functions.insert(name.clone(), value);
+            project_specializations.push((source_module, function, name));
+        }
+    }
     functions.insert(
         "main".into(),
         module.add_function("main", context.i32_type().fn_type(&[], false), None),
@@ -333,6 +414,22 @@ pub fn emit_scalar_project_llvm(
             &modules,
             &globals,
             &name,
+            &module,
+            &all_structs,
+        )?;
+    }
+    for (source_module, function, name) in &project_specializations {
+        emit_project_function(
+            &context,
+            &builder,
+            &functions,
+            &call_targets,
+            &signatures,
+            function,
+            source_module,
+            &modules,
+            &globals,
+            name,
             &module,
             &all_structs,
         )?;
@@ -1257,7 +1354,21 @@ fn emit_function<'ctx, 'module>(
             if outputs.outputs.len() == 1 {
                 emit_typed_expression(context, &mut state, expression, &outputs.outputs[0].ty)?
             } else {
-                emit_expression(context, &mut state, expression)?
+                let value = emit_expression(context, &mut state, expression)?;
+                if outputs
+                    .outputs
+                    .iter()
+                    .all(|output| output.ty == outputs.outputs[0].ty)
+                {
+                    build_aggregate(
+                        context,
+                        &mut state,
+                        outputs,
+                        vec![value; outputs.outputs.len()],
+                    )?
+                } else {
+                    value
+                }
             }
         }
         _ => emit_block(context, &mut state, &function.body)?,
@@ -1399,7 +1510,27 @@ fn emit_project_function<'ctx, 'module>(
                     modules,
                 )?
             } else {
-                emit_project_expression(context, &mut state, expression, source_module, modules)?
+                let value = emit_project_expression(
+                    context,
+                    &mut state,
+                    expression,
+                    source_module,
+                    modules,
+                )?;
+                if outputs
+                    .outputs
+                    .iter()
+                    .all(|output| output.ty == outputs.outputs[0].ty)
+                {
+                    build_aggregate(
+                        context,
+                        &mut state,
+                        outputs,
+                        vec![value; outputs.outputs.len()],
+                    )?
+                } else {
+                    value
+                }
             }
         }
         _ => emit_project_block(context, &mut state, &function.body, source_module, modules)?,
@@ -2052,7 +2183,14 @@ fn emit_expression<'ctx, 'module>(
             {
                 return emit_int_conversion(context, state, name, type_arguments, arguments);
             }
-            emit_call(context, state, receiver.as_deref(), name, arguments)
+            emit_call(
+                context,
+                state,
+                receiver.as_deref(),
+                name,
+                type_arguments,
+                arguments,
+            )
         }
         ScalarExpression::If {
             condition,
@@ -2232,9 +2370,11 @@ fn emit_project_expression<'ctx, 'module>(
                         )
                     },
                 );
+            let lookup = specialization_lookup_key(&qualified, type_arguments);
             let target = state
                 .call_targets
-                .get(&qualified)
+                .get(&lookup)
+                .or_else(|| state.call_targets.get(&qualified))
                 .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?
                 .clone();
             let ScalarType::Callable { parameters, .. } = state
@@ -2371,13 +2511,16 @@ fn emit_call<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     receiver: Option<&str>,
     name: &str,
+    type_arguments: &[crate::scalar::ScalarTypeArgument],
     arguments: &[ScalarExpression],
 ) -> Result<EmitValue<'ctx>, String> {
     let qualified =
         receiver.map_or_else(|| name.to_owned(), |receiver| format!("{receiver}.{name}"));
+    let lookup = specialization_lookup_key(&qualified, type_arguments);
     let target = state
         .call_targets
-        .get(&qualified)
+        .get(&lookup)
+        .or_else(|| state.call_targets.get(&qualified))
         .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?
         .clone();
     let ScalarType::Callable { parameters, .. } = state
@@ -3259,6 +3402,269 @@ fn encoded_llvm_name<'a>(prefix: &str, components: impl IntoIterator<Item = &'a 
     symbol
 }
 
+fn generic_specializations<'a>(
+    items: &[ScalarItem],
+    function: impl Fn(&str) -> Option<&'a ScalarFunction>,
+    symbol: impl Fn(&str) -> String,
+) -> Result<Vec<(String, ScalarFunction, String)>, String> {
+    let mut calls = Vec::new();
+    for item in items {
+        match item {
+            ScalarItem::Binding(binding) => collect_generic_calls(&binding.value, &mut calls),
+            ScalarItem::Executable(item) => collect_generic_calls_in_item(item, &mut calls),
+            ScalarItem::Namespace(_) | ScalarItem::Extern(_) | ScalarItem::Function(_) => {}
+        }
+    }
+    let mut specializations = BTreeMap::new();
+    for (name, arguments) in calls {
+        let Some(function) = function(&name) else {
+            continue;
+        };
+        if function.generic_parameters.is_empty() {
+            continue;
+        }
+        if function.generic_parameters.len() != arguments.len() {
+            return Err("validated generic call has invalid type argument arity".to_owned());
+        }
+        let signature = substitute_generic_signature(function, &arguments);
+        let base = symbol(&name);
+        let lookup = generic_specialization_key(&base, &arguments);
+        let name = generic_specialization_name(&base, &arguments);
+        specializations.entry(lookup).or_insert_with(|| {
+            let mut function = function.clone();
+            function.signature = signature;
+            function.generic_parameters.clear();
+            (function, name)
+        });
+    }
+    Ok(specializations
+        .into_iter()
+        .map(|(lookup, (function, name))| (lookup, function, name))
+        .collect())
+}
+
+fn collect_generic_calls(
+    expression: &ScalarExpression,
+    calls: &mut Vec<(String, Vec<ScalarType>)>,
+) {
+    match expression {
+        ScalarExpression::Call {
+            receiver: None,
+            name,
+            type_arguments,
+            arguments,
+            ..
+        } => {
+            calls.push((
+                name.clone(),
+                type_arguments
+                    .iter()
+                    .map(|argument| argument.ty.clone())
+                    .collect(),
+            ));
+            for argument in arguments {
+                collect_generic_calls(argument, calls);
+            }
+        }
+        ScalarExpression::Call { arguments, .. } => {
+            for argument in arguments {
+                collect_generic_calls(argument, calls);
+            }
+        }
+        ScalarExpression::Binary { left, right, .. } => {
+            collect_generic_calls(left, calls);
+            collect_generic_calls(right, calls);
+        }
+        ScalarExpression::Unary { operand, .. } => collect_generic_calls(operand, calls),
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_generic_calls(condition, calls);
+            collect_generic_calls_in_block(then_branch, calls);
+            collect_generic_calls_in_block(else_branch, calls);
+        }
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => {
+            collect_generic_calls(condition, calls);
+            collect_generic_calls_in_block(then_branch, calls);
+        }
+        ScalarExpression::Block(block) => collect_generic_calls_in_block(block, calls),
+        ScalarExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_generic_calls(&field.value, calls);
+            }
+        }
+        ScalarExpression::Name { .. }
+        | ScalarExpression::Member { .. }
+        | ScalarExpression::Integer { .. }
+        | ScalarExpression::InvalidInteger { .. }
+        | ScalarExpression::Float { .. }
+        | ScalarExpression::InvalidFloat { .. }
+        | ScalarExpression::Boolean { .. }
+        | ScalarExpression::Char { .. }
+        | ScalarExpression::Utf8 { .. }
+        | ScalarExpression::RawAddress { .. } => {}
+    }
+}
+
+fn collect_generic_calls_in_block(block: &ScalarBlock, calls: &mut Vec<(String, Vec<ScalarType>)>) {
+    for item in &block.items {
+        collect_generic_calls_in_item(item, calls);
+    }
+    for output in &block.final_output_values {
+        collect_generic_calls(&output.value, calls);
+    }
+}
+
+fn collect_generic_calls_in_item(
+    item: &ScalarBlockItem,
+    calls: &mut Vec<(String, Vec<ScalarType>)>,
+) {
+    match item {
+        ScalarBlockItem::LocalBinding(binding) => collect_generic_calls(&binding.value, calls),
+        ScalarBlockItem::Expression(expression) => collect_generic_calls(expression, calls),
+        ScalarBlockItem::Assignment(assignment) => collect_generic_calls(&assignment.value, calls),
+        ScalarBlockItem::While(while_expression) => {
+            collect_generic_calls(&while_expression.condition, calls);
+            collect_generic_calls_in_block(&while_expression.body, calls);
+        }
+    }
+}
+
+fn substitute_generic_signature(function: &ScalarFunction, arguments: &[ScalarType]) -> ScalarType {
+    let substitutions = function
+        .generic_parameters
+        .iter()
+        .zip(arguments)
+        .map(|(parameter, argument)| (parameter.name.as_str(), argument))
+        .collect::<BTreeMap<_, _>>();
+    substitute_generic_type(&function.signature, &substitutions)
+}
+
+fn substitute_generic_type(
+    ty: &ScalarType,
+    substitutions: &BTreeMap<&str, &ScalarType>,
+) -> ScalarType {
+    match ty {
+        ScalarType::Named { name, .. } => substitutions
+            .get(name.as_str())
+            .map_or_else(|| ty.clone(), |replacement| (*replacement).clone()),
+        ScalarType::RawPointer(inner) => {
+            ScalarType::RawPointer(Box::new(substitute_generic_type(inner, substitutions)))
+        }
+        ScalarType::Callable {
+            outputs,
+            parameters,
+        } => ScalarType::Callable {
+            outputs: crate::ScalarOutputSequence {
+                outputs: outputs
+                    .outputs
+                    .iter()
+                    .map(|output| crate::ScalarOutput {
+                        ty: substitute_generic_type(&output.ty, substitutions),
+                        span: output.span,
+                    })
+                    .collect(),
+                span: outputs.span,
+            },
+            parameters: parameters
+                .iter()
+                .map(|parameter| substitute_generic_type(parameter, substitutions))
+                .collect(),
+        },
+        _ => ty.clone(),
+    }
+}
+
+fn specialization_lookup_key(
+    name: &str,
+    arguments: &[crate::scalar::ScalarTypeArgument],
+) -> String {
+    if arguments.is_empty() {
+        name.to_owned()
+    } else {
+        generic_specialization_key(
+            name,
+            &arguments
+                .iter()
+                .map(|argument| argument.ty.clone())
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+fn generic_specialization_key(name: &str, arguments: &[ScalarType]) -> String {
+    let tuple = arguments
+        .iter()
+        .map(generic_type_name)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{name}<{tuple}>")
+}
+
+fn generic_specialization_name(name: &str, arguments: &[ScalarType]) -> String {
+    let tuple = arguments
+        .iter()
+        .map(generic_type_name)
+        .collect::<Vec<_>>()
+        .join(",");
+    encoded_llvm_name("wosy_generic", [name, tuple.as_str()])
+}
+
+fn generic_type_name(ty: &ScalarType) -> String {
+    match ty {
+        ScalarType::Unit => "unit".into(),
+        ScalarType::Bool => "bool".into(),
+        ScalarType::I8 => "i8".into(),
+        ScalarType::I16 => "i16".into(),
+        ScalarType::I32 => "i32".into(),
+        ScalarType::I64 => "i64".into(),
+        ScalarType::I128 => "i128".into(),
+        ScalarType::U8 => "u8".into(),
+        ScalarType::U16 => "u16".into(),
+        ScalarType::U32 => "u32".into(),
+        ScalarType::U64 => "u64".into(),
+        ScalarType::U128 => "u128".into(),
+        ScalarType::F32 => "f32".into(),
+        ScalarType::F64 => "f64".into(),
+        ScalarType::Char => "char".into(),
+        ScalarType::ArtifactId => "artifact_id".into(),
+        ScalarType::RawPointer(inner) => format!("ptr({})", generic_type_name(inner)),
+        ScalarType::Callable {
+            outputs,
+            parameters,
+        } => format!(
+            "fn({})->({})",
+            parameters
+                .iter()
+                .map(generic_type_name)
+                .collect::<Vec<_>>()
+                .join(","),
+            outputs
+                .outputs
+                .iter()
+                .map(|output| generic_type_name(&output.ty))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        ScalarType::Named { name, .. } => format!("named({name})"),
+        ScalarType::Qualified {
+            receiver, member, ..
+        } => format!("qualified({receiver}.{member})"),
+        ScalarType::Struct(id) => format!(
+            "struct({}:{}:{}:{})",
+            id.source.package, id.source.path, id.source.revision, id.index
+        ),
+        ScalarType::Error => "error".into(),
+    }
+}
+
 fn project_global_name(source: &wosy_syntax::SourceIdentity, name: &str) -> String {
     project_function_name(source, &format!("global_{name}"))
 }
@@ -3425,6 +3831,87 @@ mod tests {
         assert!(text.contains("call i1 @flag"));
         assert!(text.contains("call void @touch"));
         assert!(text.contains("call i32 @count"));
+    }
+
+    #[test]
+    fn emits_concrete_ordinary_generic_direct_call() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\ngeneric T;\nT(T) identity = fn(value) { value };\ni64 result = identity<i64>(1);\n%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+
+        let text = emit_scalar_llvm(&validation)
+            .expect("ordinary generic LLVM")
+            .to_text();
+
+        assert!(text.contains("define i64 @wosy_generic__"), "{text}");
+        assert!(text.contains("call i64 @wosy_generic__"), "{text}");
+
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                validation.program.clone(),
+                Vec::new(),
+            )],
+            vec![source],
+        ));
+        let project_text = emit_scalar_project_llvm(&project)
+            .expect("project ordinary generic LLVM")
+            .to_text();
+        assert!(
+            project_text.contains("call i64 @wosy_generic__"),
+            "{project_text}"
+        );
+    }
+
+    #[test]
+    fn emits_concrete_ordinary_generic_multi_output_call() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\ngeneric T;\n(T, T)(T) pair = fn(value) { value };\ni64 first, i64 second = pair<i64>(1);\n%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+
+        let text = emit_scalar_llvm(&validation)
+            .expect("ordinary generic multi-output LLVM")
+            .to_text();
+
+        assert!(
+            text.contains("define { i64, i64 } @wosy_generic__"),
+            "{text}"
+        );
+        assert!(text.contains("call { i64, i64 } @wosy_generic__"), "{text}");
+        assert!(text.contains("extractvalue { i64, i64 }"), "{text}");
     }
 
     #[test]
