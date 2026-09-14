@@ -27,6 +27,54 @@ stderr = "expected/stderr"
 exact = true
 
 [[steps]]
+source = "project/src/public_stdout.w"
+command = ["wosy", "build"]
+exit = 0
+
+[[assert]]
+source = "project/src/public_stdout.w"
+command = ["wosy", "run"]
+exit = 0
+stdout = "expected/public-stdout"
+stderr = "expected/empty"
+exact = true
+
+[[steps]]
+source = "project/src/public_stderr.w"
+command = ["wosy", "build"]
+exit = 0
+
+[[assert]]
+source = "project/src/public_stderr.w"
+command = ["wosy", "run"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/public-stderr"
+exact = true
+
+[[steps]]
+source = "project/src/public_empty.w"
+command = ["wosy", "build"]
+exit = 0
+
+[[assert]]
+source = "project/src/public_empty.w"
+command = ["wosy", "run"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[steps]]
+source = "project/src/public_partial.w"
+command = ["wosy", "build"]
+exit = 0
+
+[[assert]]
+source = "project/src/public_partial.w"
+partial_fd_write_count = 3
+
+[[steps]]
 source = "project/src/direct_root.w"
 command = ["wosy", "build"]
 exit = 0
