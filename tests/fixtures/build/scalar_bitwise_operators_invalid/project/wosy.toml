@@ -5,6 +5,14 @@ default_target = "app"
 [comments]
 categories = []
 
+[builders.native]
+command = ["python3", "scripts/build-native"]
+args = []
+
+[runners.native]
+command = ["python3", "scripts/run-native"]
+args = []
+
 [targets.app]
 root = "src/main.w"
 
@@ -14,6 +22,8 @@ artifact = "Main"
 [targets.app.artifacts.main.profiles.dev]
 backend = "llvm"
 output = "native"
+builder = "native"
+run_runner = "native"
 
 [targets.app.profiles.dev]
 main_artifact = "main"
