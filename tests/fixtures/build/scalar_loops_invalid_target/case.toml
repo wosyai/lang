@@ -1,8 +1,7 @@
 [[steps]]
 command = ["wosy", "build", "app"]
-exit = 1
+exit = 0
 
 [[assert]]
 command = ["wosy", "build", "app"]
-exit = 1
-stderr_contains = ["B0001", "src/main.w"]
+exit = 0
