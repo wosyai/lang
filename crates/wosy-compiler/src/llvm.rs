@@ -1884,12 +1884,21 @@ fn emit_assignment<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     assignment: &ScalarAssignment,
 ) -> Result<EmitValue<'ctx>, String> {
-    let expected = assignment_target_type(state, &assignment.targets[0]);
-    let value = match expected {
-        Some(ref ty) => emit_typed_expression(context, state, &assignment.value, ty)?,
-        None => emit_expression(context, state, &assignment.value)?,
-    };
-    let values = materialize_assignment_values(context, state, assignment, value, expected)?;
+    let expected = assignment
+        .targets
+        .iter()
+        .map(|target| assignment_target_type(state, target))
+        .collect::<Vec<_>>();
+    let values = materialize_assignment_values(
+        context,
+        state,
+        &assignment.values,
+        &expected,
+        |state, value, expected| match expected {
+            Some(ty) => emit_typed_expression(context, state, value, ty),
+            None => emit_expression(context, state, value),
+        },
+    )?;
     for (target, (value, ty)) in assignment.targets.iter().zip(values) {
         if target.receiver.is_some() {
             return Err(format!(
@@ -1934,19 +1943,30 @@ fn emit_project_assignment<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
-    let expected = if let Some(receiver) = &assignment.targets[0].receiver {
-        let target = project_namespace_target(module, modules, receiver)?;
-        Some(project_member_global(state, target, &assignment.targets[0].target)?.1)
-    } else {
-        assignment_target_type(state, &assignment.targets[0])
-    };
-    let value = match expected {
-        Some(ref ty) => {
-            emit_project_typed_expression(context, state, &assignment.value, ty, module, modules)?
-        }
-        None => emit_project_expression(context, state, &assignment.value, module, modules)?,
-    };
-    let values = materialize_assignment_values(context, state, assignment, value, expected)?;
+    let expected = assignment
+        .targets
+        .iter()
+        .map(|target| {
+            if let Some(receiver) = &target.receiver {
+                let target_module = project_namespace_target(module, modules, receiver)?;
+                Ok(Some(
+                    project_member_global(state, target_module, &target.target)?.1,
+                ))
+            } else {
+                Ok(assignment_target_type(state, target))
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let values = materialize_assignment_values(
+        context,
+        state,
+        &assignment.values,
+        &expected,
+        |state, value, expected| match expected {
+            Some(ty) => emit_project_typed_expression(context, state, value, ty, module, modules),
+            None => emit_project_expression(context, state, value, module, modules),
+        },
+    )?;
     for (target, (value, ty)) in assignment.targets.iter().zip(values) {
         if ty == ScalarType::Unit {
             state.values.insert(target.target.clone(), EmitValue::Unit);
@@ -2040,26 +2060,38 @@ fn raw_pointer_target_type<'ctx, 'module>(
 fn materialize_assignment_values<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
-    assignment: &ScalarAssignment,
-    value: EmitValue<'ctx>,
-    expected: Option<ScalarType>,
+    expressions: &[ScalarExpression],
+    expected: &[Option<ScalarType>],
+    emit: impl FnMut(
+        &mut EmitState<'ctx, 'module>,
+        &ScalarExpression,
+        Option<&ScalarType>,
+    ) -> Result<EmitValue<'ctx>, String>,
 ) -> Result<Vec<(EmitValue<'ctx>, ScalarType)>, String> {
-    let output_types = match &value {
-        EmitValue::Aggregate { outputs, .. } => outputs.clone(),
-        EmitValue::Unit => vec![ScalarType::Unit],
-        EmitValue::Basic(value) => vec![expected
-            .or_else(|| assignment_target_type(state, &assignment.targets[0]))
-            .unwrap_or_else(|| basic_value_type(*value))],
-    };
-    assignment
-        .targets
-        .iter()
-        .enumerate()
-        .zip(output_types)
-        .map(|((position, target), ty)| {
-            let value = extract_output(state, value.clone(), position)?;
+    let mut emit = emit;
+    let mut position = 0;
+    let mut values = Vec::new();
+    for expression in expressions {
+        let value = emit(
+            state,
+            expression,
+            expected.get(position).and_then(Option::as_ref),
+        )?;
+        let output_types = match &value {
+            EmitValue::Aggregate { outputs, .. } => outputs.clone(),
+            EmitValue::Unit => vec![ScalarType::Unit],
+            EmitValue::Basic(value) => vec![expected
+                .get(position)
+                .and_then(Option::as_ref)
+                .cloned()
+                .unwrap_or_else(|| basic_value_type(*value))],
+        };
+        for (output_position, ty) in output_types.into_iter().enumerate() {
+            let value = extract_output(state, value.clone(), output_position)?;
             if ty == ScalarType::Unit {
-                return Ok((EmitValue::Unit, ty));
+                values.push((EmitValue::Unit, ty));
+                position += 1;
+                continue;
             }
             let temporary = state
                 .builder
@@ -2079,10 +2111,11 @@ fn materialize_assignment_values<'ctx, 'module>(
                         .map_err(builder_error)?,
                 )
             };
-            let ty = assignment_target_type(state, target).unwrap_or(ty);
-            Ok((value, ty))
-        })
-        .collect()
+            values.push((value, ty));
+            position += 1;
+        }
+    }
+    Ok(values)
 }
 
 fn basic_value_type(value: BasicValueEnum<'_>) -> ScalarType {

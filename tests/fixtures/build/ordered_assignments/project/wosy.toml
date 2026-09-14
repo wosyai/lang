@@ -1,0 +1,32 @@
+[package]
+name = "ordered_assignments"
+default_target = "app"
+
+[dependencies.std]
+path = "stdlib"
+
+[comments]
+categories = []
+
+[builders.llvm-wasm]
+command = ["scripts/build-wasm"]
+args = []
+
+[runners.wasmtime-wasip1]
+command = ["scripts/run-wasmtime"]
+args = []
+
+[targets.app]
+root = "src/main.w"
+
+[targets.app.artifacts.main]
+artifact = "OrderedAssignments"
+
+[targets.app.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "llvm-wasm"
+run_runner = "wasmtime-wasip1"
+
+[targets.app.profiles.dev]
+main_artifact = "main"
