@@ -661,6 +661,7 @@ pub struct ScalarAssignment {
     pub target_span: ByteSpan,
     pub targets: Vec<ScalarAssignmentTarget>,
     pub value: ScalarExpression,
+    pub values: Vec<ScalarExpression>,
     pub span: ByteSpan,
 }
 
@@ -1135,12 +1136,22 @@ fn record_block_overload_selections(
             ScalarBlockItem::Expression(expression) => {
                 record_expression_overload_selection(expression, None, &scope, overloads)
             }
-            ScalarBlockItem::Assignment(assignment) => record_expression_overload_selection(
-                &mut assignment.value,
-                scope.get(&assignment.target),
-                &scope,
-                overloads,
-            ),
+            ScalarBlockItem::Assignment(assignment) => {
+                record_expression_overload_selection(
+                    &mut assignment.value,
+                    scope.get(&assignment.target),
+                    &scope,
+                    overloads,
+                );
+                for (value, target) in assignment.values.iter_mut().zip(&assignment.targets) {
+                    record_expression_overload_selection(
+                        value,
+                        scope.get(&target.target),
+                        &scope,
+                        overloads,
+                    );
+                }
+            }
             ScalarBlockItem::While(while_expression) => {
                 record_block_overload_selections(&mut while_expression.body, &scope, overloads)
             }
@@ -1345,7 +1356,10 @@ fn resolve_item_places(
             for target in &mut assignment.targets {
                 resolve_place(&mut target.place, scope, program);
             }
-            resolve_expression_places(&mut assignment.value, scope, program)
+            resolve_expression_places(&mut assignment.value, scope, program);
+            for value in &mut assignment.values {
+                resolve_expression_places(value, scope, program);
+            }
         }
         ScalarBlockItem::While(while_expression) => {
             resolve_expression_places(&mut while_expression.condition, scope, program);
@@ -2189,7 +2203,10 @@ fn resolve_item_module_places(
             for target in &mut assignment.targets {
                 resolve_module_place(&mut target.place, scope, module, modules);
             }
-            resolve_expression_module_places(&mut assignment.value, scope, module, modules)
+            resolve_expression_module_places(&mut assignment.value, scope, module, modules);
+            for value in &mut assignment.values {
+                resolve_expression_module_places(value, scope, module, modules);
+            }
         }
         ScalarBlockItem::While(while_expression) => {
             resolve_expression_module_places(
@@ -2950,25 +2967,36 @@ fn assignment_type_in_module(
             assignment_target_type_in_module(target, scope, module, modules, diagnostics)
         })
         .collect::<Vec<_>>();
-    let actual = expression_type_in_module_expected(
-        &assignment.value,
-        expected.first().and_then(Option::as_ref),
-        scope,
-        visible_names,
-        folded_names,
-        module,
-        modules,
-        diagnostics,
-        unsafe_context,
-    );
-    let outputs = call_output_sequence_in_module(&assignment.value, scope, module, modules)
-        .unwrap_or(ScalarOutputSequence {
-            outputs: vec![ScalarOutput {
-                ty: actual,
-                span: expression_span(&assignment.value),
-            }],
-            span: expression_span(&assignment.value),
-        });
+    let outputs = ScalarOutputSequence {
+        outputs: assignment
+            .values
+            .iter()
+            .enumerate()
+            .flat_map(|(position, value)| {
+                let actual = expression_type_in_module_expected(
+                    value,
+                    expected.get(position).and_then(Option::as_ref),
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+                call_output_sequence_in_module(value, scope, module, modules)
+                    .unwrap_or(ScalarOutputSequence {
+                        outputs: vec![ScalarOutput {
+                            ty: actual,
+                            span: expression_span(value),
+                        }],
+                        span: expression_span(value),
+                    })
+                    .outputs
+            })
+            .collect(),
+        span: assignment.span,
+    };
     if assignment.targets.len() != outputs.outputs.len() {
         diagnostics.push(module_diagnostic(
             module,
@@ -6111,15 +6139,16 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
         })
         .collect();
     let target = identifiers.last().expect("assignment target name");
-    let value = direct_nodes(node)
+    let output_list = direct_nodes(node)
         .into_iter()
-        .find(|child| child.kind() == SyntaxKind::Expression)
-        .or_else(|| {
-            node.descendants()
-                .find(|child| child.kind() == SyntaxKind::Expression)
-        })
+        .find(|child| child.kind() == SyntaxKind::OutputList)
+        .expect("assignment output list");
+    let values = output_list
+        .children()
+        .filter(|child| child.kind() == SyntaxKind::Expression)
         .map(|child| derive_expression(&child))
-        .expect("assignment value");
+        .collect::<Vec<_>>();
+    let value = values[0].clone();
     ScalarAssignment {
         receiver: (identifiers.len() == 2).then(|| identifiers[0].text().to_owned()),
         target: target.text().to_owned(),
@@ -6127,6 +6156,7 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
         target_span: token_span(&target),
         targets,
         value,
+        values,
         span: wosy_syntax::byte_span(node),
     }
 }
@@ -6634,7 +6664,9 @@ fn validate_unit_if_positions_in_item(
             validate_unit_if_position(expression, statement, source, diagnostics)
         }
         ScalarBlockItem::Assignment(assignment) => {
-            validate_unit_if_position(&assignment.value, false, source, diagnostics)
+            for value in &assignment.values {
+                validate_unit_if_position(value, false, source, diagnostics);
+            }
         }
         ScalarBlockItem::While(while_expression) => {
             validate_unit_if_position(&while_expression.condition, false, source, diagnostics);
@@ -7164,6 +7196,9 @@ impl StaticUseAnalyzer {
             ScalarBlockItem::Expression(expression) => self.expression(expression, visible),
             ScalarBlockItem::Assignment(assignment) => {
                 self.expression(&assignment.value, visible);
+                for value in &assignment.values {
+                    self.expression(value, visible);
+                }
                 if let Some(receiver) = &assignment.receiver {
                     self.use_name(receiver, visible);
                 } else {
@@ -7561,35 +7596,46 @@ fn assignment_type(
             assignment_target_type(target, scope, program, diagnostics)
         })
         .collect::<Vec<_>>();
-    let actual = match expected.first().and_then(Option::as_ref) {
-        Some(expected) => expression_type_expected(
-            &assignment.value,
-            expected,
-            scope,
-            visible_names,
-            folded_names,
-            program,
-            diagnostics,
-            unsafe_context,
-        ),
-        None => expression_type(
-            &assignment.value,
-            scope,
-            visible_names,
-            folded_names,
-            program,
-            diagnostics,
-            unsafe_context,
-        ),
+    let outputs = ScalarOutputSequence {
+        outputs: assignment
+            .values
+            .iter()
+            .enumerate()
+            .flat_map(|(position, value)| {
+                let actual = match expected.get(position).and_then(Option::as_ref) {
+                    Some(expected) => expression_type_expected(
+                        value,
+                        expected,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                    ),
+                    None => expression_type(
+                        value,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                    ),
+                };
+                call_output_sequence(value, scope, program)
+                    .unwrap_or(ScalarOutputSequence {
+                        outputs: vec![ScalarOutput {
+                            ty: actual,
+                            span: expression_span(value),
+                        }],
+                        span: expression_span(value),
+                    })
+                    .outputs
+            })
+            .collect(),
+        span: assignment.span,
     };
-    let outputs =
-        call_output_sequence(&assignment.value, scope, program).unwrap_or(ScalarOutputSequence {
-            outputs: vec![ScalarOutput {
-                ty: actual,
-                span: expression_span(&assignment.value),
-            }],
-            span: expression_span(&assignment.value),
-        });
     if assignment.targets.len() != outputs.outputs.len() {
         diagnostics.push(diagnostic(
             program,
