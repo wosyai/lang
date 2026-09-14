@@ -16,6 +16,48 @@ exit = 0
 
 [[steps]]
 remove_manifest_field = ".wosy/artifacts/app/dev/main/artifact-manifest.json"
+field = "source_observations"
+exit = 0
+
+[[steps]]
+command = ["wosy", "run"]
+exit = 1
+
+[[steps]]
+command = ["wosy", "build"]
+exit = 0
+
+[[steps]]
+remove_manifest_field = ".wosy/artifacts/app/dev/main/artifact-manifest.json"
+field = "identity.builder_toolchain_identity"
+exit = 0
+
+[[steps]]
+command = ["wosy", "run"]
+exit = 1
+
+[[steps]]
+command = ["wosy", "build"]
+exit = 0
+
+[[steps]]
+replace_manifest_field = ".wosy/artifacts/app/dev/main/artifact-manifest.json"
+field = "identity.compiler_identity"
+value = "wosy-cli-next"
+exit = 0
+
+[[steps]]
+command = ["wosy", "run"]
+exit = 1
+
+[[steps]]
+command = ["wosy", "build"]
+exit = 0
+
+[[steps]]
+replace_manifest_field = ".wosy/artifacts/app/dev/main/artifact-manifest.json"
+field = "identity.llvm_identity"
+value = "inkwell-next"
 exit = 0
 
 [[steps]]
@@ -56,7 +98,7 @@ exit = 0
 
 [[steps]]
 write = "wosy.toml"
-contents = "[package]\nname = \"scalar_base\"\ndefault_target = \"app\"\n\n[comments]\ncategories = [\"changed\"]\n\n[builders.native]\ncommand = [\"scripts/build-native\"]\nargs = []\n\n[runners.native]\ncommand = [\"scripts/run-native\"]\nargs = []\n\n[targets.app]\nroot = \"src/main.w\"\n\n[targets.app.artifacts.main]\nartifact = \"Main\"\n\n[targets.app.artifacts.main.profiles.dev]\nbackend = \"llvm\"\noutput = \"native\"\nbuilder = \"native\"\nrun_runner = \"native\"\n\n[targets.app.profiles.dev]\nmain_artifact = \"main\"\n"
+contents = "[package]\nname = \"scalar_base\"\ndefault_target = \"app\"\n\n[comments]\ncategories = [\"changed\"]\n\n[builders.native]\ncommand = [\"scripts/build-native\"]\nargs = []\ntoolchain_identity = \"llvm-18.1.4\"\n\n[runners.native]\ncommand = [\"scripts/run-native\"]\nargs = []\n\n[targets.app]\nroot = \"src/main.w\"\n\n[targets.app.artifacts.main]\nartifact = \"Main\"\n\n[targets.app.artifacts.main.profiles.dev]\nbackend = \"llvm\"\noutput = \"native\"\nbuilder = \"native\"\nrun_runner = \"native\"\n\n[targets.app.profiles.dev]\nmain_artifact = \"main\"\n"
 
 [[steps]]
 command = ["wosy", "run"]
@@ -64,7 +106,7 @@ exit = 1
 
 [[steps]]
 write = "wosy.toml"
-contents = "[package]\nname = \"scalar_base\"\ndefault_target = \"app\"\n\n[comments]\ncategories = []\n\n[builders.native]\ncommand = [\"scripts/build-native\"]\nargs = []\n\n[runners.native]\ncommand = [\"scripts/run-native\"]\nargs = []\n\n[targets.app]\nroot = \"src/main.w\"\n\n[targets.app.artifacts.main]\nartifact = \"Main\"\n\n[targets.app.artifacts.main.profiles.dev]\nbackend = \"llvm\"\noutput = \"native\"\nbuilder = \"native\"\nrun_runner = \"native\"\n\n[targets.app.profiles.dev]\nmain_artifact = \"main\"\n"
+contents = "[package]\nname = \"scalar_base\"\ndefault_target = \"app\"\n\n[comments]\ncategories = []\n\n[builders.native]\ncommand = [\"scripts/build-native\"]\nargs = []\ntoolchain_identity = \"llvm-18.1.3\"\n\n[runners.native]\ncommand = [\"scripts/run-native\"]\nargs = []\n\n[targets.app]\nroot = \"src/main.w\"\n\n[targets.app.artifacts.main]\nartifact = \"Main\"\n\n[targets.app.artifacts.main.profiles.dev]\nbackend = \"llvm\"\noutput = \"native\"\nbuilder = \"native\"\nrun_runner = \"native\"\n\n[targets.app.profiles.dev]\nmain_artifact = \"main\"\n"
 
 [[steps]]
 command = ["wosy", "build"]

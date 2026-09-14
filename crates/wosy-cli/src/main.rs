@@ -221,6 +221,9 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
             != serde_json::to_string(builder).map_err(|error| error.to_string())?
         || identity.runner_identity
             != serde_json::to_string(runner).map_err(|error| error.to_string())?
+        || identity.compiler_identity != compiler_identity()
+        || identity.llvm_identity != llvm_identity()
+        || identity.builder_toolchain_identity != builder.toolchain_identity
     {
         return Err("artifact manifest is stale".to_owned());
     }
@@ -638,7 +641,18 @@ fn artifact_identity(
         builder_identity: serde_json::to_string(builder).map_err(|error| error.to_string())?,
         runner_identity: serde_json::to_string(runner).map_err(|error| error.to_string())?,
         llvm_input_identity: blake3::hash(llvm.as_bytes()).to_hex().to_string(),
+        compiler_identity: compiler_identity(),
+        llvm_identity: llvm_identity(),
+        builder_toolchain_identity: builder.toolchain_identity.clone(),
     })
+}
+
+fn compiler_identity() -> String {
+    wosy_compiler::COMPILER_IDENTITY.to_owned()
+}
+
+fn llvm_identity() -> String {
+    "inkwell-0.10.0+llvm-sys-181.3.0".to_owned()
 }
 
 fn invoke_direct(

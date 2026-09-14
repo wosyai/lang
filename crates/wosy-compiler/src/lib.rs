@@ -21,6 +21,8 @@ pub use scalar::{
 
 mod llvm;
 
+pub const COMPILER_IDENTITY: &str = concat!("wosy-compiler-", env!("CARGO_PKG_VERSION"));
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DiagnosticSeverity {
     Error,

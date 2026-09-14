@@ -371,6 +371,7 @@ pub struct ProjectContext {
 pub struct BuilderConfig {
     pub command: Vec<String>,
     pub args: Vec<String>,
+    pub toolchain_identity: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -754,6 +755,7 @@ fn named_commands(
             BuilderConfig {
                 command: string_array(table, "command")?,
                 args: string_array_optional(table, "args")?,
+                toolchain_identity: scalar_string(table, "toolchain_identity")?,
             },
         );
     }
@@ -890,6 +892,9 @@ pub struct ArtifactIdentity {
     pub builder_identity: String,
     pub runner_identity: String,
     pub llvm_input_identity: String,
+    pub compiler_identity: String,
+    pub llvm_identity: String,
+    pub builder_toolchain_identity: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1104,6 +1109,9 @@ mod tests {
                 builder_identity: "builder".to_owned(),
                 runner_identity: "runner".to_owned(),
                 llvm_input_identity: "llvm".to_owned(),
+                compiler_identity: "compiler".to_owned(),
+                llvm_identity: "llvm".to_owned(),
+                builder_toolchain_identity: "builder-toolchain".to_owned(),
             },
             executable: PathBuf::from("main"),
             source_observations: observations,
@@ -1174,6 +1182,22 @@ mod tests {
         assert_eq!(profile.output, "wasm-wasip1");
         assert_eq!(profile.builder, "llvm-wasm");
         assert_eq!(profile.run_runner, "wasmtime-wasip1");
+    }
+
+    #[test]
+    fn builder_requires_string_toolchain_identity() {
+        for declaration in ["", "toolchain_identity = 181"] {
+            let document = format!(
+                "[builders.native]\ncommand = [\"build-native\"]\nargs = []\n{declaration}"
+            )
+            .parse::<DocumentMut>()
+            .expect("builder configuration");
+
+            assert_eq!(
+                named_commands(document.as_table().get("builders"), "builder"),
+                Err("toolchain_identity must be a string".to_owned())
+            );
+        }
     }
 
     #[test]

@@ -91,13 +91,42 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
             .and_then(|value| value.as_str())
         {
             let manifest_path = temporary.join(path);
+            let field = step
+                .get("field")
+                .and_then(Item::as_value)
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "remove_manifest_field step field must be a string".to_owned())?;
             let bytes = fs::read(&manifest_path).map_err(|error| error.to_string())?;
             let mut manifest = serde_json::from_slice::<serde_json::Value>(&bytes)
                 .map_err(|error| error.to_string())?;
-            manifest
-                .as_object_mut()
-                .ok_or_else(|| "manifest must be a JSON object".to_owned())?
-                .remove("source_observations");
+            remove_manifest_field(&mut manifest, field)?;
+            fs::write(
+                manifest_path,
+                serde_json::to_vec(&manifest).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            continue;
+        }
+        if let Some(path) = step
+            .get("replace_manifest_field")
+            .and_then(Item::as_value)
+            .and_then(|value| value.as_str())
+        {
+            let field = step
+                .get("field")
+                .and_then(Item::as_value)
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "replace_manifest_field step field must be a string".to_owned())?;
+            let replacement = step
+                .get("value")
+                .and_then(Item::as_value)
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "replace_manifest_field step value must be a string".to_owned())?;
+            let manifest_path = temporary.join(path);
+            let bytes = fs::read(&manifest_path).map_err(|error| error.to_string())?;
+            let mut manifest = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map_err(|error| error.to_string())?;
+            replace_manifest_field(&mut manifest, field, replacement)?;
             fs::write(
                 manifest_path,
                 serde_json::to_vec(&manifest).map_err(|error| error.to_string())?,
@@ -265,6 +294,52 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
     fs::remove_dir_all(&temporary).map_err(|error| error.to_string())?;
     println!("passed {}", case.display());
     Ok(())
+}
+
+fn remove_manifest_field(manifest: &mut serde_json::Value, path: &str) -> Result<(), String> {
+    let fields = path.split('.').collect::<Vec<_>>();
+    let (field, parent) = fields
+        .split_last()
+        .ok_or_else(|| "manifest field path must not be empty".to_owned())?;
+    manifest_field_parent(manifest, parent)?
+        .remove(*field)
+        .ok_or_else(|| format!("manifest field {path} is missing"))?;
+    Ok(())
+}
+
+fn replace_manifest_field(
+    manifest: &mut serde_json::Value,
+    path: &str,
+    replacement: &str,
+) -> Result<(), String> {
+    let fields = path.split('.').collect::<Vec<_>>();
+    let (field, parent) = fields
+        .split_last()
+        .ok_or_else(|| "manifest field path must not be empty".to_owned())?;
+    let entry = manifest_field_parent(manifest, parent)?
+        .get_mut(*field)
+        .ok_or_else(|| format!("manifest field {path} is missing"))?;
+    *entry = serde_json::Value::String(replacement.to_owned());
+    Ok(())
+}
+
+fn manifest_field_parent<'a>(
+    manifest: &'a mut serde_json::Value,
+    fields: &[&str],
+) -> Result<&'a mut serde_json::Map<String, serde_json::Value>, String> {
+    if let Some((field, remaining)) = fields.split_first() {
+        let object = manifest
+            .as_object_mut()
+            .ok_or_else(|| format!("manifest field {field} has no object parent"))?;
+        let value = object
+            .get_mut(*field)
+            .ok_or_else(|| format!("manifest field {field} is missing"))?;
+        manifest_field_parent(value, remaining)
+    } else {
+        manifest
+            .as_object_mut()
+            .ok_or_else(|| "manifest field has no object parent".to_owned())
+    }
 }
 
 fn partial_fd_write_count(assertion: &toml_edit::Table) -> Result<Option<u32>, String> {
