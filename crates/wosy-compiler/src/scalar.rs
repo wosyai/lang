@@ -670,6 +670,7 @@ pub struct ScalarAssignmentTarget {
     pub target: String,
     pub receiver_span: Option<ByteSpan>,
     pub target_span: ByteSpan,
+    pub place: ScalarPlace,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1341,6 +1342,9 @@ fn resolve_item_places(
             resolve_expression_places(expression, scope, program)
         }
         ScalarBlockItem::Assignment(assignment) => {
+            for target in &mut assignment.targets {
+                resolve_place(&mut target.place, scope, program);
+            }
             resolve_expression_places(&mut assignment.value, scope, program)
         }
         ScalarBlockItem::While(while_expression) => {
@@ -2182,6 +2186,9 @@ fn resolve_item_module_places(
             resolve_expression_module_places(expression, scope, module, modules)
         }
         ScalarBlockItem::Assignment(assignment) => {
+            for target in &mut assignment.targets {
+                resolve_module_place(&mut target.place, scope, module, modules);
+            }
             resolve_expression_module_places(&mut assignment.value, scope, module, modules)
         }
         ScalarBlockItem::While(while_expression) => {
@@ -2732,89 +2739,6 @@ fn validate_output_receivers(
     }
 }
 
-fn validate_assignment_outputs_in_module(
-    assignment: &ScalarAssignment,
-    scope: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
-    diagnostics: &mut Vec<super::Diagnostic>,
-) {
-    let Some(outputs) = call_output_sequence_in_module(&assignment.value, scope, module, modules)
-    else {
-        return;
-    };
-    if assignment.targets.len() != outputs.outputs.len() {
-        diagnostics.push(module_diagnostic(
-            module,
-            "B0004",
-            if assignment.targets.len() > outputs.outputs.len() {
-                "call has fewer outputs than assignment targets"
-            } else {
-                "call has more outputs than assignment targets"
-            },
-            assignment.span,
-        ));
-    }
-    for (target, output) in assignment.targets.iter().zip(&outputs.outputs) {
-        let expected = match &target.receiver {
-            None => scope.get(&target.target),
-            Some(receiver) => module
-                .namespace_bindings
-                .iter()
-                .find(|namespace| namespace.binding == *receiver)
-                .and_then(|namespace| {
-                    modules
-                        .iter()
-                        .find(|candidate| candidate.source == namespace.target)
-                })
-                .and_then(|target_module| target_module.members.get(&target.target)),
-        };
-        if let Some(expected) = expected {
-            expect_module_type(
-                module,
-                expected,
-                &output.ty,
-                target.target_span,
-                diagnostics,
-            );
-        }
-    }
-}
-
-fn validate_assignment_outputs(
-    assignment: &ScalarAssignment,
-    scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
-    diagnostics: &mut Vec<super::Diagnostic>,
-) {
-    let Some(outputs) = call_output_sequence(&assignment.value, scope, program) else {
-        return;
-    };
-    if assignment.targets.len() != outputs.outputs.len() {
-        diagnostics.push(diagnostic(
-            program,
-            "B0004",
-            if assignment.targets.len() > outputs.outputs.len() {
-                "call has fewer outputs than assignment targets"
-            } else {
-                "call has more outputs than assignment targets"
-            },
-            assignment.span,
-        ));
-    }
-    for (target, output) in assignment.targets.iter().zip(&outputs.outputs) {
-        if let Some(expected) = scope.get(&target.target) {
-            expect_type(
-                program,
-                expected,
-                &output.ty,
-                target.target_span,
-                diagnostics,
-            );
-        }
-    }
-}
-
 fn block_type_in_module(
     block: &ScalarBlock,
     scope: &BTreeMap<String, ScalarType>,
@@ -3008,88 +2932,27 @@ fn assignment_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
-    let expected = match &assignment.receiver {
-        None => {
-            if is_const_binding_name(&assignment.target)
-                && (scope.contains_key(&assignment.target)
-                    || module.items.iter().any(|item| {
-                        matches!(
-                            item,
-                            ScalarItem::Namespace(namespace)
-                                if namespace.binding == assignment.target
-                        )
-                    }))
-            {
+    let mut target_names = BTreeSet::new();
+    let mut inferred_names = visible_names.clone();
+    let mut inferred_folded_names = folded_names.clone();
+    let expected = assignment
+        .targets
+        .iter()
+        .map(|target| {
+            if !target_names.insert((target.receiver.clone(), target.target.clone())) {
                 diagnostics.push(module_diagnostic(
                     module,
-                    "B0007",
-                    "assignment targets a SCREAMING_SNAKE_CASE const binding",
-                    assignment.target_span,
+                    "B0002",
+                    "duplicate assignment target",
+                    target.target_span,
                 ));
             }
-            scope.get(&assignment.target)
-        }
-        Some(receiver) => {
-            let Some(namespace) = module
-                .namespace_bindings
-                .iter()
-                .find(|namespace| namespace.binding == *receiver)
-            else {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0001",
-                    "unknown assignment target",
-                    assignment
-                        .receiver_span
-                        .expect("qualified assignment receiver span"),
-                ));
-                return ScalarType::Error;
-            };
-            let Some(target) = modules
-                .iter()
-                .find(|candidate| candidate.source == namespace.target)
-            else {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0001",
-                    "unknown assignment target",
-                    assignment
-                        .receiver_span
-                        .expect("qualified assignment receiver span"),
-                ));
-                return ScalarType::Error;
-            };
-            let Some(expected) = target.members.get(&assignment.target) else {
-                diagnostics.push(unknown_member_diagnostic(
-                    module,
-                    assignment.target_span,
-                    &target.source,
-                ));
-                return ScalarType::Error;
-            };
-            if is_const_binding_name(&assignment.target) {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0007",
-                    "assignment targets a SCREAMING_SNAKE_CASE const binding",
-                    assignment.target_span,
-                ));
-            }
-            Some(expected)
-        }
-    };
-    let Some(expected) = expected else {
-        diagnostics.push(module_diagnostic(
-            module,
-            "B0001",
-            "unknown assignment target",
-            assignment.target_span,
-        ));
-        return ScalarType::Error;
-    };
+            assignment_target_type_in_module(target, scope, module, modules, diagnostics)
+        })
+        .collect::<Vec<_>>();
     let actual = expression_type_in_module_expected(
         &assignment.value,
-        Some(expected),
+        expected.first().and_then(Option::as_ref),
         scope,
         visible_names,
         folded_names,
@@ -3098,12 +2961,128 @@ fn assignment_type_in_module(
         diagnostics,
         unsafe_context,
     );
-    validate_assignment_outputs_in_module(assignment, scope, module, modules, diagnostics);
-    expect_module_type(module, expected, &actual, assignment.span, diagnostics);
-    if is_error_type(&actual) {
-        ScalarType::Error
-    } else {
-        expected.clone()
+    let outputs = call_output_sequence_in_module(&assignment.value, scope, module, modules)
+        .unwrap_or(ScalarOutputSequence {
+            outputs: vec![ScalarOutput {
+                ty: actual,
+                span: expression_span(&assignment.value),
+            }],
+            span: expression_span(&assignment.value),
+        });
+    if assignment.targets.len() != outputs.outputs.len() {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            if assignment.targets.len() > outputs.outputs.len() {
+                "call has fewer outputs than assignment targets"
+            } else {
+                "call has more outputs than assignment targets"
+            },
+            assignment.span,
+        ));
+    }
+    for ((index, (target, expected)), output) in assignment
+        .targets
+        .iter()
+        .zip(&expected)
+        .enumerate()
+        .zip(&outputs.outputs)
+    {
+        if let Some(expected) = expected {
+            expect_module_type(
+                module,
+                expected,
+                &output.ty,
+                if index == 0 {
+                    assignment.span
+                } else {
+                    target.target_span
+                },
+                diagnostics,
+            );
+        } else if let ScalarPlace::Name { name, span } = &target.place {
+            validate_identifier_style(module, name, *span, diagnostics);
+            if declare_module_name(
+                module,
+                name,
+                *span,
+                &mut inferred_names,
+                &mut inferred_folded_names,
+                diagnostics,
+            ) {
+                scope.insert(name.clone(), output.ty.clone());
+            }
+        }
+    }
+    ScalarType::Unit
+}
+
+fn assignment_target_type_in_module(
+    target: &ScalarAssignmentTarget,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> Option<ScalarType> {
+    if let Some(receiver) = &target.receiver {
+        if let Some(namespace) = module
+            .namespace_bindings
+            .iter()
+            .find(|namespace| namespace.binding == *receiver)
+        {
+            let Some(target_module) = modules
+                .iter()
+                .find(|candidate| candidate.source == namespace.target)
+            else {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0001",
+                    "unknown assignment target",
+                    target
+                        .receiver_span
+                        .expect("qualified assignment receiver span"),
+                ));
+                return Some(ScalarType::Error);
+            };
+            let Some(expected) = target_module.members.get(&target.target).cloned() else {
+                diagnostics.push(unknown_member_diagnostic(
+                    module,
+                    target.target_span,
+                    &target_module.source,
+                ));
+                return Some(ScalarType::Error);
+            };
+            if is_const_binding_name(&target.target) {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0007",
+                    "assignment targets a SCREAMING_SNAKE_CASE const binding",
+                    target.target_span,
+                ));
+            }
+            return Some(expected);
+        }
+    }
+    match &target.place {
+        ScalarPlace::Name { name, span } => {
+            let expected = scope.get(name).cloned();
+            if expected.is_some() && is_const_binding_name(name) {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0007",
+                    "assignment targets a SCREAMING_SNAKE_CASE const binding",
+                    *span,
+                ));
+            }
+            expected
+        }
+        place => Some(place_type_in_module(
+            place,
+            scope,
+            module,
+            modules,
+            diagnostics,
+        )),
     }
 }
 
@@ -6112,6 +6091,7 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
                 target: target.text().to_owned(),
                 receiver_span: (identifiers.len() == 2).then(|| token_span(&identifiers[0])),
                 target_span: token_span(target),
+                place: derive_place(&target_node),
             }
         })
         .collect::<Vec<_>>();
@@ -7563,72 +7543,121 @@ fn assignment_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
-    let field_expected = assignment.receiver.as_ref().and_then(|receiver| {
-        let receiver_type = scope.get(receiver);
-        let receiver_type = receiver_type?;
-        let structure = match receiver_type {
-            ScalarType::Struct(id) => program.structs.get(id.index),
-            ScalarType::RawPointer(inner) => match inner.as_ref() {
-                ScalarType::Struct(id) => program.structs.get(id.index),
-                _ => None,
-            },
-            _ => None,
-        }?;
-        structure
-            .fields
-            .iter()
-            .find(|field| field.name == assignment.target)
-            .map(|field| field.ty.clone())
-    });
-    let Some(expected) = field_expected.or_else(|| scope.get(&assignment.target).cloned()) else {
-        if is_const_binding_name(&assignment.target)
-            && program.items.iter().any(|item| {
-                matches!(
-                    item,
-                    ScalarItem::Namespace(namespace) if namespace.binding == assignment.target
-                )
-            })
-        {
-            diagnostics.push(diagnostic(
-                program,
-                "B0007",
-                "assignment targets a SCREAMING_SNAKE_CASE const binding",
-                assignment.target_span,
-            ));
-            return ScalarType::Unit;
-        }
-        diagnostics.push(diagnostic(
+    let mut target_names = BTreeSet::new();
+    let mut inferred_names = visible_names.clone();
+    let mut inferred_folded_names = folded_names.clone();
+    let expected = assignment
+        .targets
+        .iter()
+        .map(|target| {
+            if !target_names.insert((target.receiver.clone(), target.target.clone())) {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0002",
+                    "duplicate assignment target",
+                    target.target_span,
+                ));
+            }
+            assignment_target_type(target, scope, program, diagnostics)
+        })
+        .collect::<Vec<_>>();
+    let actual = match expected.first().and_then(Option::as_ref) {
+        Some(expected) => expression_type_expected(
+            &assignment.value,
+            expected,
+            scope,
+            visible_names,
+            folded_names,
             program,
-            "B0001",
-            "unknown assignment target",
-            assignment.target_span,
-        ));
-        return ScalarType::Error;
+            diagnostics,
+            unsafe_context,
+        ),
+        None => expression_type(
+            &assignment.value,
+            scope,
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+            unsafe_context,
+        ),
     };
-    if is_const_binding_name(&assignment.target) {
+    let outputs =
+        call_output_sequence(&assignment.value, scope, program).unwrap_or(ScalarOutputSequence {
+            outputs: vec![ScalarOutput {
+                ty: actual,
+                span: expression_span(&assignment.value),
+            }],
+            span: expression_span(&assignment.value),
+        });
+    if assignment.targets.len() != outputs.outputs.len() {
         diagnostics.push(diagnostic(
             program,
-            "B0007",
-            "assignment targets a SCREAMING_SNAKE_CASE const binding",
-            assignment.target_span,
+            "B0004",
+            if assignment.targets.len() > outputs.outputs.len() {
+                "call has fewer outputs than assignment targets"
+            } else {
+                "call has more outputs than assignment targets"
+            },
+            assignment.span,
         ));
     }
-    let actual = expression_type_expected(
-        &assignment.value,
-        &expected,
-        scope,
-        visible_names,
-        folded_names,
-        program,
-        diagnostics,
-        unsafe_context,
-    );
-    validate_assignment_outputs(assignment, scope, program, diagnostics);
-    expect_type(program, &expected, &actual, assignment.span, diagnostics);
-    if is_error_type(&actual) {
-        ScalarType::Error
-    } else {
-        expected
+    for ((index, (target, expected)), output) in assignment
+        .targets
+        .iter()
+        .zip(&expected)
+        .enumerate()
+        .zip(&outputs.outputs)
+    {
+        if let Some(expected) = expected {
+            expect_type(
+                program,
+                expected,
+                &output.ty,
+                if index == 0 {
+                    assignment.span
+                } else {
+                    target.target_span
+                },
+                diagnostics,
+            );
+        } else if let ScalarPlace::Name { name, span } = &target.place {
+            validate_program_identifier_style(program, name, *span, diagnostics);
+            if declare_program_name(
+                program,
+                name,
+                *span,
+                &mut inferred_names,
+                &mut inferred_folded_names,
+                diagnostics,
+            ) {
+                scope.insert(name.clone(), output.ty.clone());
+            }
+        }
+    }
+    ScalarType::Unit
+}
+
+fn assignment_target_type(
+    target: &ScalarAssignmentTarget,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> Option<ScalarType> {
+    match &target.place {
+        ScalarPlace::Name { name, span } => {
+            let expected = scope.get(name).cloned();
+            if expected.is_some() && is_const_binding_name(name) {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0007",
+                    "assignment targets a SCREAMING_SNAKE_CASE const binding",
+                    *span,
+                ));
+            }
+            expected
+        }
+        place => Some(place_type(place, scope, program, diagnostics)),
     }
 }
 
@@ -9680,15 +9709,14 @@ bool integer_inversion = !1;
     }
 
     #[test]
-    fn rejects_unknown_assignment_target_and_mismatched_assignment_type() {
-        let unknown =
-            validate_text("%%start\ni32(i32) f = fn(value) { missing = value; 0 };\n%%end");
-        let diagnostic = unknown
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.code == "B0001")
-            .expect("unknown assignment target");
-        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(33, 40));
+    fn infers_assignment_targets_and_rejects_mismatched_assignment_type() {
+        let inferred =
+            validate_text("%%start\ni32(i32) f = fn(value) { inferred = value; inferred };\n%%end");
+        assert!(
+            inferred.diagnostics.is_empty(),
+            "{:?}",
+            inferred.diagnostics
+        );
 
         let mismatch = validate_text(
             "%%start\ni32(i32) f = fn(value) { i32 local = value; local = true; local };\n%%end",
@@ -9697,6 +9725,75 @@ bool integer_inversion = !1;
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "B0003"));
+    }
+
+    #[test]
+    fn validates_ordered_assignment_outputs_and_inferred_project_targets() {
+        let valid = validate_text(
+            "%%start\n(i32, bool)() pair = fn { 1 };\ni32() result = fn { first, second = pair(); first };\n%%end",
+        );
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+        let ScalarItem::Function(result) = &valid.program.items[1] else {
+            panic!("ordered assignment")
+        };
+        let ScalarBlockItem::Assignment(assignment) = &result.body.items[0] else {
+            panic!("ordered assignment")
+        };
+        assert_eq!(
+            assignment
+                .targets
+                .iter()
+                .map(|target| &target.target)
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+
+        for text in [
+            "%%start\n(i32, bool)() pair = fn { 1 };\nfirst = pair();\n%%end",
+            "%%start\n(i32, bool)() pair = fn { 1 };\nfirst, second, third = pair();\n%%end",
+            "%%start\n(i32, bool)() pair = fn { 1 };\nbool first = false;\ni32 second = 0;\nfirst, second = pair();\n%%end",
+            "%%start\ni32 value = 0;\nvalue, value = 1;\n%%end",
+        ] {
+            let invalid = validate_text(text);
+            assert!(
+                invalid.diagnostics.iter().any(|diagnostic| {
+                    matches!(diagnostic.code.as_str(), "B0002" | "B0003" | "B0004")
+                }),
+                "missing assignment diagnostic: {:?}",
+                invalid.diagnostics
+            );
+        }
+
+        let child_source = module_source("src/child.w");
+        let child = module_from_text(
+            child_source.clone(),
+            "%%start\ni32() value = fn { 1 };\n%%end",
+        );
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nchild = namespace app \"src/child.w\";\ni32() result = fn { inferred = child.value(); 0 };\n%%end",
+        );
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source,
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "child".to_owned(),
+                        target: child_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(child_source, child.items, Vec::new()),
+            ],
+            Vec::new(),
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
     }
 
     #[test]
