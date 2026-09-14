@@ -3321,12 +3321,8 @@ fn type_core_int_conversion_in_module(
         ));
         return ScalarType::Error;
     }
-    let (source, destination) = match operation {
-        "int_trunc" => (ScalarType::U64, ScalarType::U32),
-        "int_extend" => (ScalarType::U32, ScalarType::U64),
-        _ => unreachable!(),
-    };
-    if type_arguments[0].ty != destination {
+    let destination = &type_arguments[0].ty;
+    if !is_integer_type(destination) {
         diagnostics.push(module_diagnostic(
             module,
             "B0003",
@@ -3346,7 +3342,7 @@ fn type_core_int_conversion_in_module(
     }
     let actual = expression_type_in_module_expected(
         &arguments[0],
-        Some(&source),
+        None,
         scope,
         visible_names,
         folded_names,
@@ -3355,17 +3351,34 @@ fn type_core_int_conversion_in_module(
         diagnostics,
         unsafe_context,
     );
-    expect_module_type(
-        module,
-        &source,
-        &actual,
-        expression_span(&arguments[0]),
-        diagnostics,
-    );
-    if is_error_type(&actual) {
+    let source_width = integer_width(&actual);
+    let destination_width = integer_width(destination);
+    if !is_error_type(&actual) && (source_width.is_none() || destination_width.is_none()) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            &format!("core.{operation} requires integer source and destination types"),
+            expression_span(&arguments[0]),
+        ));
+    }
+    if source_width.is_some_and(|source| {
+        destination_width.is_some_and(|destination| match operation {
+            "int_trunc" => source <= destination,
+            "int_extend" => source >= destination,
+            _ => unreachable!(),
+        })
+    }) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            &format!("core.{operation} requires a destination with the appropriate integer width"),
+            type_arguments[0].span,
+        ));
+    }
+    if is_error_type(&actual) || source_width.is_none() {
         ScalarType::Error
     } else {
-        destination
+        destination.clone()
     }
 }
 
@@ -3390,12 +3403,8 @@ fn type_core_int_conversion(
         ));
         return ScalarType::Error;
     }
-    let (source, destination) = match operation {
-        "int_trunc" => (ScalarType::U64, ScalarType::U32),
-        "int_extend" => (ScalarType::U32, ScalarType::U64),
-        _ => unreachable!(),
-    };
-    if type_arguments[0].ty != destination {
+    let destination = &type_arguments[0].ty;
+    if !is_integer_type(destination) {
         diagnostics.push(diagnostic(
             program,
             "B0003",
@@ -3415,7 +3424,7 @@ fn type_core_int_conversion(
     }
     let actual = expression_type_expected(
         &arguments[0],
-        &source,
+        &ScalarType::Error,
         scope,
         visible_names,
         folded_names,
@@ -3423,17 +3432,34 @@ fn type_core_int_conversion(
         diagnostics,
         unsafe_context,
     );
-    expect_type(
-        program,
-        &source,
-        &actual,
-        expression_span(&arguments[0]),
-        diagnostics,
-    );
-    if is_error_type(&actual) {
+    let source_width = integer_width(&actual);
+    let destination_width = integer_width(destination);
+    if !is_error_type(&actual) && (source_width.is_none() || destination_width.is_none()) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            &format!("core.{operation} requires integer source and destination types"),
+            expression_span(&arguments[0]),
+        ));
+    }
+    if source_width.is_some_and(|source| {
+        destination_width.is_some_and(|destination| match operation {
+            "int_trunc" => source <= destination,
+            "int_extend" => source >= destination,
+            _ => unreachable!(),
+        })
+    }) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            &format!("core.{operation} requires a destination with the appropriate integer width"),
+            type_arguments[0].span,
+        ));
+    }
+    if is_error_type(&actual) || source_width.is_none() {
         ScalarType::Error
     } else {
-        destination
+        destination.clone()
     }
 }
 
@@ -4948,6 +4974,17 @@ fn is_integer_type(ty: &ScalarType) -> bool {
             | ScalarType::U64
             | ScalarType::U128
     )
+}
+
+fn integer_width(ty: &ScalarType) -> Option<u32> {
+    match ty {
+        ScalarType::I8 | ScalarType::U8 => Some(8),
+        ScalarType::I16 | ScalarType::U16 => Some(16),
+        ScalarType::I32 | ScalarType::U32 => Some(32),
+        ScalarType::I64 | ScalarType::U64 => Some(64),
+        ScalarType::I128 | ScalarType::U128 => Some(128),
+        _ => None,
+    }
 }
 
 fn expect_module_integer(
@@ -10189,8 +10226,8 @@ bool integer_inversion = !1;
     }
 
     #[test]
-    fn validates_integer_conversions_in_single_file_and_project() {
-        let text = "%%start\nu64 source = 42;\nu32 narrow = core.int_trunc<u32>(source);\nu64 wide = core.int_extend<u64>(narrow);\n%%end";
+    fn validates_generic_integer_conversions_in_single_file_and_project() {
+        let text = "%%start\ni8 signed_eight = 1;\ni16 signed_sixteen = core.int_extend<i16>(signed_eight);\ni32 signed_thirty_two = core.int_extend<i32>(signed_sixteen);\ni64 signed_sixty_four = core.int_extend<i64>(signed_thirty_two);\ni128 signed_full = core.int_extend<i128>(signed_sixty_four);\nu8 unsigned_eight = core.int_trunc<u8>(signed_full);\nu16 unsigned_sixteen = core.int_extend<u16>(unsigned_eight);\nu32 unsigned_thirty_two = core.int_extend<u32>(unsigned_sixteen);\nu64 unsigned_sixty_four = core.int_extend<u64>(unsigned_thirty_two);\nu128 unsigned_full = core.int_extend<u128>(unsigned_sixty_four);\nu8 narrow_unsigned = core.int_trunc<u8>(unsigned_full);\ni8 narrow_signed = core.int_trunc<i8>(unsigned_full);\n%%end";
         let single = validate_text(text);
         assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
         let source = module_source("src/main.w");
@@ -10201,13 +10238,28 @@ bool integer_inversion = !1;
         ));
         assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
 
-        let invalid = validate_text(
+        for text in [
+            "%%start\nu32 source = 1;\nu32 value = core.int_trunc<u32>(source);\n%%end",
             "%%start\nu32 source = 1;\nu64 value = core.int_trunc<u64>(source);\n%%end",
-        );
-        assert!(invalid
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "B0003"));
+            "%%start\nu64 source = 1;\nu32 value = core.int_extend<u32>(source);\n%%end",
+            "%%start\nu32 source = 1;\nu32 value = core.int_extend<u32>(source);\n%%end",
+            "%%start\nbool source = true;\nu32 value = core.int_extend<u32>(source);\n%%end",
+            "%%start\nu64 source = 1;\nu32 value = core.int_trunc<bool>(source);\n%%end",
+            "%%start\nu64 source = 1;\nu32 value = core.int_trunc(source);\n%%end",
+            "%%start\nu64 source = 1;\nu32 value = core.int_trunc<u32, u16>(source);\n%%end",
+            "%%start\nu64 source = 1;\nu32 value = core.int_trunc<u32>();\n%%end",
+            "%%start\nu64 source = 1;\nu32 value = core.int_trunc<u32>(source, source);\n%%end",
+        ] {
+            let invalid = validate_text(text);
+            assert!(
+                invalid
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003" || diagnostic.code == "B0004"),
+                "{text}: {:?}",
+                invalid.diagnostics
+            );
+        }
     }
 
     #[test]

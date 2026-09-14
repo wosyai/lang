@@ -22,9 +22,10 @@ use crate::{
     ScalarValidation, ScalarWhile,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LlvmValueType {
     Void,
+    Aggregate(Vec<LlvmValueType>),
     I1,
     I16,
     I32,
@@ -148,7 +149,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     {
         let value = module.add_function(
             &function.name,
-            function_type(&context, &function.signature)?,
+            function_type(&context, &function.signature)?.0,
             None,
         );
         for (index, name) in function.parameters.iter().enumerate() {
@@ -170,7 +171,8 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         |name| name.to_owned(),
     )?;
     for (lookup, function, name) in &specializations {
-        let value = module.add_function(name, function_type(&context, &function.signature)?, None);
+        let value =
+            module.add_function(name, function_type(&context, &function.signature)?.0, None);
         for (index, parameter) in function.parameters.iter().enumerate() {
             if let Some(argument) = value.get_nth_param(index as u32) {
                 argument.set_name(parameter);
@@ -190,7 +192,8 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             }),
     );
     for (lookup, function, name) in &overloads {
-        let value = module.add_function(name, function_type(&context, &function.signature)?, None);
+        let value =
+            module.add_function(name, function_type(&context, &function.signature)?.0, None);
         for (index, parameter) in function.parameters.iter().enumerate() {
             if let Some(argument) = value.get_nth_param(index as u32) {
                 argument.set_name(parameter);
@@ -218,7 +221,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
                 );
                 let value = module.add_function(
                     &identity.internal_name,
-                    function_type(&context, &function.signature)?,
+                    function_type(&context, &function.signature)?.0,
                     None,
                 );
                 call_targets.insert(key, identity.internal_name.clone());
@@ -303,6 +306,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     finish_partition(
         ManuallyDrop::into_inner(module),
         validation.program.source.path.clone(),
+        &context,
         &functions,
         &signatures,
         &externs,
@@ -367,8 +371,11 @@ pub fn emit_scalar_project_llvm(
                     continue;
                 }
                 let name = project_function_name(&source_module.source, &function.name);
-                let value =
-                    module.add_function(&name, function_type(&context, &function.signature)?, None);
+                let value = module.add_function(
+                    &name,
+                    function_type(&context, &function.signature)?.0,
+                    None,
+                );
                 for (index, parameter) in function.parameters.iter().enumerate() {
                     if let Some(argument) = value.get_nth_param(index as u32) {
                         argument.set_name(parameter);
@@ -394,7 +401,7 @@ pub fn emit_scalar_project_llvm(
                     );
                     let value = module.add_function(
                         &identity.internal_name,
-                        function_type(&context, &function.signature)?,
+                        function_type(&context, &function.signature)?.0,
                         None,
                     );
                     let key = project_extern_lookup_key(
@@ -425,7 +432,7 @@ pub fn emit_scalar_project_llvm(
         )?;
         for (lookup, function, name) in specializations {
             let value =
-                module.add_function(&name, function_type(&context, &function.signature)?, None);
+                module.add_function(&name, function_type(&context, &function.signature)?.0, None);
             for (index, parameter) in function.parameters.iter().enumerate() {
                 if let Some(argument) = value.get_nth_param(index as u32) {
                     argument.set_name(parameter);
@@ -461,7 +468,7 @@ pub fn emit_scalar_project_llvm(
             selections,
         ) {
             let value =
-                module.add_function(&name, function_type(&context, &function.signature)?, None);
+                module.add_function(&name, function_type(&context, &function.signature)?.0, None);
             for (index, parameter) in function.parameters.iter().enumerate() {
                 if let Some(argument) = value.get_nth_param(index as u32) {
                     argument.set_name(parameter);
@@ -539,6 +546,7 @@ pub fn emit_scalar_project_llvm(
     finish_partition(
         ManuallyDrop::into_inner(module),
         module_name,
+        &context,
         &functions,
         &signatures,
         &externs,
@@ -621,6 +629,7 @@ fn declaration_attributes(declarations: &[LlvmFunction]) -> Vec<&LlvmFunctionAtt
 fn finish_partition<'ctx>(
     module: inkwell::module::Module<'ctx>,
     module_name: String,
+    context: &'ctx Context,
     functions: &BTreeMap<String, FunctionValue<'ctx>>,
     signatures: &BTreeMap<String, ScalarType>,
     externs: &[LlvmExternIdentity],
@@ -644,14 +653,14 @@ fn finish_partition<'ctx>(
             } else {
                 signatures.get(name)?.clone()
             };
+            let (_, result) = function_type(context, &signature).ok()?;
             let ScalarType::Callable {
-                outputs,
+                outputs: _,
                 parameters,
             } = signature
             else {
                 return None;
             };
-            let result = callable_result(&outputs);
             let parameters = parameters
                 .iter()
                 .enumerate()
@@ -663,7 +672,7 @@ fn finish_partition<'ctx>(
                 .collect::<Option<Vec<_>>>()?;
             Some(LlvmFunction {
                 name: name.clone(),
-                result: value_type(&result).ok()?,
+                result,
                 parameters,
                 attributes: Vec::new(),
                 body: String::new(),
@@ -676,13 +685,13 @@ fn finish_partition<'ctx>(
         .filter_map(|(group, extern_identity)| {
             let function = functions.get(&extern_identity.internal_name)?;
             let ScalarType::Callable {
-                outputs,
+                outputs: _,
                 parameters,
             } = &extern_identity.signature
             else {
                 return None;
             };
-            let result = callable_result(outputs);
+            let (_, result) = function_type(context, &extern_identity.signature).ok()?;
             let parameters = parameters
                 .iter()
                 .enumerate()
@@ -696,7 +705,7 @@ fn finish_partition<'ctx>(
                 .collect::<Option<Vec<_>>>()?;
             Some(LlvmFunction {
                 name: extern_identity.internal_name.clone(),
-                result: value_type(&result).ok()?,
+                result,
                 parameters,
                 attributes: vec![LlvmFunctionAttributes {
                     group: group as u32,
@@ -718,7 +727,7 @@ fn finish_partition<'ctx>(
 fn function_type<'ctx>(
     context: &'ctx Context,
     signature: &ScalarType,
-) -> Result<FunctionType<'ctx>, String> {
+) -> Result<(FunctionType<'ctx>, LlvmValueType), String> {
     let ScalarType::Callable {
         outputs,
         parameters,
@@ -731,12 +740,34 @@ fn function_type<'ctx>(
         .map(|ty| basic_type(context, ty).map(Into::into))
         .collect::<Result<Vec<BasicMetadataTypeEnum>, _>>()?;
     match outputs.outputs.as_slice() {
-        [] => Ok(context.void_type().fn_type(&parameters, false)),
-        [output] if output.ty == ScalarType::Unit => {
-            Ok(context.void_type().fn_type(&parameters, false))
-        }
-        [output] => Ok(basic_type(context, &output.ty)?.fn_type(&parameters, false)),
-        _ => Ok(aggregate_type(context, outputs)?.fn_type(&parameters, false)),
+        [] => Ok((
+            context.void_type().fn_type(&parameters, false),
+            LlvmValueType::Void,
+        )),
+        [output] if output.ty == ScalarType::Unit => Ok((
+            context.void_type().fn_type(&parameters, false),
+            LlvmValueType::Void,
+        )),
+        [output] => Ok((
+            basic_type(context, &output.ty)?.fn_type(&parameters, false),
+            value_type(&output.ty)?,
+        )),
+        _ => Ok((
+            aggregate_type(context, outputs)?.fn_type(&parameters, false),
+            LlvmValueType::Aggregate(
+                outputs
+                    .outputs
+                    .iter()
+                    .map(|output| {
+                        if output.ty == ScalarType::Unit {
+                            Ok(LlvmValueType::I8)
+                        } else {
+                            value_type(&output.ty)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        )),
     }
 }
 
@@ -867,13 +898,6 @@ fn output_basic_type<'ctx>(
     } else {
         basic_type(context, ty)
     }
-}
-
-fn callable_result(outputs: &crate::ScalarOutputSequence) -> ScalarType {
-    outputs
-        .outputs
-        .first()
-        .map_or(ScalarType::Unit, |output| output.ty.clone())
 }
 
 fn builder_error(error: BuilderError) -> String {
@@ -2825,25 +2849,22 @@ fn emit_int_conversion<'ctx, 'module>(
     let [value] = arguments else {
         return Err(format!("core.{operation} has invalid argument arity"));
     };
-    let (source, destination) = match operation {
-        "int_trunc" if type_argument.ty == ScalarType::U32 => (ScalarType::U64, ScalarType::U32),
-        "int_extend" if type_argument.ty == ScalarType::U64 => (ScalarType::U32, ScalarType::U64),
-        _ => {
-            return Err(format!(
-                "core.{operation} has an invalid integer conversion"
-            ))
-        }
-    };
+    let source = integer_conversion_source_type(state, value, None)?;
+    let destination = &type_argument.ty;
     let value =
         take_basic(emit_typed_expression(context, state, value, &source)?)?.into_int_value();
     let converted = if operation == "int_trunc" {
         state
             .builder
-            .build_int_truncate(value, integer_type(context, &destination)?, "int_trunc")
+            .build_int_truncate(value, integer_type(context, destination)?, "int_trunc")
+    } else if is_signed_integer_type(&source) {
+        state
+            .builder
+            .build_int_s_extend(value, integer_type(context, destination)?, "int_extend")
     } else {
         state
             .builder
-            .build_int_z_extend(value, integer_type(context, &destination)?, "int_extend")
+            .build_int_z_extend(value, integer_type(context, destination)?, "int_extend")
     }
     .map_err(builder_error)?;
     Ok(EmitValue::Basic(converted.into()))
@@ -2894,15 +2915,8 @@ fn emit_int_conversion_project<'ctx, 'module>(
     let [value] = arguments else {
         return Err(format!("core.{operation} has invalid argument arity"));
     };
-    let (source, destination) = match operation {
-        "int_trunc" if type_argument.ty == ScalarType::U32 => (ScalarType::U64, ScalarType::U32),
-        "int_extend" if type_argument.ty == ScalarType::U64 => (ScalarType::U32, ScalarType::U64),
-        _ => {
-            return Err(format!(
-                "core.{operation} has an invalid integer conversion"
-            ))
-        }
-    };
+    let source = integer_conversion_source_type(state, value, Some(module))?;
+    let destination = &type_argument.ty;
     let value = take_basic(emit_project_typed_expression(
         context, state, value, &source, module, modules,
     )?)?
@@ -2910,14 +2924,94 @@ fn emit_int_conversion_project<'ctx, 'module>(
     let converted = if operation == "int_trunc" {
         state
             .builder
-            .build_int_truncate(value, integer_type(context, &destination)?, "int_trunc")
+            .build_int_truncate(value, integer_type(context, destination)?, "int_trunc")
+    } else if is_signed_integer_type(&source) {
+        state
+            .builder
+            .build_int_s_extend(value, integer_type(context, destination)?, "int_extend")
     } else {
         state
             .builder
-            .build_int_z_extend(value, integer_type(context, &destination)?, "int_extend")
+            .build_int_z_extend(value, integer_type(context, destination)?, "int_extend")
     }
     .map_err(builder_error)?;
     Ok(EmitValue::Basic(converted.into()))
+}
+
+fn is_signed_integer_type(ty: &ScalarType) -> bool {
+    matches!(
+        ty,
+        ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128
+    )
+}
+
+fn integer_conversion_source_type(
+    state: &EmitState<'_, '_>,
+    expression: &ScalarExpression,
+    project_module: Option<&ScalarModule>,
+) -> Result<ScalarType, String> {
+    let ty = match expression {
+        ScalarExpression::Name { name, .. } => state
+            .storage
+            .get(name)
+            .map(|(_, ty)| ty.clone())
+            .or_else(|| state.globals.get(name).map(|(_, ty)| ty.clone())),
+        ScalarExpression::Integer { .. } => Some(ScalarType::I32),
+        ScalarExpression::Unary { operand, .. } => {
+            integer_conversion_source_type(state, operand, project_module).ok()
+        }
+        ScalarExpression::Binary { left, .. } => {
+            integer_conversion_source_type(state, left, project_module).ok()
+        }
+        ScalarExpression::Call {
+            receiver,
+            name,
+            type_arguments,
+            ..
+        } if receiver.as_deref() == Some("core")
+            && matches!(name.as_str(), "int_trunc" | "int_extend") =>
+        {
+            type_arguments.first().map(|argument| argument.ty.clone())
+        }
+        ScalarExpression::Call {
+            receiver,
+            name,
+            type_arguments,
+            overload_selection,
+            ..
+        } => {
+            let qualified = receiver.as_ref().map_or_else(
+                || {
+                    project_module.map_or_else(
+                        || name.clone(),
+                        |module| project_function_name(&module.source, name),
+                    )
+                },
+                |receiver| format!("{receiver}.{name}"),
+            );
+            let lookup = overload_selection
+                .as_ref()
+                .map(|selection| selected_overload_lookup_key(&qualified, selection));
+            state
+                .call_targets
+                .get(lookup.as_ref().unwrap_or(&qualified))
+                .or_else(|| {
+                    state
+                        .call_targets
+                        .get(&specialization_lookup_key(&qualified, type_arguments))
+                })
+                .or_else(|| state.call_targets.get(&qualified))
+                .and_then(|target| state.signatures.get(target))
+                .and_then(|signature| match signature {
+                    ScalarType::Callable { outputs, .. } => outputs.outputs.first(),
+                    _ => None,
+                })
+                .map(|output| output.ty.clone())
+        }
+        _ => None,
+    };
+    ty.filter(|ty| integer_width(ty).is_some())
+        .ok_or_else(|| "core integer conversion has an unknown source type".to_owned())
 }
 
 fn emit_call_values<'ctx, 'module>(
@@ -4187,14 +4281,18 @@ fn module_globals<'ctx>(
 mod tests {
     use std::collections::BTreeMap;
 
+    use inkwell::context::Context;
+
     use super::emit_scalar_llvm;
     use super::emit_scalar_project_llvm;
+    use super::function_type;
     use super::project_function_name;
     use super::project_global_name;
     use super::{LlvmFunction, LlvmFunctionAttributes, LlvmPartition, LlvmValueType};
     use crate::scalar::ScalarOverloadSelection;
     use crate::{
-        derive_scalar_program, parse_source, validate_scalar_project, ScalarModule, ScalarProject,
+        derive_scalar_program, parse_source, validate_scalar_project, ScalarModule, ScalarOutput,
+        ScalarOutputSequence, ScalarProject, ScalarType,
     };
     use wosy_syntax::SourceIdentity;
 
@@ -4245,6 +4343,110 @@ mod tests {
                 "attributes #7 = { \"wasm-import-module\"=\"two\" \"wasm-import-name\"=\"second_import\" }"
             ),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn preserves_callable_return_metadata_for_every_output_form() {
+        let context = Context::create();
+        let sequence = |types: Vec<ScalarType>| ScalarOutputSequence {
+            outputs: types
+                .into_iter()
+                .map(|ty| ScalarOutput {
+                    ty,
+                    span: wosy_syntax::ByteSpan::new(0, 0),
+                })
+                .collect(),
+            span: wosy_syntax::ByteSpan::new(0, 0),
+        };
+        let callable = |outputs| ScalarType::Callable {
+            outputs,
+            parameters: Vec::new(),
+        };
+
+        assert_eq!(
+            function_type(&context, &callable(sequence(Vec::new())))
+                .expect("zero-output function type")
+                .1,
+            LlvmValueType::Void
+        );
+        assert_eq!(
+            function_type(&context, &callable(sequence(vec![ScalarType::I32])))
+                .expect("direct function type")
+                .1,
+            LlvmValueType::I32
+        );
+        assert_eq!(
+            function_type(
+                &context,
+                &callable(sequence(vec![ScalarType::I32, ScalarType::Bool])),
+            )
+            .expect("aggregate function type")
+            .1,
+            LlvmValueType::Aggregate(vec![LlvmValueType::I32, LlvmValueType::I1])
+        );
+        assert_eq!(
+            function_type(
+                &context,
+                &callable(sequence(vec![ScalarType::Unit, ScalarType::I32])),
+            )
+            .expect("unit aggregate function type")
+            .1,
+            LlvmValueType::Aggregate(vec![LlvmValueType::I8, LlvmValueType::I32])
+        );
+    }
+
+    #[test]
+    fn collects_function_and_declaration_aggregate_metadata() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\nenv = extern wasm \"metadata\" { unit() void_result; i32() direct_result; (i32, bool)() aggregate_result; (unit, i32)() unit_aggregate_result; };\nunit() local_void = fn { env.void_result() };\ni32() local_direct = fn { env.direct_result() };\n(i32, bool)() local_aggregate = fn { env.aggregate_result() };\n(unit, i32)() local_unit_aggregate = fn { env.unit_aggregate_result() };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+
+        let partition = emit_scalar_llvm(&validation).expect("LLVM metadata");
+        let function_results = partition
+            .functions
+            .iter()
+            .filter(|function| function.name.starts_with("local_"))
+            .map(|function| function.result.clone())
+            .collect::<Vec<_>>();
+        let declaration_results = partition
+            .declarations
+            .iter()
+            .map(|declaration| declaration.result.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            function_results,
+            vec![
+                LlvmValueType::Aggregate(vec![LlvmValueType::I32, LlvmValueType::I1]),
+                LlvmValueType::I32,
+                LlvmValueType::Aggregate(vec![LlvmValueType::I8, LlvmValueType::I32]),
+                LlvmValueType::Void,
+            ]
+        );
+        assert_eq!(
+            declaration_results,
+            vec![
+                LlvmValueType::Void,
+                LlvmValueType::I32,
+                LlvmValueType::Aggregate(vec![LlvmValueType::I32, LlvmValueType::I1]),
+                LlvmValueType::Aggregate(vec![LlvmValueType::I8, LlvmValueType::I32]),
+            ]
         );
     }
 
@@ -4725,7 +4927,7 @@ u64 reported, bool complete = text.print(\"\");
     }
 
     #[test]
-    fn emits_integer_conversions_for_single_file_and_project() {
+    fn emits_generic_integer_conversions_for_single_file_and_project() {
         let source = SourceIdentity::new(
             "project".into(),
             "package".into(),
@@ -4735,7 +4937,7 @@ u64 reported, bool complete = text.print(\"\");
         let program = derive_scalar_program(
             &parse_source(
                 source.clone(),
-                "%%start\nu64 source = 42;\nu32 narrow = core.int_trunc<u32>(source);\nu64 wide = core.int_extend<u64>(narrow);\n%%end".into(),
+                "%%start\ni8() signed_result = fn { 1 };\ni16 signed_from_call = core.int_extend<i16>(signed_result());\ni64 signed_source = 42;\ni128 signed_wide = core.int_extend<i128>(signed_source);\nu64 unsigned_source = 42;\nu128 unsigned_wide = core.int_extend<u128>(unsigned_source);\ni8 signed_narrow = core.int_trunc<i8>(signed_wide);\nu8 unsigned_narrow = core.int_trunc<u8>(unsigned_wide);\n%%end".into(),
                 &[],
             )
             .result,
@@ -4743,8 +4945,10 @@ u64 reported, bool complete = text.print(\"\");
         let single = emit_scalar_llvm(&program)
             .expect("single-file conversion LLVM")
             .to_text();
-        assert!(single.contains("trunc i64"), "{single}");
-        assert!(single.contains("zext i32"), "{single}");
+        assert!(single.contains("sext i64"), "{single}");
+        assert!(single.contains("sext i8"), "{single}");
+        assert!(single.contains("zext i64"), "{single}");
+        assert!(single.contains("trunc i128"), "{single}");
 
         let validation = validate_scalar_project(ScalarProject::new(
             vec![ScalarModule::new(
@@ -4762,8 +4966,9 @@ u64 reported, bool complete = text.print(\"\");
         let project = emit_scalar_project_llvm(&validation)
             .expect("project conversion LLVM")
             .to_text();
-        assert!(project.contains("trunc i64"), "{project}");
-        assert!(project.contains("zext i32"), "{project}");
+        assert!(project.contains("sext i64"), "{project}");
+        assert!(project.contains("zext i64"), "{project}");
+        assert!(project.contains("trunc i128"), "{project}");
     }
 
     #[test]
