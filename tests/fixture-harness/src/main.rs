@@ -3,6 +3,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml_edit::{DocumentMut, Item};
+use wasmtime::{Caller, Engine, Linker, Memory, Module, Store};
+use wasmtime_wasi::p1::WasiP1Ctx;
+use wasmtime_wasi::WasiCtx;
+
+const ARTIFACT_MANIFEST: &str = ".wosy/artifacts/app/dev/main/artifact-manifest.json";
+
+struct HostState {
+    wasi: WasiP1Ctx,
+    writes: Vec<WriteRecord>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WriteRecord {
+    descriptor: i32,
+    text: String,
+    reported: u32,
+}
 
 fn main() -> Result<(), String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -40,8 +57,8 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
         .is_some_and(|enabled| enabled)
     {
         let repository_root = root.join("../..");
-        let stdlib = fs::canonicalize(repository_root.join("stdlib"))
-            .map_err(|error| error.to_string())?;
+        let stdlib =
+            fs::canonicalize(repository_root.join("stdlib")).map_err(|error| error.to_string())?;
         std::os::unix::fs::symlink(&stdlib, temporary.join("stdlib"))
             .map_err(|error| error.to_string())?;
     }
@@ -131,6 +148,17 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
         .and_then(Item::as_array_of_tables)
         .ok_or_else(|| format!("{} has no [[assert]]", case.display()))?;
     for assertion in assertions.iter() {
+        if let Some(partial_fd_write_count) = partial_fd_write_count(assertion)? {
+            run_partial_fd_write_assertion(
+                assertion,
+                partial_fd_write_count,
+                &temporary,
+                &case,
+                &binary,
+            )?;
+            assert_source_observations(assertion, &temporary, &case)?;
+            continue;
+        }
         let has_source_selector = assertion
             .get("source")
             .and_then(Item::as_value)
@@ -239,6 +267,224 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn partial_fd_write_count(assertion: &toml_edit::Table) -> Result<Option<u32>, String> {
+    let Some(item) = assertion.get("partial_fd_write_count") else {
+        return Ok(None);
+    };
+    let count = item
+        .as_value()
+        .and_then(|value| value.as_integer())
+        .ok_or_else(|| "partial_fd_write_count must be an integer".to_owned())?;
+    u32::try_from(count)
+        .map(Some)
+        .map_err(|_| "partial_fd_write_count must fit in u32".to_owned())
+}
+
+fn run_partial_fd_write_assertion(
+    assertion: &toml_edit::Table,
+    partial_count: u32,
+    temporary: &Path,
+    case: &Path,
+    binary: &Path,
+) -> Result<(), String> {
+    if assertion.get("command").is_some() {
+        return Err(format!(
+            "{}: partial_fd_write_count assertion accepts no command",
+            case.display()
+        ));
+    }
+    if assertion
+        .get("source")
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_str())
+        .is_none()
+    {
+        return Err(format!(
+            "{}: partial_fd_write_count assertion requires source",
+            case.display()
+        ));
+    }
+    select_source(assertion, temporary, case)?;
+    let status = Command::new(binary)
+        .arg("build")
+        .current_dir(temporary)
+        .status()
+        .map_err(|error| error.to_string())?;
+    if !status.success() {
+        return Err(format!(
+            "{}: partial_fd_write_count source build failed",
+            case.display()
+        ));
+    }
+    let executable = artifact_executable(temporary, case)?;
+    run_partial_fd_write_host(&executable, partial_count, case)
+}
+
+fn artifact_executable(temporary: &Path, case: &Path) -> Result<PathBuf, String> {
+    let manifest_path = temporary.join(ARTIFACT_MANIFEST);
+    let manifest = fs::read(&manifest_path).map_err(|error| error.to_string())?;
+    let manifest = serde_json::from_slice::<serde_json::Value>(&manifest)
+        .map_err(|error| format!("{}: artifact manifest is not JSON: {error}", case.display()))?;
+    let executable = manifest
+        .get("executable")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{}: artifact manifest executable is missing",
+                case.display()
+            )
+        })?;
+    Ok(temporary.join(executable))
+}
+
+fn run_partial_fd_write_host(
+    executable: &Path,
+    partial_count: u32,
+    case: &Path,
+) -> Result<(), String> {
+    let engine = Engine::default();
+    let module = Module::from_file(&engine, executable).map_err(|error| error.to_string())?;
+    let mut linker = Linker::new(&engine);
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| &mut state.wasi)
+        .map_err(|error| error.to_string())?;
+    linker.allow_shadowing(true);
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_write",
+            move |mut caller: Caller<'_, HostState>,
+                  fd: i32,
+                  iovs: i32,
+                  iovs_len: i32,
+                  nwritten: i32| {
+                controlled_fd_write(&mut caller, fd, iovs, iovs_len, nwritten, partial_count)
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let wasi = WasiCtx::builder().build_p1();
+    let mut store = Store::new(
+        &engine,
+        HostState {
+            wasi,
+            writes: Vec::new(),
+        },
+    );
+    let instance = linker.instantiate(&mut store, &module).map_err(|error| {
+        format!(
+            "{}: embedded P1 instantiation failed: {error}",
+            case.display()
+        )
+    })?;
+    instance
+        .get_typed_func::<(), ()>(&mut store, "_start")
+        .map_err(|error| format!("{}: _start export is missing: {error}", case.display()))?
+        .call(&mut store, ())
+        .map_err(|error| format!("{}: _start failed: {error}", case.display()))?;
+    assert_partial_fd_write_result(&store.data().writes, partial_count, case)
+}
+
+fn controlled_fd_write(
+    caller: &mut Caller<'_, HostState>,
+    descriptor: i32,
+    iovs: i32,
+    iovs_len: i32,
+    nwritten: i32,
+    partial_count: u32,
+) -> Result<i32, wasmtime::Error> {
+    if iovs_len != 1 {
+        return Err(wasmtime::Error::msg(format!(
+            "fd_write expected one iovec, observed {iovs_len}"
+        )));
+    }
+    let memory = caller
+        .get_export("memory")
+        .and_then(|export| export.into_memory())
+        .ok_or_else(|| wasmtime::Error::msg("fd_write guest memory is missing"))?;
+    let iovec = read_guest_memory(&memory, caller, iovs as u32, 8)?;
+    let data = u32::from_le_bytes(iovec[..4].try_into().expect("iovec address"));
+    let length = u32::from_le_bytes(iovec[4..].try_into().expect("iovec length"));
+    let bytes = read_guest_memory(&memory, caller, data, length as usize)?;
+    let reported = match descriptor {
+        1 => partial_count,
+        2 => length,
+        _ => {
+            return Err(wasmtime::Error::msg(format!(
+                "fd_write expected descriptor 1 or 2, observed {descriptor}"
+            )));
+        }
+    };
+    memory
+        .write(&mut *caller, nwritten as usize, &reported.to_le_bytes())
+        .map_err(|error| {
+            wasmtime::Error::msg(format!("fd_write nwritten write failed: {error}"))
+        })?;
+    caller.data_mut().writes.push(WriteRecord {
+        descriptor,
+        text: String::from_utf8(bytes).map_err(|error| {
+            wasmtime::Error::msg(format!("fd_write text is not UTF-8: {error}"))
+        })?,
+        reported,
+    });
+    Ok(0)
+}
+
+fn read_guest_memory(
+    memory: &Memory,
+    caller: &mut Caller<'_, HostState>,
+    offset: u32,
+    length: usize,
+) -> Result<Vec<u8>, wasmtime::Error> {
+    let mut bytes = vec![0; length];
+    memory
+        .read(caller, offset as usize, &mut bytes)
+        .map_err(|error| {
+            wasmtime::Error::msg(format!("fd_write guest memory read failed: {error}"))
+        })?;
+    Ok(bytes)
+}
+
+fn assert_partial_fd_write_result(
+    writes: &[WriteRecord],
+    partial_count: u32,
+    case: &Path,
+) -> Result<(), String> {
+    let expected = [
+        WriteRecord {
+            descriptor: 1,
+            text: "partial\n".to_owned(),
+            reported: partial_count,
+        },
+        WriteRecord {
+            descriptor: 2,
+            text: "partial result\n".to_owned(),
+            reported: "partial result\n".len() as u32,
+        },
+    ];
+    if writes.len() != expected.len() {
+        return Err(format!(
+            "{}: fd_write record count expected {}, observed {}",
+            case.display(),
+            expected.len(),
+            writes.len()
+        ));
+    }
+    for (index, (actual, expected)) in writes.iter().zip(expected.iter()).enumerate() {
+        if actual != expected {
+            return Err(format!(
+                "{}: fd_write record {index} expected descriptor {}, text {:?}, reported {}; observed descriptor {}, text {:?}, reported {}",
+                case.display(),
+                expected.descriptor,
+                expected.text,
+                expected.reported,
+                actual.descriptor,
+                actual.text,
+                actual.reported
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn requires_selected_source_build(has_source_selector: bool, command: &[String]) -> bool {
     has_source_selector
         && command.first().map(String::as_str) == Some("wosy")
@@ -256,10 +502,8 @@ fn assert_source_observations(
     else {
         return Ok(());
     };
-    let manifest = fs::read(temporary.join(
-        ".wosy/artifacts/app/dev/main/artifact-manifest.json",
-    ))
-    .map_err(|error| error.to_string())?;
+    let manifest = fs::read(temporary.join(".wosy/artifacts/app/dev/main/artifact-manifest.json"))
+        .map_err(|error| error.to_string())?;
     let manifest = serde_json::from_slice::<serde_json::Value>(&manifest)
         .map_err(|error| format!("{}: manifest is not JSON: {error}", case.display()))?;
     let observations = manifest
@@ -464,7 +708,12 @@ fn collect_cases(directory: &Path, cases: &mut Vec<PathBuf>) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
-    use super::requires_selected_source_build;
+    use super::{
+        assert_partial_fd_write_result, partial_fd_write_count, requires_selected_source_build,
+        WriteRecord,
+    };
+    use std::path::Path;
+    use toml_edit::DocumentMut;
 
     #[test]
     fn selected_source_negative_build_assertion_runs_directly() {
@@ -478,5 +727,62 @@ mod tests {
         let command = vec!["wosy".to_owned(), "run".to_owned()];
 
         assert!(requires_selected_source_build(true, &command));
+    }
+
+    #[test]
+    fn recognizes_partial_fd_write_count() {
+        let document =
+            "[[assert]]\nsource = \"project/src/public_partial.w\"\npartial_fd_write_count = 3\n"
+                .parse::<DocumentMut>()
+                .expect("assertion document");
+        let assertion = document
+            .get("assert")
+            .and_then(toml_edit::Item::as_array_of_tables)
+            .and_then(|assertions| assertions.iter().next())
+            .expect("partial assertion");
+
+        assert_eq!(partial_fd_write_count(assertion), Ok(Some(3)));
+    }
+
+    #[test]
+    fn ignores_assertions_without_partial_fd_write_count() {
+        let assertion = toml_edit::Table::new();
+
+        assert_eq!(partial_fd_write_count(&assertion), Ok(None));
+    }
+
+    #[test]
+    fn validates_controlled_partial_write_records() {
+        let writes = [
+            WriteRecord {
+                descriptor: 1,
+                text: "partial\n".to_owned(),
+                reported: 3,
+            },
+            WriteRecord {
+                descriptor: 2,
+                text: "partial result\n".to_owned(),
+                reported: 15,
+            },
+        ];
+
+        assert_eq!(
+            assert_partial_fd_write_result(&writes, 3, Path::new("runtime_stdio")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn reports_controlled_partial_write_record_mismatches() {
+        let writes = [WriteRecord {
+            descriptor: 1,
+            text: "partial\n".to_owned(),
+            reported: 3,
+        }];
+
+        assert_eq!(
+            assert_partial_fd_write_result(&writes, 3, Path::new("runtime_stdio")),
+            Err("runtime_stdio: fd_write record count expected 2, observed 1".to_owned())
+        );
     }
 }
