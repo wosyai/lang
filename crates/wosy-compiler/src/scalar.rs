@@ -2849,43 +2849,6 @@ fn scalar_call_result_in_module(outputs: &ScalarOutputSequence) -> ScalarType {
         .map_or(ScalarType::Unit, |output| output.ty.clone())
 }
 
-fn reject_multi_output_statement_in_module(
-    expression: &ScalarExpression,
-    scope: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
-    diagnostics: &mut Vec<super::Diagnostic>,
-) {
-    if let Some(outputs) = call_output_sequence_in_module(expression, scope, module, modules) {
-        if outputs.outputs.len() > 1 {
-            diagnostics.push(module_diagnostic(
-                module,
-                "B0003",
-                "multi-output call requires output receivers",
-                outputs.span,
-            ));
-        }
-    }
-}
-
-fn reject_multi_output_statement(
-    expression: &ScalarExpression,
-    scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
-    diagnostics: &mut Vec<super::Diagnostic>,
-) {
-    if let Some(outputs) = call_output_sequence(expression, scope, program) {
-        if outputs.outputs.len() > 1 {
-            diagnostics.push(diagnostic(
-                program,
-                "B0003",
-                "multi-output call requires output receivers",
-                outputs.span,
-            ));
-        }
-    }
-}
-
 fn expression_span(expression: &ScalarExpression) -> ByteSpan {
     match expression {
         ScalarExpression::Name { span, .. }
@@ -2921,15 +2884,11 @@ fn validate_output_receivers_in_module(
     let Some(outputs) = call_output_sequence_in_module(expression, scope, module, modules) else {
         return;
     };
-    if receivers.len() != outputs.outputs.len() {
+    if receivers.len() > outputs.outputs.len() {
         diagnostics.push(module_diagnostic(
             module,
             "B0004",
-            if receivers.len() > outputs.outputs.len() {
-                "call has fewer outputs than receivers"
-            } else {
-                "call has more outputs than receivers"
-            },
+            "call has fewer outputs than receivers",
             binding_span,
         ));
     }
@@ -2949,15 +2908,11 @@ fn validate_output_receivers(
     let Some(outputs) = call_output_sequence(expression, scope, program) else {
         return;
     };
-    if receivers.len() != outputs.outputs.len() {
+    if receivers.len() > outputs.outputs.len() {
         diagnostics.push(diagnostic(
             program,
             "B0004",
-            if receivers.len() > outputs.outputs.len() {
-                "call has fewer outputs than receivers"
-            } else {
-                "call has more outputs than receivers"
-            },
+            "call has fewer outputs than receivers",
             binding_span,
         ));
     }
@@ -3113,25 +3068,16 @@ fn block_item_type_in_module(
             }
             ScalarType::Unit
         }
-        ScalarBlockItem::Expression(expression) => {
-            reject_multi_output_statement_in_module(
-                expression,
-                scope,
-                module,
-                modules,
-                diagnostics,
-            );
-            expression_type_in_module(
-                expression,
-                scope,
-                visible_names,
-                folded_names,
-                module,
-                modules,
-                diagnostics,
-                unsafe_context,
-            )
-        }
+        ScalarBlockItem::Expression(expression) => expression_type_in_module(
+            expression,
+            scope,
+            visible_names,
+            folded_names,
+            module,
+            modules,
+            diagnostics,
+            unsafe_context,
+        ),
         ScalarBlockItem::Assignment(assignment) => assignment_type_in_module(
             assignment,
             scope,
@@ -3213,15 +3159,11 @@ fn assignment_type_in_module(
             .collect(),
         span: assignment.span,
     };
-    if assignment.targets.len() != outputs.outputs.len() {
+    if assignment.targets.len() > outputs.outputs.len() {
         diagnostics.push(module_diagnostic(
             module,
             "B0004",
-            if assignment.targets.len() > outputs.outputs.len() {
-                "call has fewer outputs than assignment targets"
-            } else {
-                "call has more outputs than assignment targets"
-            },
+            "call has fewer outputs than assignment targets",
             assignment.span,
         ));
     }
@@ -8103,18 +8045,15 @@ fn block_item_type(
             }
             ScalarType::Unit
         }
-        ScalarBlockItem::Expression(expression) => {
-            reject_multi_output_statement(expression, scope, program, diagnostics);
-            expression_type(
-                expression,
-                scope,
-                visible_names,
-                folded_names,
-                program,
-                diagnostics,
-                unsafe_context,
-            )
-        }
+        ScalarBlockItem::Expression(expression) => expression_type(
+            expression,
+            scope,
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+            unsafe_context,
+        ),
         ScalarBlockItem::Assignment(assignment) => assignment_type(
             assignment,
             scope,
@@ -8203,15 +8142,11 @@ fn assignment_type(
             .collect(),
         span: assignment.span,
     };
-    if assignment.targets.len() != outputs.outputs.len() {
+    if assignment.targets.len() > outputs.outputs.len() {
         diagnostics.push(diagnostic(
             program,
             "B0004",
-            if assignment.targets.len() > outputs.outputs.len() {
-                "call has fewer outputs than assignment targets"
-            } else {
-                "call has more outputs than assignment targets"
-            },
+            "call has fewer outputs than assignment targets",
             assignment.span,
         ));
     }
@@ -10443,7 +10378,6 @@ bool integer_inversion = !1;
         );
 
         for text in [
-            "%%start\n(i32, bool)() pair = fn { 1 };\nfirst = pair();\n%%end",
             "%%start\n(i32, bool)() pair = fn { 1 };\nfirst, second, third = pair();\n%%end",
             "%%start\n(i32, bool)() pair = fn { 1 };\nbool first = false;\ni32 second = 0;\nfirst, second = pair();\n%%end",
             "%%start\ni32 value = 0;\nvalue, value = 1;\n%%end",
@@ -12085,64 +12019,121 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
     }
 
     #[test]
-    fn validates_multiple_output_calls_and_output_arity() {
-        let valid = validate_text(
-            "%%start\n(u64, bool)() pair = fn { 1 };\nu64 first, bool second = pair<u32>();\n%%end",
+    fn discards_unreceived_outputs_in_scalar_programs() {
+        for text in [
+            "%%start\n(i32, u64)() pair = fn { 1 };\npair();\n%%end",
+            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first = pair();\n%%end",
+            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first, u64 second = pair();\n%%end",
+            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first = 0;\nfirst = pair();\n%%end",
+            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first = 0;\nu64 second = 0;\nfirst, second = pair();\n%%end",
+        ] {
+            let valid = validate_text(text);
+            assert!(valid.diagnostics.is_empty(), "{text}: {:?}", valid.diagnostics);
+        }
+
+        let wrong_binding =
+            validate_text("%%start\n(i32, u64)() pair = fn { 1 };\nbool first = pair();\n%%end");
+        assert!(wrong_binding.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "expression type does not match expected type"
+        }));
+        let wrong_assignment = validate_text(
+            "%%start\n(i32, u64)() pair = fn { 1 };\nbool first = false;\nfirst = pair();\n%%end",
         );
-        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
-        let ScalarItem::Binding(binding) = &valid.program.items[1] else {
-            panic!("multi-output binding")
+        assert!(wrong_assignment.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "expression type does not match expected type"
+        }));
+
+        for (text, message) in [
+            (
+                "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first, u64 second, bool third = pair();\n%%end",
+                "call has fewer outputs than receivers",
+            ),
+            (
+                "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first = 0;\nu64 second = 0;\nbool third = false;\nfirst, second, third = pair();\n%%end",
+                "call has fewer outputs than assignment targets",
+            ),
+        ] {
+            let invalid = validate_text(text);
+            assert!(invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == message));
+            assert!(!invalid.diagnostics.iter().any(|diagnostic| {
+                diagnostic.message == "call has more outputs than receivers"
+                    || diagnostic.message == "call has more outputs than assignment targets"
+            }));
+        }
+    }
+
+    #[test]
+    fn discards_unreceived_outputs_in_namespace_resolved_projects() {
+        let std_source = module_source("src/std.w");
+        let std = module_from_text(
+            std_source.clone(),
+            "%%start\n(i32, u64)() print = fn { 1 };\n%%end",
+        );
+        let validate_project_text = |text: &str| {
+            let main_source = module_source("src/main.w");
+            let main = module_from_text(main_source.clone(), text);
+            let namespace_span = match &main.items[0] {
+                ScalarItem::Namespace(namespace) => namespace.span,
+                _ => panic!("namespace item"),
+            };
+            validate_scalar_project(ScalarProject::new(
+                vec![
+                    ScalarModule::new(
+                        main_source,
+                        main.items,
+                        vec![ScalarNamespaceBinding {
+                            binding: "std".to_owned(),
+                            target: std_source.clone(),
+                            span: namespace_span,
+                        }],
+                    ),
+                    ScalarModule::new(std_source.clone(), std.items.clone(), Vec::new()),
+                ],
+                Vec::new(),
+            ))
         };
-        assert_eq!(
-            binding.output_origin,
-            ScalarBindingOutputOrigin::SingleExpression
+
+        for text in [
+            "%%start\nstd = namespace app \"src/std.w\";\nstd.print();\n%%end",
+            "%%start\nstd = namespace app \"src/std.w\";\ni32 first = std.print();\n%%end",
+            "%%start\nstd = namespace app \"src/std.w\";\ni32 first, u64 second = std.print();\n%%end",
+            "%%start\nstd = namespace app \"src/std.w\";\ni32 first = 0;\nfirst = std.print();\n%%end",
+            "%%start\nstd = namespace app \"src/std.w\";\ni32 first = 0;\nu64 second = 0;\nfirst, second = std.print();\n%%end",
+        ] {
+            let valid = validate_project_text(text);
+            assert!(valid.diagnostics.is_empty(), "{text}: {:?}", valid.diagnostics);
+        }
+
+        let wrong_type = validate_project_text(
+            "%%start\nstd = namespace app \"src/std.w\";\nbool first = std.print();\n%%end",
         );
-        assert_eq!(binding.output_sequence.outputs.len(), 2);
-        assert_eq!(binding.output_sequence.outputs[0].ty, ScalarType::U64);
-        assert_eq!(binding.output_sequence.outputs[1].ty, ScalarType::Bool);
-        let call_span = expression_span(&binding.value);
-        assert_eq!(binding.output_sequence.outputs[0].span, call_span);
-        assert_eq!(binding.output_sequence.outputs[1].span, call_span);
-        assert_eq!(binding.output_values[0].position, 0);
-        assert_eq!(binding.output_values[1].position, 1);
-        assert_eq!(binding.output_values[0].ty, ScalarType::U64);
-        assert_eq!(binding.output_values[1].ty, ScalarType::Bool);
-        let wrong_type_text =
-            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first, i32 second = pair();\n%%end";
-        let wrong_type = validate_text(wrong_type_text);
-        let second_receiver_start =
-            wrong_type_text.find("i32 second").expect("second receiver") as u32;
-        let second_receiver_end = second_receiver_start + "i32 second".len() as u32;
         assert!(wrong_type.diagnostics.iter().any(|diagnostic| {
             diagnostic.message == "expression type does not match expected type"
-                && diagnostic.labels.iter().any(|label| {
-                    label.span.range == ByteSpan::new(second_receiver_start, second_receiver_end)
-                })
         }));
 
-        let wrong_arity =
-            validate_text("%%start\n(i32, u64)() pair = fn { 1 };\ni32 first = pair();\n%%end");
-        assert!(wrong_arity
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message == "call has more outputs than receivers"));
-
-        let too_many_text =
-            "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first, u64 second, bool third = pair();\n%%end";
-        let too_many = validate_text(too_many_text);
-        let too_many_start = too_many_text.find("i32 first").expect("binding start") as u32;
-        let too_many_end = too_many_text.find(";\n%%end").expect("binding end") as u32 + 1;
-        assert!(too_many.diagnostics.iter().any(|diagnostic| {
-            diagnostic.message == "call has fewer outputs than receivers"
-                && diagnostic.labels[0].span.range == ByteSpan::new(too_many_start, too_many_end)
-        }));
-
-        let scalar = validate_text("%%start\n(i32, u64)() pair = fn { 1 };\npair();\n%%end");
-        let output_span = ByteSpan::new(8, 20);
-        assert!(scalar.diagnostics.iter().any(|diagnostic| {
-            diagnostic.message == "multi-output call requires output receivers"
-                && diagnostic.labels[0].span.range == output_span
-        }));
+        for (text, message) in [
+            (
+                "%%start\nstd = namespace app \"src/std.w\";\ni32 first, u64 second, bool third = std.print();\n%%end",
+                "call has fewer outputs than receivers",
+            ),
+            (
+                "%%start\nstd = namespace app \"src/std.w\";\ni32 first = 0;\nu64 second = 0;\nbool third = false;\nfirst, second, third = std.print();\n%%end",
+                "call has fewer outputs than assignment targets",
+            ),
+        ] {
+            let invalid = validate_project_text(text);
+            assert!(invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == message));
+            assert!(!invalid.diagnostics.iter().any(|diagnostic| {
+                diagnostic.message == "call has more outputs than receivers"
+                    || diagnostic.message == "call has more outputs than assignment targets"
+            }));
+        }
     }
 
     #[test]
