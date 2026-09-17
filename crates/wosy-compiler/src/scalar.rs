@@ -13559,6 +13559,50 @@ struct Node {
     }
 
     #[test]
+    fn reports_recursive_and_overflowing_connected_aggregate_layouts_independently() {
+        let text = "%%start
+struct Root {
+	Recursive recursive;
+	Huge huge;
+}
+struct Recursive {
+	Recursive member;
+}
+struct Huge {
+	u8[18446744073709551615] values;
+	u8 later;
+}
+%%end";
+        let validation = validate_text(text);
+        let diagnostics = validation
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "B0003")
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2, "{:?}", validation.diagnostics);
+        assert_eq!(
+            diagnostics[0].message,
+            "recursive by-value struct layout is unsupported"
+        );
+        assert_eq!(diagnostics[1].message, "struct layout exceeds u64");
+        for (diagnostic, field) in diagnostics.iter().zip(["member", "later"]) {
+            let start = text.rfind(field).expect("diagnostic field") as u32;
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(start, start + field.len() as u32)
+            );
+        }
+        assert!(validation.program.structs.iter().all(|structure| {
+            structure.layout.is_none()
+                && structure
+                    .fields
+                    .iter()
+                    .all(|field| field.layout.is_none() && field.offset.is_none())
+        }));
+        assert!(crate::emit_scalar_llvm(&validation).is_err());
+    }
+
+    #[test]
     fn reports_local_recursive_layout_components_in_source_order() {
         let text = "%%start
 struct Root {
