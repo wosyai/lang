@@ -78,6 +78,9 @@ pub enum SyntaxKind {
     FixedArraySuffix,
     ArrayLiteral,
     FixedArrayLength,
+    CheckedPointerType,
+    ParenthesizedType,
+    CheckedAddress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -156,6 +159,9 @@ impl Language for WosyLanguage {
             65 => SyntaxKind::FixedArraySuffix,
             66 => SyntaxKind::ArrayLiteral,
             67 => SyntaxKind::FixedArrayLength,
+            68 => SyntaxKind::CheckedPointerType,
+            69 => SyntaxKind::ParenthesizedType,
+            70 => SyntaxKind::CheckedAddress,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -600,6 +606,8 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::type_name => SyntaxKind::TypeName,
         Rule::qualified_type => SyntaxKind::QualifiedType,
         Rule::raw_pointer_type => SyntaxKind::RawPointerType,
+        Rule::checked_pointer_type => SyntaxKind::CheckedPointerType,
+        Rule::parenthesized_type => SyntaxKind::ParenthesizedType,
         Rule::unsafe_marker => SyntaxKind::Unsafe,
         Rule::identifier => SyntaxKind::Identifier,
         Rule::parameters => SyntaxKind::Parameters,
@@ -634,6 +642,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::dereferenced_field => SyntaxKind::DereferencedField,
         Rule::dereference => SyntaxKind::Dereference,
         Rule::raw_address => SyntaxKind::RawAddress,
+        Rule::checked_address => SyntaxKind::CheckedAddress,
         Rule::error_item => SyntaxKind::Error,
         Rule::parenthesized => SyntaxKind::Parenthesized,
         Rule::boolean => SyntaxKind::Boolean,
@@ -900,6 +909,9 @@ mod tests {
             SyntaxKind::GenericFunctionDecl,
             SyntaxKind::OverloadDecl,
             SyntaxKind::OverloadArm,
+            SyntaxKind::CheckedPointerType,
+            SyntaxKind::ParenthesizedType,
+            SyntaxKind::CheckedAddress,
         ];
         for kind in kinds {
             assert_eq!(
@@ -1435,6 +1447,56 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn checked_references_addresses_and_grouped_types_are_structural_and_lossless() {
+        let text = "%%start\nstruct Record {\n\tu8 field;\n}\nu8 value = 0;\nu8[4] bytes = [0, 0, 0, 0];\n*u8 shared = &value;\n*!u8 mutable = &!value;\n*u8 field = &record.field;\n*u8[4] references = null;\n*(u8[4]) whole = &bytes;\n*!(u8[4]) mutable_whole = &!bytes;\nunsafe {\n\t*?u8 raw = &?value;\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+
+        assert_eq!(
+            result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::CheckedPointerType)
+                .count(),
+            6
+        );
+        assert_eq!(
+            result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::CheckedAddress)
+                .count(),
+            5
+        );
+        let array_of_references = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::TypeSpec && node.text() == "*u8[4]")
+            .expect("array of references type");
+        assert!(array_of_references
+            .children()
+            .any(|node| { node.kind() == SyntaxKind::CheckedPointerType && node.text() == "*u8" }));
+        assert!(array_of_references
+            .children()
+            .any(|node| node.kind() == SyntaxKind::FixedArraySuffix));
+
+        let reference_to_array = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::CheckedPointerType && node.text() == "*(u8[4])")
+            .expect("reference to array type");
+        let grouped = reference_to_array
+            .children()
+            .find(|node| node.kind() == SyntaxKind::ParenthesizedType)
+            .expect("grouped array type");
+        assert_eq!(grouped.text(), "(u8[4])");
+        assert!(grouped
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::FixedArraySuffix));
     }
 
     #[test]

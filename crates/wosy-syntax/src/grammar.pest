@@ -25,11 +25,14 @@ generic_function_decl = { generic_decl ~ function_decl }
 overload_decl = { identifier ~ "=" ~ "overload" ~ "{" ~ overload_arm+ ~ "}" ~ ";" }
 overload_arm = { generic_decl? ~ callable_type ~ "=>" ~ "fn" ~ parameters? ~ block ~ ";" }
 binding_decl = { receiver_list ~ "=" ~ output_list ~ ";" }
-type_spec = { (callable_type | raw_pointer_type | qualified_type | type_name) ~ fixed_array_suffix* }
-array_type = { (raw_pointer_type | qualified_type | type_name) ~ fixed_array_suffix* }
+type_spec = { (callable_type | checked_pointer_type | raw_pointer_type | parenthesized_type | qualified_type | type_name) ~ fixed_array_suffix* }
+array_type = { (checked_pointer_type | raw_pointer_type | parenthesized_type | qualified_type | type_name) ~ fixed_array_suffix* }
 callable_type = { callable_output ~ "(" ~ (array_type ~ ("," ~ array_type)*)? ~ ")" }
 callable_output = { array_type | "(" ~ array_type ~ ("," ~ array_type)* ~ ")" }
+checked_pointer_type = { "*" ~ checked_pointer_mutability? ~ (parenthesized_type | qualified_type | type_name) }
+checked_pointer_mutability = { "!" }
 raw_pointer_type = { "*?" ~ (qualified_type | type_name) ~ fixed_array_suffix* }
+parenthesized_type = { "(" ~ type_spec ~ ")" }
 fixed_array_suffix = { "[" ~ fixed_array_length ~ "]" }
 fixed_array_length = { "-"? ~ integer }
 type_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
@@ -65,12 +68,14 @@ shift = { additive ~ (shift_operator ~ additive)* }
 additive = { multiplicative ~ (add_operator ~ multiplicative)* }
 multiplicative = { unary ~ (multiply_operator ~ unary)* }
 unary = { unary_operator ~ unary | primary }
-primary = { call | raw_address | field_access | dereference | struct_literal | array_literal | boolean | identifier | float | integer | char | string | parenthesized }
+primary = { call | raw_address | checked_address | field_access | dereference | struct_literal | array_literal | boolean | identifier | float | integer | char | string | parenthesized }
 parenthesized = { "(" ~ expression ~ ")" }
 struct_literal = { "{" ~ struct_literal_field* ~ "}" }
 struct_literal_field = { "." ~ identifier ~ "=" ~ expression ~ ";" }
 array_literal = { "[" ~ (expression ~ ("," ~ expression)*)? ~ "]" }
 raw_address = { "&?" ~ assignment_target }
+checked_address = { "&" ~ checked_address_mutability? ~ assignment_target }
+checked_address_mutability = { "!" }
 dereference = { "*" ~ primary }
 field_access = { qualified_member | dereferenced_field }
 dereferenced_field = { parenthesized ~ "." ~ identifier }
@@ -83,7 +88,7 @@ or_operator = { "||" }
 and_operator = { "&&" }
 bit_or_operator = { "|" }
 bit_xor_operator = { "^" }
-bit_and_operator = { "&" }
+bit_and_operator = @{ "&" ~ !"&" }
 shift_operator = { "<<" | ">>" }
 unary_operator = { "!" | "~" | "-" }
 comparison_operator = { "==" | "!=" | "<=" | ">=" | "<" | ">" }
