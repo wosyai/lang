@@ -5429,7 +5429,10 @@ fn is_supported_checked_address_place(place: &ScalarPlace) -> bool {
 }
 
 fn is_addressable_checked_reference_type(ty: &ScalarType) -> bool {
-    !matches!(ty, ScalarType::Callable { .. } | ScalarType::Error)
+    !matches!(
+        ty,
+        ScalarType::Unit | ScalarType::Callable { .. } | ScalarType::Error
+    )
 }
 
 fn checked_address_type(
@@ -13103,6 +13106,17 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         assert!(callable.diagnostics.iter().any(|diagnostic| {
             diagnostic.message == "checked address requires a storage name or direct storage field"
         }));
+
+        let unit = validate_text(
+            "%%start\nunit() touch = fn { 1; };\nunit value = touch();\n*unit reference = &value;\n%%end",
+        );
+        assert!(unit.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "checked address requires a storage name or direct storage field"
+        }));
+        assert_eq!(
+            crate::emit_scalar_llvm(&unit).unwrap_err(),
+            "cannot emit LLVM for an invalid scalar program"
+        );
     }
 
     #[test]
