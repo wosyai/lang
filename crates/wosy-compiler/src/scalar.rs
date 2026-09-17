@@ -5428,6 +5428,10 @@ fn is_supported_checked_address_place(place: &ScalarPlace) -> bool {
     }
 }
 
+fn is_addressable_checked_reference_type(ty: &ScalarType) -> bool {
+    !matches!(ty, ScalarType::Callable { .. } | ScalarType::Error)
+}
+
 fn checked_address_type(
     mutability: ScalarReferenceMutability,
     place: &ScalarPlace,
@@ -5445,9 +5449,19 @@ fn checked_address_type(
         ));
         return ScalarType::Error;
     }
+    let inner = place_type(place, scope, program, diagnostics);
+    if !is_addressable_checked_reference_type(&inner) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            "checked address requires a storage name or direct storage field",
+            span,
+        ));
+        return ScalarType::Error;
+    }
     ScalarType::CheckedReference {
         mutability,
-        inner: Box::new(place_type(place, scope, program, diagnostics)),
+        inner: Box::new(inner),
     }
 }
 
@@ -5469,15 +5483,19 @@ fn checked_address_type_in_module(
         ));
         return ScalarType::Error;
     }
+    let inner = place_type_in_module(place, scope, module, modules, diagnostics);
+    if !is_addressable_checked_reference_type(&inner) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "checked address requires a storage name or direct storage field",
+            span,
+        ));
+        return ScalarType::Error;
+    }
     ScalarType::CheckedReference {
         mutability,
-        inner: Box::new(place_type_in_module(
-            place,
-            scope,
-            module,
-            modules,
-            diagnostics,
-        )),
+        inner: Box::new(inner),
     }
 }
 
@@ -13077,6 +13095,12 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             "%%start\nstruct Record {\n\tu8 field;\n}\n*?Record pointer = null;\n*u8 field = &(*pointer).field;\n%%end",
         );
         assert!(unsupported.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "checked address requires a storage name or direct storage field"
+        }));
+
+        let callable =
+            validate_text("%%start\nu8() make = fn { 1 };\n*(u8()) reference = &make;\n%%end");
+        assert!(callable.diagnostics.iter().any(|diagnostic| {
             diagnostic.message == "checked address requires a storage name or direct storage field"
         }));
     }

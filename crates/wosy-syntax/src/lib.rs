@@ -1500,6 +1500,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_indexed_checked_address_formation() {
+        let result = parse(
+            identity(),
+            "%%start\nu8[4] bytes = [1, 2, 3, 4];\n*u8 reference = &bytes[0];\n%%end".into(),
+            &[],
+        );
+        assert!(!result.is_valid());
+    }
+
+    #[test]
     fn local_binding_assignment_and_direct_block_while_are_structural() {
         let text = "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t}\n};\n%%end";
         let result = parse(identity(), text.into(), &[]);

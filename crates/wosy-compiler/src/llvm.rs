@@ -6759,7 +6759,7 @@ mutable_forwarded;
         let root = derive_scalar_program(
             &parse_source(
                 root_source.clone(),
-                "%%start\nchild = namespace package \"src/child.w\";\nchild.Pair item = { .first = 1; .second = 2; };\nunsafe { *?child.Pair pointer = &?item; *?u32 address = &?(*pointer).second; };\n%%end".into(),
+                "%%start\nchild = namespace package \"src/child.w\";\nchild.Pair item = { .first = 1; .second = 2; };\n*u32 checked_address = &item.second;\nunsafe { *?child.Pair pointer = &?item; *?u32 address = &?(*pointer).second; };\n%%end".into(),
                 &[],
             )
             .result,
@@ -6789,6 +6789,11 @@ mutable_forwarded;
         assert!(text.contains("[8 x i8]"), "{text}");
         assert!(text.contains("getelementptr inbounds i8"), "{text}");
         assert!(text.contains("i8 4"), "{text}");
+        assert!(
+            text.contains("ptrtoint (ptr getelementptr inbounds (i8, ptr @wosy_fn"),
+            "{text}"
+        );
+        assert!(text.contains("i8 4) to i32)"), "{text}");
     }
 
     #[test]
