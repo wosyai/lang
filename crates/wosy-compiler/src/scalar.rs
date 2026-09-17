@@ -2282,6 +2282,7 @@ fn aggregate_layout_order(structures: &[ScalarStruct]) -> (Vec<Vec<usize>>, Vec<
             cycles.push(component);
         }
     }
+    cycles.sort_unstable_by_key(|cycle| cycle_participant(structures, cycle));
     let mut visited = vec![false; structures.len()];
     let mut order = Vec::new();
     for index in 0..structures.len() {
@@ -13482,6 +13483,115 @@ struct Second {
                         .iter()
                         .all(|field| field.layout.is_none() && field.offset.is_none())
             }));
+        }
+    }
+
+    #[test]
+    fn reports_local_recursive_layout_components_in_source_order() {
+        let text = "%%start
+struct Root {
+	Late late;
+}
+struct Early {
+	Early early;
+}
+struct Late {
+	Late late;
+}
+%%end";
+        let validation = validate_text(text);
+        let diagnostics = validation
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "recursive by-value struct layout is unsupported"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2, "{:?}", validation.diagnostics);
+        for (diagnostic, field) in diagnostics.iter().zip(["early", "late"]) {
+            let start = text.rfind(field).expect("recursive field") as u32;
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(start, start + field.len() as u32)
+            );
+        }
+        for structure in &validation.program.structs[1..] {
+            assert_eq!(structure.layout, None);
+            assert!(structure
+                .fields
+                .iter()
+                .all(|field| { field.layout.is_none() && field.offset.is_none() }));
+        }
+    }
+
+    #[test]
+    fn reports_project_recursive_layout_components_in_source_order() {
+        let main_source = module_source("src/main.w");
+        let main_text = "%%start
+late = namespace app \"src/late.w\";
+struct Root {
+	late.Late late;
+}
+struct Early {
+	Early early;
+}
+%%end";
+        let main = module_from_text(main_source.clone(), main_text);
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("late namespace"),
+        };
+        let late_source = module_source("src/late.w");
+        let late_text = "%%start
+struct Late {
+	Late late;
+}
+%%end";
+        let late = module_from_text(late_source.clone(), late_text);
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    main,
+                    vec![ScalarNamespaceBinding {
+                        binding: "late".to_owned(),
+                        target: late_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::from_program(late, Vec::new()),
+            ],
+            vec![main_source.clone(), late_source.clone()],
+        ));
+        let diagnostics = validation
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "recursive by-value struct layout is unsupported"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2, "{:?}", validation.diagnostics);
+        for (diagnostic, (source, text, field)) in diagnostics.iter().zip([
+            (&main_source, main_text, "early"),
+            (&late_source, late_text, "late"),
+        ]) {
+            let start = text.find(field).expect("recursive field") as u32;
+            assert_eq!(diagnostic.labels[0].span.source, *source);
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(start, start + field.len() as u32)
+            );
+        }
+        for structure in [
+            &validation.project.modules[0].structs[1],
+            &validation.project.modules[1].structs[0],
+        ] {
+            assert_eq!(structure.layout, None);
+            assert!(structure
+                .fields
+                .iter()
+                .all(|field| { field.layout.is_none() && field.offset.is_none() }));
         }
     }
 
