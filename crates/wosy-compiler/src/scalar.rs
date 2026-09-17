@@ -13526,6 +13526,39 @@ struct Third {
     }
 
     #[test]
+    fn rejects_nested_array_recursive_layout_while_raw_pointers_and_callables_are_non_edges() {
+        let text = "%%start
+struct Node {
+	*?Node parent;
+	unit(Node) visit;
+	Node[1][1] children;
+}
+%%end";
+        let validation = validate_text(text);
+        let diagnostics = validation
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "recursive by-value struct layout is unsupported"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1, "{:?}", validation.diagnostics);
+        let field = "children";
+        let start = text.find(field).expect("recursive field") as u32;
+        assert_eq!(
+            diagnostics[0].labels[0].span.range,
+            ByteSpan::new(start, start + field.len() as u32)
+        );
+        let node = &validation.program.structs[0];
+        assert_eq!(node.layout, None);
+        assert!(node
+            .fields
+            .iter()
+            .all(|field| field.layout.is_none() && field.offset.is_none()));
+    }
+
+    #[test]
     fn reports_local_recursive_layout_components_in_source_order() {
         let text = "%%start
 struct Root {
