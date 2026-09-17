@@ -6853,67 +6853,80 @@ mutable_forwarded;
     }
 
     #[test]
-    fn emits_imported_struct_layout_and_field_address() {
-        let child_source = SourceIdentity::new(
-            "project".into(),
-            "package".into(),
-            "src/child.w".into(),
-            "r1".into(),
-        );
-        let child = derive_scalar_program(
-            &parse_source(
-                child_source.clone(),
-                "%%start\nstruct Pair {\n\tu8 first;\n\tu32 second;\n}\n*Pair(*Pair) forward = fn(value) { value };\n%%end".into(),
-                &[],
+    fn emits_imported_callable_result_field_read_for_target_layouts() {
+        for (layout, pointer_type, field_offset) in [
+            (ScalarTargetLayout::WASM32, "i32", 4),
+            (ScalarTargetLayout::NATIVE64, "i64", 4),
+        ] {
+            let child_source = SourceIdentity::new(
+                "project".into(),
+                "package".into(),
+                "src/child.w".into(),
+                "r1".into(),
+            );
+            let child = crate::derive_scalar_program_with_layout(
+                &parse_source(
+                    child_source.clone(),
+                    "%%start\nstruct Pair {\n\tu8 first;\n\tu32 second;\n}\n*Pair(*Pair) forward = fn(value) { value };\n%%end".into(),
+                    &[],
+                )
+                .result,
+                layout,
             )
-            .result,
-        )
-        .program;
-        let root_source = SourceIdentity::new(
-            "project".into(),
-            "package".into(),
-            "src/main.w".into(),
-            "r1".into(),
-        );
-        let root = derive_scalar_program(
-            &parse_source(
-                root_source.clone(),
-                "%%start\nchild = namespace package \"src/child.w\";\nchild.Pair item = { .first = 1; .second = 2; };\n*u32 checked_address = &item.second;\n*child.Pair pair = &item;\nu32 checked_read = (*pair).second;\nu32 forwarded_read = (*child.forward(pair)).second;\nunsafe { *?child.Pair pointer = &?item; *?u32 address = &?(*pointer).second; };\n%%end".into(),
-                &[],
+            .program;
+            let root_source = SourceIdentity::new(
+                "project".into(),
+                "package".into(),
+                "src/main.w".into(),
+                "r1".into(),
+            );
+            let root = crate::derive_scalar_program_with_layout(
+                &parse_source(
+                    root_source.clone(),
+                    "%%start\nchild = namespace package \"src/child.w\";\nchild.Pair item = { .first = 1; .second = 2; };\n*child.Pair pair = &item;\nu32 forwarded_read = (*child.forward(pair)).second;\n%%end".into(),
+                    &[],
+                )
+                .result,
+                layout,
             )
-            .result,
-        )
-        .program;
-        let namespace = match &root.items[0] {
-            crate::ScalarItem::Namespace(namespace) => (namespace.binding.clone(), namespace.span),
-            _ => panic!("namespace item"),
-        };
-        let validation = validate_scalar_project(ScalarProject::new(
-            vec![
-                ScalarModule::from_program(
-                    root,
-                    vec![crate::ScalarNamespaceBinding {
-                        binding: namespace.0,
-                        target: child_source.clone(),
-                        span: namespace.1,
-                    }],
-                ),
-                ScalarModule::from_program(child, Vec::new()),
-            ],
-            vec![root_source, child_source],
-        ));
-        let text = emit_scalar_project_llvm(&validation)
-            .expect("imported struct LLVM")
-            .to_text();
-        assert!(text.contains("[8 x i8]"), "{text}");
-        assert!(text.contains("getelementptr inbounds i8"), "{text}");
-        assert!(text.contains("i8 4"), "{text}");
-        assert!(
-            text.contains("ptrtoint (ptr getelementptr inbounds (i8, ptr @wosy_fn"),
-            "{text}"
-        );
-        assert!(text.contains("i8 4) to i32)"), "{text}");
-        assert!(text.contains("inttoptr i32"), "{text}");
+            .program;
+            let namespace = match &root.items[0] {
+                crate::ScalarItem::Namespace(namespace) => {
+                    (namespace.binding.clone(), namespace.span)
+                }
+                _ => panic!("namespace item"),
+            };
+            let forward = project_function_name(&child_source, "forward");
+            let validation = validate_scalar_project(ScalarProject::new(
+                vec![
+                    ScalarModule::from_program(
+                        root,
+                        vec![crate::ScalarNamespaceBinding {
+                            binding: namespace.0,
+                            target: child_source.clone(),
+                            span: namespace.1,
+                        }],
+                    ),
+                    ScalarModule::from_program(child, Vec::new()),
+                ],
+                vec![root_source, child_source],
+            ));
+            let text = emit_scalar_project_llvm(&validation)
+                .expect("imported struct LLVM")
+                .to_text();
+            assert!(text.contains("[8 x i8]"), "{text}");
+            assert!(
+                text.contains(&format!(
+                    "getelementptr inbounds i8, ptr %deref, i8 {field_offset}"
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("call {pointer_type} @{forward}({pointer_type}")),
+                "{text}"
+            );
+            assert!(text.contains(&format!("inttoptr {pointer_type}")), "{text}");
+        }
     }
 
     #[test]

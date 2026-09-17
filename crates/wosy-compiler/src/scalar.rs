@@ -13513,10 +13513,10 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         let child_source = module_source("src/child.w");
         let child = module_from_text(
             child_source.clone(),
-            "%%start\nstruct Record {\n\tu32 value;\n}\n%%end",
+            "%%start\nstruct Record {\n\tunit marker;\n\tu32 value;\n}\n%%end",
         );
         let root_source = module_source("src/main.w");
-        let root_text = "%%start\nchild = namespace app \"src/child.w\";\nchild.Record item = { .value = 1; };\n*child.Record reference = &item;\nu32 result = (*reference).missing;\n%%end";
+        let root_text = "%%start\nchild = namespace app \"src/child.w\";\nu32 value = 1;\n*?u32 raw = null;\n*unit unit = null;\nu32 invalid_value = *value;\nu32 invalid_raw = *raw;\nunit invalid_unit = *unit;\nchild.Record item = { .marker = 1; .value = 1; };\n*child.Record reference = &item;\nunit marker = (*reference).marker;\nu32 result = (*reference).missing;\n%%end";
         let root = module_from_text(root_source.clone(), root_text);
         let namespace = match &root.items[0] {
             ScalarItem::Namespace(namespace) => (namespace.binding.clone(), namespace.span),
@@ -13545,6 +13545,36 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         assert_eq!(
             diagnostic.labels[0].span.range,
             ByteSpan::new(start, start + "missing".len() as u32)
+        );
+        for (message, spelling) in [
+            ("cannot dereference value", "*value"),
+            ("checked dereference requires a checked reference", "*raw"),
+            ("cannot read unit through checked reference", "*unit"),
+        ] {
+            let start = root_text.rfind(spelling).expect("dereference") as u32;
+            let diagnostic = result
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.message == message)
+                .expect("dereference diagnostic");
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(start, start + spelling.len() as u32)
+            );
+        }
+        let marker_start = root_text.rfind("marker").expect("field") as u32;
+        let marker = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.message == "cannot read unit through checked reference"
+                    && diagnostic.labels[0].span.range
+                        == ByteSpan::new(marker_start, marker_start + "marker".len() as u32)
+            })
+            .expect("unit field diagnostic");
+        assert_eq!(
+            marker.labels[0].span.range,
+            ByteSpan::new(marker_start, marker_start + "marker".len() as u32)
         );
     }
 
