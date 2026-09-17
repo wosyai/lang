@@ -1060,22 +1060,8 @@ fn emit_place_value<'ctx, 'module>(
             .map(|(_, ty)| ty.clone())
             .or_else(|| state.globals.get(name).map(|(_, ty)| ty.clone()))
             .ok_or_else(|| format!("unknown LLVM place {name}"))?,
-        crate::ScalarPlace::Dereference {
-            pointer: expression,
-            ..
-        } => {
-            let value = take_basic(emit_expression(context, state, expression)?)?.into_int_value();
-            let pointer = state
-                .builder
-                .build_int_to_ptr(value, context.ptr_type(AddressSpace::default()), "deref")
-                .map_err(builder_error)?;
-            return Ok(EmitValue::Basic(
-                state
-                    .builder
-                    .build_load(context.i32_type(), pointer, "deref")
-                    .map_err(builder_error)?,
-            ));
-        }
+        crate::ScalarPlace::Dereference { .. } => assignment_place_type(state, place)
+            .ok_or_else(|| "unknown LLVM dereference target type".to_owned())?,
     };
     if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
         return Ok(EmitValue::Basic(pointer.into()));
@@ -2209,11 +2195,11 @@ fn assignment_place_type<'ctx, 'module>(
             }
             ScalarFieldReference::Unresolved { .. } => None,
         },
-        crate::ScalarPlace::Dereference { pointer, .. } => raw_pointer_target_type(state, pointer),
+        crate::ScalarPlace::Dereference { pointer, .. } => pointer_target_type(state, pointer),
     }
 }
 
-fn raw_pointer_target_type<'ctx, 'module>(
+fn pointer_target_type<'ctx, 'module>(
     state: &EmitState<'ctx, 'module>,
     expression: &ScalarExpression,
 ) -> Option<ScalarType> {
@@ -2224,7 +2210,9 @@ fn raw_pointer_target_type<'ctx, 'module>(
             .map(|(_, ty)| ty)
             .or_else(|| state.globals.get(name).map(|(_, ty)| ty))
             .and_then(|ty| match ty {
-                ScalarType::RawPointer(inner) => Some(*inner.clone()),
+                ScalarType::RawPointer(inner) | ScalarType::CheckedReference { inner, .. } => {
+                    Some(*inner.clone())
+                }
                 _ => None,
             }),
         ScalarExpression::RawAddress { place, .. } => assignment_place_type(state, place),
@@ -2554,6 +2542,7 @@ fn emit_expression<'ctx, 'module>(
             }
             Err(format!("unknown LLVM member {receiver}.{name}"))
         }
+        ScalarExpression::Dereference { place, .. } => emit_place_value(context, state, place),
         ScalarExpression::Integer { value, .. } => Ok(EmitValue::Basic(
             context
                 .i32_type()
@@ -2721,6 +2710,7 @@ fn emit_project_expression<'ctx, 'module>(
                     .map_err(builder_error)?,
             ))
         }
+        ScalarExpression::Dereference { place, .. } => emit_place_value(context, state, place),
         ScalarExpression::Call {
             receiver,
             name,
@@ -3153,6 +3143,7 @@ fn integer_conversion_source_type(
                 Some(_) | None => None,
             }
         }
+        ScalarExpression::Dereference { place, .. } => assignment_place_type(state, place),
         ScalarExpression::Integer { .. } => Some(ScalarType::I32),
         ScalarExpression::Unary { operand, .. } => {
             integer_conversion_source_type(state, operand, project_module).ok()
@@ -4119,6 +4110,11 @@ fn collect_selected_overloads(
                 collect_selected_overloads(element, selections);
             }
         }
+        ScalarExpression::Dereference { place, .. } => {
+            if let Some(pointer) = dereference_pointer(place) {
+                collect_selected_overloads(pointer, selections);
+            }
+        }
         ScalarExpression::RawAddress { .. }
         | ScalarExpression::CheckedAddress { .. }
         | ScalarExpression::Name { .. }
@@ -4130,6 +4126,17 @@ fn collect_selected_overloads(
         | ScalarExpression::Boolean { .. }
         | ScalarExpression::Char { .. }
         | ScalarExpression::Utf8 { .. } => {}
+    }
+}
+
+fn dereference_pointer(place: &crate::ScalarPlace) -> Option<&ScalarExpression> {
+    match place {
+        crate::ScalarPlace::Dereference { pointer, .. } => Some(pointer),
+        crate::ScalarPlace::Field { base, .. } => match base.as_ref() {
+            crate::ScalarPlace::Dereference { pointer, .. } => Some(pointer),
+            crate::ScalarPlace::Name { .. } | crate::ScalarPlace::Field { .. } => None,
+        },
+        crate::ScalarPlace::Name { .. } => None,
     }
 }
 
@@ -4233,6 +4240,11 @@ fn collect_generic_calls(
         ScalarExpression::ArrayLiteral { elements, .. } => {
             for element in elements {
                 collect_generic_calls(element, calls);
+            }
+        }
+        ScalarExpression::Dereference { place, .. } => {
+            if let Some(pointer) = dereference_pointer(place) {
+                collect_generic_calls(pointer, calls);
             }
         }
         ScalarExpression::Name { .. }
@@ -6677,6 +6689,10 @@ struct Record {
 Record item = { .bytes = null; .count = 2; };
 *u32 shared = &item.count;
 *!u32 mutable = &!item.count;
+*Record record_shared = &item;
+u32 shared_value = *shared;
+u32 mutable_value = *mutable;
+u32 field_value = (*record_shared).count;
 *u32 forwarded = transport(shared);
 *!u32 mutable_forwarded = transport_mutable(mutable);
 forwarded;
@@ -6730,6 +6746,8 @@ mutable_forwarded;
                 )),
                 "{text}"
             );
+            assert!(text.contains(&format!("inttoptr {pointer_type}")), "{text}");
+            assert!(text.contains("load i32"), "{text}");
         }
     }
 
@@ -6759,7 +6777,7 @@ mutable_forwarded;
         let root = derive_scalar_program(
             &parse_source(
                 root_source.clone(),
-                "%%start\nchild = namespace package \"src/child.w\";\nchild.Pair item = { .first = 1; .second = 2; };\n*u32 checked_address = &item.second;\nunsafe { *?child.Pair pointer = &?item; *?u32 address = &?(*pointer).second; };\n%%end".into(),
+                "%%start\nchild = namespace package \"src/child.w\";\nchild.Pair item = { .first = 1; .second = 2; };\n*u32 checked_address = &item.second;\n*child.Pair pair = &item;\nu32 checked_read = (*pair).second;\nunsafe { *?child.Pair pointer = &?item; *?u32 address = &?(*pointer).second; };\n%%end".into(),
                 &[],
             )
             .result,
@@ -6794,6 +6812,7 @@ mutable_forwarded;
             "{text}"
         );
         assert!(text.contains("i8 4) to i32)"), "{text}");
+        assert!(text.contains("inttoptr i32"), "{text}");
     }
 
     #[test]

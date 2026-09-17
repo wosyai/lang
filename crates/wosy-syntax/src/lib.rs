@@ -1510,6 +1510,26 @@ mod tests {
     }
 
     #[test]
+    fn checked_dereference_reads_are_structural_and_lossless() {
+        let text = "%%start\nstruct Record {\n\tu32 value;\n}\nu32 value = 1;\nRecord item = { .value = 2; };\n*u32 shared = &value;\n*!Record mutable = &!item;\nu32 read = *shared;\nu32 field = (*mutable).value;\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(
+            result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::Dereference)
+                .count(),
+            2
+        );
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::DereferencedField));
+    }
+
+    #[test]
     fn local_binding_assignment_and_direct_block_while_are_structural() {
         let text = "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t}\n};\n%%end";
         let result = parse(identity(), text.into(), &[]);

@@ -674,6 +674,10 @@ pub enum ScalarExpression {
         place: ScalarPlace,
         span: ByteSpan,
     },
+    Dereference {
+        place: ScalarPlace,
+        span: ByteSpan,
+    },
     StructLiteral {
         fields: Vec<ScalarStructLiteralField>,
         span: ByteSpan,
@@ -1199,7 +1203,8 @@ fn record_expression_overload_selection(
         }
         ScalarExpression::Block(block) => record_block_overload_selections(block, scope, overloads),
         ScalarExpression::RawAddress { place, .. }
-        | ScalarExpression::CheckedAddress { place, .. } => match place {
+        | ScalarExpression::CheckedAddress { place, .. }
+        | ScalarExpression::Dereference { place, .. } => match place {
             ScalarPlace::Dereference { pointer, .. } => {
                 record_expression_overload_selection(pointer, None, scope, overloads)
             }
@@ -1510,7 +1515,8 @@ fn resolve_expression_places(
 ) {
     match expression {
         ScalarExpression::RawAddress { place, .. }
-        | ScalarExpression::CheckedAddress { place, .. } => resolve_place(place, scope, program),
+        | ScalarExpression::CheckedAddress { place, .. }
+        | ScalarExpression::Dereference { place, .. } => resolve_place(place, scope, program),
         ScalarExpression::StructLiteral { fields, .. } => {
             for field in fields {
                 resolve_expression_places(&mut field.value, scope, program);
@@ -1582,7 +1588,26 @@ fn resolve_place(
         }
         ScalarPlace::Field { base, field, span } => {
             resolve_place(base, scope, program);
-            let base_type = place_type(base, scope, program, &mut Vec::new());
+            let base_type = match base.as_ref() {
+                ScalarPlace::Dereference { pointer, .. } => {
+                    match expression_type(
+                        pointer,
+                        scope,
+                        &BTreeSet::new(),
+                        &BTreeMap::new(),
+                        program,
+                        &mut Vec::new(),
+                        false,
+                    ) {
+                        ScalarType::RawPointer(inner)
+                        | ScalarType::CheckedReference { inner, .. } => *inner,
+                        _ => ScalarType::Error,
+                    }
+                }
+                ScalarPlace::Name { .. } | ScalarPlace::Field { .. } => {
+                    place_type(base, scope, program, &mut Vec::new())
+                }
+            };
             let structure = match base_type {
                 ScalarType::Struct(id) => program.structs.get(id.index),
                 ScalarType::RawPointer(inner) => match inner.as_ref() {
@@ -2722,7 +2747,8 @@ fn resolve_expression_module_places(
 ) {
     match expression {
         ScalarExpression::RawAddress { place, .. }
-        | ScalarExpression::CheckedAddress { place, .. } => {
+        | ScalarExpression::CheckedAddress { place, .. }
+        | ScalarExpression::Dereference { place, .. } => {
             resolve_module_place(place, scope, module, modules)
         }
         ScalarExpression::StructLiteral { fields, .. } => {
@@ -2797,7 +2823,26 @@ fn resolve_module_place(
         }
         ScalarPlace::Field { base, field, .. } => {
             resolve_module_place(base, scope, module, modules);
-            let base_type = place_type_in_module(base, scope, module, modules, &mut Vec::new());
+            let base_type = match base.as_ref() {
+                ScalarPlace::Dereference { pointer, .. } => match expression_type_in_module(
+                    pointer,
+                    scope,
+                    &BTreeSet::new(),
+                    &BTreeMap::new(),
+                    module,
+                    modules,
+                    &mut Vec::new(),
+                    false,
+                ) {
+                    ScalarType::RawPointer(inner) | ScalarType::CheckedReference { inner, .. } => {
+                        *inner
+                    }
+                    _ => ScalarType::Error,
+                },
+                ScalarPlace::Name { .. } | ScalarPlace::Field { .. } => {
+                    place_type_in_module(base, scope, module, modules, &mut Vec::new())
+                }
+            };
             let structure = match base_type {
                 ScalarType::Struct(id) => modules
                     .iter()
@@ -3195,6 +3240,7 @@ fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::Utf8 { span, .. }
         | ScalarExpression::RawAddress { span, .. }
         | ScalarExpression::CheckedAddress { span, .. }
+        | ScalarExpression::Dereference { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::ArrayLiteral { span, .. }
         | ScalarExpression::Binary { span, .. }
@@ -4123,6 +4169,9 @@ fn expression_type_in_module(
             modules,
             diagnostics,
         ),
+        ScalarExpression::Dereference { place, span } => {
+            checked_dereference_type_in_module(place, *span, scope, module, modules, diagnostics)
+        }
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {
             diagnostics.push(module_diagnostic(
@@ -5670,6 +5719,256 @@ fn place_type_in_module(
             }
         }
     }
+}
+
+fn checked_dereference_target_type(
+    pointer: &ScalarExpression,
+    span: ByteSpan,
+    allow_aggregate: bool,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    match expression_type(
+        pointer,
+        scope,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        program,
+        diagnostics,
+        false,
+    ) {
+        ScalarType::CheckedReference { inner, .. } => match inner.as_ref() {
+            ScalarType::Unit => {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "cannot read unit through checked reference",
+                    span,
+                ));
+                ScalarType::Error
+            }
+            ScalarType::Struct(_) | ScalarType::Array { .. } if !allow_aggregate => {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "whole aggregate checked dereference read is not supported",
+                    span,
+                ));
+                ScalarType::Error
+            }
+            _ => *inner,
+        },
+        ScalarType::RawPointer(_) => {
+            diagnostics.push(diagnostic(
+                program,
+                "B0003",
+                "checked dereference requires a checked reference",
+                span,
+            ));
+            ScalarType::Error
+        }
+        _ => {
+            diagnostics.push(diagnostic(
+                program,
+                "B0003",
+                "cannot dereference value",
+                span,
+            ));
+            ScalarType::Error
+        }
+    }
+}
+
+fn checked_dereference_type(
+    place: &ScalarPlace,
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    match place {
+        ScalarPlace::Dereference { pointer, span } => {
+            checked_dereference_target_type(pointer, *span, false, scope, program, diagnostics)
+        }
+        ScalarPlace::Field {
+            base,
+            field,
+            span: field_span,
+        } => {
+            let ScalarPlace::Dereference { pointer, span } = base.as_ref() else {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "checked dereference requires a direct struct field",
+                    span,
+                ));
+                return ScalarType::Error;
+            };
+            let base_type =
+                checked_dereference_target_type(pointer, *span, true, scope, program, diagnostics);
+            let ScalarFieldReference::Resolved(field) = field else {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "value has no field",
+                    *field_span,
+                ));
+                return ScalarType::Error;
+            };
+            let ScalarType::Struct(structure) = base_type else {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "value has no field",
+                    *field_span,
+                ));
+                return ScalarType::Error;
+            };
+            program
+                .structs
+                .iter()
+                .find(|candidate| candidate.id == structure)
+                .and_then(|candidate| candidate.fields.get(field.index))
+                .filter(|candidate| candidate.id == *field)
+                .map_or_else(
+                    || {
+                        diagnostics.push(diagnostic(
+                            program,
+                            "B0003",
+                            "value has no field",
+                            *field_span,
+                        ));
+                        ScalarType::Error
+                    },
+                    |candidate| candidate.ty.clone(),
+                )
+        }
+        ScalarPlace::Name { .. } => {
+            diagnostics.push(diagnostic(
+                program,
+                "B0003",
+                "checked dereference requires a dereference place",
+                span,
+            ));
+            ScalarType::Error
+        }
+    }
+}
+
+fn checked_dereference_type_in_module(
+    place: &ScalarPlace,
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    let (pointer, dereference_span, field) = match place {
+        ScalarPlace::Dereference { pointer, span } => (pointer, *span, None),
+        ScalarPlace::Field { base, field, .. } => {
+            let ScalarPlace::Dereference { pointer, span } = base.as_ref() else {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "checked dereference requires a direct struct field",
+                    span,
+                ));
+                return ScalarType::Error;
+            };
+            (pointer, *span, Some(field))
+        }
+        ScalarPlace::Name { .. } => {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "checked dereference requires a dereference place",
+                span,
+            ));
+            return ScalarType::Error;
+        }
+    };
+    let allow_aggregate = field.is_some();
+    let inner = match expression_type_in_module(
+        pointer,
+        scope,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        module,
+        modules,
+        diagnostics,
+        false,
+    ) {
+        ScalarType::CheckedReference { inner, .. } => match inner.as_ref() {
+            ScalarType::Unit => {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "cannot read unit through checked reference",
+                    dereference_span,
+                ));
+                return ScalarType::Error;
+            }
+            ScalarType::Struct(_) | ScalarType::Array { .. } if !allow_aggregate => {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "whole aggregate checked dereference read is not supported",
+                    dereference_span,
+                ));
+                return ScalarType::Error;
+            }
+            _ => *inner,
+        },
+        ScalarType::RawPointer(_) => {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "checked dereference requires a checked reference",
+                dereference_span,
+            ));
+            return ScalarType::Error;
+        }
+        _ => {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "cannot dereference value",
+                dereference_span,
+            ));
+            return ScalarType::Error;
+        }
+    };
+    let Some(ScalarFieldReference::Resolved(field)) = field else {
+        return inner;
+    };
+    let ScalarType::Struct(structure) = inner else {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "value has no field",
+            span,
+        ));
+        return ScalarType::Error;
+    };
+    modules
+        .iter()
+        .flat_map(|candidate| candidate.structs.iter())
+        .find(|candidate| candidate.id == structure)
+        .and_then(|candidate| candidate.fields.get(field.index))
+        .filter(|candidate| candidate.id == *field)
+        .map_or_else(
+            || {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "value has no field",
+                    span,
+                ));
+                ScalarType::Error
+            },
+            |candidate| candidate.ty.clone(),
+        )
 }
 
 fn expect_module_type(
@@ -7323,28 +7622,23 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 span: wosy_syntax::byte_span(&actual),
             }
         }
-        SyntaxKind::DereferencedField => {
-            let name = direct_token(&actual, SyntaxKind::Identifier).expect("field name");
-            let receiver = direct_nodes(&actual)
-                .into_iter()
-                .find(|child| child.kind() == SyntaxKind::Parenthesized)
-                .map(|child| derive_expression(&child))
-                .unwrap_or_else(|| ScalarExpression::Name {
-                    name: String::new(),
+        SyntaxKind::FieldAccess => {
+            if let Some(field) = actual
+                .descendants()
+                .find(|child| child.kind() == SyntaxKind::DereferencedField)
+            {
+                ScalarExpression::Dereference {
+                    place: derive_place(&field),
                     span: wosy_syntax::byte_span(&actual),
-                });
-            let receiver_name = match &receiver {
-                ScalarExpression::Name { name, .. } => name.clone(),
-                _ => String::new(),
-            };
-            ScalarExpression::Member {
-                receiver: receiver_name,
-                name: name.text().to_owned(),
-                receiver_span: span_of(&receiver),
-                name_span: token_span(&name),
-                span: wosy_syntax::byte_span(&actual),
+                }
+            } else {
+                derive_element(&semantic_children(&actual)[0])
             }
         }
+        SyntaxKind::Dereference | SyntaxKind::DereferencedField => ScalarExpression::Dereference {
+            place: derive_place(&actual),
+            span: wosy_syntax::byte_span(&actual),
+        },
         SyntaxKind::CheckedAddress => {
             let target = direct_nodes(&actual)
                 .into_iter()
@@ -7447,11 +7741,12 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                 .into_iter()
                 .find(|child| child.kind() == SyntaxKind::Parenthesized)
                 .expect("dereference receiver");
+            let dereference = parent
+                .descendants()
+                .find(|child| child.kind() == SyntaxKind::Dereference)
+                .expect("dereference expression");
             ScalarPlace::Field {
-                base: Box::new(ScalarPlace::Dereference {
-                    pointer: Box::new(derive_expression(&direct_nodes(&parent)[0])),
-                    span: wosy_syntax::byte_span(&parent),
-                }),
+                base: Box::new(derive_place(&dereference)),
                 field: ScalarFieldReference::Unresolved {
                     name: field.text().to_owned(),
                     span: token_span(&field),
@@ -7459,6 +7754,15 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                 span: wosy_syntax::byte_span(node),
             }
         }
+        SyntaxKind::Dereference => ScalarPlace::Dereference {
+            pointer: Box::new(derive_expression(
+                &direct_nodes(node)
+                    .into_iter()
+                    .next()
+                    .expect("dereference pointer"),
+            )),
+            span: wosy_syntax::byte_span(node),
+        },
         _ => panic!("place grammar"),
     }
 }
@@ -7622,6 +7926,7 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::UnitIf { span, .. } => *span,
         ScalarExpression::RawAddress { span, .. }
         | ScalarExpression::CheckedAddress { span, .. }
+        | ScalarExpression::Dereference { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::ArrayLiteral { span, .. } => *span,
         ScalarExpression::Block(block) => block.span,
@@ -7747,7 +8052,8 @@ fn validate_unit_if_position(
             }
         }
         ScalarExpression::RawAddress { place, .. }
-        | ScalarExpression::CheckedAddress { place, .. } => {
+        | ScalarExpression::CheckedAddress { place, .. }
+        | ScalarExpression::Dereference { place, .. } => {
             validate_unit_if_position_in_place(place, source, diagnostics)
         }
         ScalarExpression::StructLiteral { fields, .. } => {
@@ -8283,7 +8589,8 @@ impl StaticUseAnalyzer {
             }
             ScalarExpression::Block(block) => self.block(block, visible),
             ScalarExpression::RawAddress { place, .. }
-            | ScalarExpression::CheckedAddress { place, .. } => self.place(place, visible),
+            | ScalarExpression::CheckedAddress { place, .. }
+            | ScalarExpression::Dereference { place, .. } => self.place(place, visible),
             ScalarExpression::StructLiteral { fields, .. } => {
                 for field in fields {
                     self.expression(&field.value, visible);
@@ -8801,6 +9108,9 @@ fn expression_type(
             place,
             span,
         } => checked_address_type(*mutability, place, *span, scope, program, diagnostics),
+        ScalarExpression::Dereference { place, span } => {
+            checked_dereference_type(place, *span, scope, program, diagnostics)
+        }
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {
             diagnostics.push(diagnostic(
@@ -13078,6 +13388,56 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
     }
 
     #[test]
+    fn derives_checked_reference_dereference_reads_and_rejects_deferred_targets() {
+        let result = validate_text(
+            "%%start\nstruct Record {\n\tu8 first;\n\tu32 second;\n}\nu32 value = 7;\nRecord item = { .first = 1; .second = 2; };\n*u32 shared = &value;\n*!u32 mutable = &!value;\n*Record record_shared = &item;\nu32 shared_value = *shared;\nu32 mutable_value = *mutable;\nu32 field_value = (*record_shared).second;\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        for index in [5, 6, 7] {
+            let ScalarItem::Binding(binding) = &result.program.items[index] else {
+                panic!("checked dereference binding")
+            };
+            assert!(matches!(
+                binding.value,
+                ScalarExpression::Dereference { .. }
+            ));
+        }
+
+        let invalid = validate_text(
+            "%%start\nu32 value = 7;\n*?u32 raw = null;\n*unit unit = null;\nu32 non_reference = *value;\nu32 raw_read = *raw;\nunit unit_read = *unit;\n%%end",
+        );
+        for message in [
+            "cannot dereference value",
+            "checked dereference requires a checked reference",
+            "cannot read unit through checked reference",
+        ] {
+            assert!(
+                invalid
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message == message),
+                "{:?}",
+                invalid.diagnostics
+            );
+        }
+
+        let aggregate = validate_text(
+            "%%start\nstruct Record {\n\tu32 value;\n}\nRecord record = { .value = 7; };\n*Record reference = &record;\nRecord read = *reference;\n%%end",
+        );
+        assert!(aggregate.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "whole aggregate checked dereference read is not supported"
+        }));
+
+        let null_reference =
+            validate_text("%%start\n*u32 reference = null;\nu32 value = *reference;\n%%end");
+        assert!(
+            null_reference.diagnostics.is_empty(),
+            "{:?}",
+            null_reference.diagnostics
+        );
+    }
+
+    #[test]
     fn rejects_checked_reference_mutability_mismatches_and_unsupported_addresses() {
         let mismatch = validate_text(
             "%%start\nu8 value = 1;\n*!u8 shared = &value;\n*u8 mutable = &!value;\n%%end",
@@ -13277,7 +13637,7 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         let main_source = module_source("src/main.w");
         let main_program = module_from_text(
             main_source.clone(),
-            "%%start\nchild = namespace app \"src/child.w\";\nchild.Pair item = { .first = 1; .second = 2; };\n*u32 address = &item.second;\n%%end",
+            "%%start\nchild = namespace app \"src/child.w\";\nchild.Pair item = { .first = 1; .second = 2; };\n*u32 address = &item.second;\n*child.Pair pair = &item;\nu32 read = (*pair).second;\n%%end",
         );
         let namespace_span = match &main_program.items[0] {
             ScalarItem::Namespace(namespace) => namespace.span,
