@@ -5808,12 +5808,10 @@ fn checked_dereference_type(
             let base_type =
                 checked_dereference_target_type(pointer, *span, true, scope, program, diagnostics);
             let ScalarFieldReference::Resolved(field) = field else {
-                diagnostics.push(diagnostic(
-                    program,
-                    "B0003",
-                    "value has no field",
-                    *field_span,
-                ));
+                let ScalarFieldReference::Unresolved { span, .. } = field else {
+                    unreachable!("field reference")
+                };
+                diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
                 return ScalarType::Error;
             };
             let ScalarType::Struct(structure) = base_type else {
@@ -5825,24 +5823,35 @@ fn checked_dereference_type(
                 ));
                 return ScalarType::Error;
             };
-            program
+            let candidate = program
                 .structs
                 .iter()
                 .find(|candidate| candidate.id == structure)
                 .and_then(|candidate| candidate.fields.get(field.index))
                 .filter(|candidate| candidate.id == *field)
-                .map_or_else(
-                    || {
-                        diagnostics.push(diagnostic(
-                            program,
-                            "B0003",
-                            "value has no field",
-                            *field_span,
-                        ));
-                        ScalarType::Error
-                    },
-                    |candidate| candidate.ty.clone(),
-                )
+                .cloned();
+            let Some(candidate) = candidate else {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "value has no field",
+                    *field_span,
+                ));
+                return ScalarType::Error;
+            };
+            if candidate.ty == ScalarType::Unit {
+                let field_name_span =
+                    ByteSpan::new(field_span.end - candidate.name.len() as u32, field_span.end);
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "cannot read unit through checked reference",
+                    field_name_span,
+                ));
+                ScalarType::Error
+            } else {
+                candidate.ty
+            }
         }
         ScalarPlace::Name { .. } => {
             diagnostics.push(diagnostic(
@@ -5866,17 +5875,25 @@ fn checked_dereference_type_in_module(
 ) -> ScalarType {
     let (pointer, dereference_span, field) = match place {
         ScalarPlace::Dereference { pointer, span } => (pointer, *span, None),
-        ScalarPlace::Field { base, field, .. } => {
-            let ScalarPlace::Dereference { pointer, span } = base.as_ref() else {
+        ScalarPlace::Field {
+            base,
+            field,
+            span: field_span,
+        } => {
+            let ScalarPlace::Dereference {
+                pointer,
+                span: dereference_span,
+            } = base.as_ref()
+            else {
                 diagnostics.push(module_diagnostic(
                     module,
                     "B0003",
                     "checked dereference requires a direct struct field",
-                    span,
+                    *field_span,
                 ));
                 return ScalarType::Error;
             };
-            (pointer, *span, Some(field))
+            (pointer, *dereference_span, Some((field, *field_span)))
         }
         ScalarPlace::Name { .. } => {
             diagnostics.push(module_diagnostic(
@@ -5939,36 +5956,57 @@ fn checked_dereference_type_in_module(
             return ScalarType::Error;
         }
     };
-    let Some(ScalarFieldReference::Resolved(field)) = field else {
-        return inner;
+    let (field, field_span) = match field {
+        None => return inner,
+        Some((ScalarFieldReference::Resolved(field), field_span)) => (field, field_span),
+        Some((ScalarFieldReference::Unresolved { span, .. }, _)) => {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "value has no field",
+                *span,
+            ));
+            return ScalarType::Error;
+        }
     };
     let ScalarType::Struct(structure) = inner else {
         diagnostics.push(module_diagnostic(
             module,
             "B0003",
             "value has no field",
-            span,
+            field_span,
         ));
         return ScalarType::Error;
     };
-    modules
+    let candidate = modules
         .iter()
         .flat_map(|candidate| candidate.structs.iter())
         .find(|candidate| candidate.id == structure)
         .and_then(|candidate| candidate.fields.get(field.index))
         .filter(|candidate| candidate.id == *field)
-        .map_or_else(
-            || {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0003",
-                    "value has no field",
-                    span,
-                ));
-                ScalarType::Error
-            },
-            |candidate| candidate.ty.clone(),
-        )
+        .cloned();
+    let Some(candidate) = candidate else {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "value has no field",
+            field_span,
+        ));
+        return ScalarType::Error;
+    };
+    if candidate.ty == ScalarType::Unit {
+        let field_name_span =
+            ByteSpan::new(field_span.end - candidate.name.len() as u32, field_span.end);
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "cannot read unit through checked reference",
+            field_name_span,
+        ));
+        ScalarType::Error
+    } else {
+        candidate.ty
+    }
 }
 
 fn expect_module_type(
@@ -13403,9 +13441,8 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             ));
         }
 
-        let invalid = validate_text(
-            "%%start\nu32 value = 7;\n*?u32 raw = null;\n*unit unit = null;\nu32 non_reference = *value;\nu32 raw_read = *raw;\nunit unit_read = *unit;\n%%end",
-        );
+        let invalid_text = "%%start\nu32 value = 7;\n*?u32 raw = null;\n*unit unit = null;\nu32 non_reference = *value;\nu32 raw_read = *raw;\nunit unit_read = *unit;\n%%end";
+        let invalid = validate_text(invalid_text);
         for message in [
             "cannot dereference value",
             "checked dereference requires a checked reference",
@@ -13418,6 +13455,40 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
                     .any(|diagnostic| diagnostic.message == message),
                 "{:?}",
                 invalid.diagnostics
+            );
+        }
+        for (message, spelling) in [
+            ("cannot dereference value", "*value"),
+            ("checked dereference requires a checked reference", "*raw"),
+            ("cannot read unit through checked reference", "*unit"),
+        ] {
+            let start = invalid_text.rfind(spelling).expect("dereference") as u32;
+            let diagnostic = invalid
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.message == message)
+                .expect("dereference diagnostic");
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(start, start + spelling.len() as u32)
+            );
+        }
+
+        let invalid_field_text = "%%start\nstruct Record {\n\tunit marker;\n\tu32 value;\n}\nRecord item = { .marker = 1; .value = 2; };\n*Record reference = &item;\nunit marker = (*reference).marker;\nu32 missing = (*reference).missing;\n%%end";
+        let invalid_field = validate_text(invalid_field_text);
+        for (message, field) in [
+            ("cannot read unit through checked reference", "marker"),
+            ("value has no field", "missing"),
+        ] {
+            let start = invalid_field_text.rfind(field).expect("field") as u32;
+            let diagnostic = invalid_field
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.message == message)
+                .expect("field diagnostic");
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(start, start + field.len() as u32)
             );
         }
 
@@ -13434,6 +13505,46 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             null_reference.diagnostics.is_empty(),
             "{:?}",
             null_reference.diagnostics
+        );
+    }
+
+    #[test]
+    fn reports_project_dereference_field_errors_at_the_field_token() {
+        let child_source = module_source("src/child.w");
+        let child = module_from_text(
+            child_source.clone(),
+            "%%start\nstruct Record {\n\tu32 value;\n}\n%%end",
+        );
+        let root_source = module_source("src/main.w");
+        let root_text = "%%start\nchild = namespace app \"src/child.w\";\nchild.Record item = { .value = 1; };\n*child.Record reference = &item;\nu32 result = (*reference).missing;\n%%end";
+        let root = module_from_text(root_source.clone(), root_text);
+        let namespace = match &root.items[0] {
+            ScalarItem::Namespace(namespace) => (namespace.binding.clone(), namespace.span),
+            _ => panic!("namespace"),
+        };
+        let result = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    root,
+                    vec![ScalarNamespaceBinding {
+                        binding: namespace.0,
+                        target: child_source.clone(),
+                        span: namespace.1,
+                    }],
+                ),
+                ScalarModule::from_program(child, Vec::new()),
+            ],
+            vec![root_source, child_source],
+        ));
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message == "value has no field")
+            .expect("field diagnostic");
+        let start = root_text.rfind("missing").expect("field") as u32;
+        assert_eq!(
+            diagnostic.labels[0].span.range,
+            ByteSpan::new(start, start + "missing".len() as u32)
         );
     }
 

@@ -89,6 +89,12 @@ struct EmitState<'ctx, 'module> {
     next_block: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ProjectCallScope<'a> {
+    module: &'a ScalarModule,
+    modules: &'a [&'a ScalarModule],
+}
+
 struct LlvmExternIdentity {
     internal_name: String,
     import_module: String,
@@ -985,6 +991,7 @@ fn place_pointer<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     place: &crate::ScalarPlace,
+    project: Option<ProjectCallScope<'_>>,
 ) -> Result<PointerValue<'ctx>, String> {
     match place {
         crate::ScalarPlace::Name { name, .. } => {
@@ -998,14 +1005,30 @@ fn place_pointer<'ctx, 'module>(
                 .ok_or_else(|| format!("unknown LLVM place {name}"))
         }
         crate::ScalarPlace::Dereference { pointer, .. } => {
-            let pointer = take_basic(emit_expression(context, state, pointer)?)?.into_int_value();
+            let pointer_value = take_basic(match project {
+                Some(project) => emit_project_expression(
+                    context,
+                    state,
+                    pointer,
+                    project.module,
+                    project.modules,
+                )?,
+                None => emit_expression(context, state, pointer)?,
+            })?
+            .into_int_value();
+            pointer_target_type(state, pointer, project)
+                .ok_or_else(|| "unknown LLVM dereference target type".to_owned())?;
             state
                 .builder
-                .build_int_to_ptr(pointer, context.ptr_type(AddressSpace::default()), "deref")
+                .build_int_to_ptr(
+                    pointer_value,
+                    context.ptr_type(AddressSpace::default()),
+                    "deref",
+                )
                 .map_err(builder_error)
         }
         crate::ScalarPlace::Field { base, field, .. } => {
-            let base = place_pointer(context, state, base)?;
+            let base = place_pointer(context, state, base, project)?;
             let ScalarFieldReference::Resolved(field) = field else {
                 return Err("unresolved LLVM struct field".to_owned());
             };
@@ -1040,7 +1063,16 @@ fn emit_place_value<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     place: &crate::ScalarPlace,
 ) -> Result<EmitValue<'ctx>, String> {
-    let pointer = place_pointer(context, state, place)?;
+    emit_place_value_in_project(context, state, place, None)
+}
+
+fn emit_place_value_in_project<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    place: &crate::ScalarPlace,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<EmitValue<'ctx>, String> {
+    let pointer = place_pointer(context, state, place, project)?;
     let ty = match place {
         crate::ScalarPlace::Field { field, .. } => {
             let ScalarFieldReference::Resolved(field) = field else {
@@ -1060,8 +1092,10 @@ fn emit_place_value<'ctx, 'module>(
             .map(|(_, ty)| ty.clone())
             .or_else(|| state.globals.get(name).map(|(_, ty)| ty.clone()))
             .ok_or_else(|| format!("unknown LLVM place {name}"))?,
-        crate::ScalarPlace::Dereference { .. } => assignment_place_type(state, place)
-            .ok_or_else(|| "unknown LLVM dereference target type".to_owned())?,
+        crate::ScalarPlace::Dereference { pointer, .. } => {
+            pointer_target_type(state, pointer, project)
+                .ok_or_else(|| "unknown LLVM dereference target type".to_owned())?
+        }
     };
     if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
         return Ok(EmitValue::Basic(pointer.into()));
@@ -2088,7 +2122,7 @@ fn emit_assignment<'ctx, 'module>(
                     }
                 }
             }
-            place => place_pointer(context, state, place)?,
+            place => place_pointer(context, state, place, None)?,
         };
         store_value(context, state, destination, &ty, value)?;
     }
@@ -2159,7 +2193,7 @@ fn emit_project_assignment<'ctx, 'module>(
                         }
                     }
                 }
-                place => place_pointer(context, state, place)?,
+                place => place_pointer(context, state, place, None)?,
             }
         };
         store_value(context, state, destination, &ty, value)?;
@@ -2195,13 +2229,16 @@ fn assignment_place_type<'ctx, 'module>(
             }
             ScalarFieldReference::Unresolved { .. } => None,
         },
-        crate::ScalarPlace::Dereference { pointer, .. } => pointer_target_type(state, pointer),
+        crate::ScalarPlace::Dereference { pointer, .. } => {
+            pointer_target_type(state, pointer, None)
+        }
     }
 }
 
 fn pointer_target_type<'ctx, 'module>(
     state: &EmitState<'ctx, 'module>,
     expression: &ScalarExpression,
+    project: Option<ProjectCallScope<'_>>,
 ) -> Option<ScalarType> {
     match expression {
         ScalarExpression::Name { name, .. } => state
@@ -2216,6 +2253,63 @@ fn pointer_target_type<'ctx, 'module>(
                 _ => None,
             }),
         ScalarExpression::RawAddress { place, .. } => assignment_place_type(state, place),
+        ScalarExpression::Call {
+            receiver,
+            name,
+            type_arguments,
+            overload_selection,
+            ..
+        } => {
+            let qualified = project.map_or_else(
+                || {
+                    receiver
+                        .as_ref()
+                        .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"))
+                },
+                |project| {
+                    let target = receiver
+                        .as_ref()
+                        .and_then(|binding| {
+                            project
+                                .module
+                                .namespace_bindings
+                                .iter()
+                                .find(|namespace| namespace.binding == *binding)
+                                .and_then(|namespace| {
+                                    project
+                                        .modules
+                                        .iter()
+                                        .find(|candidate| candidate.source == namespace.target)
+                                        .copied()
+                                })
+                        })
+                        .unwrap_or(project.module);
+                    project_function_name(&target.source, name)
+                },
+            );
+            let lookup = overload_selection
+                .as_ref()
+                .map(|selection| selected_overload_lookup_key(&qualified, selection));
+            state
+                .call_targets
+                .get(lookup.as_ref().unwrap_or(&qualified))
+                .or_else(|| {
+                    state
+                        .call_targets
+                        .get(&specialization_lookup_key(&qualified, type_arguments))
+                })
+                .or_else(|| state.call_targets.get(&qualified))
+                .and_then(|target| state.signatures.get(target))
+                .and_then(|signature| match signature {
+                    ScalarType::Callable { outputs, .. } => outputs.outputs.first(),
+                    _ => None,
+                })
+                .and_then(|output| match &output.ty {
+                    ScalarType::CheckedReference { inner, .. } => Some(*inner.clone()),
+                    ScalarType::RawPointer(_) => None,
+                    _ => None,
+                })
+        }
         _ => None,
     }
 }
@@ -2627,7 +2721,7 @@ fn emit_expression<'ctx, 'module>(
             state
                 .builder
                 .build_ptr_to_int(
-                    place_pointer(context, state, place)?,
+                    place_pointer(context, state, place, None)?,
                     pointer_integer_type(context, state.target_layout),
                     "address",
                 )
@@ -2710,7 +2804,12 @@ fn emit_project_expression<'ctx, 'module>(
                     .map_err(builder_error)?,
             ))
         }
-        ScalarExpression::Dereference { place, .. } => emit_place_value(context, state, place),
+        ScalarExpression::Dereference { place, .. } => emit_place_value_in_project(
+            context,
+            state,
+            place,
+            Some(ProjectCallScope { module, modules }),
+        ),
         ScalarExpression::Call {
             receiver,
             name,
@@ -2928,7 +3027,7 @@ fn emit_project_expression<'ctx, 'module>(
             state
                 .builder
                 .build_ptr_to_int(
-                    place_pointer(context, state, place)?,
+                    place_pointer(context, state, place, None)?,
                     pointer_integer_type(context, state.target_layout),
                     "address",
                 )
@@ -6695,6 +6794,8 @@ u32 mutable_value = *mutable;
 u32 field_value = (*record_shared).count;
 *u32 forwarded = transport(shared);
 *!u32 mutable_forwarded = transport_mutable(mutable);
+u32 forwarded_value = *transport(shared);
+u32 mutable_forwarded_value = *transport_mutable(mutable);
 forwarded;
 mutable_forwarded;
 %%end"
@@ -6762,7 +6863,7 @@ mutable_forwarded;
         let child = derive_scalar_program(
             &parse_source(
                 child_source.clone(),
-                "%%start\nstruct Pair {\n\tu8 first;\n\tu32 second;\n}\n%%end".into(),
+                "%%start\nstruct Pair {\n\tu8 first;\n\tu32 second;\n}\n*Pair(*Pair) forward = fn(value) { value };\n%%end".into(),
                 &[],
             )
             .result,
@@ -6777,7 +6878,7 @@ mutable_forwarded;
         let root = derive_scalar_program(
             &parse_source(
                 root_source.clone(),
-                "%%start\nchild = namespace package \"src/child.w\";\nchild.Pair item = { .first = 1; .second = 2; };\n*u32 checked_address = &item.second;\n*child.Pair pair = &item;\nu32 checked_read = (*pair).second;\nunsafe { *?child.Pair pointer = &?item; *?u32 address = &?(*pointer).second; };\n%%end".into(),
+                "%%start\nchild = namespace package \"src/child.w\";\nchild.Pair item = { .first = 1; .second = 2; };\n*u32 checked_address = &item.second;\n*child.Pair pair = &item;\nu32 checked_read = (*pair).second;\nu32 forwarded_read = (*child.forward(pair)).second;\nunsafe { *?child.Pair pointer = &?item; *?u32 address = &?(*pointer).second; };\n%%end".into(),
                 &[],
             )
             .result,
