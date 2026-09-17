@@ -4528,6 +4528,18 @@ mod tests {
     }
 
     #[test]
+    fn accepts_fixed_array_lengths_at_llvm_array_size_limit() {
+        let context = Context::create();
+        let array = ScalarType::Array {
+            element: Box::new(ScalarType::U8),
+            length: u64::from(u32::MAX),
+            length_span: ByteSpan::new(0, 1),
+            span: ByteSpan::new(0, 1),
+        };
+        assert!(storage_type(&context, &array, &[], ScalarTargetLayout::NATIVE64).is_ok());
+    }
+
+    #[test]
     fn serializes_each_extern_with_its_wasm_import_attribute_group() {
         let partition = LlvmPartition {
             module_name: "test".into(),

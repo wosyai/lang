@@ -1251,16 +1251,7 @@ fn resolve_program_types(program: &mut ScalarProgram, diagnostics: &mut Vec<supe
         }
         compute_initial_struct_layout(structure, program.target_layout);
     }
-    let structs = program.structs.clone();
-    for structure in &mut program.structs {
-        recompute_struct_layout(
-            structure,
-            &structs,
-            program.target_layout,
-            &source,
-            diagnostics,
-        );
-    }
+    resolve_program_struct_layouts(program, &source, diagnostics);
     for item in &mut program.items {
         match item {
             ScalarItem::Binding(binding) => {
@@ -1582,18 +1573,8 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
     for module in &mut project.modules {
         resolve_module_types_in_project(module, &struct_lookup);
     }
+    resolve_project_struct_layouts(&mut project, &mut diagnostics);
     let struct_lookup = project.modules.clone();
-    for module in &mut project.modules {
-        for structure in &mut module.structs {
-            recompute_struct_layout_project(
-                structure,
-                &struct_lookup,
-                module.target_layout,
-                &module.source,
-                &mut diagnostics,
-            );
-        }
-    }
     for module in &mut project.modules {
         resolve_module_places(module, &struct_lookup);
     }
@@ -2194,6 +2175,250 @@ fn resolve_type_in_project(
         },
         value => value.clone(),
     }
+}
+
+fn resolve_program_struct_layouts(
+    program: &mut ScalarProgram,
+    source: &SourceIdentity,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    let (cycles, order) = aggregate_layout_order(&program.structs);
+    for cycle in cycles {
+        let (structure_index, field_index) = cycle_participant(&program.structs, &cycle);
+        let field = &program.structs[structure_index].fields[field_index];
+        recursive_layout_diagnostic(source, field.name_span, diagnostics);
+        for index in cycle {
+            clear_struct_layout(&mut program.structs[index]);
+        }
+    }
+    for index in order {
+        let structs = program.structs.clone();
+        recompute_struct_layout(
+            &mut program.structs[index],
+            &structs,
+            program.target_layout,
+            source,
+            diagnostics,
+        );
+    }
+}
+
+fn resolve_project_struct_layouts(
+    project: &mut ScalarProject,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    let locations = project
+        .modules
+        .iter()
+        .enumerate()
+        .flat_map(|(module_index, module)| {
+            module
+                .structs
+                .iter()
+                .enumerate()
+                .map(move |(structure_index, structure)| {
+                    (module_index, structure_index, structure.clone())
+                })
+        })
+        .collect::<Vec<_>>();
+    let structures = locations
+        .iter()
+        .map(|(_, _, structure)| structure.clone())
+        .collect::<Vec<_>>();
+    let (cycles, order) = aggregate_layout_order(&structures);
+    for cycle in cycles {
+        let (participant, field_index) = cycle_participant(&structures, &cycle);
+        let (module_index, structure_index, _) = locations[participant];
+        let field = &project.modules[module_index].structs[structure_index].fields[field_index];
+        let source = project.modules[module_index].source.clone();
+        recursive_layout_diagnostic(&source, field.name_span, diagnostics);
+        for index in cycle {
+            let (module_index, structure_index, _) = locations[index];
+            clear_struct_layout(&mut project.modules[module_index].structs[structure_index]);
+        }
+    }
+    for index in order {
+        let (module_index, structure_index, _) = locations[index];
+        let modules = project.modules.clone();
+        let target_layout = project.modules[module_index].target_layout;
+        let source = project.modules[module_index].source.clone();
+        recompute_struct_layout_project(
+            &mut project.modules[module_index].structs[structure_index],
+            &modules,
+            target_layout,
+            &source,
+            diagnostics,
+        );
+    }
+}
+
+fn aggregate_layout_order(structures: &[ScalarStruct]) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let indices = structures
+        .iter()
+        .enumerate()
+        .map(|(index, structure)| (structure.id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let dependencies = structures
+        .iter()
+        .map(|structure| {
+            let mut ids = Vec::new();
+            for field in &structure.fields {
+                by_value_struct_dependencies(&field.ty, &mut ids);
+            }
+            ids.into_iter()
+                .filter_map(|id| indices.get(&id).copied())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let components = aggregate_layout_components(&dependencies);
+    let mut cyclic = vec![false; structures.len()];
+    let mut cycles = Vec::new();
+    for component in components {
+        let self_edge = component.len() == 1 && dependencies[component[0]].contains(&component[0]);
+        if component.len() > 1 || self_edge {
+            for &index in &component {
+                cyclic[index] = true;
+            }
+            cycles.push(component);
+        }
+    }
+    let mut visited = vec![false; structures.len()];
+    let mut order = Vec::new();
+    for index in 0..structures.len() {
+        aggregate_layout_visit(index, &dependencies, &cyclic, &mut visited, &mut order);
+    }
+    (cycles, order)
+}
+
+fn by_value_struct_dependencies(ty: &ScalarType, dependencies: &mut Vec<ScalarStructId>) {
+    match ty {
+        ScalarType::Struct(id) => dependencies.push(id.clone()),
+        ScalarType::Array { element, .. } => by_value_struct_dependencies(element, dependencies),
+        _ => {}
+    }
+}
+
+fn aggregate_layout_components(dependencies: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut index = 0;
+    let mut indices = vec![None; dependencies.len()];
+    let mut lowlinks = vec![0; dependencies.len()];
+    let mut stack = Vec::new();
+    let mut on_stack = vec![false; dependencies.len()];
+    let mut components = Vec::new();
+    for node in 0..dependencies.len() {
+        if indices[node].is_none() {
+            aggregate_layout_component_visit(
+                node,
+                dependencies,
+                &mut index,
+                &mut indices,
+                &mut lowlinks,
+                &mut stack,
+                &mut on_stack,
+                &mut components,
+            );
+        }
+    }
+    components
+}
+
+fn aggregate_layout_component_visit(
+    node: usize,
+    dependencies: &[Vec<usize>],
+    index: &mut usize,
+    indices: &mut [Option<usize>],
+    lowlinks: &mut [usize],
+    stack: &mut Vec<usize>,
+    on_stack: &mut [bool],
+    components: &mut Vec<Vec<usize>>,
+) {
+    indices[node] = Some(*index);
+    lowlinks[node] = *index;
+    *index += 1;
+    stack.push(node);
+    on_stack[node] = true;
+    for &dependency in &dependencies[node] {
+        if indices[dependency].is_none() {
+            aggregate_layout_component_visit(
+                dependency,
+                dependencies,
+                index,
+                indices,
+                lowlinks,
+                stack,
+                on_stack,
+                components,
+            );
+            lowlinks[node] = lowlinks[node].min(lowlinks[dependency]);
+        } else if on_stack[dependency] {
+            lowlinks[node] = lowlinks[node].min(indices[dependency].expect("component index"));
+        }
+    }
+    if lowlinks[node] == indices[node].expect("component index") {
+        let mut component = Vec::new();
+        loop {
+            let member = stack.pop().expect("component member");
+            on_stack[member] = false;
+            component.push(member);
+            if member == node {
+                break;
+            }
+        }
+        component.sort_unstable();
+        components.push(component);
+    }
+}
+
+fn aggregate_layout_visit(
+    node: usize,
+    dependencies: &[Vec<usize>],
+    cyclic: &[bool],
+    visited: &mut [bool],
+    order: &mut Vec<usize>,
+) {
+    if visited[node] || cyclic[node] {
+        return;
+    }
+    visited[node] = true;
+    for &dependency in &dependencies[node] {
+        aggregate_layout_visit(dependency, dependencies, cyclic, visited, order);
+    }
+    order.push(node);
+}
+
+fn cycle_participant(structures: &[ScalarStruct], cycle: &[usize]) -> (usize, usize) {
+    for &structure_index in cycle {
+        for (field_index, field) in structures[structure_index].fields.iter().enumerate() {
+            let mut dependencies = Vec::new();
+            by_value_struct_dependencies(&field.ty, &mut dependencies);
+            if dependencies.iter().any(|dependency| {
+                cycle
+                    .iter()
+                    .any(|&candidate| structures[candidate].id == *dependency)
+            }) {
+                return (structure_index, field_index);
+            }
+        }
+    }
+    panic!("recursive aggregate component has a participating field")
+}
+
+fn recursive_layout_diagnostic(
+    source: &SourceIdentity,
+    span: ByteSpan,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    diagnostics.push(super::Diagnostic {
+        code: "B0003".to_owned(),
+        severity: super::DiagnosticSeverity::Error,
+        message: "recursive by-value struct layout is unsupported".to_owned(),
+        labels: vec![super::DiagnosticLabel {
+            kind: super::DiagnosticLabelKind::Primary,
+            span: SourceSpan::new(source.clone(), span),
+            message: "field participates in a recursive struct layout".to_owned(),
+        }],
+        notes: Vec::new(),
+    });
 }
 
 fn recompute_struct_layout(
@@ -13102,6 +13327,162 @@ u128 j = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
         assert!(diagnostics
             .iter()
             .all(|diagnostic| diagnostic.code == "B0003"));
+    }
+
+    #[test]
+    fn resolves_transitive_local_aggregate_layout_absence() {
+        let text = "%%start
+struct Outer {
+	Middle middle;
+}
+struct Middle {
+	Huge huge;
+}
+struct Huge {
+	u8[18446744073709551615] values;
+	u8 later;
+}
+%%end";
+        let validation = validate_text(text);
+        assert_eq!(
+            validation.diagnostics.len(),
+            1,
+            "{:?}",
+            validation.diagnostics
+        );
+        assert_eq!(
+            validation.diagnostics[0].message,
+            "struct layout exceeds u64"
+        );
+        assert_eq!(
+            validation.diagnostics[0].labels[0].span.range,
+            ByteSpan::new(
+                text.rfind("later").expect("later field") as u32,
+                (text.rfind("later").expect("later field") + "later".len()) as u32,
+            )
+        );
+        assert!(validation.program.structs.iter().all(|structure| {
+            structure.layout.is_none()
+                && structure
+                    .fields
+                    .iter()
+                    .all(|field| field.layout.is_none() && field.offset.is_none())
+        }));
+        assert!(crate::emit_scalar_llvm(&validation).is_err());
+    }
+
+    #[test]
+    fn resolves_transitive_project_aggregate_layout_absence() {
+        let huge_source = module_source("src/huge.w");
+        let huge = module_from_text(
+            huge_source.clone(),
+            "%%start
+struct Huge {
+	u8[18446744073709551615] values;
+	u8 later;
+}
+%%end",
+        );
+        let middle_source = module_source("src/middle.w");
+        let middle = module_from_text(
+            middle_source.clone(),
+            "%%start
+huge = namespace app \"src/huge.w\";
+struct Middle {
+	huge.Huge value;
+}
+%%end",
+        );
+        let outer_source = module_source("src/main.w");
+        let outer = module_from_text(
+            outer_source.clone(),
+            "%%start
+middle = namespace app \"src/middle.w\";
+struct Outer {
+	middle.Middle value;
+}
+%%end",
+        );
+        let outer_namespace_span = match &outer.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("outer namespace"),
+        };
+        let middle_namespace_span = match &middle.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("middle namespace"),
+        };
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    outer,
+                    vec![ScalarNamespaceBinding {
+                        binding: "middle".to_owned(),
+                        target: middle_source.clone(),
+                        span: outer_namespace_span,
+                    }],
+                ),
+                ScalarModule::from_program(
+                    middle,
+                    vec![ScalarNamespaceBinding {
+                        binding: "huge".to_owned(),
+                        target: huge_source.clone(),
+                        span: middle_namespace_span,
+                    }],
+                ),
+                ScalarModule::from_program(huge, Vec::new()),
+            ],
+            vec![outer_source, middle_source, huge_source],
+        ));
+        assert_eq!(project.diagnostics.len(), 1, "{:?}", project.diagnostics);
+        assert_eq!(project.diagnostics[0].message, "struct layout exceeds u64");
+        assert!(project.project.modules.iter().all(|module| {
+            module.structs.iter().all(|structure| {
+                structure.layout.is_none()
+                    && structure
+                        .fields
+                        .iter()
+                        .all(|field| field.layout.is_none() && field.offset.is_none())
+            })
+        }));
+        assert!(crate::emit_scalar_project_llvm(&project).is_err());
+    }
+
+    #[test]
+    fn rejects_recursive_by_value_struct_layouts_once_per_component() {
+        for text in [
+            "%%start
+struct Node {
+	Node next;
+}
+%%end",
+            "%%start
+struct First {
+	Second second;
+}
+struct Second {
+	First first;
+}
+%%end",
+        ] {
+            let validation = validate_text(text);
+            assert_eq!(
+                validation.diagnostics.len(),
+                1,
+                "{:?}",
+                validation.diagnostics
+            );
+            assert_eq!(
+                validation.diagnostics[0].message,
+                "recursive by-value struct layout is unsupported"
+            );
+            assert!(validation.program.structs.iter().all(|structure| {
+                structure.layout.is_none()
+                    && structure
+                        .fields
+                        .iter()
+                        .all(|field| field.layout.is_none() && field.offset.is_none())
+            }));
+        }
     }
 
     #[test]
