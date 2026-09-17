@@ -850,7 +850,9 @@ fn basic_type<'ctx>(
         ScalarType::F32 => Ok(context.f32_type().into()),
         ScalarType::F64 => Ok(context.f64_type().into()),
         ScalarType::ArtifactId => Ok(context.ptr_type(AddressSpace::default()).into()),
-        ScalarType::RawPointer(_) => Ok(pointer_integer_type(context, target_layout).into()),
+        ScalarType::RawPointer(_) | ScalarType::CheckedReference { .. } => {
+            Ok(pointer_integer_type(context, target_layout).into())
+        }
         ScalarType::Struct(_) | ScalarType::Array { .. } => {
             Ok(context.ptr_type(AddressSpace::default()).into())
         }
@@ -901,7 +903,9 @@ fn value_type(ty: &ScalarType) -> Result<LlvmValueType, String> {
         ScalarType::F64 => Ok(LlvmValueType::F64),
         ScalarType::Char => Ok(LlvmValueType::Char),
         ScalarType::ArtifactId => Ok(LlvmValueType::ArtifactId),
-        ScalarType::RawPointer(_) => Ok(LlvmValueType::Pointer),
+        ScalarType::RawPointer(_) | ScalarType::CheckedReference { .. } => {
+            Ok(LlvmValueType::Pointer)
+        }
         ScalarType::Struct(_) | ScalarType::Array { .. } => Ok(LlvmValueType::Pointer),
         _ => Err("unsupported LLVM scalar type".into()),
     }
@@ -2629,7 +2633,8 @@ fn emit_expression<'ctx, 'module>(
             ..
         } => emit_unit_if(context, state, condition, then_branch),
         ScalarExpression::Block(block) => emit_block(context, state, block),
-        ScalarExpression::RawAddress { place, .. } => Ok(EmitValue::Basic(
+        ScalarExpression::RawAddress { place, .. }
+        | ScalarExpression::CheckedAddress { place, .. } => Ok(EmitValue::Basic(
             state
                 .builder
                 .build_ptr_to_int(
@@ -2928,7 +2933,8 @@ fn emit_project_expression<'ctx, 'module>(
         ScalarExpression::Block(block) => {
             emit_project_block(context, state, block, module, modules)
         }
-        ScalarExpression::RawAddress { place, .. } => Ok(EmitValue::Basic(
+        ScalarExpression::RawAddress { place, .. }
+        | ScalarExpression::CheckedAddress { place, .. } => Ok(EmitValue::Basic(
             state
                 .builder
                 .build_ptr_to_int(
@@ -4114,6 +4120,7 @@ fn collect_selected_overloads(
             }
         }
         ScalarExpression::RawAddress { .. }
+        | ScalarExpression::CheckedAddress { .. }
         | ScalarExpression::Name { .. }
         | ScalarExpression::Member { .. }
         | ScalarExpression::Integer { .. }
@@ -4237,7 +4244,8 @@ fn collect_generic_calls(
         | ScalarExpression::Boolean { .. }
         | ScalarExpression::Char { .. }
         | ScalarExpression::Utf8 { .. }
-        | ScalarExpression::RawAddress { .. } => {}
+        | ScalarExpression::RawAddress { .. }
+        | ScalarExpression::CheckedAddress { .. } => {}
     }
 }
 
@@ -4286,6 +4294,10 @@ fn substitute_generic_type(
         ScalarType::RawPointer(inner) => {
             ScalarType::RawPointer(Box::new(substitute_generic_type(inner, substitutions)))
         }
+        ScalarType::CheckedReference { mutability, inner } => ScalarType::CheckedReference {
+            mutability: *mutability,
+            inner: Box::new(substitute_generic_type(inner, substitutions)),
+        },
         ScalarType::Array {
             element,
             length,
@@ -4375,6 +4387,14 @@ fn generic_type_name(ty: &ScalarType) -> String {
         ScalarType::Char => "char".into(),
         ScalarType::ArtifactId => "artifact_id".into(),
         ScalarType::RawPointer(inner) => format!("ptr({})", generic_type_name(inner)),
+        ScalarType::CheckedReference { mutability, inner } => format!(
+            "checked_{}({})",
+            match mutability {
+                crate::scalar::ScalarReferenceMutability::Shared => "shared",
+                crate::scalar::ScalarReferenceMutability::Mutable => "mutable",
+            },
+            generic_type_name(inner)
+        ),
         ScalarType::Array {
             element, length, ..
         } => format!("array({};{length})", generic_type_name(element)),
@@ -6631,6 +6651,86 @@ child.marker = child.touch();
             text.contains("ptrtoint (ptr getelementptr inbounds (i8, ptr @item, i8 8) to i64)"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn lowers_checked_reference_field_addresses_and_callable_transport_at_target_width() {
+        for (layout, pointer_type, field_offset) in [
+            (ScalarTargetLayout::WASM32, "i32", 4),
+            (ScalarTargetLayout::NATIVE64, "i64", 8),
+        ] {
+            let source = SourceIdentity::new(
+                "project".into(),
+                "package".into(),
+                "src/checked_references.w".into(),
+                "r1".into(),
+            );
+            let parsed = parse_source(
+                source,
+                "%%start
+struct Record {
+    *?u8 bytes;
+    u32 count;
+}
+*u32(*u32) transport = fn(value) { value };
+*!u32(*!u32) transport_mutable = fn(value) { value };
+Record item = { .bytes = null; .count = 2; };
+*u32 shared = &item.count;
+*!u32 mutable = &!item.count;
+*u32 forwarded = transport(shared);
+*!u32 mutable_forwarded = transport_mutable(mutable);
+forwarded;
+mutable_forwarded;
+%%end"
+                    .into(),
+                &[],
+            );
+            let validation = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(
+                validation.diagnostics.is_empty(),
+                "{:?}",
+                validation.diagnostics
+            );
+
+            let text = emit_scalar_llvm(&validation)
+                .expect("checked-reference LLVM")
+                .to_text();
+
+            assert!(
+                text.contains(&format!(
+                    "define {pointer_type} @transport({pointer_type} %value)"
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "define {pointer_type} @transport_mutable({pointer_type} %value)"
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("call {pointer_type} @transport({pointer_type}")),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "call {pointer_type} @transport_mutable({pointer_type}"
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "getelementptr inbounds i8, ptr %struct_literal, i8 {field_offset}"
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "ptrtoint (ptr getelementptr inbounds (i8, ptr @item, i8 {field_offset}) to {pointer_type})"
+                )),
+                "{text}"
+            );
+        }
     }
 
     #[test]

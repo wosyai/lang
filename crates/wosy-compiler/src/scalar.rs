@@ -27,6 +27,10 @@ pub enum ScalarType {
     Char,
     ArtifactId,
     RawPointer(Box<ScalarType>),
+    CheckedReference {
+        mutability: ScalarReferenceMutability,
+        inner: Box<ScalarType>,
+    },
     Callable {
         outputs: ScalarOutputSequence,
         parameters: Vec<ScalarType>,
@@ -50,6 +54,12 @@ pub enum ScalarType {
         span: ByteSpan,
     },
     Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarReferenceMutability {
+    Shared,
+    Mutable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -224,6 +234,16 @@ fn scalar_type_equal(left: &ScalarType, right: &ScalarType) -> bool {
             scalar_type_equal(left, right)
         }
         (
+            ScalarType::CheckedReference {
+                mutability: left_mutability,
+                inner: left_inner,
+            },
+            ScalarType::CheckedReference {
+                mutability: right_mutability,
+                inner: right_inner,
+            },
+        ) => left_mutability == right_mutability && scalar_type_equal(left_inner, right_inner),
+        (
             ScalarType::Array {
                 element: left_element,
                 length: left_length,
@@ -261,6 +281,9 @@ fn scalar_type_equal(left: &ScalarType, right: &ScalarType) -> bool {
                     .all(|(left, right)| scalar_type_equal(left, right))
         }
         (ScalarType::RawPointer(_), _) | (_, ScalarType::RawPointer(_)) => false,
+        (ScalarType::CheckedReference { .. }, _) | (_, ScalarType::CheckedReference { .. }) => {
+            false
+        }
         (ScalarType::Callable { .. }, _) | (_, ScalarType::Callable { .. }) => false,
         _ => left == right,
     }
@@ -275,6 +298,10 @@ fn substitute_type(ty: &ScalarType, substitutions: &BTreeMap<String, ScalarType>
         ScalarType::RawPointer(inner) => {
             ScalarType::RawPointer(Box::new(substitute_type(inner, substitutions)))
         }
+        ScalarType::CheckedReference { mutability, inner } => ScalarType::CheckedReference {
+            mutability: *mutability,
+            inner: Box::new(substitute_type(inner, substitutions)),
+        },
         ScalarType::Array {
             element,
             length,
@@ -347,6 +374,18 @@ fn infer_overload_substitutions(
     match (pattern, actual) {
         (ScalarType::RawPointer(pattern), ScalarType::RawPointer(actual)) => {
             infer_overload_substitutions(pattern, actual, parameters, substitutions)
+        }
+        (
+            ScalarType::CheckedReference {
+                mutability: pattern_mutability,
+                inner: pattern_inner,
+            },
+            ScalarType::CheckedReference {
+                mutability: actual_mutability,
+                inner: actual_inner,
+            },
+        ) if pattern_mutability == actual_mutability => {
+            infer_overload_substitutions(pattern_inner, actual_inner, parameters, substitutions)
         }
         (
             ScalarType::Array {
@@ -627,6 +666,11 @@ pub enum ScalarExpression {
         span: ByteSpan,
     },
     RawAddress {
+        place: ScalarPlace,
+        span: ByteSpan,
+    },
+    CheckedAddress {
+        mutability: ScalarReferenceMutability,
         place: ScalarPlace,
         span: ByteSpan,
     },
@@ -1154,7 +1198,8 @@ fn record_expression_overload_selection(
             record_block_overload_selections(then_branch, scope, overloads);
         }
         ScalarExpression::Block(block) => record_block_overload_selections(block, scope, overloads),
-        ScalarExpression::RawAddress { place, .. } => match place {
+        ScalarExpression::RawAddress { place, .. }
+        | ScalarExpression::CheckedAddress { place, .. } => match place {
             ScalarPlace::Dereference { pointer, .. } => {
                 record_expression_overload_selection(pointer, None, scope, overloads)
             }
@@ -1343,6 +1388,10 @@ fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarStructId>) -> Sc
         ScalarType::RawPointer(inner) => {
             ScalarType::RawPointer(Box::new(resolve_type(inner, names)))
         }
+        ScalarType::CheckedReference { mutability, inner } => ScalarType::CheckedReference {
+            mutability: *mutability,
+            inner: Box::new(resolve_type(inner, names)),
+        },
         ScalarType::Array {
             element,
             length,
@@ -1460,7 +1509,8 @@ fn resolve_expression_places(
     program: &ScalarProgram,
 ) {
     match expression {
-        ScalarExpression::RawAddress { place, .. } => resolve_place(place, scope, program),
+        ScalarExpression::RawAddress { place, .. }
+        | ScalarExpression::CheckedAddress { place, .. } => resolve_place(place, scope, program),
         ScalarExpression::StructLiteral { fields, .. } => {
             for field in fields {
                 resolve_expression_places(&mut field.value, scope, program);
@@ -2142,6 +2192,10 @@ fn resolve_type_in_project(
         ScalarType::RawPointer(inner) => ScalarType::RawPointer(Box::new(resolve_type_in_project(
             inner, names, module, modules,
         ))),
+        ScalarType::CheckedReference { mutability, inner } => ScalarType::CheckedReference {
+            mutability: *mutability,
+            inner: Box::new(resolve_type_in_project(inner, names, module, modules)),
+        },
         ScalarType::Array {
             element,
             length,
@@ -2667,7 +2721,8 @@ fn resolve_expression_module_places(
     modules: &[ScalarModule],
 ) {
     match expression {
-        ScalarExpression::RawAddress { place, .. } => {
+        ScalarExpression::RawAddress { place, .. }
+        | ScalarExpression::CheckedAddress { place, .. } => {
             resolve_module_place(place, scope, module, modules)
         }
         ScalarExpression::StructLiteral { fields, .. } => {
@@ -2806,6 +2861,9 @@ fn validate_module_type(
         | ScalarType::F64
         | ScalarType::Char
         | ScalarType::ArtifactId => {}
+        ScalarType::CheckedReference { inner, .. } => {
+            validate_module_type(module, inner, span, diagnostics)
+        }
         ScalarType::RawPointer(inner)
             if matches!(inner.as_ref(), ScalarType::U8 | ScalarType::Struct(_)) => {}
         ScalarType::RawPointer(_) => diagnostics.push(module_diagnostic(
@@ -2834,7 +2892,7 @@ fn validate_module_generic_type(
             if generic_parameters
                 .iter()
                 .any(|parameter| parameter.name == *name) => {}
-        ScalarType::RawPointer(inner) => {
+        ScalarType::RawPointer(inner) | ScalarType::CheckedReference { inner, .. } => {
             validate_module_generic_type(module, inner, span, generic_parameters, diagnostics)
         }
         ScalarType::Array { element, .. } => {
@@ -2899,13 +2957,43 @@ fn validate_extern(
                 function.signature_span,
             ));
         }
+        if contains_checked_reference(&function.signature) {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "direct FFI checked references are not supported",
+                function.signature_span,
+            ));
+        }
+    }
+}
+
+fn contains_checked_reference(ty: &ScalarType) -> bool {
+    match ty {
+        ScalarType::CheckedReference { .. } => true,
+        ScalarType::RawPointer(inner) | ScalarType::Array { element: inner, .. } => {
+            contains_checked_reference(inner)
+        }
+        ScalarType::Callable {
+            outputs,
+            parameters,
+        } => {
+            outputs
+                .outputs
+                .iter()
+                .any(|output| contains_checked_reference(&output.ty))
+                || parameters.iter().any(contains_checked_reference)
+        }
+        _ => false,
     }
 }
 
 fn contains_fixed_array(ty: &ScalarType) -> bool {
     match ty {
         ScalarType::Array { .. } => true,
-        ScalarType::RawPointer(inner) => contains_fixed_array(inner),
+        ScalarType::RawPointer(inner) | ScalarType::CheckedReference { inner, .. } => {
+            contains_fixed_array(inner)
+        }
         ScalarType::Callable {
             outputs,
             parameters,
@@ -3106,6 +3194,7 @@ fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::Char { span, .. }
         | ScalarExpression::Utf8 { span, .. }
         | ScalarExpression::RawAddress { span, .. }
+        | ScalarExpression::CheckedAddress { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::ArrayLiteral { span, .. }
         | ScalarExpression::Binary { span, .. }
@@ -4021,6 +4110,19 @@ fn expression_type_in_module(
                 diagnostics,
             )))
         }
+        ScalarExpression::CheckedAddress {
+            mutability,
+            place,
+            span,
+        } => checked_address_type_in_module(
+            *mutability,
+            place,
+            *span,
+            scope,
+            module,
+            modules,
+            diagnostics,
+        ),
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {
             diagnostics.push(module_diagnostic(
@@ -4834,8 +4936,11 @@ fn expression_type_in_module_expected(
     }
     if let ScalarExpression::Name { name, span } = expression {
         if name == "null" {
-            if let Some(ScalarType::RawPointer(pointer)) = expected {
-                return ScalarType::RawPointer(pointer.clone());
+            if let Some(
+                pointer @ ScalarType::RawPointer(_) | pointer @ ScalarType::CheckedReference { .. },
+            ) = expected
+            {
+                return pointer.clone();
             }
             diagnostics.push(module_diagnostic(
                 module,
@@ -5313,6 +5418,67 @@ fn field_type_in_module(
         return ScalarType::Error;
     };
     field.ty.clone()
+}
+
+fn is_supported_checked_address_place(place: &ScalarPlace) -> bool {
+    match place {
+        ScalarPlace::Name { .. } => true,
+        ScalarPlace::Field { base, .. } => matches!(base.as_ref(), ScalarPlace::Name { .. }),
+        ScalarPlace::Dereference { .. } => false,
+    }
+}
+
+fn checked_address_type(
+    mutability: ScalarReferenceMutability,
+    place: &ScalarPlace,
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    if !is_supported_checked_address_place(place) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            "checked address requires a storage name or direct storage field",
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    ScalarType::CheckedReference {
+        mutability,
+        inner: Box::new(place_type(place, scope, program, diagnostics)),
+    }
+}
+
+fn checked_address_type_in_module(
+    mutability: ScalarReferenceMutability,
+    place: &ScalarPlace,
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    if !is_supported_checked_address_place(place) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "checked address requires a storage name or direct storage field",
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    ScalarType::CheckedReference {
+        mutability,
+        inner: Box::new(place_type_in_module(
+            place,
+            scope,
+            module,
+            modules,
+            diagnostics,
+        )),
+    }
 }
 
 fn place_type(
@@ -5995,7 +6161,9 @@ fn layout_for_type(
             size: 8,
             alignment: 8,
         },
-        ScalarType::RawPointer(_) | ScalarType::ArtifactId => ScalarLayout {
+        ScalarType::RawPointer(_)
+        | ScalarType::CheckedReference { .. }
+        | ScalarType::ArtifactId => ScalarLayout {
             size: target_layout.pointer_size,
             alignment: target_layout.pointer_alignment,
         },
@@ -6065,7 +6233,10 @@ fn output_sequence(node: &CstNode) -> ScalarOutputSequence {
                         .children_with_tokens()
                         .filter_map(|element| match element {
                             NodeOrToken::Node(node)
-                                if node.kind() == SyntaxKind::RawPointerType =>
+                                if matches!(
+                                    node.kind(),
+                                    SyntaxKind::RawPointerType | SyntaxKind::CheckedPointerType
+                                ) =>
                             {
                                 Some(ScalarOutput {
                                     ty: derive_type(&node),
@@ -6367,6 +6538,8 @@ fn derive_type(node: &CstNode) -> ScalarType {
                     child.kind(),
                     SyntaxKind::CallableType
                         | SyntaxKind::RawPointerType
+                        | SyntaxKind::CheckedPointerType
+                        | SyntaxKind::ParenthesizedType
                         | SyntaxKind::QualifiedType
                 )
             })
@@ -6375,6 +6548,37 @@ fn derive_type(node: &CstNode) -> ScalarType {
         node.clone()
     };
     let mut ty = match actual.kind() {
+        SyntaxKind::CheckedPointerType => {
+            let inner = actual
+                .children()
+                .find(|child| {
+                    matches!(
+                        child.kind(),
+                        SyntaxKind::ParenthesizedType
+                            | SyntaxKind::QualifiedType
+                            | SyntaxKind::Punctuation
+                    )
+                })
+                .map(|child| derive_type(&child))
+                .unwrap_or_else(|| {
+                    let token = direct_token(&actual, SyntaxKind::TypeName)
+                        .expect("checked reference type");
+                    type_from_name(token.text(), token_span(&token))
+                });
+            ScalarType::CheckedReference {
+                mutability: if actual.children_with_tokens().any(
+                    |element| matches!(element, NodeOrToken::Token(token) if token.text() == "!"),
+                ) {
+                    ScalarReferenceMutability::Mutable
+                } else {
+                    ScalarReferenceMutability::Shared
+                },
+                inner: Box::new(inner),
+            }
+        }
+        SyntaxKind::ParenthesizedType => {
+            derive_type(&actual.children().next().expect("parenthesized type inner"))
+        }
         SyntaxKind::RawPointerType => {
             let inner = actual
                 .children()
@@ -7120,6 +7324,23 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 span: wosy_syntax::byte_span(&actual),
             }
         }
+        SyntaxKind::CheckedAddress => {
+            let target = direct_nodes(&actual)
+                .into_iter()
+                .find(|child| child.kind() == SyntaxKind::AssignmentTarget)
+                .expect("checked address target");
+            ScalarExpression::CheckedAddress {
+                mutability: if actual.children_with_tokens().any(
+                    |element| matches!(element, NodeOrToken::Token(token) if token.text() == "!"),
+                ) {
+                    ScalarReferenceMutability::Mutable
+                } else {
+                    ScalarReferenceMutability::Shared
+                },
+                place: derive_place(&target),
+                span: wosy_syntax::byte_span(&actual),
+            }
+        }
         SyntaxKind::RawAddress => {
             let target = direct_nodes(&actual)
                 .into_iter()
@@ -7379,6 +7600,7 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::If { span, .. }
         | ScalarExpression::UnitIf { span, .. } => *span,
         ScalarExpression::RawAddress { span, .. }
+        | ScalarExpression::CheckedAddress { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::ArrayLiteral { span, .. } => *span,
         ScalarExpression::Block(block) => block.span,
@@ -7503,7 +7725,8 @@ fn validate_unit_if_position(
                 validate_unit_if_position(argument, false, source, diagnostics);
             }
         }
-        ScalarExpression::RawAddress { place, .. } => {
+        ScalarExpression::RawAddress { place, .. }
+        | ScalarExpression::CheckedAddress { place, .. } => {
             validate_unit_if_position_in_place(place, source, diagnostics)
         }
         ScalarExpression::StructLiteral { fields, .. } => {
@@ -8038,7 +8261,8 @@ impl StaticUseAnalyzer {
                 self.block(then_branch, visible);
             }
             ScalarExpression::Block(block) => self.block(block, visible),
-            ScalarExpression::RawAddress { place, .. } => self.place(place, visible),
+            ScalarExpression::RawAddress { place, .. }
+            | ScalarExpression::CheckedAddress { place, .. } => self.place(place, visible),
             ScalarExpression::StructLiteral { fields, .. } => {
                 for field in fields {
                     self.expression(&field.value, visible);
@@ -8143,7 +8367,9 @@ fn validate_type(
         | ScalarType::Char
         | ScalarType::ArtifactId => {}
         ScalarType::RawPointer(inner) if matches!(inner.as_ref(), ScalarType::U8) => {}
-        ScalarType::RawPointer(inner) => validate_type(program, inner, span, diagnostics),
+        ScalarType::RawPointer(inner) | ScalarType::CheckedReference { inner, .. } => {
+            validate_type(program, inner, span, diagnostics)
+        }
         ScalarType::Array { element, .. } => validate_type(program, element, span, diagnostics),
         ScalarType::Error => {}
     }
@@ -8161,7 +8387,7 @@ fn validate_generic_type(
             if generic_parameters
                 .iter()
                 .any(|parameter| parameter.name == *name) => {}
-        ScalarType::RawPointer(inner) => {
+        ScalarType::RawPointer(inner) | ScalarType::CheckedReference { inner, .. } => {
             validate_generic_type(program, inner, span, generic_parameters, diagnostics)
         }
         ScalarType::Array { element, .. } => {
@@ -8549,6 +8775,11 @@ fn expression_type(
             }
             ScalarType::RawPointer(Box::new(place_type(place, scope, program, diagnostics)))
         }
+        ScalarExpression::CheckedAddress {
+            mutability,
+            place,
+            span,
+        } => checked_address_type(*mutability, place, *span, scope, program, diagnostics),
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {
             diagnostics.push(diagnostic(
@@ -9334,7 +9565,10 @@ fn expression_type_expected(
             return then_type;
         }
         if matches!(expression, ScalarExpression::Name { name, .. } if name == "null")
-            && matches!(expected, ScalarType::RawPointer(_))
+            && matches!(
+                expected,
+                ScalarType::RawPointer(_) | ScalarType::CheckedReference { .. }
+            )
         {
             return expected.clone();
         }
@@ -12784,6 +13018,94 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
     }
 
     #[test]
+    fn derives_checked_reference_addresses_with_exact_shared_mutable_and_aggregate_types() {
+        let result = validate_text(
+            "%%start\nstruct Item {\n\tu8 field;\n}\nu8 value = 1;\nItem record = { .field = 2; };\nu8[4] bytes = [3, 4, 5, 6];\n*u8 shared = &value;\n*!u8 mutable = &!value;\n*u8 field = &record.field;\n*(u8[4]) array = &bytes;\n*!(u8[4]) mutable_array = &!bytes;\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        for (item, mutability, array) in [
+            (3, ScalarReferenceMutability::Shared, false),
+            (4, ScalarReferenceMutability::Mutable, false),
+            (5, ScalarReferenceMutability::Shared, false),
+            (6, ScalarReferenceMutability::Shared, true),
+            (7, ScalarReferenceMutability::Mutable, true),
+        ] {
+            let item = &result.program.items[item];
+            let ScalarItem::Binding(binding) = item else {
+                panic!("checked reference binding")
+            };
+            assert!(matches!(
+                &binding.declared_type,
+                ScalarType::CheckedReference { mutability: actual, inner }
+                    if *actual == mutability
+                        && if array {
+                            matches!(
+                                inner.as_ref(),
+                                ScalarType::Array { element, length: 4, .. }
+                                    if element.as_ref() == &ScalarType::U8
+                            )
+                        } else {
+                            inner.as_ref() == &ScalarType::U8
+                        }
+            ));
+            assert!(matches!(
+                binding.value,
+                ScalarExpression::CheckedAddress { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_checked_reference_mutability_mismatches_and_unsupported_addresses() {
+        let mismatch = validate_text(
+            "%%start\nu8 value = 1;\n*!u8 shared = &value;\n*u8 mutable = &!value;\n%%end",
+        );
+        assert_eq!(
+            mismatch
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message
+                    == "expression type does not match expected type")
+                .count(),
+            2,
+            "{:?}",
+            mismatch.diagnostics
+        );
+
+        let unsupported = validate_text(
+            "%%start\nstruct Record {\n\tu8 field;\n}\n*?Record pointer = null;\n*u8 field = &(*pointer).field;\n%%end",
+        );
+        assert!(unsupported.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "checked address requires a storage name or direct storage field"
+        }));
+    }
+
+    #[test]
+    fn retains_raw_address_safety_and_rejects_checked_references_in_extern_signatures() {
+        let raw = validate_text("%%start\nu8 value = 1;\n*?u8 address = &?value;\n%%end");
+        assert!(raw.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0012"
+                && diagnostic.message == "raw address requires an unsafe block"
+        }));
+
+        let externs = validate_text(
+            "%%start\nenv = extern wasm \"env\" { unit(*u8) consume; *!u8() produce; };\n%%end",
+        );
+        assert_eq!(
+            externs
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message
+                    == "direct FFI checked references are not supported")
+                .count(),
+            2,
+            "{:?}",
+            externs.diagnostics
+        );
+    }
+
+    #[test]
     fn validates_structs_through_project_modules() {
         let source = module_source("src/main.w");
         let program = module_from_text(
@@ -12895,6 +13217,62 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         } = &binding.value
         else {
             panic!("field address")
+        };
+        assert!(matches!(field, ScalarFieldReference::Resolved(id) if id.structure == imported_id));
+    }
+
+    #[test]
+    fn types_imported_struct_field_checked_addresses_in_projects() {
+        let child_source = module_source("src/child.w");
+        let child_program = module_from_text(
+            child_source.clone(),
+            "%%start\nstruct Pair {\n\tu8 first;\n\tu32 second;\n}\n%%end",
+        );
+        let imported_id = child_program.structs[0].id.clone();
+        let main_source = module_source("src/main.w");
+        let main_program = module_from_text(
+            main_source.clone(),
+            "%%start\nchild = namespace app \"src/child.w\";\nchild.Pair item = { .first = 1; .second = 2; };\n*u32 address = &item.second;\n%%end",
+        );
+        let namespace_span = match &main_program.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    main_program,
+                    vec![ScalarNamespaceBinding {
+                        binding: "child".to_owned(),
+                        target: child_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::from_program(child_program, Vec::new()),
+            ],
+            vec![main_source, child_source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let ScalarItem::Binding(binding) = &validation.project.modules[0].items[2] else {
+            panic!("checked address binding")
+        };
+        assert_eq!(
+            binding.declared_type,
+            ScalarType::CheckedReference {
+                mutability: ScalarReferenceMutability::Shared,
+                inner: Box::new(ScalarType::U32),
+            }
+        );
+        let ScalarExpression::CheckedAddress {
+            place: ScalarPlace::Field { field, .. },
+            ..
+        } = &binding.value
+        else {
+            panic!("checked field address")
         };
         assert!(matches!(field, ScalarFieldReference::Resolved(id) if id.structure == imported_id));
     }
