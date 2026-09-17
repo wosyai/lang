@@ -1,2 +1,5 @@
-#!/bin/sh
-cp "$1" "$2/main"
+#!/usr/bin/env python3
+import shutil
+import sys
+
+shutil.copyfile(sys.argv[1], f"{sys.argv[2]}/main")

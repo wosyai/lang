@@ -1,2 +1,4 @@
-#!/bin/sh
-exit 0
+#!/usr/bin/env python3
+import sys
+
+sys.exit(0)
