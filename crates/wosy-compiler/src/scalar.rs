@@ -2205,11 +2205,7 @@ fn recompute_struct_layout(
 ) {
     let mut offset = 0;
     let mut alignment = 1;
-    structure.layout = None;
-    for field in &mut structure.fields {
-        field.layout = None;
-        field.offset = None;
-    }
+    clear_struct_layout(structure);
     for field in &mut structure.fields {
         let layout = match layout_for_type_in_structs(&field.ty, structs, target_layout) {
             Ok(layout) => layout,
@@ -2219,15 +2215,29 @@ fn recompute_struct_layout(
             }
         };
         alignment = alignment.max(layout.alignment);
-        offset = align_offset(offset, layout.alignment);
-        field.offset = Some(offset);
+        let Some((field_offset, next_offset)) = checked_layout_offset(offset, &layout) else {
+            layout_error_source(
+                source,
+                LayoutError::AggregateSizeOverflow(field.name_span),
+                diagnostics,
+            );
+            clear_struct_layout(structure);
+            return;
+        };
+        field.offset = Some(field_offset);
         field.layout = Some(layout.clone());
-        offset += layout.size;
+        offset = next_offset;
     }
-    structure.layout = Some(ScalarLayout {
-        size: align_offset(offset, alignment),
-        alignment,
-    });
+    let Some(size) = checked_align_offset(offset, alignment) else {
+        layout_error_source(
+            source,
+            LayoutError::AggregateSizeOverflow(structure.name_span),
+            diagnostics,
+        );
+        clear_struct_layout(structure);
+        return;
+    };
+    structure.layout = Some(ScalarLayout { size, alignment });
 }
 
 fn recompute_struct_layout_project(
@@ -2239,11 +2249,7 @@ fn recompute_struct_layout_project(
 ) {
     let mut offset = 0;
     let mut alignment = 1;
-    structure.layout = None;
-    for field in &mut structure.fields {
-        field.layout = None;
-        field.offset = None;
-    }
+    clear_struct_layout(structure);
     for field in &mut structure.fields {
         let layout = match layout_for_type_in_modules(&field.ty, modules, target_layout) {
             Ok(layout) => layout,
@@ -2253,15 +2259,29 @@ fn recompute_struct_layout_project(
             }
         };
         alignment = alignment.max(layout.alignment);
-        offset = align_offset(offset, layout.alignment);
-        field.offset = Some(offset);
+        let Some((field_offset, next_offset)) = checked_layout_offset(offset, &layout) else {
+            layout_error_source(
+                source,
+                LayoutError::AggregateSizeOverflow(field.name_span),
+                diagnostics,
+            );
+            clear_struct_layout(structure);
+            return;
+        };
+        field.offset = Some(field_offset);
         field.layout = Some(layout.clone());
-        offset += layout.size;
+        offset = next_offset;
     }
-    structure.layout = Some(ScalarLayout {
-        size: align_offset(offset, alignment),
-        alignment,
-    });
+    let Some(size) = checked_align_offset(offset, alignment) else {
+        layout_error_source(
+            source,
+            LayoutError::AggregateSizeOverflow(structure.name_span),
+            diagnostics,
+        );
+        clear_struct_layout(structure);
+        return;
+    };
+    structure.layout = Some(ScalarLayout { size, alignment });
 }
 
 fn layout_for_type_in_structs(
@@ -5642,8 +5662,25 @@ fn derive_struct(
     }
 }
 
-fn align_offset(offset: u64, alignment: u64) -> u64 {
-    (offset + alignment - 1) / alignment * alignment
+fn checked_align_offset(offset: u64, alignment: u64) -> Option<u64> {
+    offset
+        .checked_add(alignment - 1)
+        .and_then(|value| value.checked_div(alignment))
+        .and_then(|value| value.checked_mul(alignment))
+}
+
+fn checked_layout_offset(offset: u64, layout: &ScalarLayout) -> Option<(u64, u64)> {
+    let field_offset = checked_align_offset(offset, layout.alignment)?;
+    let next_offset = field_offset.checked_add(layout.size)?;
+    Some((field_offset, next_offset))
+}
+
+fn clear_struct_layout(structure: &mut ScalarStruct) {
+    structure.layout = None;
+    for field in &mut structure.fields {
+        field.layout = None;
+        field.offset = None;
+    }
 }
 
 fn compute_initial_struct_layout(structure: &mut ScalarStruct, target_layout: ScalarTargetLayout) {
@@ -5660,14 +5697,20 @@ fn compute_initial_struct_fields_layout(
         field.offset = None;
     }
     let mut offset = 0;
-    for field in fields {
-        let Ok(layout) = layout_for_type(&field.ty, target_layout) else {
+    for index in 0..fields.len() {
+        let Ok(layout) = layout_for_type(&fields[index].ty, target_layout) else {
             return;
         };
-        offset = align_offset(offset, layout.alignment);
-        field.offset = Some(offset);
-        field.layout = Some(layout.clone());
-        offset += layout.size;
+        let Some((field_offset, next_offset)) = checked_layout_offset(offset, &layout) else {
+            for field in fields.iter_mut() {
+                field.layout = None;
+                field.offset = None;
+            }
+            return;
+        };
+        fields[index].offset = Some(field_offset);
+        fields[index].layout = Some(layout.clone());
+        offset = next_offset;
     }
 }
 
@@ -5677,11 +5720,11 @@ fn initial_struct_layout(fields: &[ScalarStructField]) -> Option<ScalarLayout> {
     for field in fields {
         let layout = field.layout.as_ref()?;
         alignment = alignment.max(layout.alignment);
-        offset = align_offset(offset, layout.alignment);
-        offset += layout.size;
+        let (_, next_offset) = checked_layout_offset(offset, layout)?;
+        offset = next_offset;
     }
     Some(ScalarLayout {
-        size: align_offset(offset, alignment),
+        size: checked_align_offset(offset, alignment)?,
         alignment,
     })
 }
@@ -5689,6 +5732,7 @@ fn initial_struct_layout(fields: &[ScalarStructField]) -> Option<ScalarLayout> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LayoutError {
     ArraySizeOverflow(ByteSpan),
+    AggregateSizeOverflow(ByteSpan),
     InvalidType,
 }
 
@@ -5757,19 +5801,30 @@ fn layout_error_source(
     error: LayoutError,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    if let LayoutError::ArraySizeOverflow(span) = error {
-        diagnostics.push(super::Diagnostic {
-            code: "B0003".to_owned(),
-            severity: super::DiagnosticSeverity::Error,
-            message: "fixed array layout exceeds u64".to_owned(),
-            labels: vec![super::DiagnosticLabel {
-                kind: super::DiagnosticLabelKind::Primary,
-                span: SourceSpan::new(source.clone(), span),
-                message: "fixed array length overflows its layout".to_owned(),
-            }],
-            notes: Vec::new(),
-        });
-    }
+    let (message, span, label) = match error {
+        LayoutError::ArraySizeOverflow(span) => (
+            "fixed array layout exceeds u64",
+            span,
+            "fixed array length overflows its layout",
+        ),
+        LayoutError::AggregateSizeOverflow(span) => (
+            "struct layout exceeds u64",
+            span,
+            "field overflows its enclosing struct layout",
+        ),
+        LayoutError::InvalidType => return,
+    };
+    diagnostics.push(super::Diagnostic {
+        code: "B0003".to_owned(),
+        severity: super::DiagnosticSeverity::Error,
+        message: message.to_owned(),
+        labels: vec![super::DiagnosticLabel {
+            kind: super::DiagnosticLabelKind::Primary,
+            span: SourceSpan::new(source.clone(), span),
+            message: label.to_owned(),
+        }],
+        notes: Vec::new(),
+    });
 }
 
 fn output_sequence(node: &CstNode) -> ScalarOutputSequence {
@@ -12985,6 +13040,68 @@ u128 j = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
         let project = validate_scalar_project(ScalarProject::new(vec![module], vec![source()]));
         assert_eq!(project.diagnostics.len(), 1, "{:?}", project.diagnostics);
         assert_eq!(project.diagnostics[0].code, "B0003");
+    }
+
+    #[test]
+    fn aggregate_layout_addition_overflow_is_a_single_diagnostic_with_absent_layouts() {
+        let text =
+            "%%start\nstruct Huge {\n\tu8[18446744073709551615] values;\n\tu8 later;\n}\n%%end";
+        let validation = validate_text(text);
+        assert_eq!(
+            validation.diagnostics.len(),
+            1,
+            "{:?}",
+            validation.diagnostics
+        );
+        let diagnostic = &validation.diagnostics[0];
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(diagnostic.message, "struct layout exceeds u64");
+        let later = "later";
+        assert_eq!(
+            diagnostic.labels[0].span.range,
+            ByteSpan::new(
+                text.find(later).expect("later field") as u32,
+                (text.find(later).expect("later field") + later.len()) as u32,
+            )
+        );
+        let huge = &validation.program.structs[0];
+        assert_eq!(huge.layout, None);
+        assert!(huge.fields.iter().all(|field| field.layout.is_none()));
+        assert!(huge.fields.iter().all(|field| field.offset.is_none()));
+        assert!(crate::emit_scalar_llvm(&validation).is_err());
+
+        let source = source();
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                module_from_text(source.clone(), text),
+                Vec::new(),
+            )],
+            vec![source],
+        ));
+        assert_eq!(project.diagnostics.len(), 1, "{:?}", project.diagnostics);
+        assert_eq!(project.diagnostics[0].code, "B0003");
+        assert_eq!(project.diagnostics[0].message, "struct layout exceeds u64");
+        let huge = &project.project.modules[0].structs[0];
+        assert_eq!(huge.layout, None);
+        assert!(huge.fields.iter().all(|field| field.layout.is_none()));
+        assert!(huge.fields.iter().all(|field| field.offset.is_none()));
+        assert!(crate::emit_scalar_project_llvm(&project).is_err());
+    }
+
+    #[test]
+    fn rejects_direct_extern_fixed_array_inputs_and_outputs() {
+        let text =
+            "%%start\nenv = extern wasm \"env\" { unit(u8[2]) consume; u8[2]() produce; };\n%%end";
+        let validation = validate_text(text);
+        let diagnostics = validation
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message == "direct FFI arrays are not supported")
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2, "{:?}", validation.diagnostics);
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code == "B0003"));
     }
 
     #[test]

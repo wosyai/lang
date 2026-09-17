@@ -4503,13 +4503,29 @@ mod tests {
     use super::function_type;
     use super::project_function_name;
     use super::project_global_name;
+    use super::storage_type;
     use super::{LlvmFunction, LlvmFunctionAttributes, LlvmPartition, LlvmValueType};
     use crate::scalar::ScalarOverloadSelection;
     use crate::{
         derive_scalar_program, parse_source, validate_scalar_project, ScalarModule, ScalarOutput,
         ScalarOutputSequence, ScalarProject, ScalarTargetLayout, ScalarType,
     };
-    use wosy_syntax::SourceIdentity;
+    use wosy_syntax::{ByteSpan, SourceIdentity};
+
+    #[test]
+    fn rejects_fixed_array_lengths_that_exceed_llvm_array_size() {
+        let context = Context::create();
+        let array = ScalarType::Array {
+            element: Box::new(ScalarType::U8),
+            length: u64::from(u32::MAX) + 1,
+            length_span: ByteSpan::new(0, 1),
+            span: ByteSpan::new(0, 1),
+        };
+        assert_eq!(
+            storage_type(&context, &array, &[], ScalarTargetLayout::NATIVE64).unwrap_err(),
+            "fixed array length exceeds LLVM array size"
+        );
+    }
 
     #[test]
     fn serializes_each_extern_with_its_wasm_import_attribute_group() {
