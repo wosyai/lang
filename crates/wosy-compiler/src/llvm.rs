@@ -6915,4 +6915,84 @@ text.utf8 value = \"hé\";
         assert!(run.contains("call ptr @transport(ptr %bytes)"), "{run}");
         assert!(transport.contains("ret ptr %bytes"), "{transport}");
     }
+
+    #[test]
+    fn emits_valid_nested_struct_array_storage_with_final_layout_offsets() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start
+struct Leaf {
+    u16 value;
+}
+struct Grid {
+    Leaf[2][2] leaves;
+    u8 marker;
+}
+raw = extern wasm \"env\" { unit(*?u8) inspect; };
+unit(Grid) store_grid = fn(value) {
+    value;
+};
+unit(*?Grid) marker_address = fn(pointer) {
+    unsafe {
+        *?u8 marker = &?(*pointer).marker;
+        raw.inspect(marker);
+    };
+};
+%%end"
+                    .into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let leaf = validation
+            .program
+            .structs
+            .iter()
+            .find(|structure| structure.name == "Leaf")
+            .expect("Leaf layout");
+        let grid = validation
+            .program
+            .structs
+            .iter()
+            .find(|structure| structure.name == "Grid")
+            .expect("Grid layout");
+
+        assert_eq!(
+            leaf.layout
+                .as_ref()
+                .map(|layout| (layout.size, layout.alignment)),
+            Some((2, 2))
+        );
+        assert_eq!(leaf.fields[0].offset, Some(0));
+        assert_eq!(
+            grid.layout
+                .as_ref()
+                .map(|layout| (layout.size, layout.alignment)),
+            Some((10, 2))
+        );
+        assert_eq!(grid.fields[0].offset, Some(0));
+        assert_eq!(grid.fields[1].offset, Some(8));
+
+        let text = emit_scalar_llvm(&validation)
+            .expect("nested aggregate LLVM")
+            .to_text();
+
+        assert!(text.contains("alloca [10 x i8]"), "{text}");
+        assert!(
+            text.contains("getelementptr inbounds i8, ptr %deref, i8 8"),
+            "{text}"
+        );
+    }
 }
