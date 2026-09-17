@@ -13487,6 +13487,45 @@ struct Second {
     }
 
     #[test]
+    fn rejects_three_member_recursive_layout_with_duplicate_participating_edges_once() {
+        let text = "%%start
+struct First {
+	Second first_second;
+	Second second_second;
+}
+struct Second {
+	Third third;
+}
+struct Third {
+	First first;
+}
+%%end";
+        let validation = validate_text(text);
+        let diagnostics = validation
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "recursive by-value struct layout is unsupported"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1, "{:?}", validation.diagnostics);
+        let first_field = "first_second";
+        let start = text.find(first_field).expect("first participating field") as u32;
+        assert_eq!(
+            diagnostics[0].labels[0].span.range,
+            ByteSpan::new(start, start + first_field.len() as u32)
+        );
+        assert!(validation.program.structs.iter().all(|structure| {
+            structure.layout.is_none()
+                && structure
+                    .fields
+                    .iter()
+                    .all(|field| field.layout.is_none() && field.offset.is_none())
+        }));
+    }
+
+    #[test]
     fn reports_local_recursive_layout_components_in_source_order() {
         let text = "%%start
 struct Root {
