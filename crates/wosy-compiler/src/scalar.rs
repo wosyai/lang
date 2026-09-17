@@ -13117,6 +13117,13 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             crate::emit_scalar_llvm(&unit).unwrap_err(),
             "cannot emit LLVM for an invalid scalar program"
         );
+
+        let unit_field = validate_text(
+            "%%start\nstruct Record {\n\tunit field;\n}\nunit() touch = fn { 1; };\nRecord record = { .field = touch(); };\n*unit reference = &record.field;\n%%end",
+        );
+        assert!(unit_field.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "checked address requires a storage name or direct storage field"
+        }));
     }
 
     #[test]
