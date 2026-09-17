@@ -851,7 +851,9 @@ fn basic_type<'ctx>(
         ScalarType::F64 => Ok(context.f64_type().into()),
         ScalarType::ArtifactId => Ok(context.ptr_type(AddressSpace::default()).into()),
         ScalarType::RawPointer(_) => Ok(pointer_integer_type(context, target_layout).into()),
-        ScalarType::Struct(_) => Ok(context.ptr_type(AddressSpace::default()).into()),
+        ScalarType::Struct(_) | ScalarType::Array { .. } => {
+            Ok(context.ptr_type(AddressSpace::default()).into())
+        }
         _ => Err("unit is only valid as a function result".into()),
     }
 }
@@ -868,10 +870,21 @@ fn storage_type<'ctx>(
                 .iter()
                 .find(|structure| structure.id == *id)
                 .ok_or_else(|| format!("unknown LLVM struct {}", id.index))?;
-            let size = u32::try_from(structure.layout.size)
-                .map_err(|_| "struct layout exceeds LLVM array size")?;
+            let layout = structure
+                .layout
+                .as_ref()
+                .ok_or_else(|| format!("LLVM struct {} has no valid layout", id.index))?;
+            let size =
+                u32::try_from(layout.size).map_err(|_| "struct layout exceeds LLVM array size")?;
             Ok(context.i8_type().array_type(size).into())
         }
+        ScalarType::Array {
+            element, length, ..
+        } => Ok(storage_type(context, element, structs, target_layout)?
+            .array_type(
+                u32::try_from(*length).map_err(|_| "fixed array length exceeds LLVM array size")?,
+            )
+            .into()),
         _ => basic_type(context, ty, target_layout),
     }
 }
@@ -889,7 +902,7 @@ fn value_type(ty: &ScalarType) -> Result<LlvmValueType, String> {
         ScalarType::Char => Ok(LlvmValueType::Char),
         ScalarType::ArtifactId => Ok(LlvmValueType::ArtifactId),
         ScalarType::RawPointer(_) => Ok(LlvmValueType::Pointer),
-        ScalarType::Struct(_) => Ok(LlvmValueType::Pointer),
+        ScalarType::Struct(_) | ScalarType::Array { .. } => Ok(LlvmValueType::Pointer),
         _ => Err("unsupported LLVM scalar type".into()),
     }
 }
@@ -999,7 +1012,12 @@ fn place_pointer<'ctx, 'module>(
                 .filter(|candidate| candidate.id == *field)
                 .ok_or_else(|| format!("unknown LLVM struct field {}", field.index))?;
             let byte_type = context.i8_type();
-            let offset = byte_type.const_int(resolved.offset, false);
+            let offset = byte_type.const_int(
+                resolved.offset.ok_or_else(|| {
+                    format!("LLVM struct field {} has no valid offset", field.index)
+                })?,
+                false,
+            );
             unsafe {
                 state.builder.build_in_bounds_gep(
                     byte_type,
@@ -1055,7 +1073,7 @@ fn emit_place_value<'ctx, 'module>(
             ));
         }
     };
-    if matches!(ty, ScalarType::Struct(_)) {
+    if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
         return Ok(EmitValue::Basic(pointer.into()));
     }
     Ok(EmitValue::Basic(
@@ -1108,9 +1126,12 @@ fn emit_struct_literal<'ctx, 'module>(
         return Err("struct literal requires a resolved struct type".to_owned());
     };
     let structure = structure(state.structs, id.clone())?;
+    let layout = structure
+        .layout
+        .as_ref()
+        .ok_or_else(|| format!("LLVM struct {} has no valid layout", id.index))?;
     let storage = context.i8_type().array_type(
-        u32::try_from(structure.layout.size)
-            .map_err(|_| "struct layout exceeds LLVM array size")?,
+        u32::try_from(layout.size).map_err(|_| "struct layout exceeds LLVM array size")?,
     );
     let destination = state
         .builder
@@ -1141,12 +1162,58 @@ fn emit_struct_literal<'ctx, 'module>(
             state.builder.build_in_bounds_gep(
                 context.i8_type(),
                 destination,
-                &[context.i8_type().const_int(field.offset, false)],
+                &[context.i8_type().const_int(
+                    field.offset.ok_or_else(|| {
+                        format!("LLVM struct field {} has no valid offset", field.id.index)
+                    })?,
+                    false,
+                )],
                 field.name.as_str(),
             )
         }
         .map_err(builder_error)?;
         store_value(context, state, pointer, &field.ty, value)?;
+    }
+    Ok(EmitValue::Basic(destination.into()))
+}
+
+fn emit_array_literal<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    expected: &ScalarType,
+    elements: &[ScalarExpression],
+) -> Result<EmitValue<'ctx>, String> {
+    let ScalarType::Array {
+        element, length, ..
+    } = expected
+    else {
+        return Err("array literal requires a resolved fixed array type".to_owned());
+    };
+    if elements.len() as u64 != *length {
+        return Err("array literal element count does not match fixed array length".to_owned());
+    }
+    let storage = storage_type(context, expected, state.structs, state.target_layout)?;
+    let destination = state
+        .builder
+        .build_alloca(storage, "array_literal")
+        .map_err(builder_error)?;
+    let element_storage = storage_type(context, element, state.structs, state.target_layout)?;
+    for (index, expression) in elements.iter().enumerate() {
+        let pointer = unsafe {
+            state.builder.build_in_bounds_gep(
+                storage,
+                destination,
+                &[
+                    context.i32_type().const_zero(),
+                    context.i32_type().const_int(index as u64, false),
+                ],
+                "array_element",
+            )
+        }
+        .map_err(builder_error)?;
+        let value = emit_typed_expression(context, state, expression, element)?;
+        let _ = element_storage;
+        store_value(context, state, pointer, element, value)?;
     }
     Ok(EmitValue::Basic(destination.into()))
 }
@@ -1163,6 +1230,9 @@ fn emit_typed_expression<'ctx, 'module>(
         }
         (ScalarExpression::StructLiteral { fields, .. }, ScalarType::Struct(_)) => {
             emit_struct_literal(context, state, expected, fields)
+        }
+        (ScalarExpression::ArrayLiteral { elements, .. }, ScalarType::Array { .. }) => {
+            emit_array_literal(context, state, expected, elements)
         }
         (
             ScalarExpression::Unary {
@@ -1227,7 +1297,12 @@ fn emit_utf8_literal<'ctx, 'module>(
         state.builder.build_in_bounds_gep(
             byte_type,
             destination,
-            &[byte_type.const_int(structure.fields[0].offset, false)],
+            &[byte_type.const_int(
+                structure.fields[0]
+                    .offset
+                    .ok_or_else(|| "std.utf8 data field has no valid offset".to_owned())?,
+                false,
+            )],
             "data",
         )
     }
@@ -1248,7 +1323,12 @@ fn emit_utf8_literal<'ctx, 'module>(
         state.builder.build_in_bounds_gep(
             byte_type,
             destination,
-            &[byte_type.const_int(structure.fields[1].offset, false)],
+            &[byte_type.const_int(
+                structure.fields[1]
+                    .offset
+                    .ok_or_else(|| "std.utf8 length field has no valid offset".to_owned())?,
+                false,
+            )],
             "length",
         )
     }
@@ -1270,13 +1350,9 @@ fn store_value<'ctx, 'module>(
     ty: &ScalarType,
     value: EmitValue<'ctx>,
 ) -> Result<(), String> {
-    if let ScalarType::Struct(id) = ty {
-        let structure = structure(state.structs, id.clone())?;
+    if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
         let source = take_basic(value)?.into_pointer_value();
-        let aggregate = context.i8_type().array_type(
-            u32::try_from(structure.layout.size)
-                .map_err(|_| "struct layout exceeds LLVM array size")?,
-        );
+        let aggregate = storage_type(context, ty, state.structs, state.target_layout)?;
         let value = state
             .builder
             .build_load(aggregate, source, "struct_value")
@@ -2196,7 +2272,7 @@ fn materialize_assignment_values<'ctx, 'module>(
                 )
                 .map_err(builder_error)?;
             store_value(context, state, temporary, &ty, value)?;
-            let value = if matches!(ty, ScalarType::Struct(_)) {
+            let value = if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
                 EmitValue::Basic(temporary.into())
             } else {
                 EmitValue::Basic(
@@ -2433,7 +2509,7 @@ fn emit_expression<'ctx, 'module>(
                 ));
             }
             if let Some((slot, ty)) = state.storage.get(name).cloned() {
-                if matches!(ty, ScalarType::Struct(_)) {
+                if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
                     return Ok(EmitValue::Basic(slot.into()));
                 }
                 return Ok(EmitValue::Basic(
@@ -2448,7 +2524,7 @@ fn emit_expression<'ctx, 'module>(
                 ));
             }
             if let Some((global, ty)) = state.globals.get(name).cloned() {
-                if matches!(ty, ScalarType::Struct(_)) {
+                if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
                     return Ok(EmitValue::Basic(global.as_pointer_value().into()));
                 }
                 return Ok(EmitValue::Basic(
@@ -2567,6 +2643,9 @@ fn emit_expression<'ctx, 'module>(
         ScalarExpression::StructLiteral { .. } => {
             return Err("struct literal requires an expected struct type".to_owned())
         }
+        ScalarExpression::ArrayLiteral { .. } => {
+            return Err("array literal requires an expected fixed array type".to_owned())
+        }
     }
 }
 
@@ -2598,6 +2677,9 @@ fn emit_project_typed_expression<'ctx, 'module>(
         ScalarExpression::StructLiteral { fields, .. } => {
             emit_struct_literal(context, state, expected, fields)
         }
+        ScalarExpression::ArrayLiteral { elements, .. } => {
+            emit_array_literal(context, state, expected, elements)
+        }
         _ => emit_project_expression(context, state, expression, module, modules),
     }
 }
@@ -2620,7 +2702,7 @@ fn emit_project_expression<'ctx, 'module>(
                 return Ok(EmitValue::Unit);
             }
             let global = global.ok_or_else(|| format!("unknown LLVM member storage {name}"))?;
-            if matches!(ty, ScalarType::Struct(_)) {
+            if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
                 return Ok(EmitValue::Basic(global.as_pointer_value().into()));
             }
             Ok(EmitValue::Basic(
@@ -2859,6 +2941,9 @@ fn emit_project_expression<'ctx, 'module>(
         )),
         ScalarExpression::StructLiteral { .. } => {
             return Err("struct literal requires an expected struct type".to_owned())
+        }
+        ScalarExpression::ArrayLiteral { .. } => {
+            return Err("array literal requires an expected fixed array type".to_owned())
         }
     }
 }
@@ -4023,6 +4108,11 @@ fn collect_selected_overloads(
                 collect_selected_overloads(&field.value, selections);
             }
         }
+        ScalarExpression::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                collect_selected_overloads(element, selections);
+            }
+        }
         ScalarExpression::RawAddress { .. }
         | ScalarExpression::Name { .. }
         | ScalarExpression::Member { .. }
@@ -4133,6 +4223,11 @@ fn collect_generic_calls(
                 collect_generic_calls(&field.value, calls);
             }
         }
+        ScalarExpression::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                collect_generic_calls(element, calls);
+            }
+        }
         ScalarExpression::Name { .. }
         | ScalarExpression::Member { .. }
         | ScalarExpression::Integer { .. }
@@ -4191,6 +4286,17 @@ fn substitute_generic_type(
         ScalarType::RawPointer(inner) => {
             ScalarType::RawPointer(Box::new(substitute_generic_type(inner, substitutions)))
         }
+        ScalarType::Array {
+            element,
+            length,
+            length_span,
+            span,
+        } => ScalarType::Array {
+            element: Box::new(substitute_generic_type(element, substitutions)),
+            length: *length,
+            length_span: *length_span,
+            span: *span,
+        },
         ScalarType::Callable {
             outputs,
             parameters,
@@ -4269,6 +4375,9 @@ fn generic_type_name(ty: &ScalarType) -> String {
         ScalarType::Char => "char".into(),
         ScalarType::ArtifactId => "artifact_id".into(),
         ScalarType::RawPointer(inner) => format!("ptr({})", generic_type_name(inner)),
+        ScalarType::Array {
+            element, length, ..
+        } => format!("array({};{length})", generic_type_name(element)),
         ScalarType::Callable {
             outputs,
             parameters,
@@ -6730,5 +6839,52 @@ text.utf8 value = \"hé\";
         );
         assert!(text.contains("store i64 3"), "{text}");
         assert!(text.contains("i8 0"), "{text}");
+    }
+
+    #[test]
+    fn emits_fixed_array_callable_transport_with_typed_address_storage() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\nu8[2](u8[2]) transport = fn(bytes) { bytes };\nunit(u8) observe = fn(value) { value; };\nunit() run = fn { u8[2] bytes = [7, 9]; transport(bytes); observe(1); };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let text = emit_scalar_llvm(&validation)
+            .expect("fixed array callable LLVM")
+            .to_text();
+        let transport = text
+            .split("define ptr @transport(ptr %bytes)")
+            .nth(1)
+            .expect("transport function");
+        let run = text
+            .split("define void @run()")
+            .nth(1)
+            .expect("run function");
+
+        assert!(text.contains("[2 x i8]"), "{text}");
+        assert!(run.contains("%array_literal = alloca [2 x i8]"), "{run}");
+        let first = run
+            .find("store i8 7, ptr %array_element")
+            .expect("first element");
+        let second = run
+            .find("store i8 9, ptr %array_element")
+            .expect("second element");
+        assert!(first < second, "{run}");
+        assert!(run.contains("%bytes = alloca [2 x i8]"), "{run}");
+        assert!(run.contains("call ptr @transport(ptr %bytes)"), "{run}");
+        assert!(transport.contains("ret ptr %bytes"), "{transport}");
     }
 }

@@ -75,6 +75,9 @@ pub enum SyntaxKind {
     GenericFunctionDecl,
     OverloadDecl,
     OverloadArm,
+    FixedArraySuffix,
+    ArrayLiteral,
+    FixedArrayLength,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -150,6 +153,9 @@ impl Language for WosyLanguage {
             62 => SyntaxKind::GenericFunctionDecl,
             63 => SyntaxKind::OverloadDecl,
             64 => SyntaxKind::OverloadArm,
+            65 => SyntaxKind::FixedArraySuffix,
+            66 => SyntaxKind::ArrayLiteral,
+            67 => SyntaxKind::FixedArrayLength,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -582,6 +588,9 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::generic_function_decl => SyntaxKind::GenericFunctionDecl,
         Rule::overload_decl => SyntaxKind::OverloadDecl,
         Rule::overload_arm => SyntaxKind::OverloadArm,
+        Rule::fixed_array_suffix => SyntaxKind::FixedArraySuffix,
+        Rule::fixed_array_length => SyntaxKind::FixedArrayLength,
+        Rule::array_literal => SyntaxKind::ArrayLiteral,
         Rule::binding_decl => SyntaxKind::BindingDecl,
         Rule::local_binding => SyntaxKind::LocalBinding,
         Rule::namespace_decl => SyntaxKind::NamespaceDecl,
@@ -672,6 +681,43 @@ mod tests {
         assert!(result.is_valid());
         assert_eq!(result.reconstruct(), BASE);
         assert_eq!(result.range(), ByteSpan::new(0, BASE.len() as u32));
+    }
+    #[test]
+    fn fixed_array_types_and_literals_are_structural_and_lossless() {
+        let text = "%%start\nu8[2][3] values = [[1, 2], [3, 4], [5, 6]];\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(
+            result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::FixedArraySuffix)
+                .count(),
+            2
+        );
+        assert_eq!(
+            result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::ArrayLiteral)
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn negative_fixed_array_length_is_lossless_and_structural() {
+        let text = "%%start\nu8[-1] value = [0];\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let length = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::FixedArrayLength)
+            .expect("fixed array length");
+        assert_eq!(length.text(), "-1");
     }
     #[test]
     fn comment_payload_and_tabs() {

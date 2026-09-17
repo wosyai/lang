@@ -43,6 +43,12 @@ pub enum ScalarType {
         span: ByteSpan,
     },
     Struct(ScalarStructId),
+    Array {
+        element: Box<ScalarType>,
+        length: u64,
+        length_span: ByteSpan,
+        span: ByteSpan,
+    },
     Error,
 }
 
@@ -149,8 +155,8 @@ pub struct ScalarStructField {
     pub name_span: ByteSpan,
     pub ty: ScalarType,
     pub declaration_index: usize,
-    pub offset: u64,
-    pub layout: ScalarLayout,
+    pub offset: Option<u64>,
+    pub layout: Option<ScalarLayout>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -160,7 +166,7 @@ pub struct ScalarStruct {
     pub name_span: ByteSpan,
     pub fields: Vec<ScalarStructField>,
     pub span: ByteSpan,
-    pub layout: ScalarLayout,
+    pub layout: Option<ScalarLayout>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -210,10 +216,25 @@ fn is_error_type(ty: &ScalarType) -> bool {
 }
 
 fn scalar_type_equal(left: &ScalarType, right: &ScalarType) -> bool {
+    if is_error_type(left) || is_error_type(right) {
+        return false;
+    }
     match (left, right) {
         (ScalarType::RawPointer(left), ScalarType::RawPointer(right)) => {
             scalar_type_equal(left, right)
         }
+        (
+            ScalarType::Array {
+                element: left_element,
+                length: left_length,
+                ..
+            },
+            ScalarType::Array {
+                element: right_element,
+                length: right_length,
+                ..
+            },
+        ) => left_length == right_length && scalar_type_equal(left_element, right_element),
         (ScalarType::Named { name: left, .. }, ScalarType::Named { name: right, .. }) => {
             left == right
         }
@@ -254,6 +275,17 @@ fn substitute_type(ty: &ScalarType, substitutions: &BTreeMap<String, ScalarType>
         ScalarType::RawPointer(inner) => {
             ScalarType::RawPointer(Box::new(substitute_type(inner, substitutions)))
         }
+        ScalarType::Array {
+            element,
+            length,
+            length_span,
+            span,
+        } => ScalarType::Array {
+            element: Box::new(substitute_type(element, substitutions)),
+            length: *length,
+            length_span: *length_span,
+            span: *span,
+        },
         ScalarType::Callable {
             outputs,
             parameters,
@@ -315,6 +347,20 @@ fn infer_overload_substitutions(
     match (pattern, actual) {
         (ScalarType::RawPointer(pattern), ScalarType::RawPointer(actual)) => {
             infer_overload_substitutions(pattern, actual, parameters, substitutions)
+        }
+        (
+            ScalarType::Array {
+                element: pattern_element,
+                length: pattern_length,
+                ..
+            },
+            ScalarType::Array {
+                element: actual_element,
+                length: actual_length,
+                ..
+            },
+        ) if pattern_length == actual_length => {
+            infer_overload_substitutions(pattern_element, actual_element, parameters, substitutions)
         }
         (
             ScalarType::Callable {
@@ -586,6 +632,10 @@ pub enum ScalarExpression {
     },
     StructLiteral {
         fields: Vec<ScalarStructLiteralField>,
+        span: ByteSpan,
+    },
+    ArrayLiteral {
+        elements: Vec<ScalarExpression>,
         span: ByteSpan,
     },
     Binary {
@@ -898,6 +948,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
     diagnostics.extend(char_diagnostics(canonical));
     diagnostics.extend(integer_diagnostics(canonical));
     diagnostics.extend(float_diagnostics(canonical));
+    diagnostics.extend(fixed_array_length_diagnostics(canonical));
     let source_root = canonical
         .root
         .children()
@@ -977,7 +1028,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
         structs,
         target_layout,
     };
-    resolve_program_types(&mut program);
+    resolve_program_types(&mut program, &mut diagnostics);
     resolve_program_places(&mut program);
     let mut validation_diagnostics = validate(&program);
     let mut diagnostics = diagnostics;
@@ -1119,6 +1170,11 @@ fn record_expression_overload_selection(
                 record_expression_overload_selection(&mut field.value, None, scope, overloads);
             }
         }
+        ScalarExpression::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                record_expression_overload_selection(element, None, scope, overloads);
+            }
+        }
         ScalarExpression::Name { .. }
         | ScalarExpression::Member { .. }
         | ScalarExpression::Integer { .. }
@@ -1182,7 +1238,8 @@ fn record_block_overload_selections(
     }
 }
 
-fn resolve_program_types(program: &mut ScalarProgram) {
+fn resolve_program_types(program: &mut ScalarProgram, diagnostics: &mut Vec<super::Diagnostic>) {
+    let source = program.source.clone();
     let names: BTreeMap<String, ScalarStructId> = program
         .structs
         .iter()
@@ -1191,24 +1248,18 @@ fn resolve_program_types(program: &mut ScalarProgram) {
     for structure in &mut program.structs {
         for field in &mut structure.fields {
             field.ty = resolve_type(&field.ty, &names);
-            field.layout = layout_for_type(&field.ty, program.target_layout);
         }
-        let mut offset = 0;
-        let mut alignment = 1;
-        for field in &mut structure.fields {
-            alignment = alignment.max(field.layout.alignment);
-            offset = align_offset(offset, field.layout.alignment);
-            field.offset = offset;
-            offset += field.layout.size;
-        }
-        structure.layout = ScalarLayout {
-            size: align_offset(offset, alignment),
-            alignment,
-        };
+        compute_initial_struct_layout(structure, program.target_layout);
     }
     let structs = program.structs.clone();
     for structure in &mut program.structs {
-        recompute_struct_layout(structure, &structs, program.target_layout);
+        recompute_struct_layout(
+            structure,
+            &structs,
+            program.target_layout,
+            &source,
+            diagnostics,
+        );
     }
     for item in &mut program.items {
         match item {
@@ -1301,6 +1352,17 @@ fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarStructId>) -> Sc
         ScalarType::RawPointer(inner) => {
             ScalarType::RawPointer(Box::new(resolve_type(inner, names)))
         }
+        ScalarType::Array {
+            element,
+            length,
+            length_span,
+            span,
+        } => ScalarType::Array {
+            element: Box::new(resolve_type(element, names)),
+            length: *length,
+            length_span: *length_span,
+            span: *span,
+        },
         ScalarType::Callable {
             outputs,
             parameters,
@@ -1413,6 +1475,11 @@ fn resolve_expression_places(
                 resolve_expression_places(&mut field.value, scope, program);
             }
         }
+        ScalarExpression::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                resolve_expression_places(element, scope, program);
+            }
+        }
         ScalarExpression::Binary { left, right, .. } => {
             resolve_expression_places(left, scope, program);
             resolve_expression_places(right, scope, program);
@@ -1504,24 +1571,32 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
     diagnostics.extend(char_diagnostics(canonical));
     diagnostics.extend(integer_diagnostics(canonical));
     diagnostics.extend(float_diagnostics(canonical));
+    diagnostics.extend(fixed_array_length_diagnostics(canonical));
     diagnostics
 }
 
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
     let mut project = project;
+    let mut diagnostics = Vec::new();
     let struct_lookup = project.modules.clone();
     for module in &mut project.modules {
         resolve_module_types_in_project(module, &struct_lookup);
     }
+    let struct_lookup = project.modules.clone();
     for module in &mut project.modules {
         for structure in &mut module.structs {
-            recompute_struct_layout_project(structure, &struct_lookup, module.target_layout);
+            recompute_struct_layout_project(
+                structure,
+                &struct_lookup,
+                module.target_layout,
+                &module.source,
+                &mut diagnostics,
+            );
         }
     }
     for module in &mut project.modules {
         resolve_module_places(module, &struct_lookup);
     }
-    let mut diagnostics = Vec::new();
     for module in &project.modules {
         validate_unit_if_positions_in_module(module, &mut diagnostics);
         let mut declarations = BTreeMap::new();
@@ -2086,6 +2161,17 @@ fn resolve_type_in_project(
         ScalarType::RawPointer(inner) => ScalarType::RawPointer(Box::new(resolve_type_in_project(
             inner, names, module, modules,
         ))),
+        ScalarType::Array {
+            element,
+            length,
+            length_span,
+            span,
+        } => ScalarType::Array {
+            element: Box::new(resolve_type_in_project(element, names, module, modules)),
+            length: *length,
+            length_span: *length_span,
+            span: *span,
+        },
         ScalarType::Callable {
             outputs,
             parameters,
@@ -2114,53 +2200,96 @@ fn recompute_struct_layout(
     structure: &mut ScalarStruct,
     structs: &[ScalarStruct],
     target_layout: ScalarTargetLayout,
+    source: &SourceIdentity,
+    diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     let mut offset = 0;
     let mut alignment = 1;
+    structure.layout = None;
     for field in &mut structure.fields {
-        field.layout = layout_for_type_in_structs(&field.ty, structs, target_layout);
-        alignment = alignment.max(field.layout.alignment);
-        offset = align_offset(offset, field.layout.alignment);
-        field.offset = offset;
-        offset += field.layout.size;
+        field.layout = None;
+        field.offset = None;
     }
-    structure.layout = ScalarLayout {
+    for field in &mut structure.fields {
+        let layout = match layout_for_type_in_structs(&field.ty, structs, target_layout) {
+            Ok(layout) => layout,
+            Err(error) => {
+                layout_error_source(source, error, diagnostics);
+                return;
+            }
+        };
+        alignment = alignment.max(layout.alignment);
+        offset = align_offset(offset, layout.alignment);
+        field.offset = Some(offset);
+        field.layout = Some(layout.clone());
+        offset += layout.size;
+    }
+    structure.layout = Some(ScalarLayout {
         size: align_offset(offset, alignment),
         alignment,
-    };
+    });
 }
 
 fn recompute_struct_layout_project(
     structure: &mut ScalarStruct,
     modules: &[ScalarModule],
     target_layout: ScalarTargetLayout,
+    source: &SourceIdentity,
+    diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     let mut offset = 0;
     let mut alignment = 1;
+    structure.layout = None;
     for field in &mut structure.fields {
-        field.layout = layout_for_type_in_modules(&field.ty, modules, target_layout);
-        alignment = alignment.max(field.layout.alignment);
-        offset = align_offset(offset, field.layout.alignment);
-        field.offset = offset;
-        offset += field.layout.size;
+        field.layout = None;
+        field.offset = None;
     }
-    structure.layout = ScalarLayout {
+    for field in &mut structure.fields {
+        let layout = match layout_for_type_in_modules(&field.ty, modules, target_layout) {
+            Ok(layout) => layout,
+            Err(error) => {
+                layout_error_source(source, error, diagnostics);
+                return;
+            }
+        };
+        alignment = alignment.max(layout.alignment);
+        offset = align_offset(offset, layout.alignment);
+        field.offset = Some(offset);
+        field.layout = Some(layout.clone());
+        offset += layout.size;
+    }
+    structure.layout = Some(ScalarLayout {
         size: align_offset(offset, alignment),
         alignment,
-    };
+    });
 }
 
 fn layout_for_type_in_structs(
     ty: &ScalarType,
     structs: &[ScalarStruct],
     target_layout: ScalarTargetLayout,
-) -> ScalarLayout {
+) -> Result<ScalarLayout, LayoutError> {
     match ty {
+        ScalarType::Array {
+            element,
+            length,
+            length_span,
+            ..
+        } => {
+            let element = layout_for_type_in_structs(element, structs, target_layout)?;
+            Ok(ScalarLayout {
+                size: element
+                    .size
+                    .checked_mul(*length)
+                    .ok_or(LayoutError::ArraySizeOverflow(*length_span))?,
+                alignment: element.alignment,
+            })
+        }
         ScalarType::Struct(id) => structs
             .iter()
             .find(|structure| structure.id == *id)
-            .map(|structure| structure.layout.clone())
-            .expect("resolved local struct layout"),
+            .and_then(|structure| structure.layout.clone())
+            .ok_or(LayoutError::InvalidType),
         _ => layout_for_type(ty, target_layout),
     }
 }
@@ -2169,14 +2298,29 @@ fn layout_for_type_in_modules(
     ty: &ScalarType,
     modules: &[ScalarModule],
     target_layout: ScalarTargetLayout,
-) -> ScalarLayout {
+) -> Result<ScalarLayout, LayoutError> {
     match ty {
+        ScalarType::Array {
+            element,
+            length,
+            length_span,
+            ..
+        } => {
+            let element = layout_for_type_in_modules(element, modules, target_layout)?;
+            Ok(ScalarLayout {
+                size: element
+                    .size
+                    .checked_mul(*length)
+                    .ok_or(LayoutError::ArraySizeOverflow(*length_span))?,
+                alignment: element.alignment,
+            })
+        }
         ScalarType::Struct(id) => modules
             .iter()
             .flat_map(|module| module.structs.iter())
             .find(|structure| structure.id == *id)
-            .map(|structure| structure.layout.clone())
-            .expect("resolved project struct layout"),
+            .and_then(|structure| structure.layout.clone())
+            .ok_or(LayoutError::InvalidType),
         _ => layout_for_type(ty, target_layout),
     }
 }
@@ -2283,6 +2427,11 @@ fn resolve_expression_module_places(
         ScalarExpression::StructLiteral { fields, .. } => {
             for field in fields {
                 resolve_expression_module_places(&mut field.value, scope, module, modules);
+            }
+        }
+        ScalarExpression::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                resolve_expression_module_places(element, scope, module, modules);
             }
         }
         ScalarExpression::Binary { left, right, .. } => {
@@ -2419,13 +2568,11 @@ fn validate_module_type(
             "unsupported raw pointer type",
             span,
         )),
+        ScalarType::Array { element, .. } => {
+            validate_module_type(module, element, span, diagnostics)
+        }
         ScalarType::Struct(_) => {}
-        ScalarType::Error => diagnostics.push(module_diagnostic(
-            module,
-            "B0003",
-            "invalid scalar type",
-            span,
-        )),
+        ScalarType::Error => {}
     }
 }
 
@@ -2443,6 +2590,9 @@ fn validate_module_generic_type(
                 .any(|parameter| parameter.name == *name) => {}
         ScalarType::RawPointer(inner) => {
             validate_module_generic_type(module, inner, span, generic_parameters, diagnostics)
+        }
+        ScalarType::Array { element, .. } => {
+            validate_module_generic_type(module, element, span, generic_parameters, diagnostics)
         }
         ScalarType::Callable {
             outputs,
@@ -2495,6 +2645,32 @@ fn validate_extern(
             function.signature_span,
             diagnostics,
         );
+        if contains_fixed_array(&function.signature) {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "direct FFI arrays are not supported",
+                function.signature_span,
+            ));
+        }
+    }
+}
+
+fn contains_fixed_array(ty: &ScalarType) -> bool {
+    match ty {
+        ScalarType::Array { .. } => true,
+        ScalarType::RawPointer(inner) => contains_fixed_array(inner),
+        ScalarType::Callable {
+            outputs,
+            parameters,
+        } => {
+            outputs
+                .outputs
+                .iter()
+                .any(|output| contains_fixed_array(&output.ty))
+                || parameters.iter().any(contains_fixed_array)
+        }
+        _ => false,
     }
 }
 
@@ -2722,6 +2898,7 @@ fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::Utf8 { span, .. }
         | ScalarExpression::RawAddress { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
+        | ScalarExpression::ArrayLiteral { span, .. }
         | ScalarExpression::Binary { span, .. }
         | ScalarExpression::Unary { span, .. }
         | ScalarExpression::Call { span, .. }
@@ -3657,6 +3834,15 @@ fn expression_type_in_module(
             )))
         }
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
+        ScalarExpression::ArrayLiteral { span, .. } => {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "array literal requires a fixed array context",
+                *span,
+            ));
+            ScalarType::Error
+        }
         ScalarExpression::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
             diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
             ScalarType::Error
@@ -4262,6 +4448,9 @@ fn expression_type_in_module_expected(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
+    if expected.is_some_and(is_error_type) {
+        return ScalarType::Error;
+    }
     if let ScalarExpression::Call {
         receiver,
         name,
@@ -4485,6 +4674,49 @@ fn expression_type_in_module_expected(
         let utf8 = utf8_type_from_namespace_target(module, modules, *span, diagnostics);
         expect_module_type(module, &utf8, expected, *span, diagnostics);
         return ScalarType::Error;
+    }
+    if let ScalarExpression::ArrayLiteral { elements, span } = expression {
+        let Some(ScalarType::Array {
+            element, length, ..
+        }) = expected
+        else {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "array literal requires a fixed array context",
+                *span,
+            ));
+            return ScalarType::Error;
+        };
+        if elements.len() as u64 != *length {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "array literal element count does not match fixed array length",
+                *span,
+            ));
+        }
+        for value in elements {
+            let actual = expression_type_in_module_expected(
+                value,
+                Some(element),
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            );
+            expect_module_type(
+                module,
+                element,
+                &actual,
+                expression_span(value),
+                diagnostics,
+            );
+        }
+        return expected.cloned().expect("array context");
     }
     if let ScalarExpression::StructLiteral { fields, span } = expression {
         let Some(ScalarType::Struct(id)) = expected else {
@@ -5435,7 +5667,7 @@ fn derive_struct(
     target_layout: ScalarTargetLayout,
 ) -> ScalarStruct {
     let name = direct_token(&node, SyntaxKind::Identifier).expect("struct name");
-    let fields = node
+    let mut fields = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::StructField)
         .enumerate()
@@ -5449,26 +5681,15 @@ fn derive_struct(
                 },
                 name: field_name.text().to_owned(),
                 name_span: token_span(&field_name),
-                layout: layout_for_type(&ty, target_layout),
+                layout: None,
                 ty,
                 declaration_index: index,
-                offset: 0,
+                offset: None,
             }
         })
         .collect::<Vec<_>>();
-    let mut offset = 0;
-    let mut alignment = 1;
-    let mut fields = fields;
-    for field in &mut fields {
-        alignment = alignment.max(field.layout.alignment);
-        offset = align_offset(offset, field.layout.alignment);
-        field.offset = offset;
-        offset += field.layout.size;
-    }
-    let layout = ScalarLayout {
-        size: align_offset(offset, alignment),
-        alignment,
-    };
+    compute_initial_struct_fields_layout(&mut fields, target_layout);
+    let layout = initial_struct_layout(&fields);
     ScalarStruct {
         id,
         name: name.text().to_owned(),
@@ -5483,8 +5704,57 @@ fn align_offset(offset: u64, alignment: u64) -> u64 {
     (offset + alignment - 1) / alignment * alignment
 }
 
-fn layout_for_type(ty: &ScalarType, target_layout: ScalarTargetLayout) -> ScalarLayout {
-    match ty {
+fn compute_initial_struct_layout(structure: &mut ScalarStruct, target_layout: ScalarTargetLayout) {
+    compute_initial_struct_fields_layout(&mut structure.fields, target_layout);
+    structure.layout = initial_struct_layout(&structure.fields);
+}
+
+fn compute_initial_struct_fields_layout(
+    fields: &mut [ScalarStructField],
+    target_layout: ScalarTargetLayout,
+) {
+    for field in fields.iter_mut() {
+        field.layout = None;
+        field.offset = None;
+    }
+    let mut offset = 0;
+    for field in fields {
+        let Ok(layout) = layout_for_type(&field.ty, target_layout) else {
+            return;
+        };
+        offset = align_offset(offset, layout.alignment);
+        field.offset = Some(offset);
+        field.layout = Some(layout.clone());
+        offset += layout.size;
+    }
+}
+
+fn initial_struct_layout(fields: &[ScalarStructField]) -> Option<ScalarLayout> {
+    let mut offset = 0;
+    let mut alignment = 1;
+    for field in fields {
+        let layout = field.layout.as_ref()?;
+        alignment = alignment.max(layout.alignment);
+        offset = align_offset(offset, layout.alignment);
+        offset += layout.size;
+    }
+    Some(ScalarLayout {
+        size: align_offset(offset, alignment),
+        alignment,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LayoutError {
+    ArraySizeOverflow(ByteSpan),
+    InvalidType,
+}
+
+fn layout_for_type(
+    ty: &ScalarType,
+    target_layout: ScalarTargetLayout,
+) -> Result<ScalarLayout, LayoutError> {
+    Ok(match ty {
         ScalarType::Bool | ScalarType::I8 | ScalarType::U8 => ScalarLayout {
             size: 1,
             alignment: 1,
@@ -5517,10 +5787,46 @@ fn layout_for_type(ty: &ScalarType, target_layout: ScalarTargetLayout) -> Scalar
             size: target_layout.pointer_size,
             alignment: target_layout.pointer_alignment,
         },
+        ScalarType::Array {
+            element,
+            length,
+            length_span,
+            ..
+        } => {
+            let element = layout_for_type(element, target_layout)?;
+            ScalarLayout {
+                size: element
+                    .size
+                    .checked_mul(*length)
+                    .ok_or(LayoutError::ArraySizeOverflow(*length_span))?,
+                alignment: element.alignment,
+            }
+        }
+        ScalarType::Error => return Err(LayoutError::InvalidType),
         _ => ScalarLayout {
             size: 0,
             alignment: 1,
         },
+    })
+}
+
+fn layout_error_source(
+    source: &SourceIdentity,
+    error: LayoutError,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    if let LayoutError::ArraySizeOverflow(span) = error {
+        diagnostics.push(super::Diagnostic {
+            code: "B0003".to_owned(),
+            severity: super::DiagnosticSeverity::Error,
+            message: "fixed array layout exceeds u64".to_owned(),
+            labels: vec![super::DiagnosticLabel {
+                kind: super::DiagnosticLabelKind::Primary,
+                span: SourceSpan::new(source.clone(), span),
+                message: "fixed array length overflows its layout".to_owned(),
+            }],
+            notes: Vec::new(),
+        });
     }
 }
 
@@ -5831,63 +6137,140 @@ fn select_final_output(block: &ScalarBlock, position: usize) -> ScalarBlock {
 }
 
 fn derive_type(node: &CstNode) -> ScalarType {
-    if node.kind() != SyntaxKind::RawPointerType {
-        if let Some(qualified) = direct_nodes(node)
-            .into_iter()
-            .find(|child| child.kind() == SyntaxKind::QualifiedType)
-        {
-            return qualified_type(&qualified);
-        }
-    }
-    if node.kind() == SyntaxKind::RawPointerType {
-        if let Some(qualified) = direct_nodes(node)
-            .into_iter()
-            .find(|child| child.kind() == SyntaxKind::QualifiedType)
-        {
-            return ScalarType::RawPointer(Box::new(derive_type(&qualified)));
-        }
-        let token = direct_token(node, SyntaxKind::TypeName).expect("raw pointer type");
-        let inner = type_from_name(token.text(), token_span(&token));
-        return ScalarType::RawPointer(Box::new(inner));
-    }
-    let actual = direct_nodes(node)
-        .into_iter()
-        .find(|child| child.kind() == SyntaxKind::CallableType)
-        .unwrap_or_else(|| node.clone());
-    if actual.kind() == SyntaxKind::CallableType {
-        let outputs = output_sequence(&actual);
-        let parameters = actual
-            .children_with_tokens()
-            .filter_map(|element| match element {
-                NodeOrToken::Node(node) if node.kind() == SyntaxKind::RawPointerType => {
-                    Some(derive_type(&node))
-                }
-                NodeOrToken::Node(node) if node.kind() == SyntaxKind::QualifiedType => {
-                    Some(derive_type(&node))
-                }
-                NodeOrToken::Token(token) if token.kind() == SyntaxKind::TypeName => {
-                    Some(type_from_name(token.text(), token_span(&token)))
-                }
-                _ => None,
+    let actual = if matches!(node.kind(), SyntaxKind::TypeSpec | SyntaxKind::Punctuation) {
+        node.descendants()
+            .find(|child| {
+                matches!(
+                    child.kind(),
+                    SyntaxKind::CallableType
+                        | SyntaxKind::RawPointerType
+                        | SyntaxKind::QualifiedType
+                )
             })
-            .collect();
-        ScalarType::Callable {
-            outputs,
-            parameters,
-        }
+            .unwrap_or_else(|| node.clone())
     } else {
-        match direct_nodes(node)
-            .into_iter()
-            .find(|child| child.kind() == SyntaxKind::RawPointerType)
-        {
-            Some(pointer) => derive_type(&pointer),
-            None if node.kind() == SyntaxKind::QualifiedType => qualified_type(node),
-            None => {
-                let token = direct_token(node, SyntaxKind::TypeName).expect("type token");
-                type_from_name(token.text(), token_span(&token))
+        node.clone()
+    };
+    let mut ty = match actual.kind() {
+        SyntaxKind::RawPointerType => {
+            let inner = actual
+                .children()
+                .find(|child| {
+                    matches!(
+                        child.kind(),
+                        SyntaxKind::Punctuation
+                            | SyntaxKind::QualifiedType
+                            | SyntaxKind::RawPointerType
+                    )
+                })
+                .map(|child| derive_type(&child))
+                .unwrap_or_else(|| {
+                    let token =
+                        direct_token(&actual, SyntaxKind::TypeName).expect("raw pointer type");
+                    type_from_name(token.text(), token_span(&token))
+                });
+            ScalarType::RawPointer(Box::new(inner))
+        }
+        SyntaxKind::QualifiedType => qualified_type(&actual),
+        SyntaxKind::CallableType => {
+            let output = actual
+                .descendants()
+                .find(|child| child.kind() == SyntaxKind::CallableOutput)
+                .expect("callable output");
+            let outputs = ScalarOutputSequence {
+                outputs: output
+                    .children()
+                    .map(|child| ScalarOutput {
+                        ty: derive_type(&child),
+                        span: wosy_syntax::byte_span(&child),
+                    })
+                    .collect(),
+                span: wosy_syntax::byte_span(&actual),
+            };
+            let parameters = actual
+                .children()
+                .filter(|child| child.kind() != SyntaxKind::CallableOutput)
+                .filter(|child| child.kind() == SyntaxKind::Punctuation)
+                .filter(|child| child.text() != "(")
+                .filter(|child| child.text() != ")")
+                .map(|child| derive_type(&child))
+                .collect();
+            ScalarType::Callable {
+                outputs,
+                parameters,
             }
         }
+        _ => {
+            let token = actual
+                .descendants_with_tokens()
+                .filter_map(|element| match element {
+                    NodeOrToken::Token(token) if token.kind() == SyntaxKind::TypeName => {
+                        Some(token)
+                    }
+                    _ => None,
+                })
+                .next()
+                .expect("type token");
+            type_from_name(token.text(), token_span(&token))
+        }
+    };
+    for suffix in node
+        .children()
+        .filter(|child| child.kind() == SyntaxKind::FixedArraySuffix)
+    {
+        let length = suffix
+            .children()
+            .find(|child| child.kind() == SyntaxKind::FixedArrayLength)
+            .expect("fixed array length");
+        let token = direct_token(&length, SyntaxKind::Integer).expect("fixed array length token");
+        let length_span = wosy_syntax::byte_span(&length);
+        let negative = length
+            .children_with_tokens()
+            .any(|element| matches!(element, NodeOrToken::Token(token) if token.kind() == SyntaxKind::Punctuation && token.text() == "-"));
+        if negative {
+            return ScalarType::Error;
+        }
+        let Some(length) = parse_integer(token.text()).and_then(|value| u64::try_from(value).ok())
+        else {
+            return ScalarType::Error;
+        };
+        ty = ScalarType::Array {
+            element: Box::new(ty),
+            length,
+            length_span,
+            span: wosy_syntax::byte_span(node),
+        };
     }
+    ty
+}
+
+fn fixed_array_length_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
+    canonical
+        .root
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::FixedArrayLength)
+        .filter_map(|length| {
+            let token = direct_token(&length, SyntaxKind::Integer)?;
+            let negative = length
+                .children_with_tokens()
+                .any(|element| matches!(element, NodeOrToken::Token(token) if token.kind() == SyntaxKind::Punctuation && token.text() == "-"));
+            (!negative && parse_integer(token.text())
+                .and_then(|value| u64::try_from(value).ok())
+                .is_none()
+                || negative)
+                .then(|| super::Diagnostic {
+                    code: "B0003".to_owned(),
+                    severity: super::DiagnosticSeverity::Error,
+                    message: "fixed array length must be an unsigned u64".to_owned(),
+                    labels: vec![super::DiagnosticLabel {
+                        kind: super::DiagnosticLabelKind::Primary,
+                        span: SourceSpan::new(canonical.source.clone(), wosy_syntax::byte_span(&length)),
+                        message: "invalid fixed array length".to_owned(),
+                    }],
+                    notes: Vec::new(),
+                })
+        })
+        .collect()
 }
 
 fn qualified_type(node: &CstNode) -> ScalarType {
@@ -6364,6 +6747,14 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .expect("unsafe block"),
             true,
         )),
+        SyntaxKind::ArrayLiteral => ScalarExpression::ArrayLiteral {
+            elements: direct_nodes(&actual)
+                .into_iter()
+                .filter(|child| child.kind() == SyntaxKind::Expression)
+                .map(|child| derive_expression(&child))
+                .collect(),
+            span: wosy_syntax::byte_span(&actual),
+        },
         SyntaxKind::Binary => {
             let children = semantic_children(&actual);
             let mut value = derive_element(&children[0]);
@@ -6765,7 +7156,8 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::If { span, .. }
         | ScalarExpression::UnitIf { span, .. } => *span,
         ScalarExpression::RawAddress { span, .. }
-        | ScalarExpression::StructLiteral { span, .. } => *span,
+        | ScalarExpression::StructLiteral { span, .. }
+        | ScalarExpression::ArrayLiteral { span, .. } => *span,
         ScalarExpression::Block(block) => block.span,
     }
 }
@@ -6894,6 +7286,11 @@ fn validate_unit_if_position(
         ScalarExpression::StructLiteral { fields, .. } => {
             for field in fields {
                 validate_unit_if_position(&field.value, false, source, diagnostics);
+            }
+        }
+        ScalarExpression::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                validate_unit_if_position(element, false, source, diagnostics);
             }
         }
         ScalarExpression::Block(block) => {
@@ -7424,6 +7821,11 @@ impl StaticUseAnalyzer {
                     self.expression(&field.value, visible);
                 }
             }
+            ScalarExpression::ArrayLiteral { elements, .. } => {
+                for element in elements {
+                    self.expression(element, visible);
+                }
+            }
             ScalarExpression::Integer { .. }
             | ScalarExpression::InvalidInteger { .. }
             | ScalarExpression::Float { .. }
@@ -7519,9 +7921,8 @@ fn validate_type(
         | ScalarType::ArtifactId => {}
         ScalarType::RawPointer(inner) if matches!(inner.as_ref(), ScalarType::U8) => {}
         ScalarType::RawPointer(inner) => validate_type(program, inner, span, diagnostics),
-        ScalarType::Error => {
-            diagnostics.push(diagnostic(program, "B0003", "invalid scalar type", span))
-        }
+        ScalarType::Array { element, .. } => validate_type(program, element, span, diagnostics),
+        ScalarType::Error => {}
     }
 }
 
@@ -7539,6 +7940,9 @@ fn validate_generic_type(
                 .any(|parameter| parameter.name == *name) => {}
         ScalarType::RawPointer(inner) => {
             validate_generic_type(program, inner, span, generic_parameters, diagnostics)
+        }
+        ScalarType::Array { element, .. } => {
+            validate_generic_type(program, element, span, generic_parameters, diagnostics)
         }
         ScalarType::Callable {
             outputs,
@@ -7930,6 +8334,15 @@ fn expression_type(
             ScalarType::RawPointer(Box::new(place_type(place, scope, program, diagnostics)))
         }
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
+        ScalarExpression::ArrayLiteral { span, .. } => {
+            diagnostics.push(diagnostic(
+                program,
+                "B0003",
+                "array literal requires a fixed array context",
+                *span,
+            ));
+            ScalarType::Error
+        }
         ScalarExpression::Name { name, span } if name == "null" => {
             diagnostics.push(diagnostic(
                 program,
@@ -8502,6 +8915,9 @@ fn expression_type_expected(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
+    if is_error_type(expected) {
+        return ScalarType::Error;
+    }
     if let ScalarExpression::Call {
         receiver: None,
         name,
@@ -8951,6 +9367,48 @@ fn expression_type_expected(
             }
             return ScalarType::I32;
         }
+        if let ScalarExpression::ArrayLiteral { elements, span } = expression {
+            let ScalarType::Array {
+                element, length, ..
+            } = expected
+            else {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "array literal requires a fixed array context",
+                    *span,
+                ));
+                return ScalarType::Error;
+            };
+            if elements.len() as u64 != *length {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "array literal element count does not match fixed array length",
+                    *span,
+                ));
+            }
+            for value in elements {
+                let actual = expression_type_expected(
+                    value,
+                    element,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                expect_type(
+                    program,
+                    element,
+                    &actual,
+                    expression_span(value),
+                    diagnostics,
+                );
+            }
+            return expected.clone();
+        }
         if let ScalarExpression::StructLiteral { fields, span } = expression {
             let ScalarType::Struct(id) = expected else {
                 diagnostics.push(diagnostic(
@@ -9269,20 +9727,20 @@ mod tests {
 
         assert_eq!(
             wasm.program.structs[0].layout,
-            ScalarLayout {
+            Some(ScalarLayout {
                 size: 8,
                 alignment: 4
-            }
+            })
         );
-        assert_eq!(wasm.program.structs[0].fields[1].offset, 4);
+        assert_eq!(wasm.program.structs[0].fields[1].offset, Some(4));
         assert_eq!(
             native.program.structs[0].layout,
-            ScalarLayout {
+            Some(ScalarLayout {
                 size: 16,
                 alignment: 8
-            }
+            })
         );
-        assert_eq!(native.program.structs[0].fields[1].offset, 8);
+        assert_eq!(native.program.structs[0].fields[1].offset, Some(8));
     }
 
     #[test]
@@ -11585,9 +12043,9 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             "%%start\nstruct WasiIovec {\n\t*?u8 buf;\n\tu32 len;\n}\nunsafe {\n\tWasiIovec item = {\n\t\t.buf = null;\n\t\t.len = 0;\n\t};\n\t*?WasiIovec address = &?item;\n};\n%%end",
         );
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-        assert_eq!(result.program.structs[0].fields[0].offset, 0);
-        assert_eq!(result.program.structs[0].fields[1].offset, 4);
-        assert_eq!(result.program.structs[0].layout.size, 8);
+        assert_eq!(result.program.structs[0].fields[0].offset, Some(0));
+        assert_eq!(result.program.structs[0].fields[1].offset, Some(4));
+        assert_eq!(result.program.structs[0].layout.as_ref().unwrap().size, 8);
         assert_eq!(result.program.target_layout, ScalarTargetLayout::WASM32);
         assert_eq!(
             result.program.structs[0].id,
@@ -12447,6 +12905,242 @@ u128 j = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
         assert_eq!(
             function.body.final_output_values[1].span,
             ByteSpan::new(second_start, second_start + 5)
+        );
+    }
+
+    #[test]
+    fn derives_and_contextually_validates_fixed_array_literals() {
+        let valid = validate_text("%%start\nu8[2] bytes = [1, 2];\n%%end");
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+        let ScalarItem::Binding(binding) = &valid.program.items[0] else {
+            panic!("array binding")
+        };
+        assert!(matches!(
+            binding.declared_type,
+            ScalarType::Array { length: 2, .. }
+        ));
+        assert!(matches!(
+            binding.value,
+            ScalarExpression::ArrayLiteral { .. }
+        ));
+
+        let count = validate_text("%%start\nu8[2] bytes = [1];\n%%end");
+        assert!(count.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "array literal element count does not match fixed array length"
+        }));
+        let element = validate_text("%%start\nu8[1] bytes = [300];\n%%end");
+        assert!(element
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0010"));
+    }
+
+    #[test]
+    fn rejects_invalid_fixed_array_lengths_at_the_complete_length_span() {
+        for length in ["-1", "18446744073709551616"] {
+            let text = format!("%%start\nu8[{length}] value = [0];\n%%end");
+            let validation = validate_text(&text);
+            assert_eq!(
+                validation.diagnostics.len(),
+                1,
+                "{:?}",
+                validation.diagnostics
+            );
+            let diagnostic = &validation.diagnostics[0];
+            assert_eq!(diagnostic.code, "B0003");
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(
+                    text.find(length).expect("length") as u32,
+                    (text.find(length).expect("length") + length.len()) as u32,
+                )
+            );
+            let ScalarItem::Binding(binding) = &validation.program.items[0] else {
+                panic!("array binding")
+            };
+            assert_eq!(binding.declared_type, ScalarType::Error);
+        }
+    }
+
+    #[test]
+    fn fixed_array_layout_overflow_is_a_single_diagnostic_not_a_panic() {
+        let text =
+            "%%start\nstruct Huge {\n\tu128[18446744073709551615] values;\n\tu32 later;\n}\n%%end";
+        let validation = validate_text(text);
+        assert_eq!(
+            validation.diagnostics.len(),
+            1,
+            "{:?}",
+            validation.diagnostics
+        );
+        assert_eq!(validation.diagnostics[0].code, "B0003");
+        let length = "18446744073709551615";
+        assert_eq!(
+            validation.diagnostics[0].labels[0].span.range,
+            ByteSpan::new(
+                text.find(length).expect("length") as u32,
+                (text.find(length).expect("length") + length.len()) as u32,
+            )
+        );
+        let huge = &validation.program.structs[0];
+        assert_eq!(huge.layout, None);
+        assert_eq!(huge.fields[0].layout, None);
+        assert_eq!(huge.fields[0].offset, None);
+        assert_eq!(huge.fields[1].layout, None);
+        assert_eq!(huge.fields[1].offset, None);
+        assert!(crate::emit_scalar_llvm(&validation).is_err());
+
+        let module = ScalarModule::from_program(validation.program, Vec::new());
+        let project = validate_scalar_project(ScalarProject::new(vec![module], vec![source()]));
+        assert_eq!(project.diagnostics.len(), 1, "{:?}", project.diagnostics);
+        assert_eq!(project.diagnostics[0].code, "B0003");
+    }
+
+    #[test]
+    fn absent_local_struct_layout_stops_containing_layout_accumulation() {
+        let text = "%%start\nstruct Outer {\n\tHuge huge;\n\tu32 later;\n}\nstruct Huge {\n\tu128[18446744073709551615] values;\n}\n%%end";
+        let validation = validate_text(text);
+        assert_eq!(
+            validation.diagnostics.len(),
+            1,
+            "{:?}",
+            validation.diagnostics
+        );
+        assert_eq!(validation.diagnostics[0].code, "B0003");
+        let length = "18446744073709551615";
+        assert_eq!(
+            validation.diagnostics[0].labels[0].span.range,
+            ByteSpan::new(
+                text.find(length).expect("length") as u32,
+                (text.find(length).expect("length") + length.len()) as u32,
+            )
+        );
+        let outer = &validation.program.structs[0];
+        assert_eq!(outer.layout, None);
+        assert_eq!(outer.fields[0].layout, None);
+        assert_eq!(outer.fields[0].offset, None);
+        assert_eq!(outer.fields[1].layout, None);
+        assert_eq!(outer.fields[1].offset, None);
+        let huge = &validation.program.structs[1];
+        assert_eq!(huge.layout, None);
+        assert_eq!(huge.fields[0].layout, None);
+        assert_eq!(huge.fields[0].offset, None);
+    }
+
+    #[test]
+    fn absent_project_struct_layout_propagates_without_a_duplicate_diagnostic() {
+        let library_source = module_source("src/library.w");
+        let library_text = "%%start\nstruct Huge {\n\tu128[18446744073709551615] values;\n}\n%%end";
+        let library = module_from_text(library_source.clone(), library_text);
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nlibrary = namespace app \"src/library.w\";\nstruct Outer {\n\tlibrary.Huge huge;\n\tu32 later;\n}\n%%end",
+        );
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    main,
+                    vec![ScalarNamespaceBinding {
+                        binding: "library".to_owned(),
+                        target: library_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::from_program(library, Vec::new()),
+            ],
+            vec![main_source, library_source],
+        ));
+        assert_eq!(project.diagnostics.len(), 1, "{:?}", project.diagnostics);
+        assert_eq!(project.diagnostics[0].code, "B0003");
+        let length = "18446744073709551615";
+        assert_eq!(
+            project.diagnostics[0].labels[0].span.range,
+            ByteSpan::new(
+                library_text.find(length).expect("length") as u32,
+                (library_text.find(length).expect("length") + length.len()) as u32,
+            )
+        );
+        let outer = &project.project.modules[0].structs[0];
+        assert_eq!(outer.layout, None);
+        assert_eq!(outer.fields[0].layout, None);
+        assert_eq!(outer.fields[0].offset, None);
+        assert_eq!(outer.fields[1].layout, None);
+        assert_eq!(outer.fields[1].offset, None);
+        let huge = &project.project.modules[1].structs[0];
+        assert_eq!(huge.layout, None);
+        assert_eq!(huge.fields[0].layout, None);
+        assert_eq!(huge.fields[0].offset, None);
+        assert!(crate::emit_scalar_project_llvm(&project).is_err());
+    }
+
+    #[test]
+    fn error_type_is_not_a_valid_equal_type() {
+        assert!(!scalar_type_equal(&ScalarType::Error, &ScalarType::Error));
+        assert!(!scalar_type_equal(&ScalarType::Error, &ScalarType::U8));
+    }
+
+    #[test]
+    fn invalid_fixed_array_length_is_rejected_before_llvm_emission() {
+        let validation = validate_text("%%start\nu8[-1] value = [0];\n%%end");
+        assert!(crate::emit_scalar_llvm(&validation).is_err());
+    }
+
+    #[test]
+    fn validates_scoped_fixed_array_callable_transport_and_preserves_module_collision() {
+        let valid = validate_text(
+            "%%start\nu8[2](u8[2]) transport = fn(bytes) { bytes };\nunit(u8) observe = fn(value) { value; };\nunit() run = fn { u8[2] bytes = [7, 9]; transport(bytes); observe(1); };\n%%end",
+        );
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+        let ScalarItem::Function(transport) = &valid.program.items[0] else {
+            panic!("transport function")
+        };
+        let ScalarType::Callable {
+            outputs,
+            parameters,
+        } = &transport.signature
+        else {
+            panic!("transport callable signature")
+        };
+        assert_eq!(outputs.outputs.len(), 1);
+        assert_eq!(parameters.len(), 1);
+        assert!(matches!(
+            &outputs.outputs[0].ty,
+            ScalarType::Array {
+                element,
+                length: 2,
+                ..
+            } if **element == ScalarType::U8
+        ));
+        assert!(matches!(
+            &parameters[0],
+            ScalarType::Array {
+                element,
+                length: 2,
+                ..
+            } if **element == ScalarType::U8
+        ));
+
+        let source = source();
+        let invalid = module_from_text(
+            source.clone(),
+            "%%start\nu8[2] bytes = [1, 2];\nu8[2](u8[2]) transport = fn(bytes) { bytes };\n%%end",
+        );
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), invalid.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(
+            project
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0002"),
+            "{:?}",
+            project.diagnostics
         );
     }
 }
