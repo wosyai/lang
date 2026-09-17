@@ -3,42 +3,42 @@ command = ["wosy", "parse", "app"]
 exit = 1
 
 [[assert]]
-command = ["cat", ".wosy/cst/current.json"]
+command = ["python", "-c", "import sys; sys.stdout.buffer.write(open('.wosy/cst/current.json', 'rb').read())"]
 exit = 0
 stdout = "expected/cst.json"
 
 [[assert]]
-command = ["cat", ".wosy/cst/current.json"]
+command = ["python", "-c", "import sys; sys.stdout.buffer.write(open('.wosy/cst/current.json', 'rb').read())"]
 select = ["/root/children/0/children/0/kind"]
 exit = 0
 stdout = "expected/boundary-start-kind.json"
 
 [[assert]]
-command = ["cat", ".wosy/cst/current.json"]
+command = ["python", "-c", "import sys; sys.stdout.buffer.write(open('.wosy/cst/current.json', 'rb').read())"]
 select = ["/root/children/0/children/2/children/0/kind"]
 exit = 0
 stdout = "expected/before-kind.json"
 
 [[assert]]
-command = ["cat", ".wosy/cst/current.json"]
+command = ["python", "-c", "import sys; sys.stdout.buffer.write(open('.wosy/cst/current.json', 'rb').read())"]
 select = ["/root/children/0/children/6/kind"]
 exit = 0
 stdout = "expected/error-kind.json"
 
 [[assert]]
-command = ["cat", ".wosy/cst/current.json"]
+command = ["python", "-c", "import sys; sys.stdout.buffer.write(open('.wosy/cst/current.json', 'rb').read())"]
 select = ["/root/children/0/children/8/children/0/kind"]
 exit = 0
 stdout = "expected/after-kind.json"
 
 [[assert]]
-command = ["cat", ".wosy/cst/current.json"]
+command = ["python", "-c", "import sys; sys.stdout.buffer.write(open('.wosy/cst/current.json', 'rb').read())"]
 select = ["/root/children/0/children/10/kind"]
 exit = 0
 stdout = "expected/boundary-end-kind.json"
 
 [[assert]]
-command = ["cat", ".wosy/cst/current.json"]
+command = ["python", "-c", "import sys; sys.stdout.buffer.write(open('.wosy/cst/current.json', 'rb').read())"]
 select = ["/root/children/0/children/6/span"]
 exit = 0
 stdout = "expected/error-span.json"
