@@ -6,7 +6,7 @@ default_target = "app"
 categories = []
 
 [builders.native]
-command = ["scripts/build-native"]
+command = ["python", "scripts/build-native"]
 args = []
 toolchain_identity = "llvm-18.1.3"
 
