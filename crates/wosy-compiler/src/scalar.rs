@@ -13668,6 +13668,91 @@ struct Late {
     }
 
     #[test]
+    fn reports_sibling_import_recursive_layout_components_in_import_observation_order() {
+        let root_source = module_source("src/main.w");
+        let root = module_from_text(
+            root_source.clone(),
+            "%%start
+zeta = namespace app \"src/zeta.w\";
+alpha = namespace app \"src/alpha.w\";
+%%end",
+        );
+        let zeta_source = module_source("src/zeta.w");
+        let zeta_text = "%%start
+struct Zeta {
+	Zeta zeta;
+}
+%%end";
+        let zeta = module_from_text(zeta_source.clone(), zeta_text);
+        let alpha_source = module_source("src/alpha.w");
+        let alpha_text = "%%start
+struct Alpha {
+	Alpha alpha;
+}
+%%end";
+        let alpha = module_from_text(alpha_source.clone(), alpha_text);
+        let zeta_namespace = match &root.items[0] {
+            ScalarItem::Namespace(namespace) => (namespace.binding.clone(), namespace.span),
+            _ => panic!("zeta namespace"),
+        };
+        let alpha_namespace = match &root.items[1] {
+            ScalarItem::Namespace(namespace) => (namespace.binding.clone(), namespace.span),
+            _ => panic!("alpha namespace"),
+        };
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    root,
+                    vec![
+                        ScalarNamespaceBinding {
+                            binding: zeta_namespace.0,
+                            target: zeta_source.clone(),
+                            span: zeta_namespace.1,
+                        },
+                        ScalarNamespaceBinding {
+                            binding: alpha_namespace.0,
+                            target: alpha_source.clone(),
+                            span: alpha_namespace.1,
+                        },
+                    ],
+                ),
+                ScalarModule::from_program(zeta, Vec::new()),
+                ScalarModule::from_program(alpha, Vec::new()),
+            ],
+            vec![root_source, zeta_source.clone(), alpha_source.clone()],
+        ));
+        let diagnostics = validation
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "recursive by-value struct layout is unsupported"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2, "{:?}", validation.diagnostics);
+        for (diagnostic, (source, text, field)) in diagnostics.iter().zip([
+            (&zeta_source, zeta_text, "zeta"),
+            (&alpha_source, alpha_text, "alpha"),
+        ]) {
+            let start = text.rfind(field).expect("recursive field") as u32;
+            assert_eq!(diagnostic.labels[0].span.source, *source);
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(start, start + field.len() as u32)
+            );
+        }
+        for module in &validation.project.modules[1..] {
+            assert!(module.structs.iter().all(|structure| {
+                structure.layout.is_none()
+                    && structure
+                        .fields
+                        .iter()
+                        .all(|field| field.layout.is_none() && field.offset.is_none())
+            }));
+        }
+    }
+
+    #[test]
     fn absent_local_struct_layout_stops_containing_layout_accumulation() {
         let text = "%%start\nstruct Outer {\n\tHuge huge;\n\tu32 later;\n}\nstruct Huge {\n\tu128[18446744073709551615] values;\n}\n%%end";
         let validation = validate_text(text);
