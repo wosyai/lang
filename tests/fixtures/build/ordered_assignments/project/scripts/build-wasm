@@ -24,7 +24,7 @@ subprocess.run(
 )
 subprocess.run(
     [
-        "wasm-ld-19",
+        "wasm-ld",
         "--no-entry",
         "--allow-undefined",
         "--export=_start",

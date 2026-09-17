@@ -1390,10 +1390,22 @@ mod tests {
     }
 
     fn dependency_test_root() -> PathBuf {
+        let current_thread = std::thread::current();
+        let thread_name = current_thread.name().unwrap_or("test");
+        let safe_thread_name: String = thread_name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect();
         std::env::temp_dir().join(format!(
             "wosy-project-dependency-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            safe_thread_name
         ))
     }
 
