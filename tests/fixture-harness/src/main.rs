@@ -59,8 +59,7 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
         let repository_root = root.join("../..");
         let stdlib =
             fs::canonicalize(repository_root.join("stdlib")).map_err(|error| error.to_string())?;
-        std::os::unix::fs::symlink(&stdlib, temporary.join("stdlib"))
-            .map_err(|error| error.to_string())?;
+        link_shared_stdlib(&stdlib, &temporary)?;
     }
     let binary = env::var("WOSY_BIN")
         .map(PathBuf::from)
@@ -294,6 +293,18 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
     fs::remove_dir_all(&temporary).map_err(|error| error.to_string())?;
     println!("passed {}", case.display());
     Ok(())
+}
+
+#[cfg(unix)]
+fn link_shared_stdlib(stdlib: &Path, temporary: &Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(stdlib, temporary.join("stdlib"))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn link_shared_stdlib(stdlib: &Path, temporary: &Path) -> Result<(), String> {
+    std::os::windows::fs::symlink_dir(stdlib, temporary.join("stdlib"))
+        .map_err(|error| error.to_string())
 }
 
 fn remove_manifest_field(manifest: &mut serde_json::Value, path: &str) -> Result<(), String> {
@@ -784,10 +795,10 @@ fn collect_cases(directory: &Path, cases: &mut Vec<PathBuf>) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_partial_fd_write_result, partial_fd_write_count, requires_selected_source_build,
-        WriteRecord,
+        assert_partial_fd_write_result, link_shared_stdlib, partial_fd_write_count,
+        requires_selected_source_build, WriteRecord,
     };
-    use std::path::Path;
+    use std::{env, fs, path::Path};
     use toml_edit::DocumentMut;
 
     #[test]
@@ -859,5 +870,25 @@ mod tests {
             assert_partial_fd_write_result(&writes, 3, Path::new("runtime_stdio")),
             Err("runtime_stdio: fd_write record count expected 2, observed 1".to_owned())
         );
+    }
+
+    #[test]
+    fn shared_stdlib_link_exposes_its_manifest() {
+        let temporary = env::temp_dir().join(format!(
+            "wosy-fixture-harness-stdlib-link-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temporary).expect("temporary directory");
+        let result = (|| -> Result<(), String> {
+            let stdlib = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stdlib");
+            link_shared_stdlib(&stdlib, &temporary)?;
+            fs::read_to_string(temporary.join("stdlib/wosy.toml"))
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })();
+
+        fs::remove_dir_all(&temporary).expect("temporary directory cleanup");
+        assert!(!temporary.exists(), "temporary directory was not removed");
+        result.expect("shared stdlib manifest is readable");
     }
 }
