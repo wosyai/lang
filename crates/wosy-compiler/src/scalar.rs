@@ -3456,8 +3456,8 @@ fn call_output_sequence_in_module(
     else {
         return None;
     };
-    let (callable, target) = match receiver {
-        None => (scope.get(name), module),
+    let (callable, target, member_visible) = match receiver {
+        None => (scope.get(name), module, true),
         Some(binding) => {
             let namespace = module
                 .namespace_bindings
@@ -3467,7 +3467,11 @@ fn call_output_sequence_in_module(
                 let target = modules
                     .iter()
                     .find(|candidate| candidate.source == namespace.target)?;
-                (target.members.get(name), target)
+                (
+                    target.members.get(name),
+                    target,
+                    target.members.contains_key(name),
+                )
             } else {
                 (
                     module.items.iter().find_map(|item| match item {
@@ -3481,38 +3485,45 @@ fn call_output_sequence_in_module(
                         _ => None,
                     }),
                     module,
+                    true,
                 )
             }
         }
     };
-    if let Some(overload) = target.items.iter().find_map(|item| match item {
-        ScalarItem::Function(function)
-            if function.name == *name && !function.overload_arms.is_empty() =>
-        {
-            Some(function)
+    if member_visible {
+        if let Some(overload) = target.items.iter().find_map(|item| match item {
+            ScalarItem::Function(function)
+                if function.name == *name && !function.overload_arms.is_empty() =>
+            {
+                Some(function)
+            }
+            _ => None,
+        }) {
+            let argument_types = arguments
+                .iter()
+                .map(|argument| overload_argument_type(argument, scope))
+                .collect::<Option<Vec<_>>>()?;
+            let ScalarType::Callable { outputs, .. } =
+                resolve_overload_candidate(overload, &argument_types, None)
+                    .ok()?
+                    .0
+            else {
+                return None;
+            };
+            return Some(outputs);
         }
-        _ => None,
-    }) {
-        let argument_types = arguments
-            .iter()
-            .map(|argument| overload_argument_type(argument, scope))
-            .collect::<Option<Vec<_>>>()?;
-        let ScalarType::Callable { outputs, .. } =
-            resolve_overload_candidate(overload, &argument_types, None)
-                .ok()?
-                .0
-        else {
-            return None;
-        };
-        return Some(outputs);
     }
     let callable = callable?;
-    let generic_parameters = target.items.iter().find_map(|item| match item {
-        ScalarItem::Function(function) if function.name == *name => {
-            Some(&function.generic_parameters)
-        }
-        _ => None,
-    });
+    let generic_parameters = if member_visible {
+        target.items.iter().find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == *name => {
+                Some(&function.generic_parameters)
+            }
+            _ => None,
+        })
+    } else {
+        None
+    };
     let callable = if let Some(parameters) = generic_parameters {
         substitute_generic_callable(callable, parameters, type_arguments)?
     } else {
@@ -13133,6 +13144,52 @@ bool integer_inversion = !1;
             assert_eq!(diagnostic.labels[0].span.source, main_source);
             assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(start, end));
         }
+    }
+
+    #[test]
+    fn keeps_private_overload_output_sequences_local() {
+        let child_source = module_source("src/child.w");
+        let child = module_from_text(
+            child_source.clone(),
+            "%%start\n_private_pair = overload {\n    (i32, bool)(i64) => fn(value) { 1, true };\n};\npublic_pair = overload {\n    (i32, bool)(i64) => fn(value) { 1, true };\n};\ni32 local_number, bool local_flag = _private_pair(1);\n%%end",
+        );
+        let main_source = module_source("src/main.w");
+        let main_text = "%%start\nchild = namespace output_sequences \"src/child.w\";\ni32 public_number, bool public_flag = child.public_pair(1);\nbool private_flag, i32 private_number = child._private_pair(1);\n%%end";
+        let main = module_from_text(main_source.clone(), main_text);
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let result = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source.clone(),
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "child".to_owned(),
+                        target: child_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(child_source.clone(), child.items, Vec::new()),
+            ],
+            vec![main_source.clone(), child_source],
+        ));
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        let diagnostic = &result.diagnostics[0];
+        assert_eq!(diagnostic.code, "M0002");
+        assert_eq!(diagnostic.labels[0].span.source, main_source);
+        let start = main_text
+            .find("child._private_pair")
+            .expect("private overload member")
+            + "child.".len();
+        let start = u32::try_from(start).expect("source span");
+        let end = start + u32::try_from("_private_pair".len()).expect("member span");
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(start, end));
+        assert!(!result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"));
     }
 
     #[test]
