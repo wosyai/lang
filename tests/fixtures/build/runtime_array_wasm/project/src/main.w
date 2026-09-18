@@ -26,6 +26,21 @@ u8[](u8[]) replace = fn(old) {
 	next
 };
 
+struct Packet {
+	*?u8 data;
+	u64 length;
+}
+
+*Packet() make_packet = fn {
+	u64 length = 1;
+	u8[length] bytes;
+	bytes[0] = 4;
+	*?u8 data = null;
+	unsafe { data = &?bytes[0]; };
+	Packet result = { .data = data; .length = length; };
+	&result
+};
+
 unit() run = fn {
 	u64 length = 3;
 	u8[length] bytes;
@@ -36,6 +51,12 @@ unit() run = fn {
 	u8[] returned = make();
 	u8[] replaced = replace(returned);
 	u8[] alias = relay(replaced);
+	*Packet returned_packet = make_packet();
+	u64 overwrite_length = 1;
+	u8[overwrite_length] overwrite;
+	overwrite[0] = 9;
+	u8 packet_value = 0;
+	unsafe { packet_value = *(*returned_packet).data; };
 	u8[] moved = bytes;
 	u8 moved_expected = 7;
 	u8 transferred = alias[0];
@@ -50,7 +71,7 @@ unit() run = fn {
 		nested[0] = 6;
 	};
 	u8 expected = 8;
-	if (value != expected || transferred != transferred_expected || widened_value != widened_expected || moved[0] != moved_expected) {
+	if (value != expected || transferred != transferred_expected || widened_value != widened_expected || moved[0] != moved_expected || packet_value != transferred_expected) {
 		core.system_panic();
 	};
 };

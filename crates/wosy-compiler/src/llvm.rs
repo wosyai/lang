@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::mem::ManuallyDrop;
 use std::num::NonZeroU32;
@@ -1957,15 +1957,213 @@ fn release_scope_runtime_array_owners<'ctx, 'module>(
 
 fn transfer_runtime_array_return(
     state: &mut EmitState<'_, '_>,
+    block: &ScalarBlock,
     expression: &ScalarExpression,
     ty: &ScalarType,
 ) {
     if !matches!(ty, ScalarType::RuntimeArray { .. }) {
+        let bindings = return_bindings(block);
+        let mut visited = BTreeSet::new();
+        for name in escaped_runtime_array_owners(expression, &bindings, &mut visited) {
+            if state.runtime_array_owners.contains_key(&name) {
+                state.runtime_array_owners.insert(name, false);
+            }
+        }
         return;
     }
     if let ScalarExpression::Name { name, .. } = expression {
         state.runtime_array_owners.insert(name.clone(), false);
     }
+}
+
+fn return_bindings(block: &ScalarBlock) -> BTreeMap<String, ScalarExpression> {
+    let mut bindings = BTreeMap::new();
+    for item in &block.items {
+        match item {
+            ScalarBlockItem::LocalBinding(binding) => {
+                let receivers = binding_receivers(binding);
+                if receivers.len() == 1 {
+                    bindings.insert(receivers[0].0.clone(), binding.value.clone());
+                } else if binding.output_origin == ScalarBindingOutputOrigin::IndependentExpressions
+                {
+                    for ((name, _), output) in receivers.iter().zip(&binding.output_values) {
+                        bindings.insert(name.clone(), output.value.clone());
+                    }
+                }
+            }
+            ScalarBlockItem::Assignment(assignment) => {
+                if assignment.targets.len() == 1 {
+                    bindings.insert(assignment.target.clone(), assignment.value.clone());
+                }
+                for (target, value) in assignment.targets.iter().zip(&assignment.values) {
+                    if let crate::ScalarPlace::Name { name, .. } = &target.place {
+                        bindings.insert(name.clone(), value.clone());
+                    }
+                }
+            }
+            ScalarBlockItem::Expression(expression) => {
+                extend_return_bindings_from_expression(&mut bindings, expression);
+            }
+            ScalarBlockItem::While(while_expression) => {
+                extend_return_bindings_from_expression(&mut bindings, &while_expression.condition);
+            }
+        }
+    }
+    bindings
+}
+
+fn extend_return_bindings_from_expression(
+    bindings: &mut BTreeMap<String, ScalarExpression>,
+    expression: &ScalarExpression,
+) {
+    match expression {
+        ScalarExpression::Block(block) => bindings.extend(return_bindings(block)),
+        ScalarExpression::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            bindings.extend(return_bindings(then_branch));
+            bindings.extend(return_bindings(else_branch));
+        }
+        ScalarExpression::UnitIf { then_branch, .. } => {
+            bindings.extend(return_bindings(then_branch));
+        }
+        ScalarExpression::Name { .. }
+        | ScalarExpression::Member { .. }
+        | ScalarExpression::Integer { .. }
+        | ScalarExpression::InvalidInteger { .. }
+        | ScalarExpression::Float { .. }
+        | ScalarExpression::InvalidFloat { .. }
+        | ScalarExpression::Boolean { .. }
+        | ScalarExpression::Char { .. }
+        | ScalarExpression::Utf8 { .. }
+        | ScalarExpression::RawAddress { .. }
+        | ScalarExpression::CheckedAddress { .. }
+        | ScalarExpression::Dereference { .. }
+        | ScalarExpression::IndexedRead { .. }
+        | ScalarExpression::StructLiteral { .. }
+        | ScalarExpression::ArrayLiteral { .. }
+        | ScalarExpression::Binary { .. }
+        | ScalarExpression::Unary { .. }
+        | ScalarExpression::Call { .. } => {}
+    }
+}
+
+fn escaped_runtime_array_owners(
+    expression: &ScalarExpression,
+    bindings: &BTreeMap<String, ScalarExpression>,
+    visited: &mut BTreeSet<String>,
+) -> BTreeSet<String> {
+    match expression {
+        ScalarExpression::Name { name, .. } => {
+            if !visited.insert(name.clone()) {
+                return BTreeSet::new();
+            }
+            let owners = match bindings.get(name) {
+                Some(value) => escaped_runtime_array_owners(value, bindings, visited),
+                None => BTreeSet::new(),
+            };
+            visited.remove(name);
+            owners
+        }
+        ScalarExpression::RawAddress { place, .. }
+        | ScalarExpression::CheckedAddress { place, .. } => {
+            escaped_runtime_array_owners_in_place(place, bindings, visited)
+        }
+        ScalarExpression::StructLiteral { fields, .. } => {
+            fields.iter().fold(BTreeSet::new(), |mut owners, field| {
+                owners.extend(escaped_runtime_array_owners(
+                    &field.value,
+                    bindings,
+                    visited,
+                ));
+                owners
+            })
+        }
+        ScalarExpression::ArrayLiteral { elements, .. } => {
+            elements
+                .iter()
+                .fold(BTreeSet::new(), |mut owners, element| {
+                    owners.extend(escaped_runtime_array_owners(element, bindings, visited));
+                    owners
+                })
+        }
+        ScalarExpression::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let mut owners = escaped_runtime_array_owners_in_block(then_branch, bindings, visited);
+            owners.extend(escaped_runtime_array_owners_in_block(
+                else_branch,
+                bindings,
+                visited,
+            ));
+            owners
+        }
+        ScalarExpression::Block(block) => {
+            escaped_runtime_array_owners_in_block(block, bindings, visited)
+        }
+        ScalarExpression::Dereference { place, .. }
+        | ScalarExpression::IndexedRead { place, .. } => {
+            escaped_runtime_array_owners_in_place(place, bindings, visited)
+        }
+        ScalarExpression::Member { .. }
+        | ScalarExpression::Integer { .. }
+        | ScalarExpression::InvalidInteger { .. }
+        | ScalarExpression::Float { .. }
+        | ScalarExpression::InvalidFloat { .. }
+        | ScalarExpression::Boolean { .. }
+        | ScalarExpression::Char { .. }
+        | ScalarExpression::Utf8 { .. }
+        | ScalarExpression::Binary { .. }
+        | ScalarExpression::Unary { .. }
+        | ScalarExpression::Call { .. }
+        | ScalarExpression::UnitIf { .. } => BTreeSet::new(),
+    }
+}
+
+fn escaped_runtime_array_owners_in_place(
+    place: &crate::ScalarPlace,
+    bindings: &BTreeMap<String, ScalarExpression>,
+    visited: &mut BTreeSet<String>,
+) -> BTreeSet<String> {
+    match place {
+        crate::ScalarPlace::Name { name, .. } => {
+            let mut owners = BTreeSet::from([name.clone()]);
+            if let Some(value) = bindings.get(name) {
+                owners.extend(escaped_runtime_array_owners(value, bindings, visited));
+            }
+            owners
+        }
+        crate::ScalarPlace::Field { base, .. } | crate::ScalarPlace::Index { base, .. } => {
+            escaped_runtime_array_owners_in_place(base, bindings, visited)
+        }
+        crate::ScalarPlace::Dereference { pointer, .. } => {
+            escaped_runtime_array_owners(pointer, bindings, visited)
+        }
+    }
+}
+
+fn escaped_runtime_array_owners_in_block(
+    block: &ScalarBlock,
+    bindings: &BTreeMap<String, ScalarExpression>,
+    visited: &mut BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut local_bindings = bindings.clone();
+    local_bindings.extend(return_bindings(block));
+    block
+        .final_output_values
+        .iter()
+        .fold(BTreeSet::new(), |mut owners, output| {
+            owners.extend(escaped_runtime_array_owners(
+                &output.value,
+                &local_bindings,
+                visited,
+            ));
+            owners
+        })
 }
 
 fn emit_runtime_array_allocation<'ctx, 'module>(
@@ -2666,7 +2864,7 @@ fn emit_final_outputs<'ctx, 'module>(
             return emit_expression(context, state, &output.value);
         }
         let value = emit_typed_expression(context, state, &output.value, &output.ty)?;
-        transfer_runtime_array_return(state, &output.value, &output.ty);
+        transfer_runtime_array_return(state, block, &output.value, &output.ty);
         return Ok(value);
     }
     if let Some((condition, then_branch, else_branch)) = recombine_conditional_final_outputs(block)
@@ -2698,7 +2896,7 @@ fn emit_final_outputs<'ctx, 'module>(
         .map(|output| emit_typed_expression(context, state, &output.value, &output.ty))
         .collect::<Result<Vec<_>, _>>()?;
     for output in &block.final_output_values {
-        transfer_runtime_array_return(state, &output.value, &output.ty);
+        transfer_runtime_array_return(state, block, &output.value, &output.ty);
     }
     build_aggregate(context, state, &outputs, values)
 }
@@ -2723,7 +2921,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
             module,
             modules,
         )?;
-        transfer_runtime_array_return(state, &output.value, &output.ty);
+        transfer_runtime_array_return(state, block, &output.value, &output.ty);
         return Ok(value);
     }
     if let Some((condition, then_branch, else_branch)) = recombine_conditional_final_outputs(block)
@@ -2767,7 +2965,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     for output in &block.final_output_values {
-        transfer_runtime_array_return(state, &output.value, &output.ty);
+        transfer_runtime_array_return(state, block, &output.value, &output.ty);
     }
     build_aggregate(context, state, &outputs, values)
 }
@@ -5833,7 +6031,11 @@ mod tests {
             )
             .result,
         );
-        assert!(validation.diagnostics.is_empty(), "{:?}", validation.diagnostics);
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
 
         let llvm = emit_scalar_llvm(&validation)
             .expect("integer comparison LLVM")
@@ -6004,6 +6206,37 @@ mod tests {
                 .expect("moved runtime array LLVM")
                 .to_text();
             assert!(llvm.contains("call ptr @__wosy_core_alloc"), "{llvm}");
+            assert_eq!(
+                llvm.matches("call void @__wosy_core_free").count(),
+                1,
+                "{llvm}"
+            );
+        }
+    }
+
+    #[test]
+    fn transfers_runtime_array_ownership_through_a_returned_aggregate_pointer() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nstruct Packet { *?u8 data; u64 length; }\n*Packet() make_packet = fn { u64 length = 1; u8[length] bytes; bytes[0] = 4; *?u8 data = null; unsafe { data = &?bytes[0]; }; Packet result = { .data = data; .length = length; }; &result };\nunit() release = fn { u64 length = 1; u8[length] temporary; temporary[0] = 9; };\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let validation = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(
+                validation.diagnostics.is_empty(),
+                "{:?}",
+                validation.diagnostics
+            );
+            let llvm = emit_scalar_llvm(&validation)
+                .expect("returned aggregate pointer LLVM")
+                .to_text();
+            let packet = &llvm[llvm.find("@make_packet(").expect("packet function")..];
+            let packet = &packet[..packet.find("\n}").expect("packet function end")];
+            assert!(!packet.contains("call void @__wosy_core_free"), "{llvm}");
             assert_eq!(
                 llvm.matches("call void @__wosy_core_free").count(),
                 1,

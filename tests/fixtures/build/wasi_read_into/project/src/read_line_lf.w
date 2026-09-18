@@ -23,6 +23,9 @@ Nwritten written = { .value = 0; };
 unsafe {
 	text, status = std.read_line(4);
 	if (text != null && (*text).length == 1 && status == std.ReadLineStatus::line) {
+		u64 overwrite_length = 4;
+		u8[overwrite_length] overwrite;
+		overwrite[0] = 121;
 		data = (*text).data;
 		length = (*text).length;
 		iovec.data = data;
