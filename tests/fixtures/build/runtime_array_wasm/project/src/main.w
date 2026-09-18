@@ -10,6 +10,13 @@ u8[](u8[]) relay = fn(values) {
 	values
 };
 
+u8[](u8[]) replace = fn(old) {
+	u64 length = 1;
+	u8[length] next;
+	next[0] = old[0];
+	next
+};
+
 unit() run = fn {
 	u64 length = 3;
 	u8[length] bytes;
@@ -18,7 +25,8 @@ unit() run = fn {
 	bytes[2] = 9;
 	u8 value = bytes[1];
 	u8[] returned = make();
-	u8[] alias = relay(returned);
+	u8[] replaced = replace(returned);
+	u8[] alias = relay(replaced);
 	u8 transferred = alias[0];
 	u8 transferred_expected = 4;
 	u8[1] fixed = [5];

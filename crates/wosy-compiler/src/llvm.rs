@@ -79,6 +79,7 @@ struct EmitState<'ctx, 'module> {
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
+    runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
     values: BTreeMap<String, EmitValue<'ctx>>,
     storage: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
     runtime_array_owners: BTreeMap<String, bool>,
@@ -89,6 +90,26 @@ struct EmitState<'ctx, 'module> {
     target_layout: ScalarTargetLayout,
     next_literal: usize,
     next_block: usize,
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeArrayResultProvenance {
+    LocalOwner,
+    ParameterAlias,
+    FixedWidening,
+    FreshCall,
+}
+
+impl RuntimeArrayResultProvenance {
+    fn owns(self) -> bool {
+        matches!(self, Self::LocalOwner | Self::FreshCall)
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeArrayAssignmentProvenance {
+    result: RuntimeArrayResultProvenance,
+    source_name: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -276,6 +297,23 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         "main".into(),
         module.add_function("main", context.i32_type().fn_type(&[], false), None),
     );
+    let mut runtime_array_results = BTreeMap::new();
+    for function in validation
+        .program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarItem::Function(function) => Some(function),
+            _ => None,
+        })
+    {
+        if let Some(target) = call_targets.get(&function.name) {
+            insert_runtime_array_result_provenance(&mut runtime_array_results, target, function);
+        }
+    }
+    for (_, function, name) in specializations.iter().chain(overloads.iter()) {
+        insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
+    }
     for function in validation
         .program
         .items
@@ -295,6 +333,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &functions,
             &call_targets,
             &signatures,
+            &runtime_array_results,
             &globals,
             function,
             &function.name,
@@ -311,6 +350,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &functions,
             &call_targets,
             &signatures,
+            &runtime_array_results,
             &globals,
             function,
             name,
@@ -327,6 +367,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &functions,
             &call_targets,
             &signatures,
+            &runtime_array_results,
             &globals,
             function,
             name,
@@ -342,6 +383,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         &functions,
         &call_targets,
         &signatures,
+        &runtime_array_results,
         &globals,
         &validation.program.items,
         &module,
@@ -542,6 +584,16 @@ pub fn emit_scalar_project_llvm(
         "main".into(),
         module.add_function("main", context.i32_type().fn_type(&[], false), None),
     );
+    let mut runtime_array_results = BTreeMap::new();
+    for (_, function, name) in &definitions {
+        insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
+    }
+    for (_, function, name) in &project_specializations {
+        insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
+    }
+    for (_, function, name) in &project_overloads {
+        insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
+    }
     for (source_module, function, name) in definitions {
         emit_project_function(
             &context,
@@ -549,6 +601,7 @@ pub fn emit_scalar_project_llvm(
             &functions,
             &call_targets,
             &signatures,
+            &runtime_array_results,
             function,
             source_module,
             &modules,
@@ -566,6 +619,7 @@ pub fn emit_scalar_project_llvm(
             &functions,
             &call_targets,
             &signatures,
+            &runtime_array_results,
             function,
             source_module,
             &modules,
@@ -583,6 +637,7 @@ pub fn emit_scalar_project_llvm(
             &functions,
             &call_targets,
             &signatures,
+            &runtime_array_results,
             function,
             source_module,
             &modules,
@@ -599,6 +654,7 @@ pub fn emit_scalar_project_llvm(
         &functions,
         &call_targets,
         &signatures,
+        &runtime_array_results,
         &modules,
         &globals,
         &module,
@@ -1677,7 +1733,9 @@ fn store_binding_outputs<'ctx, 'module>(
         if matches!(ty, ScalarType::RuntimeArray { .. }) {
             state.runtime_array_owners.insert(
                 name.clone(),
-                runtime_array_call_transfers_ownership(state, &binding.value),
+                runtime_array_assignment_provenance(state, &binding.value)
+                    .result
+                    .owns(),
             );
             state.runtime_array_allocations.insert(name.clone(), false);
         }
@@ -1685,19 +1743,108 @@ fn store_binding_outputs<'ctx, 'module>(
     Ok(())
 }
 
-fn runtime_array_call_transfers_ownership(
+fn runtime_array_assignment_provenance(
     state: &EmitState<'_, '_>,
     expression: &ScalarExpression,
-) -> bool {
-    let ScalarExpression::Call { arguments, .. } = expression else {
-        return false;
+) -> RuntimeArrayAssignmentProvenance {
+    match expression {
+        ScalarExpression::Name { name, .. } => RuntimeArrayAssignmentProvenance {
+            result: if state
+                .runtime_array_owners
+                .get(name)
+                .copied()
+                .unwrap_or(false)
+            {
+                RuntimeArrayResultProvenance::LocalOwner
+            } else {
+                RuntimeArrayResultProvenance::ParameterAlias
+            },
+            source_name: Some(name.clone()),
+        },
+        ScalarExpression::Call {
+            receiver,
+            name,
+            type_arguments,
+            overload_selection,
+            ..
+        } => {
+            let qualified = receiver
+                .as_ref()
+                .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"));
+            let lookup = overload_selection
+                .as_ref()
+                .map(|selection| selected_overload_lookup_key(&qualified, selection));
+            let target = state
+                .call_targets
+                .get(lookup.as_ref().unwrap_or(&qualified))
+                .or_else(|| {
+                    state
+                        .call_targets
+                        .get(&specialization_lookup_key(&qualified, type_arguments))
+                })
+                .or_else(|| state.call_targets.get(&qualified));
+            RuntimeArrayAssignmentProvenance {
+                result: target
+                    .and_then(|target| state.runtime_array_results.get(target))
+                    .copied()
+                    .unwrap_or(RuntimeArrayResultProvenance::FreshCall),
+                source_name: None,
+            }
+        }
+        _ => RuntimeArrayAssignmentProvenance {
+            result: RuntimeArrayResultProvenance::FixedWidening,
+            source_name: None,
+        },
+    }
+}
+
+fn insert_runtime_array_result_provenance(
+    results: &mut BTreeMap<String, RuntimeArrayResultProvenance>,
+    name: &str,
+    function: &ScalarFunction,
+) {
+    if let Some(provenance) = function_runtime_array_result_provenance(function) {
+        results.insert(name.into(), provenance);
+    }
+}
+
+fn function_runtime_array_result_provenance(
+    function: &ScalarFunction,
+) -> Option<RuntimeArrayResultProvenance> {
+    let ScalarType::Callable { outputs, .. } = &function.signature else {
+        return None;
     };
-    !arguments.iter().any(|argument| {
-        matches!(argument, ScalarExpression::Name { name, .. } if matches!(
-            state.storage.get(name).map(|(_, ty)| ty),
-            Some(ScalarType::RuntimeArray { .. })
-        ))
-    })
+    if !matches!(outputs.outputs.first()?.ty, ScalarType::RuntimeArray { .. }) {
+        return None;
+    }
+    let expression = function.body.final_output_values.first()?.value.clone();
+    match expression {
+        ScalarExpression::Call { .. } => Some(RuntimeArrayResultProvenance::FreshCall),
+        ScalarExpression::Name { name, .. } => {
+            if function.parameters.contains(&name) {
+                return Some(RuntimeArrayResultProvenance::ParameterAlias);
+            }
+            function.body.items.iter().find_map(|item| match item {
+                ScalarBlockItem::LocalBinding(binding)
+                    if binding_receivers(binding)
+                        .iter()
+                        .any(|(receiver, _)| receiver == &name) =>
+                {
+                    if binding.is_allocation {
+                        Some(RuntimeArrayResultProvenance::LocalOwner)
+                    } else if matches!(binding.declared_type, ScalarType::Array { .. }) {
+                        Some(RuntimeArrayResultProvenance::FixedWidening)
+                    } else if matches!(binding.value, ScalarExpression::Call { .. }) {
+                        Some(RuntimeArrayResultProvenance::FreshCall)
+                    } else {
+                        Some(RuntimeArrayResultProvenance::ParameterAlias)
+                    }
+                }
+                _ => None,
+            })
+        }
+        _ => Some(RuntimeArrayResultProvenance::FixedWidening),
+    }
 }
 
 fn release_runtime_array_owner<'ctx, 'module>(
@@ -1904,6 +2051,7 @@ fn emit_function<'ctx, 'module>(
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
+    runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     function: &ScalarFunction,
     name: &str,
@@ -1923,6 +2071,7 @@ fn emit_function<'ctx, 'module>(
         functions,
         call_targets,
         signatures,
+        runtime_array_results,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         runtime_array_owners: BTreeMap::new(),
@@ -2004,6 +2153,7 @@ fn emit_main<'ctx, 'module>(
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
+    runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     items: &[ScalarItem],
     module: &'module Module<'ctx>,
@@ -2021,6 +2171,7 @@ fn emit_main<'ctx, 'module>(
         functions,
         call_targets,
         signatures,
+        runtime_array_results,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         runtime_array_owners: BTreeMap::new(),
@@ -2037,6 +2188,9 @@ fn emit_main<'ctx, 'module>(
         match item {
             ScalarItem::Binding(binding) => {
                 let value = emit_binding_value(context, &mut state, binding)?;
+                if binding.is_allocation {
+                    continue;
+                }
                 for (position, (name, ty)) in binding_receivers(binding).iter().enumerate() {
                     if *ty == ScalarType::Unit {
                         continue;
@@ -2056,6 +2210,7 @@ fn emit_main<'ctx, 'module>(
             ScalarItem::Namespace(_) | ScalarItem::Extern(_) | ScalarItem::Function(_) => {}
         }
     }
+    release_scope_runtime_array_owners(context, &mut state, &BTreeMap::new())?;
     builder
         .build_return(Some(&context.i32_type().const_zero()))
         .map_err(builder_error)?;
@@ -2068,6 +2223,7 @@ fn emit_project_function<'ctx, 'module>(
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
+    runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
     function: &ScalarFunction,
     source_module: &ScalarModule,
     modules: &[&'module ScalarModule],
@@ -2088,6 +2244,7 @@ fn emit_project_function<'ctx, 'module>(
         functions,
         call_targets,
         signatures,
+        runtime_array_results,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         runtime_array_owners: BTreeMap::new(),
@@ -2182,6 +2339,7 @@ fn emit_project_main<'ctx, 'module>(
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
+    runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
     modules: &[&ScalarModule],
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     module: &'module Module<'ctx>,
@@ -2199,6 +2357,7 @@ fn emit_project_main<'ctx, 'module>(
         functions,
         call_targets,
         signatures,
+        runtime_array_results,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         runtime_array_owners: BTreeMap::new(),
@@ -2259,6 +2418,9 @@ fn initialize_project_module<'ctx, 'module>(
             }
             ScalarItem::Binding(binding) => {
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
+                if binding.is_allocation {
+                    continue;
+                }
                 for (position, (name, ty)) in binding_receivers(binding).iter().enumerate() {
                     if *ty == ScalarType::Unit {
                         continue;
@@ -2471,7 +2633,7 @@ fn emit_assignment<'ctx, 'module>(
             None => emit_expression(context, state, value),
         },
     )?;
-    for (target, (value, ty)) in assignment.targets.iter().zip(values) {
+    for (target, (value, ty, provenance)) in assignment.targets.iter().zip(values) {
         if ty == ScalarType::Unit {
             state.values.insert(target.target.clone(), EmitValue::Unit);
             continue;
@@ -2500,6 +2662,7 @@ fn emit_assignment<'ctx, 'module>(
             }
             place => place_pointer(context, state, place, None)?,
         };
+        transition_runtime_array_assignment(context, state, target, &ty, &provenance)?;
         store_value(context, state, destination, &ty, value)?;
     }
     Ok(EmitValue::Unit)
@@ -2540,7 +2703,7 @@ fn emit_project_assignment<'ctx, 'module>(
             None => emit_project_expression(context, state, value, module, modules),
         },
     )?;
-    for (target, (value, ty)) in assignment.targets.iter().zip(values) {
+    for (target, (value, ty, provenance)) in assignment.targets.iter().zip(values) {
         if ty == ScalarType::Unit {
             state.values.insert(target.target.clone(), EmitValue::Unit);
             continue;
@@ -2582,9 +2745,38 @@ fn emit_project_assignment<'ctx, 'module>(
                 place => place_pointer(context, state, place, None)?,
             }
         };
+        transition_runtime_array_assignment(context, state, target, &ty, &provenance)?;
         store_value(context, state, destination, &ty, value)?;
     }
     Ok(EmitValue::Unit)
+}
+
+fn transition_runtime_array_assignment<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    target: &crate::scalar::ScalarAssignmentTarget,
+    ty: &ScalarType,
+    provenance: &RuntimeArrayAssignmentProvenance,
+) -> Result<(), String> {
+    if !matches!(ty, ScalarType::RuntimeArray { .. }) {
+        return Ok(());
+    }
+    let crate::ScalarPlace::Name { name, .. } = &target.place else {
+        return Ok(());
+    };
+    let source_is_target = provenance.source_name.as_deref() == Some(name);
+    if !source_is_target {
+        release_runtime_array_owner(context, state, name)?;
+    }
+    let owns = provenance.result.owns();
+    state.runtime_array_owners.insert(name.clone(), owns);
+    state.runtime_array_allocations.insert(name.clone(), false);
+    if owns && !source_is_target {
+        if let Some(source) = provenance.source_name.as_ref() {
+            state.runtime_array_owners.insert(source.clone(), false);
+        }
+    }
+    Ok(())
 }
 
 fn assignment_target_type<'ctx, 'module>(
@@ -2716,11 +2908,19 @@ fn materialize_assignment_values<'ctx, 'module>(
         &ScalarExpression,
         Option<&ScalarType>,
     ) -> Result<EmitValue<'ctx>, String>,
-) -> Result<Vec<(EmitValue<'ctx>, ScalarType)>, String> {
+) -> Result<
+    Vec<(
+        EmitValue<'ctx>,
+        ScalarType,
+        RuntimeArrayAssignmentProvenance,
+    )>,
+    String,
+> {
     let mut emit = emit;
     let mut position = 0;
     let mut values = Vec::new();
     for expression in expressions {
+        let provenance = runtime_array_assignment_provenance(state, expression);
         let value = emit(
             state,
             expression,
@@ -2738,7 +2938,7 @@ fn materialize_assignment_values<'ctx, 'module>(
         for (output_position, ty) in output_types.into_iter().enumerate() {
             let value = extract_output(state, value.clone(), output_position)?;
             if ty == ScalarType::Unit {
-                values.push((EmitValue::Unit, ty));
+                values.push((EmitValue::Unit, ty, provenance.clone()));
                 position += 1;
                 continue;
             }
@@ -2764,7 +2964,7 @@ fn materialize_assignment_values<'ctx, 'module>(
                         .map_err(builder_error)?,
                 )
             };
-            values.push((value, ty));
+            values.push((value, ty, provenance.clone()));
             position += 1;
         }
     }
@@ -2834,7 +3034,9 @@ fn emit_block_item<'ctx, 'module>(
             if matches!(binding.declared_type, ScalarType::RuntimeArray { .. }) {
                 state.runtime_array_owners.insert(
                     binding.name.clone(),
-                    runtime_array_call_transfers_ownership(state, &binding.value),
+                    runtime_array_assignment_provenance(state, &binding.value)
+                        .result
+                        .owns(),
                 );
                 state
                     .runtime_array_allocations
@@ -2921,7 +3123,9 @@ fn emit_project_block_item<'ctx, 'module>(
             if matches!(binding.declared_type, ScalarType::RuntimeArray { .. }) {
                 state.runtime_array_owners.insert(
                     binding.name.clone(),
-                    runtime_array_call_transfers_ownership(state, &binding.value),
+                    runtime_array_assignment_provenance(state, &binding.value)
+                        .result
+                        .owns(),
                 );
                 state
                     .runtime_array_allocations
