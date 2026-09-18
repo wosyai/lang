@@ -859,7 +859,7 @@ fn basic_type<'ctx>(
         ScalarType::RawPointer(_) | ScalarType::CheckedReference { .. } => {
             Ok(pointer_integer_type(context, target_layout).into())
         }
-        ScalarType::Struct(_) | ScalarType::Array { .. } => {
+        ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::RuntimeArray { .. } => {
             Ok(context.ptr_type(AddressSpace::default()).into())
         }
         _ => Err("unit is only valid as a function result".into()),
@@ -912,7 +912,9 @@ fn value_type(ty: &ScalarType) -> Result<LlvmValueType, String> {
         ScalarType::RawPointer(_) | ScalarType::CheckedReference { .. } => {
             Ok(LlvmValueType::Pointer)
         }
-        ScalarType::Struct(_) | ScalarType::Array { .. } => Ok(LlvmValueType::Pointer),
+        ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::RuntimeArray { .. } => {
+            Ok(LlvmValueType::Pointer)
+        }
         _ => Err("unsupported LLVM scalar type".into()),
     }
 }
@@ -1059,8 +1061,11 @@ fn place_pointer<'ctx, 'module>(
             let base_pointer = place_pointer(context, state, base, project)?;
             let base_type = assignment_place_type(state, base)
                 .ok_or_else(|| "unknown LLVM indexed place type".to_owned())?;
-            if !matches!(base_type, ScalarType::Array { .. }) {
-                return Err("LLVM indexed place requires a fixed array".to_owned());
+            if !matches!(
+                base_type,
+                ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }
+            ) {
+                return Err("LLVM indexed place requires an array".to_owned());
             }
             let index = take_basic(match project {
                 Some(project) => emit_project_typed_expression(
@@ -1074,6 +1079,18 @@ fn place_pointer<'ctx, 'module>(
                 None => emit_typed_expression(context, state, index, &ScalarType::U64)?,
             })?
             .into_int_value();
+            if let ScalarType::RuntimeArray { element, .. } = base_type {
+                let element = storage_type(context, &element, state.structs, state.target_layout)?;
+                return unsafe {
+                    state.builder.build_in_bounds_gep(
+                        element,
+                        base_pointer,
+                        &[index],
+                        "array_element",
+                    )
+                }
+                .map_err(builder_error);
+            }
             let array = storage_type(context, &base_type, state.structs, state.target_layout)?;
             unsafe {
                 state.builder.build_in_bounds_gep(
@@ -1129,7 +1146,10 @@ fn emit_place_value_in_project<'ctx, 'module>(
         crate::ScalarPlace::Index { .. } => assignment_place_type(state, place)
             .ok_or_else(|| "unknown LLVM indexed place type".to_owned())?,
     };
-    if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
+    if matches!(
+        ty,
+        ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }
+    ) {
         return Ok(EmitValue::Basic(pointer.into()));
     }
     Ok(EmitValue::Basic(
@@ -1519,6 +1539,38 @@ fn store_binding_outputs<'ctx, 'module>(
     binding: &crate::ScalarBinding,
     value: EmitValue<'ctx>,
 ) -> Result<(), String> {
+    if binding.is_allocation {
+        let receiver = binding
+            .receivers
+            .first()
+            .ok_or_else(|| "runtime allocation has no receiver".to_owned())?;
+        let ScalarType::RuntimeArray { element, .. } = &receiver.ty else {
+            return Err("allocation binding requires a runtime array type".to_owned());
+        };
+        let length = receiver
+            .allocation_length
+            .as_ref()
+            .ok_or_else(|| "runtime allocation has no length".to_owned())?;
+        let length = take_basic(emit_typed_expression(
+            context,
+            state,
+            length,
+            &ScalarType::U64,
+        )?)?
+        .into_int_value();
+        let slot = state
+            .builder
+            .build_array_alloca(
+                storage_type(context, element, state.structs, state.target_layout)?,
+                length,
+                receiver.name.as_str(),
+            )
+            .map_err(builder_error)?;
+        state
+            .storage
+            .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
+        return Ok(());
+    }
     let receivers = binding_receivers(binding);
     for (position, (name, ty)) in receivers.iter().enumerate() {
         let value = extract_output(state, value.clone(), position)?;
@@ -2268,7 +2320,9 @@ fn assignment_place_type<'ctx, 'module>(
             pointer_target_type(state, pointer, None)
         }
         crate::ScalarPlace::Index { base, .. } => match assignment_place_type(state, base)? {
-            ScalarType::Array { element, .. } => Some(*element),
+            ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
+                Some(*element)
+            }
             _ => None,
         },
     }
@@ -2452,6 +2506,10 @@ fn emit_block_item<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
+            if binding.is_allocation {
+                store_binding_outputs(context, state, binding, EmitValue::Unit)?;
+                return Ok(EmitValue::Unit);
+            }
             let value =
                 emit_typed_expression(context, state, &binding.value, &binding.declared_type)?;
             if binding.declared_type == ScalarType::Unit {
@@ -2491,6 +2549,40 @@ fn emit_project_block_item<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
+            if binding.is_allocation {
+                let receiver = binding
+                    .receivers
+                    .first()
+                    .ok_or_else(|| "runtime allocation has no receiver".to_owned())?;
+                let ScalarType::RuntimeArray { element, .. } = &receiver.ty else {
+                    return Err("allocation binding requires a runtime array type".to_owned());
+                };
+                let length = receiver
+                    .allocation_length
+                    .as_ref()
+                    .ok_or_else(|| "runtime allocation has no length".to_owned())?;
+                let length = take_basic(emit_project_typed_expression(
+                    context,
+                    state,
+                    length,
+                    &ScalarType::U64,
+                    module,
+                    modules,
+                )?)?
+                .into_int_value();
+                let slot = state
+                    .builder
+                    .build_array_alloca(
+                        storage_type(context, element, state.structs, state.target_layout)?,
+                        length,
+                        receiver.name.as_str(),
+                    )
+                    .map_err(builder_error)?;
+                state
+                    .storage
+                    .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
+                return Ok(EmitValue::Unit);
+            }
             let value = emit_project_typed_expression(
                 context,
                 state,
@@ -4779,6 +4871,32 @@ mod tests {
             );
             assert!(llvm.contains("getelementptr inbounds [2 x i8]"), "{llvm}");
             assert!(llvm.contains("ptrtoint"), "{llvm}");
+            assert!(!llvm.contains("icmp ult"), "{llvm}");
+        }
+    }
+
+    #[test]
+    fn emits_runtime_array_allocation_and_indexing_for_both_targets() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nu8(u64) read = fn(length) { u8[length] bytes; bytes[0] = 7; bytes[0] };\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let validation = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(
+                validation.diagnostics.is_empty(),
+                "{:?}",
+                validation.diagnostics
+            );
+            let llvm = emit_scalar_llvm(&validation)
+                .expect("runtime array LLVM")
+                .to_text();
+            assert!(llvm.contains("alloca i8, i64 %length"), "{llvm}");
+            assert!(llvm.contains("getelementptr inbounds i8"), "{llvm}");
             assert!(!llvm.contains("icmp ult"), "{llvm}");
         }
     }

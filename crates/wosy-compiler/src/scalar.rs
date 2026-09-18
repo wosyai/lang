@@ -523,6 +523,7 @@ pub struct ScalarOutputReceiver {
     pub name: String,
     pub name_span: ByteSpan,
     pub ty: ScalarType,
+    pub allocation_length: Option<ScalarExpression>,
     pub span: ByteSpan,
 }
 
@@ -1150,6 +1151,7 @@ pub struct ScalarBinding {
     pub output_sequence: ScalarOutputSequence,
     pub output_values: Vec<ScalarOutputValue>,
     pub output_origin: ScalarBindingOutputOrigin,
+    pub is_allocation: bool,
     pub span: ByteSpan,
 }
 
@@ -3872,6 +3874,44 @@ fn block_item_type_in_module(
             for receiver in &binding.receivers {
                 validate_identifier_style(module, &receiver.name, receiver.name_span, diagnostics);
             }
+            if binding.is_allocation {
+                for receiver in &binding.receivers {
+                    let Some(length) = &receiver.allocation_length else {
+                        continue;
+                    };
+                    let actual = expression_type_in_module_expected(
+                        length,
+                        Some(&ScalarType::U64),
+                        scope,
+                        visible_names,
+                        folded_names,
+                        module,
+                        modules,
+                        diagnostics,
+                        unsafe_context,
+                    );
+                    expect_module_type(
+                        module,
+                        &ScalarType::U64,
+                        &actual,
+                        receiver.span,
+                        diagnostics,
+                    );
+                }
+                if declare_module_name(
+                    module,
+                    &binding.name,
+                    binding.span,
+                    visible_names,
+                    folded_names,
+                    diagnostics,
+                ) {
+                    for receiver in &binding.receivers {
+                        scope.insert(receiver.name.clone(), receiver.ty.clone());
+                    }
+                }
+                return ScalarType::Unit;
+            }
             let actual = expression_type_in_module_expected(
                 &binding.value,
                 Some(&binding.declared_type),
@@ -6271,7 +6311,9 @@ fn writable_path_type(
                 diagnostics,
             );
             match base_type {
-                ScalarType::Array { element, .. } => *element,
+                ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
+                    *element
+                }
                 ScalarType::Error => ScalarType::Error,
                 _ => {
                     diagnostics.push(diagnostic(
@@ -6387,7 +6429,9 @@ fn writable_path_type_in_module(
                 diagnostics,
             );
             match base_type {
-                ScalarType::Array { element, .. } => *element,
+                ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
+                    *element
+                }
                 ScalarType::Error => ScalarType::Error,
                 _ => {
                     diagnostics.push(module_diagnostic(
@@ -6493,7 +6537,9 @@ fn place_type(
                 diagnostics,
             );
             match base_type {
-                ScalarType::Array { element, .. } => *element,
+                ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
+                    *element
+                }
                 ScalarType::Error => ScalarType::Error,
                 _ => {
                     diagnostics.push(diagnostic(
@@ -6634,7 +6680,9 @@ fn place_type_in_module(
                 diagnostics,
             );
             match base_type {
-                ScalarType::Array { element, .. } => *element,
+                ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
+                    *element
+                }
                 ScalarType::Error => ScalarType::Error,
                 _ => {
                     diagnostics.push(module_diagnostic(
@@ -7253,15 +7301,33 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         .children()
         .filter(|child| child.kind() == SyntaxKind::Receiver)
         .map(|receiver| {
-            let ty_node = direct_nodes(&receiver)
-                .into_iter()
-                .next()
-                .expect("receiver type");
             let name = direct_token(&receiver, SyntaxKind::Identifier).expect("receiver name");
+            let allocation_length = receiver
+                .children()
+                .find(|child| child.kind() == SyntaxKind::Expression)
+                .map(|child| derive_expression(&child));
+            let ty = allocation_length.as_ref().map_or_else(
+                || {
+                    let ty_node = direct_nodes(&receiver)
+                        .into_iter()
+                        .next()
+                        .expect("receiver type");
+                    derive_type(&ty_node)
+                },
+                |_| {
+                    let element = direct_token(&receiver, SyntaxKind::TypeName)
+                        .expect("runtime array element type");
+                    ScalarType::RuntimeArray {
+                        element: Box::new(type_from_name(element.text(), token_span(&element))),
+                        span: wosy_syntax::byte_span(&receiver),
+                    }
+                },
+            );
             ScalarOutputReceiver {
                 name: name.text().to_owned(),
                 name_span: token_span(&name),
-                ty: derive_type(&ty_node),
+                ty,
+                allocation_length,
                 span: wosy_syntax::byte_span(&receiver),
             }
         })
@@ -7269,14 +7335,21 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
     let declared_type = receivers[0].ty.clone();
     let output_list = direct_nodes(node)
         .into_iter()
-        .find(|child| child.kind() == SyntaxKind::OutputList)
-        .expect("output list");
-    let outputs = output_list
-        .children()
-        .filter(|child| child.kind() == SyntaxKind::Expression)
-        .map(|child| derive_expression(&child))
-        .collect::<Vec<_>>();
-    let value = outputs[0].clone();
+        .find(|child| child.kind() == SyntaxKind::OutputList);
+    let outputs = output_list.as_ref().map_or_else(Vec::new, |output_list| {
+        output_list
+            .children()
+            .filter(|child| child.kind() == SyntaxKind::Expression)
+            .map(|child| derive_expression(&child))
+            .collect::<Vec<_>>()
+    });
+    let value = outputs
+        .first()
+        .cloned()
+        .unwrap_or(ScalarExpression::Integer {
+            value: BigInt::from(0),
+            span: wosy_syntax::byte_span(node),
+        });
     let name = receivers[0].name.clone();
     let output_values = receivers
         .iter()
@@ -7284,12 +7357,16 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         .map(|(position, receiver)| ScalarOutputValue {
             position,
             ty: receiver.ty.clone(),
-            span: span_of(if outputs.len() == 1 {
-                &value
+            span: if outputs.is_empty() {
+                receiver.span
             } else {
-                &outputs[position]
-            }),
-            value: if outputs.len() == 1 {
+                span_of(if outputs.len() == 1 {
+                    &value
+                } else {
+                    &outputs[position]
+                })
+            },
+            value: if outputs.is_empty() || outputs.len() == 1 {
                 value.clone()
             } else {
                 outputs[position].clone()
@@ -7309,7 +7386,9 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
                 span: output_values[position].span,
             })
             .collect(),
-        span: wosy_syntax::byte_span(&output_list),
+        span: output_list
+            .as_ref()
+            .map_or_else(|| wosy_syntax::byte_span(node), wosy_syntax::byte_span),
     };
     ScalarBinding {
         name,
@@ -7320,6 +7399,7 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         output_sequence,
         output_values,
         output_origin,
+        is_allocation: outputs.is_empty(),
         span: wosy_syntax::byte_span(node),
     }
 }
@@ -9587,7 +9667,15 @@ impl StaticUseAnalyzer {
     fn item(&mut self, item: &ScalarBlockItem, visible: &mut BTreeMap<String, usize>) {
         match item {
             ScalarBlockItem::LocalBinding(binding) => {
-                self.expression(&binding.value, visible);
+                if binding.is_allocation {
+                    for receiver in &binding.receivers {
+                        if let Some(length) = &receiver.allocation_length {
+                            self.expression(length, visible);
+                        }
+                    }
+                } else {
+                    self.expression(&binding.value, visible);
+                }
                 let id = self.declarations.len();
                 visible.insert(binding.name.clone(), id);
                 self.declarations.push(binding.span);
@@ -9912,6 +10000,43 @@ fn block_item_type(
                     receiver.name_span,
                     diagnostics,
                 );
+            }
+            if binding.is_allocation {
+                for receiver in &binding.receivers {
+                    let Some(length) = &receiver.allocation_length else {
+                        continue;
+                    };
+                    let actual = expression_type_expected(
+                        length,
+                        &ScalarType::U64,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                    );
+                    expect_type(
+                        program,
+                        &ScalarType::U64,
+                        &actual,
+                        receiver.span,
+                        diagnostics,
+                    );
+                }
+                if declare_program_name(
+                    program,
+                    &binding.name,
+                    binding.span,
+                    visible_names,
+                    folded_names,
+                    diagnostics,
+                ) {
+                    for receiver in &binding.receivers {
+                        scope.insert(receiver.name.clone(), receiver.ty.clone());
+                    }
+                }
+                return ScalarType::Unit;
             }
             let actual = expression_type_expected(
                 &binding.value,
