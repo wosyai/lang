@@ -4588,6 +4588,9 @@ fn generic_type_name(ty: &ScalarType) -> String {
         ScalarType::Array {
             element, length, ..
         } => format!("array({};{length})", generic_type_name(element)),
+        ScalarType::RuntimeArray { element, .. } => {
+            format!("array({})", generic_type_name(element))
+        }
         ScalarType::Callable {
             outputs,
             parameters,

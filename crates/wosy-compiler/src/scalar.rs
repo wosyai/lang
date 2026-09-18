@@ -53,6 +53,10 @@ pub enum ScalarType {
         length_span: ByteSpan,
         span: ByteSpan,
     },
+    RuntimeArray {
+        element: Box<ScalarType>,
+        span: ByteSpan,
+    },
     Error,
 }
 
@@ -235,6 +239,7 @@ enum ScalarTypeIdentity {
     Qualified(String, String),
     Struct(ScalarStructId),
     Array(Box<ScalarTypeIdentity>, u64),
+    RuntimeArray(Box<ScalarTypeIdentity>),
     Error,
 }
 
@@ -422,6 +427,9 @@ fn scalar_type_identity(ty: &ScalarType) -> ScalarTypeIdentity {
         ScalarType::Array {
             element, length, ..
         } => ScalarTypeIdentity::Array(Box::new(scalar_type_identity(element)), *length),
+        ScalarType::RuntimeArray { element, .. } => {
+            ScalarTypeIdentity::RuntimeArray(Box::new(scalar_type_identity(element)))
+        }
         ScalarType::Error => ScalarTypeIdentity::Error,
     }
 }
@@ -586,6 +594,18 @@ fn scalar_type_equal(left: &ScalarType, right: &ScalarType) -> bool {
                 ..
             },
         ) => left_length == right_length && scalar_type_equal(left_element, right_element),
+        (
+            ScalarType::RuntimeArray { element: left, .. },
+            ScalarType::RuntimeArray { element: right, .. },
+        ) => scalar_type_equal(left, right),
+        (
+            ScalarType::RuntimeArray { element: left, .. },
+            ScalarType::Array { element: right, .. },
+        )
+        | (
+            ScalarType::Array { element: left, .. },
+            ScalarType::RuntimeArray { element: right, .. },
+        ) => scalar_type_equal(left, right),
         (ScalarType::Named { name: left, .. }, ScalarType::Named { name: right, .. }) => {
             left == right
         }
@@ -3304,7 +3324,7 @@ fn validate_module_type(
             "unsupported raw pointer type",
             span,
         )),
-        ScalarType::Array { element, .. } => {
+        ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
             validate_module_type(module, element, span, diagnostics)
         }
         ScalarType::Struct(_) => {}
@@ -7957,6 +7977,15 @@ fn derive_type(node: &CstNode) -> ScalarType {
             span: wosy_syntax::byte_span(node),
         };
     }
+    for _ in node
+        .children()
+        .filter(|child| child.kind() == SyntaxKind::ErasedArraySuffix)
+    {
+        ty = ScalarType::RuntimeArray {
+            element: Box::new(ty),
+            span: wosy_syntax::byte_span(node),
+        };
+    }
     ty
 }
 
@@ -9740,7 +9769,9 @@ fn validate_type(
         ScalarType::RawPointer(inner) | ScalarType::CheckedReference { inner, .. } => {
             validate_type(program, inner, span, diagnostics)
         }
-        ScalarType::Array { element, .. } => validate_type(program, element, span, diagnostics),
+        ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
+            validate_type(program, element, span, diagnostics)
+        }
         ScalarType::Error => {}
     }
 }

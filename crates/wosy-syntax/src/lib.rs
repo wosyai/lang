@@ -85,6 +85,9 @@ pub enum SyntaxKind {
     IndexSuffix,
     PlaceTarget,
     Primary,
+    EnumDecl,
+    EnumVariant,
+    ErasedArraySuffix,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -170,6 +173,9 @@ impl Language for WosyLanguage {
             72 => SyntaxKind::IndexSuffix,
             73 => SyntaxKind::PlaceTarget,
             74 => SyntaxKind::Primary,
+            75 => SyntaxKind::EnumDecl,
+            76 => SyntaxKind::EnumVariant,
+            77 => SyntaxKind::ErasedArraySuffix,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -603,6 +609,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::overload_decl => SyntaxKind::OverloadDecl,
         Rule::overload_arm => SyntaxKind::OverloadArm,
         Rule::fixed_array_suffix => SyntaxKind::FixedArraySuffix,
+        Rule::erased_array_suffix => SyntaxKind::ErasedArraySuffix,
         Rule::fixed_array_length => SyntaxKind::FixedArrayLength,
         Rule::array_literal => SyntaxKind::ArrayLiteral,
         Rule::binding_decl => SyntaxKind::BindingDecl,
@@ -638,6 +645,8 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::assignment => SyntaxKind::Assignment,
         Rule::top_level_item => SyntaxKind::TopLevelItem,
         Rule::struct_decl => SyntaxKind::StructDecl,
+        Rule::enum_decl => SyntaxKind::EnumDecl,
+        Rule::enum_variant => SyntaxKind::EnumVariant,
         Rule::struct_field => SyntaxKind::StructField,
         Rule::callable_output => SyntaxKind::CallableOutput,
         Rule::receiver_list => SyntaxKind::ReceiverList,
