@@ -84,6 +84,7 @@ struct EmitState<'ctx, 'module> {
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
     values: BTreeMap<String, EmitValue<'ctx>>,
     storage: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
+    return_bindings: BTreeMap<String, ScalarExpression>,
     runtime_array_owners: BTreeMap<String, bool>,
     runtime_array_allocations: BTreeMap<String, bool>,
     globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
@@ -1962,7 +1963,8 @@ fn transfer_runtime_array_return(
     ty: &ScalarType,
 ) {
     if !matches!(ty, ScalarType::RuntimeArray { .. }) {
-        let bindings = return_bindings(block);
+        let mut bindings = state.return_bindings.clone();
+        bindings.extend(return_bindings(block));
         let mut visited = BTreeSet::new();
         for name in escaped_runtime_array_owners(expression, &bindings, &mut visited) {
             if state.runtime_array_owners.contains_key(&name) {
@@ -2312,6 +2314,7 @@ fn emit_function<'ctx, 'module>(
         runtime_array_results,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        return_bindings: return_bindings(&function.body),
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
         globals: globals.clone(),
@@ -2412,6 +2415,7 @@ fn emit_main<'ctx, 'module>(
         runtime_array_results,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        return_bindings: BTreeMap::new(),
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
         globals: globals.clone(),
@@ -2497,6 +2501,7 @@ fn emit_project_function<'ctx, 'module>(
         runtime_array_results,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        return_bindings: return_bindings(&function.body),
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
         globals: module_globals(source_module, globals),
@@ -2610,6 +2615,7 @@ fn emit_project_main<'ctx, 'module>(
         runtime_array_results,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        return_bindings: BTreeMap::new(),
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
         globals: BTreeMap::new(),
@@ -2869,6 +2875,9 @@ fn emit_final_outputs<'ctx, 'module>(
     }
     if let Some((condition, then_branch, else_branch)) = recombine_conditional_final_outputs(block)
     {
+        for output in &block.final_output_values {
+            transfer_runtime_array_return(state, block, &output.value, &output.ty);
+        }
         let condition = take_basic(emit_expression(context, state, &condition)?)?.into_int_value();
         return emit_if_value(
             context,
@@ -2926,6 +2935,9 @@ fn emit_project_final_outputs<'ctx, 'module>(
     }
     if let Some((condition, then_branch, else_branch)) = recombine_conditional_final_outputs(block)
     {
+        for output in &block.final_output_values {
+            transfer_runtime_array_return(state, block, &output.value, &output.ty);
+        }
         let condition = take_basic(emit_project_expression(
             context, state, &condition, module, modules,
         )?)?

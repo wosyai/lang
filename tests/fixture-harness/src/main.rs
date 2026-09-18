@@ -348,8 +348,7 @@ fn fd_read_assertion(assertion: &toml_edit::Table) -> Result<Option<FdReadAssert
                 .and_then(|value| value.as_integer())
                 .ok_or_else(|| "fd_read capacity must be an integer".to_owned())
                 .and_then(|value| {
-                    u32::try_from(value)
-                        .map_err(|_| "fd_read capacity must fit in u32".to_owned())
+                    u32::try_from(value).map_err(|_| "fd_read capacity must fit in u32".to_owned())
                 })?;
             let bytes = step
                 .get("bytes")
@@ -371,8 +370,7 @@ fn fd_read_assertion(assertion: &toml_edit::Table) -> Result<Option<FdReadAssert
                 .and_then(|value| value.as_integer())
                 .ok_or_else(|| "fd_read errno must be an integer".to_owned())
                 .and_then(|value| {
-                    i32::try_from(value)
-                        .map_err(|_| "fd_read errno must fit in i32".to_owned())
+                    i32::try_from(value).map_err(|_| "fd_read errno must fit in i32".to_owned())
                 })?;
             Ok(FdReadStep {
                 bytes,
@@ -407,8 +405,19 @@ fn run_fd_read_assertion(
         return Err(format!("{}: fd_read source build failed", case.display()));
     }
     let executable = artifact_executable(temporary, case)?;
-    let writes = run_fd_read_host(&executable, &read_assertion, case)?;
-    assert_stream(assertion, "stdout", &writes, case)
+    let source = assertion
+        .get("source")
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "fd_read assertion source must be a string".to_owned())?;
+    let writes = run_fd_read_host(&executable, &read_assertion, case)
+        .map_err(|error| format!("{source}: {error}"))?;
+    assert_stream(assertion, "stdout", &writes, case).map_err(|error| {
+        format!(
+            "{source}: {error}; observed stdout {:?}",
+            String::from_utf8_lossy(&writes)
+        )
+    })
 }
 
 fn run_fd_read_host(
@@ -423,18 +432,10 @@ fn run_fd_read_host(
         .map_err(|error| error.to_string())?;
     linker.allow_shadowing(true);
     linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "fd_read",
-            controlled_fd_read,
-        )
+        .func_wrap("wasi_snapshot_preview1", "fd_read", controlled_fd_read)
         .map_err(|error| error.to_string())?;
     linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "fd_write",
-            recording_fd_write,
-        )
+        .func_wrap("wasi_snapshot_preview1", "fd_write", recording_fd_write)
         .map_err(|error| error.to_string())?;
     let wasi = WasiCtx::builder().build_p1();
     let mut store = Store::new(
@@ -554,8 +555,9 @@ fn recording_fd_write(
         })?;
     caller.data_mut().writes.push(WriteRecord {
         descriptor,
-        text: String::from_utf8(bytes)
-            .map_err(|error| wasmtime::Error::msg(format!("fd_write text is not UTF-8: {error}")))?,
+        text: String::from_utf8(bytes).map_err(|error| {
+            wasmtime::Error::msg(format!("fd_write text is not UTF-8: {error}"))
+        })?,
         reported: length,
     });
     Ok(0)
@@ -595,8 +597,7 @@ fn assert_fd_read_result(
 
 #[cfg(unix)]
 fn link_shared_stdlib(stdlib: &Path, temporary: &Path) -> Result<(), String> {
-    std::os::unix::fs::symlink(stdlib, temporary.join("stdlib"))
-        .map_err(|error| error.to_string())
+    std::os::unix::fs::symlink(stdlib, temporary.join("stdlib")).map_err(|error| error.to_string())
 }
 
 #[cfg(windows)]

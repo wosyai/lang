@@ -10,7 +10,8 @@ preview1 = namespace std "wasi/preview1.w";
 	u64 reported = 0;
 	u64 zero = core.int_extend<u64>(0);
 	bool complete = text.length == zero;
-	u64 maximum = core.int_extend<u64>(4294967295);
+	u32 maximum_u32 = 4294967295;
+	u64 maximum = core.int_extend<u64>(maximum_u32);
 	i32 success = 0;
 	preview1.Iovec iovec = {
 		.data = text.data;
@@ -42,7 +43,8 @@ preview1 = namespace std "wasi/preview1.w";
 	u64 reported = 0;
 	u64 zero = core.int_extend<u64>(0);
 	bool complete = text.length == zero;
-	u64 maximum = core.int_extend<u64>(4294967295);
+	u32 maximum_u32 = 4294967295;
+	u64 maximum = core.int_extend<u64>(maximum_u32);
 	i32 success = 0;
 	preview1.Iovec iovec = {
 		.data = text.data;
@@ -193,7 +195,8 @@ ReadLineStatus() _read_line_discard = fn {
 (*utf8, ReadLineStatus)(u64) read_line = fn(max_bytes) {
 	u64 zero = core.int_extend<u64>(0);
 	u64 one = core.int_extend<u64>(1);
-	u64 maximum_u32 = core.int_extend<u64>(4294967295);
+	u32 maximum_u32_value = 4294967295;
+	u64 maximum_u32 = core.int_extend<u64>(maximum_u32_value);
 	if (max_bytes > maximum_u32) {
 		null, ReadLineStatus::limit_exceeded
 	} else {

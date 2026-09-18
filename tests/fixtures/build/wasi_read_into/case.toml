@@ -52,6 +52,21 @@ stdout = "expected/read_line_lf.stdout"
 exact = true
 
 [[assert]]
+source = "project/src/read_line_empty_eof.w"
+fd_read = [{ capacity = 1, bytes = [], errno = 0 }]
+stdout = "expected/read_line_empty_eof.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_eof_after_data.w"
+fd_read = [
+  { capacity = 1, bytes = [120], errno = 0 },
+  { capacity = 1, bytes = [], errno = 0 },
+]
+stdout = "expected/read_line_eof_after_data.stdout"
+exact = true
+
+[[assert]]
 source = "project/src/read_line_crlf.w"
 fd_read = [
   { capacity = 1, bytes = [13], errno = 0 },
@@ -74,6 +89,88 @@ exact = true
 source = "project/src/read_line_empty_lf.w"
 fd_read = [{ capacity = 1, bytes = [10], errno = 0 }]
 stdout = "expected/read_line_empty_lf.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_io_error.w"
+fd_read = [{ capacity = 1, bytes = [], errno = 5 }]
+stdout = "expected/read_line_io_error.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_discard_io_error.w"
+fd_read = [
+  { capacity = 1, bytes = [120], errno = 0 },
+  { capacity = 1, bytes = [121], errno = 0 },
+  { capacity = 1, bytes = [], errno = 5 },
+]
+stdout = "expected/read_line_discard_io_error.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_invalid_continuation.w"
+fd_read = [
+  { capacity = 1, bytes = [128], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/read_line_invalid_continuation.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_invalid_truncated.w"
+fd_read = [
+  { capacity = 1, bytes = [194], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/read_line_invalid_truncated.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_invalid_overlong.w"
+fd_read = [
+  { capacity = 1, bytes = [192], errno = 0 },
+  { capacity = 1, bytes = [128], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/read_line_invalid_overlong.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_invalid_surrogate.w"
+fd_read = [
+  { capacity = 1, bytes = [237], errno = 0 },
+  { capacity = 1, bytes = [160], errno = 0 },
+  { capacity = 1, bytes = [128], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/read_line_invalid_surrogate.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_invalid_above_max.w"
+fd_read = [
+  { capacity = 1, bytes = [244], errno = 0 },
+  { capacity = 1, bytes = [144], errno = 0 },
+  { capacity = 1, bytes = [128], errno = 0 },
+  { capacity = 1, bytes = [128], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/read_line_invalid_above_max.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_oversized.w"
+fd_read = []
+stdout = "expected/read_line_oversized.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_exact_capacity_lf.w"
+fd_read = [
+  { capacity = 1, bytes = [120], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/read_line_exact_capacity_lf.stdout"
 exact = true
 
 [[assert]]
