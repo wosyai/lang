@@ -1055,6 +1055,36 @@ fn place_pointer<'ctx, 'module>(
             }
             .map_err(builder_error)
         }
+        crate::ScalarPlace::Index { base, index, .. } => {
+            let base_pointer = place_pointer(context, state, base, project)?;
+            let base_type = assignment_place_type(state, base)
+                .ok_or_else(|| "unknown LLVM indexed place type".to_owned())?;
+            if !matches!(base_type, ScalarType::Array { .. }) {
+                return Err("LLVM indexed place requires a fixed array".to_owned());
+            }
+            let index = take_basic(match project {
+                Some(project) => emit_project_typed_expression(
+                    context,
+                    state,
+                    index,
+                    &ScalarType::U64,
+                    project.module,
+                    project.modules,
+                )?,
+                None => emit_typed_expression(context, state, index, &ScalarType::U64)?,
+            })?
+            .into_int_value();
+            let array = storage_type(context, &base_type, state.structs, state.target_layout)?;
+            unsafe {
+                state.builder.build_in_bounds_gep(
+                    array,
+                    base_pointer,
+                    &[context.i32_type().const_zero(), index],
+                    "array_element",
+                )
+            }
+            .map_err(builder_error)
+        }
     }
 }
 
@@ -1096,6 +1126,8 @@ fn emit_place_value_in_project<'ctx, 'module>(
             pointer_target_type(state, pointer, project)
                 .ok_or_else(|| "unknown LLVM dereference target type".to_owned())?
         }
+        crate::ScalarPlace::Index { .. } => assignment_place_type(state, place)
+            .ok_or_else(|| "unknown LLVM indexed place type".to_owned())?,
     };
     if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
         return Ok(EmitValue::Basic(pointer.into()));
@@ -2232,6 +2264,10 @@ fn assignment_place_type<'ctx, 'module>(
         crate::ScalarPlace::Dereference { pointer, .. } => {
             pointer_target_type(state, pointer, None)
         }
+        crate::ScalarPlace::Index { base, .. } => match assignment_place_type(state, base)? {
+            ScalarType::Array { element, .. } => Some(*element),
+            _ => None,
+        },
     }
 }
 
@@ -2637,6 +2673,7 @@ fn emit_expression<'ctx, 'module>(
             Err(format!("unknown LLVM member {receiver}.{name}"))
         }
         ScalarExpression::Dereference { place, .. } => emit_place_value(context, state, place),
+        ScalarExpression::IndexedRead { place, .. } => emit_place_value(context, state, place),
         ScalarExpression::Integer { value, .. } => Ok(EmitValue::Basic(
             context
                 .i32_type()
@@ -2805,6 +2842,12 @@ fn emit_project_expression<'ctx, 'module>(
             ))
         }
         ScalarExpression::Dereference { place, .. } => emit_place_value_in_project(
+            context,
+            state,
+            place,
+            Some(ProjectCallScope { module, modules }),
+        ),
+        ScalarExpression::IndexedRead { place, .. } => emit_place_value_in_project(
             context,
             state,
             place,
@@ -3027,7 +3070,12 @@ fn emit_project_expression<'ctx, 'module>(
             state
                 .builder
                 .build_ptr_to_int(
-                    place_pointer(context, state, place, None)?,
+                    place_pointer(
+                        context,
+                        state,
+                        place,
+                        Some(ProjectCallScope { module, modules }),
+                    )?,
                     pointer_integer_type(context, state.target_layout),
                     "address",
                 )
@@ -4210,9 +4258,10 @@ fn collect_selected_overloads(
             }
         }
         ScalarExpression::Dereference { place, .. } => {
-            if let Some(pointer) = dereference_pointer(place) {
-                collect_selected_overloads(pointer, selections);
-            }
+            collect_selected_overloads_in_place(place, selections);
+        }
+        ScalarExpression::IndexedRead { place, .. } => {
+            collect_selected_overloads_in_place(place, selections);
         }
         ScalarExpression::RawAddress { .. }
         | ScalarExpression::CheckedAddress { .. }
@@ -4228,14 +4277,22 @@ fn collect_selected_overloads(
     }
 }
 
-fn dereference_pointer(place: &crate::ScalarPlace) -> Option<&ScalarExpression> {
+fn collect_selected_overloads_in_place(
+    place: &crate::ScalarPlace,
+    selections: &mut Vec<(Option<String>, String, ScalarOverloadSelection)>,
+) {
     match place {
-        crate::ScalarPlace::Dereference { pointer, .. } => Some(pointer),
-        crate::ScalarPlace::Field { base, .. } => match base.as_ref() {
-            crate::ScalarPlace::Dereference { pointer, .. } => Some(pointer),
-            crate::ScalarPlace::Name { .. } | crate::ScalarPlace::Field { .. } => None,
-        },
-        crate::ScalarPlace::Name { .. } => None,
+        crate::ScalarPlace::Name { .. } => {}
+        crate::ScalarPlace::Dereference { pointer, .. } => {
+            collect_selected_overloads(pointer, selections)
+        }
+        crate::ScalarPlace::Field { base, .. } => {
+            collect_selected_overloads_in_place(base, selections)
+        }
+        crate::ScalarPlace::Index { base, index, .. } => {
+            collect_selected_overloads_in_place(base, selections);
+            collect_selected_overloads(index, selections);
+        }
     }
 }
 
@@ -4342,9 +4399,10 @@ fn collect_generic_calls(
             }
         }
         ScalarExpression::Dereference { place, .. } => {
-            if let Some(pointer) = dereference_pointer(place) {
-                collect_generic_calls(pointer, calls);
-            }
+            collect_generic_calls_in_place(place, calls);
+        }
+        ScalarExpression::IndexedRead { place, .. } => {
+            collect_generic_calls_in_place(place, calls);
         }
         ScalarExpression::Name { .. }
         | ScalarExpression::Member { .. }
@@ -4357,6 +4415,21 @@ fn collect_generic_calls(
         | ScalarExpression::Utf8 { .. }
         | ScalarExpression::RawAddress { .. }
         | ScalarExpression::CheckedAddress { .. } => {}
+    }
+}
+
+fn collect_generic_calls_in_place(
+    place: &crate::ScalarPlace,
+    calls: &mut Vec<(String, Vec<ScalarType>)>,
+) {
+    match place {
+        crate::ScalarPlace::Name { .. } => {}
+        crate::ScalarPlace::Dereference { pointer, .. } => collect_generic_calls(pointer, calls),
+        crate::ScalarPlace::Field { base, .. } => collect_generic_calls_in_place(base, calls),
+        crate::ScalarPlace::Index { base, index, .. } => {
+            collect_generic_calls_in_place(base, calls);
+            collect_generic_calls(index, calls);
+        }
     }
 }
 
@@ -4668,6 +4741,36 @@ mod tests {
             span: ByteSpan::new(0, 1),
         };
         assert!(storage_type(&context, &array, &[], ScalarTargetLayout::NATIVE64).is_ok());
+    }
+
+    #[test]
+    fn emits_recursive_fixed_array_index_reads_and_addresses_for_both_targets() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nu8() read = fn { u8[2][2] matrix = [[1, 2], [3, 4]]; u64 row = 1; u64 column = 0; u8 value = matrix[row][column]; *u8 shared = &matrix[row][column]; shared; unsafe { *?u8 raw = &?matrix[row][column]; raw; }; value };\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let validation = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(
+                validation.diagnostics.is_empty(),
+                "{:?}",
+                validation.diagnostics
+            );
+            let llvm = emit_scalar_llvm(&validation)
+                .expect("indexed LLVM")
+                .to_text();
+            assert!(
+                llvm.contains("getelementptr inbounds [2 x [2 x i8]]"),
+                "{llvm}"
+            );
+            assert!(llvm.contains("getelementptr inbounds [2 x i8]"), "{llvm}");
+            assert!(llvm.contains("ptrtoint"), "{llvm}");
+            assert!(!llvm.contains("icmp ult"), "{llvm}");
+        }
     }
 
     #[test]

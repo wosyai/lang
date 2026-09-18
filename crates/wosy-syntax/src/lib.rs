@@ -81,6 +81,10 @@ pub enum SyntaxKind {
     CheckedPointerType,
     ParenthesizedType,
     CheckedAddress,
+    IndexedPlace,
+    IndexSuffix,
+    PlaceTarget,
+    Primary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -162,6 +166,10 @@ impl Language for WosyLanguage {
             68 => SyntaxKind::CheckedPointerType,
             69 => SyntaxKind::ParenthesizedType,
             70 => SyntaxKind::CheckedAddress,
+            71 => SyntaxKind::IndexedPlace,
+            72 => SyntaxKind::IndexSuffix,
+            73 => SyntaxKind::PlaceTarget,
+            74 => SyntaxKind::Primary,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -643,6 +651,10 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::dereference => SyntaxKind::Dereference,
         Rule::raw_address => SyntaxKind::RawAddress,
         Rule::checked_address => SyntaxKind::CheckedAddress,
+        Rule::indexed_place => SyntaxKind::IndexedPlace,
+        Rule::index_suffix => SyntaxKind::IndexSuffix,
+        Rule::place_target => SyntaxKind::PlaceTarget,
+        Rule::primary => SyntaxKind::Primary,
         Rule::error_item => SyntaxKind::Error,
         Rule::parenthesized => SyntaxKind::Parenthesized,
         Rule::boolean => SyntaxKind::Boolean,
@@ -712,6 +724,30 @@ mod tests {
                 .filter(|node| node.kind() == SyntaxKind::ArrayLiteral)
                 .count(),
             4
+        );
+    }
+
+    #[test]
+    fn indexed_places_and_addresses_are_structural_and_lossless() {
+        let text = "%%start\nu8[2][3] matrix = [[1, 2, 3], [4, 5, 6]];\nu64 row = 0;\nu64 column = 1;\nu8 value = matrix[row][column];\n*u8 shared = &matrix[row][column];\n*!u8 mutable = &!matrix[row][column];\nunsafe { *?u8 raw = &?matrix[row][column]; };\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(
+            result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::IndexedPlace)
+                .count(),
+            4
+        );
+        assert_eq!(
+            result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::IndexSuffix)
+                .count(),
+            8
         );
     }
 
@@ -1500,13 +1536,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_indexed_checked_address_formation() {
+    fn accepts_indexed_checked_address_formation() {
         let result = parse(
             identity(),
             "%%start\nu8[4] bytes = [1, 2, 3, 4];\n*u8 reference = &bytes[0];\n%%end".into(),
             &[],
         );
-        assert!(!result.is_valid());
+        assert!(result.is_valid(), "{:?}", result.errors);
     }
 
     #[test]

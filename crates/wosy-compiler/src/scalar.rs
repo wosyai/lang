@@ -150,6 +150,12 @@ pub enum ScalarPlace {
         pointer: Box<ScalarExpression>,
         span: ByteSpan,
     },
+    Index {
+        base: Box<ScalarPlace>,
+        index: Box<ScalarExpression>,
+        span: ByteSpan,
+        index_span: ByteSpan,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -675,6 +681,10 @@ pub enum ScalarExpression {
         span: ByteSpan,
     },
     Dereference {
+        place: ScalarPlace,
+        span: ByteSpan,
+    },
+    IndexedRead {
         place: ScalarPlace,
         span: ByteSpan,
     },
@@ -1213,8 +1223,20 @@ fn record_expression_overload_selection(
                     record_expression_overload_selection(pointer, None, scope, overloads);
                 }
             }
+            ScalarPlace::Index { base, index, .. } => {
+                record_place_overload_selections(base, scope, overloads);
+                record_expression_overload_selection(
+                    index,
+                    Some(&ScalarType::U64),
+                    scope,
+                    overloads,
+                );
+            }
             ScalarPlace::Name { .. } => {}
         },
+        ScalarExpression::IndexedRead { place, .. } => {
+            record_place_overload_selections(place, scope, overloads)
+        }
         ScalarExpression::StructLiteral { fields, .. } => {
             for field in fields {
                 record_expression_overload_selection(&mut field.value, None, scope, overloads);
@@ -1234,6 +1256,24 @@ fn record_expression_overload_selection(
         | ScalarExpression::Boolean { .. }
         | ScalarExpression::Char { .. }
         | ScalarExpression::Utf8 { .. } => {}
+    }
+}
+
+fn record_place_overload_selections(
+    place: &mut ScalarPlace,
+    scope: &BTreeMap<String, ScalarType>,
+    overloads: &BTreeMap<String, ScalarFunction>,
+) {
+    match place {
+        ScalarPlace::Name { .. } => {}
+        ScalarPlace::Dereference { pointer, .. } => {
+            record_expression_overload_selection(pointer, None, scope, overloads)
+        }
+        ScalarPlace::Field { base, .. } => record_place_overload_selections(base, scope, overloads),
+        ScalarPlace::Index { base, index, .. } => {
+            record_place_overload_selections(base, scope, overloads);
+            record_expression_overload_selection(index, Some(&ScalarType::U64), scope, overloads);
+        }
     }
 }
 
@@ -1517,6 +1557,7 @@ fn resolve_expression_places(
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
         | ScalarExpression::Dereference { place, .. } => resolve_place(place, scope, program),
+        ScalarExpression::IndexedRead { place, .. } => resolve_place(place, scope, program),
         ScalarExpression::StructLiteral { fields, .. } => {
             for field in fields {
                 resolve_expression_places(&mut field.value, scope, program);
@@ -1604,9 +1645,9 @@ fn resolve_place(
                         _ => ScalarType::Error,
                     }
                 }
-                ScalarPlace::Name { .. } | ScalarPlace::Field { .. } => {
-                    place_type(base, scope, program, &mut Vec::new())
-                }
+                ScalarPlace::Name { .. }
+                | ScalarPlace::Field { .. }
+                | ScalarPlace::Index { .. } => place_type(base, scope, program, &mut Vec::new()),
             };
             let structure = match base_type {
                 ScalarType::Struct(id) => program.structs.get(id.index),
@@ -1628,6 +1669,10 @@ fn resolve_place(
             } else {
                 let _ = span;
             }
+        }
+        ScalarPlace::Index { base, index, .. } => {
+            resolve_place(base, scope, program);
+            resolve_expression_places(index, scope, program);
         }
     }
 }
@@ -2751,6 +2796,9 @@ fn resolve_expression_module_places(
         | ScalarExpression::Dereference { place, .. } => {
             resolve_module_place(place, scope, module, modules)
         }
+        ScalarExpression::IndexedRead { place, .. } => {
+            resolve_module_place(place, scope, module, modules)
+        }
         ScalarExpression::StructLiteral { fields, .. } => {
             for field in fields {
                 resolve_expression_module_places(&mut field.value, scope, module, modules);
@@ -2839,7 +2887,9 @@ fn resolve_module_place(
                     }
                     _ => ScalarType::Error,
                 },
-                ScalarPlace::Name { .. } | ScalarPlace::Field { .. } => {
+                ScalarPlace::Name { .. }
+                | ScalarPlace::Field { .. }
+                | ScalarPlace::Index { .. } => {
                     place_type_in_module(base, scope, module, modules, &mut Vec::new())
                 }
             };
@@ -2865,6 +2915,10 @@ fn resolve_module_place(
             }) {
                 *field = ScalarFieldReference::Resolved(declared.id.clone());
             }
+        }
+        ScalarPlace::Index { base, index, .. } => {
+            resolve_module_place(base, scope, module, modules);
+            resolve_expression_module_places(index, scope, module, modules);
         }
     }
 }
@@ -3241,6 +3295,7 @@ fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::RawAddress { span, .. }
         | ScalarExpression::CheckedAddress { span, .. }
         | ScalarExpression::Dereference { span, .. }
+        | ScalarExpression::IndexedRead { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::ArrayLiteral { span, .. }
         | ScalarExpression::Binary { span, .. }
@@ -4171,6 +4226,9 @@ fn expression_type_in_module(
         ),
         ScalarExpression::Dereference { place, span } => {
             checked_dereference_type_in_module(place, *span, scope, module, modules, diagnostics)
+        }
+        ScalarExpression::IndexedRead { place, .. } => {
+            place_type_in_module(place, scope, module, modules, diagnostics)
         }
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {
@@ -5474,6 +5532,7 @@ fn is_supported_checked_address_place(place: &ScalarPlace) -> bool {
         ScalarPlace::Name { .. } => true,
         ScalarPlace::Field { base, .. } => matches!(base.as_ref(), ScalarPlace::Name { .. }),
         ScalarPlace::Dereference { .. } => false,
+        ScalarPlace::Index { base, .. } => is_supported_checked_address_place(base),
     }
 }
 
@@ -5616,6 +5675,44 @@ fn place_type(
                 ScalarType::Error
             }
         },
+        ScalarPlace::Index {
+            base,
+            index,
+            span,
+            index_span,
+        } => {
+            let base_type = place_type(base, scope, program, diagnostics);
+            let index_type = expression_type_expected(
+                index,
+                &ScalarType::U64,
+                scope,
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                program,
+                diagnostics,
+                false,
+            );
+            expect_type(
+                program,
+                &ScalarType::U64,
+                &index_type,
+                *index_span,
+                diagnostics,
+            );
+            match base_type {
+                ScalarType::Array { element, .. } => *element,
+                ScalarType::Error => ScalarType::Error,
+                _ => {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "B0003",
+                        "indexed place requires a fixed array",
+                        *span,
+                    ));
+                    ScalarType::Error
+                }
+            }
+        }
     }
 }
 
@@ -5712,6 +5809,45 @@ fn place_type_in_module(
                         module,
                         "B0003",
                         "value has no field",
+                        *span,
+                    ));
+                    ScalarType::Error
+                }
+            }
+        }
+        ScalarPlace::Index {
+            base,
+            index,
+            span,
+            index_span,
+        } => {
+            let base_type = place_type_in_module(base, scope, module, modules, diagnostics);
+            let index_type = expression_type_in_module_expected(
+                index,
+                Some(&ScalarType::U64),
+                scope,
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                module,
+                modules,
+                diagnostics,
+                false,
+            );
+            expect_module_type(
+                module,
+                &ScalarType::U64,
+                &index_type,
+                *index_span,
+                diagnostics,
+            );
+            match base_type {
+                ScalarType::Array { element, .. } => *element,
+                ScalarType::Error => ScalarType::Error,
+                _ => {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0003",
+                        "indexed place requires a fixed array",
                         *span,
                     ));
                     ScalarType::Error
@@ -5862,6 +5998,15 @@ fn checked_dereference_type(
             ));
             ScalarType::Error
         }
+        ScalarPlace::Index { .. } => {
+            diagnostics.push(diagnostic(
+                program,
+                "B0003",
+                "checked dereference requires a dereference place",
+                span,
+            ));
+            ScalarType::Error
+        }
     }
 }
 
@@ -5896,6 +6041,15 @@ fn checked_dereference_type_in_module(
             (pointer, *dereference_span, Some((field, *field_span)))
         }
         ScalarPlace::Name { .. } => {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "checked dereference requires a dereference place",
+                span,
+            ));
+            return ScalarType::Error;
+        }
+        ScalarPlace::Index { .. } => {
             diagnostics.push(module_diagnostic(
                 module,
                 "B0003",
@@ -7540,6 +7694,13 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .collect(),
             span: wosy_syntax::byte_span(&actual),
         },
+        SyntaxKind::Primary
+            if actual.children_with_tokens().any(|element| {
+                matches!(element, NodeOrToken::Token(token) if token.kind() == SyntaxKind::ArrayLiteral)
+            }) => ScalarExpression::ArrayLiteral {
+            elements: Vec::new(),
+            span: wosy_syntax::byte_span(&actual),
+        },
         SyntaxKind::Binary => {
             let children = semantic_children(&actual);
             let mut value = derive_element(&children[0]);
@@ -7673,6 +7834,10 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 derive_element(&semantic_children(&actual)[0])
             }
         }
+        SyntaxKind::IndexedPlace => ScalarExpression::IndexedRead {
+            place: derive_place(&actual),
+            span: wosy_syntax::byte_span(&actual),
+        },
         SyntaxKind::Dereference | SyntaxKind::DereferencedField => ScalarExpression::Dereference {
             place: derive_place(&actual),
             span: wosy_syntax::byte_span(&actual),
@@ -7680,7 +7845,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
         SyntaxKind::CheckedAddress => {
             let target = direct_nodes(&actual)
                 .into_iter()
-                .find(|child| child.kind() == SyntaxKind::AssignmentTarget)
+                .find(|child| child.kind() == SyntaxKind::PlaceTarget)
                 .expect("checked address target");
             ScalarExpression::CheckedAddress {
                 mutability: if actual.children_with_tokens().any(
@@ -7697,7 +7862,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
         SyntaxKind::RawAddress => {
             let target = direct_nodes(&actual)
                 .into_iter()
-                .find(|child| child.kind() == SyntaxKind::AssignmentTarget)
+                .find(|child| child.kind() == SyntaxKind::PlaceTarget)
                 .expect("raw address target");
             ScalarExpression::RawAddress {
                 place: derive_place(&target),
@@ -7727,12 +7892,21 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
         },
         SyntaxKind::Parenthesized => derive_expression(&direct_nodes(&actual)[0]),
         SyntaxKind::Expression => derive_element(&semantic_children(&actual)[0]),
-        _ => derive_element(&semantic_children(&actual)[0]),
+        _ => {
+            let children = semantic_children(&actual);
+            children
+                .first()
+                .map(derive_element)
+                .unwrap_or_else(|| panic!("expression grammar {:?}", actual.kind()))
+        }
     }
 }
 
 fn derive_place(node: &CstNode) -> ScalarPlace {
     match node.kind() {
+        SyntaxKind::PlaceTarget => {
+            derive_place(&direct_nodes(node).into_iter().next().expect("place target"))
+        }
         SyntaxKind::AssignmentTarget => {
             if let Some(child) = direct_nodes(node).into_iter().next() {
                 derive_place(&child)
@@ -7801,6 +7975,41 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
             )),
             span: wosy_syntax::byte_span(node),
         },
+        SyntaxKind::IndexedPlace => {
+            let children = direct_nodes(node);
+            let mut place = children
+                .iter()
+                .find(|child| child.kind() != SyntaxKind::IndexSuffix)
+                .map(derive_place)
+                .unwrap_or_else(|| {
+                    let name =
+                        direct_token(node, SyntaxKind::Identifier).expect("indexed place name");
+                    ScalarPlace::Name {
+                        name: name.text().to_owned(),
+                        span: token_span(&name),
+                    }
+                });
+            for suffix in children
+                .iter()
+                .filter(|child| child.kind() == SyntaxKind::IndexSuffix)
+            {
+                let index = suffix
+                    .children()
+                    .find(|child| child.kind() == SyntaxKind::Expression)
+                    .expect("indexed place expression");
+                let index_span = wosy_syntax::byte_span(&index);
+                place = ScalarPlace::Index {
+                    base: Box::new(place),
+                    index: Box::new(derive_expression(&index)),
+                    span: ByteSpan::new(
+                        wosy_syntax::byte_span(node).start,
+                        wosy_syntax::byte_span(&suffix).end,
+                    ),
+                    index_span,
+                };
+            }
+            place
+        }
         _ => panic!("place grammar"),
     }
 }
@@ -7965,6 +8174,7 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
         ScalarExpression::RawAddress { span, .. }
         | ScalarExpression::CheckedAddress { span, .. }
         | ScalarExpression::Dereference { span, .. }
+        | ScalarExpression::IndexedRead { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::ArrayLiteral { span, .. } => *span,
         ScalarExpression::Block(block) => block.span,
@@ -8094,6 +8304,9 @@ fn validate_unit_if_position(
         | ScalarExpression::Dereference { place, .. } => {
             validate_unit_if_position_in_place(place, source, diagnostics)
         }
+        ScalarExpression::IndexedRead { place, .. } => {
+            validate_unit_if_position_in_place(place, source, diagnostics)
+        }
         ScalarExpression::StructLiteral { fields, .. } => {
             for field in fields {
                 validate_unit_if_position(&field.value, false, source, diagnostics);
@@ -8130,6 +8343,10 @@ fn validate_unit_if_position_in_place(
         }
         ScalarPlace::Field { base, .. } => {
             validate_unit_if_position_in_place(base, source, diagnostics)
+        }
+        ScalarPlace::Index { base, index, .. } => {
+            validate_unit_if_position_in_place(base, source, diagnostics);
+            validate_unit_if_position(index, false, source, diagnostics);
         }
         ScalarPlace::Name { .. } => {}
     }
@@ -8629,6 +8846,7 @@ impl StaticUseAnalyzer {
             ScalarExpression::RawAddress { place, .. }
             | ScalarExpression::CheckedAddress { place, .. }
             | ScalarExpression::Dereference { place, .. } => self.place(place, visible),
+            ScalarExpression::IndexedRead { place, .. } => self.place(place, visible),
             ScalarExpression::StructLiteral { fields, .. } => {
                 for field in fields {
                     self.expression(&field.value, visible);
@@ -8654,6 +8872,10 @@ impl StaticUseAnalyzer {
             ScalarPlace::Name { name, .. } => self.use_name(name, visible),
             ScalarPlace::Field { base, .. } => self.place(base, visible),
             ScalarPlace::Dereference { pointer, .. } => self.expression(pointer, visible),
+            ScalarPlace::Index { base, index, .. } => {
+                self.place(base, visible);
+                self.expression(index, visible);
+            }
         }
     }
 
@@ -9148,6 +9370,9 @@ fn expression_type(
         } => checked_address_type(*mutability, place, *span, scope, program, diagnostics),
         ScalarExpression::Dereference { place, span } => {
             checked_dereference_type(place, *span, scope, program, diagnostics)
+        }
+        ScalarExpression::IndexedRead { place, .. } => {
+            place_type(place, scope, program, diagnostics)
         }
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {
@@ -10533,6 +10758,72 @@ mod tests {
             parsed.diagnostics
         );
         derive_scalar_program(&parsed.result)
+    }
+
+    #[test]
+    fn derives_and_types_fixed_array_index_places_and_addresses() {
+        let text = "%%start\nstruct Record { u8[2] bytes; }\nu8[2][2] matrix = [[1, 2], [3, 4]];\nu64 row = 1;\nu64 column = 0;\nRecord holder = { .bytes = [5, 6]; };\nu8 nested = matrix[row][column];\nu8 field = holder.bytes[column];\n*u8 shared = &matrix[row][column];\n*!u8 mutable = &!holder.bytes[column];\nunsafe { *?u8 raw = &?matrix[row][column]; };\n%%end";
+        let result = validate_text(text);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Binding(nested) = &result.program.items[4] else {
+            panic!("nested indexed read")
+        };
+        let ScalarExpression::IndexedRead {
+            place: ScalarPlace::Index {
+                base, index_span, ..
+            },
+            ..
+        } = &nested.value
+        else {
+            panic!("nested indexed read place")
+        };
+        let index_start = text.find("column];").expect("column") as u32;
+        assert_eq!(*index_span, ByteSpan::new(index_start, index_start + 6));
+        assert!(matches!(base.as_ref(), ScalarPlace::Index { .. }));
+        for item in [6, 7] {
+            let ScalarItem::Binding(binding) = &result.program.items[item] else {
+                panic!("indexed address binding")
+            };
+            assert!(matches!(
+                binding.value,
+                ScalarExpression::CheckedAddress {
+                    place: ScalarPlace::Index { .. },
+                    ..
+                }
+            ));
+        }
+        let ScalarItem::Executable(ScalarBlockItem::Expression(ScalarExpression::Block(block))) =
+            &result.program.items[8]
+        else {
+            panic!("unsafe indexed raw address")
+        };
+        assert!(matches!(
+            block.items[0],
+            ScalarBlockItem::LocalBinding(ScalarBinding {
+                value: ScalarExpression::RawAddress {
+                    place: ScalarPlace::Index { .. },
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let invalid = validate_text("%%start\nu8[1] bytes = [1];\ni32 index = 0;\nu8 value = bytes[index];\nu8 wrong = index[0];\nu8[0] empty = [];\nu8 accepted = empty[0];\n%%end");
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message
+                    == "expression type does not match expected type")
+        );
+        assert!(invalid
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "indexed place requires a fixed array"));
+        assert!(invalid
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.message != "index is outside the array"));
     }
 
     #[test]
