@@ -41,3 +41,57 @@ source = "project/src/read_oversized.w"
 fd_read = []
 stdout = "expected/read_oversized.stdout"
 exact = true
+
+[[assert]]
+source = "project/src/read_line_lf.w"
+fd_read = [
+  { capacity = 1, bytes = [120], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/read_line_lf.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_crlf.w"
+fd_read = [
+  { capacity = 1, bytes = [13], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/read_line_crlf.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_cr_x.w"
+fd_read = [
+  { capacity = 1, bytes = [13], errno = 0 },
+  { capacity = 1, bytes = [120], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/read_line_cr_x.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_empty_lf.w"
+fd_read = [{ capacity = 1, bytes = [10], errno = 0 }]
+stdout = "expected/read_line_empty_lf.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_limit_lf.w"
+fd_read = [
+  { capacity = 1, bytes = [120], errno = 0 },
+  { capacity = 1, bytes = [121], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/read_line_limit_lf.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_limit_eof.w"
+fd_read = [
+  { capacity = 1, bytes = [120], errno = 0 },
+  { capacity = 1, bytes = [121], errno = 0 },
+  { capacity = 1, bytes = [], errno = 0 },
+]
+stdout = "expected/read_line_limit_eof.stdout"
+exact = true

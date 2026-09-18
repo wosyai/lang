@@ -163,8 +163,7 @@ ReadLineStatus() _read_line_discard = fn {
 	u64 length = zero;
 	bool reading = true;
 	ReadLineStatus status = ReadLineStatus::line;
-	bytes[length] = first;
-	length = length + one;
+	if (!pending_cr) { bytes[length] = first; length = length + one; };
 	while (reading) {
 		u64 count = zero;
 		bool complete = false;
@@ -185,7 +184,7 @@ ReadLineStatus() _read_line_discard = fn {
 	if (status == ReadLineStatus::line) { status = _read_line_utf8_status(bytes, length, status); };
 	if (status == ReadLineStatus::line) {
 		*?u8 data = null;
-		unsafe { data = &?bytes[0]; };
+		if (length != zero) { unsafe { data = &?bytes[0]; }; };
 		utf8 text = { .data = data; .length = length; };
 		&text, status
 	} else { null, status }
@@ -208,7 +207,12 @@ ReadLineStatus() _read_line_discard = fn {
 			unsafe { count, complete = read_into(&?scratch[0], one); };
 			if (!complete) { status = ReadLineStatus::io_error; reading = false; };
 			if (complete && count == zero) { status = ReadLineStatus::eof; reading = false; };
-			if (complete && count != zero && scratch[0] == 10) { status = ReadLineStatus::line; reading = false; };
+			if (complete && count != zero && scratch[0] == 10) {
+				utf8 empty = { .data = null; .length = zero; };
+				text = &empty;
+				status = ReadLineStatus::line;
+				reading = false;
+			};
 			if (complete && count != zero && scratch[0] != 10 && max_bytes == zero) { status = _read_line_discard(); reading = false; };
 			if (complete && count != zero && scratch[0] != 10 && max_bytes != zero) {
 				text, status = _read_line_allocated(max_bytes, scratch[0], scratch[0] == 13);
