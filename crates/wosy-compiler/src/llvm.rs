@@ -3514,7 +3514,17 @@ fn emit_project_expression<'ctx, 'module>(
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
-        ScalarExpression::Member { receiver, name, .. } => {
+        ScalarExpression::Member {
+            receiver,
+            name,
+            enum_tag,
+            ..
+        } => {
+            if let Some(tag) = enum_tag {
+                return Ok(EmitValue::Basic(
+                    context.i32_type().const_int(u64::from(*tag), false).into(),
+                ));
+            }
             if let Some(place) = struct_member_place(state, receiver, name)? {
                 return emit_place_value(context, state, &place);
             }

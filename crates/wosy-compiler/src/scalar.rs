@@ -1980,6 +1980,9 @@ fn resolve_block_places(
     for item in &mut block.items {
         resolve_item_places(item, scope, program);
     }
+    for output in &mut block.final_output_values {
+        resolve_expression_places(&mut output.value, scope, program);
+    }
 }
 
 fn resolve_expression_places(
@@ -3290,6 +3293,9 @@ fn resolve_block_module_places(
     for item in &mut block.items {
         resolve_item_module_places(item, scope, module, modules);
     }
+    for output in &mut block.final_output_values {
+        resolve_expression_module_places(&mut output.value, scope, module, modules);
+    }
 }
 
 fn resolve_expression_module_places(
@@ -3360,17 +3366,7 @@ fn resolve_expression_module_places(
             enum_tag,
             ..
         } => {
-            *enum_tag = module
-                .enums
-                .iter()
-                .find(|enumeration| enumeration.name == *receiver)
-                .and_then(|enumeration| {
-                    enumeration
-                        .variants
-                        .iter()
-                        .find(|variant| variant.name == *name)
-                })
-                .map(|variant| variant.tag);
+            *enum_tag = enum_member_in_module(module, modules, receiver, name).map(|(_, tag)| tag);
         }
         ScalarExpression::Name { .. }
         | ScalarExpression::Integer { .. }
@@ -3381,6 +3377,42 @@ fn resolve_expression_module_places(
         | ScalarExpression::Char { .. }
         | ScalarExpression::Utf8 { .. } => {}
     }
+}
+
+fn enum_member_in_module(
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    receiver: &str,
+    name: &str,
+) -> Option<(ScalarEnumId, u32)> {
+    let enumeration = module
+        .enums
+        .iter()
+        .find(|enumeration| enumeration.name == receiver)
+        .or_else(|| {
+            receiver.split_once('.').and_then(|(namespace, enum_name)| {
+                module
+                    .namespace_bindings
+                    .iter()
+                    .find(|binding| binding.binding == namespace)
+                    .and_then(|binding| {
+                        modules
+                            .iter()
+                            .find(|candidate| candidate.source == binding.target)
+                    })
+                    .and_then(|target| {
+                        target.enums.iter().find(|enumeration| {
+                            enumeration.name == enum_name
+                                && !is_module_private_name(&enumeration.name)
+                        })
+                    })
+            })
+        })?;
+    enumeration
+        .variants
+        .iter()
+        .find(|variant| variant.name == name)
+        .map(|variant| (enumeration.id.clone(), variant.tag))
 }
 
 fn resolve_module_place(
@@ -5090,11 +5122,7 @@ fn expression_type_in_module(
             span,
             ..
         } => {
-            if let Some(enumeration) = module
-                .enums
-                .iter()
-                .find(|enumeration| enumeration.name == *receiver)
-            {
+            if let Some((enum_id, _)) = enum_member_in_module(module, modules, receiver, name) {
                 if enum_tag.is_none() {
                     diagnostics.push(module_diagnostic(
                         module,
@@ -5104,7 +5132,7 @@ fn expression_type_in_module(
                     ));
                     return ScalarType::Error;
                 }
-                return ScalarType::Enum(enumeration.id.clone());
+                return ScalarType::Enum(enum_id);
             }
             if let Some(receiver_type) = scope.get(receiver) {
                 if matches!(receiver_type, ScalarType::Struct(_))
@@ -9149,11 +9177,15 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 })
                 .collect();
             ScalarExpression::Member {
-                receiver: identifiers[0].text().to_owned(),
-                name: identifiers[1].text().to_owned(),
+                receiver: if identifiers.len() == 3 {
+                    format!("{}.{}", identifiers[0].text(), identifiers[1].text())
+                } else {
+                    identifiers[0].text().to_owned()
+                },
+                name: identifiers.last().expect("qualified member name").text().to_owned(),
                 enum_tag: None,
                 receiver_span: token_span(&identifiers[0]),
-                name_span: token_span(&identifiers[1]),
+                name_span: token_span(identifiers.last().expect("qualified member name")),
                 span: wosy_syntax::byte_span(&actual),
             }
         }
@@ -12260,7 +12292,7 @@ mod tests {
     #[test]
     fn derives_zero_payload_enum_tags_and_equality() {
         let result = validate_text(
-            "%%start\nenum Status { first; second; third; }\nStatus value = Status.second;\nbool equal = value == Status.second;\n%%end",
+            "%%start\nenum Status { first; second; third; }\nStatus value = Status::second;\nbool equal = value == Status::second;\n%%end",
         );
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         assert_eq!(result.program.enums[0].variants[0].tag, 0);
