@@ -26,7 +26,7 @@ generic_decl = { "generic" ~ identifier ~ ";" }
 generic_function_decl = { generic_decl ~ function_decl }
 overload_decl = { identifier ~ "=" ~ "overload" ~ "{" ~ overload_arm+ ~ "}" ~ ";" }
 overload_arm = { generic_decl? ~ callable_type ~ "=>" ~ "fn" ~ parameters? ~ block ~ ";" }
-binding_decl = { receiver_list ~ "=" ~ output_list ~ ";" }
+binding_decl = { allocation_binding | receiver_list ~ "=" ~ output_list ~ ";" }
 type_spec = { (callable_type | checked_pointer_type | raw_pointer_type | parenthesized_type | qualified_type | type_name) ~ (fixed_array_suffix | erased_array_suffix)* }
 array_type = { (checked_pointer_type | raw_pointer_type | parenthesized_type | qualified_type | type_name) ~ (fixed_array_suffix | erased_array_suffix)* }
 callable_type = { callable_output ~ "(" ~ (array_type ~ ("," ~ array_type)*)? ~ ")" }
@@ -49,7 +49,9 @@ block_item = { local_binding | if_block_item | while_expr | unsafe_block_item ~ 
 unsafe_block_item = { unsafe_expr }
 if_block_item = { (if_expr | unit_if_expr) ~ !";" ~ !"}" }
 final_output_list = { output_list }
-local_binding = { receiver_list ~ "=" ~ output_list ~ ";" }
+local_binding = { allocation_binding | receiver_list ~ "=" ~ output_list ~ ";" }
+allocation_binding = { runtime_receiver ~ ";" }
+runtime_receiver = { type_name ~ "[" ~ expression ~ "]" ~ identifier }
 expression = { if_expr | unit_if_expr | unsafe_expr | assignment | logical_or }
 if_expr = { "if" ~ "(" ~ expression ~ ")" ~ block ~ "else" ~ block }
 unit_if_expr = { "if" ~ "(" ~ expression ~ ")" ~ block }

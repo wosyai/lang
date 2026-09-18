@@ -88,6 +88,7 @@ pub enum SyntaxKind {
     EnumDecl,
     EnumVariant,
     ErasedArraySuffix,
+    AllocationBinding,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -176,6 +177,7 @@ impl Language for WosyLanguage {
             75 => SyntaxKind::EnumDecl,
             76 => SyntaxKind::EnumVariant,
             77 => SyntaxKind::ErasedArraySuffix,
+            78 => SyntaxKind::AllocationBinding,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -614,6 +616,8 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::array_literal => SyntaxKind::ArrayLiteral,
         Rule::binding_decl => SyntaxKind::BindingDecl,
         Rule::local_binding => SyntaxKind::LocalBinding,
+        Rule::allocation_binding => SyntaxKind::ReceiverList,
+        Rule::runtime_receiver => SyntaxKind::Receiver,
         Rule::namespace_decl => SyntaxKind::NamespaceDecl,
         Rule::item => SyntaxKind::Item,
         Rule::type_spec => SyntaxKind::TypeSpec,
