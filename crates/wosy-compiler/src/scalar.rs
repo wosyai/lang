@@ -3899,74 +3899,76 @@ fn assignment_type_in_module(
         .map(|target| assignment_target_type_in_module(target, scope, module, modules, diagnostics))
         .collect::<Vec<_>>();
     validate_assignment_target_distinctness_in_module(assignment, module, diagnostics);
-    let outputs = ScalarOutputSequence {
-        outputs: assignment
-            .values
-            .iter()
-            .enumerate()
-            .flat_map(|(position, value)| {
-                let actual = expression_type_in_module_expected(
-                    value,
-                    expected.get(position).and_then(Option::as_ref),
-                    scope,
-                    visible_names,
-                    folded_names,
-                    module,
-                    modules,
-                    diagnostics,
-                    unsafe_context,
-                );
-                call_output_sequence_in_module(value, scope, module, modules)
-                    .unwrap_or(ScalarOutputSequence {
-                        outputs: vec![ScalarOutput {
-                            ty: actual,
-                            span: expression_span(value),
-                        }],
-                        span: expression_span(value),
-                    })
-                    .outputs
-            })
-            .collect(),
-        span: assignment.span,
-    };
-    if assignment.targets.len() > outputs.outputs.len() {
-        diagnostics.push(module_diagnostic(
-            module,
-            "B0004",
-            "call has fewer outputs than assignment targets",
-            assignment.span,
-        ));
-    }
-    for ((index, (target, expected)), output) in assignment
-        .targets
+    let outputs = assignment
+        .values
         .iter()
-        .zip(&expected)
         .enumerate()
-        .zip(&outputs.outputs)
-    {
-        if let Some(expected) = expected {
-            expect_module_type(
+        .map(|(position, value)| {
+            let actual = expression_type_in_module_expected(
+                value,
+                expected.get(position).and_then(Option::as_ref),
+                scope,
+                visible_names,
+                folded_names,
                 module,
-                expected,
-                &output.ty,
-                if index == 0 {
-                    assignment.span
-                } else {
-                    target.target_span
-                },
+                modules,
                 diagnostics,
+                unsafe_context,
             );
-        } else if let ScalarPlace::Name { name, span } = &target.place {
-            validate_identifier_style(module, name, *span, diagnostics);
-            if declare_module_name(
+            match call_output_sequence_in_module(value, scope, module, modules) {
+                Some(outputs) => Some(outputs.outputs),
+                None if matches!(value, ScalarExpression::Call { .. }) => None,
+                None => Some(vec![ScalarOutput {
+                    ty: actual,
+                    span: expression_span(value),
+                }]),
+            }
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|outputs| ScalarOutputSequence {
+            outputs: outputs.into_iter().flatten().collect(),
+            span: assignment.span,
+        });
+    if let Some(outputs) = outputs {
+        if assignment.targets.len() > outputs.outputs.len() {
+            diagnostics.push(module_diagnostic(
                 module,
-                name,
-                *span,
-                &mut inferred_names,
-                &mut inferred_folded_names,
-                diagnostics,
-            ) {
-                scope.insert(name.clone(), output.ty.clone());
+                "B0004",
+                "call has fewer outputs than assignment targets",
+                assignment.span,
+            ));
+        }
+        for ((index, (target, expected)), output) in assignment
+            .targets
+            .iter()
+            .zip(&expected)
+            .enumerate()
+            .zip(&outputs.outputs)
+        {
+            if let Some(expected) = expected {
+                expect_module_type(
+                    module,
+                    expected,
+                    &output.ty,
+                    if index == 0 {
+                        assignment.span
+                    } else {
+                        target.target_span
+                    },
+                    diagnostics,
+                );
+            } else if let ScalarPlace::Name { name, span } = &target.place {
+                validate_identifier_style(module, name, *span, diagnostics);
+                if declare_module_name(
+                    module,
+                    name,
+                    *span,
+                    &mut inferred_names,
+                    &mut inferred_folded_names,
+                    diagnostics,
+                ) {
+                    scope.insert(name.clone(), output.ty.clone());
+                }
             }
         }
     }
@@ -13147,14 +13149,14 @@ bool integer_inversion = !1;
     }
 
     #[test]
-    fn keeps_private_overload_output_sequences_local() {
+    fn suppresses_derived_assignment_diagnostics_for_private_overload_output_sequences() {
         let child_source = module_source("src/child.w");
         let child = module_from_text(
             child_source.clone(),
             "%%start\n_private_pair = overload {\n    (i32, bool)(i64) => fn(value) { 1, true };\n};\npublic_pair = overload {\n    (i32, bool)(i64) => fn(value) { 1, true };\n};\ni32 local_number, bool local_flag = _private_pair(1);\n%%end",
         );
         let main_source = module_source("src/main.w");
-        let main_text = "%%start\nchild = namespace output_sequences \"src/child.w\";\ni32 public_number, bool public_flag = child.public_pair(1);\nbool private_flag, i32 private_number = child._private_pair(1);\n%%end";
+        let main_text = "%%start\nchild = namespace output_sequences \"src/child.w\";\ni32 public_number, bool public_flag = child.public_pair(1);\nnumber, flag = child._private_pair(1);\n%%end";
         let main = module_from_text(main_source.clone(), main_text);
         let namespace_span = match &main.items[0] {
             ScalarItem::Namespace(namespace) => namespace.span,
@@ -13190,6 +13192,10 @@ bool integer_inversion = !1;
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "B0003"));
+        assert!(!result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0004"));
     }
 
     #[test]
