@@ -158,6 +158,331 @@ pub enum ScalarPlace {
     },
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum ScalarPlaceIdentity {
+    Name(String),
+    Field(Box<ScalarPlaceIdentity>, ScalarFieldIdentity),
+    Dereference(Box<ScalarExpressionIdentity>),
+    Index(Box<ScalarPlaceIdentity>, Box<ScalarExpressionIdentity>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ScalarFieldIdentity {
+    Unresolved(String),
+    Resolved(ScalarStructFieldId),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ScalarExpressionIdentity {
+    Name(String),
+    Member(String, String),
+    Integer(BigInt),
+    InvalidInteger,
+    Float(f64),
+    InvalidFloat,
+    Boolean(bool),
+    Char(char),
+    Utf8(Vec<u8>),
+    RawAddress(ScalarPlaceIdentity),
+    CheckedAddress(ScalarReferenceMutability, ScalarPlaceIdentity),
+    Dereference(ScalarPlaceIdentity),
+    IndexedRead(ScalarPlaceIdentity),
+    StructLiteral(Vec<(String, ScalarExpressionIdentity)>),
+    ArrayLiteral(Vec<ScalarExpressionIdentity>),
+    Binary(
+        BinaryOperator,
+        Box<ScalarExpressionIdentity>,
+        Box<ScalarExpressionIdentity>,
+    ),
+    Unary(UnaryOperator, Box<ScalarExpressionIdentity>),
+    Call(
+        Option<String>,
+        String,
+        Vec<ScalarTypeIdentity>,
+        Vec<ScalarExpressionIdentity>,
+    ),
+    If(
+        Box<ScalarExpressionIdentity>,
+        ScalarBlockIdentity,
+        ScalarBlockIdentity,
+    ),
+    UnitIf(Box<ScalarExpressionIdentity>, ScalarBlockIdentity),
+    Block(ScalarBlockIdentity),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ScalarTypeIdentity {
+    Unit,
+    Bool,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    F32,
+    F64,
+    Char,
+    ArtifactId,
+    RawPointer(Box<ScalarTypeIdentity>),
+    CheckedReference(ScalarReferenceMutability, Box<ScalarTypeIdentity>),
+    Callable(Vec<ScalarTypeIdentity>, Vec<ScalarTypeIdentity>),
+    Named(String),
+    Qualified(String, String),
+    Struct(ScalarStructId),
+    Array(Box<ScalarTypeIdentity>, u64),
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ScalarBlockIdentity {
+    items: Vec<ScalarBlockItemIdentity>,
+    expressions: Vec<ScalarExpressionIdentity>,
+    final_output_values: Vec<(usize, ScalarTypeIdentity, ScalarExpressionIdentity)>,
+    unsafe_context: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ScalarBlockItemIdentity {
+    LocalBinding(
+        String,
+        ScalarTypeIdentity,
+        ScalarExpressionIdentity,
+        Vec<(String, ScalarTypeIdentity)>,
+    ),
+    Expression(ScalarExpressionIdentity),
+    Assignment(Vec<ScalarPlaceIdentity>, Vec<ScalarExpressionIdentity>),
+    While(ScalarExpressionIdentity, ScalarBlockIdentity),
+}
+
+fn scalar_place_identity(place: &ScalarPlace) -> ScalarPlaceIdentity {
+    match place {
+        ScalarPlace::Name { name, .. } => ScalarPlaceIdentity::Name(name.clone()),
+        ScalarPlace::Field { base, field, .. } => ScalarPlaceIdentity::Field(
+            Box::new(scalar_place_identity(base)),
+            match field {
+                ScalarFieldReference::Unresolved { name, .. } => {
+                    ScalarFieldIdentity::Unresolved(name.clone())
+                }
+                ScalarFieldReference::Resolved(id) => ScalarFieldIdentity::Resolved(id.clone()),
+            },
+        ),
+        ScalarPlace::Dereference { pointer, .. } => {
+            ScalarPlaceIdentity::Dereference(Box::new(scalar_expression_identity(pointer)))
+        }
+        ScalarPlace::Index { base, index, .. } => ScalarPlaceIdentity::Index(
+            Box::new(scalar_place_identity(base)),
+            Box::new(scalar_expression_identity(index)),
+        ),
+    }
+}
+
+fn scalar_place_target_span(place: &ScalarPlace) -> ByteSpan {
+    match place {
+        ScalarPlace::Name { span, .. } | ScalarPlace::Dereference { span, .. } => *span,
+        ScalarPlace::Field { base, span, .. } | ScalarPlace::Index { base, span, .. } => {
+            ByteSpan::new(scalar_place_target_span(base).start, span.end)
+        }
+    }
+}
+
+fn scalar_expression_identity(expression: &ScalarExpression) -> ScalarExpressionIdentity {
+    match expression {
+        ScalarExpression::Name { name, .. } => ScalarExpressionIdentity::Name(name.clone()),
+        ScalarExpression::Member { receiver, name, .. } => {
+            ScalarExpressionIdentity::Member(receiver.clone(), name.clone())
+        }
+        ScalarExpression::Integer { value, .. } => ScalarExpressionIdentity::Integer(value.clone()),
+        ScalarExpression::InvalidInteger { .. } => ScalarExpressionIdentity::InvalidInteger,
+        ScalarExpression::Float { value, .. } => ScalarExpressionIdentity::Float(*value),
+        ScalarExpression::InvalidFloat { .. } => ScalarExpressionIdentity::InvalidFloat,
+        ScalarExpression::Boolean { value, .. } => ScalarExpressionIdentity::Boolean(*value),
+        ScalarExpression::Char { value, .. } => ScalarExpressionIdentity::Char(*value),
+        ScalarExpression::Utf8 { value, .. } => ScalarExpressionIdentity::Utf8(value.clone()),
+        ScalarExpression::RawAddress { place, .. } => {
+            ScalarExpressionIdentity::RawAddress(scalar_place_identity(place))
+        }
+        ScalarExpression::CheckedAddress {
+            mutability, place, ..
+        } => ScalarExpressionIdentity::CheckedAddress(*mutability, scalar_place_identity(place)),
+        ScalarExpression::Dereference { place, .. } => {
+            ScalarExpressionIdentity::Dereference(scalar_place_identity(place))
+        }
+        ScalarExpression::IndexedRead { place, .. } => {
+            ScalarExpressionIdentity::IndexedRead(scalar_place_identity(place))
+        }
+        ScalarExpression::StructLiteral { fields, .. } => ScalarExpressionIdentity::StructLiteral(
+            fields
+                .iter()
+                .map(|field| (field.name.clone(), scalar_expression_identity(&field.value)))
+                .collect(),
+        ),
+        ScalarExpression::ArrayLiteral { elements, .. } => ScalarExpressionIdentity::ArrayLiteral(
+            elements.iter().map(scalar_expression_identity).collect(),
+        ),
+        ScalarExpression::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } => ScalarExpressionIdentity::Binary(
+            operator.clone(),
+            Box::new(scalar_expression_identity(left)),
+            Box::new(scalar_expression_identity(right)),
+        ),
+        ScalarExpression::Unary {
+            operator, operand, ..
+        } => ScalarExpressionIdentity::Unary(
+            operator.clone(),
+            Box::new(scalar_expression_identity(operand)),
+        ),
+        ScalarExpression::Call {
+            receiver,
+            name,
+            type_arguments,
+            arguments,
+            ..
+        } => ScalarExpressionIdentity::Call(
+            receiver.clone(),
+            name.clone(),
+            type_arguments
+                .iter()
+                .map(|argument| scalar_type_identity(&argument.ty))
+                .collect(),
+            arguments.iter().map(scalar_expression_identity).collect(),
+        ),
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => ScalarExpressionIdentity::If(
+            Box::new(scalar_expression_identity(condition)),
+            scalar_block_identity(then_branch),
+            scalar_block_identity(else_branch),
+        ),
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => ScalarExpressionIdentity::UnitIf(
+            Box::new(scalar_expression_identity(condition)),
+            scalar_block_identity(then_branch),
+        ),
+        ScalarExpression::Block(block) => {
+            ScalarExpressionIdentity::Block(scalar_block_identity(block))
+        }
+    }
+}
+
+fn scalar_type_identity(ty: &ScalarType) -> ScalarTypeIdentity {
+    match ty {
+        ScalarType::Unit => ScalarTypeIdentity::Unit,
+        ScalarType::Bool => ScalarTypeIdentity::Bool,
+        ScalarType::I8 => ScalarTypeIdentity::I8,
+        ScalarType::I16 => ScalarTypeIdentity::I16,
+        ScalarType::I32 => ScalarTypeIdentity::I32,
+        ScalarType::I64 => ScalarTypeIdentity::I64,
+        ScalarType::I128 => ScalarTypeIdentity::I128,
+        ScalarType::U8 => ScalarTypeIdentity::U8,
+        ScalarType::U16 => ScalarTypeIdentity::U16,
+        ScalarType::U32 => ScalarTypeIdentity::U32,
+        ScalarType::U64 => ScalarTypeIdentity::U64,
+        ScalarType::U128 => ScalarTypeIdentity::U128,
+        ScalarType::F32 => ScalarTypeIdentity::F32,
+        ScalarType::F64 => ScalarTypeIdentity::F64,
+        ScalarType::Char => ScalarTypeIdentity::Char,
+        ScalarType::ArtifactId => ScalarTypeIdentity::ArtifactId,
+        ScalarType::RawPointer(inner) => {
+            ScalarTypeIdentity::RawPointer(Box::new(scalar_type_identity(inner)))
+        }
+        ScalarType::CheckedReference { mutability, inner } => {
+            ScalarTypeIdentity::CheckedReference(*mutability, Box::new(scalar_type_identity(inner)))
+        }
+        ScalarType::Callable {
+            outputs,
+            parameters,
+        } => ScalarTypeIdentity::Callable(
+            outputs
+                .outputs
+                .iter()
+                .map(|output| scalar_type_identity(&output.ty))
+                .collect(),
+            parameters.iter().map(scalar_type_identity).collect(),
+        ),
+        ScalarType::Named { name, .. } => ScalarTypeIdentity::Named(name.clone()),
+        ScalarType::Qualified {
+            receiver, member, ..
+        } => ScalarTypeIdentity::Qualified(receiver.clone(), member.clone()),
+        ScalarType::Struct(id) => ScalarTypeIdentity::Struct(id.clone()),
+        ScalarType::Array {
+            element, length, ..
+        } => ScalarTypeIdentity::Array(Box::new(scalar_type_identity(element)), *length),
+        ScalarType::Error => ScalarTypeIdentity::Error,
+    }
+}
+
+fn scalar_block_identity(block: &ScalarBlock) -> ScalarBlockIdentity {
+    ScalarBlockIdentity {
+        items: block
+            .items
+            .iter()
+            .map(|item| match item {
+                ScalarBlockItem::LocalBinding(binding) => ScalarBlockItemIdentity::LocalBinding(
+                    binding.name.clone(),
+                    scalar_type_identity(&binding.declared_type),
+                    scalar_expression_identity(&binding.value),
+                    binding
+                        .receivers
+                        .iter()
+                        .map(|receiver| (receiver.name.clone(), scalar_type_identity(&receiver.ty)))
+                        .collect(),
+                ),
+                ScalarBlockItem::Expression(expression) => {
+                    ScalarBlockItemIdentity::Expression(scalar_expression_identity(expression))
+                }
+                ScalarBlockItem::Assignment(assignment) => ScalarBlockItemIdentity::Assignment(
+                    assignment
+                        .targets
+                        .iter()
+                        .map(|target| scalar_place_identity(&target.place))
+                        .collect(),
+                    assignment
+                        .values
+                        .iter()
+                        .map(scalar_expression_identity)
+                        .collect(),
+                ),
+                ScalarBlockItem::While(while_expression) => ScalarBlockItemIdentity::While(
+                    scalar_expression_identity(&while_expression.condition),
+                    scalar_block_identity(&while_expression.body),
+                ),
+            })
+            .collect(),
+        expressions: block
+            .expressions
+            .iter()
+            .map(scalar_expression_identity)
+            .collect(),
+        final_output_values: block
+            .final_output_values
+            .iter()
+            .map(|value| {
+                (
+                    value.position,
+                    scalar_type_identity(&value.ty),
+                    scalar_expression_identity(&value.value),
+                )
+            })
+            .collect(),
+        unsafe_context: block.unsafe_context,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarLayout {
     pub size: u64,
@@ -784,6 +1109,7 @@ pub struct ScalarAssignmentTarget {
     pub target: String,
     pub receiver_span: Option<ByteSpan>,
     pub target_span: ByteSpan,
+    pub span: ByteSpan,
     pub place: ScalarPlace,
 }
 
@@ -3690,6 +4016,7 @@ fn assignment_target_type_in_module(
         }
         place => Some(writable_place_type_in_module(
             place,
+            target.span,
             scope,
             module,
             modules,
@@ -3705,7 +4032,7 @@ fn validate_assignment_target_distinctness_in_module(
 ) {
     for (index, target) in assignment.targets.iter().enumerate() {
         for previous in &assignment.targets[..index] {
-            if target.place == previous.place {
+            if scalar_place_identity(&target.place) == scalar_place_identity(&previous.place) {
                 diagnostics.push(module_diagnostic(
                     module,
                     "B0002",
@@ -5630,72 +5957,332 @@ fn checked_address_type_in_module(
 
 fn writable_place_type(
     place: &ScalarPlace,
+    target_span: ByteSpan,
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
-    let ScalarPlace::Dereference { pointer, span } = place else {
-        return place_type(place, scope, program, diagnostics);
-    };
-    match expression_type(
-        pointer,
-        scope,
-        &BTreeSet::new(),
-        &BTreeMap::new(),
-        program,
-        diagnostics,
-        false,
-    ) {
-        ScalarType::CheckedReference {
-            mutability: ScalarReferenceMutability::Mutable,
-            inner,
-        } => *inner,
-        ScalarType::Error => ScalarType::Error,
-        _ => {
-            diagnostics.push(diagnostic(
+    if writable_place_contains_raw_dereference(place, scope, program, diagnostics) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            "assignment through raw pointer dereference is not supported",
+            target_span,
+        ));
+        return ScalarType::Error;
+    }
+    let ty = writable_path_type(place, scope, program, diagnostics);
+    if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            "assignment place requires a scalar leaf type",
+            target_span,
+        ));
+        return ScalarType::Error;
+    }
+    ty
+}
+
+fn writable_place_type_in_module(
+    place: &ScalarPlace,
+    target_span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    if writable_place_contains_raw_dereference_in_module(place, scope, module, modules, diagnostics)
+    {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "assignment through raw pointer dereference is not supported",
+            target_span,
+        ));
+        return ScalarType::Error;
+    }
+    let ty = writable_path_type_in_module(place, scope, module, modules, diagnostics);
+    if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "assignment place requires a scalar leaf type",
+            target_span,
+        ));
+        return ScalarType::Error;
+    }
+    ty
+}
+
+fn writable_place_contains_raw_dereference(
+    place: &ScalarPlace,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> bool {
+    match place {
+        ScalarPlace::Name { .. } => false,
+        ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } => {
+            writable_place_contains_raw_dereference(base, scope, program, diagnostics)
+        }
+        ScalarPlace::Dereference { pointer, .. } => matches!(
+            expression_type(
+                pointer,
+                scope,
+                &BTreeSet::new(),
+                &BTreeMap::new(),
                 program,
-                "B0003",
-                "assignment dereference requires a mutable checked reference",
-                *span,
-            ));
-            ScalarType::Error
+                diagnostics,
+                true,
+            ),
+            ScalarType::RawPointer(_)
+        ),
+    }
+}
+
+fn writable_place_contains_raw_dereference_in_module(
+    place: &ScalarPlace,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> bool {
+    match place {
+        ScalarPlace::Name { .. } => false,
+        ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } => {
+            writable_place_contains_raw_dereference_in_module(
+                base,
+                scope,
+                module,
+                modules,
+                diagnostics,
+            )
+        }
+        ScalarPlace::Dereference { pointer, .. } => matches!(
+            expression_type_in_module(
+                pointer,
+                scope,
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                module,
+                modules,
+                diagnostics,
+                true,
+            ),
+            ScalarType::RawPointer(_)
+        ),
+    }
+}
+
+fn writable_path_type(
+    place: &ScalarPlace,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    match place {
+        ScalarPlace::Name { .. } => place_type(place, scope, program, diagnostics),
+        ScalarPlace::Dereference { pointer, span } => match expression_type(
+            pointer,
+            scope,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            program,
+            diagnostics,
+            false,
+        ) {
+            ScalarType::CheckedReference {
+                mutability: ScalarReferenceMutability::Mutable,
+                inner,
+            } => *inner,
+            ScalarType::Error => ScalarType::Error,
+            _ => {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "assignment dereference requires a mutable checked reference",
+                    *span,
+                ));
+                ScalarType::Error
+            }
+        },
+        ScalarPlace::Field { base, field, span } => {
+            let ScalarType::Struct(structure) =
+                writable_path_type(base, scope, program, diagnostics)
+            else {
+                diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
+                return ScalarType::Error;
+            };
+            let ScalarFieldReference::Resolved(field) = field else {
+                diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
+                return ScalarType::Error;
+            };
+            let Some(field) = program
+                .structs
+                .iter()
+                .find(|candidate| candidate.id == structure && field.structure == structure)
+                .and_then(|candidate| candidate.fields.get(field.index))
+                .filter(|candidate| candidate.id == *field)
+            else {
+                diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
+                return ScalarType::Error;
+            };
+            field.ty.clone()
+        }
+        ScalarPlace::Index {
+            base,
+            index,
+            span,
+            index_span,
+        } => {
+            let base_type = writable_path_type(base, scope, program, diagnostics);
+            let index_type = expression_type_expected(
+                index,
+                &ScalarType::U64,
+                scope,
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                program,
+                diagnostics,
+                false,
+            );
+            expect_type(
+                program,
+                &ScalarType::U64,
+                &index_type,
+                *index_span,
+                diagnostics,
+            );
+            match base_type {
+                ScalarType::Array { element, .. } => *element,
+                ScalarType::Error => ScalarType::Error,
+                _ => {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "B0003",
+                        "indexed place requires a fixed array",
+                        *span,
+                    ));
+                    ScalarType::Error
+                }
+            }
         }
     }
 }
 
-fn writable_place_type_in_module(
+fn writable_path_type_in_module(
     place: &ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
-    let ScalarPlace::Dereference { pointer, span } = place else {
-        return place_type_in_module(place, scope, module, modules, diagnostics);
-    };
-    match expression_type_in_module(
-        pointer,
-        scope,
-        &BTreeSet::new(),
-        &BTreeMap::new(),
-        module,
-        modules,
-        diagnostics,
-        false,
-    ) {
-        ScalarType::CheckedReference {
-            mutability: ScalarReferenceMutability::Mutable,
-            inner,
-        } => *inner,
-        ScalarType::Error => ScalarType::Error,
-        _ => {
-            diagnostics.push(module_diagnostic(
+    match place {
+        ScalarPlace::Name { .. } => {
+            place_type_in_module(place, scope, module, modules, diagnostics)
+        }
+        ScalarPlace::Dereference { pointer, span } => match expression_type_in_module(
+            pointer,
+            scope,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            module,
+            modules,
+            diagnostics,
+            false,
+        ) {
+            ScalarType::CheckedReference {
+                mutability: ScalarReferenceMutability::Mutable,
+                inner,
+            } => *inner,
+            ScalarType::Error => ScalarType::Error,
+            _ => {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "assignment dereference requires a mutable checked reference",
+                    *span,
+                ));
+                ScalarType::Error
+            }
+        },
+        ScalarPlace::Field { base, field, span } => {
+            let ScalarType::Struct(structure) =
+                writable_path_type_in_module(base, scope, module, modules, diagnostics)
+            else {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "value has no field",
+                    *span,
+                ));
+                return ScalarType::Error;
+            };
+            let ScalarFieldReference::Resolved(field) = field else {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "value has no field",
+                    *span,
+                ));
+                return ScalarType::Error;
+            };
+            let Some(field) = modules
+                .iter()
+                .flat_map(|candidate| candidate.structs.iter())
+                .find(|candidate| candidate.id == structure && field.structure == structure)
+                .and_then(|candidate| candidate.fields.get(field.index))
+                .filter(|candidate| candidate.id == *field)
+            else {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "value has no field",
+                    *span,
+                ));
+                return ScalarType::Error;
+            };
+            field.ty.clone()
+        }
+        ScalarPlace::Index {
+            base,
+            index,
+            span,
+            index_span,
+        } => {
+            let base_type = writable_path_type_in_module(base, scope, module, modules, diagnostics);
+            let index_type = expression_type_in_module_expected(
+                index,
+                Some(&ScalarType::U64),
+                scope,
+                &BTreeSet::new(),
+                &BTreeMap::new(),
                 module,
-                "B0003",
-                "assignment dereference requires a mutable checked reference",
-                *span,
-            ));
-            ScalarType::Error
+                modules,
+                diagnostics,
+                false,
+            );
+            expect_module_type(
+                module,
+                &ScalarType::U64,
+                &index_type,
+                *index_span,
+                diagnostics,
+            );
+            match base_type {
+                ScalarType::Array { element, .. } => *element,
+                ScalarType::Error => ScalarType::Error,
+                _ => {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0003",
+                        "indexed place requires a fixed array",
+                        *span,
+                    ));
+                    ScalarType::Error
+                }
+            }
         }
     }
 }
@@ -7689,12 +8276,17 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
                 })
                 .collect();
             let target = identifiers.last().expect("assignment target name");
+            let place = derive_place(&target_node);
             ScalarAssignmentTarget {
                 receiver: (identifiers.len() == 2).then(|| identifiers[0].text().to_owned()),
                 target: target.text().to_owned(),
                 receiver_span: (identifiers.len() == 2).then(|| token_span(&identifiers[0])),
                 target_span: token_span(target),
-                place: derive_place(&target_node),
+                span: ByteSpan::new(
+                    wosy_syntax::byte_span(&target_node).start,
+                    scalar_place_target_span(&place).end,
+                ),
+                place,
             }
         })
         .collect::<Vec<_>>();
@@ -9380,7 +9972,13 @@ fn assignment_target_type(
             }
             expected
         }
-        place => Some(writable_place_type(place, scope, program, diagnostics)),
+        place => Some(writable_place_type(
+            place,
+            target.span,
+            scope,
+            program,
+            diagnostics,
+        )),
     }
 }
 
@@ -9391,7 +9989,7 @@ fn validate_assignment_target_distinctness(
 ) {
     for (index, target) in assignment.targets.iter().enumerate() {
         for previous in &assignment.targets[..index] {
-            if target.place == previous.place {
+            if scalar_place_identity(&target.place) == scalar_place_identity(&previous.place) {
                 diagnostics.push(diagnostic(
                     program,
                     "B0002",
@@ -10894,17 +11492,146 @@ mod tests {
                 && diagnostic.message == "assignment targets require a distinctness proof"
         }));
 
-        for text in [
+        let shared = validate_text(
             "%%start\nu8[2] values = [1, 2];\n*u8 shared = &values[0];\n*shared = 3;\n%%end",
-            "%%start\nu8[2] values = [1, 2];\nunsafe { *?u8 raw = &?values[0]; *raw = 3; };\n%%end",
+        );
+        assert!(shared.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0003"
+                && diagnostic.message
+                    == "assignment dereference requires a mutable checked reference"
+        }));
+    }
+
+    #[test]
+    fn enforces_canonical_assignment_targets_and_writable_place_paths() {
+        for text in [
+            "%%start\nu8 value = 0;\nvalue, value = 1, 2;\n%%end",
+            "%%start\nstruct Record { u8 value; }\nRecord holder = { .value = 0; };\nholder.value, holder.value = 1, 2;\n%%end",
+            "%%start\nu8[2] items = [0, 0];\nitems[0], items[0] = 1, 2;\n%%end",
+        ] {
+            let result = validate_text(text);
+            assert!(result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B0002" && diagnostic.message == "duplicate assignment target"
+            }));
+        }
+        for text in [
+            "%%start\nstruct Record { u8 first; u8 second; }\nRecord holder = { .first = 0; .second = 0; };\nholder.first, holder.second = 1, 2;\n%%end",
+            "%%start\nu8[2] items = [0, 0];\nitems[0], items[1] = 1, 2;\n%%end",
+        ] {
+            let result = validate_text(text);
+            assert!(result.diagnostics.is_empty(), "{text}: {:?}", result.diagnostics);
+        }
+        for text in [
+            "%%start\nu8[2] items = [0, 0];\nu64 index = 0;\nitems[index], items[0] = 1, 2;\n%%end",
+            "%%start\nu8[2] items = [0, 0];\nu64 index = 0;\nitems[0], items[index] = 1, 2;\n%%end",
+        ] {
+            let result = validate_text(text);
+            assert!(result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B0002"
+                    && diagnostic.message == "assignment targets require a distinctness proof"
+            }));
+        }
+
+        let valid = validate_text(
+            "%%start\nstruct Record { u8 value; u8[2] bytes; }\nRecord holder = { .value = 0; .bytes = [0, 0]; };\n*!Record writer = &!holder;\n(*writer).value = 1;\n(*writer).bytes[0] = 2;\n%%end",
+        );
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+
+        for target in ["(*raw).value", "(*raw).bytes[0]"] {
+            let text = format!(
+                "%%start\nstruct Record {{ u8 value; u8[2] bytes; }}\nRecord holder = {{ .value = 0; .bytes = [0, 0]; }};\nunsafe {{ *?Record raw = &?holder; {target} = 1; }};\n%%end"
+            );
+            let result = validate_text(&text);
+            let diagnostic = result
+                .diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.message
+                        == "assignment through raw pointer dereference is not supported"
+                })
+                .expect("raw write diagnostic");
+            let start = text.find(target).expect("raw assignment target") as u32;
+            assert_eq!(diagnostic.code, "B0003");
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(start, start + target.len() as u32)
+            );
+        }
+
+        for text in [
+            "%%start\nu8[2] values = [1, 2];\n*!(u8[2]) writer = &!values;\n*writer = [3, 4];\n%%end",
+            "%%start\nstruct Record { u8[2] bytes; }\nRecord holder = { .bytes = [1, 2]; };\nholder.bytes = [3, 4];\n%%end",
         ] {
             let result = validate_text(text);
             assert!(result.diagnostics.iter().any(|diagnostic| {
                 diagnostic.code == "B0003"
-                    && diagnostic.message
-                        == "assignment dereference requires a mutable checked reference"
+                    && diagnostic.message == "assignment place requires a scalar leaf type"
             }));
         }
+    }
+
+    #[test]
+    fn enforces_assignment_target_and_writable_path_rules_in_projects() {
+        let validate_project_text = |text: &str| {
+            let main_source = module_source("src/main.w");
+            let main = module_from_text(main_source.clone(), text);
+            validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(main, Vec::new())],
+                vec![main_source],
+            ))
+        };
+        let duplicates = validate_project_text(
+            "%%start\nstruct Record { u8 first; u8 second; }\nu8 value = 0;\nRecord record = { .first = 0; .second = 0; };\nu8[2] items = [0, 0];\nvalue, value = 1, 2;\nrecord.first, record.first = 1, 2;\nitems[0], items[0] = 1, 2;\n%%end",
+        );
+        assert_eq!(
+            duplicates
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message == "duplicate assignment target")
+                .count(),
+            3,
+            "{:?}",
+            duplicates.diagnostics
+        );
+        let distinct = validate_project_text(
+            "%%start\nstruct Record { u8 first; u8 second; }\nRecord record = { .first = 0; .second = 0; };\nu8[2] items = [0, 0];\nrecord.first, record.second = 1, 2;\nitems[0], items[1] = 1, 2;\n%%end",
+        );
+        assert!(
+            distinct.diagnostics.is_empty(),
+            "{:?}",
+            distinct.diagnostics
+        );
+        for text in [
+            "%%start\nu8[2] items = [0, 0];\nu64 index = 0;\nitems[index], items[0] = 1, 2;\n%%end",
+            "%%start\nu8[2] items = [0, 0];\nu64 index = 0;\nitems[0], items[index] = 1, 2;\n%%end",
+        ] {
+            let result = validate_project_text(text);
+            assert!(result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B0002"
+                    && diagnostic.message == "assignment targets require a distinctness proof"
+            }));
+        }
+        let raw = validate_project_text(
+            "%%start\nstruct Record { u8 value; u8[2] bytes; }\nRecord record = { .value = 0; .bytes = [0, 0]; };\nunsafe { *?Record raw = &?record; (*raw).value = 1; (*raw).bytes[0] = 2; };\n%%end",
+        );
+        assert_eq!(
+            raw.diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.message
+                        == "assignment through raw pointer dereference is not supported"
+                })
+                .count(),
+            2,
+            "{:?}",
+            raw.diagnostics
+        );
+        let aggregate = validate_project_text(
+            "%%start\nu8[2] values = [1, 2];\n*!(u8[2]) writer = &!values;\n*writer = [3, 4];\n%%end",
+        );
+        assert!(aggregate.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "assignment place requires a scalar leaf type"
+        }));
     }
 
     #[test]
