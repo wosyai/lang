@@ -15,7 +15,9 @@ use inkwell::AddressSpace;
 use inkwell::{FloatPredicate, IntPredicate};
 use serde::{Deserialize, Serialize};
 
-use crate::scalar::{ScalarBindingOutputOrigin, ScalarFieldReference, ScalarOverloadSelection};
+use crate::scalar::{
+    ScalarBindingOutputOrigin, ScalarFieldReference, ScalarOutputValue, ScalarOverloadSelection,
+};
 use crate::{
     BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarExpression,
     ScalarFunction, ScalarItem, ScalarModule, ScalarProjectValidation, ScalarStruct,
@@ -2656,6 +2658,18 @@ fn emit_final_outputs<'ctx, 'module>(
         transfer_runtime_array_return(state, &output.value, &output.ty);
         return Ok(value);
     }
+    if let Some((condition, then_branch, else_branch)) = recombine_conditional_final_outputs(block)
+    {
+        let condition = take_basic(emit_expression(context, state, &condition)?)?.into_int_value();
+        return emit_if_value(
+            context,
+            state,
+            condition,
+            &then_branch,
+            &else_branch,
+            |state, branch| emit_block(context, state, branch),
+        );
+    }
     let outputs = crate::ScalarOutputSequence {
         outputs: block
             .final_output_values
@@ -2701,6 +2715,21 @@ fn emit_project_final_outputs<'ctx, 'module>(
         transfer_runtime_array_return(state, &output.value, &output.ty);
         return Ok(value);
     }
+    if let Some((condition, then_branch, else_branch)) = recombine_conditional_final_outputs(block)
+    {
+        let condition = take_basic(emit_project_expression(
+            context, state, &condition, module, modules,
+        )?)?
+        .into_int_value();
+        return emit_if_value(
+            context,
+            state,
+            condition,
+            &then_branch,
+            &else_branch,
+            |state, branch| emit_project_block(context, state, branch, module, modules),
+        );
+    }
     let outputs = crate::ScalarOutputSequence {
         outputs: block
             .final_output_values
@@ -2730,6 +2759,82 @@ fn emit_project_final_outputs<'ctx, 'module>(
         transfer_runtime_array_return(state, &output.value, &output.ty);
     }
     build_aggregate(context, state, &outputs, values)
+}
+
+fn recombine_conditional_final_outputs(
+    block: &ScalarBlock,
+) -> Option<(ScalarExpression, ScalarBlock, ScalarBlock)> {
+    let ScalarExpression::If {
+        condition,
+        then_branch,
+        else_branch,
+        ..
+    } = &block.final_output_values.first()?.value
+    else {
+        return None;
+    };
+    let conditional_span = block.final_output_values.first()?.span;
+    let mut then_outputs = Vec::new();
+    let mut else_outputs = Vec::new();
+    for output in &block.final_output_values {
+        let ScalarExpression::If {
+            condition: output_condition,
+            then_branch: output_then_branch,
+            else_branch: output_else_branch,
+            ..
+        } = &output.value
+        else {
+            return None;
+        };
+        if output.span != conditional_span || output_condition != condition {
+            return None;
+        }
+        let [then_output] = output_then_branch.final_output_values.as_slice() else {
+            return None;
+        };
+        let [else_output] = output_else_branch.final_output_values.as_slice() else {
+            return None;
+        };
+        let mut then_output = then_output.clone();
+        then_output.ty = output.ty.clone();
+        then_outputs.push(then_output);
+        let mut else_output = else_output.clone();
+        else_output.ty = output.ty.clone();
+        else_outputs.push(else_output);
+    }
+    Some((
+        (**condition).clone(),
+        recombine_conditional_branch(then_branch, then_outputs),
+        recombine_conditional_branch(else_branch, else_outputs),
+    ))
+}
+
+fn recombine_conditional_branch(
+    branch: &ScalarBlock,
+    final_output_values: Vec<ScalarOutputValue>,
+) -> ScalarBlock {
+    let final_start = branch.items.len() - branch.final_output_values.len();
+    let mut branch = branch.clone();
+    branch.items.truncate(final_start);
+    branch.terminated_items.truncate(final_start);
+    branch.items.extend(
+        final_output_values
+            .iter()
+            .map(|output| ScalarBlockItem::Expression(output.value.clone())),
+    );
+    branch
+        .terminated_items
+        .extend(final_output_values.iter().map(|_| false));
+    branch.final_output_values = final_output_values;
+    branch.expressions = branch
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarBlockItem::Expression(expression) => Some(expression.clone()),
+            _ => None,
+        })
+        .collect();
+    branch
 }
 
 fn emit_assignment<'ctx, 'module>(
@@ -4843,6 +4948,26 @@ where
             phi.add_incoming(&[(&then_value, then_end), (&else_value, else_end)]);
             Ok(EmitValue::Basic(phi.as_basic_value()))
         }
+        (
+            EmitValue::Aggregate {
+                value: then_value,
+                outputs,
+            },
+            EmitValue::Aggregate {
+                value: else_value,
+                outputs: else_outputs,
+            },
+        ) if outputs == else_outputs => {
+            let phi = state
+                .builder
+                .build_phi(then_value.get_type(), "if")
+                .map_err(builder_error)?;
+            phi.add_incoming(&[(&then_value, then_end), (&else_value, else_end)]);
+            Ok(EmitValue::Aggregate {
+                value: phi.as_basic_value().into_struct_value(),
+                outputs,
+            })
+        }
         _ => Err("conditional branches have different LLVM values".into()),
     }
 }
@@ -5666,6 +5791,80 @@ mod tests {
         assert!(llvm.contains("while.cond.0:"), "{llvm}");
         assert!(llvm.contains("while.cond.3:"), "{llvm}");
         assert!(llvm.contains("getelementptr inbounds i8"), "{llvm}");
+    }
+
+    #[test]
+    fn emits_multiple_unit_conditionals_in_a_while_body() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\n(i32, bool)() run = fn { bool running = true; if (true) { while (running) { if (running) { running = false; } else { running = false; }; if (running) { running = running; } else { running = running; }; } running = false; 1, true } else { 2, false } };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+
+        let llvm = emit_scalar_llvm(&validation)
+            .expect("multiple loop unit conditional LLVM")
+            .to_text();
+        assert_eq!(
+            llvm.lines()
+                .filter(|line| line.starts_with("while.cond.") && line.contains(':'))
+                .count(),
+            1,
+            "{llvm}"
+        );
+    }
+
+    #[test]
+    fn emits_project_multiple_unit_conditionals_in_a_while_body_once() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let scalar = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\n(i32, bool)() run = fn { bool running = true; if (true) { while (running) { if (running) { running = false; } else { running = false; }; if (running) { running = running; } else { running = running; }; } running = false; 1, true } else { 2, false } };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(scalar.diagnostics.is_empty(), "{:?}", scalar.diagnostics);
+        let program = scalar.program;
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+
+        let llvm = emit_scalar_project_llvm(&validation)
+            .expect("project multiple loop unit conditional LLVM")
+            .to_text();
+        assert_eq!(
+            llvm.lines()
+                .filter(|line| line.starts_with("while.cond.") && line.contains(':'))
+                .count(),
+            1,
+            "{llvm}"
+        );
     }
 
     #[test]
@@ -7021,17 +7220,10 @@ count, complete = read_into(buffer, requested_capacity);
             .split("define { i32, i1 } @pair")
             .nth(1)
             .expect("pair function");
-        let insertions = pair
-            .match_indices("insertvalue { i32, i1 }")
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-
-        assert_eq!(insertions.len(), 2, "{pair}");
-        assert!(
-            pair[insertions[0]..insertions[1]].contains(", i32 "),
-            "{pair}"
-        );
-        assert!(pair[insertions[1]..].contains(", i1 "), "{pair}");
+        assert_eq!(pair.matches("phi { i32, i1 }").count(), 2, "{pair}");
+        assert!(pair.contains("{ i32 1, i1 true }"), "{pair}");
+        assert!(pair.contains("{ i32 2, i1 false }"), "{pair}");
+        assert!(pair.contains("{ i32 3, i1 true }"), "{pair}");
         assert!(pair.contains("ret { i32, i1 }"), "{pair}");
     }
 
