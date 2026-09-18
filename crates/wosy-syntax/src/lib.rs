@@ -414,7 +414,7 @@ fn build_pair(
         );
         return;
     }
-    if is_empty_operator_tier(&pair) {
+    if is_elided_operator_tier(&pair) {
         let span = pair.as_span();
         let mut inner = pair.into_inner();
         let Some(first) = inner.next() else {
@@ -452,25 +452,24 @@ fn build_pair(
     builder.finish_node();
 }
 
-fn is_empty_operator_tier(pair: &Pair<'_, Rule>) -> bool {
-    matches!(
-        pair.as_rule(),
-        Rule::bit_or | Rule::bit_xor | Rule::bit_and | Rule::shift | Rule::unary
-    ) && !pair.clone().into_inner().any(|child| {
-        matches!(
-            child.as_rule(),
-            Rule::or_operator
-                | Rule::and_operator
-                | Rule::bit_or_operator
-                | Rule::bit_xor_operator
-                | Rule::bit_and_operator
-                | Rule::comparison_operator
-                | Rule::shift_operator
-                | Rule::add_operator
-                | Rule::multiply_operator
-                | Rule::unary_operator
-        )
-    })
+fn is_elided_operator_tier(pair: &Pair<'_, Rule>) -> bool {
+    let operator_rule = match pair.as_rule() {
+        Rule::logical_or => Rule::or_operator,
+        Rule::logical_and => Rule::and_operator,
+        Rule::bit_or => Rule::bit_or_operator,
+        Rule::bit_xor => Rule::bit_xor_operator,
+        Rule::bit_and => Rule::bit_and_operator,
+        Rule::comparison => Rule::comparison_operator,
+        Rule::shift => Rule::shift_operator,
+        Rule::additive => Rule::add_operator,
+        Rule::multiplicative => Rule::multiply_operator,
+        Rule::unary => Rule::unary_operator,
+        _ => return false,
+    };
+    !pair
+        .clone()
+        .into_inner()
+        .any(|child| child.as_rule() == operator_rule)
 }
 
 fn add_gap(
@@ -1034,6 +1033,63 @@ mod tests {
                     )
                 }),
                 "missing operator token {operator}"
+            );
+        }
+    }
+
+    #[test]
+    fn binary_tiers_are_elided_without_an_operator_and_lossless_with_one() {
+        let operands = [
+            "value",
+            "!value",
+            "~value",
+            "-value",
+            "&?bytes[0]",
+            "&bytes[0]",
+            "&!bytes[0]",
+            "bytes[0]",
+        ];
+        for operand in operands {
+            let text = format!(
+                "%%start\nu8[1] bytes = [0];\ni32 value = 1;\n{} result = {};\n%%end",
+                if operand.starts_with('&') {
+                    "*?u8"
+                } else {
+                    "i32"
+                },
+                operand
+            );
+            let result = parse(identity(), text.clone(), &[]);
+            assert!(result.is_valid(), "{operand}: {:?}", result.errors);
+            assert_eq!(result.reconstruct(), text, "{operand}");
+            assert!(
+                result
+                    .root
+                    .descendants()
+                    .all(|node| node.kind() != SyntaxKind::Binary),
+                "{operand} retained a redundant Binary tier"
+            );
+        }
+
+        for operator in [
+            "||", "&&", "|", "^", "&", "==", "!=", "<", "<=", ">", ">=", "<<", ">>", "+", "-", "*",
+            "/", "%",
+        ] {
+            let text = format!("%%start\ni32 result = 1 {operator} 2;\n%%end");
+            let result = parse(identity(), text.clone(), &[]);
+            assert!(result.is_valid(), "{operator}: {:?}", result.errors);
+            assert_eq!(result.reconstruct(), text, "{operator}");
+            let binary = result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::Binary)
+                .collect::<Vec<_>>();
+            assert_eq!(binary.len(), 1, "{operator}");
+            assert!(
+                binary[0]
+                    .children_with_tokens()
+                    .any(|element| element.kind() == SyntaxKind::Operator),
+                "{operator} Binary node is missing its operator"
             );
         }
     }
