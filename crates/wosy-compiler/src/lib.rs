@@ -37,7 +37,8 @@ pub fn core_runtime(backend: &str, output: &str) -> Result<&'static str, String>
 
 #[cfg(test)]
 mod tests {
-    use super::core_runtime;
+    use super::{core_runtime, parse_source};
+    use wosy_syntax::{ByteSpan, SourceIdentity};
 
     #[test]
     fn derives_core_runtime_from_llvm_output() {
@@ -57,6 +58,28 @@ mod tests {
         assert_eq!(
             core_runtime("custom", "artifact"),
             Err("unsupported core runtime target backend custom with output artifact".to_owned())
+        );
+    }
+
+    #[test]
+    fn reports_only_the_trailing_while_semicolon_syntax_diagnostic() {
+        let text = "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t};\n};\n%%end";
+        let output = parse_source(
+            SourceIdentity::new(
+                "project".into(),
+                "package".into(),
+                "src/main.w".into(),
+                "r1".into(),
+            ),
+            text.into(),
+            &[],
+        );
+
+        assert_eq!(output.diagnostics.len(), 1);
+        let semicolon = text.find("\n\t};\n").expect("trailing semicolon") as u32 + 3;
+        assert_eq!(
+            output.diagnostics[0].labels[0].span.range,
+            ByteSpan::new(semicolon, semicolon + 1)
         );
     }
 }
