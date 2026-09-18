@@ -11611,21 +11611,27 @@ mod tests {
                     && diagnostic.message == "assignment targets require a distinctness proof"
             }));
         }
-        let raw = validate_project_text(
-            "%%start\nstruct Record { u8 value; u8[2] bytes; }\nRecord record = { .value = 0; .bytes = [0, 0]; };\nunsafe { *?Record raw = &?record; (*raw).value = 1; (*raw).bytes[0] = 2; };\n%%end",
+        let valid = validate_project_text(
+            "%%start\nstruct Record { u8 value; u8[2] bytes; }\nRecord holder = { .value = 0; .bytes = [0, 0]; };\n*!Record writer = &!holder;\n(*writer).value = 1;\n(*writer).bytes[0] = 2;\n%%end",
         );
-        assert_eq!(
-            raw.diagnostics
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+        let raw_text =
+            "%%start\nstruct Record { u8 value; u8[2] bytes; }\nRecord record = { .value = 0; .bytes = [0, 0]; };\nunsafe { *?Record raw = &?record; (*raw).value = 1; (*raw).bytes[0] = 2; };\n%%end";
+        let raw = validate_project_text(raw_text);
+        for target in ["(*raw).value", "(*raw).bytes[0]"] {
+            let start = raw_text.find(target).expect("raw assignment target") as u32;
+            let diagnostic = raw
+                .diagnostics
                 .iter()
-                .filter(|diagnostic| {
+                .find(|diagnostic| {
                     diagnostic.message
                         == "assignment through raw pointer dereference is not supported"
+                        && diagnostic.labels[0].span.range
+                            == ByteSpan::new(start, start + target.len() as u32)
                 })
-                .count(),
-            2,
-            "{:?}",
-            raw.diagnostics
-        );
+                .expect("raw write diagnostic");
+            assert_eq!(diagnostic.code, "B0003");
+        }
         let aggregate = validate_project_text(
             "%%start\nu8[2] values = [1, 2];\n*!(u8[2]) writer = &!values;\n*writer = [3, 4];\n%%end",
         );
