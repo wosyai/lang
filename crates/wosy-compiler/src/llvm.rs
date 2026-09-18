@@ -1730,17 +1730,29 @@ fn store_binding_outputs<'ctx, 'module>(
             .map_err(builder_error)?;
         store_value(context, state, slot, ty, value)?;
         state.storage.insert(name.clone(), (slot, ty.clone()));
-        if matches!(ty, ScalarType::RuntimeArray { .. }) {
-            state.runtime_array_owners.insert(
-                name.clone(),
-                runtime_array_assignment_provenance(state, &binding.value)
-                    .result
-                    .owns(),
-            );
-            state.runtime_array_allocations.insert(name.clone(), false);
-        }
+        transition_runtime_array_binding_initialization(state, name, ty, &binding.value);
     }
     Ok(())
+}
+
+fn transition_runtime_array_binding_initialization(
+    state: &mut EmitState<'_, '_>,
+    name: &str,
+    ty: &ScalarType,
+    value: &ScalarExpression,
+) {
+    if !matches!(ty, ScalarType::RuntimeArray { .. }) {
+        return;
+    }
+    let provenance = runtime_array_assignment_provenance(state, value);
+    let owns = provenance.result.owns();
+    state.runtime_array_owners.insert(name.into(), owns);
+    state.runtime_array_allocations.insert(name.into(), false);
+    if owns {
+        if let Some(source) = provenance.source_name.filter(|source| source != name) {
+            state.runtime_array_owners.insert(source, false);
+        }
+    }
 }
 
 fn runtime_array_assignment_provenance(
@@ -2189,6 +2201,7 @@ fn emit_main<'ctx, 'module>(
             ScalarItem::Binding(binding) => {
                 let value = emit_binding_value(context, &mut state, binding)?;
                 if binding.is_allocation {
+                    store_binding_outputs(context, &mut state, binding, value)?;
                     continue;
                 }
                 for (position, (name, ty)) in binding_receivers(binding).iter().enumerate() {
@@ -2202,6 +2215,17 @@ fn emit_main<'ctx, 'module>(
                         .cloned()
                         .ok_or_else(|| format!("unknown LLVM global {name}"))?;
                     store_value(context, &mut state, global.as_pointer_value(), ty, value)?;
+                    if matches!(ty, ScalarType::RuntimeArray { .. }) {
+                        state
+                            .storage
+                            .insert(name.clone(), (global.as_pointer_value(), ty.clone()));
+                    }
+                    transition_runtime_array_binding_initialization(
+                        &mut state,
+                        name,
+                        ty,
+                        &binding.value,
+                    );
                 }
             }
             ScalarItem::Executable(item) => {
@@ -2419,6 +2443,7 @@ fn initialize_project_module<'ctx, 'module>(
             ScalarItem::Binding(binding) => {
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 if binding.is_allocation {
+                    store_binding_outputs(context, state, binding, value)?;
                     continue;
                 }
                 for (position, (name, ty)) in binding_receivers(binding).iter().enumerate() {
@@ -2432,6 +2457,17 @@ fn initialize_project_module<'ctx, 'module>(
                         .cloned()
                         .ok_or_else(|| format!("unknown LLVM global {name}"))?;
                     store_value(context, state, global.as_pointer_value(), ty, value)?;
+                    if matches!(ty, ScalarType::RuntimeArray { .. }) {
+                        state
+                            .storage
+                            .insert(name.clone(), (global.as_pointer_value(), ty.clone()));
+                    }
+                    transition_runtime_array_binding_initialization(
+                        state,
+                        name,
+                        ty,
+                        &binding.value,
+                    );
                 }
             }
             ScalarItem::Executable(item) => {
@@ -2443,7 +2479,9 @@ fn initialize_project_module<'ctx, 'module>(
 
     state.globals = current_globals;
     state.values = values;
-    state.storage = storage;
+    let mut retained_storage = storage;
+    retained_storage.extend(std::mem::take(&mut state.storage));
+    state.storage = retained_storage;
     Ok(())
 }
 
@@ -3005,43 +3043,8 @@ fn emit_block_item<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            if binding.is_allocation {
-                store_binding_outputs(context, state, binding, EmitValue::Unit)?;
-                return Ok(EmitValue::Unit);
-            }
-            let value =
-                emit_typed_expression(context, state, &binding.value, &binding.declared_type)?;
-            if binding.declared_type == ScalarType::Unit {
-                state.values.insert(binding.name.clone(), EmitValue::Unit);
-                return Ok(EmitValue::Unit);
-            }
-            let slot = state
-                .builder
-                .build_alloca(
-                    storage_type(
-                        context,
-                        &binding.declared_type,
-                        state.structs,
-                        state.target_layout,
-                    )?,
-                    &binding.name,
-                )
-                .map_err(builder_error)?;
-            store_value(context, state, slot, &binding.declared_type, value)?;
-            state
-                .storage
-                .insert(binding.name.clone(), (slot, binding.declared_type.clone()));
-            if matches!(binding.declared_type, ScalarType::RuntimeArray { .. }) {
-                state.runtime_array_owners.insert(
-                    binding.name.clone(),
-                    runtime_array_assignment_provenance(state, &binding.value)
-                        .result
-                        .owns(),
-                );
-                state
-                    .runtime_array_allocations
-                    .insert(binding.name.clone(), false);
-            }
+            let value = emit_binding_value(context, state, binding)?;
+            store_binding_outputs(context, state, binding, value)?;
             Ok(EmitValue::Unit)
         }
         ScalarBlockItem::Expression(expression) => emit_expression(context, state, expression),
@@ -3100,37 +3103,7 @@ fn emit_project_block_item<'ctx, 'module>(
                 module,
                 modules,
             )?;
-            if binding.declared_type == ScalarType::Unit {
-                state.values.insert(binding.name.clone(), EmitValue::Unit);
-                return Ok(EmitValue::Unit);
-            }
-            let slot = state
-                .builder
-                .build_alloca(
-                    storage_type(
-                        context,
-                        &binding.declared_type,
-                        state.structs,
-                        state.target_layout,
-                    )?,
-                    &binding.name,
-                )
-                .map_err(builder_error)?;
-            store_value(context, state, slot, &binding.declared_type, value)?;
-            state
-                .storage
-                .insert(binding.name.clone(), (slot, binding.declared_type.clone()));
-            if matches!(binding.declared_type, ScalarType::RuntimeArray { .. }) {
-                state.runtime_array_owners.insert(
-                    binding.name.clone(),
-                    runtime_array_assignment_provenance(state, &binding.value)
-                        .result
-                        .owns(),
-                );
-                state
-                    .runtime_array_allocations
-                    .insert(binding.name.clone(), false);
-            }
+            store_binding_outputs(context, state, binding, value)?;
             Ok(EmitValue::Unit)
         }
         ScalarBlockItem::Expression(expression) => {
@@ -5615,6 +5588,35 @@ mod tests {
             );
             assert!(llvm.contains("getelementptr inbounds i8"), "{llvm}");
             assert!(!llvm.contains("icmp ult"), "{llvm}");
+        }
+    }
+
+    #[test]
+    fn emits_one_release_for_a_moved_top_level_runtime_array_for_both_targets() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nu64 length = 1;\nu8[length] first;\nu8[] second = first;\nsecond[0] = 7;\nu8 value = second[0];\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let validation = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(
+                validation.diagnostics.is_empty(),
+                "{:?}",
+                validation.diagnostics
+            );
+            let llvm = emit_scalar_llvm(&validation)
+                .expect("moved runtime array LLVM")
+                .to_text();
+            assert!(llvm.contains("call ptr @__wosy_core_alloc"), "{llvm}");
+            assert_eq!(
+                llvm.matches("call void @__wosy_core_free").count(),
+                1,
+                "{llvm}"
+            );
         }
     }
 

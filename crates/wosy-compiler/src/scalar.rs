@@ -2160,6 +2160,32 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
             match item {
                 ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
                 ScalarItem::Binding(binding) => {
+                    if binding.is_allocation {
+                        for receiver in &binding.receivers {
+                            let Some(length) = &receiver.allocation_length else {
+                                continue;
+                            };
+                            let actual = expression_type_in_module_expected(
+                                length,
+                                Some(&ScalarType::U64),
+                                &declarations,
+                                &BTreeSet::new(),
+                                &BTreeMap::new(),
+                                module,
+                                &project.modules,
+                                &mut diagnostics,
+                                false,
+                            );
+                            expect_module_type(
+                                module,
+                                &ScalarType::U64,
+                                &actual,
+                                receiver.span,
+                                &mut diagnostics,
+                            );
+                        }
+                        continue;
+                    }
                     let actual = expression_type_in_module_expected(
                         &binding.value,
                         Some(&binding.declared_type),
@@ -9633,6 +9659,31 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
         match item {
             ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
             ScalarItem::Binding(binding) => {
+                if binding.is_allocation {
+                    for receiver in &binding.receivers {
+                        let Some(length) = &receiver.allocation_length else {
+                            continue;
+                        };
+                        let actual = expression_type_expected(
+                            length,
+                            &ScalarType::U64,
+                            &declarations,
+                            &BTreeSet::new(),
+                            &BTreeMap::new(),
+                            program,
+                            &mut diagnostics,
+                            false,
+                        );
+                        expect_type(
+                            program,
+                            &ScalarType::U64,
+                            &actual,
+                            receiver.span,
+                            &mut diagnostics,
+                        );
+                    }
+                    continue;
+                }
                 let actual = expression_type_expected(
                     &binding.value,
                     &binding.declared_type,
@@ -12029,6 +12080,19 @@ mod tests {
     fn validates_runtime_array_callable_transport() {
         let validation = validate_text(
             "%%start\nu8[]() make = fn { u64 length = 1; u8[length] bytes; bytes };\nu8[](u8[]) relay = fn(values) { values };\nu8[] value = make();\nu8[] alias = relay(value);\n%%end",
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "diagnostics: {:#?}\nprogram: {:#?}",
+            validation.diagnostics,
+            validation.program
+        );
+    }
+
+    #[test]
+    fn validates_runtime_array_binding_move_and_top_level_materialization() {
+        let validation = validate_text(
+            "%%start\nu64 length = 1;\nu8[length] first;\nu8[] second = first;\nsecond[0] = 7;\nu8 value = second[0];\n%%end",
         );
         assert!(
             validation.diagnostics.is_empty(),

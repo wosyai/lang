@@ -1,4 +1,13 @@
 %%start
+u64 top_length = 1;
+u8[top_length] top;
+top[0] = 3;
+u8 top_value = top[0];
+u8 top_expected = 3;
+if (top_value != top_expected) {
+	core.system_panic();
+};
+
 u8[]() make = fn {
 	u64 length = 1;
 	u8[length] bytes;
@@ -27,6 +36,8 @@ unit() run = fn {
 	u8[] returned = make();
 	u8[] replaced = replace(returned);
 	u8[] alias = relay(replaced);
+	u8[] moved = bytes;
+	u8 moved_expected = 7;
 	u8 transferred = alias[0];
 	u8 transferred_expected = 4;
 	u8[1] fixed = [5];
@@ -39,7 +50,7 @@ unit() run = fn {
 		nested[0] = 6;
 	};
 	u8 expected = 8;
-	if (value != expected || transferred != transferred_expected || widened_value != widened_expected) {
+	if (value != expected || transferred != transferred_expected || widened_value != widened_expected || moved[0] != moved_expected) {
 		core.system_panic();
 	};
 };
