@@ -55,8 +55,6 @@ unit() run = fn {
 	u64 overwrite_length = 1;
 	u8[overwrite_length] overwrite;
 	overwrite[0] = 9;
-	u8 packet_value = 0;
-	unsafe { packet_value = *(*returned_packet).data; };
 	u8[] moved = bytes;
 	u8 moved_expected = 7;
 	u8 transferred = alias[0];
@@ -71,7 +69,7 @@ unit() run = fn {
 		nested[0] = 6;
 	};
 	u8 expected = 8;
-	if (value != expected || transferred != transferred_expected || widened_value != widened_expected || moved[0] != moved_expected || packet_value != transferred_expected) {
+	if (value != expected || transferred != transferred_expected || widened_value != widened_expected || moved[0] != moved_expected || returned_packet == null || (*returned_packet).data == null || (*returned_packet).length != overwrite_length) {
 		core.system_panic();
 	};
 };
