@@ -4046,7 +4046,10 @@ fn llvm_extern_identity(
     LlvmExternIdentity {
         internal_name,
         import_module: import_module.to_owned(),
-        import_name: import_name.to_owned(),
+        import_name: match import_name.strip_prefix('_') {
+            Some(private_name) => private_name.to_owned(),
+            None => import_name.to_owned(),
+        },
         signature: signature.clone(),
     }
 }
@@ -5452,15 +5455,15 @@ u64 reported, bool complete = text.print(\"\");
             "r1".into(),
         );
         let text = "%%start
-struct Iovec { *?u8 data; u32 length; }
-struct Nread { u32 value; }
-wasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, *?Iovec, i32, *?Nread) fd_read; };
-i32(i32, *?Iovec, *?Nread) fd_read_once = fn(descriptor, iovec_address, count_address) { unsafe { wasi.fd_read(descriptor, iovec_address, 1, count_address) } };
+struct _Iovec { *?u8 data; u32 length; }
+struct _Nread { u32 value; }
+_wasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, *?_Iovec, i32, *?_Nread) _fd_read; };
+i32(i32, *?_Iovec, *?_Nread) _fd_read_once = fn(descriptor, iovec_address, count_address) { unsafe { _wasi._fd_read(descriptor, iovec_address, 1, count_address) } };
 (u64, bool)(*?u8, u64) read_into = fn(destination, capacity) {
-	Iovec entry = { .data = destination; .length = core.int_trunc<u32>(capacity); };
-	Nread count_cell = { .value = 0; };
+	_Iovec entry = { .data = destination; .length = core.int_trunc<u32>(capacity); };
+	_Nread count_cell = { .value = 0; };
 	i32 result = 0;
-	unsafe { result = fd_read_once(0, &?entry, &?count_cell); };
+	unsafe { result = _fd_read_once(0, &?entry, &?count_cell); };
 	core.int_extend<u64>(count_cell.value), result == 0
 };
 *?u8 buffer = null;

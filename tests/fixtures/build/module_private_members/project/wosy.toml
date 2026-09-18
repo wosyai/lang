@@ -1,0 +1,30 @@
+[package]
+name = "app"
+default_target = "app"
+
+[comments]
+categories = []
+
+[builders.native]
+command = ["python", "scripts/build-native"]
+args = []
+toolchain_identity = "llvm-18.1.3"
+
+[runners.native]
+command = ["python", "scripts/run-native"]
+args = []
+
+[targets.app]
+root = "src/main.w"
+
+[targets.app.artifacts.main]
+artifact = "Main"
+
+[targets.app.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.app.profiles.dev]
+main_artifact = "main"

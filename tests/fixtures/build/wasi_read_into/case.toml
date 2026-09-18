@@ -4,6 +4,17 @@ shared_stdlib = true
 command = ["wosy", "build", "app"]
 exit = 0
 
+[[steps]]
+source = "project/src/read_private.w"
+command = ["wosy", "build", "app"]
+exit = 1
+
+[[assert]]
+source = "project/src/read_private.w"
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["M0002", "_fd_read", "_fd_read_once", "_ReadIovec", "_Nread"]
+
 [[assert]]
 source = "project/src/read_bytes.w"
 fd_read_capacity = 4

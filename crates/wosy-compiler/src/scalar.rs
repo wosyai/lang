@@ -1238,7 +1238,9 @@ impl ScalarModule {
                 ScalarItem::Namespace(_) => continue,
                 ScalarItem::Extern(extern_decl) => {
                     for function in &extern_decl.functions {
-                        members.insert(function.name.clone(), function.signature.clone());
+                        if !is_module_private_name(&function.name) {
+                            members.insert(function.name.clone(), function.signature.clone());
+                        }
                     }
                     continue;
                 }
@@ -1250,7 +1252,9 @@ impl ScalarModule {
                 }
                 ScalarItem::Executable(_) => continue,
             };
-            members.entry(name.clone()).or_insert_with(|| ty.clone());
+            if !is_module_private_name(name) {
+                members.entry(name.clone()).or_insert_with(|| ty.clone());
+            }
             initialization_nodes.push(ScalarInitializationNode { item_index, span });
         }
         Self {
@@ -2087,7 +2091,9 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         }
                     }
                     if let ScalarItem::Function(function) = item {
-                        if !function.overload_arms.is_empty() {
+                        if !is_module_private_name(&function.name)
+                            && !function.overload_arms.is_empty()
+                        {
                             for arm in &function.overload_arms {
                                 if arm.generic_parameters.is_empty() {
                                     validate_module_type(
@@ -2489,12 +2495,12 @@ fn resolve_module_types_in_project(module: &mut ScalarModule, modules: &[ScalarM
     }
     for item in &module.items {
         match item {
-            ScalarItem::Binding(binding) => {
+            ScalarItem::Binding(binding) if !is_module_private_name(&binding.name) => {
                 module
                     .members
                     .insert(binding.name.clone(), binding.declared_type.clone());
             }
-            ScalarItem::Function(function) => {
+            ScalarItem::Function(function) if !is_module_private_name(&function.name) => {
                 module
                     .members
                     .insert(function.name.clone(), function.signature.clone());
@@ -2571,10 +2577,9 @@ fn resolve_type_in_project(
                     .find(|candidate| candidate.source == namespace.target)
             })
             .and_then(|target| {
-                target
-                    .structs
-                    .iter()
-                    .find(|structure| structure.name == *member)
+                target.structs.iter().find(|structure| {
+                    structure.name == *member && !is_module_private_name(&structure.name)
+                })
             }) {
             Some(structure) => ScalarType::Struct(structure.id.clone()),
             None => ScalarType::Qualified {
@@ -7046,6 +7051,10 @@ fn unknown_member_diagnostic(
         ],
         notes: Vec::new(),
     }
+}
+
+fn is_module_private_name(name: &str) -> bool {
+    name.starts_with('_')
 }
 
 fn derive_namespace(node: &CstNode) -> ScalarNamespace {
@@ -11811,16 +11820,16 @@ mod tests {
     }
 
     #[test]
-    fn validates_public_read_into_signature_and_keeps_fd_read_in_the_wasi_module() {
+    fn validates_public_read_into_signature_and_hides_preview1_read_details() {
         let preview_source = module_source("src/wasi/preview1.w");
         let preview = module_from_text(
             preview_source.clone(),
-            "%%start\nstruct Iovec { *?u8 data; u32 length; }\nstruct Nread { u32 value; }\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, *?Iovec, i32, *?Nread) fd_read; };\ni32(i32, *?Iovec, *?Nread) fd_read_once = fn(descriptor, iovec, nread) { unsafe { wasi.fd_read(descriptor, iovec, 1, nread) } };\n%%end",
+            "%%start\nstruct _ReadIovec { *?u8 data; u32 length; }\nstruct _Nread { u32 value; }\n_wasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, *?_ReadIovec, i32, *?_Nread) _fd_read; };\n(u64, bool)(*?u8, u64) _fd_read_once = fn(destination, capacity) { _ReadIovec _iovec = { .data = destination; .length = core.int_trunc<u32>(capacity); }; _Nread _byte_count = { .value = 0; }; i32 _result = unsafe { _wasi._fd_read(0, &?_iovec, 1, &?_byte_count) }; u64 reported = 0; bool complete = false; if (_result == 0) { reported = core.int_extend<u64>(_byte_count.value); complete = true; } else { reported = 0; complete = false; }; reported, complete };\n(u64, bool)(*?u8, u64) read_into = fn(destination, capacity) { _fd_read_once(destination, capacity) };\n%%end",
         );
         let bootstrap_source = module_source("src/bootstrap.w");
         let bootstrap = module_from_text(
             bootstrap_source.clone(),
-            "%%start\npreview1 = namespace std \"wasi/preview1.w\";\n(u64, bool)(*?u8, u64) read_into = fn(destination, capacity) { capacity, destination == null };\n%%end",
+            "%%start\npreview1 = namespace std \"wasi/preview1.w\";\n(u64, bool)(*?u8, u64) read_into = fn(destination, capacity) { preview1.read_into(destination, capacity) };\n%%end",
         );
         let main_source = module_source("src/main.w");
         let main = module_from_text(
@@ -11869,6 +11878,12 @@ mod tests {
         assert!(!validation.project.modules[1]
             .members
             .contains_key("fd_read_once"));
+        assert!(!validation.project.modules[2]
+            .members
+            .contains_key("_fd_read"));
+        assert!(!validation.project.modules[2]
+            .members
+            .contains_key("_fd_read_once"));
     }
 
     #[test]
