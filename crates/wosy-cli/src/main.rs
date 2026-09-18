@@ -3,6 +3,7 @@ use codespan_reporting::diagnostic::{Diagnostic as Report, Label};
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -499,7 +500,11 @@ fn persist_cst(
 
 fn load_canonical_cst(path: &std::path::Path) -> Result<wosy_syntax::CanonicalCstRoot, String> {
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    let snapshot = serde_json::from_slice(bytes.as_slice()).map_err(|error| error.to_string())?;
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes.as_slice());
+    deserializer.disable_recursion_limit();
+    let snapshot = wosy_syntax::CanonicalCstSnapshot::deserialize(&mut deserializer)
+        .map_err(|error| error.to_string())?;
+    deserializer.end().map_err(|error| error.to_string())?;
     Ok(wosy_syntax::CanonicalCstRoot::from_snapshot(snapshot))
 }
 
@@ -756,6 +761,80 @@ fn render_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_test_path(name: &str) -> std::path::PathBuf {
+        let current_thread = std::thread::current();
+        let thread_name = current_thread.name().expect("named test thread");
+        let safe_thread_name: String = thread_name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        std::env::temp_dir().join(format!(
+            "wosy-cli-canonical-cst-{}-{}-{name}.json",
+            std::process::id(),
+            safe_thread_name
+        ))
+    }
+
+    #[test]
+    fn loads_deep_archived_snapshot_and_reaches_scalar_derivation() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/bootstrap.w".into(),
+            "r1".into(),
+        );
+        let output = parse_source(
+            source,
+            include_str!("../../../stdlib/src/bootstrap.w").into(),
+            &[],
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let path = snapshot_test_path("deep");
+        fs::write(
+            &path,
+            serde_json::to_vec(&output.result.canonical_cst().snapshot())
+                .expect("serialize canonical CST snapshot"),
+        )
+        .expect("write archived snapshot");
+
+        let canonical = load_canonical_cst(&path).expect("load deep canonical CST snapshot");
+        let scalar = wosy_compiler::derive_scalar_program_from_cst(&canonical);
+
+        assert!(!scalar.program.items.is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_canonical_cst_snapshot() {
+        let path = snapshot_test_path("malformed");
+        fs::write(&path, b"{").expect("write malformed snapshot");
+
+        assert!(load_canonical_cst(&path).is_err());
+    }
+
+    #[test]
+    fn rejects_trailing_input_after_canonical_cst_snapshot() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let output = parse_source(source, "%%start\n%%end".into(), &[]);
+        let mut bytes = serde_json::to_vec(&output.result.canonical_cst().snapshot())
+            .expect("serialize canonical CST snapshot");
+        bytes.extend_from_slice(b" trailing");
+        let path = snapshot_test_path("trailing");
+        fs::write(&path, bytes).expect("write snapshot with trailing input");
+
+        assert!(load_canonical_cst(&path).is_err());
+    }
 
     #[test]
     fn compiler_namespace_target_retains_dependency_identity() {

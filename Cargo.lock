@@ -615,6 +615,7 @@ dependencies = [
  "blake3",
  "clap",
  "codespan-reporting",
+ "serde",
  "serde_json",
  "wosy-compiler",
  "wosy-project",

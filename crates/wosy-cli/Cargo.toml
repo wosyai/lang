@@ -8,6 +8,7 @@ license.workspace = true
 blake3.workspace = true
 clap.workspace = true
 codespan-reporting.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 wosy-compiler.workspace = true
 wosy-project.workspace = true
