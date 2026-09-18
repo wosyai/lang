@@ -940,6 +940,7 @@ fn basic_type<'ctx>(
         ScalarType::Bool => Ok(context.bool_type().into()),
         ty if integer_width(ty).is_some() => Ok(integer_type(context, ty)?.into()),
         ScalarType::Char => Ok(context.i32_type().into()),
+        ScalarType::Enum(_) => Ok(context.i32_type().into()),
         ScalarType::F32 => Ok(context.f32_type().into()),
         ScalarType::F64 => Ok(context.f64_type().into()),
         ScalarType::ArtifactId => Ok(context.ptr_type(AddressSpace::default()).into()),
@@ -1000,6 +1001,7 @@ fn allocation_layout(
         | ScalarType::ArtifactId => {
             Ok((target_layout.pointer_size, target_layout.pointer_alignment))
         }
+        ScalarType::Enum(_) => Ok((4, 4)),
         ScalarType::Struct(id) => structs
             .iter()
             .find(|structure| structure.id == *id)
@@ -1041,6 +1043,7 @@ fn value_type(ty: &ScalarType) -> Result<LlvmValueType, String> {
         ScalarType::RawPointer(_) | ScalarType::CheckedReference { .. } => {
             Ok(LlvmValueType::Pointer)
         }
+        ScalarType::Enum(_) => Ok(LlvmValueType::I32),
         ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::RuntimeArray { .. } => {
             Ok(LlvmValueType::Pointer)
         }
@@ -3341,7 +3344,17 @@ fn emit_expression<'ctx, 'module>(
                 .cloned()
                 .ok_or_else(|| format!("unknown LLVM value {name}"))
         }
-        ScalarExpression::Member { receiver, name, .. } => {
+        ScalarExpression::Member {
+            receiver,
+            name,
+            enum_tag,
+            ..
+        } => {
+            if let Some(tag) = enum_tag {
+                return Ok(EmitValue::Basic(
+                    context.i32_type().const_int(u64::from(*tag), false).into(),
+                ));
+            }
             if let Some(place) = struct_member_place(state, receiver, name)? {
                 return emit_place_value(context, state, &place);
             }
@@ -5462,6 +5475,10 @@ fn generic_type_name(ty: &ScalarType) -> String {
         } => format!("qualified({receiver}.{member})"),
         ScalarType::Struct(id) => format!(
             "struct({}:{}:{}:{})",
+            id.source.package, id.source.path, id.source.revision, id.index
+        ),
+        ScalarType::Enum(id) => format!(
+            "enum({}:{}:{}:{})",
             id.source.package, id.source.path, id.source.revision, id.index
         ),
         ScalarType::Error => "error".into(),

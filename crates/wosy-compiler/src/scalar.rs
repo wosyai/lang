@@ -47,6 +47,7 @@ pub enum ScalarType {
         span: ByteSpan,
     },
     Struct(ScalarStructId),
+    Enum(ScalarEnumId),
     Array {
         element: Box<ScalarType>,
         length: u64,
@@ -70,6 +71,37 @@ pub enum ScalarReferenceMutability {
 pub struct ScalarStructId {
     pub source: SourceIdentity,
     pub index: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarEnumId {
+    pub source: SourceIdentity,
+    pub index: usize,
+}
+
+impl Ord for ScalarEnumId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            &self.source.project,
+            &self.source.package,
+            &self.source.path,
+            &self.source.revision,
+            self.index,
+        )
+            .cmp(&(
+                &other.source.project,
+                &other.source.package,
+                &other.source.path,
+                &other.source.revision,
+                other.index,
+            ))
+    }
+}
+
+impl PartialOrd for ScalarEnumId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl Ord for ScalarStructId {
@@ -238,6 +270,7 @@ enum ScalarTypeIdentity {
     Named(String),
     Qualified(String, String),
     Struct(ScalarStructId),
+    Enum(ScalarEnumId),
     Array(Box<ScalarTypeIdentity>, u64),
     RuntimeArray(Box<ScalarTypeIdentity>),
     Error,
@@ -424,6 +457,7 @@ fn scalar_type_identity(ty: &ScalarType) -> ScalarTypeIdentity {
             receiver, member, ..
         } => ScalarTypeIdentity::Qualified(receiver.clone(), member.clone()),
         ScalarType::Struct(id) => ScalarTypeIdentity::Struct(id.clone()),
+        ScalarType::Enum(id) => ScalarTypeIdentity::Enum(id.clone()),
         ScalarType::Array {
             element, length, ..
         } => ScalarTypeIdentity::Array(Box::new(scalar_type_identity(element)), *length),
@@ -516,6 +550,22 @@ pub struct ScalarStruct {
     pub fields: Vec<ScalarStructField>,
     pub span: ByteSpan,
     pub layout: Option<ScalarLayout>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarEnumVariant {
+    pub name: String,
+    pub name_span: ByteSpan,
+    pub tag: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarEnum {
+    pub id: ScalarEnumId,
+    pub name: String,
+    pub name_span: ByteSpan,
+    pub variants: Vec<ScalarEnumVariant>,
+    pub span: ByteSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -984,6 +1034,7 @@ pub enum ScalarExpression {
     Member {
         receiver: String,
         name: String,
+        enum_tag: Option<u32>,
         receiver_span: ByteSpan,
         name_span: ByteSpan,
         span: ByteSpan,
@@ -1220,6 +1271,7 @@ pub struct ScalarProgram {
     pub source: SourceIdentity,
     pub items: Vec<ScalarItem>,
     pub structs: Vec<ScalarStruct>,
+    pub enums: Vec<ScalarEnum>,
     pub target_layout: ScalarTargetLayout,
 }
 
@@ -1244,6 +1296,7 @@ pub struct ScalarModule {
     pub members: BTreeMap<String, ScalarType>,
     pub initialization_nodes: Vec<ScalarInitializationNode>,
     pub structs: Vec<ScalarStruct>,
+    pub enums: Vec<ScalarEnum>,
     pub target_layout: ScalarTargetLayout,
 }
 
@@ -1286,6 +1339,7 @@ impl ScalarModule {
             members,
             initialization_nodes,
             structs: Vec::new(),
+            enums: Vec::new(),
             target_layout: ScalarTargetLayout::WASM32,
         }
     }
@@ -1296,6 +1350,7 @@ impl ScalarModule {
     ) -> Self {
         let mut module = Self::new(program.source, program.items, namespace_bindings);
         module.structs = program.structs;
+        module.enums = program.enums;
         module.target_layout = program.target_layout;
         module
     }
@@ -1380,6 +1435,21 @@ pub fn derive_scalar_program_from_cst_with_layout(
             )
         })
         .collect();
+    let enums = source_root
+        .children()
+        .chain(source_root.descendants())
+        .filter(|node| node.kind() == SyntaxKind::EnumDecl)
+        .enumerate()
+        .map(|(index, node)| {
+            derive_enum(
+                node,
+                ScalarEnumId {
+                    source: canonical.source.clone(),
+                    index,
+                },
+            )
+        })
+        .collect();
     let mut generic_function = false;
     for node in source_root.children() {
         match node.kind() {
@@ -1436,6 +1506,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
         source: canonical.source.clone(),
         items,
         structs,
+        enums,
         target_layout,
     };
     resolve_program_types(&mut program, &mut diagnostics);
@@ -1682,10 +1753,21 @@ fn record_block_overload_selections(
 
 fn resolve_program_types(program: &mut ScalarProgram, diagnostics: &mut Vec<super::Diagnostic>) {
     let source = program.source.clone();
-    let names: BTreeMap<String, ScalarStructId> = program
+    let names: BTreeMap<String, ScalarType> = program
         .structs
         .iter()
-        .map(|structure| (structure.name.clone(), structure.id.clone()))
+        .map(|structure| {
+            (
+                structure.name.clone(),
+                ScalarType::Struct(structure.id.clone()),
+            )
+        })
+        .chain(program.enums.iter().map(|enumeration| {
+            (
+                enumeration.name.clone(),
+                ScalarType::Enum(enumeration.id.clone()),
+            )
+        }))
         .collect();
     for structure in &mut program.structs {
         for field in &mut structure.fields {
@@ -1738,7 +1820,7 @@ fn resolve_program_types(program: &mut ScalarProgram, diagnostics: &mut Vec<supe
     }
 }
 
-fn resolve_item_types(item: &mut ScalarBlockItem, names: &BTreeMap<String, ScalarStructId>) {
+fn resolve_item_types(item: &mut ScalarBlockItem, names: &BTreeMap<String, ScalarType>) {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
             binding.declared_type = resolve_type(&binding.declared_type, names);
@@ -1756,7 +1838,7 @@ fn resolve_item_types(item: &mut ScalarBlockItem, names: &BTreeMap<String, Scala
     }
 }
 
-fn resolve_block_types(block: &mut ScalarBlock, names: &BTreeMap<String, ScalarStructId>) {
+fn resolve_block_types(block: &mut ScalarBlock, names: &BTreeMap<String, ScalarType>) {
     for item in &mut block.items {
         match item {
             ScalarBlockItem::LocalBinding(binding) => {
@@ -1773,14 +1855,14 @@ fn resolve_block_types(block: &mut ScalarBlock, names: &BTreeMap<String, ScalarS
     }
 }
 
-fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarStructId>) -> ScalarType {
+fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarType>) -> ScalarType {
     match ty {
         ScalarType::Named { name, span } => names.get(name).cloned().map_or_else(
             || ScalarType::Named {
                 name: name.clone(),
                 span: *span,
             },
-            ScalarType::Struct,
+            |ty| ty,
         ),
         ScalarType::RawPointer(inner) => {
             ScalarType::RawPointer(Box::new(resolve_type(inner, names)))
@@ -1957,8 +2039,25 @@ fn resolve_expression_places(
             let mut scope = scope.clone();
             resolve_block_places(block, &mut scope, program);
         }
+        ScalarExpression::Member {
+            receiver,
+            name,
+            enum_tag,
+            ..
+        } => {
+            *enum_tag = program
+                .enums
+                .iter()
+                .find(|enumeration| enumeration.name == *receiver)
+                .and_then(|enumeration| {
+                    enumeration
+                        .variants
+                        .iter()
+                        .find(|variant| variant.name == *name)
+                })
+                .map(|variant| variant.tag);
+        }
         ScalarExpression::Name { .. }
-        | ScalarExpression::Member { .. }
         | ScalarExpression::Integer { .. }
         | ScalarExpression::InvalidInteger { .. }
         | ScalarExpression::Float { .. }
@@ -2498,7 +2597,18 @@ fn resolve_module_types_in_project(module: &mut ScalarModule, modules: &[ScalarM
     let names = module
         .structs
         .iter()
-        .map(|structure| (structure.name.clone(), structure.id.clone()))
+        .map(|structure| {
+            (
+                structure.name.clone(),
+                ScalarType::Struct(structure.id.clone()),
+            )
+        })
+        .chain(module.enums.iter().map(|enumeration| {
+            (
+                enumeration.name.clone(),
+                ScalarType::Enum(enumeration.id.clone()),
+            )
+        }))
         .collect::<BTreeMap<_, _>>();
     for structure in &mut module.structs {
         for field in &mut structure.fields {
@@ -2562,7 +2672,7 @@ fn resolve_module_types_in_project(module: &mut ScalarModule, modules: &[ScalarM
 
 fn resolve_item_types_project(
     item: &mut ScalarBlockItem,
-    names: &BTreeMap<String, ScalarStructId>,
+    names: &BTreeMap<String, ScalarType>,
     module: &ScalarModule,
     modules: &[ScalarModule],
 ) {
@@ -2586,7 +2696,7 @@ fn resolve_item_types_project(
 
 fn resolve_block_types_project(
     block: &mut ScalarBlock,
-    names: &BTreeMap<String, ScalarStructId>,
+    names: &BTreeMap<String, ScalarType>,
     module: &ScalarModule,
     modules: &[ScalarModule],
 ) {
@@ -2597,14 +2707,14 @@ fn resolve_block_types_project(
 
 fn resolve_type_in_project(
     ty: &ScalarType,
-    names: &BTreeMap<String, ScalarStructId>,
+    names: &BTreeMap<String, ScalarType>,
     module: &ScalarModule,
     modules: &[ScalarModule],
 ) -> ScalarType {
     match ty {
         ScalarType::Named { name, span } => {
             if let Some(id) = names.get(name) {
-                return ScalarType::Struct(id.clone());
+                return id.clone();
             }
             ScalarType::Named {
                 name: name.clone(),
@@ -2632,13 +2742,30 @@ fn resolve_type_in_project(
                 })
             }) {
             Some(structure) => ScalarType::Struct(structure.id.clone()),
-            None => ScalarType::Qualified {
-                receiver: receiver.clone(),
-                receiver_span: *receiver_span,
-                member: member.clone(),
-                member_span: *member_span,
-                span: *span,
-            },
+            None => module
+                .namespace_bindings
+                .iter()
+                .find(|namespace| namespace.binding == *receiver)
+                .and_then(|namespace| {
+                    modules
+                        .iter()
+                        .find(|candidate| candidate.source == namespace.target)
+                })
+                .and_then(|target| {
+                    target.enums.iter().find(|enumeration| {
+                        enumeration.name == *member && !is_module_private_name(&enumeration.name)
+                    })
+                })
+                .map_or_else(
+                    || ScalarType::Qualified {
+                        receiver: receiver.clone(),
+                        receiver_span: *receiver_span,
+                        member: member.clone(),
+                        member_span: *member_span,
+                        span: *span,
+                    },
+                    |enumeration| ScalarType::Enum(enumeration.id.clone()),
+                ),
         },
         ScalarType::RawPointer(inner) => ScalarType::RawPointer(Box::new(resolve_type_in_project(
             inner, names, module, modules,
@@ -3227,8 +3354,25 @@ fn resolve_expression_module_places(
             let mut scope = scope.clone();
             resolve_block_module_places(block, &mut scope, module, modules);
         }
+        ScalarExpression::Member {
+            receiver,
+            name,
+            enum_tag,
+            ..
+        } => {
+            *enum_tag = module
+                .enums
+                .iter()
+                .find(|enumeration| enumeration.name == *receiver)
+                .and_then(|enumeration| {
+                    enumeration
+                        .variants
+                        .iter()
+                        .find(|variant| variant.name == *name)
+                })
+                .map(|variant| variant.tag);
+        }
         ScalarExpression::Name { .. }
-        | ScalarExpression::Member { .. }
         | ScalarExpression::Integer { .. }
         | ScalarExpression::InvalidInteger { .. }
         | ScalarExpression::Float { .. }
@@ -3355,7 +3499,7 @@ fn validate_module_type(
         ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
             validate_module_type(module, element, span, diagnostics)
         }
-        ScalarType::Struct(_) => {}
+        ScalarType::Struct(_) | ScalarType::Enum(_) => {}
         ScalarType::Error => {}
     }
 }
@@ -4941,10 +5085,27 @@ fn expression_type_in_module(
         ScalarExpression::Member {
             receiver,
             name,
+            enum_tag,
             name_span,
             span,
             ..
         } => {
+            if let Some(enumeration) = module
+                .enums
+                .iter()
+                .find(|enumeration| enumeration.name == *receiver)
+            {
+                if enum_tag.is_none() {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "M0002",
+                        "unknown enum variant",
+                        *name_span,
+                    ));
+                    return ScalarType::Error;
+                }
+                return ScalarType::Enum(enumeration.id.clone());
+            }
             if let Some(receiver_type) = scope.get(receiver) {
                 if matches!(receiver_type, ScalarType::Struct(_))
                     || matches!(
@@ -7682,6 +7843,30 @@ fn derive_struct(
     }
 }
 
+fn derive_enum(node: CstNode, id: ScalarEnumId) -> ScalarEnum {
+    let name = direct_token(&node, SyntaxKind::Identifier).expect("enum name");
+    let variants = node
+        .children()
+        .filter(|child| child.kind() == SyntaxKind::EnumVariant)
+        .enumerate()
+        .map(|(tag, variant)| {
+            let name = direct_token(&variant, SyntaxKind::Identifier).expect("enum variant");
+            ScalarEnumVariant {
+                name: name.text().to_owned(),
+                name_span: token_span(&name),
+                tag: u32::try_from(tag).expect("enum variant tag fits u32"),
+            }
+        })
+        .collect();
+    ScalarEnum {
+        id,
+        name: name.text().to_owned(),
+        name_span: token_span(&name),
+        variants,
+        span: wosy_syntax::byte_span(&node),
+    }
+}
+
 fn checked_align_offset(offset: u64, alignment: u64) -> Option<u64> {
     offset
         .checked_add(alignment - 1)
@@ -8966,6 +9151,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             ScalarExpression::Member {
                 receiver: identifiers[0].text().to_owned(),
                 name: identifiers[1].text().to_owned(),
+                enum_tag: None,
                 receiver_span: token_span(&identifiers[0]),
                 name_span: token_span(&identifiers[1]),
                 span: wosy_syntax::byte_span(&actual),
@@ -10109,7 +10295,7 @@ fn validate_type(
             diagnostics.push(diagnostic(program, "B0003", "unknown scalar type", span))
         }
         ScalarType::Named { .. } | ScalarType::Qualified { .. } => {}
-        ScalarType::Struct(_) => {}
+        ScalarType::Struct(_) | ScalarType::Enum(_) => {}
         ScalarType::Callable {
             outputs,
             parameters,
@@ -10659,17 +10845,37 @@ fn expression_type(
         ScalarExpression::Member {
             receiver,
             name,
+            enum_tag,
             name_span,
             span,
             ..
-        } => field_type(
-            scope.get(receiver),
-            name,
-            *name_span,
-            *span,
-            program,
-            diagnostics,
-        ),
+        } => match program
+            .enums
+            .iter()
+            .find(|enumeration| enumeration.name == *receiver)
+        {
+            Some(enumeration) => {
+                if enum_tag.is_some() {
+                    ScalarType::Enum(enumeration.id.clone())
+                } else {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "M0002",
+                        "unknown enum variant",
+                        *name_span,
+                    ));
+                    ScalarType::Error
+                }
+            }
+            None => field_type(
+                scope.get(receiver),
+                name,
+                *name_span,
+                *span,
+                program,
+                diagnostics,
+            ),
+        },
         ScalarExpression::Integer { value, span } => {
             validate_integer_range_program(program, value, *span, diagnostics);
             ScalarType::I32
@@ -12049,6 +12255,17 @@ mod tests {
             parsed.diagnostics
         );
         derive_scalar_program(&parsed.result)
+    }
+
+    #[test]
+    fn derives_zero_payload_enum_tags_and_equality() {
+        let result = validate_text(
+            "%%start\nenum Status { first; second; third; }\nStatus value = Status.second;\nbool equal = value == Status.second;\n%%end",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.program.enums[0].variants[0].tag, 0);
+        assert_eq!(result.program.enums[0].variants[1].tag, 1);
+        assert_eq!(result.program.enums[0].variants[2].tag, 2);
     }
 
     #[test]
@@ -14626,6 +14843,7 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         let ScalarExpression::Member {
             receiver,
             name,
+            enum_tag: _,
             receiver_span,
             name_span,
             span,
