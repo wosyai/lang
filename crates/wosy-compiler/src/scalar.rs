@@ -14115,6 +14115,162 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
     }
 
     #[test]
+    fn resolves_imported_struct_fixed_array_field_indexes_and_addresses_in_projects() {
+        let child_source = module_source("src/child.w");
+        let child_program = module_from_text(
+            child_source.clone(),
+            "%%start\nstruct Record {\n\tu8[3] bytes;\n}\n%%end",
+        );
+        let imported_id = child_program.structs[0].id.clone();
+        let main_source = module_source("src/main.w");
+        let main_text = "%%start\nchild = namespace app \"src/child.w\";\nchild.Record value = { .bytes = [3, 5, 7]; };\nu64 index = 1;\nu8 result = value.bytes[index];\n*u8 shared = &value.bytes[index];\n*!u8 mutable = &!value.bytes[index];\nunsafe { *?u8 raw = &?value.bytes[index]; };\n%%end";
+        let main_program = module_from_text(main_source.clone(), main_text);
+        let namespace_span = match &main_program.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    main_program,
+                    vec![ScalarNamespaceBinding {
+                        binding: "child".to_owned(),
+                        target: child_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::from_program(child_program, Vec::new()),
+            ],
+            vec![main_source, child_source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+
+        let ScalarItem::Binding(value) = &validation.project.modules[0].items[1] else {
+            panic!("imported struct binding")
+        };
+        assert_eq!(value.declared_type, ScalarType::Struct(imported_id.clone()));
+        let field_starts = main_text
+            .match_indices("value.bytes[index]")
+            .map(|(start, _)| start as u32)
+            .collect::<Vec<_>>();
+        let ScalarItem::Binding(result) = &validation.project.modules[0].items[3] else {
+            panic!("indexed read binding")
+        };
+        assert_eq!(result.declared_type, ScalarType::U8);
+        let ScalarExpression::IndexedRead {
+            place:
+                ScalarPlace::Index {
+                    base,
+                    span,
+                    index_span,
+                    ..
+                },
+            ..
+        } = &result.value
+        else {
+            panic!("indexed read")
+        };
+        let expected_field_span = ByteSpan::new(field_starts[0], field_starts[0] + 11);
+        let expected_index_span = ByteSpan::new(field_starts[0] + 12, field_starts[0] + 17);
+        assert_eq!(
+            *span,
+            ByteSpan::new(expected_field_span.start, field_starts[0] + 18)
+        );
+        assert_eq!(*index_span, expected_index_span);
+        let ScalarPlace::Field { field, span, .. } = base.as_ref() else {
+            panic!("imported fixed-array field")
+        };
+        assert_eq!(*span, expected_field_span);
+        assert!(matches!(field, ScalarFieldReference::Resolved(id) if id.structure == imported_id));
+
+        for (address_index, (item_index, expected_type)) in [
+            (
+                4,
+                ScalarType::CheckedReference {
+                    mutability: ScalarReferenceMutability::Shared,
+                    inner: Box::new(ScalarType::U8),
+                },
+            ),
+            (
+                5,
+                ScalarType::CheckedReference {
+                    mutability: ScalarReferenceMutability::Mutable,
+                    inner: Box::new(ScalarType::U8),
+                },
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ScalarItem::Binding(binding) = &validation.project.modules[0].items[item_index]
+            else {
+                panic!("indexed checked address binding")
+            };
+            assert_eq!(binding.declared_type, expected_type);
+            let ScalarExpression::CheckedAddress {
+                place:
+                    ScalarPlace::Index {
+                        base, index_span, ..
+                    },
+                ..
+            } = &binding.value
+            else {
+                panic!("indexed checked address")
+            };
+            let field_start = field_starts[address_index + 1];
+            let expected_field_span = ByteSpan::new(field_start, field_start + 11);
+            assert_eq!(
+                *index_span,
+                ByteSpan::new(field_start + 12, field_start + 17)
+            );
+            let ScalarPlace::Field { field, span, .. } = base.as_ref() else {
+                panic!("imported fixed-array field")
+            };
+            assert_eq!(*span, expected_field_span);
+            assert!(
+                matches!(field, ScalarFieldReference::Resolved(id) if id.structure == imported_id)
+            );
+        }
+
+        let ScalarItem::Executable(ScalarBlockItem::Expression(ScalarExpression::Block(block))) =
+            &validation.project.modules[0].items[6]
+        else {
+            panic!("unsafe block")
+        };
+        let ScalarBlockItem::LocalBinding(raw) = &block.items[0] else {
+            panic!("indexed raw address binding")
+        };
+        assert_eq!(
+            raw.declared_type,
+            ScalarType::RawPointer(Box::new(ScalarType::U8))
+        );
+        let ScalarExpression::RawAddress {
+            place: ScalarPlace::Index {
+                base, index_span, ..
+            },
+            ..
+        } = &raw.value
+        else {
+            panic!("indexed raw address")
+        };
+        let field_start = field_starts[3];
+        let expected_field_span = ByteSpan::new(field_start, field_start + 11);
+        assert_eq!(
+            *index_span,
+            ByteSpan::new(field_start + 12, field_start + 17)
+        );
+        let ScalarPlace::Field { field, span, .. } = base.as_ref() else {
+            panic!("imported fixed-array field")
+        };
+        assert_eq!(*span, expected_field_span);
+        assert!(matches!(field, ScalarFieldReference::Resolved(id) if id.structure == imported_id));
+    }
+
+    #[test]
     fn resolves_utf8_literals_through_aliased_namespace_targets() {
         let std_source = module_source("src/bootstrap.w");
         let std = module_from_text(

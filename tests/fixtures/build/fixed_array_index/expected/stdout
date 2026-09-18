@@ -1,1 +1,4 @@
-fixed array index reads
+scalar index
+nested index
+field index
+checked address index
