@@ -2415,7 +2415,9 @@ fn record_project_overload_selections(project: &mut ScalarProject) {
             {
                 for item in &target.items {
                     if let ScalarItem::Function(function) = item {
-                        if !function.overload_arms.is_empty() {
+                        if target.members.contains_key(&function.name)
+                            && !function.overload_arms.is_empty()
+                        {
                             overloads.insert(
                                 format!("{}.{}", namespace.binding, function.name),
                                 function.clone(),
@@ -4907,13 +4909,16 @@ fn expression_type_in_module(
                             .find(|candidate| candidate.source == namespace.target)
                     })
                     .and_then(|target| {
-                        target.items.iter().find_map(|item| match item {
-                            ScalarItem::Function(function)
-                                if function.name == *name && !function.overload_arms.is_empty() =>
-                            {
-                                Some(function)
-                            }
-                            _ => None,
+                        target.members.get(name).and_then(|_| {
+                            target.items.iter().find_map(|item| match item {
+                                ScalarItem::Function(function)
+                                    if function.name == *name
+                                        && !function.overload_arms.is_empty() =>
+                                {
+                                    Some(function)
+                                }
+                                _ => None,
+                            })
                         })
                     }),
             };
@@ -5226,13 +5231,15 @@ fn expression_type_in_module_expected(
                         .find(|candidate| candidate.source == namespace.target)
                 })
                 .and_then(|target| {
-                    target.items.iter().find_map(|item| match item {
-                        ScalarItem::Function(function)
-                            if function.name == *name && !function.overload_arms.is_empty() =>
-                        {
-                            Some(function)
-                        }
-                        _ => None,
+                    target.members.get(name).and_then(|_| {
+                        target.items.iter().find_map(|item| match item {
+                            ScalarItem::Function(function)
+                                if function.name == *name && !function.overload_arms.is_empty() =>
+                            {
+                                Some(function)
+                            }
+                            _ => None,
+                        })
                     })
                 }),
         };
@@ -13075,6 +13082,57 @@ bool integer_inversion = !1;
         };
         assert_eq!(selection.arm_index, 1);
         assert_eq!(selection.substitutions.get("T"), Some(&ScalarType::Char));
+    }
+
+    #[test]
+    fn keeps_private_overloads_local_and_reports_imported_private_overloads_at_member_tokens() {
+        let child_source = module_source("src/child.w");
+        let child = module_from_text(
+            child_source.clone(),
+            "%%start\n_ordinary = overload {\n    i32(i64) => fn(value) { value };\n};\n_identity = overload {\n    i32(i64) => fn(value) { 7 };\n    generic T;\n    T(T) => fn(value) { value };\n};\npublic_ordinary = overload {\n    i32(i64) => fn(value) { value };\n};\npublic_identity = overload {\n    i32(i64) => fn(value) { 7 };\n    generic T;\n    T(T) => fn(value) { value };\n};\ni32 local_ordinary = _ordinary(1);\nchar local_generic = _identity('l');\n%%end",
+        );
+        let main_source = module_source("src/main.w");
+        let main_text = "%%start\nchild = namespace generic_overloads \"src/child.w\";\ni32 public_ordinary = child.public_ordinary(1);\nchar public_value = child.public_identity('p');\ni32 ordinary = child._ordinary(1);\nchar value = child._identity('g');\n%%end";
+        let main = module_from_text(main_source.clone(), main_text);
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let result = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::new(
+                    main_source.clone(),
+                    main.items,
+                    vec![ScalarNamespaceBinding {
+                        binding: "child".to_owned(),
+                        target: child_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::new(child_source.clone(), child.items, Vec::new()),
+            ],
+            vec![main_source.clone(), child_source],
+        ));
+        let diagnostics: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "M0002")
+            .collect();
+        assert_eq!(
+            diagnostics.len(),
+            result.diagnostics.len(),
+            "{:?}",
+            result.diagnostics
+        );
+        assert_eq!(diagnostics.len(), 2, "{:?}", result.diagnostics);
+        for (diagnostic, member) in diagnostics.iter().zip(["_ordinary", "_identity"]) {
+            let qualified = format!("child.{member}");
+            let start = main_text.find(&qualified).expect("private member") + "child.".len();
+            let start = u32::try_from(start).expect("source span");
+            let end = start + u32::try_from(member.len()).expect("member span");
+            assert_eq!(diagnostic.labels[0].span.source, main_source);
+            assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(start, end));
+        }
     }
 
     #[test]

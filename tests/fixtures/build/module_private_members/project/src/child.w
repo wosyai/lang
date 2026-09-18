@@ -9,6 +9,23 @@ i32() _function = fn {
 	_binding
 };
 
+_ordinary = overload {
+	i32(i64) => fn(value) {
+		value
+	};
+};
+
+_identity = overload {
+	i32(i64) => fn(value) {
+		7
+	};
+
+	generic T;
+	T(T) => fn(value) {
+		value
+	};
+};
+
 ffi = extern wasm "env" {
 	i32() _extern;
 };
