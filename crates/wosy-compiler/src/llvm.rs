@@ -1144,11 +1144,23 @@ fn place_pointer<'ctx, 'module>(
                 }
                 return Ok(slot);
             }
-            state
+            let (global, ty) = state
                 .globals
                 .get(name)
-                .map(|(global, _)| global.as_pointer_value())
-                .ok_or_else(|| format!("unknown LLVM place {name}"))
+                .cloned()
+                .ok_or_else(|| format!("unknown LLVM place {name}"))?;
+            if matches!(ty, ScalarType::RuntimeArray { .. }) {
+                return state
+                    .builder
+                    .build_load(
+                        basic_type(context, &ty, state.target_layout)?,
+                        global.as_pointer_value(),
+                        name,
+                    )
+                    .map_err(builder_error)
+                    .map(BasicValueEnum::into_pointer_value);
+            }
+            Ok(global.as_pointer_value())
         }
         crate::ScalarPlace::Dereference { pointer, .. } => {
             let pointer_value = take_basic(match project {
@@ -2447,7 +2459,46 @@ fn initialize_project_module<'ctx, 'module>(
             ScalarItem::Binding(binding) => {
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 if binding.is_allocation {
-                    store_binding_outputs(context, state, binding, value)?;
+                    let receiver = binding
+                        .receivers
+                        .first()
+                        .ok_or_else(|| "runtime allocation has no receiver".to_owned())?;
+                    let ScalarType::RuntimeArray { element, .. } = &receiver.ty else {
+                        return Err("allocation binding requires a runtime array type".to_owned());
+                    };
+                    let length = receiver
+                        .allocation_length
+                        .as_ref()
+                        .ok_or_else(|| "runtime allocation has no length".to_owned())?;
+                    let length = take_basic(emit_project_typed_expression(
+                        context,
+                        state,
+                        length,
+                        &ScalarType::U64,
+                        module,
+                        modules,
+                    )?)?
+                    .into_int_value();
+                    let pointer = emit_runtime_array_allocation(context, state, element, length)?;
+                    let (global, _) = state
+                        .all_globals
+                        .get(&project_global_name(&module.source, &receiver.name))
+                        .cloned()
+                        .ok_or_else(|| format!("unknown LLVM global {}", receiver.name))?;
+                    state
+                        .builder
+                        .build_store(global.as_pointer_value(), pointer)
+                        .map_err(builder_error)?;
+                    state.storage.insert(
+                        receiver.name.clone(),
+                        (global.as_pointer_value(), receiver.ty.clone()),
+                    );
+                    state
+                        .runtime_array_owners
+                        .insert(receiver.name.clone(), true);
+                    state
+                        .runtime_array_allocations
+                        .insert(receiver.name.clone(), false);
                     continue;
                 }
                 for (position, (name, ty)) in binding_receivers(binding).iter().enumerate() {
@@ -7308,13 +7359,14 @@ count, complete = read_into(buffer, requested_capacity);
             "src/second.w".into(),
             "r1".into(),
         );
-        let module_text = "%%start\nu64 length = 1;\nu8[length] bytes;\nbytes[0] = 7;\nu8() read = fn { bytes[0] };\n%%end";
+        let first_module_text = "%%start\nu64 length = 1;\nu8[length] bytes;\nbytes[0] = 7;\nu8() read = fn { bytes[0] };\n%%end";
+        let second_module_text = "%%start\nu64 length = 1;\nu8[length] bytes;\nbytes[0] = 11;\nu8() read = fn { bytes[0] };\n%%end";
         let first = derive_scalar_program(
-            &parse_source(first_source.clone(), module_text.into(), &[]).result,
+            &parse_source(first_source.clone(), first_module_text.into(), &[]).result,
         )
         .program;
         let second = derive_scalar_program(
-            &parse_source(second_source.clone(), module_text.into(), &[]).result,
+            &parse_source(second_source.clone(), second_module_text.into(), &[]).result,
         )
         .program;
         let root_source = SourceIdentity::new(
@@ -7326,7 +7378,7 @@ count, complete = read_into(buffer, requested_capacity);
         let root = derive_scalar_program(
             &parse_source(
                 root_source.clone(),
-                "%%start\nfirst = namespace package \"src/first.w\";\nsecond = namespace package \"src/second.w\";\nu8 first_value = first.read();\nu8 second_value = second.read();\nif (first_value != second_value) { core.system_panic(); };\n%%end".into(),
+                "%%start\nfirst = namespace package \"src/first.w\";\nsecond = namespace package \"src/second.w\";\nu8 first_value = first.read();\nu8 second_value = second.read();\nu8 first_expected = 7;\nu8 second_expected = 11;\nif (first_value != first_expected || second_value != second_expected) { core.system_panic(); };\n%%end".into(),
                 &[],
             )
             .result,
@@ -7354,7 +7406,7 @@ count, complete = read_into(buffer, requested_capacity);
                 ScalarModule::new(first_source.clone(), first.items, Vec::new()),
                 ScalarModule::new(second_source.clone(), second.items, Vec::new()),
             ],
-            vec![root_source, first_source, second_source],
+            vec![root_source, first_source.clone(), second_source.clone()],
         );
         for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
             let mut project = project.clone();
@@ -7380,6 +7432,29 @@ count, complete = read_into(buffer, requested_capacity);
                 2,
                 "{text}"
             );
+            for (source, value) in [(&first_source, 7), (&second_source, 11)] {
+                let global = project_global_name(source, "bytes");
+                let read = project_function_name(source, "read");
+                assert!(
+                    text.lines().any(|line| {
+                        line.contains("store ptr %") && line.contains(&format!("ptr @{global}"))
+                    }),
+                    "{text}"
+                );
+                let body = text
+                    .split(&format!("define i8 @{read}"))
+                    .nth(1)
+                    .expect("read function")
+                    .split("}")
+                    .next()
+                    .expect("read function body");
+                let load = body
+                    .find(&format!("load ptr, ptr @{global}"))
+                    .expect("global pointer load");
+                let gep = body.find("getelementptr inbounds i8").expect("indexed GEP");
+                assert!(load < gep, "{body}");
+                assert!(text.contains(&format!("store i8 {value}")), "{text}");
+            }
         }
     }
 

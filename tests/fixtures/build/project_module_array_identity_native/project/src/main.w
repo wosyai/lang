@@ -4,7 +4,9 @@ second = namespace project_module_array_identity_native "src/second.w";
 
 u8 first_value = first.read();
 u8 second_value = second.read();
-if (first_value != second_value) {
+u8 first_expected = 7;
+u8 second_expected = 11;
+if (first_value != first_expected || second_value != second_expected) {
 	core.system_panic();
 };
 %%end
