@@ -37,11 +37,13 @@ pub fn core_runtime(backend: &str, output: &str) -> Result<&'static str, String>
 
 #[cfg(test)]
 mod tests {
+    use super::ScalarNamespaceBinding;
     use super::{
-        core_runtime, derive_scalar_program, emit_scalar_project_llvm, parse_source,
-        validate_scalar_project, ScalarModule, ScalarProject,
+        core_runtime, derive_scalar_program, derive_scalar_program_from_cst,
+        emit_scalar_project_llvm, parse_source, validate_scalar_project, ScalarModule,
+        ScalarProject,
     };
-    use wosy_syntax::{ByteSpan, SourceIdentity};
+    use wosy_syntax::{ByteSpan, CanonicalCstRoot, CanonicalCstSnapshot, SourceIdentity};
 
     #[test]
     fn derives_core_runtime_from_llvm_output() {
@@ -136,6 +138,61 @@ enum ReadLineStatus { line; eof; }
             validation.diagnostics
         );
         emit_scalar_project_llvm(&validation).expect("read_line loop project LLVM");
+    }
+
+    #[test]
+    fn archived_decomposed_read_line_snapshot_deserializes_and_reaches_project_validation() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/bootstrap.w".into(),
+            "r1".into(),
+        );
+        let output = parse_source(
+            source.clone(),
+            include_str!("../../../stdlib/src/bootstrap.w").into(),
+            &[],
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+
+        let serialized = serde_json::to_vec(&output.result.canonical_cst().snapshot())
+            .expect("serialize canonical CST snapshot");
+        let snapshot: CanonicalCstSnapshot =
+            serde_json::from_slice(&serialized).expect("deserialize canonical CST snapshot");
+        let canonical = CanonicalCstRoot::from_snapshot(snapshot);
+        assert_eq!(
+            canonical.root.text().to_string(),
+            output.result.reconstruct()
+        );
+
+        let scalar = derive_scalar_program_from_cst(&canonical);
+        let preview_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/wasi/preview1.w".into(),
+            "r1".into(),
+        );
+        let preview = parse_source(
+            preview_source.clone(),
+            include_str!("../../../stdlib/src/wasi/preview1.w").into(),
+            &[],
+        );
+        assert!(preview.diagnostics.is_empty(), "{:?}", preview.diagnostics);
+        let preview_scalar = derive_scalar_program(&preview.result);
+        let _validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    scalar.program,
+                    vec![ScalarNamespaceBinding {
+                        binding: "preview1".into(),
+                        target: preview_source.clone(),
+                        span: ByteSpan::new(0, 0),
+                    }],
+                ),
+                ScalarModule::from_program(preview_scalar.program, Vec::new()),
+            ],
+            vec![source, preview_source],
+        ));
     }
 }
 
