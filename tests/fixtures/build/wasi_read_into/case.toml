@@ -17,36 +17,27 @@ stderr_contains = ["M0002", "_fd_read", "_fd_read_once", "_ReadIovec", "_Nread"]
 
 [[assert]]
 source = "project/src/read_bytes.w"
-fd_read_capacity = 4
-fd_read_bytes = [65, 66]
-fd_read_errno = 0
-fd_read_calls = 2
+fd_read = [
+  { capacity = 4, bytes = [65, 66], errno = 0 },
+  { capacity = 4, bytes = [], errno = 0 },
+]
 stdout = "expected/read_bytes.stdout"
 exact = true
 
 [[assert]]
 source = "project/src/read_error.w"
-fd_read_capacity = 4
-fd_read_bytes = []
-fd_read_errno = 5
-fd_read_calls = 1
+fd_read = [{ capacity = 4, bytes = [], errno = 5 }]
 stdout = "expected/read_error.stdout"
 exact = true
 
 [[assert]]
 source = "project/src/read_zero.w"
-fd_read_capacity = 4
-fd_read_bytes = []
-fd_read_errno = 0
-fd_read_calls = 0
+fd_read = []
 stdout = "expected/read_zero.stdout"
 exact = true
 
 [[assert]]
 source = "project/src/read_oversized.w"
-fd_read_capacity = 4
-fd_read_bytes = []
-fd_read_errno = 0
-fd_read_calls = 0
+fd_read = []
 stdout = "expected/read_oversized.stdout"
 exact = true

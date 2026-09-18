@@ -13,9 +13,7 @@ struct HostState {
     wasi: WasiP1Ctx,
     writes: Vec<WriteRecord>,
     reads: Vec<ReadRecord>,
-    read_bytes: Vec<u8>,
-    read_errno: i32,
-    read_capacity: u32,
+    read_steps: Vec<FdReadStep>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -322,60 +320,68 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
 }
 
 struct FdReadAssertion {
+    steps: Vec<FdReadStep>,
+}
+
+#[derive(Clone)]
+struct FdReadStep {
     bytes: Vec<u8>,
     errno: i32,
     capacity: u32,
-    calls: usize,
 }
 
 fn fd_read_assertion(assertion: &toml_edit::Table) -> Result<Option<FdReadAssertion>, String> {
-    let Some(item) = assertion.get("fd_read_capacity") else {
+    let Some(item) = assertion.get("fd_read") else {
         return Ok(None);
     };
-    let capacity = item
+    let steps = item
         .as_value()
-        .and_then(|value| value.as_integer())
-        .ok_or_else(|| "fd_read_capacity must be an integer".to_owned())?;
-    let capacity = u32::try_from(capacity)
-        .map_err(|_| "fd_read_capacity must fit in u32".to_owned())?;
-    let bytes = assertion
-        .get("fd_read_bytes")
-        .and_then(Item::as_value)
         .and_then(|value| value.as_array())
-        .ok_or_else(|| "fd_read_bytes must be an array".to_owned())?
+        .ok_or_else(|| "fd_read must be an array".to_owned())?
         .iter()
-        .map(|value| {
-            value
-                .as_integer()
-                .ok_or_else(|| "fd_read_bytes values must be integers".to_owned())
+        .map(|step| {
+            let step = step
+                .as_inline_table()
+                .ok_or_else(|| "fd_read entries must be inline tables".to_owned())?;
+            let capacity = step
+                .get("capacity")
+                .and_then(|value| value.as_integer())
+                .ok_or_else(|| "fd_read capacity must be an integer".to_owned())
                 .and_then(|value| {
-                    u8::try_from(value)
-                        .map_err(|_| "fd_read_bytes values must fit in u8".to_owned())
+                    u32::try_from(value)
+                        .map_err(|_| "fd_read capacity must fit in u32".to_owned())
+                })?;
+            let bytes = step
+                .get("bytes")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| "fd_read bytes must be an array".to_owned())?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_integer()
+                        .ok_or_else(|| "fd_read bytes values must be integers".to_owned())
+                        .and_then(|value| {
+                            u8::try_from(value)
+                                .map_err(|_| "fd_read bytes values must fit in u8".to_owned())
+                        })
                 })
+                .collect::<Result<Vec<_>, _>>()?;
+            let errno = step
+                .get("errno")
+                .and_then(|value| value.as_integer())
+                .ok_or_else(|| "fd_read errno must be an integer".to_owned())
+                .and_then(|value| {
+                    i32::try_from(value)
+                        .map_err(|_| "fd_read errno must fit in i32".to_owned())
+                })?;
+            Ok(FdReadStep {
+                bytes,
+                errno,
+                capacity,
+            })
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let errno = assertion
-        .get("fd_read_errno")
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_integer())
-        .ok_or_else(|| "fd_read_errno must be an integer".to_owned())
-        .and_then(|value| {
-            i32::try_from(value).map_err(|_| "fd_read_errno must fit in i32".to_owned())
-        })?;
-    let calls = assertion
-        .get("fd_read_calls")
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_integer())
-        .ok_or_else(|| "fd_read_calls must be an integer".to_owned())
-        .and_then(|value| {
-            usize::try_from(value).map_err(|_| "fd_read_calls must be nonnegative".to_owned())
-        })?;
-    Ok(Some(FdReadAssertion {
-        bytes,
-        errno,
-        capacity,
-        calls,
-    }))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Some(FdReadAssertion { steps }))
 }
 
 fn run_fd_read_assertion(
@@ -387,7 +393,7 @@ fn run_fd_read_assertion(
 ) -> Result<(), String> {
     if assertion.get("command").is_some() {
         return Err(format!(
-            "{}: fd_read_capacity assertion accepts no command",
+            "{}: fd_read assertion accepts no command",
             case.display()
         ));
     }
@@ -437,9 +443,7 @@ fn run_fd_read_host(
             wasi,
             writes: Vec::new(),
             reads: Vec::new(),
-            read_bytes: read_assertion.bytes.clone(),
-            read_errno: read_assertion.errno,
-            read_capacity: read_assertion.capacity,
+            read_steps: read_assertion.steps.clone(),
         },
     );
     let instance = linker.instantiate(&mut store, &module).map_err(|error| {
@@ -487,18 +491,20 @@ fn controlled_fd_read(
     let iovec = read_guest_memory(&memory, &mut caller, iovs as u32, 8)?;
     let data = u32::from_le_bytes(iovec[..4].try_into().expect("iovec address"));
     let capacity = u32::from_le_bytes(iovec[4..].try_into().expect("iovec length"));
-    if capacity != caller.data().read_capacity {
+    let step = caller
+        .data()
+        .read_steps
+        .get(caller.data().reads.len())
+        .cloned()
+        .ok_or_else(|| wasmtime::Error::msg("fd_read exceeded the configured steps"))?;
+    if capacity != step.capacity {
         return Err(wasmtime::Error::msg(format!(
             "fd_read expected capacity {}, observed {capacity}",
-            caller.data().read_capacity
+            step.capacity
         )));
     }
-    let errno = caller.data().read_errno;
-    let bytes = if errno == 0 && caller.data().reads.is_empty() {
-        caller.data().read_bytes.clone()
-    } else {
-        Vec::new()
-    };
+    let errno = step.errno;
+    let bytes = step.bytes;
     if bytes.len() > capacity as usize {
         return Err(wasmtime::Error::msg("fd_read bytes exceed guest capacity"));
     }
@@ -560,26 +566,23 @@ fn assert_fd_read_result(
     read_assertion: &FdReadAssertion,
     case: &Path,
 ) -> Result<(), String> {
-    if reads.len() != read_assertion.calls {
+    if reads.len() != read_assertion.steps.len() {
         return Err(format!(
             "{}: fd_read call count expected {}, observed {}",
             case.display(),
-            read_assertion.calls,
+            read_assertion.steps.len(),
             reads.len()
         ));
     }
     for (index, read) in reads.iter().enumerate() {
-        let expected_bytes: &[u8] = if index == 0 && read_assertion.errno == 0 {
-            read_assertion.bytes.as_slice()
-        } else {
-            &[]
-        };
+        let expected = &read_assertion.steps[index];
+        let expected_bytes: &[u8] = expected.bytes.as_slice();
         let expected_reported = expected_bytes.len() as u32;
         if read.descriptor != 0
-            || read.capacity != read_assertion.capacity
+            || read.capacity != expected.capacity
             || read.bytes != expected_bytes
             || read.reported != expected_reported
-            || read.errno != read_assertion.errno
+            || read.errno != expected.errno
         {
             return Err(format!(
                 "{}: fd_read record {index} has unexpected descriptor, capacity, bytes, reported count, or errno",
@@ -749,9 +752,7 @@ fn run_partial_fd_write_host(
             wasi,
             writes: Vec::new(),
             reads: Vec::new(),
-            read_bytes: Vec::new(),
-            read_errno: 0,
-            read_capacity: 0,
+            read_steps: Vec::new(),
         },
     );
     let instance = linker.instantiate(&mut store, &module).map_err(|error| {
