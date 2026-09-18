@@ -921,6 +921,17 @@ fn integer_type<'ctx>(
         .map_err(str::to_owned)
 }
 
+fn integer_scalar_type(width: u32) -> Result<ScalarType, String> {
+    match width {
+        8 => Ok(ScalarType::U8),
+        16 => Ok(ScalarType::U16),
+        32 => Ok(ScalarType::U32),
+        64 => Ok(ScalarType::U64),
+        128 => Ok(ScalarType::U128),
+        _ => Err(format!("unsupported LLVM integer width {width}")),
+    }
+}
+
 fn pointer_integer_type<'ctx>(
     context: &'ctx Context,
     target_layout: ScalarTargetLayout,
@@ -4501,6 +4512,13 @@ fn emit_binary_with_rhs<'ctx, 'module>(
     if !matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
         let right = match path {
             ExpressionPath::Single => match right {
+                ScalarExpression::Integer { .. } => match &left {
+                    EmitValue::Basic(BasicValueEnum::IntValue(value)) => {
+                        let ty = integer_scalar_type(value.get_type().get_bit_width())?;
+                        emit_typed_expression(context, state, right, &ty)?
+                    }
+                    _ => emit_expression(context, state, right)?,
+                },
                 ScalarExpression::Float { .. } => match &left {
                     EmitValue::Basic(BasicValueEnum::FloatValue(value)) => {
                         let ty = if value.get_type() == context.f32_type() {
@@ -4515,6 +4533,13 @@ fn emit_binary_with_rhs<'ctx, 'module>(
                 _ => emit_expression(context, state, right)?,
             },
             ExpressionPath::Project { module, modules } => match right {
+                ScalarExpression::Integer { .. } => match &left {
+                    EmitValue::Basic(BasicValueEnum::IntValue(value)) => {
+                        let ty = integer_scalar_type(value.get_type().get_bit_width())?;
+                        emit_project_typed_expression(context, state, right, &ty, module, modules)?
+                    }
+                    _ => emit_project_expression(context, state, right, module, modules)?,
+                },
                 ScalarExpression::Float { .. } => match &left {
                     EmitValue::Basic(BasicValueEnum::FloatValue(value)) => {
                         let ty = if value.get_type() == context.f32_type() {
@@ -5791,6 +5816,29 @@ mod tests {
         assert!(llvm.contains("while.cond.0:"), "{llvm}");
         assert!(llvm.contains("while.cond.3:"), "{llvm}");
         assert!(llvm.contains("getelementptr inbounds i8"), "{llvm}");
+    }
+
+    #[test]
+    fn lowers_integer_literals_in_binary_expressions_to_the_left_operand_width() {
+        let validation = derive_scalar_program(
+            &parse_source(
+                SourceIdentity::new(
+                    "project".into(),
+                    "package".into(),
+                    "src/main.w".into(),
+                    "r1".into(),
+                ),
+                "%%start\nbool() equal = fn { u8 value = 10; value == 10 };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(validation.diagnostics.is_empty(), "{:?}", validation.diagnostics);
+
+        let llvm = emit_scalar_llvm(&validation)
+            .expect("integer comparison LLVM")
+            .to_text();
+        assert!(llvm.contains("icmp eq i8"), "{llvm}");
     }
 
     #[test]
