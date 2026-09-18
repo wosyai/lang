@@ -395,7 +395,7 @@ fn build_pair(
     let span = pair.as_span();
     if matches!(
         pair.as_rule(),
-        Rule::error_item | Rule::malformed_generic_decl
+        Rule::error_item | Rule::malformed_generic_decl | Rule::trailing_while_semicolon
     ) {
         let range = ByteSpan::new(span.start() as u32, span.end() as u32);
         builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Error));
@@ -1622,6 +1622,23 @@ mod tests {
             "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t};\n};\n%%end";
         let rejected = parse(identity(), trailing_semicolon.into(), &[]);
         assert!(!rejected.is_valid());
+        assert_eq!(rejected.errors.len(), 1);
+        let semicolon = trailing_semicolon
+            .find("\n\t};\n")
+            .expect("trailing semicolon") as u32
+            + 3;
+        assert_eq!(
+            rejected.errors[0].span,
+            ByteSpan::new(semicolon, semicolon + 1)
+        );
+        assert!(rejected
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::FunctionDecl));
+        assert!(rejected
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::While));
 
         let expression_statement = "%%start\nunit() main = fn {\n\tprint();\n};\n%%end";
         assert!(parse(identity(), expression_statement.into(), &[]).is_valid());

@@ -45,7 +45,7 @@ unsafe_keyword = { "unsafe" }
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 parameters = { "(" ~ (identifier ~ ("," ~ identifier)*)? ~ ")" }
 block = { "{" ~ block_item* ~ final_output_list? ~ "}" }
-block_item = { local_binding | if_block_item | while_expr | unsafe_block_item ~ !";" | expression ~ ";" }
+block_item = { local_binding | if_block_item | while_expr ~ trailing_while_semicolon | while_expr | unsafe_block_item ~ !";" | expression ~ ";" }
 unsafe_block_item = { unsafe_expr }
 if_block_item = { (if_expr | unit_if_expr) ~ !";" ~ !"}" }
 final_output_list = { output_list }
@@ -57,6 +57,7 @@ if_expr = { "if" ~ "(" ~ expression ~ ")" ~ block ~ "else" ~ block }
 unit_if_expr = { "if" ~ "(" ~ expression ~ ")" ~ block }
 unsafe_expr = { unsafe_keyword ~ block }
 while_expr = { "while" ~ "(" ~ expression ~ ")" ~ block }
+trailing_while_semicolon = @{ ";" }
 assignment = { assignment_targets ~ "=" ~ output_list }
 assignment_targets = { assignment_target ~ ("," ~ assignment_target)* }
 assignment_target = { indexed_place | dereference | qualified_member | dereferenced_field | identifier }
