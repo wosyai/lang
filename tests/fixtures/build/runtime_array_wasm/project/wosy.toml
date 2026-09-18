@@ -23,7 +23,6 @@ artifact = "Main"
 [targets.app.artifacts.main.profiles.dev]
 backend = "llvm"
 output = "wasm-wasip1"
-runtime = "wasm32"
 builder = "wasm"
 run_runner = "wasm"
 

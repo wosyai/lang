@@ -144,7 +144,7 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let partition_path = output_dir.join("partition.ll");
     fs::write(&partition_path, &llvm).map_err(|error| error.to_string())?;
     let runtime_path = output_dir.join("runtime.ll");
-    let runtime = wosy_compiler::core_runtime(artifact_profile.core_runtime()?)?;
+    let runtime = wosy_compiler::core_runtime(&artifact_profile.backend, &artifact_profile.output)?;
     fs::write(&runtime_path, runtime).map_err(|error| error.to_string())?;
     let identity = artifact_identity(
         &root,

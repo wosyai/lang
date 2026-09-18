@@ -27,10 +27,12 @@ entry:
 reuse_check:
   %free_head = load i32, ptr @__wosy_core_free_head
   %has_free_block = icmp ne i32 %free_head, 0
-  br i1 %has_free_block, label %reuse_match, label %extend_header
+  br i1 %has_free_block, label %reuse_search, label %extend_header
 
-reuse_match:
-  %free_header = inttoptr i32 %free_head to ptr
+reuse_search:
+  %current_address = phi i32 [ %free_head, %reuse_check ], [ %next_free, %reuse_continue ]
+  %previous_address = phi i32 [ 0, %reuse_check ], [ %current_address, %reuse_continue ]
+  %free_header = inttoptr i32 %current_address to ptr
   %free_size_address = getelementptr i8, ptr %free_header, i32 4
   %free_size = load i32, ptr %free_size_address, align 4
   %free_size64 = zext i32 %free_size to i64
@@ -40,11 +42,28 @@ reuse_match:
   %size_reusable = icmp uge i64 %free_size64, %size
   %alignment_reusable = icmp uge i64 %free_alignment64, %alignment
   %reusable = and i1 %size_reusable, %alignment_reusable
-  br i1 %reusable, label %reuse, label %extend_header
+  br i1 %reusable, label %reuse, label %reuse_continue
+
+reuse_continue:
+  %next_free = load i32, ptr %free_header, align 4
+  %has_next_free = icmp ne i32 %next_free, 0
+  br i1 %has_next_free, label %reuse_search, label %extend_header
 
 reuse:
-  %next_free = load i32, ptr %free_header, align 4
-  store i32 %next_free, ptr @__wosy_core_free_head
+  %selected_next_free = load i32, ptr %free_header, align 4
+  %selects_head = icmp eq i32 %previous_address, 0
+  br i1 %selects_head, label %reuse_head, label %reuse_after
+
+reuse_head:
+  store i32 %selected_next_free, ptr @__wosy_core_free_head
+  br label %reuse_return
+
+reuse_after:
+  %previous_header = inttoptr i32 %previous_address to ptr
+  store i32 %selected_next_free, ptr %previous_header, align 4
+  br label %reuse_return
+
+reuse_return:
   %free_payload_address = getelementptr i8, ptr %free_header, i32 12
   %free_payload = load i32, ptr %free_payload_address, align 4
   %reused_pointer = inttoptr i32 %free_payload to ptr

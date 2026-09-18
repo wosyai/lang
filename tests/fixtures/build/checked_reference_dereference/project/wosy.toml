@@ -26,7 +26,6 @@ artifact = "CheckedReferences"
 [targets.app.artifacts.main.profiles.dev]
 backend = "llvm"
 output = "wasm-wasip1"
-runtime = "wasm32"
 builder = "llvm-wasm"
 run_runner = "wasmtime-wasip1"
 

@@ -98,7 +98,7 @@ exit = 0
 
 [[steps]]
 write = "wosy.toml"
-contents = "[package]\nname = \"scalar_base\"\ndefault_target = \"app\"\n\n[comments]\ncategories = [\"changed\"]\n\n[builders.native]\ncommand = [\"python\", \"scripts/build-native\"]\nargs = []\ntoolchain_identity = \"llvm-18.1.4\"\n\n[runners.native]\ncommand = [\"python\", \"scripts/run-native\"]\nargs = []\n\n[targets.app]\nroot = \"src/main.w\"\n\n[targets.app.artifacts.main]\nartifact = \"Main\"\n\n[targets.app.artifacts.main.profiles.dev]\nbackend = \"llvm\"\noutput = \"native\"\nruntime = \"native64\"\nbuilder = \"native\"\nrun_runner = \"native\"\n\n[targets.app.profiles.dev]\nmain_artifact = \"main\"\n"
+contents = "[package]\nname = \"scalar_base\"\ndefault_target = \"app\"\n\n[comments]\ncategories = [\"changed\"]\n\n[builders.native]\ncommand = [\"python\", \"scripts/build-native\"]\nargs = []\ntoolchain_identity = \"llvm-18.1.4\"\n\n[runners.native]\ncommand = [\"python\", \"scripts/run-native\"]\nargs = []\n\n[targets.app]\nroot = \"src/main.w\"\n\n[targets.app.artifacts.main]\nartifact = \"Main\"\n\n[targets.app.artifacts.main.profiles.dev]\nbackend = \"llvm\"\noutput = \"native\"\nbuilder = \"native\"\nrun_runner = \"native\"\n\n[targets.app.profiles.dev]\nmain_artifact = \"main\"\n"
 
 [[steps]]
 command = ["wosy", "run"]
@@ -106,7 +106,7 @@ exit = 1
 
 [[steps]]
 write = "wosy.toml"
-contents = "[package]\nname = \"scalar_base\"\ndefault_target = \"app\"\n\n[comments]\ncategories = []\n\n[builders.native]\ncommand = [\"python\", \"scripts/build-native\"]\nargs = []\ntoolchain_identity = \"llvm-18.1.3\"\n\n[runners.native]\ncommand = [\"python\", \"scripts/run-native\"]\nargs = []\n\n[targets.app]\nroot = \"src/main.w\"\n\n[targets.app.artifacts.main]\nartifact = \"Main\"\n\n[targets.app.artifacts.main.profiles.dev]\nbackend = \"llvm\"\noutput = \"native\"\nruntime = \"native64\"\nbuilder = \"native\"\nrun_runner = \"native\"\n\n[targets.app.profiles.dev]\nmain_artifact = \"main\"\n"
+contents = "[package]\nname = \"scalar_base\"\ndefault_target = \"app\"\n\n[comments]\ncategories = []\n\n[builders.native]\ncommand = [\"python\", \"scripts/build-native\"]\nargs = []\ntoolchain_identity = \"llvm-18.1.3\"\n\n[runners.native]\ncommand = [\"python\", \"scripts/run-native\"]\nargs = []\n\n[targets.app]\nroot = \"src/main.w\"\n\n[targets.app.artifacts.main]\nartifact = \"Main\"\n\n[targets.app.artifacts.main.profiles.dev]\nbackend = \"llvm\"\noutput = \"native\"\nbuilder = \"native\"\nrun_runner = \"native\"\n\n[targets.app.profiles.dev]\nmain_artifact = \"main\"\n"
 
 [[steps]]
 command = ["wosy", "build"]

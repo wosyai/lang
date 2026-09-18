@@ -24,11 +24,39 @@ mod llvm;
 
 pub const COMPILER_IDENTITY: &str = concat!("wosy-compiler-", env!("CARGO_PKG_VERSION"));
 
-pub fn core_runtime(target: &str) -> Result<&'static str, String> {
-    match target {
-        "native64" => Ok(include_str!("../runtime/native64.ll")),
-        "wasm32" => Ok(include_str!("../runtime/wasm32.ll")),
-        target => Err(format!("core runtime {target} is unsupported")),
+pub fn core_runtime(backend: &str, output: &str) -> Result<&'static str, String> {
+    match (backend, output) {
+        ("llvm", "native") => Ok(include_str!("../runtime/native64.ll")),
+        ("llvm", "wasm-wasip1" | "wasm-wasip2") => Ok(include_str!("../runtime/wasm32.ll")),
+        (backend, output) => Err(format!(
+            "unsupported core runtime target backend {backend} with output {output}"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::core_runtime;
+
+    #[test]
+    fn derives_core_runtime_from_llvm_output() {
+        assert!(core_runtime("llvm", "native")
+            .expect("native runtime")
+            .contains("__wosy_core_alloc"));
+        assert!(core_runtime("llvm", "wasm-wasip1")
+            .expect("WASI preview 1 runtime")
+            .contains("wasm32-wasi"));
+        assert!(core_runtime("llvm", "wasm-wasip2")
+            .expect("WASI preview 2 runtime")
+            .contains("wasm32-wasi"));
+    }
+
+    #[test]
+    fn reports_unsupported_runtime_target() {
+        assert_eq!(
+            core_runtime("custom", "artifact"),
+            Err("unsupported core runtime target backend custom with output artifact".to_owned())
+        );
     }
 }
 

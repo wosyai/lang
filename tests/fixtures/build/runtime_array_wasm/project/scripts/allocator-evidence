@@ -6,6 +6,7 @@ runtime = ".wosy/artifacts/app/dev/main/runtime.ll"
 evidence = """target triple = \"wasm32-wasi\"
 declare ptr @__wosy_core_alloc(i64, i64)
 declare void @__wosy_core_free(ptr)
+declare i32 @llvm.wasm.memory.size.i32(i32)
 declare void @proc_exit(i32) #0
 attributes #0 = { \"wasm-import-module\"=\"wasi_snapshot_preview1\" \"wasm-import-name\"=\"proc_exit\" }
 define void @_start() {
@@ -22,13 +23,40 @@ release:
   call void @__wosy_core_free(ptr %pointer)
   %reused = call ptr @__wosy_core_alloc(i64 1, i64 64)
   %is_reused = icmp eq ptr %pointer, %reused
-  br i1 %is_reused, label %overflow, label %failed
+  br i1 %is_reused, label %release_reused, label %failed
+release_reused:
+  call void @__wosy_core_free(ptr %reused)
+  %large = call ptr @__wosy_core_alloc(i64 1024, i64 8)
+  %large_allocated = icmp ne ptr %large, null
+  br i1 %large_allocated, label %allocate_small, label %failed
+allocate_small:
+  %small = call ptr @__wosy_core_alloc(i64 1, i64 8)
+  %small_allocated = icmp ne ptr %small, null
+  br i1 %small_allocated, label %release_large, label %failed
+release_large:
+  call void @__wosy_core_free(ptr %large)
+  br label %release_small
+release_small:
+  call void @__wosy_core_free(ptr %small)
+  %pages_before = call i32 @llvm.wasm.memory.size.i32(i32 0)
+  %reused_large = call ptr @__wosy_core_alloc(i64 1024, i64 8)
+  %reused_large_matches = icmp eq ptr %large, %reused_large
+  br i1 %reused_large_matches, label %pages_after, label %failed
+pages_after:
+  %pages_after_count = call i32 @llvm.wasm.memory.size.i32(i32 0)
+  %did_not_grow = icmp eq i32 %pages_before, %pages_after_count
+  br i1 %did_not_grow, label %retain_small, label %failed
+retain_small:
+  %reused_small = call ptr @__wosy_core_alloc(i64 1, i64 8)
+  %reused_small_matches = icmp eq ptr %small, %reused_small
+  br i1 %reused_small_matches, label %overflow, label %failed
 overflow:
   %overflow_pointer = call ptr @__wosy_core_alloc(i64 -1, i64 64)
   %overflow_failed = icmp eq ptr %overflow_pointer, null
   br i1 %overflow_failed, label %complete, label %failed
 complete:
-  call void @__wosy_core_free(ptr %reused)
+  call void @__wosy_core_free(ptr %reused_large)
+  call void @__wosy_core_free(ptr %reused_small)
   ret void
 failed:
   call void @proc_exit(i32 17)
