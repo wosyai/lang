@@ -4364,6 +4364,203 @@ fn type_core_cast(
     }
 }
 
+fn type_core_memory_in_module(
+    operation: &str,
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if matches!(operation, "alloc" | "free") && !unsafe_context {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0012",
+            &format!("core.{operation} requires an unsafe block"),
+            span,
+        ));
+    }
+    match operation {
+        "alloc" => {
+            if arguments.len() != 2 {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0004",
+                    "core.alloc requires size and alignment",
+                    span,
+                ));
+                return ScalarType::Error;
+            }
+            for argument in arguments {
+                let actual = expression_type_in_module_expected(
+                    argument,
+                    Some(&ScalarType::U64),
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+                expect_module_type(
+                    module,
+                    &ScalarType::U64,
+                    &actual,
+                    expression_span(argument),
+                    diagnostics,
+                );
+            }
+            ScalarType::RawPointer(Box::new(ScalarType::U8))
+        }
+        "free" => {
+            let [pointer] = arguments else {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0004",
+                    "core.free requires one pointer",
+                    span,
+                ));
+                return ScalarType::Error;
+            };
+            let actual = expression_type_in_module(
+                pointer,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            );
+            if !matches!(actual, ScalarType::RawPointer(_)) && !is_error_type(&actual) {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "core.free requires a raw pointer",
+                    expression_span(pointer),
+                ));
+                return ScalarType::Error;
+            }
+            ScalarType::Unit
+        }
+        "system_panic" => {
+            if !arguments.is_empty() {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0004",
+                    "core.system_panic accepts no arguments",
+                    span,
+                ));
+                return ScalarType::Error;
+            }
+            ScalarType::Unit
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn type_core_memory(
+    operation: &str,
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if matches!(operation, "alloc" | "free") && !unsafe_context {
+        diagnostics.push(diagnostic(
+            program,
+            "B0012",
+            &format!("core.{operation} requires an unsafe block"),
+            span,
+        ));
+    }
+    match operation {
+        "alloc" => {
+            if arguments.len() != 2 {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0004",
+                    "core.alloc requires size and alignment",
+                    span,
+                ));
+                return ScalarType::Error;
+            }
+            for argument in arguments {
+                let actual = expression_type_expected(
+                    argument,
+                    &ScalarType::U64,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                expect_type(
+                    program,
+                    &ScalarType::U64,
+                    &actual,
+                    expression_span(argument),
+                    diagnostics,
+                );
+            }
+            ScalarType::RawPointer(Box::new(ScalarType::U8))
+        }
+        "free" => {
+            let [pointer] = arguments else {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0004",
+                    "core.free requires one pointer",
+                    span,
+                ));
+                return ScalarType::Error;
+            };
+            let actual = expression_type(
+                pointer,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            if !matches!(actual, ScalarType::RawPointer(_)) && !is_error_type(&actual) {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "core.free requires a raw pointer",
+                    expression_span(pointer),
+                ));
+                return ScalarType::Error;
+            }
+            ScalarType::Unit
+        }
+        "system_panic" => {
+            if !arguments.is_empty() {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0004",
+                    "core.system_panic accepts no arguments",
+                    span,
+                ));
+                return ScalarType::Error;
+            }
+            ScalarType::Unit
+        }
+        _ => unreachable!(),
+    }
+}
+
 fn type_core_int_conversion_in_module(
     operation: &str,
     type_arguments: &[ScalarTypeArgument],
@@ -4981,6 +5178,22 @@ fn expression_type_in_module(
             if receiver.as_deref() == Some("core") && name == "cast" {
                 return type_core_cast_in_module(
                     type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
+            if receiver.as_deref() == Some("core")
+                && matches!(name.as_str(), "alloc" | "free" | "system_panic")
+            {
+                return type_core_memory_in_module(
+                    name,
                     arguments,
                     *span,
                     scope,
@@ -10590,6 +10803,21 @@ fn expression_type(
             if receiver.as_deref() == Some("core") && name == "cast" {
                 return type_core_cast(
                     type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
+            if receiver.as_deref() == Some("core")
+                && matches!(name.as_str(), "alloc" | "free" | "system_panic")
+            {
+                return type_core_memory(
+                    name,
                     arguments,
                     *span,
                     scope,

@@ -102,6 +102,30 @@ struct LlvmExternIdentity {
     signature: ScalarType,
 }
 
+const CORE_ALLOC_SYMBOL: &str = "__wosy_core_alloc";
+const CORE_FREE_SYMBOL: &str = "__wosy_core_free";
+const CORE_SYSTEM_PANIC_SYMBOL: &str = "__wosy_core_system_panic";
+
+fn declare_core_runtime<'ctx>(context: &'ctx Context, module: &Module<'ctx>) {
+    let pointer = context.ptr_type(AddressSpace::default());
+    let u64_type = context.i64_type();
+    module.add_function(
+        CORE_ALLOC_SYMBOL,
+        pointer.fn_type(&[u64_type.into(), u64_type.into()], false),
+        None,
+    );
+    module.add_function(
+        CORE_FREE_SYMBOL,
+        context.void_type().fn_type(&[pointer.into()], false),
+        None,
+    );
+    module.add_function(
+        CORE_SYSTEM_PANIC_SYMBOL,
+        context.void_type().fn_type(&[], false),
+        None,
+    );
+}
+
 pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, String> {
     if !validation.diagnostics.is_empty() {
         return Err("cannot emit LLVM for an invalid scalar program".into());
@@ -896,6 +920,48 @@ fn storage_type<'ctx>(
         _ => basic_type(context, ty, target_layout),
     }
 }
+
+fn allocation_layout(
+    ty: &ScalarType,
+    structs: &[ScalarStruct],
+    target_layout: ScalarTargetLayout,
+) -> Result<(u64, u64), String> {
+    match ty {
+        ScalarType::Bool | ScalarType::I8 | ScalarType::U8 => Ok((1, 1)),
+        ScalarType::I16 | ScalarType::U16 => Ok((2, 2)),
+        ScalarType::I32 | ScalarType::U32 | ScalarType::Char | ScalarType::F32 => Ok((4, 4)),
+        ScalarType::I64 | ScalarType::U64 | ScalarType::F64 => Ok((8, 8)),
+        ScalarType::I128 | ScalarType::U128 => Ok((16, 16)),
+        ScalarType::RawPointer(_)
+        | ScalarType::CheckedReference { .. }
+        | ScalarType::ArtifactId => {
+            Ok((target_layout.pointer_size, target_layout.pointer_alignment))
+        }
+        ScalarType::Struct(id) => structs
+            .iter()
+            .find(|structure| structure.id == *id)
+            .and_then(|structure| structure.layout.as_ref())
+            .map(|layout| (layout.size, layout.alignment))
+            .ok_or_else(|| format!("runtime allocation has no layout for struct {}", id.index)),
+        ScalarType::Array {
+            element, length, ..
+        } => {
+            let (size, alignment) = allocation_layout(element, structs, target_layout)?;
+            let size = size
+                .checked_mul(*length)
+                .ok_or_else(|| "runtime allocation size overflows u64".to_owned())?;
+            Ok((size, alignment))
+        }
+        ScalarType::Named { .. }
+        | ScalarType::Qualified { .. }
+        | ScalarType::RuntimeArray { .. }
+        | ScalarType::Unit
+        | ScalarType::Error
+        | ScalarType::Callable { .. } => {
+            Err("runtime allocation requires a sized element type".to_owned())
+        }
+    }
+}
 fn value_type(ty: &ScalarType) -> Result<LlvmValueType, String> {
     match ty {
         ScalarType::Unit => Ok(LlvmValueType::Void),
@@ -1558,14 +1624,7 @@ fn store_binding_outputs<'ctx, 'module>(
             &ScalarType::U64,
         )?)?
         .into_int_value();
-        let slot = state
-            .builder
-            .build_array_alloca(
-                storage_type(context, element, state.structs, state.target_layout)?,
-                length,
-                receiver.name.as_str(),
-            )
-            .map_err(builder_error)?;
+        let slot = emit_runtime_array_allocation(context, state, element, length)?;
         state
             .storage
             .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
@@ -1589,6 +1648,70 @@ fn store_binding_outputs<'ctx, 'module>(
         state.storage.insert(name.clone(), (slot, ty.clone()));
     }
     Ok(())
+}
+
+fn emit_runtime_array_allocation<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    element: &ScalarType,
+    length: inkwell::values::IntValue<'ctx>,
+) -> Result<PointerValue<'ctx>, String> {
+    declare_core_runtime(context, state.module);
+    let (element_size, alignment) = allocation_layout(element, state.structs, state.target_layout)?;
+    let size = state
+        .builder
+        .build_int_mul(
+            length,
+            context.i64_type().const_int(element_size, false),
+            "allocation_size",
+        )
+        .map_err(builder_error)?;
+    let allocator = state
+        .module
+        .get_function(CORE_ALLOC_SYMBOL)
+        .ok_or_else(|| "core allocation runtime declaration is missing".to_owned())?;
+    let allocation = state
+        .builder
+        .build_call(
+            allocator,
+            &[
+                size.into(),
+                context.i64_type().const_int(alignment, false).into(),
+            ],
+            "allocation",
+        )
+        .map_err(builder_error)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| "core allocation runtime returned no pointer".to_owned())?
+        .into_pointer_value();
+    let failed = state
+        .builder
+        .build_is_null(allocation, "allocation_failed")
+        .map_err(builder_error)?;
+    let function = state
+        .builder
+        .get_insert_block()
+        .and_then(|block| block.get_parent())
+        .ok_or_else(|| "runtime allocation has no containing function".to_owned())?;
+    let panic_block = context.append_basic_block(function, "allocation_panic");
+    let continue_block = context.append_basic_block(function, "allocation_continue");
+    state
+        .builder
+        .build_conditional_branch(failed, panic_block, continue_block)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(panic_block);
+    let panic = state
+        .module
+        .get_function(CORE_SYSTEM_PANIC_SYMBOL)
+        .ok_or_else(|| "core system-panic runtime declaration is missing".to_owned())?;
+    state
+        .builder
+        .build_call(panic, &[], "system_panic")
+        .map_err(builder_error)?;
+    state.builder.build_unreachable().map_err(builder_error)?;
+    state.builder.position_at_end(continue_block);
+    Ok(allocation)
 }
 
 fn binding_receivers(binding: &crate::ScalarBinding) -> Vec<(String, ScalarType)> {
@@ -2570,14 +2693,7 @@ fn emit_project_block_item<'ctx, 'module>(
                     modules,
                 )?)?
                 .into_int_value();
-                let slot = state
-                    .builder
-                    .build_array_alloca(
-                        storage_type(context, element, state.structs, state.target_layout)?,
-                        length,
-                        receiver.name.as_str(),
-                    )
-                    .map_err(builder_error)?;
+                let slot = emit_runtime_array_allocation(context, state, element, length)?;
                 state
                     .storage
                     .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
@@ -2821,6 +2937,15 @@ fn emit_expression<'ctx, 'module>(
             if receiver.as_deref() == Some("core") && name == "cast" {
                 return emit_cast(context, state, type_arguments, arguments);
             }
+            if receiver.as_deref() == Some("core") && name == "alloc" {
+                return emit_core_alloc(context, state, arguments);
+            }
+            if receiver.as_deref() == Some("core") && name == "free" {
+                return emit_core_free(context, state, arguments);
+            }
+            if receiver.as_deref() == Some("core") && name == "system_panic" {
+                return emit_core_system_panic(context, state, arguments);
+            }
             if receiver.as_deref() == Some("core")
                 && matches!(name.as_str(), "int_trunc" | "int_extend")
             {
@@ -2966,6 +3091,15 @@ fn emit_project_expression<'ctx, 'module>(
                     modules,
                 )?;
                 return Ok(values);
+            }
+            if receiver.as_deref() == Some("core") && name == "alloc" {
+                return emit_core_alloc_project(context, state, arguments, module, modules);
+            }
+            if receiver.as_deref() == Some("core") && name == "free" {
+                return emit_core_free_project(context, state, arguments, module, modules);
+            }
+            if receiver.as_deref() == Some("core") && name == "system_panic" {
+                return emit_core_system_panic(context, state, arguments);
             }
             if receiver.as_deref() == Some("core")
                 && matches!(name.as_str(), "int_trunc" | "int_extend")
@@ -3250,6 +3384,164 @@ fn emit_cast<'ctx, 'module>(
             .map_err(builder_error)?
             .into(),
     ))
+}
+
+fn emit_core_alloc<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    arguments: &[ScalarExpression],
+) -> Result<EmitValue<'ctx>, String> {
+    declare_core_runtime(context, state.module);
+    let [size, alignment] = arguments else {
+        return Err("core.alloc has invalid argument arity".to_owned());
+    };
+    let size = take_basic(emit_typed_expression(
+        context,
+        state,
+        size,
+        &ScalarType::U64,
+    )?)?;
+    let alignment = take_basic(emit_typed_expression(
+        context,
+        state,
+        alignment,
+        &ScalarType::U64,
+    )?)?;
+    emit_core_alloc_values(context, state, size, alignment)
+}
+
+fn emit_core_alloc_project<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    arguments: &[ScalarExpression],
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    declare_core_runtime(context, state.module);
+    let [size, alignment] = arguments else {
+        return Err("core.alloc has invalid argument arity".to_owned());
+    };
+    let size = take_basic(emit_project_typed_expression(
+        context,
+        state,
+        size,
+        &ScalarType::U64,
+        module,
+        modules,
+    )?)?;
+    let alignment = take_basic(emit_project_typed_expression(
+        context,
+        state,
+        alignment,
+        &ScalarType::U64,
+        module,
+        modules,
+    )?)?;
+    emit_core_alloc_values(context, state, size, alignment)
+}
+
+fn emit_core_alloc_values<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    size: BasicValueEnum<'ctx>,
+    alignment: BasicValueEnum<'ctx>,
+) -> Result<EmitValue<'ctx>, String> {
+    let allocator = state
+        .module
+        .get_function(CORE_ALLOC_SYMBOL)
+        .ok_or_else(|| "core allocation runtime declaration is missing".to_owned())?;
+    let pointer = state
+        .builder
+        .build_call(allocator, &[size.into(), alignment.into()], "allocation")
+        .map_err(builder_error)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| "core allocation runtime returned no pointer".to_owned())?
+        .into_pointer_value();
+    let address = state
+        .builder
+        .build_ptr_to_int(
+            pointer,
+            pointer_integer_type(context, state.target_layout),
+            "allocation_address",
+        )
+        .map_err(builder_error)?;
+    Ok(EmitValue::Basic(address.into()))
+}
+
+fn emit_core_free<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    arguments: &[ScalarExpression],
+) -> Result<EmitValue<'ctx>, String> {
+    declare_core_runtime(context, state.module);
+    let [pointer] = arguments else {
+        return Err("core.free has invalid argument arity".to_owned());
+    };
+    let value = take_basic(emit_expression(context, state, pointer)?)?.into_int_value();
+    emit_core_free_value(context, state, value)
+}
+
+fn emit_core_free_project<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    arguments: &[ScalarExpression],
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    declare_core_runtime(context, state.module);
+    let [pointer] = arguments else {
+        return Err("core.free has invalid argument arity".to_owned());
+    };
+    let value = take_basic(emit_project_expression(
+        context, state, pointer, module, modules,
+    )?)?
+    .into_int_value();
+    emit_core_free_value(context, state, value)
+}
+
+fn emit_core_free_value<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    value: inkwell::values::IntValue<'ctx>,
+) -> Result<EmitValue<'ctx>, String> {
+    let deallocator = state
+        .module
+        .get_function(CORE_FREE_SYMBOL)
+        .ok_or_else(|| "core free runtime declaration is missing".to_owned())?;
+    let pointer = state
+        .builder
+        .build_int_to_ptr(
+            value,
+            context.ptr_type(AddressSpace::default()),
+            "free_pointer",
+        )
+        .map_err(builder_error)?;
+    state
+        .builder
+        .build_call(deallocator, &[pointer.into()], "free")
+        .map_err(builder_error)?;
+    Ok(EmitValue::Unit)
+}
+
+fn emit_core_system_panic<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    arguments: &[ScalarExpression],
+) -> Result<EmitValue<'ctx>, String> {
+    if !arguments.is_empty() {
+        return Err("core.system_panic has invalid argument arity".to_owned());
+    }
+    declare_core_runtime(context, state.module);
+    let panic = state
+        .module
+        .get_function(CORE_SYSTEM_PANIC_SYMBOL)
+        .ok_or_else(|| "core system-panic runtime declaration is missing".to_owned())?;
+    state
+        .builder
+        .build_call(panic, &[], "system_panic")
+        .map_err(builder_error)?;
+    Ok(EmitValue::Unit)
 }
 
 fn emit_int_conversion<'ctx, 'module>(
@@ -4895,9 +5187,82 @@ mod tests {
             let llvm = emit_scalar_llvm(&validation)
                 .expect("runtime array LLVM")
                 .to_text();
-            assert!(llvm.contains("alloca i8, i64 %length"), "{llvm}");
+            assert!(
+                llvm.contains("declare ptr @__wosy_core_alloc(i64, i64)"),
+                "{llvm}"
+            );
+            assert!(
+                llvm.contains("call ptr @__wosy_core_alloc(i64 %allocation_size, i64 1)"),
+                "{llvm}"
+            );
+            assert!(llvm.contains("icmp eq ptr %allocation, null"), "{llvm}");
+            assert!(
+                llvm.contains("call void @__wosy_core_system_panic()\n  unreachable"),
+                "{llvm}"
+            );
             assert!(llvm.contains("getelementptr inbounds i8"), "{llvm}");
             assert!(!llvm.contains("icmp ult"), "{llvm}");
+        }
+    }
+
+    #[test]
+    fn emits_shared_core_allocation_release_and_panic_abi_for_both_targets() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nunit() release = fn { unsafe { *?u8 storage = core.alloc(16, 8); core.free(storage); }; };\nunit() panic = fn { core.system_panic(); };\ni64(u64) allocate = fn(length) { i64[length] values; values[0] = 7; values[0] };\n%%end";
+        for (layout, pointer_width) in [
+            (ScalarTargetLayout::WASM32, 32),
+            (ScalarTargetLayout::NATIVE64, 64),
+        ] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let validation = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(
+                validation.diagnostics.is_empty(),
+                "{:?}",
+                validation.diagnostics
+            );
+            let llvm = emit_scalar_llvm(&validation)
+                .expect("core allocation LLVM")
+                .to_text();
+            assert!(
+                llvm.contains("declare ptr @__wosy_core_alloc(i64, i64)"),
+                "{llvm}"
+            );
+            assert!(
+                llvm.contains("declare void @__wosy_core_free(ptr)"),
+                "{llvm}"
+            );
+            assert!(
+                llvm.contains("declare void @__wosy_core_system_panic()"),
+                "{llvm}"
+            );
+            assert!(
+                llvm.contains("call ptr @__wosy_core_alloc(i64 16, i64 8)"),
+                "{llvm}"
+            );
+            assert!(
+                llvm.contains(&format!("ptrtoint ptr %allocation to i{pointer_width}")),
+                "{llvm}"
+            );
+            assert!(
+                llvm.contains(&format!("inttoptr i{pointer_width}")),
+                "{llvm}"
+            );
+            assert!(
+                llvm.contains("call void @__wosy_core_free(ptr %free_pointer)"),
+                "{llvm}"
+            );
+            assert!(
+                llvm.contains("call ptr @__wosy_core_alloc(i64 %allocation_size, i64 8)"),
+                "{llvm}"
+            );
+            assert!(llvm.contains("allocation_panic:"), "{llvm}");
+            assert!(llvm.contains("unreachable"), "{llvm}");
+            assert!(llvm.contains("define void @panic()"), "{llvm}");
         }
     }
 
