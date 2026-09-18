@@ -3514,6 +3514,41 @@ fn call_output_sequence_in_module(
         }
     }
     let callable = callable?;
+    let extern_callable = match receiver {
+        None => false,
+        Some(binding) => {
+            if let Some(namespace) = module
+                .namespace_bindings
+                .iter()
+                .find(|namespace| namespace.binding == *binding)
+            {
+                modules
+                    .iter()
+                    .find(|candidate| candidate.source == namespace.target)
+                    .is_some_and(|target| {
+                        target.items.iter().any(|item| {
+                            matches!(
+                                item,
+                                ScalarItem::Extern(extern_decl)
+                                    if extern_decl.functions.iter().any(|function| function.name == *name)
+                            )
+                        })
+                    })
+            } else {
+                module.items.iter().any(|item| {
+                    matches!(
+                        item,
+                        ScalarItem::Extern(extern_decl)
+                            if extern_decl.binding == *binding
+                                && extern_decl.functions.iter().any(|function| function.name == *name)
+                    )
+                })
+            }
+        }
+    };
+    if extern_callable && !type_arguments.is_empty() {
+        return None;
+    }
     let generic_parameters = if member_visible {
         target.items.iter().find_map(|item| match item {
             ScalarItem::Function(function) if function.name == *name => {
@@ -3566,6 +3601,17 @@ fn call_output_sequence(
             _ => None,
         })
     }?;
+    let extern_callable = program.items.iter().any(|item| {
+        matches!(
+            item,
+            ScalarItem::Extern(extern_decl)
+                if receiver.as_deref() == Some(extern_decl.binding.as_str())
+                    && extern_decl.functions.iter().any(|function| function.name == *name)
+        )
+    });
+    if extern_callable && !type_arguments.is_empty() {
+        return None;
+    }
     if let Some(overload) = receiver
         .is_none()
         .then(|| {
@@ -4948,8 +4994,8 @@ fn expression_type_in_module(
                     unsafe_context,
                 );
             }
-            let (callable, target, unsafe_callable) = match receiver {
-                None => (scope.get(name), module, false),
+            let (callable, target, unsafe_callable, extern_callable) = match receiver {
+                None => (scope.get(name), module, false, false),
                 Some(binding) => {
                     let namespace = module
                         .namespace_bindings
@@ -4976,7 +5022,18 @@ fn expression_type_in_module(
                             ));
                             return ScalarType::Error;
                         };
-                        (Some(callable), target, false)
+                        (
+                            Some(callable),
+                            target,
+                            false,
+                            target.items.iter().any(|item| {
+                                matches!(
+                                    item,
+                                    ScalarItem::Extern(extern_decl)
+                                        if extern_decl.functions.iter().any(|function| function.name == *name)
+                                )
+                            }),
+                        )
                     } else {
                         let extern_decl = module.items.iter().find_map(|item| match item {
                             ScalarItem::Extern(extern_decl) if extern_decl.binding == *binding => {
@@ -5006,7 +5063,12 @@ fn expression_type_in_module(
                             ));
                             return ScalarType::Error;
                         };
-                        (Some(&function.signature), module, function.unsafe_marker)
+                        (
+                            Some(&function.signature),
+                            module,
+                            function.unsafe_marker,
+                            true,
+                        )
                     }
                 }
             };
@@ -5019,6 +5081,15 @@ fn expression_type_in_module(
                 ));
                 return ScalarType::Error;
             };
+            if extern_callable && !type_arguments.is_empty() {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0004",
+                    "generic argument arity does not match callable declaration",
+                    *span,
+                ));
+                return ScalarType::Error;
+            }
             let generic_parameters = target.items.iter().find_map(|item| match item {
                 ScalarItem::Function(function) if function.name == *name => {
                     Some(&function.generic_parameters)
@@ -9898,84 +9969,86 @@ fn assignment_type(
         .map(|target| assignment_target_type(target, scope, program, diagnostics))
         .collect::<Vec<_>>();
     validate_assignment_target_distinctness(assignment, program, diagnostics);
-    let outputs = ScalarOutputSequence {
-        outputs: assignment
-            .values
-            .iter()
-            .enumerate()
-            .flat_map(|(position, value)| {
-                let actual = match expected.get(position).and_then(Option::as_ref) {
-                    Some(expected) => expression_type_expected(
-                        value,
-                        expected,
-                        scope,
-                        visible_names,
-                        folded_names,
-                        program,
-                        diagnostics,
-                        unsafe_context,
-                    ),
-                    None => expression_type(
-                        value,
-                        scope,
-                        visible_names,
-                        folded_names,
-                        program,
-                        diagnostics,
-                        unsafe_context,
-                    ),
-                };
-                call_output_sequence(value, scope, program)
-                    .unwrap_or(ScalarOutputSequence {
-                        outputs: vec![ScalarOutput {
-                            ty: actual,
-                            span: expression_span(value),
-                        }],
-                        span: expression_span(value),
-                    })
-                    .outputs
-            })
-            .collect(),
-        span: assignment.span,
-    };
-    if assignment.targets.len() > outputs.outputs.len() {
-        diagnostics.push(diagnostic(
-            program,
-            "B0004",
-            "call has fewer outputs than assignment targets",
-            assignment.span,
-        ));
-    }
-    for ((index, (target, expected)), output) in assignment
-        .targets
+    let outputs = assignment
+        .values
         .iter()
-        .zip(&expected)
         .enumerate()
-        .zip(&outputs.outputs)
-    {
-        if let Some(expected) = expected {
-            expect_type(
+        .map(|(position, value)| {
+            let actual = match expected.get(position).and_then(Option::as_ref) {
+                Some(expected) => expression_type_expected(
+                    value,
+                    expected,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                ),
+                None => expression_type(
+                    value,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                ),
+            };
+            match call_output_sequence(value, scope, program) {
+                Some(outputs) => Some(outputs.outputs),
+                None if matches!(value, ScalarExpression::Call { .. }) => None,
+                None => Some(vec![ScalarOutput {
+                    ty: actual,
+                    span: expression_span(value),
+                }]),
+            }
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|outputs| ScalarOutputSequence {
+            outputs: outputs.into_iter().flatten().collect(),
+            span: assignment.span,
+        });
+    if let Some(outputs) = outputs {
+        if assignment.targets.len() > outputs.outputs.len() {
+            diagnostics.push(diagnostic(
                 program,
-                expected,
-                &output.ty,
-                if index == 0 {
-                    assignment.span
-                } else {
-                    target.target_span
-                },
-                diagnostics,
-            );
-        } else if let ScalarPlace::Name { name, span } = &target.place {
-            validate_program_identifier_style(program, name, *span, diagnostics);
-            if declare_program_name(
-                program,
-                name,
-                *span,
-                &mut inferred_names,
-                &mut inferred_folded_names,
-                diagnostics,
-            ) {
-                scope.insert(name.clone(), output.ty.clone());
+                "B0004",
+                "call has fewer outputs than assignment targets",
+                assignment.span,
+            ));
+        }
+        for ((index, (target, expected)), output) in assignment
+            .targets
+            .iter()
+            .zip(&expected)
+            .enumerate()
+            .zip(&outputs.outputs)
+        {
+            if let Some(expected) = expected {
+                expect_type(
+                    program,
+                    expected,
+                    &output.ty,
+                    if index == 0 {
+                        assignment.span
+                    } else {
+                        target.target_span
+                    },
+                    diagnostics,
+                );
+            } else if let ScalarPlace::Name { name, span } = &target.place {
+                validate_program_identifier_style(program, name, *span, diagnostics);
+                if declare_program_name(
+                    program,
+                    name,
+                    *span,
+                    &mut inferred_names,
+                    &mut inferred_folded_names,
+                    diagnostics,
+                ) {
+                    scope.insert(name.clone(), output.ty.clone());
+                }
             }
         }
     }
@@ -10483,6 +10556,23 @@ fn expression_type(
                 diagnostics.push(diagnostic(program, "B0001", "unknown callable name", *span));
                 return ScalarType::Error;
             };
+            let extern_callable = program.items.iter().any(|item| {
+                matches!(
+                    item,
+                    ScalarItem::Extern(extern_decl)
+                        if receiver.as_deref() == Some(extern_decl.binding.as_str())
+                            && extern_decl.functions.iter().any(|function| function.name == *name)
+                )
+            });
+            if extern_callable && !type_arguments.is_empty() {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0004",
+                    "generic argument arity does not match callable declaration",
+                    *span,
+                ));
+                return ScalarType::Error;
+            }
             let generic_parameters = (receiver.is_none()).then(|| {
                 program.items.iter().find_map(|item| match item {
                     ScalarItem::Function(function) if function.name == *name => {
@@ -11907,58 +11997,79 @@ mod tests {
     }
 
     #[test]
-    fn accepts_generic_extern_calls_without_wasi_adapter_validation() {
-        let invalid = validate_text(
-            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, i32) fd_write; };\ni32 out = wasi.fd_write(0, 1);\n%%end",
+    fn rejects_undeclared_extern_type_arguments_and_preserves_valid_calls() {
+        let text = "%%start\nenv = extern wasm \"helper\" { (u64, bool)() read; };\nu64 first, bool second = env.read<u32>();\n%%end";
+        let rejected = validate_text(text);
+        assert_eq!(rejected.diagnostics.len(), 1, "{:?}", rejected.diagnostics);
+        let diagnostic = &rejected.diagnostics[0];
+        assert_eq!(diagnostic.code, "B0004");
+        assert_eq!(
+            diagnostic.message,
+            "generic argument arity does not match callable declaration"
         );
-        assert!(invalid.diagnostics.is_empty(), "{:?}", invalid.diagnostics);
-
-        let dynamic = validate_text(
-            "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, i32) fd_write; };\ni32 text = 1;\ni32 out = wasi.fd_write(1, text);\n%%end",
+        let start = text.find("env.read<u32>()").expect("extern call") as u32;
+        assert_eq!(
+            diagnostic.labels[0].span.range,
+            ByteSpan::new(start, start + 15)
         );
-        assert!(dynamic.diagnostics.is_empty(), "{:?}", dynamic.diagnostics);
 
-        let missing = validate_text("%%start\ni32 out = wasi.fd_write(1, \"x\");\n%%end");
-        assert!(missing
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "B0001"));
-
-        let multiple = validate_text(
-            "%%start\nenv = extern wasm \"helper\" { (u64, bool)() read; };\nu64 first, bool second = env.read<u32>();\n%%end",
+        let ordinary = validate_text(
+            "%%start\nenv = extern wasm \"helper\" { u64() read; };\nu64 value = env.read();\n%%end",
         );
         assert!(
-            multiple.diagnostics.is_empty(),
+            ordinary.diagnostics.is_empty(),
             "{:?}",
-            multiple.diagnostics
+            ordinary.diagnostics
         );
-        let ScalarItem::Binding(binding) = &multiple.program.items[1] else {
-            panic!("generic extern binding")
-        };
+
+        let generic = validate_text(
+            "%%start\ngeneric T;\nT(T) identity = fn(value) { value };\nu64 result = identity<u64>(1);\n%%end",
+        );
+        assert!(generic.diagnostics.is_empty(), "{:?}", generic.diagnostics);
+    }
+
+    #[test]
+    fn rejects_undeclared_project_extern_type_arguments_at_call_span() {
+        let main_source = module_source("src/main.w");
+        let library_source = module_source("src/library.w");
+        let main_text = "%%start\nlibrary = namespace app \"src/library.w\";\nu64 first, bool second = library.read<u32>();\n%%end";
+        let main = module_from_text(main_source.clone(), main_text);
+        let library = module_from_text(
+            library_source.clone(),
+            "%%start\nenv = extern wasm \"helper\" { (u64, bool)() read; };\n%%end",
+        );
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    main,
+                    vec![ScalarNamespaceBinding {
+                        binding: "library".to_owned(),
+                        target: library_source.clone(),
+                        span: ByteSpan::new(8, 15),
+                    }],
+                ),
+                ScalarModule::new(library_source, library.items, Vec::new()),
+            ],
+            vec![main_source.clone()],
+        ));
         assert_eq!(
-            binding.output_origin,
-            ScalarBindingOutputOrigin::SingleExpression
+            validation.diagnostics.len(),
+            1,
+            "{:?}",
+            validation.diagnostics
         );
-        assert_eq!(binding.receivers.len(), 2);
-        assert_eq!(binding.output_sequence.outputs.len(), 2);
-        assert_eq!(binding.output_sequence.outputs[0].ty, ScalarType::U64);
-        assert_eq!(binding.output_sequence.outputs[1].ty, ScalarType::Bool);
-        let call_span = expression_span(&binding.value);
-        assert_eq!(binding.output_sequence.outputs[0].span, call_span);
-        assert_eq!(binding.output_sequence.outputs[1].span, call_span);
-        assert_eq!(binding.output_values[0].position, 0);
-        assert_eq!(binding.output_values[1].position, 1);
-        assert_eq!(binding.output_values[0].ty, ScalarType::U64);
-        assert_eq!(binding.output_values[1].ty, ScalarType::Bool);
-        assert_eq!(binding.output_values[0].span, call_span);
-        assert_eq!(binding.output_values[1].span, call_span);
-        let ScalarItem::Extern(extern_decl) = &multiple.program.items[0] else {
-            panic!("generic extern item")
-        };
-        let ScalarType::Callable { outputs, .. } = &extern_decl.functions[0].signature else {
-            panic!("generic extern signature")
-        };
-        assert_eq!(outputs.outputs.len(), 2);
+        let diagnostic = &validation.diagnostics[0];
+        assert_eq!(diagnostic.code, "B0004");
+        assert_eq!(
+            diagnostic.message,
+            "generic argument arity does not match callable declaration"
+        );
+        assert_eq!(diagnostic.labels[0].span.source, main_source);
+        let start = main_text.find("library.read<u32>()").expect("extern call") as u32;
+        assert_eq!(
+            diagnostic.labels[0].span.range,
+            ByteSpan::new(start, start + 19)
+        );
     }
 
     #[test]
