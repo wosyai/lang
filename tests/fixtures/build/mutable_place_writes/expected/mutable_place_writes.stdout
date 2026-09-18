@@ -1,0 +1,4 @@
+indexed write
+field write
+mutable dereference write
+field index write

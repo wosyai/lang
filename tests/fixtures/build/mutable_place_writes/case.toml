@@ -1,0 +1,12 @@
+shared_stdlib = true
+
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/mutable_place_writes.stdout"
+stderr = "expected/empty"
+exact = true

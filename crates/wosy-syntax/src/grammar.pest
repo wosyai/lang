@@ -54,7 +54,7 @@ unsafe_expr = { unsafe_keyword ~ block }
 while_expr = { "while" ~ "(" ~ expression ~ ")" ~ block }
 assignment = { assignment_targets ~ "=" ~ output_list }
 assignment_targets = { assignment_target ~ ("," ~ assignment_target)* }
-assignment_target = { qualified_member | dereferenced_field | identifier }
+assignment_target = { indexed_place | dereference | qualified_member | dereferenced_field | identifier }
 receiver_list = { receiver ~ ("," ~ receiver)* }
 receiver = { type_spec ~ identifier }
 output_list = { expression ~ ("," ~ expression)* }

@@ -3547,24 +3547,14 @@ fn assignment_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
-    let mut target_names = BTreeSet::new();
     let mut inferred_names = visible_names.clone();
     let mut inferred_folded_names = folded_names.clone();
     let expected = assignment
         .targets
         .iter()
-        .map(|target| {
-            if !target_names.insert((target.receiver.clone(), target.target.clone())) {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0002",
-                    "duplicate assignment target",
-                    target.target_span,
-                ));
-            }
-            assignment_target_type_in_module(target, scope, module, modules, diagnostics)
-        })
+        .map(|target| assignment_target_type_in_module(target, scope, module, modules, diagnostics))
         .collect::<Vec<_>>();
+    validate_assignment_target_distinctness_in_module(assignment, module, diagnostics);
     let outputs = ScalarOutputSequence {
         outputs: assignment
             .values
@@ -3698,13 +3688,41 @@ fn assignment_target_type_in_module(
             }
             expected
         }
-        place => Some(place_type_in_module(
+        place => Some(writable_place_type_in_module(
             place,
             scope,
             module,
             modules,
             diagnostics,
         )),
+    }
+}
+
+fn validate_assignment_target_distinctness_in_module(
+    assignment: &ScalarAssignment,
+    module: &ScalarModule,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    for (index, target) in assignment.targets.iter().enumerate() {
+        for previous in &assignment.targets[..index] {
+            if target.place == previous.place {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0002",
+                    "duplicate assignment target",
+                    target.target_span,
+                ));
+            } else if place_contains_dynamic_index(&target.place)
+                || place_contains_dynamic_index(&previous.place)
+            {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0002",
+                    "assignment targets require a distinctness proof",
+                    target.target_span,
+                ));
+            }
+        }
     }
 }
 
@@ -5607,6 +5625,78 @@ fn checked_address_type_in_module(
     ScalarType::CheckedReference {
         mutability,
         inner: Box::new(inner),
+    }
+}
+
+fn writable_place_type(
+    place: &ScalarPlace,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    let ScalarPlace::Dereference { pointer, span } = place else {
+        return place_type(place, scope, program, diagnostics);
+    };
+    match expression_type(
+        pointer,
+        scope,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        program,
+        diagnostics,
+        false,
+    ) {
+        ScalarType::CheckedReference {
+            mutability: ScalarReferenceMutability::Mutable,
+            inner,
+        } => *inner,
+        ScalarType::Error => ScalarType::Error,
+        _ => {
+            diagnostics.push(diagnostic(
+                program,
+                "B0003",
+                "assignment dereference requires a mutable checked reference",
+                *span,
+            ));
+            ScalarType::Error
+        }
+    }
+}
+
+fn writable_place_type_in_module(
+    place: &ScalarPlace,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> ScalarType {
+    let ScalarPlace::Dereference { pointer, span } = place else {
+        return place_type_in_module(place, scope, module, modules, diagnostics);
+    };
+    match expression_type_in_module(
+        pointer,
+        scope,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        module,
+        modules,
+        diagnostics,
+        false,
+    ) {
+        ScalarType::CheckedReference {
+            mutability: ScalarReferenceMutability::Mutable,
+            inner,
+        } => *inner,
+        ScalarType::Error => ScalarType::Error,
+        _ => {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "assignment dereference requires a mutable checked reference",
+                *span,
+            ));
+            ScalarType::Error
+        }
     }
 }
 
@@ -9179,24 +9269,14 @@ fn assignment_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
-    let mut target_names = BTreeSet::new();
     let mut inferred_names = visible_names.clone();
     let mut inferred_folded_names = folded_names.clone();
     let expected = assignment
         .targets
         .iter()
-        .map(|target| {
-            if !target_names.insert((target.receiver.clone(), target.target.clone())) {
-                diagnostics.push(diagnostic(
-                    program,
-                    "B0002",
-                    "duplicate assignment target",
-                    target.target_span,
-                ));
-            }
-            assignment_target_type(target, scope, program, diagnostics)
-        })
+        .map(|target| assignment_target_type(target, scope, program, diagnostics))
         .collect::<Vec<_>>();
+    validate_assignment_target_distinctness(assignment, program, diagnostics);
     let outputs = ScalarOutputSequence {
         outputs: assignment
             .values
@@ -9300,7 +9380,46 @@ fn assignment_target_type(
             }
             expected
         }
-        place => Some(place_type(place, scope, program, diagnostics)),
+        place => Some(writable_place_type(place, scope, program, diagnostics)),
+    }
+}
+
+fn validate_assignment_target_distinctness(
+    assignment: &ScalarAssignment,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    for (index, target) in assignment.targets.iter().enumerate() {
+        for previous in &assignment.targets[..index] {
+            if target.place == previous.place {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0002",
+                    "duplicate assignment target",
+                    target.target_span,
+                ));
+            } else if place_contains_dynamic_index(&target.place)
+                || place_contains_dynamic_index(&previous.place)
+            {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0002",
+                    "assignment targets require a distinctness proof",
+                    target.target_span,
+                ));
+            }
+        }
+    }
+}
+
+fn place_contains_dynamic_index(place: &ScalarPlace) -> bool {
+    match place {
+        ScalarPlace::Name { .. } | ScalarPlace::Dereference { .. } => false,
+        ScalarPlace::Field { base, .. } => place_contains_dynamic_index(base),
+        ScalarPlace::Index { base, index, .. } => {
+            place_contains_dynamic_index(base)
+                || !matches!(index.as_ref(), ScalarExpression::Integer { .. })
+        }
     }
 }
 
@@ -10758,6 +10877,34 @@ mod tests {
             parsed.diagnostics
         );
         derive_scalar_program(&parsed.result)
+    }
+
+    #[test]
+    fn validates_mutable_typed_place_writes_and_assignment_distinctness() {
+        let valid = validate_text(
+            "%%start\nstruct Record { u8 value; u8[3] bytes; }\nu8[3] values = [1, 2, 3];\nRecord holder = { .value = 4; .bytes = [5, 6, 7]; };\n*!u8 writer = &!values[1];\nvalues[0] = 8;\nholder.value = 9;\n*writer = 10;\nholder.bytes[2] = 11;\nvalues[0], values[2] = 12, 13;\n%%end",
+        );
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+
+        let dynamic = validate_text(
+            "%%start\nu8[2] values = [1, 2];\nu64 index = 0;\nvalues[index], values[1] = 3, 4;\n%%end",
+        );
+        assert!(dynamic.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0002"
+                && diagnostic.message == "assignment targets require a distinctness proof"
+        }));
+
+        for text in [
+            "%%start\nu8[2] values = [1, 2];\n*u8 shared = &values[0];\n*shared = 3;\n%%end",
+            "%%start\nu8[2] values = [1, 2];\nunsafe { *?u8 raw = &?values[0]; *raw = 3; };\n%%end",
+        ] {
+            let result = validate_text(text);
+            assert!(result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message
+                        == "assignment dereference requires a mutable checked reference"
+            }));
+        }
     }
 
     #[test]
@@ -14268,6 +14415,43 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         };
         assert_eq!(*span, expected_field_span);
         assert!(matches!(field, ScalarFieldReference::Resolved(id) if id.structure == imported_id));
+    }
+
+    #[test]
+    fn validates_imported_struct_fixed_array_field_writes_in_projects() {
+        let child_source = module_source("src/child.w");
+        let child_program = module_from_text(
+            child_source.clone(),
+            "%%start\nstruct Record { u8[3] bytes; }\n%%end",
+        );
+        let main_source = module_source("src/main.w");
+        let main_program = module_from_text(
+            main_source.clone(),
+            "%%start\nchild = namespace app \"src/child.w\";\nchild.Record holder = { .bytes = [1, 2, 3]; };\nu64 index = 1;\nholder.bytes[0], holder.bytes[2] = 4, 5;\nholder.bytes[index] = 6;\n%%end",
+        );
+        let namespace_span = match &main_program.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace item"),
+        };
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    main_program,
+                    vec![ScalarNamespaceBinding {
+                        binding: "child".to_owned(),
+                        target: child_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::from_program(child_program, Vec::new()),
+            ],
+            vec![main_source, child_source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
     }
 
     #[test]

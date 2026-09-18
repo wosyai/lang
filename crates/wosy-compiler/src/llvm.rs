@@ -2121,13 +2121,6 @@ fn emit_assignment<'ctx, 'module>(
         },
     )?;
     for (target, (value, ty)) in assignment.targets.iter().zip(values) {
-        if target.receiver.is_some() {
-            return Err(format!(
-                "unknown LLVM storage {}.{}",
-                target.receiver.as_deref().expect("assignment receiver"),
-                target.target
-            ));
-        }
         if ty == ScalarType::Unit {
             state.values.insert(target.target.clone(), EmitValue::Unit);
             continue;
@@ -2171,7 +2164,12 @@ fn emit_project_assignment<'ctx, 'module>(
         .targets
         .iter()
         .map(|target| {
-            if let Some(receiver) = &target.receiver {
+            if let Some(receiver) = target.receiver.as_ref().filter(|receiver| {
+                module
+                    .namespace_bindings
+                    .iter()
+                    .any(|namespace| namespace.binding == **receiver)
+            }) {
                 let target_module = project_namespace_target(module, modules, receiver)?;
                 Ok(Some(
                     project_member_global(state, target_module, &target.target)?.1,
@@ -2196,7 +2194,12 @@ fn emit_project_assignment<'ctx, 'module>(
             state.values.insert(target.target.clone(), EmitValue::Unit);
             continue;
         }
-        let destination = if let Some(receiver) = &target.receiver {
+        let destination = if let Some(receiver) = target.receiver.as_ref().filter(|receiver| {
+            module
+                .namespace_bindings
+                .iter()
+                .any(|namespace| namespace.binding == **receiver)
+        }) {
             let target_module = project_namespace_target(module, modules, receiver)?;
             let (global, _) = project_member_global(state, target_module, &target.target)?;
             global
@@ -4769,6 +4772,32 @@ mod tests {
             );
             assert!(llvm.contains("getelementptr inbounds [2 x i8]"), "{llvm}");
             assert!(llvm.contains("ptrtoint"), "{llvm}");
+            assert!(!llvm.contains("icmp ult"), "{llvm}");
+        }
+    }
+
+    #[test]
+    fn emits_mutable_typed_place_writes_for_wasm32_and_native64() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nstruct Buffer { u8 value; u8[3] bytes; }\nu8() write = fn { u8[3] values = [1, 2, 3]; Buffer holder = { .value = 4; .bytes = [5, 6, 7]; }; *!u8 writer = &!values[1]; values[0] = 8; holder.value = 9; *writer = 10; holder.bytes[2] = 11; values[0], values[2] = 12, 13; values[0] };\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let validation = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(
+                validation.diagnostics.is_empty(),
+                "{:?}",
+                validation.diagnostics
+            );
+            let llvm = emit_scalar_llvm(&validation)
+                .expect("mutable place LLVM")
+                .to_text();
+            assert!(llvm.contains("getelementptr inbounds [3 x i8]"), "{llvm}");
+            assert!(llvm.contains("inttoptr"), "{llvm}");
             assert!(!llvm.contains("icmp ult"), "{llvm}");
         }
     }

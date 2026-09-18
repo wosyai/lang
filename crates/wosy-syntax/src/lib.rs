@@ -752,6 +752,22 @@ mod tests {
     }
 
     #[test]
+    fn mutable_typed_place_writes_are_structural_and_lossless() {
+        let text = "%%start\nu8[2] bytes = [1, 2];\nstruct Record { u8 value; u8[2] bytes; }\nRecord record = { .value = 3; .bytes = [4, 5]; };\n*!u8 writer = &!bytes[0];\nbytes[1] = 6;\nrecord.value = 7;\n*writer = 8;\nrecord.bytes[0] = 9;\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(
+            result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::AssignmentTarget)
+                .count(),
+            4
+        );
+    }
+
+    #[test]
     fn negative_fixed_array_length_is_lossless_and_structural() {
         let text = "%%start\nu8[-1] value = [0];\n%%end";
         let result = parse(identity(), text.into(), &[]);
