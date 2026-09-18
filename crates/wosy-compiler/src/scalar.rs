@@ -1846,12 +1846,51 @@ fn resolve_block_types(block: &mut ScalarBlock, names: &BTreeMap<String, ScalarT
                 for receiver in &mut binding.receivers {
                     receiver.ty = resolve_type(&receiver.ty, names);
                 }
+                resolve_expression_types(&mut binding.value, names);
             }
             ScalarBlockItem::While(while_expression) => {
-                resolve_block_types(&mut while_expression.body, names)
+                resolve_expression_types(&mut while_expression.condition, names);
+                resolve_block_types(&mut while_expression.body, names);
             }
-            ScalarBlockItem::Expression(_) | ScalarBlockItem::Assignment(_) => {}
+            ScalarBlockItem::Expression(expression) => resolve_expression_types(expression, names),
+            ScalarBlockItem::Assignment(assignment) => {
+                resolve_expression_types(&mut assignment.value, names);
+                for value in &mut assignment.values {
+                    resolve_expression_types(value, names);
+                }
+            }
         }
+    }
+    for output in &mut block.final_output_values {
+        resolve_expression_types(&mut output.value, names);
+    }
+}
+
+fn resolve_expression_types(
+    expression: &mut ScalarExpression,
+    names: &BTreeMap<String, ScalarType>,
+) {
+    match expression {
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            resolve_expression_types(condition, names);
+            resolve_block_types(then_branch, names);
+            resolve_block_types(else_branch, names);
+        }
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => {
+            resolve_expression_types(condition, names);
+            resolve_block_types(then_branch, names);
+        }
+        ScalarExpression::Block(block) => resolve_block_types(block, names),
+        _ => {}
     }
 }
 
@@ -5286,16 +5325,38 @@ fn expression_type_in_module(
                 diagnostics,
                 unsafe_context,
             );
-            let right_type = expression_type_in_module(
-                right,
-                scope,
-                visible_names,
-                folded_names,
-                module,
-                modules,
-                diagnostics,
-                unsafe_context,
-            );
+            let right_type = if matches!(
+                operator,
+                BinaryOperator::Equal
+                    | BinaryOperator::NotEqual
+                    | BinaryOperator::Less
+                    | BinaryOperator::LessEqual
+                    | BinaryOperator::Greater
+                    | BinaryOperator::GreaterEqual
+            ) {
+                expression_type_in_module_expected(
+                    right,
+                    Some(&left_type),
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                )
+            } else {
+                expression_type_in_module(
+                    right,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                )
+            };
             if is_error_type(&left_type) || is_error_type(&right_type) {
                 return ScalarType::Error;
             }
@@ -6296,7 +6357,7 @@ fn expression_type_in_module_expected(
                 right,
                 if boolean {
                     Some(&bool_context)
-                } else if comparison && is_null_expression(right) {
+                } else if comparison {
                     Some(&left_type)
                 } else {
                     arithmetic_context
@@ -10303,9 +10364,17 @@ impl StaticUseAnalyzer {
 
     fn unused(self) -> Vec<ByteSpan> {
         self.declarations
-            .into_iter()
+            .iter()
             .enumerate()
-            .filter_map(|(id, span)| (!self.uses.contains(&id)).then_some(span))
+            .filter_map(|(id, span)| {
+                let used = self.uses.contains(&id)
+                    || self
+                        .declarations
+                        .iter()
+                        .enumerate()
+                        .any(|(other_id, other)| other == span && self.uses.contains(&other_id));
+                (!used).then_some(*span)
+            })
             .collect()
     }
 }
@@ -11028,15 +11097,28 @@ fn expression_type(
                 diagnostics,
                 unsafe_context,
             );
-            let right_type = expression_type(
-                right,
-                scope,
-                visible_names,
-                folded_names,
-                program,
-                diagnostics,
-                unsafe_context,
-            );
+            let right_type = if comparison {
+                expression_type_expected(
+                    right,
+                    &left_type,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                )
+            } else {
+                expression_type(
+                    right,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                )
+            };
             if is_error_type(&left_type) || is_error_type(&right_type) {
                 return ScalarType::Error;
             }
@@ -11949,7 +12031,7 @@ fn expression_type_expected(
                     right,
                     if boolean {
                         &bool_context
-                    } else if comparison && is_null_expression(right) {
+                    } else if comparison {
                         &left_type
                     } else {
                         expected

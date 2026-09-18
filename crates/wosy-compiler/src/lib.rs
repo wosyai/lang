@@ -179,7 +179,7 @@ enum ReadLineStatus { line; eof; }
         );
         assert!(preview.diagnostics.is_empty(), "{:?}", preview.diagnostics);
         let preview_scalar = derive_scalar_program(&preview.result);
-        let _validation = validate_scalar_project(ScalarProject::new(
+        let validation = validate_scalar_project(ScalarProject::new(
             vec![
                 ScalarModule::from_program(
                     scalar.program,
@@ -193,6 +193,11 @@ enum ReadLineStatus { line; eof; }
             ],
             vec![source, preview_source],
         ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
     }
 }
 
