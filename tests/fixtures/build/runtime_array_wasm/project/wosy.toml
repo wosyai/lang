@@ -1,0 +1,30 @@
+[package]
+name = "runtime_array_wasm"
+default_target = "app"
+
+[comments]
+categories = []
+
+[builders.wasm]
+command = ["python", "scripts/build-wasm"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[runners.wasm]
+command = ["python", "scripts/run-wasmtime"]
+args = []
+
+[targets.app]
+root = "src/main.w"
+
+[targets.app.artifacts.main]
+artifact = "Main"
+
+[targets.app.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.app.profiles.dev]
+main_artifact = "main"

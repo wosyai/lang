@@ -1,0 +1,26 @@
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/allocation_failure.w"
+command = ["wosy", "run", "app"]
+exit = 1
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/system_panic.w"
+command = ["wosy", "run", "app"]
+exit = 1
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true

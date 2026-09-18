@@ -626,7 +626,12 @@ impl LlvmPartition {
             let body = text
                 .lines()
                 .skip(2)
-                .filter(|line| !line.starts_with("declare "))
+                .filter(|line| {
+                    !self.declarations.iter().any(|declaration| {
+                        line.starts_with("declare ")
+                            && line.contains(&format!("@{}(", declaration.name))
+                    })
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             let mut serialized = String::new();
@@ -5264,6 +5269,41 @@ mod tests {
             assert!(llvm.contains("unreachable"), "{llvm}");
             assert!(llvm.contains("define void @panic()"), "{llvm}");
         }
+    }
+
+    #[test]
+    fn retains_core_runtime_declarations_when_serializing_wasm_externs() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let parsed = parse_source(
+            source,
+            "%%start\nenv = extern wasm \"host\" { unit() log; };\nunit() run = fn { u64 length = 1; u8[length] bytes; bytes[0] = 1; env.log(); };\nrun();\n%%end".into(),
+            &[],
+        );
+        let validation =
+            crate::derive_scalar_program_with_layout(&parsed.result, ScalarTargetLayout::WASM32);
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+
+        let llvm = emit_scalar_llvm(&validation)
+            .expect("core runtime LLVM with wasm extern")
+            .to_text();
+        assert!(
+            llvm.contains("declare ptr @__wosy_core_alloc(i64, i64)"),
+            "{llvm}"
+        );
+        assert!(
+            llvm.contains("declare void @__wosy_core_system_panic()"),
+            "{llvm}"
+        );
+        assert!(llvm.contains("wasm-import-module\"=\"host\""), "{llvm}");
     }
 
     #[test]
