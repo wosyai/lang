@@ -8210,7 +8210,7 @@ fn derive_type(node: &CstNode) -> ScalarType {
                 outputs: output
                     .children()
                     .map(|child| ScalarOutput {
-                        ty: derive_type(&child),
+                        ty: derive_callable_array_type(&child),
                         span: wosy_syntax::byte_span(&child),
                     })
                     .collect(),
@@ -8222,7 +8222,7 @@ fn derive_type(node: &CstNode) -> ScalarType {
                 .filter(|child| child.kind() == SyntaxKind::Punctuation)
                 .filter(|child| child.text() != "(")
                 .filter(|child| child.text() != ")")
-                .map(|child| derive_type(&child))
+                .map(|child| derive_callable_array_type(&child))
                 .collect();
             ScalarType::Callable {
                 outputs,
@@ -8279,7 +8279,27 @@ fn derive_type(node: &CstNode) -> ScalarType {
             span: wosy_syntax::byte_span(node),
         };
     }
+    if !matches!(ty, ScalarType::Callable { .. }) {
+        let erased_suffixes = node.text().to_string().match_indices("[]").count();
+        for _ in runtime_array_depth(&ty)..erased_suffixes {
+            ty = ScalarType::RuntimeArray {
+                element: Box::new(ty),
+                span: wosy_syntax::byte_span(node),
+            };
+        }
+    }
     ty
+}
+
+fn runtime_array_depth(ty: &ScalarType) -> usize {
+    match ty {
+        ScalarType::RuntimeArray { element, .. } => 1 + runtime_array_depth(element),
+        _ => 0,
+    }
+}
+
+fn derive_callable_array_type(node: &CstNode) -> ScalarType {
+    derive_type(node)
 }
 
 fn fixed_array_length_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
@@ -12003,6 +12023,19 @@ mod tests {
                 && diagnostic.message
                     == "assignment dereference requires a mutable checked reference"
         }));
+    }
+
+    #[test]
+    fn validates_runtime_array_callable_transport() {
+        let validation = validate_text(
+            "%%start\nu8[]() make = fn { u64 length = 1; u8[length] bytes; bytes };\nu8[](u8[]) relay = fn(values) { values };\nu8[] value = make();\nu8[] alias = relay(value);\n%%end",
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "diagnostics: {:#?}\nprogram: {:#?}",
+            validation.diagnostics,
+            validation.program
+        );
     }
 
     #[test]

@@ -81,6 +81,8 @@ struct EmitState<'ctx, 'module> {
     signatures: &'ctx BTreeMap<String, ScalarType>,
     values: BTreeMap<String, EmitValue<'ctx>>,
     storage: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
+    runtime_array_owners: BTreeMap<String, bool>,
+    runtime_array_allocations: BTreeMap<String, bool>,
     globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     all_globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     structs: &'module [ScalarStruct],
@@ -1068,7 +1070,22 @@ fn place_pointer<'ctx, 'module>(
 ) -> Result<PointerValue<'ctx>, String> {
     match place {
         crate::ScalarPlace::Name { name, .. } => {
-            if let Some((slot, _)) = state.storage.get(name).cloned() {
+            if let Some((slot, ty)) = state.storage.get(name).cloned() {
+                if matches!(ty, ScalarType::RuntimeArray { .. }) {
+                    if state
+                        .runtime_array_allocations
+                        .get(name)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        return Ok(slot);
+                    }
+                    return state
+                        .builder
+                        .build_load(basic_type(context, &ty, state.target_layout)?, slot, name)
+                        .map_err(builder_error)
+                        .map(BasicValueEnum::into_pointer_value);
+                }
                 return Ok(slot);
             }
             state
@@ -1633,6 +1650,12 @@ fn store_binding_outputs<'ctx, 'module>(
         state
             .storage
             .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
+        state
+            .runtime_array_owners
+            .insert(receiver.name.clone(), true);
+        state
+            .runtime_array_allocations
+            .insert(receiver.name.clone(), true);
         return Ok(());
     }
     let receivers = binding_receivers(binding);
@@ -1651,8 +1674,111 @@ fn store_binding_outputs<'ctx, 'module>(
             .map_err(builder_error)?;
         store_value(context, state, slot, ty, value)?;
         state.storage.insert(name.clone(), (slot, ty.clone()));
+        if matches!(ty, ScalarType::RuntimeArray { .. }) {
+            state.runtime_array_owners.insert(
+                name.clone(),
+                runtime_array_call_transfers_ownership(state, &binding.value),
+            );
+            state.runtime_array_allocations.insert(name.clone(), false);
+        }
     }
     Ok(())
+}
+
+fn runtime_array_call_transfers_ownership(
+    state: &EmitState<'_, '_>,
+    expression: &ScalarExpression,
+) -> bool {
+    let ScalarExpression::Call { arguments, .. } = expression else {
+        return false;
+    };
+    !arguments.iter().any(|argument| {
+        matches!(argument, ScalarExpression::Name { name, .. } if matches!(
+            state.storage.get(name).map(|(_, ty)| ty),
+            Some(ScalarType::RuntimeArray { .. })
+        ))
+    })
+}
+
+fn release_runtime_array_owner<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    name: &str,
+) -> Result<(), String> {
+    if !state
+        .runtime_array_owners
+        .get(name)
+        .copied()
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let (slot, ty) = state
+        .storage
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("missing runtime-array storage for {name}"))?;
+    if !matches!(ty, ScalarType::RuntimeArray { .. }) {
+        return Err(format!("runtime-array owner {name} has an invalid type"));
+    }
+    declare_core_runtime(context, state.module);
+    let pointer = if state
+        .runtime_array_allocations
+        .get(name)
+        .copied()
+        .unwrap_or(false)
+    {
+        slot.into()
+    } else {
+        state
+            .builder
+            .build_load(
+                basic_type(context, &ty, state.target_layout)?,
+                slot,
+                "runtime_array_owner",
+            )
+            .map_err(builder_error)?
+    };
+    let release = state
+        .module
+        .get_function(CORE_FREE_SYMBOL)
+        .ok_or_else(|| "core free runtime declaration is missing".to_owned())?;
+    state
+        .builder
+        .build_call(release, &[pointer.into()], "runtime_array_release")
+        .map_err(builder_error)?;
+    state.runtime_array_owners.insert(name.to_owned(), false);
+    Ok(())
+}
+
+fn release_scope_runtime_array_owners<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    outer_owners: &BTreeMap<String, bool>,
+) -> Result<(), String> {
+    let owners = state
+        .runtime_array_owners
+        .keys()
+        .filter(|name| !outer_owners.contains_key(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in owners {
+        release_runtime_array_owner(context, state, &name)?;
+    }
+    Ok(())
+}
+
+fn transfer_runtime_array_return(
+    state: &mut EmitState<'_, '_>,
+    expression: &ScalarExpression,
+    ty: &ScalarType,
+) {
+    if !matches!(ty, ScalarType::RuntimeArray { .. }) {
+        return;
+    }
+    if let ScalarExpression::Name { name, .. } = expression {
+        state.runtime_array_owners.insert(name.clone(), false);
+    }
 }
 
 fn emit_runtime_array_allocation<'ctx, 'module>(
@@ -1799,6 +1925,8 @@ fn emit_function<'ctx, 'module>(
         signatures,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        runtime_array_owners: BTreeMap::new(),
+        runtime_array_allocations: BTreeMap::new(),
         globals: globals.clone(),
         all_globals: globals.clone(),
         structs,
@@ -1829,6 +1957,14 @@ fn emit_function<'ctx, 'module>(
                 function.parameters[index].clone(),
                 (slot, parameter.clone()),
             );
+            if matches!(parameter, ScalarType::RuntimeArray { .. }) {
+                state
+                    .runtime_array_owners
+                    .insert(function.parameters[index].clone(), false);
+                state
+                    .runtime_array_allocations
+                    .insert(function.parameters[index].clone(), false);
+            }
         }
     }
     let outputs = match &function.signature {
@@ -1887,6 +2023,8 @@ fn emit_main<'ctx, 'module>(
         signatures,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        runtime_array_owners: BTreeMap::new(),
+        runtime_array_allocations: BTreeMap::new(),
         globals: globals.clone(),
         all_globals: globals.clone(),
         structs,
@@ -1952,6 +2090,8 @@ fn emit_project_function<'ctx, 'module>(
         signatures,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        runtime_array_owners: BTreeMap::new(),
+        runtime_array_allocations: BTreeMap::new(),
         globals: module_globals(source_module, globals),
         all_globals: globals.clone(),
         structs,
@@ -1982,6 +2122,14 @@ fn emit_project_function<'ctx, 'module>(
                 function.parameters[index].clone(),
                 (slot, parameter.clone()),
             );
+            if matches!(parameter, ScalarType::RuntimeArray { .. }) {
+                state
+                    .runtime_array_owners
+                    .insert(function.parameters[index].clone(), false);
+                state
+                    .runtime_array_allocations
+                    .insert(function.parameters[index].clone(), false);
+            }
         }
     }
     let outputs = match &function.signature {
@@ -2053,6 +2201,8 @@ fn emit_project_main<'ctx, 'module>(
         signatures,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        runtime_array_owners: BTreeMap::new(),
+        runtime_array_allocations: BTreeMap::new(),
         globals: BTreeMap::new(),
         all_globals: globals.clone(),
         structs,
@@ -2064,6 +2214,7 @@ fn emit_project_main<'ctx, 'module>(
         .first()
         .ok_or_else(|| "project has no reachable modules".to_owned())?;
     initialize_project_module(context, &mut state, root, modules, globals, &mut Vec::new())?;
+    release_scope_runtime_array_owners(context, &mut state, &BTreeMap::new())?;
     builder
         .build_return(Some(&context.i32_type().const_zero()))
         .map_err(builder_error)?;
@@ -2141,6 +2292,8 @@ fn emit_block<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     let storage = state.storage.clone();
     let values = state.values.clone();
+    let runtime_array_owners = state.runtime_array_owners.clone();
+    let runtime_array_allocations = state.runtime_array_allocations.clone();
     let mut result = EmitValue::Unit;
     let final_start = block.items.len() - block.final_output_values.len();
     for item in &block.items[..final_start] {
@@ -2158,8 +2311,11 @@ fn emit_block<'ctx, 'module>(
     if !block.final_output_values.is_empty() {
         result = emit_final_outputs(context, state, block)?;
     }
+    release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     state.storage = storage;
     state.values = values;
+    state.runtime_array_owners = runtime_array_owners;
+    state.runtime_array_allocations = runtime_array_allocations;
     Ok(result)
 }
 
@@ -2172,6 +2328,8 @@ fn emit_project_block<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     let storage = state.storage.clone();
     let values = state.values.clone();
+    let runtime_array_owners = state.runtime_array_owners.clone();
+    let runtime_array_allocations = state.runtime_array_allocations.clone();
     let mut result = EmitValue::Unit;
     let final_start = block.items.len() - block.final_output_values.len();
     for item in &block.items[..final_start] {
@@ -2195,8 +2353,11 @@ fn emit_project_block<'ctx, 'module>(
     if !block.final_output_values.is_empty() {
         result = emit_project_final_outputs(context, state, block, module, modules)?;
     }
+    release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     state.storage = storage;
     state.values = values;
+    state.runtime_array_owners = runtime_array_owners;
+    state.runtime_array_allocations = runtime_array_allocations;
     Ok(result)
 }
 
@@ -2210,7 +2371,9 @@ fn emit_final_outputs<'ctx, 'module>(
         if matches!(&output.value, ScalarExpression::Call { .. }) {
             return emit_expression(context, state, &output.value);
         }
-        return emit_typed_expression(context, state, &output.value, &output.ty);
+        let value = emit_typed_expression(context, state, &output.value, &output.ty)?;
+        transfer_runtime_array_return(state, &output.value, &output.ty);
+        return Ok(value);
     }
     let outputs = crate::ScalarOutputSequence {
         outputs: block
@@ -2228,6 +2391,9 @@ fn emit_final_outputs<'ctx, 'module>(
         .iter()
         .map(|output| emit_typed_expression(context, state, &output.value, &output.ty))
         .collect::<Result<Vec<_>, _>>()?;
+    for output in &block.final_output_values {
+        transfer_runtime_array_return(state, &output.value, &output.ty);
+    }
     build_aggregate(context, state, &outputs, values)
 }
 
@@ -2243,14 +2409,16 @@ fn emit_project_final_outputs<'ctx, 'module>(
         if matches!(&output.value, ScalarExpression::Call { .. }) {
             return emit_project_expression(context, state, &output.value, module, modules);
         }
-        return emit_project_typed_expression(
+        let value = emit_project_typed_expression(
             context,
             state,
             &output.value,
             &output.ty,
             module,
             modules,
-        );
+        )?;
+        transfer_runtime_array_return(state, &output.value, &output.ty);
+        return Ok(value);
     }
     let outputs = crate::ScalarOutputSequence {
         outputs: block
@@ -2277,6 +2445,9 @@ fn emit_project_final_outputs<'ctx, 'module>(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    for output in &block.final_output_values {
+        transfer_runtime_array_return(state, &output.value, &output.ty);
+    }
     build_aggregate(context, state, &outputs, values)
 }
 
@@ -2660,6 +2831,15 @@ fn emit_block_item<'ctx, 'module>(
             state
                 .storage
                 .insert(binding.name.clone(), (slot, binding.declared_type.clone()));
+            if matches!(binding.declared_type, ScalarType::RuntimeArray { .. }) {
+                state.runtime_array_owners.insert(
+                    binding.name.clone(),
+                    runtime_array_call_transfers_ownership(state, &binding.value),
+                );
+                state
+                    .runtime_array_allocations
+                    .insert(binding.name.clone(), false);
+            }
             Ok(EmitValue::Unit)
         }
         ScalarBlockItem::Expression(expression) => emit_expression(context, state, expression),
@@ -2702,6 +2882,12 @@ fn emit_project_block_item<'ctx, 'module>(
                 state
                     .storage
                     .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
+                state
+                    .runtime_array_owners
+                    .insert(receiver.name.clone(), true);
+                state
+                    .runtime_array_allocations
+                    .insert(receiver.name.clone(), true);
                 return Ok(EmitValue::Unit);
             }
             let value = emit_project_typed_expression(
@@ -2732,6 +2918,15 @@ fn emit_project_block_item<'ctx, 'module>(
             state
                 .storage
                 .insert(binding.name.clone(), (slot, binding.declared_type.clone()));
+            if matches!(binding.declared_type, ScalarType::RuntimeArray { .. }) {
+                state.runtime_array_owners.insert(
+                    binding.name.clone(),
+                    runtime_array_call_transfers_ownership(state, &binding.value),
+                );
+                state
+                    .runtime_array_allocations
+                    .insert(binding.name.clone(), false);
+            }
             Ok(EmitValue::Unit)
         }
         ScalarBlockItem::Expression(expression) => {
@@ -2848,6 +3043,15 @@ fn emit_expression<'ctx, 'module>(
             }
             if let Some((slot, ty)) = state.storage.get(name).cloned() {
                 if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
+                    return Ok(EmitValue::Basic(slot.into()));
+                }
+                if matches!(ty, ScalarType::RuntimeArray { .. })
+                    && state
+                        .runtime_array_allocations
+                        .get(name)
+                        .copied()
+                        .unwrap_or(false)
+                {
                     return Ok(EmitValue::Basic(slot.into()));
                 }
                 return Ok(EmitValue::Basic(
