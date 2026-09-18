@@ -4714,8 +4714,9 @@ mod tests {
     use super::{LlvmFunction, LlvmFunctionAttributes, LlvmPartition, LlvmValueType};
     use crate::scalar::ScalarOverloadSelection;
     use crate::{
-        derive_scalar_program, parse_source, validate_scalar_project, ScalarModule, ScalarOutput,
-        ScalarOutputSequence, ScalarProject, ScalarTargetLayout, ScalarType,
+        derive_scalar_program, derive_scalar_program_with_layout, parse_source,
+        validate_scalar_project, ScalarModule, ScalarOutput, ScalarOutputSequence, ScalarProject,
+        ScalarTargetLayout, ScalarType,
     };
     use wosy_syntax::{ByteSpan, SourceIdentity};
 
@@ -5440,6 +5441,68 @@ u64 reported, bool complete = text.print(\"\");
             )),
             "{text}"
         );
+    }
+
+    #[test]
+    fn emits_wasi_read_into_with_one_iovec_for_wasm32_and_native64() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/read_into.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start
+struct Iovec { *?u8 data; u32 length; }
+struct Nread { u32 value; }
+wasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, *?Iovec, i32, *?Nread) fd_read; };
+i32(i32, *?Iovec, *?Nread) fd_read_once = fn(descriptor, iovec_address, count_address) { unsafe { wasi.fd_read(descriptor, iovec_address, 1, count_address) } };
+(u64, bool)(*?u8, u64) read_into = fn(destination, capacity) {
+	Iovec entry = { .data = destination; .length = core.int_trunc<u32>(capacity); };
+	Nread count_cell = { .value = 0; };
+	i32 result = 0;
+	unsafe { result = fd_read_once(0, &?entry, &?count_cell); };
+	core.int_extend<u64>(count_cell.value), result == 0
+};
+*?u8 buffer = null;
+u64 requested_capacity = 4;
+u64 count = 0;
+bool complete = false;
+count, complete = read_into(buffer, requested_capacity);
+%%end";
+        for (layout, iovec_size) in [
+            (ScalarTargetLayout::WASM32, 8),
+            (ScalarTargetLayout::NATIVE64, 16),
+        ] {
+            let validation = derive_scalar_program_with_layout(
+                &parse_source(source.clone(), text.into(), &[]).result,
+                layout,
+            );
+            assert!(
+                validation.diagnostics.is_empty(),
+                "{:?}",
+                validation.diagnostics
+            );
+            let llvm = emit_scalar_llvm(&validation)
+                .expect("read_into LLVM")
+                .to_text();
+            let pointer_width = layout.pointer_size * 8;
+            assert!(llvm.contains("wasm-import-name\"=\"fd_read"), "{llvm}");
+            assert!(
+                llvm.contains(&format!("i32 0, i{pointer_width} %address")),
+                "{llvm}"
+            );
+            assert!(
+                llvm.contains(&format!("i32 1, i{pointer_width} %count_address")),
+                "{llvm}"
+            );
+            assert!(
+                llvm.contains(&format!("alloca [{iovec_size} x i8]")),
+                "{llvm}"
+            );
+            assert!(llvm.contains("trunc i64"), "{llvm}");
+            assert!(llvm.contains("zext i32"), "{llvm}");
+            assert!(!llvm.contains("icmp eq i32 %destination"), "{llvm}");
+        }
     }
 
     #[test]

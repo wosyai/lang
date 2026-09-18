@@ -69,4 +69,42 @@ preview1 = namespace std "wasi/preview1.w";
 	};
 	reported, complete
 };
+
+(u64, bool)(*?u8, u64) read_into = fn(destination, capacity) {
+	u64 reported = 0;
+	u64 zero = core.int_extend<u64>(0);
+	u32 maximum_u32 = 4294967295;
+	u64 maximum = core.int_extend<u64>(maximum_u32);
+	i32 success = 0;
+	preview1.Iovec iovec = {
+		.data = destination;
+		.length = core.int_trunc<u32>(capacity);
+	};
+	preview1.Nread byte_count = { .value = 0; };
+	i32 result = 0;
+	u32 count = 0;
+	bool complete = capacity == zero;
+	if (capacity != zero) {
+		if (capacity <= maximum) {
+			unsafe {
+				result = preview1.fd_read_once(0, &?iovec, &?byte_count);
+			};
+			count = byte_count.value;
+			if (result == success) {
+				reported = core.int_extend<u64>(count);
+				complete = true;
+			} else {
+				reported = 0;
+				complete = false;
+			};
+		} else {
+			reported = 0;
+			complete = false;
+		};
+	} else {
+		reported = 0;
+		complete = true;
+	};
+	reported, complete
+};
 %%end

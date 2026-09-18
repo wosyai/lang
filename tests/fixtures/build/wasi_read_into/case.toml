@@ -1,0 +1,41 @@
+shared_stdlib = true
+
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+source = "project/src/read_bytes.w"
+fd_read_capacity = 4
+fd_read_bytes = [65, 66]
+fd_read_errno = 0
+fd_read_calls = 2
+stdout = "expected/read_bytes.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_error.w"
+fd_read_capacity = 4
+fd_read_bytes = []
+fd_read_errno = 5
+fd_read_calls = 1
+stdout = "expected/read_error.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_zero.w"
+fd_read_capacity = 4
+fd_read_bytes = []
+fd_read_errno = 0
+fd_read_calls = 0
+stdout = "expected/read_zero.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_oversized.w"
+fd_read_capacity = 4
+fd_read_bytes = []
+fd_read_errno = 0
+fd_read_calls = 0
+stdout = "expected/read_oversized.stdout"
+exact = true

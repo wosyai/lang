@@ -11811,6 +11811,67 @@ mod tests {
     }
 
     #[test]
+    fn validates_public_read_into_signature_and_keeps_fd_read_in_the_wasi_module() {
+        let preview_source = module_source("src/wasi/preview1.w");
+        let preview = module_from_text(
+            preview_source.clone(),
+            "%%start\nstruct Iovec { *?u8 data; u32 length; }\nstruct Nread { u32 value; }\nwasi = extern wasm \"wasi_snapshot_preview1\" { unsafe i32(i32, *?Iovec, i32, *?Nread) fd_read; };\ni32(i32, *?Iovec, *?Nread) fd_read_once = fn(descriptor, iovec, nread) { unsafe { wasi.fd_read(descriptor, iovec, 1, nread) } };\n%%end",
+        );
+        let bootstrap_source = module_source("src/bootstrap.w");
+        let bootstrap = module_from_text(
+            bootstrap_source.clone(),
+            "%%start\npreview1 = namespace std \"wasi/preview1.w\";\n(u64, bool)(*?u8, u64) read_into = fn(destination, capacity) { capacity, destination == null };\n%%end",
+        );
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nstd = namespace std \"bootstrap.w\";\n*?u8 destination = null;\nu64 capacity = 4;\nu64 count = 0;\nbool complete = false;\ncount, complete = std.read_into(destination, capacity);\n%%end",
+        );
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    main,
+                    vec![ScalarNamespaceBinding {
+                        binding: "std".to_owned(),
+                        target: bootstrap_source.clone(),
+                        span: ByteSpan::new(0, 0),
+                    }],
+                ),
+                ScalarModule::from_program(
+                    bootstrap,
+                    vec![ScalarNamespaceBinding {
+                        binding: "preview1".to_owned(),
+                        target: preview_source.clone(),
+                        span: ByteSpan::new(0, 0),
+                    }],
+                ),
+                ScalarModule::from_program(preview, Vec::new()),
+            ],
+            vec![main_source, bootstrap_source, preview_source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let ScalarItem::Binding(count) = &validation.project.modules[0].items[3] else {
+            panic!("read count binding")
+        };
+        assert_eq!(count.declared_type, ScalarType::U64);
+        let ScalarItem::Binding(complete) = &validation.project.modules[0].items[4] else {
+            panic!("read complete binding")
+        };
+        assert_eq!(complete.declared_type, ScalarType::Bool);
+
+        assert!(validation.project.modules[1]
+            .members
+            .contains_key("read_into"));
+        assert!(!validation.project.modules[1]
+            .members
+            .contains_key("fd_read_once"));
+    }
+
+    #[test]
     fn accepts_generic_extern_calls_without_wasi_adapter_validation() {
         let invalid = validate_text(
             "%%start\nwasi = extern wasm \"wasi_snapshot_preview1\" { i32(i32, i32) fd_write; };\ni32 out = wasi.fd_write(0, 1);\n%%end",

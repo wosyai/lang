@@ -12,6 +12,10 @@ const ARTIFACT_MANIFEST: &str = ".wosy/artifacts/app/dev/main/artifact-manifest.
 struct HostState {
     wasi: WasiP1Ctx,
     writes: Vec<WriteRecord>,
+    reads: Vec<ReadRecord>,
+    read_bytes: Vec<u8>,
+    read_errno: i32,
+    read_capacity: u32,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -19,6 +23,15 @@ struct WriteRecord {
     descriptor: i32,
     text: String,
     reported: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReadRecord {
+    descriptor: i32,
+    capacity: u32,
+    bytes: Vec<u8>,
+    reported: u32,
+    errno: i32,
 }
 
 fn main() -> Result<(), String> {
@@ -176,6 +189,11 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
         .and_then(Item::as_array_of_tables)
         .ok_or_else(|| format!("{} has no [[assert]]", case.display()))?;
     for assertion in assertions.iter() {
+        if let Some(read_assertion) = fd_read_assertion(assertion)? {
+            run_fd_read_assertion(assertion, read_assertion, &temporary, &case, &binary)?;
+            assert_source_observations(assertion, &temporary, &case)?;
+            continue;
+        }
         if let Some(partial_fd_write_count) = partial_fd_write_count(assertion)? {
             run_partial_fd_write_assertion(
                 assertion,
@@ -292,6 +310,275 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
     }
     fs::remove_dir_all(&temporary).map_err(|error| error.to_string())?;
     println!("passed {}", case.display());
+    Ok(())
+}
+
+struct FdReadAssertion {
+    bytes: Vec<u8>,
+    errno: i32,
+    capacity: u32,
+    calls: usize,
+}
+
+fn fd_read_assertion(assertion: &toml_edit::Table) -> Result<Option<FdReadAssertion>, String> {
+    let Some(item) = assertion.get("fd_read_capacity") else {
+        return Ok(None);
+    };
+    let capacity = item
+        .as_value()
+        .and_then(|value| value.as_integer())
+        .ok_or_else(|| "fd_read_capacity must be an integer".to_owned())?;
+    let capacity = u32::try_from(capacity)
+        .map_err(|_| "fd_read_capacity must fit in u32".to_owned())?;
+    let bytes = assertion
+        .get("fd_read_bytes")
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "fd_read_bytes must be an array".to_owned())?
+        .iter()
+        .map(|value| {
+            value
+                .as_integer()
+                .ok_or_else(|| "fd_read_bytes values must be integers".to_owned())
+                .and_then(|value| {
+                    u8::try_from(value)
+                        .map_err(|_| "fd_read_bytes values must fit in u8".to_owned())
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let errno = assertion
+        .get("fd_read_errno")
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_integer())
+        .ok_or_else(|| "fd_read_errno must be an integer".to_owned())
+        .and_then(|value| {
+            i32::try_from(value).map_err(|_| "fd_read_errno must fit in i32".to_owned())
+        })?;
+    let calls = assertion
+        .get("fd_read_calls")
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_integer())
+        .ok_or_else(|| "fd_read_calls must be an integer".to_owned())
+        .and_then(|value| {
+            usize::try_from(value).map_err(|_| "fd_read_calls must be nonnegative".to_owned())
+        })?;
+    Ok(Some(FdReadAssertion {
+        bytes,
+        errno,
+        capacity,
+        calls,
+    }))
+}
+
+fn run_fd_read_assertion(
+    assertion: &toml_edit::Table,
+    read_assertion: FdReadAssertion,
+    temporary: &Path,
+    case: &Path,
+    binary: &Path,
+) -> Result<(), String> {
+    if assertion.get("command").is_some() {
+        return Err(format!(
+            "{}: fd_read_capacity assertion accepts no command",
+            case.display()
+        ));
+    }
+    select_source(assertion, temporary, case)?;
+    let status = Command::new(binary)
+        .arg("build")
+        .current_dir(temporary)
+        .status()
+        .map_err(|error| error.to_string())?;
+    if !status.success() {
+        return Err(format!("{}: fd_read source build failed", case.display()));
+    }
+    let executable = artifact_executable(temporary, case)?;
+    let writes = run_fd_read_host(&executable, &read_assertion, case)?;
+    assert_stream(assertion, "stdout", &writes, case)
+}
+
+fn run_fd_read_host(
+    executable: &Path,
+    read_assertion: &FdReadAssertion,
+    case: &Path,
+) -> Result<Vec<u8>, String> {
+    let engine = Engine::default();
+    let module = Module::from_file(&engine, executable).map_err(|error| error.to_string())?;
+    let mut linker = Linker::new(&engine);
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| &mut state.wasi)
+        .map_err(|error| error.to_string())?;
+    linker.allow_shadowing(true);
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_read",
+            controlled_fd_read,
+        )
+        .map_err(|error| error.to_string())?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_write",
+            recording_fd_write,
+        )
+        .map_err(|error| error.to_string())?;
+    let wasi = WasiCtx::builder().build_p1();
+    let mut store = Store::new(
+        &engine,
+        HostState {
+            wasi,
+            writes: Vec::new(),
+            reads: Vec::new(),
+            read_bytes: read_assertion.bytes.clone(),
+            read_errno: read_assertion.errno,
+            read_capacity: read_assertion.capacity,
+        },
+    );
+    let instance = linker.instantiate(&mut store, &module).map_err(|error| {
+        format!(
+            "{}: controlled fd_read instantiation failed: {error}",
+            case.display()
+        )
+    })?;
+    instance
+        .get_typed_func::<(), ()>(&mut store, "_start")
+        .map_err(|error| format!("{}: _start export is missing: {error}", case.display()))?
+        .call(&mut store, ())
+        .map_err(|error| format!("{}: _start failed: {error:?}", case.display()))?;
+    assert_fd_read_result(&store.data().reads, read_assertion, case)?;
+    Ok(store
+        .data()
+        .writes
+        .iter()
+        .filter(|write| write.descriptor == 1)
+        .flat_map(|write| write.text.bytes())
+        .collect())
+}
+
+fn controlled_fd_read(
+    mut caller: Caller<'_, HostState>,
+    descriptor: i32,
+    iovs: i32,
+    iovs_len: i32,
+    nread: i32,
+) -> Result<i32, wasmtime::Error> {
+    if descriptor != 0 {
+        return Err(wasmtime::Error::msg(format!(
+            "fd_read expected descriptor 0, observed {descriptor}"
+        )));
+    }
+    if iovs_len != 1 {
+        return Err(wasmtime::Error::msg(format!(
+            "fd_read expected one iovec, observed {iovs_len}"
+        )));
+    }
+    let memory = caller
+        .get_export("memory")
+        .and_then(|export| export.into_memory())
+        .ok_or_else(|| wasmtime::Error::msg("fd_read guest memory is missing"))?;
+    let iovec = read_guest_memory(&memory, &mut caller, iovs as u32, 8)?;
+    let data = u32::from_le_bytes(iovec[..4].try_into().expect("iovec address"));
+    let capacity = u32::from_le_bytes(iovec[4..].try_into().expect("iovec length"));
+    if capacity != caller.data().read_capacity {
+        return Err(wasmtime::Error::msg(format!(
+            "fd_read expected capacity {}, observed {capacity}",
+            caller.data().read_capacity
+        )));
+    }
+    let errno = caller.data().read_errno;
+    let bytes = if errno == 0 && caller.data().reads.is_empty() {
+        caller.data().read_bytes.clone()
+    } else {
+        Vec::new()
+    };
+    if bytes.len() > capacity as usize {
+        return Err(wasmtime::Error::msg("fd_read bytes exceed guest capacity"));
+    }
+    let reported = if errno == 0 { bytes.len() as u32 } else { 0 };
+    if errno == 0 {
+        memory
+            .write(&mut caller, data as usize, &bytes)
+            .map_err(|error| wasmtime::Error::msg(format!("fd_read data write failed: {error}")))?;
+    }
+    memory
+        .write(&mut caller, nread as usize, &reported.to_le_bytes())
+        .map_err(|error| wasmtime::Error::msg(format!("fd_read nread write failed: {error}")))?;
+    caller.data_mut().reads.push(ReadRecord {
+        descriptor,
+        capacity,
+        bytes,
+        reported,
+        errno,
+    });
+    Ok(errno)
+}
+
+fn recording_fd_write(
+    mut caller: Caller<'_, HostState>,
+    descriptor: i32,
+    iovs: i32,
+    iovs_len: i32,
+    nwritten: i32,
+) -> Result<i32, wasmtime::Error> {
+    if iovs_len != 1 {
+        return Err(wasmtime::Error::msg(format!(
+            "fd_write expected one iovec, observed {iovs_len}"
+        )));
+    }
+    let memory = caller
+        .get_export("memory")
+        .and_then(|export| export.into_memory())
+        .ok_or_else(|| wasmtime::Error::msg("fd_write guest memory is missing"))?;
+    let iovec = read_guest_memory(&memory, &mut caller, iovs as u32, 8)?;
+    let data = u32::from_le_bytes(iovec[..4].try_into().expect("iovec address"));
+    let length = u32::from_le_bytes(iovec[4..].try_into().expect("iovec length"));
+    let bytes = read_guest_memory(&memory, &mut caller, data, length as usize)?;
+    memory
+        .write(&mut caller, nwritten as usize, &length.to_le_bytes())
+        .map_err(|error| {
+            wasmtime::Error::msg(format!("fd_write nwritten write failed: {error}"))
+        })?;
+    caller.data_mut().writes.push(WriteRecord {
+        descriptor,
+        text: String::from_utf8(bytes)
+            .map_err(|error| wasmtime::Error::msg(format!("fd_write text is not UTF-8: {error}")))?,
+        reported: length,
+    });
+    Ok(0)
+}
+
+fn assert_fd_read_result(
+    reads: &[ReadRecord],
+    read_assertion: &FdReadAssertion,
+    case: &Path,
+) -> Result<(), String> {
+    if reads.len() != read_assertion.calls {
+        return Err(format!(
+            "{}: fd_read call count expected {}, observed {}",
+            case.display(),
+            read_assertion.calls,
+            reads.len()
+        ));
+    }
+    for (index, read) in reads.iter().enumerate() {
+        let expected_bytes: &[u8] = if index == 0 && read_assertion.errno == 0 {
+            read_assertion.bytes.as_slice()
+        } else {
+            &[]
+        };
+        let expected_reported = expected_bytes.len() as u32;
+        if read.descriptor != 0
+            || read.capacity != read_assertion.capacity
+            || read.bytes != expected_bytes
+            || read.reported != expected_reported
+            || read.errno != read_assertion.errno
+        {
+            return Err(format!(
+                "{}: fd_read record {index} has unexpected descriptor, capacity, bytes, reported count, or errno",
+                case.display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -453,6 +740,10 @@ fn run_partial_fd_write_host(
         HostState {
             wasi,
             writes: Vec::new(),
+            reads: Vec::new(),
+            read_bytes: Vec::new(),
+            read_errno: 0,
+            read_capacity: 0,
         },
     );
     let instance = linker.instantiate(&mut store, &module).map_err(|error| {
