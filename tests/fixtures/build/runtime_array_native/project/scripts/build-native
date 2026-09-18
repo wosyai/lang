@@ -2,8 +2,8 @@
 import subprocess
 import sys
 
-partition, output_dir, manifest = sys.argv[1:]
+partition, output_dir, manifest, runtime = sys.argv[1:]
 subprocess.run(
-    ["clang", "-x", "ir", partition, "runtime/native64.ll", "-o", output_dir + "/main"],
+    ["clang", "-x", "ir", partition, runtime, "-o", output_dir + "/main"],
     check=True,
 )

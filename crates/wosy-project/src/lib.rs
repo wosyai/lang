@@ -384,6 +384,7 @@ pub struct RunnerConfig {
 pub struct ArtifactProfile {
     pub backend: String,
     pub output: String,
+    pub runtime: String,
     pub builder: String,
     pub run_runner: String,
 }
@@ -395,6 +396,16 @@ pub struct TargetLayout {
 }
 
 impl ArtifactProfile {
+    pub fn core_runtime(&self) -> Result<&str, String> {
+        match (self.backend.as_str(), self.output.as_str(), self.runtime.as_str()) {
+            ("llvm", "native", "native64") => Ok("native64"),
+            ("llvm", "wasm-wasip1" | "wasm-wasip2", "wasm32") => Ok("wasm32"),
+            (backend, output, runtime) => Err(format!(
+                "core runtime {runtime} is unsupported for artifact profile backend {backend} with output {output}"
+            )),
+        }
+    }
+
     pub fn target_layout(&self) -> Result<TargetLayout, String> {
         match (self.backend.as_str(), self.output.as_str()) {
             ("llvm", "wasm-wasip1" | "wasm-wasip2") => Ok(TargetLayout {
@@ -860,6 +871,7 @@ fn parse_artifacts(
                 ArtifactProfile {
                     backend: scalar_string(profile, "backend")?,
                     output: scalar_string(profile, "output")?,
+                    runtime: scalar_string(profile, "runtime")?,
                     builder: scalar_string(profile, "builder")?,
                     run_runner: scalar_string(profile, "run_runner")?,
                 },
@@ -1190,6 +1202,7 @@ mod tests {
             [artifacts.main.profiles.dev]
             backend = "llvm"
             output = "wasm-wasip1"
+            runtime = "wasm32"
             builder = "llvm-wasm"
             run_runner = "wasmtime-wasip1"
         "#
@@ -1204,6 +1217,8 @@ mod tests {
         let profile = artifact.profiles.get("dev").expect("dev profile");
 
         assert_eq!(profile.output, "wasm-wasip1");
+        assert_eq!(profile.runtime, "wasm32");
+        assert_eq!(profile.core_runtime(), Ok("wasm32"));
         assert_eq!(profile.builder, "llvm-wasm");
         assert_eq!(profile.run_runner, "wasmtime-wasip1");
     }
@@ -1214,6 +1229,7 @@ mod tests {
             let profile = ArtifactProfile {
                 backend: "llvm".to_owned(),
                 output: output.to_owned(),
+                runtime: "wasm32".to_owned(),
                 builder: "builder".to_owned(),
                 run_runner: "runner".to_owned(),
             };
@@ -1228,6 +1244,7 @@ mod tests {
         let native = ArtifactProfile {
             backend: "llvm".to_owned(),
             output: "native".to_owned(),
+            runtime: "native64".to_owned(),
             builder: "builder".to_owned(),
             run_runner: "runner".to_owned(),
         };
@@ -1241,12 +1258,20 @@ mod tests {
         let unsupported = ArtifactProfile {
             backend: "other".to_owned(),
             output: "custom".to_owned(),
+            runtime: "custom".to_owned(),
             builder: "builder".to_owned(),
             run_runner: "runner".to_owned(),
         };
         assert_eq!(
             unsupported.target_layout(),
             Err("unsupported artifact profile backend other with output custom".to_owned())
+        );
+        assert_eq!(
+            unsupported.core_runtime(),
+            Err(
+                "core runtime custom is unsupported for artifact profile backend other with output custom"
+                    .to_owned()
+            )
         );
     }
 

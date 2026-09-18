@@ -170,8 +170,16 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
             .and_then(Item::as_value)
             .and_then(|value| value.as_integer())
             .ok_or_else(|| "step exit must be an integer".to_owned())?;
-        let status = Command::new(&binary)
-            .args(command.iter().skip(1))
+        let mut process = if command[0] == "wosy" {
+            let mut process = Command::new(&binary);
+            process.args(command.iter().skip(1));
+            process
+        } else {
+            let mut process = Command::new(&command[0]);
+            process.args(command.iter().skip(1));
+            process
+        };
+        let status = process
             .current_dir(&temporary)
             .status()
             .map_err(|error| error.to_string())?;

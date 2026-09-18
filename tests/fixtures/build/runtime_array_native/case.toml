@@ -2,6 +2,10 @@
 command = ["wosy", "build", "app"]
 exit = 0
 
+[[steps]]
+command = ["python", "scripts/allocator-evidence"]
+exit = 0
+
 [[assert]]
 command = ["wosy", "run", "app"]
 exit = 0

@@ -2,7 +2,7 @@
 import subprocess
 import sys
 
-partition, output_dir, manifest = sys.argv[1:]
+partition, output_dir, manifest, runtime = sys.argv[1:]
 object_path = output_dir + "/main.o"
 wrapper_object_path = output_dir + "/start.o"
 runtime_object_path = output_dir + "/runtime.o"
@@ -15,7 +15,7 @@ subprocess.run(
     check=True,
 )
 subprocess.run(
-    ["clang", "--target=wasm32-wasi", "-c", "-x", "ir", "runtime/wasm32.ll", "-o", runtime_object_path],
+    ["clang", "--target=wasm32-wasi", "-c", "-x", "ir", runtime, "-o", runtime_object_path],
     check=True,
 )
 subprocess.run(

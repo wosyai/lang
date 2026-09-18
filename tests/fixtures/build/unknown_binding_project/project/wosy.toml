@@ -23,6 +23,7 @@ artifact = "Main"
 [targets.app.artifacts.main.profiles.dev]
 backend = "llvm"
 output = "native"
+runtime = "native64"
 builder = "native"
 run_runner = "native"
 

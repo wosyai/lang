@@ -143,6 +143,9 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
     let partition_path = output_dir.join("partition.ll");
     fs::write(&partition_path, &llvm).map_err(|error| error.to_string())?;
+    let runtime_path = output_dir.join("runtime.ll");
+    let runtime = wosy_compiler::core_runtime(artifact_profile.core_runtime()?)?;
+    fs::write(&runtime_path, runtime).map_err(|error| error.to_string())?;
     let identity = artifact_identity(
         &root,
         &configuration,
@@ -174,6 +177,7 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
             partition_path.to_string_lossy().as_ref(),
             output_dir.to_string_lossy().as_ref(),
             pending_manifest.to_string_lossy().as_ref(),
+            runtime_path.to_string_lossy().as_ref(),
         ],
     )?;
     publish_artifact(&output_dir, executable, identity, source_observations)?;

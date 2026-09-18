@@ -24,6 +24,14 @@ mod llvm;
 
 pub const COMPILER_IDENTITY: &str = concat!("wosy-compiler-", env!("CARGO_PKG_VERSION"));
 
+pub fn core_runtime(target: &str) -> Result<&'static str, String> {
+    match target {
+        "native64" => Ok(include_str!("../runtime/native64.ll")),
+        "wasm32" => Ok(include_str!("../runtime/wasm32.ll")),
+        target => Err(format!("core runtime {target} is unsupported")),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DiagnosticSeverity {
     Error,

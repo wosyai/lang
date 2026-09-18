@@ -18,6 +18,7 @@ artifact = "Parse"
 [targets.app.artifacts.main.profiles.dev]
 backend = "parse"
 output = "none"
+runtime = "none"
 builder = "none"
 run_runner = "none"
 

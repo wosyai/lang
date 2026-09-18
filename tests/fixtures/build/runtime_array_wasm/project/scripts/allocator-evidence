@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+import subprocess
+import sys
+
+runtime = ".wosy/artifacts/app/dev/main/runtime.ll"
+evidence = """target triple = \"wasm32-wasi\"
+declare ptr @__wosy_core_alloc(i64, i64)
+declare void @__wosy_core_free(ptr)
+declare void @proc_exit(i32) #0
+attributes #0 = { \"wasm-import-module\"=\"wasi_snapshot_preview1\" \"wasm-import-name\"=\"proc_exit\" }
+define void @_start() {
+entry:
+  %pointer = call ptr @__wosy_core_alloc(i64 1, i64 64)
+  %allocated = icmp ne ptr %pointer, null
+  br i1 %allocated, label %alignment, label %failed
+alignment:
+  %address = ptrtoint ptr %pointer to i32
+  %mask = and i32 %address, 63
+  %is_aligned = icmp eq i32 %mask, 0
+  br i1 %is_aligned, label %release, label %failed
+release:
+  call void @__wosy_core_free(ptr %pointer)
+  %reused = call ptr @__wosy_core_alloc(i64 1, i64 64)
+  %is_reused = icmp eq ptr %pointer, %reused
+  br i1 %is_reused, label %overflow, label %failed
+overflow:
+  %overflow_pointer = call ptr @__wosy_core_alloc(i64 -1, i64 64)
+  %overflow_failed = icmp eq ptr %overflow_pointer, null
+  br i1 %overflow_failed, label %complete, label %failed
+complete:
+  call void @__wosy_core_free(ptr %reused)
+  ret void
+failed:
+  call void @proc_exit(i32 17)
+  unreachable
+}
+"""
+with open("allocator-evidence.ll", "w", encoding="utf-8") as file:
+    file.write(evidence)
+subprocess.run(["clang", "--target=wasm32-wasi", "-c", "-x", "ir", "allocator-evidence.ll", "-o", "allocator-evidence.o"], check=True)
+subprocess.run(["clang", "--target=wasm32-wasi", "-c", "-x", "ir", runtime, "-o", "allocator-runtime.o"], check=True)
+subprocess.run(["wasm-ld", "--no-entry", "--allow-undefined", "--export=_start", "allocator-evidence.o", "allocator-runtime.o", "-o", "allocator-evidence.wasm"], check=True)
+subprocess.run(["wasmtime", "run", "allocator-evidence.wasm"], check=True)
+with open("allocator-panic.ll", "w", encoding="utf-8") as file:
+    file.write("target triple = \"wasm32-wasi\"\ndeclare void @__wosy_core_system_panic()\ndefine void @_start() { entry: call void @__wosy_core_system_panic() unreachable }\n")
+subprocess.run(["clang", "--target=wasm32-wasi", "-c", "-x", "ir", "allocator-panic.ll", "-o", "allocator-panic.o"], check=True)
+subprocess.run(["wasm-ld", "--no-entry", "--allow-undefined", "--export=_start", "allocator-panic.o", "allocator-runtime.o", "-o", "allocator-panic.wasm"], check=True)
+panic = subprocess.run(["wasmtime", "run", "allocator-panic.wasm"])
+sys.exit(0 if panic.returncode == 1 else 1)
