@@ -2419,10 +2419,14 @@ fn initialize_project_module<'ctx, 'module>(
 
     let values = state.values.clone();
     let storage = state.storage.clone();
+    let runtime_array_owners = state.runtime_array_owners.clone();
+    let runtime_array_allocations = state.runtime_array_allocations.clone();
     let current_module_globals = module_globals(module, globals);
     let current_globals = std::mem::replace(&mut state.globals, current_module_globals);
     state.values.clear();
     state.storage.clear();
+    state.runtime_array_owners.clear();
+    state.runtime_array_allocations.clear();
     insert_unit_values(&mut state.values, &module.items);
 
     for item in &module.items {
@@ -2480,8 +2484,31 @@ fn initialize_project_module<'ctx, 'module>(
     state.globals = current_globals;
     state.values = values;
     let mut retained_storage = storage;
-    retained_storage.extend(std::mem::take(&mut state.storage));
+    retained_storage.extend(
+        std::mem::take(&mut state.storage)
+            .into_iter()
+            .map(|(name, storage)| (project_runtime_array_name(&module.source, &name), storage)),
+    );
     state.storage = retained_storage;
+    let mut retained_owners = runtime_array_owners;
+    retained_owners.extend(
+        std::mem::take(&mut state.runtime_array_owners)
+            .into_iter()
+            .map(|(name, owner)| (project_runtime_array_name(&module.source, &name), owner)),
+    );
+    state.runtime_array_owners = retained_owners;
+    let mut retained_allocations = runtime_array_allocations;
+    retained_allocations.extend(
+        std::mem::take(&mut state.runtime_array_allocations)
+            .into_iter()
+            .map(|(name, allocation)| {
+                (
+                    project_runtime_array_name(&module.source, &name),
+                    allocation,
+                )
+            }),
+    );
+    state.runtime_array_allocations = retained_allocations;
     Ok(())
 }
 
@@ -5394,6 +5421,10 @@ fn project_global_name(source: &wosy_syntax::SourceIdentity, name: &str) -> Stri
     project_function_name(source, &format!("global_{name}"))
 }
 
+fn project_runtime_array_name(source: &wosy_syntax::SourceIdentity, name: &str) -> String {
+    project_global_name(source, name)
+}
+
 fn project_namespace_target<'a>(
     module: &'a ScalarModule,
     modules: &'a [&ScalarModule],
@@ -7261,6 +7292,95 @@ count, complete = read_into(buffer, requested_capacity);
         );
         assert!(child_store.expect("child initialization") < read_call.expect("read call"));
         assert!(read_call.expect("read call") < observed_store.expect("observed store"));
+    }
+
+    #[test]
+    fn releases_same_named_top_level_runtime_arrays_per_project_module() {
+        let first_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/first.w".into(),
+            "r1".into(),
+        );
+        let second_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/second.w".into(),
+            "r1".into(),
+        );
+        let module_text = "%%start\nu64 length = 1;\nu8[length] bytes;\nbytes[0] = 7;\nu8() read = fn { bytes[0] };\n%%end";
+        let first = derive_scalar_program(
+            &parse_source(first_source.clone(), module_text.into(), &[]).result,
+        )
+        .program;
+        let second = derive_scalar_program(
+            &parse_source(second_source.clone(), module_text.into(), &[]).result,
+        )
+        .program;
+        let root_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let root = derive_scalar_program(
+            &parse_source(
+                root_source.clone(),
+                "%%start\nfirst = namespace package \"src/first.w\";\nsecond = namespace package \"src/second.w\";\nu8 first_value = first.read();\nu8 second_value = second.read();\nif (first_value != second_value) { core.system_panic(); };\n%%end".into(),
+                &[],
+            )
+            .result,
+        )
+        .program;
+        let namespace_bindings = root
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::ScalarItem::Namespace(namespace) => Some(crate::ScalarNamespaceBinding {
+                    binding: namespace.binding.clone(),
+                    target: match namespace.binding.as_str() {
+                        "first" => first_source.clone(),
+                        "second" => second_source.clone(),
+                        binding => panic!("unexpected namespace binding {binding}"),
+                    },
+                    span: namespace.span,
+                }),
+                _ => None,
+            })
+            .collect();
+        let project = ScalarProject::new(
+            vec![
+                ScalarModule::new(root_source.clone(), root.items, namespace_bindings),
+                ScalarModule::new(first_source.clone(), first.items, Vec::new()),
+                ScalarModule::new(second_source.clone(), second.items, Vec::new()),
+            ],
+            vec![root_source, first_source, second_source],
+        );
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let mut project = project.clone();
+            for module in &mut project.modules {
+                module.target_layout = layout;
+            }
+            let validation = validate_scalar_project(project);
+            assert!(
+                validation.diagnostics.is_empty(),
+                "{:?}",
+                validation.diagnostics
+            );
+            let text = emit_scalar_project_llvm(&validation)
+                .expect("project runtime-array LLVM")
+                .to_text();
+            assert_eq!(
+                text.matches("call ptr @__wosy_core_alloc").count(),
+                2,
+                "{text}"
+            );
+            assert_eq!(
+                text.matches("call void @__wosy_core_free").count(),
+                2,
+                "{text}"
+            );
+        }
     }
 
     #[test]
