@@ -6993,6 +6993,49 @@ count, complete = read_into(buffer, requested_capacity);
     }
 
     #[test]
+    fn emits_nested_conditional_multi_outputs_in_aggregate_order() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let validation = derive_scalar_program(
+            &parse_source(
+                source,
+                "%%start\n(i32, bool)() pair = fn { if (true) { if (true) { 1, true } else { 2, false } } else { 3, true } };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+
+        let text = emit_scalar_llvm(&validation)
+            .expect("nested conditional LLVM")
+            .to_text();
+        let pair = text
+            .split("define { i32, i1 } @pair")
+            .nth(1)
+            .expect("pair function");
+        let insertions = pair
+            .match_indices("insertvalue { i32, i1 }")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+
+        assert_eq!(insertions.len(), 2, "{pair}");
+        assert!(
+            pair[insertions[0]..insertions[1]].contains(", i32 "),
+            "{pair}"
+        );
+        assert!(pair[insertions[1]..].contains(", i1 "), "{pair}");
+        assert!(pair.contains("ret { i32, i1 }"), "{pair}");
+    }
+
+    #[test]
     fn materializes_multi_output_assignments_before_ordered_writes() {
         let source = SourceIdentity::new(
             "project".into(),

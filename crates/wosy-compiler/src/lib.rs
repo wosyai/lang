@@ -37,7 +37,10 @@ pub fn core_runtime(backend: &str, output: &str) -> Result<&'static str, String>
 
 #[cfg(test)]
 mod tests {
-    use super::{core_runtime, parse_source};
+    use super::{
+        core_runtime, derive_scalar_program, emit_scalar_project_llvm, parse_source,
+        validate_scalar_project, ScalarModule, ScalarProject,
+    };
     use wosy_syntax::{ByteSpan, SourceIdentity};
 
     #[test]
@@ -81,6 +84,58 @@ mod tests {
             output.diagnostics[0].labels[0].span.range,
             ByteSpan::new(semicolon, semicolon + 1)
         );
+    }
+
+    #[test]
+    fn validates_ordinary_read_line_source_in_scalar() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/bootstrap.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nstruct utf8 { *?u8 data; u64 length; }\nenum ReadLineStatus { line; eof; }\n(*?utf8, ReadLineStatus)(u64) read_line = fn(max_bytes) {\n\tu8[max_bytes] bytes;\n\tbool reading = true;\n\tReadLineStatus status = ReadLineStatus::line;\n\twhile (reading) {\n\t\tif (reading) { bytes[0] = 13; reading = false; } else { status = ReadLineStatus::eof; };\n\t}\n\tnull, status\n};\n%%end";
+        let output = parse_source(source, text.into(), &[]);
+
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let scalar = derive_scalar_program(&output.result);
+        assert!(scalar.diagnostics.is_empty(), "{:?}", scalar.diagnostics);
+    }
+    #[test]
+    fn lowers_a_valid_read_line_loop_shape() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/bootstrap.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start
+struct utf8 { *?u8 data; u64 length; }
+enum ReadLineStatus { line; eof; }
+(*?utf8, ReadLineStatus)(u64) read_line = fn(max_bytes) {
+	u8[max_bytes] bytes;
+	bool reading = true;
+	ReadLineStatus status = ReadLineStatus::line;
+	while (reading) {
+		if (reading) { bytes[0] = 13; reading = false; } else { status = ReadLineStatus::eof; };
+	}
+	null, status
+};
+%%end";
+        let output = parse_source(source.clone(), text.into(), &[]);
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let scalar = derive_scalar_program(&output.result);
+        assert!(scalar.diagnostics.is_empty(), "{:?}", scalar.diagnostics);
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(scalar.program, Vec::new())],
+            vec![source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        emit_scalar_project_llvm(&validation).expect("read_line loop project LLVM");
     }
 }
 

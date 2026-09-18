@@ -8304,13 +8304,15 @@ fn expand_conditional_final_outputs(block: &mut ScalarBlock, output_count: usize
     else {
         return;
     };
+    let mut then_branch = then_branch.clone();
+    let mut else_branch = else_branch.clone();
+    expand_conditional_final_outputs(&mut then_branch, output_count);
+    expand_conditional_final_outputs(&mut else_branch, output_count);
     if then_branch.final_output_values.len() != output_count
         || else_branch.final_output_values.len() != output_count
     {
         return;
     }
-    let then_branch = then_branch.clone();
-    let else_branch = else_branch.clone();
     let condition = condition.clone();
     let conditional_span = span_of(&block.final_output_values[0].value);
     block.final_output_values = (0..output_count)
@@ -9993,6 +9995,19 @@ fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     }
                     if function.body.final_output_values.len() == 1
                         && matches!(
+                            function.body.final_output_values[0].value,
+                            ScalarExpression::If { .. }
+                        )
+                    {
+                        validate_conditional_output_arity(
+                            &function.body,
+                            outputs.outputs.len(),
+                            program,
+                            &mut diagnostics,
+                        );
+                    }
+                    if function.body.final_output_values.len() == 1
+                        && matches!(
                             &function.body.final_output_values[0].value,
                             ScalarExpression::Call { .. }
                         )
@@ -11440,6 +11455,49 @@ fn expression_type(
             unsafe_context,
         ),
     }
+}
+
+fn validate_conditional_output_arity(
+    block: &ScalarBlock,
+    output_count: usize,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    if block.final_output_values.len() == output_count {
+        for output in &block.final_output_values {
+            if let ScalarExpression::If {
+                then_branch,
+                else_branch,
+                ..
+            } = &output.value
+            {
+                validate_conditional_output_arity(then_branch, output_count, program, diagnostics);
+                validate_conditional_output_arity(else_branch, output_count, program, diagnostics);
+            }
+        }
+        return;
+    }
+    if let [output] = block.final_output_values.as_slice() {
+        if let ScalarExpression::If {
+            then_branch,
+            else_branch,
+            ..
+        } = &output.value
+        {
+            validate_conditional_output_arity(then_branch, output_count, program, diagnostics);
+            validate_conditional_output_arity(else_branch, output_count, program, diagnostics);
+            return;
+        }
+    }
+    diagnostics.push(diagnostic(
+        program,
+        "B0004",
+        "function output arity does not match its final output list",
+        block
+            .final_output_values
+            .first()
+            .map_or(block.span, |output| output.span),
+    ));
 }
 
 fn expect_type(
@@ -16453,6 +16511,73 @@ u128 j = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
             &function.body.final_output_values[0].value,
             ScalarExpression::If { .. }
         ));
+    }
+
+    #[test]
+    fn validates_nested_conditional_output_lists_by_position() {
+        let result = validate_text(
+            "%%start\n(i32, bool)() pair = fn { if (true) { if (true) { 1, true } else { 2, false } } else { 3, true } };\n%%end",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn validates_nested_conditional_output_lists_in_a_project() {
+        let source = module_source("src/pair.w");
+        let program = module_from_text(
+            source.clone(),
+            "%%start\n(i32, bool)() pair = fn { if (true) { if (true) { 1, true } else { 2, false } } else { 3, true } };\n%%end",
+        );
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(program, Vec::new())],
+            vec![source],
+        ));
+
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+    }
+
+    #[test]
+    fn reports_nested_conditional_output_type_at_the_inner_branch() {
+        let text = "%%start\n(i32, bool)() pair = fn { if (true) { if (true) { 1, true } else { 2, 3 } } else { 3, true } };\n%%end";
+        let validation = validate_text(text);
+        let diagnostic = validation
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0006")
+            .expect("inner branch type diagnostic");
+        let start = text
+            .find("if (true) { 1, true } else { 2, 3 }")
+            .expect("inner conditional");
+
+        assert_eq!(
+            diagnostic.labels[0].span.range,
+            ByteSpan::new(
+                start as u32,
+                (start + "if (true) { 1, true } else { 2, 3 }".len()) as u32
+            )
+        );
+    }
+
+    #[test]
+    fn reports_nested_conditional_output_arity_at_the_inner_branch() {
+        let text = "%%start\n(i32, bool)() pair = fn { if (true) { if (true) { 1 } else { 2, false } } else { 3, true } };\n%%end";
+        let validation = validate_text(text);
+        let diagnostic = validation
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0004")
+            .expect("inner branch arity diagnostic");
+        let start = text.find("{ 1 }").expect("inner branch") + 2;
+
+        assert_eq!(
+            diagnostic.labels[0].span.range,
+            ByteSpan::new(start as u32, start as u32 + 1)
+        );
     }
 
     #[test]
