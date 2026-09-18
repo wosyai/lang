@@ -5633,6 +5633,42 @@ mod tests {
     }
 
     #[test]
+    fn lowers_nested_project_while_loops_with_runtime_array_operations_and_conditionals() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let scalar = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\ni32(u64) count = fn(length) { u8[length] bytes; i32 outer = 0; while (outer < 1) { i32 index = 0; while (index < 1) { if (index == 0) { bytes[0] = 1; }; index = index + 1; } outer = outer + 1; } outer };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(scalar.diagnostics.is_empty(), "{:?}", scalar.diagnostics);
+        let program = scalar.program;
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+
+        let llvm = emit_scalar_project_llvm(&validation)
+            .expect("project loop LLVM")
+            .to_text();
+        assert!(llvm.contains("while.cond.0:"), "{llvm}");
+        assert!(llvm.contains("while.cond.3:"), "{llvm}");
+        assert!(llvm.contains("getelementptr inbounds i8"), "{llvm}");
+    }
+
+    #[test]
     fn emits_recursive_fixed_array_index_reads_and_addresses_for_both_targets() {
         let source = SourceIdentity::new(
             "project".into(),
