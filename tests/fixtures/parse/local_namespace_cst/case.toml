@@ -11,5 +11,5 @@ stdout = "expected/namespace.json"
 [[assert]]
 command = ["python", "-c", "import sys; sys.stdout.buffer.write(open('.wosy/cst/current.json', 'rb').read())"]
 exit = 0
-select = ["/root/children/0/children/4/children/0/children/3/children/0/children/0/children/0/children/0/children/0/children/0/children/0/children/0/children/0"]
+select = ["/root/children/0/children/4/children/0/children/3/children/0/children/0/children/0/children/0"]
 stdout = "expected/qualified.json"
