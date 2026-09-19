@@ -465,8 +465,439 @@ bool(u128, bool) _parse_check_i128 = fn(magnitude, negative) {
 	result
 };
 
+*u16(utf8) _parse_u16 = fn(text) {
+	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
+	u64 two = core.int_extend<u64>(2);
+	u8 radix = 10;
+	u64 start = zero;
+	u16 out = 0;
+	*u16 result = null;
+	if (text.data == null || text.length == zero) {
+		result = null;
+	} else {
+		u128 wide_zero = core.int_extend<u128>(zero);
+		i64 position_zero = core.int_trunc<i64>(wide_zero);
+		u8 first = 0;
+		unsafe { first = core.load<u8>(core.offset<u8>(text.data, position_zero)); };
+		if (text.length >= two) {
+			u128 wide_one = core.int_extend<u128>(one);
+			i64 position_one = core.int_trunc<i64>(wide_one);
+			u8 second = 0;
+			unsafe { second = core.load<u8>(core.offset<u8>(text.data, position_one)); };
+			u8 detected = _parse_radix_from_prefix(first, second);
+			radix = detected;
+			if (detected != 10) { start = two; };
+		};
+		u128 magnitude, bool valid = _parse_accumulate_u128(text.data, start, text.length, radix);
+		bool fits = _parse_check_u16(magnitude);
+		if (valid && fits) {
+			out = core.int_trunc<u16>(magnitude);
+			result = &out;
+		};
+	};
+	result
+};
+
+*u32(utf8) _parse_u32 = fn(text) {
+	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
+	u64 two = core.int_extend<u64>(2);
+	u8 radix = 10;
+	u64 start = zero;
+	u32 out = 0;
+	*u32 result = null;
+	if (text.data == null || text.length == zero) {
+		result = null;
+	} else {
+		u128 wide_zero = core.int_extend<u128>(zero);
+		i64 position_zero = core.int_trunc<i64>(wide_zero);
+		u8 first = 0;
+		unsafe { first = core.load<u8>(core.offset<u8>(text.data, position_zero)); };
+		if (text.length >= two) {
+			u128 wide_one = core.int_extend<u128>(one);
+			i64 position_one = core.int_trunc<i64>(wide_one);
+			u8 second = 0;
+			unsafe { second = core.load<u8>(core.offset<u8>(text.data, position_one)); };
+			u8 detected = _parse_radix_from_prefix(first, second);
+			radix = detected;
+			if (detected != 10) { start = two; };
+		};
+		u128 magnitude, bool valid = _parse_accumulate_u128(text.data, start, text.length, radix);
+		bool fits = _parse_check_u32(magnitude);
+		if (valid && fits) {
+			out = core.int_trunc<u32>(magnitude);
+			result = &out;
+		};
+	};
+	result
+};
+
+*u64(utf8) _parse_u64 = fn(text) {
+	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
+	u64 two = core.int_extend<u64>(2);
+	u8 radix = 10;
+	u64 start = zero;
+	u64 out = zero;
+	*u64 result = null;
+	if (text.data == null || text.length == zero) {
+		result = null;
+	} else {
+		u128 wide_zero = core.int_extend<u128>(zero);
+		i64 position_zero = core.int_trunc<i64>(wide_zero);
+		u8 first = 0;
+		unsafe { first = core.load<u8>(core.offset<u8>(text.data, position_zero)); };
+		if (text.length >= two) {
+			u128 wide_one = core.int_extend<u128>(one);
+			i64 position_one = core.int_trunc<i64>(wide_one);
+			u8 second = 0;
+			unsafe { second = core.load<u8>(core.offset<u8>(text.data, position_one)); };
+			u8 detected = _parse_radix_from_prefix(first, second);
+			radix = detected;
+			if (detected != 10) { start = two; };
+		};
+		u128 magnitude, bool valid = _parse_accumulate_u128(text.data, start, text.length, radix);
+		bool fits = _parse_check_u64(magnitude);
+		if (valid && fits) {
+			out = core.int_trunc<u64>(magnitude);
+			result = &out;
+		};
+	};
+	result
+};
+
+*u128(utf8) _parse_u128 = fn(text) {
+	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
+	u64 two = core.int_extend<u64>(2);
+	u8 radix = 10;
+	u64 start = zero;
+	u128 out = 0;
+	*u128 result = null;
+	if (text.data == null || text.length == zero) {
+		result = null;
+	} else {
+		u128 wide_zero = core.int_extend<u128>(zero);
+		i64 position_zero = core.int_trunc<i64>(wide_zero);
+		u8 first = 0;
+		unsafe { first = core.load<u8>(core.offset<u8>(text.data, position_zero)); };
+		if (text.length >= two) {
+			u128 wide_one = core.int_extend<u128>(one);
+			i64 position_one = core.int_trunc<i64>(wide_one);
+			u8 second = 0;
+			unsafe { second = core.load<u8>(core.offset<u8>(text.data, position_one)); };
+			u8 detected = _parse_radix_from_prefix(first, second);
+			radix = detected;
+			if (detected != 10) { start = two; };
+		};
+		u128 magnitude, bool valid = _parse_accumulate_u128(text.data, start, text.length, radix);
+		bool fits = _parse_check_u128(magnitude);
+		if (valid && fits) {
+			out = magnitude;
+			result = &out;
+		};
+	};
+	result
+};
+
+*i8(utf8) _parse_i8 = fn(text) {
+	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
+	u64 two = core.int_extend<u64>(2);
+	u8 radix = 10;
+	u64 start = zero;
+	bool negative = false;
+	u128 zero_wide = core.int_extend<u128>(zero);
+	i8 out = 0;
+	*i8 result = null;
+	if (text.data == null || text.length == zero) {
+		result = null;
+	} else {
+		u128 wide_zero = core.int_extend<u128>(zero);
+		i64 position_zero = core.int_trunc<i64>(wide_zero);
+		u8 first = 0;
+		unsafe { first = core.load<u8>(core.offset<u8>(text.data, position_zero)); };
+		if (_parse_is_sign(first)) {
+			negative = true;
+			start = one;
+		};
+		u64 rest = text.length - start;
+		if (rest >= two) {
+			u64 next = start + one;
+			u128 wide_start = core.int_extend<u128>(start);
+			i64 position_start = core.int_trunc<i64>(wide_start);
+			u128 wide_next = core.int_extend<u128>(next);
+			i64 position_next = core.int_trunc<i64>(wide_next);
+			u8 prefix_first = 0;
+			unsafe { prefix_first = core.load<u8>(core.offset<u8>(text.data, position_start)); };
+			u8 prefix_second = 0;
+			unsafe { prefix_second = core.load<u8>(core.offset<u8>(text.data, position_next)); };
+			u8 detected = _parse_radix_from_prefix(prefix_first, prefix_second);
+			radix = detected;
+			if (detected != 10) { start = start + two; };
+		};
+		u128 magnitude, bool valid = _parse_accumulate_i128_neg(text.data, start, text.length, radix);
+		bool fits = _parse_check_i8(magnitude, negative);
+		if (valid && fits) {
+			if (negative) {
+				u128 flipped = zero_wide - magnitude;
+				out = core.int_trunc<i8>(flipped);
+			} else {
+				out = core.int_trunc<i8>(magnitude);
+			};
+			result = &out;
+		};
+	};
+	result
+};
+
+*i16(utf8) _parse_i16 = fn(text) {
+	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
+	u64 two = core.int_extend<u64>(2);
+	u8 radix = 10;
+	u64 start = zero;
+	bool negative = false;
+	u128 zero_wide = core.int_extend<u128>(zero);
+	i16 out = 0;
+	*i16 result = null;
+	if (text.data == null || text.length == zero) {
+		result = null;
+	} else {
+		u128 wide_zero = core.int_extend<u128>(zero);
+		i64 position_zero = core.int_trunc<i64>(wide_zero);
+		u8 first = 0;
+		unsafe { first = core.load<u8>(core.offset<u8>(text.data, position_zero)); };
+		if (_parse_is_sign(first)) {
+			negative = true;
+			start = one;
+		};
+		u64 rest = text.length - start;
+		if (rest >= two) {
+			u64 next = start + one;
+			u128 wide_start = core.int_extend<u128>(start);
+			i64 position_start = core.int_trunc<i64>(wide_start);
+			u128 wide_next = core.int_extend<u128>(next);
+			i64 position_next = core.int_trunc<i64>(wide_next);
+			u8 prefix_first = 0;
+			unsafe { prefix_first = core.load<u8>(core.offset<u8>(text.data, position_start)); };
+			u8 prefix_second = 0;
+			unsafe { prefix_second = core.load<u8>(core.offset<u8>(text.data, position_next)); };
+			u8 detected = _parse_radix_from_prefix(prefix_first, prefix_second);
+			radix = detected;
+			if (detected != 10) { start = start + two; };
+		};
+		u128 magnitude, bool valid = _parse_accumulate_i128_neg(text.data, start, text.length, radix);
+		bool fits = _parse_check_i16(magnitude, negative);
+		if (valid && fits) {
+			if (negative) {
+				u128 flipped = zero_wide - magnitude;
+				out = core.int_trunc<i16>(flipped);
+			} else {
+				out = core.int_trunc<i16>(magnitude);
+			};
+			result = &out;
+		};
+	};
+	result
+};
+
+*i32(utf8) _parse_i32 = fn(text) {
+	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
+	u64 two = core.int_extend<u64>(2);
+	u8 radix = 10;
+	u64 start = zero;
+	bool negative = false;
+	u128 zero_wide = core.int_extend<u128>(zero);
+	i32 out = 0;
+	*i32 result = null;
+	if (text.data == null || text.length == zero) {
+		result = null;
+	} else {
+		u128 wide_zero = core.int_extend<u128>(zero);
+		i64 position_zero = core.int_trunc<i64>(wide_zero);
+		u8 first = 0;
+		unsafe { first = core.load<u8>(core.offset<u8>(text.data, position_zero)); };
+		if (_parse_is_sign(first)) {
+			negative = true;
+			start = one;
+		};
+		u64 rest = text.length - start;
+		if (rest >= two) {
+			u64 next = start + one;
+			u128 wide_start = core.int_extend<u128>(start);
+			i64 position_start = core.int_trunc<i64>(wide_start);
+			u128 wide_next = core.int_extend<u128>(next);
+			i64 position_next = core.int_trunc<i64>(wide_next);
+			u8 prefix_first = 0;
+			unsafe { prefix_first = core.load<u8>(core.offset<u8>(text.data, position_start)); };
+			u8 prefix_second = 0;
+			unsafe { prefix_second = core.load<u8>(core.offset<u8>(text.data, position_next)); };
+			u8 detected = _parse_radix_from_prefix(prefix_first, prefix_second);
+			radix = detected;
+			if (detected != 10) { start = start + two; };
+		};
+		u128 magnitude, bool valid = _parse_accumulate_i128_neg(text.data, start, text.length, radix);
+		bool fits = _parse_check_i32(magnitude, negative);
+		if (valid && fits) {
+			if (negative) {
+				u128 flipped = zero_wide - magnitude;
+				out = core.int_trunc<i32>(flipped);
+			} else {
+				out = core.int_trunc<i32>(magnitude);
+			};
+			result = &out;
+		};
+	};
+	result
+};
+
+*i64(utf8) _parse_i64 = fn(text) {
+	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
+	u64 two = core.int_extend<u64>(2);
+	u8 radix = 10;
+	u64 start = zero;
+	bool negative = false;
+	u128 zero_wide = core.int_extend<u128>(zero);
+	i64 out = 0;
+	*i64 result = null;
+	if (text.data == null || text.length == zero) {
+		result = null;
+	} else {
+		u128 wide_zero = core.int_extend<u128>(zero);
+		i64 position_zero = core.int_trunc<i64>(wide_zero);
+		u8 first = 0;
+		unsafe { first = core.load<u8>(core.offset<u8>(text.data, position_zero)); };
+		if (_parse_is_sign(first)) {
+			negative = true;
+			start = one;
+		};
+		u64 rest = text.length - start;
+		if (rest >= two) {
+			u64 next = start + one;
+			u128 wide_start = core.int_extend<u128>(start);
+			i64 position_start = core.int_trunc<i64>(wide_start);
+			u128 wide_next = core.int_extend<u128>(next);
+			i64 position_next = core.int_trunc<i64>(wide_next);
+			u8 prefix_first = 0;
+			unsafe { prefix_first = core.load<u8>(core.offset<u8>(text.data, position_start)); };
+			u8 prefix_second = 0;
+			unsafe { prefix_second = core.load<u8>(core.offset<u8>(text.data, position_next)); };
+			u8 detected = _parse_radix_from_prefix(prefix_first, prefix_second);
+			radix = detected;
+			if (detected != 10) { start = start + two; };
+		};
+		u128 magnitude, bool valid = _parse_accumulate_i128_neg(text.data, start, text.length, radix);
+		bool fits = _parse_check_i64(magnitude, negative);
+		if (valid && fits) {
+			if (negative) {
+				u128 flipped = zero_wide - magnitude;
+				out = core.int_trunc<i64>(flipped);
+			} else {
+				out = core.int_trunc<i64>(magnitude);
+			};
+			result = &out;
+		};
+	};
+	result
+};
+
+*i128(utf8) _parse_i128 = fn(text) {
+	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
+	u64 two = core.int_extend<u64>(2);
+	u8 radix = 10;
+	u64 start = zero;
+	bool negative = false;
+	u128 two64 = 18446744073709551616;
+	i128 two64_signed = 18446744073709551616;
+	i128 zero_signed = core.int_extend<i128>(zero);
+	i128 out = 0;
+	*i128 result = null;
+	if (text.data == null || text.length == zero) {
+		result = null;
+	} else {
+		u128 wide_zero = core.int_extend<u128>(zero);
+		i64 position_zero = core.int_trunc<i64>(wide_zero);
+		u8 first = 0;
+		unsafe { first = core.load<u8>(core.offset<u8>(text.data, position_zero)); };
+		if (_parse_is_sign(first)) {
+			negative = true;
+			start = one;
+		};
+		u64 rest = text.length - start;
+		if (rest >= two) {
+			u64 next = start + one;
+			u128 wide_start = core.int_extend<u128>(start);
+			i64 position_start = core.int_trunc<i64>(wide_start);
+			u128 wide_next = core.int_extend<u128>(next);
+			i64 position_next = core.int_trunc<i64>(wide_next);
+			u8 prefix_first = 0;
+			unsafe { prefix_first = core.load<u8>(core.offset<u8>(text.data, position_start)); };
+			u8 prefix_second = 0;
+			unsafe { prefix_second = core.load<u8>(core.offset<u8>(text.data, position_next)); };
+			u8 detected = _parse_radix_from_prefix(prefix_first, prefix_second);
+			radix = detected;
+			if (detected != 10) { start = start + two; };
+		};
+		u128 magnitude, bool valid = _parse_accumulate_i128_neg(text.data, start, text.length, radix);
+		bool fits = _parse_check_i128(magnitude, negative);
+		if (valid && fits) {
+			u64 lo64 = core.int_trunc<u64>(magnitude);
+			u128 hi_wide = magnitude / two64;
+			u64 hi64 = core.int_trunc<u64>(hi_wide);
+			i128 lo_ext = core.int_extend<i128>(lo64);
+			i128 hi_ext = core.int_extend<i128>(hi64);
+			if (negative) {
+				i128 neg_hi = zero_signed - hi_ext;
+				out = neg_hi * two64_signed - lo_ext;
+			} else {
+				out = hi_ext * two64_signed + lo_ext;
+			};
+			result = &out;
+		};
+	};
+	result
+};
+
+*f32(utf8) _parse_f32 = fn(text) {
+	u64 zero = core.int_extend<u64>(0);
+	*f32 result = null;
+	if (text.data == null || text.length == zero) {
+		result = null;
+	} else {
+		result = null;
+	};
+	result
+};
+
+*f64(utf8) _parse_f64 = fn(text) {
+	u64 zero = core.int_extend<u64>(0);
+	*f64 result = null;
+	if (text.data == null || text.length == zero) {
+		result = null;
+	} else {
+		result = null;
+	};
+	result
+};
+
 parse = overload {
 	*u8(utf8) => fn(text) { _parse_u8(text) };
+	*u16(utf8) => fn(text) { _parse_u16(text) };
+	*u32(utf8) => fn(text) { _parse_u32(text) };
+	*u64(utf8) => fn(text) { _parse_u64(text) };
+	*u128(utf8) => fn(text) { _parse_u128(text) };
+	*i8(utf8) => fn(text) { _parse_i8(text) };
+	*i16(utf8) => fn(text) { _parse_i16(text) };
+	*i32(utf8) => fn(text) { _parse_i32(text) };
+	*i64(utf8) => fn(text) { _parse_i64(text) };
+	*i128(utf8) => fn(text) { _parse_i128(text) };
+	*f32(utf8) => fn(text) { _parse_f32(text) };
+	*f64(utf8) => fn(text) { _parse_f64(text) };
 };
 
 %%end
