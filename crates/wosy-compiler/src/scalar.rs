@@ -4916,6 +4916,218 @@ fn type_core_int_conversion_in_module(
     }
 }
 
+fn float_conversion_destination_matches(operation: &str, destination: &ScalarType) -> bool {
+    match operation {
+        "uint_to_float" | "sint_to_float" => is_float_type(destination),
+        "float_to_sint_trunc" => matches!(
+            destination,
+            ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128
+        ),
+        "float_to_uint_trunc" => matches!(
+            destination,
+            ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::U128
+        ),
+        "float_trunc" => *destination == ScalarType::F32,
+        "float_extend" => *destination == ScalarType::F64,
+        _ => unreachable!(),
+    }
+}
+
+fn float_conversion_source_matches(operation: &str, actual: &ScalarType) -> bool {
+    match operation {
+        "uint_to_float" => matches!(
+            actual,
+            ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::U128
+        ),
+        "sint_to_float" => matches!(
+            actual,
+            ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128
+        ),
+        "float_to_sint_trunc" | "float_to_uint_trunc" | "float_trunc" | "float_extend" => {
+            is_float_type(actual)
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn float_conversion_direction_mismatched(
+    operation: &str,
+    destination: &ScalarType,
+    actual: &ScalarType,
+) -> bool {
+    if !is_float_type(destination) || !is_float_type(actual) {
+        return false;
+    }
+    match operation {
+        "float_trunc" => !(*destination == ScalarType::F32 && *actual == ScalarType::F64),
+        "float_extend" => !(*destination == ScalarType::F64 && *actual == ScalarType::F32),
+        _ => false,
+    }
+}
+
+fn type_core_float_conversion_in_module(
+    operation: &str,
+    type_arguments: &[ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if type_arguments.len() != 1 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            &format!("core.{operation} requires one destination type argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let destination = &type_arguments[0].ty;
+    if !float_conversion_destination_matches(operation, destination) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            &format!("core.{operation} has an invalid destination type"),
+            type_arguments[0].span,
+        ));
+        return ScalarType::Error;
+    }
+    if arguments.len() != 1 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            &format!("core.{operation} requires one value argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let source_context = integer_conversion_source_context(operation, destination, &arguments[0]);
+    let actual = expression_type_in_module_expected(
+        &arguments[0],
+        source_context.as_ref(),
+        scope,
+        visible_names,
+        folded_names,
+        module,
+        modules,
+        diagnostics,
+        unsafe_context,
+    );
+    let source_valid = float_conversion_source_matches(operation, &actual);
+    if !is_error_type(&actual) && !source_valid {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            &format!("core.{operation} requires a compatible source type"),
+            expression_span(&arguments[0]),
+        ));
+    }
+    if float_conversion_direction_mismatched(operation, destination, &actual) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            &format!("core.{operation} requires a destination with the appropriate float width"),
+            type_arguments[0].span,
+        ));
+    }
+    if is_error_type(&actual) || !source_valid {
+        ScalarType::Error
+    } else {
+        destination.clone()
+    }
+}
+
+fn type_core_float_conversion(
+    operation: &str,
+    type_arguments: &[ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if type_arguments.len() != 1 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            &format!("core.{operation} requires one destination type argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let destination = &type_arguments[0].ty;
+    if !float_conversion_destination_matches(operation, destination) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            &format!("core.{operation} has an invalid destination type"),
+            type_arguments[0].span,
+        ));
+        return ScalarType::Error;
+    }
+    if arguments.len() != 1 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            &format!("core.{operation} requires one value argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let source_context = integer_conversion_source_context(operation, destination, &arguments[0]);
+    let actual = match source_context {
+        Some(source) => expression_type_expected(
+            &arguments[0],
+            &source,
+            scope,
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+            unsafe_context,
+        ),
+        None => expression_type(
+            &arguments[0],
+            scope,
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+            unsafe_context,
+        ),
+    };
+    let source_valid = float_conversion_source_matches(operation, &actual);
+    if !is_error_type(&actual) && !source_valid {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            &format!("core.{operation} requires a compatible source type"),
+            expression_span(&arguments[0]),
+        ));
+    }
+    if float_conversion_direction_mismatched(operation, destination, &actual) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            &format!("core.{operation} requires a destination with the appropriate float width"),
+            type_arguments[0].span,
+        ));
+    }
+    if is_error_type(&actual) || !source_valid {
+        ScalarType::Error
+    } else {
+        destination.clone()
+    }
+}
+
 fn type_core_int_conversion(
     operation: &str,
     type_arguments: &[ScalarTypeArgument],
@@ -5273,6 +5485,12 @@ fn integer_conversion_source_context(
     destination: &ScalarType,
     expression: &ScalarExpression,
 ) -> Option<ScalarType> {
+    if matches!(
+        operation,
+        "float_to_sint_trunc" | "float_to_uint_trunc" | "float_trunc" | "float_extend"
+    ) {
+        return float_conversion_source_context(operation, expression);
+    }
     let value = match expression {
         ScalarExpression::Integer { value, .. } => value.clone(),
         ScalarExpression::Unary {
@@ -5300,6 +5518,8 @@ fn integer_conversion_source_context(
             ScalarType::I128,
             ScalarType::U128,
         ],
+        "uint_to_float" => &[ScalarType::U32, ScalarType::U64, ScalarType::U128],
+        "sint_to_float" => &[ScalarType::I32, ScalarType::I64, ScalarType::I128],
         _ => unreachable!(),
     };
     source_types
@@ -5308,17 +5528,71 @@ fn integer_conversion_source_context(
             let Some(source_width) = integer_width(source) else {
                 return false;
             };
-            let Some(destination_width) = integer_width(destination) else {
-                return false;
-            };
             let width_matches = match operation {
-                "int_trunc" => source_width > destination_width,
-                "int_extend" => source_width < destination_width,
+                "int_trunc" | "int_extend" => {
+                    let Some(destination_width) = integer_width(destination) else {
+                        return false;
+                    };
+                    match operation {
+                        "int_trunc" => source_width > destination_width,
+                        "int_extend" => source_width < destination_width,
+                        _ => unreachable!(),
+                    }
+                }
+                "uint_to_float" | "sint_to_float" => true,
                 _ => unreachable!(),
             };
             width_matches && integer_literal_fits_type(&value, source)
         })
         .cloned()
+}
+
+fn float_conversion_source_context(
+    operation: &str,
+    expression: &ScalarExpression,
+) -> Option<ScalarType> {
+    let is_float_literal = match expression {
+        ScalarExpression::Float { .. } => true,
+        ScalarExpression::Unary {
+            operator: UnaryOperator::Negate,
+            operand,
+            ..
+        } => matches!(operand.as_ref(), ScalarExpression::Float { .. }),
+        _ => false,
+    };
+    if !is_float_literal {
+        return None;
+    }
+    match operation {
+        "float_trunc" => Some(ScalarType::F64),
+        "float_extend" => Some(ScalarType::F32),
+        "float_to_sint_trunc" | "float_to_uint_trunc" => {
+            let value = match expression {
+                ScalarExpression::Float { value, .. } => *value,
+                ScalarExpression::Unary {
+                    operator: UnaryOperator::Negate,
+                    operand,
+                    ..
+                } => match operand.as_ref() {
+                    ScalarExpression::Float { value, .. } => -*value,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            [ScalarType::F32, ScalarType::F64]
+                .into_iter()
+                .find(|source| float_literal_fits_type(value, source))
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn float_literal_fits_type(value: f64, ty: &ScalarType) -> bool {
+    match ty {
+        ScalarType::F32 => (value as f32).is_finite(),
+        ScalarType::F64 => value.is_finite(),
+        _ => false,
+    }
 }
 
 fn integer_literal_fits_type(value: &BigInt, ty: &ScalarType) -> bool {
@@ -5774,6 +6048,31 @@ fn expression_type_in_module(
                 && matches!(name.as_str(), "int_trunc" | "int_extend")
             {
                 return type_core_int_conversion_in_module(
+                    name,
+                    type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
+            if receiver.as_deref() == Some("core")
+                && matches!(
+                    name.as_str(),
+                    "uint_to_float"
+                        | "sint_to_float"
+                        | "float_to_sint_trunc"
+                        | "float_to_uint_trunc"
+                        | "float_trunc"
+                        | "float_extend"
+                )
+            {
+                return type_core_float_conversion_in_module(
                     name,
                     type_arguments,
                     arguments,
@@ -7828,6 +8127,10 @@ fn is_integer_type(ty: &ScalarType) -> bool {
             | ScalarType::U64
             | ScalarType::U128
     )
+}
+
+fn is_float_type(ty: &ScalarType) -> bool {
+    matches!(ty, ScalarType::F32 | ScalarType::F64)
 }
 
 fn integer_width(ty: &ScalarType) -> Option<u32> {
@@ -11554,6 +11857,30 @@ fn expression_type(
                     unsafe_context,
                 );
             }
+            if receiver.as_deref() == Some("core")
+                && matches!(
+                    name.as_str(),
+                    "uint_to_float"
+                        | "sint_to_float"
+                        | "float_to_sint_trunc"
+                        | "float_to_uint_trunc"
+                        | "float_trunc"
+                        | "float_extend"
+                )
+            {
+                return type_core_float_conversion(
+                    name,
+                    type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
             if receiver.as_deref() == Some("core") && matches!(name.as_str(), "offset" | "load") {
                 return type_core_raw_memory(
                     name,
@@ -14285,6 +14612,117 @@ bool integer_inversion = !1;
                     .diagnostics
                     .iter()
                     .any(|diagnostic| diagnostic.code == "B0003" || diagnostic.code == "B0004"),
+                "{text}: {:?}",
+                invalid.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn validates_float_conversions_in_single_file_and_project() {
+        let text = "%%start\nu64 uint_source = 42;\ni64 sint_source = 42;\nf64 wide_source = 1.5;\nf32 narrow_source = 1.5;\nf64 from_uint = core.uint_to_float<f64>(uint_source);\nf32 from_sint = core.sint_to_float<f32>(sint_source);\nf64 from_uint_literal = core.uint_to_float<f64>(42);\nf32 from_sint_literal = core.sint_to_float<f32>(-3);\ni32 to_sint = core.float_to_sint_trunc<i32>(wide_source);\nu64 to_uint = core.float_to_uint_trunc<u64>(narrow_source);\ni32 to_sint_literal = core.float_to_sint_trunc<i32>(1.5);\nf32 narrowed = core.float_trunc<f32>(wide_source);\nf32 narrowed_literal = core.float_trunc<f32>(1.5);\nf64 widened = core.float_extend<f64>(narrow_source);\nf64 widened_literal = core.float_extend<f64>(1.5);\n%%end";
+        let single = validate_text(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+
+        for (text, code) in [
+            (
+                "%%start\nu64 source = 1;\nu32 value = core.uint_to_float<u32>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\ni64 source = 1;\nf64 value = core.sint_to_float<i64>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf64 source = 1.5;\nf64 value = core.float_to_sint_trunc<f64>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf32 source = 1.5;\nf32 value = core.float_to_uint_trunc<f32>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf64 source = 1.5;\nu32 value = core.float_trunc<u32>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf32 source = 1.5;\ni32 value = core.float_extend<i32>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\ni64 source = 1;\nf64 value = core.uint_to_float<f64>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nu64 source = 1;\nf32 value = core.sint_to_float<f32>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf64 value = core.uint_to_float<f64>(-1);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\ni64 source = 1;\ni32 value = core.float_to_sint_trunc<i32>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nu64 source = 1;\nf32 value = core.float_trunc<f32>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf32 source = 1.5;\nu32 value = core.float_to_sint_trunc<u32>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf32 source = 1.5;\ni32 value = core.float_to_uint_trunc<i32>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf32 source = 1.5;\nf32 value = core.float_trunc<f32>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf64 source = 1.5;\nf64 value = core.float_extend<f64>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf64 source = 1.5;\nf64 value = core.float_trunc<f64>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf32 source = 1.5;\nf32 value = core.float_extend<f32>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nu64 source = 1;\nf64 value = core.uint_to_float(source);\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\nu64 source = 1;\nf64 value = core.uint_to_float<f64, f32>(source);\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\nu64 source = 1;\nf64 value = core.uint_to_float<f64>();\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\nu64 source = 1;\nf64 value = core.sint_to_float<f64>(source, source);\n%%end",
+                "B0004",
+            ),
+        ] {
+            let invalid = validate_text(text);
+            assert!(
+                invalid
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == code),
                 "{text}: {:?}",
                 invalid.diagnostics
             );

@@ -4005,6 +4005,19 @@ fn emit_expression<'ctx, 'module>(
             {
                 return emit_int_conversion(context, state, name, type_arguments, arguments);
             }
+            if receiver.as_deref() == Some("core")
+                && matches!(
+                    name.as_str(),
+                    "uint_to_float"
+                        | "sint_to_float"
+                        | "float_to_sint_trunc"
+                        | "float_to_uint_trunc"
+                        | "float_trunc"
+                        | "float_extend"
+                )
+            {
+                return emit_float_conversion(context, state, name, type_arguments, arguments);
+            }
             if receiver.as_deref() == Some("core") && name == "offset" {
                 return emit_core_offset(context, state, type_arguments, arguments);
             }
@@ -4175,6 +4188,27 @@ fn emit_project_expression<'ctx, 'module>(
                 && matches!(name.as_str(), "int_trunc" | "int_extend")
             {
                 return emit_int_conversion_project(
+                    context,
+                    state,
+                    name,
+                    type_arguments,
+                    arguments,
+                    module,
+                    modules,
+                );
+            }
+            if receiver.as_deref() == Some("core")
+                && matches!(
+                    name.as_str(),
+                    "uint_to_float"
+                        | "sint_to_float"
+                        | "float_to_sint_trunc"
+                        | "float_to_uint_trunc"
+                        | "float_trunc"
+                        | "float_extend"
+                )
+            {
+                return emit_float_conversion_project(
                     context,
                     state,
                     name,
@@ -4736,6 +4770,178 @@ fn emit_int_conversion_project<'ctx, 'module>(
     Ok(EmitValue::Basic(converted.into()))
 }
 
+fn emit_float_conversion<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    operation: &str,
+    type_arguments: &[crate::scalar::ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+) -> Result<EmitValue<'ctx>, String> {
+    let [type_argument] = type_arguments else {
+        return Err(format!("core.{operation} has invalid type argument arity"));
+    };
+    let [value] = arguments else {
+        return Err(format!("core.{operation} has invalid argument arity"));
+    };
+    let destination = &type_argument.ty;
+    match operation {
+        "uint_to_float" | "sint_to_float" => {
+            let source = integer_conversion_source_type(state, value, None)?;
+            let value = take_basic(emit_typed_expression(context, state, value, &source)?)?
+                .into_int_value();
+            let converted = if is_signed_integer_type(&source) {
+                state.builder.build_signed_int_to_float(
+                    value,
+                    float_type(context, destination)?,
+                    operation,
+                )
+            } else {
+                state.builder.build_unsigned_int_to_float(
+                    value,
+                    float_type(context, destination)?,
+                    operation,
+                )
+            }
+            .map_err(builder_error)?;
+            Ok(EmitValue::Basic(converted.into()))
+        }
+        "float_to_sint_trunc" | "float_to_uint_trunc" => {
+            let source = float_conversion_source_type(state, value, None)?;
+            let value = take_basic(emit_typed_expression(context, state, value, &source)?)?
+                .into_float_value();
+            let converted = if is_signed_integer_type(destination) {
+                state.builder.build_float_to_signed_int(
+                    value,
+                    integer_type(context, destination)?,
+                    operation,
+                )
+            } else {
+                state.builder.build_float_to_unsigned_int(
+                    value,
+                    integer_type(context, destination)?,
+                    operation,
+                )
+            }
+            .map_err(builder_error)?;
+            Ok(EmitValue::Basic(converted.into()))
+        }
+        "float_trunc" => {
+            let source = float_conversion_source_type(state, value, None)?;
+            let value = take_basic(emit_typed_expression(context, state, value, &source)?)?
+                .into_float_value();
+            let converted = state
+                .builder
+                .build_float_trunc(value, float_type(context, destination)?, operation)
+                .map_err(builder_error)?;
+            Ok(EmitValue::Basic(converted.into()))
+        }
+        "float_extend" => {
+            let source = float_conversion_source_type(state, value, None)?;
+            let value = take_basic(emit_typed_expression(context, state, value, &source)?)?
+                .into_float_value();
+            let converted = state
+                .builder
+                .build_float_ext(value, float_type(context, destination)?, operation)
+                .map_err(builder_error)?;
+            Ok(EmitValue::Basic(converted.into()))
+        }
+        _ => Err(format!(
+            "core.{operation} is not a floating-point conversion"
+        )),
+    }
+}
+
+fn emit_float_conversion_project<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    operation: &str,
+    type_arguments: &[crate::scalar::ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    let [type_argument] = type_arguments else {
+        return Err(format!("core.{operation} has invalid type argument arity"));
+    };
+    let [value] = arguments else {
+        return Err(format!("core.{operation} has invalid argument arity"));
+    };
+    let destination = &type_argument.ty;
+    match operation {
+        "uint_to_float" | "sint_to_float" => {
+            let source = integer_conversion_source_type(state, value, Some(module))?;
+            let value = take_basic(emit_project_typed_expression(
+                context, state, value, &source, module, modules,
+            )?)?
+            .into_int_value();
+            let converted = if is_signed_integer_type(&source) {
+                state.builder.build_signed_int_to_float(
+                    value,
+                    float_type(context, destination)?,
+                    operation,
+                )
+            } else {
+                state.builder.build_unsigned_int_to_float(
+                    value,
+                    float_type(context, destination)?,
+                    operation,
+                )
+            }
+            .map_err(builder_error)?;
+            Ok(EmitValue::Basic(converted.into()))
+        }
+        "float_to_sint_trunc" | "float_to_uint_trunc" => {
+            let source = float_conversion_source_type(state, value, Some(module))?;
+            let value = take_basic(emit_project_typed_expression(
+                context, state, value, &source, module, modules,
+            )?)?
+            .into_float_value();
+            let converted = if is_signed_integer_type(destination) {
+                state.builder.build_float_to_signed_int(
+                    value,
+                    integer_type(context, destination)?,
+                    operation,
+                )
+            } else {
+                state.builder.build_float_to_unsigned_int(
+                    value,
+                    integer_type(context, destination)?,
+                    operation,
+                )
+            }
+            .map_err(builder_error)?;
+            Ok(EmitValue::Basic(converted.into()))
+        }
+        "float_trunc" => {
+            let source = float_conversion_source_type(state, value, Some(module))?;
+            let value = take_basic(emit_project_typed_expression(
+                context, state, value, &source, module, modules,
+            )?)?
+            .into_float_value();
+            let converted = state
+                .builder
+                .build_float_trunc(value, float_type(context, destination)?, operation)
+                .map_err(builder_error)?;
+            Ok(EmitValue::Basic(converted.into()))
+        }
+        "float_extend" => {
+            let source = float_conversion_source_type(state, value, Some(module))?;
+            let value = take_basic(emit_project_typed_expression(
+                context, state, value, &source, module, modules,
+            )?)?
+            .into_float_value();
+            let converted = state
+                .builder
+                .build_float_ext(value, float_type(context, destination)?, operation)
+                .map_err(builder_error)?;
+            Ok(EmitValue::Basic(converted.into()))
+        }
+        _ => Err(format!(
+            "core.{operation} is not a floating-point conversion"
+        )),
+    }
+}
+
 fn emit_core_offset<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -4897,6 +5103,21 @@ fn is_signed_integer_type(ty: &ScalarType) -> bool {
     )
 }
 
+fn is_float_type(ty: &ScalarType) -> bool {
+    matches!(ty, ScalarType::F32 | ScalarType::F64)
+}
+
+fn float_type<'ctx>(
+    context: &'ctx Context,
+    ty: &ScalarType,
+) -> Result<inkwell::types::FloatType<'ctx>, String> {
+    match ty {
+        ScalarType::F32 => Ok(context.f32_type()),
+        ScalarType::F64 => Ok(context.f64_type()),
+        _ => Err("expected floating-point type".to_owned()),
+    }
+}
+
 fn integer_conversion_source_type(
     state: &EmitState<'_, '_>,
     expression: &ScalarExpression,
@@ -4935,7 +5156,17 @@ fn integer_conversion_source_type(
             type_arguments,
             ..
         } if receiver.as_deref() == Some("core")
-            && matches!(name.as_str(), "int_trunc" | "int_extend") =>
+            && matches!(
+                name.as_str(),
+                "int_trunc"
+                    | "int_extend"
+                    | "uint_to_float"
+                    | "sint_to_float"
+                    | "float_to_sint_trunc"
+                    | "float_to_uint_trunc"
+                    | "float_trunc"
+                    | "float_extend"
+            ) =>
         {
             type_arguments.first().map(|argument| argument.ty.clone())
         }
@@ -4978,6 +5209,100 @@ fn integer_conversion_source_type(
     };
     ty.filter(|ty| integer_width(ty).is_some())
         .ok_or_else(|| "core integer conversion has an unknown source type".to_owned())
+}
+
+fn float_conversion_source_type(
+    state: &EmitState<'_, '_>,
+    expression: &ScalarExpression,
+    project_module: Option<&ScalarModule>,
+) -> Result<ScalarType, String> {
+    let ty = match expression {
+        ScalarExpression::Name { name, .. } => state
+            .storage
+            .get(name)
+            .map(|(_, ty)| ty.clone())
+            .or_else(|| state.globals.get(name).map(|(_, ty)| ty.clone())),
+        ScalarExpression::Member { receiver, name, .. } => {
+            match struct_member_place(state, receiver, name)? {
+                Some(crate::ScalarPlace::Field {
+                    field: ScalarFieldReference::Resolved(field),
+                    ..
+                }) => structure(state.structs, field.structure.clone())?
+                    .fields
+                    .get(field.index)
+                    .filter(|candidate| candidate.id == field)
+                    .map(|field| field.ty.clone()),
+                Some(_) | None => None,
+            }
+        }
+        ScalarExpression::Dereference { place, .. } => assignment_place_type(state, place),
+        ScalarExpression::Integer { .. } => Some(ScalarType::I32),
+        ScalarExpression::Float { .. } => Some(ScalarType::F64),
+        ScalarExpression::Unary { operand, .. } => {
+            float_conversion_source_type(state, operand, project_module).ok()
+        }
+        ScalarExpression::Binary { left, .. } => {
+            float_conversion_source_type(state, left, project_module).ok()
+        }
+        ScalarExpression::Call {
+            receiver,
+            name,
+            type_arguments,
+            ..
+        } if receiver.as_deref() == Some("core")
+            && matches!(
+                name.as_str(),
+                "int_trunc"
+                    | "int_extend"
+                    | "uint_to_float"
+                    | "sint_to_float"
+                    | "float_to_sint_trunc"
+                    | "float_to_uint_trunc"
+                    | "float_trunc"
+                    | "float_extend"
+            ) =>
+        {
+            type_arguments.first().map(|argument| argument.ty.clone())
+        }
+        ScalarExpression::Call {
+            receiver,
+            name,
+            type_arguments,
+            overload_selection,
+            ..
+        } => {
+            let qualified = receiver.as_ref().map_or_else(
+                || {
+                    project_module.map_or_else(
+                        || name.clone(),
+                        |module| project_function_name(&module.source, name),
+                    )
+                },
+                |receiver| format!("{receiver}.{name}"),
+            );
+            let lookup = overload_selection
+                .as_ref()
+                .map(|selection| selected_overload_lookup_key(&qualified, selection));
+            state
+                .call_targets
+                .get(lookup.as_ref().unwrap_or(&qualified))
+                .or_else(|| {
+                    state
+                        .call_targets
+                        .get(&specialization_lookup_key(&qualified, type_arguments))
+                })
+                .or_else(|| state.call_targets.get(&qualified))
+                .and_then(|target| state.signatures.get(target))
+                .and_then(|signature| match signature {
+                    ScalarType::Callable { outputs, .. } => outputs.outputs.first(),
+                    _ => None,
+                })
+                .map(|output| output.ty.clone())
+        }
+        _ => None,
+    };
+    ty.filter(|ty| integer_width(ty).is_some() || is_float_type(ty))
+        .ok_or_else(|| "core float conversion has an unknown source type".to_owned())
 }
 
 fn emit_call_values<'ctx, 'module>(
@@ -7639,6 +7964,53 @@ count, complete = read_into(buffer, requested_capacity);
         assert!(project.contains("sext i64"), "{project}");
         assert!(project.contains("zext i64"), "{project}");
         assert!(project.contains("trunc i128"), "{project}");
+    }
+
+    #[test]
+    fn emits_float_conversions_for_single_file_and_project() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let program = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\nu64 uint_source = 42;\ni64 sint_source = 42;\nf64 wide_source = 1.5;\nf32 narrow_source = 1.5;\nf64 from_uint = core.uint_to_float<f64>(uint_source);\nf32 from_sint = core.sint_to_float<f32>(sint_source);\nf64 from_uint_literal = core.uint_to_float<f64>(7);\ni32 to_sint = core.float_to_sint_trunc<i32>(wide_source);\nu64 to_uint = core.float_to_uint_trunc<u64>(narrow_source);\nf32 narrowed = core.float_trunc<f32>(wide_source);\nf64 widened = core.float_extend<f64>(narrow_source);\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+        let single = emit_scalar_llvm(&program)
+            .expect("single-file float conversion LLVM")
+            .to_text();
+        assert!(single.contains("uitofp"), "{single}");
+        assert!(single.contains("sitofp"), "{single}");
+        assert!(single.contains("fptosi"), "{single}");
+        assert!(single.contains("fptoui"), "{single}");
+        assert!(single.contains("fptrunc"), "{single}");
+        assert!(single.contains("fpext"), "{single}");
+
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(program.program, Vec::new())],
+            vec![source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let project = emit_scalar_project_llvm(&validation)
+            .expect("project float conversion LLVM")
+            .to_text();
+        assert!(project.contains("uitofp"), "{project}");
+        assert!(project.contains("sitofp"), "{project}");
+        assert!(project.contains("fptosi"), "{project}");
+        assert!(project.contains("fptoui"), "{project}");
+        assert!(project.contains("fptrunc"), "{project}");
+        assert!(project.contains("fpext"), "{project}");
     }
 
     #[test]
