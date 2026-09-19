@@ -31,6 +31,27 @@ struct Packet {
 	u64 length;
 }
 
+struct Pair {
+	u64 first;
+	u64 second;
+}
+
+*Pair() make_pair = fn {
+	Pair local = { .first = 17; .second = 29; };
+	&local
+};
+
+unit() clobber_pair = fn {
+	Pair local = { .first = 41; .second = 43; };
+	u64 observed = local.first;
+	if (observed == 0) { core.system_panic(); };
+};
+
+*Pair() forward_pair = fn {
+	*Pair local = make_pair();
+	local
+};
+
 *Packet() make_packet = fn {
 	u64 length = 1;
 	u8[length] bytes;
@@ -52,6 +73,12 @@ unit() run = fn {
 	u8[] replaced = replace(returned);
 	u8[] alias = relay(replaced);
 	*Packet returned_packet = make_packet();
+	*Pair returned_pair = forward_pair();
+	*?u8 allocation = unsafe { core.alloc(1, 1) };
+	clobber_pair();
+	u64 pair_first = (*returned_pair).first;
+	u64 pair_second = (*returned_pair).second;
+	unsafe { core.free(allocation); };
 	u64 overwrite_length = 1;
 	u8[overwrite_length] overwrite;
 	overwrite[0] = 9;
@@ -69,7 +96,7 @@ unit() run = fn {
 		nested[0] = 6;
 	};
 	u8 expected = 8;
-	if (value != expected || transferred != transferred_expected || widened_value != widened_expected || moved[0] != moved_expected || returned_packet == null || (*returned_packet).data == null || (*returned_packet).length != overwrite_length) {
+	if (value != expected || transferred != transferred_expected || widened_value != widened_expected || moved[0] != moved_expected || returned_packet == null || (*returned_packet).data == null || (*returned_packet).length != overwrite_length || pair_first != 17 || pair_second != 29) {
 		core.system_panic();
 	};
 };

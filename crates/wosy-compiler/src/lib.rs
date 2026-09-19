@@ -18,6 +18,7 @@ pub use scalar::{
     ScalarPlace, ScalarProgram, ScalarProject, ScalarProjectValidation, ScalarStruct,
     ScalarStructField, ScalarStructFieldId, ScalarStructId, ScalarStructLiteral,
     ScalarStructLiteralField, ScalarTargetLayout, ScalarType, ScalarValidation, ScalarWhile,
+    ScalarAllocationIdentity, ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState,
     UnaryOperator,
 };
 

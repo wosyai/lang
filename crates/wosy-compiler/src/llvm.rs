@@ -16,6 +16,7 @@ use inkwell::{FloatPredicate, IntPredicate};
 use serde::{Deserialize, Serialize};
 
 use crate::scalar::{
+    ScalarAllocationIdentity, ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState,
     ScalarBindingOutputOrigin, ScalarFieldReference, ScalarOutputValue, ScalarOverloadSelection,
 };
 use crate::{
@@ -87,6 +88,8 @@ struct EmitState<'ctx, 'module> {
     return_bindings: BTreeMap<String, ScalarExpression>,
     runtime_array_owners: BTreeMap<String, bool>,
     runtime_array_allocations: BTreeMap<String, bool>,
+    automatic_return_result_owners: BTreeMap<String, ScalarAutomaticReturnResult>,
+    automatic_return_result_results: &'ctx BTreeSet<String>,
     globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     all_globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     structs: &'module [ScalarStruct],
@@ -317,6 +320,17 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     for (_, function, name) in specializations.iter().chain(overloads.iter()) {
         insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
     }
+    let automatic_return_result_results = automatic_return_result_functions(
+        validation
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ScalarItem::Function(function) => Some((function.name.as_str(), function)),
+                _ => None,
+            }),
+        &call_targets,
+    );
     for function in validation
         .program
         .items
@@ -337,6 +351,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &call_targets,
             &signatures,
             &runtime_array_results,
+            &automatic_return_result_results,
             &globals,
             function,
             &function.name,
@@ -354,6 +369,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &call_targets,
             &signatures,
             &runtime_array_results,
+            &automatic_return_result_results,
             &globals,
             function,
             name,
@@ -371,6 +387,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &call_targets,
             &signatures,
             &runtime_array_results,
+            &automatic_return_result_results,
             &globals,
             function,
             name,
@@ -387,6 +404,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         &call_targets,
         &signatures,
         &runtime_array_results,
+        &automatic_return_result_results,
         &globals,
         &validation.program.items,
         &module,
@@ -597,6 +615,22 @@ pub fn emit_scalar_project_llvm(
     for (_, function, name) in &project_overloads {
         insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
     }
+    let automatic_return_result_results = automatic_return_result_functions(
+        definitions
+            .iter()
+            .map(|(_, function, name)| (name.as_str(), *function))
+            .chain(
+                project_specializations
+                    .iter()
+                    .map(|(_, function, name)| (name.as_str(), function)),
+            )
+            .chain(
+                project_overloads
+                    .iter()
+                    .map(|(_, function, name)| (name.as_str(), function)),
+            ),
+        &call_targets,
+    );
     for (source_module, function, name) in definitions {
         emit_project_function(
             &context,
@@ -605,6 +639,7 @@ pub fn emit_scalar_project_llvm(
             &call_targets,
             &signatures,
             &runtime_array_results,
+            &automatic_return_result_results,
             function,
             source_module,
             &modules,
@@ -623,6 +658,7 @@ pub fn emit_scalar_project_llvm(
             &call_targets,
             &signatures,
             &runtime_array_results,
+            &automatic_return_result_results,
             function,
             source_module,
             &modules,
@@ -641,6 +677,7 @@ pub fn emit_scalar_project_llvm(
             &call_targets,
             &signatures,
             &runtime_array_results,
+            &automatic_return_result_results,
             function,
             source_module,
             &modules,
@@ -658,6 +695,7 @@ pub fn emit_scalar_project_llvm(
         &call_targets,
         &signatures,
         &runtime_array_results,
+        &automatic_return_result_results,
         &modules,
         &globals,
         &module,
@@ -1760,6 +1798,93 @@ fn store_binding_outputs<'ctx, 'module>(
         store_value(context, state, slot, ty, value)?;
         state.storage.insert(name.clone(), (slot, ty.clone()));
         transition_runtime_array_binding_initialization(state, name, ty, &binding.value);
+        transition_automatic_return_result_binding_initialization(state, name, ty, &binding.value);
+    }
+    Ok(())
+}
+
+fn transition_automatic_return_result_binding_initialization(
+    state: &mut EmitState<'_, '_>,
+    name: &str,
+    ty: &ScalarType,
+    value: &ScalarExpression,
+) {
+    let ScalarType::CheckedReference { inner, .. } = ty else {
+        return;
+    };
+    let ScalarType::Struct(aggregate_type) = inner.as_ref() else {
+        return;
+    };
+    let source = match value {
+        ScalarExpression::Call {
+            receiver, name, ..
+        } => {
+            let lookup = receiver
+                .as_ref()
+                .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"));
+            state
+                .call_targets
+                .get(&lookup)
+                .is_some_and(|target| state.automatic_return_result_results.contains(target))
+        }
+        ScalarExpression::Name { name: source, .. } => state
+            .automatic_return_result_owners
+            .contains_key(source),
+        _ => false,
+    };
+    if source {
+        state.automatic_return_result_owners.insert(
+            name.to_owned(),
+            ScalarAutomaticReturnResult {
+                aggregate_type: aggregate_type.clone(),
+                allocation_identity: ScalarAllocationIdentity {
+                    binding: name.to_owned(),
+                },
+                state: ScalarAutomaticReturnResultState::Live,
+            },
+        );
+        if let ScalarExpression::Name { name: source, .. } = value {
+            state.automatic_return_result_owners.remove(source);
+        }
+    }
+}
+
+fn release_automatic_return_result_owners<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    outer_owners: &BTreeMap<String, ScalarAutomaticReturnResult>,
+) -> Result<(), String> {
+    let owners = state
+        .automatic_return_result_owners
+        .keys()
+        .filter(|name| !outer_owners.contains_key(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in owners {
+        let (slot, ty) = state
+            .storage
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| format!("missing automatic return-result storage for {name}"))?;
+        let pointer = state
+            .builder
+            .build_load(basic_type(context, &ty, state.target_layout)?, slot, "return_result_owner")
+            .map_err(builder_error)?
+            .into_int_value();
+        let pointer = state
+            .builder
+            .build_int_to_ptr(pointer, context.ptr_type(AddressSpace::default()), "return_result_release")
+            .map_err(builder_error)?;
+        declare_core_runtime(context, state.module);
+        let release = state
+            .module
+            .get_function(CORE_FREE_SYMBOL)
+            .ok_or_else(|| "core free runtime declaration is missing".to_owned())?;
+        state
+            .builder
+            .build_call(release, &[pointer.into()], "return_result_release")
+            .map_err(builder_error)?;
+        state.automatic_return_result_owners.remove(&name);
     }
     Ok(())
 }
@@ -1846,6 +1971,81 @@ fn insert_runtime_array_result_provenance(
 ) {
     if let Some(provenance) = function_runtime_array_result_provenance(function) {
         results.insert(name.into(), provenance);
+    }
+}
+
+fn automatic_return_result_functions<'a>(
+    functions: impl IntoIterator<Item = (&'a str, &'a ScalarFunction)>,
+    call_targets: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    let functions = functions.into_iter().collect::<BTreeMap<_, _>>();
+    let mut results = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for (name, function) in &functions {
+            if automatic_return_result_function(function, &results, call_targets)
+                && results.insert((*name).to_owned())
+            {
+                changed = true;
+            }
+        }
+        if !changed {
+            return results;
+        }
+    }
+}
+
+fn automatic_return_result_function(
+    function: &ScalarFunction,
+    results: &BTreeSet<String>,
+    call_targets: &BTreeMap<String, String>,
+) -> bool {
+    let ScalarType::Callable { outputs, .. } = &function.signature else {
+        return false;
+    };
+    let Some(output) = outputs.outputs.first() else {
+        return false;
+    };
+    let ScalarType::CheckedReference { inner, .. } = &output.ty else {
+        return false;
+    };
+    if !matches!(inner.as_ref(), ScalarType::Struct(_)) {
+        return false;
+    }
+    let bindings = return_bindings(&function.body);
+    automatic_return_result_expression(
+        &function.body.final_output_values[0].value,
+        &bindings,
+        results,
+        call_targets,
+        &mut BTreeSet::new(),
+    )
+}
+
+fn automatic_return_result_expression(
+    expression: &ScalarExpression,
+    bindings: &BTreeMap<String, ScalarExpression>,
+    results: &BTreeSet<String>,
+    call_targets: &BTreeMap<String, String>,
+    visited: &mut BTreeSet<String>,
+) -> bool {
+    match expression {
+        ScalarExpression::CheckedAddress { place, .. } => matches!(place, crate::ScalarPlace::Name { name, .. } if bindings.contains_key(name)),
+        ScalarExpression::Name { name, .. } => {
+            visited.insert(name.clone())
+                && bindings.get(name).is_some_and(|value| {
+                    automatic_return_result_expression(value, bindings, results, call_targets, visited)
+                })
+        }
+        ScalarExpression::Call { receiver, name, .. } => {
+            let lookup = receiver
+                .as_ref()
+                .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"));
+            call_targets
+                .get(&lookup)
+                .is_some_and(|target| results.contains(target))
+        }
+        _ => false,
     }
 }
 
@@ -2292,6 +2492,7 @@ fn emit_function<'ctx, 'module>(
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
+    automatic_return_result_results: &'ctx BTreeSet<String>,
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     function: &ScalarFunction,
     name: &str,
@@ -2317,6 +2518,8 @@ fn emit_function<'ctx, 'module>(
         return_bindings: return_bindings(&function.body),
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
+        automatic_return_result_owners: BTreeMap::new(),
+        automatic_return_result_results,
         globals: globals.clone(),
         all_globals: globals.clone(),
         structs,
@@ -2385,7 +2588,13 @@ fn emit_function<'ctx, 'module>(
         }
         _ => emit_block(context, &mut state, &function.body)?,
     };
-    emit_return(&mut state, result, outputs)
+    emit_return(
+        context,
+        &mut state,
+        result,
+        outputs,
+        function.body.final_output_values.first().map(|output| &output.value),
+    )
 }
 
 fn emit_main<'ctx, 'module>(
@@ -2395,6 +2604,7 @@ fn emit_main<'ctx, 'module>(
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
+    automatic_return_result_results: &'ctx BTreeSet<String>,
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     items: &[ScalarItem],
     module: &'module Module<'ctx>,
@@ -2418,6 +2628,8 @@ fn emit_main<'ctx, 'module>(
         return_bindings: BTreeMap::new(),
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
+        automatic_return_result_owners: BTreeMap::new(),
+        automatic_return_result_results,
         globals: globals.clone(),
         all_globals: globals.clone(),
         structs,
@@ -2465,6 +2677,7 @@ fn emit_main<'ctx, 'module>(
         }
     }
     release_scope_runtime_array_owners(context, &mut state, &BTreeMap::new())?;
+    release_automatic_return_result_owners(context, &mut state, &BTreeMap::new())?;
     builder
         .build_return(Some(&context.i32_type().const_zero()))
         .map_err(builder_error)?;
@@ -2478,6 +2691,7 @@ fn emit_project_function<'ctx, 'module>(
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
+    automatic_return_result_results: &'ctx BTreeSet<String>,
     function: &ScalarFunction,
     source_module: &ScalarModule,
     modules: &[&'module ScalarModule],
@@ -2504,6 +2718,8 @@ fn emit_project_function<'ctx, 'module>(
         return_bindings: return_bindings(&function.body),
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
+        automatic_return_result_owners: BTreeMap::new(),
+        automatic_return_result_results,
         globals: module_globals(source_module, globals),
         all_globals: globals.clone(),
         structs,
@@ -2585,7 +2801,13 @@ fn emit_project_function<'ctx, 'module>(
         }
         _ => emit_project_block(context, &mut state, &function.body, source_module, modules)?,
     };
-    emit_return(&mut state, result, outputs)
+    emit_return(
+        context,
+        &mut state,
+        result,
+        outputs,
+        function.body.final_output_values.first().map(|output| &output.value),
+    )
 }
 
 fn emit_project_main<'ctx, 'module>(
@@ -2595,6 +2817,7 @@ fn emit_project_main<'ctx, 'module>(
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
+    automatic_return_result_results: &'ctx BTreeSet<String>,
     modules: &[&ScalarModule],
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     module: &'module Module<'ctx>,
@@ -2618,6 +2841,8 @@ fn emit_project_main<'ctx, 'module>(
         return_bindings: BTreeMap::new(),
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
+        automatic_return_result_owners: BTreeMap::new(),
+        automatic_return_result_results,
         globals: BTreeMap::new(),
         all_globals: globals.clone(),
         structs,
@@ -2630,6 +2855,7 @@ fn emit_project_main<'ctx, 'module>(
         .ok_or_else(|| "project has no reachable modules".to_owned())?;
     initialize_project_module(context, &mut state, root, modules, globals, &mut Vec::new())?;
     release_scope_runtime_array_owners(context, &mut state, &BTreeMap::new())?;
+    release_automatic_return_result_owners(context, &mut state, &BTreeMap::new())?;
     builder
         .build_return(Some(&context.i32_type().const_zero()))
         .map_err(builder_error)?;
@@ -2653,12 +2879,14 @@ fn initialize_project_module<'ctx, 'module>(
     let storage = state.storage.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
     let runtime_array_allocations = state.runtime_array_allocations.clone();
+    let automatic_return_result_owners = state.automatic_return_result_owners.clone();
     let current_module_globals = module_globals(module, globals);
     let current_globals = std::mem::replace(&mut state.globals, current_module_globals);
     state.values.clear();
     state.storage.clear();
     state.runtime_array_owners.clear();
     state.runtime_array_allocations.clear();
+    state.automatic_return_result_owners.clear();
     insert_unit_values(&mut state.values, &module.items);
 
     for item in &module.items {
@@ -2780,6 +3008,9 @@ fn initialize_project_module<'ctx, 'module>(
             }),
     );
     state.runtime_array_allocations = retained_allocations;
+    let mut retained_return_results = automatic_return_result_owners;
+    retained_return_results.extend(std::mem::take(&mut state.automatic_return_result_owners));
+    state.automatic_return_result_owners = retained_return_results;
     Ok(())
 }
 
@@ -2792,6 +3023,7 @@ fn emit_block<'ctx, 'module>(
     let values = state.values.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
     let runtime_array_allocations = state.runtime_array_allocations.clone();
+    let automatic_return_result_owners = state.automatic_return_result_owners.clone();
     let mut result = EmitValue::Unit;
     let final_start = block.items.len() - block.final_output_values.len();
     for item in &block.items[..final_start] {
@@ -2810,10 +3042,16 @@ fn emit_block<'ctx, 'module>(
         result = emit_final_outputs(context, state, block)?;
     }
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
+    release_automatic_return_result_owners(
+        context,
+        state,
+        &automatic_return_result_owners,
+    )?;
     state.storage = storage;
     state.values = values;
     state.runtime_array_owners = runtime_array_owners;
     state.runtime_array_allocations = runtime_array_allocations;
+    state.automatic_return_result_owners = automatic_return_result_owners;
     Ok(result)
 }
 
@@ -2828,6 +3066,7 @@ fn emit_project_block<'ctx, 'module>(
     let values = state.values.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
     let runtime_array_allocations = state.runtime_array_allocations.clone();
+    let automatic_return_result_owners = state.automatic_return_result_owners.clone();
     let mut result = EmitValue::Unit;
     let final_start = block.items.len() - block.final_output_values.len();
     for item in &block.items[..final_start] {
@@ -2852,10 +3091,16 @@ fn emit_project_block<'ctx, 'module>(
         result = emit_project_final_outputs(context, state, block, module, modules)?;
     }
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
+    release_automatic_return_result_owners(
+        context,
+        state,
+        &automatic_return_result_owners,
+    )?;
     state.storage = storage;
     state.values = values;
     state.runtime_array_owners = runtime_array_owners;
     state.runtime_array_allocations = runtime_array_allocations;
+    state.automatic_return_result_owners = automatic_return_result_owners;
     Ok(result)
 }
 
@@ -2871,12 +3116,14 @@ fn emit_final_outputs<'ctx, 'module>(
         }
         let value = emit_typed_expression(context, state, &output.value, &output.ty)?;
         transfer_runtime_array_return(state, block, &output.value, &output.ty);
+        transfer_automatic_return_result(state, &output.value);
         return Ok(value);
     }
     if let Some((condition, then_branch, else_branch)) = recombine_conditional_final_outputs(block)
     {
         for output in &block.final_output_values {
             transfer_runtime_array_return(state, block, &output.value, &output.ty);
+            transfer_automatic_return_result(state, &output.value);
         }
         let condition = take_basic(emit_expression(context, state, &condition)?)?.into_int_value();
         return emit_if_value(
@@ -2906,6 +3153,7 @@ fn emit_final_outputs<'ctx, 'module>(
         .collect::<Result<Vec<_>, _>>()?;
     for output in &block.final_output_values {
         transfer_runtime_array_return(state, block, &output.value, &output.ty);
+        transfer_automatic_return_result(state, &output.value);
     }
     build_aggregate(context, state, &outputs, values)
 }
@@ -2931,12 +3179,14 @@ fn emit_project_final_outputs<'ctx, 'module>(
             modules,
         )?;
         transfer_runtime_array_return(state, block, &output.value, &output.ty);
+        transfer_automatic_return_result(state, &output.value);
         return Ok(value);
     }
     if let Some((condition, then_branch, else_branch)) = recombine_conditional_final_outputs(block)
     {
         for output in &block.final_output_values {
             transfer_runtime_array_return(state, block, &output.value, &output.ty);
+            transfer_automatic_return_result(state, &output.value);
         }
         let condition = take_basic(emit_project_expression(
             context, state, &condition, module, modules,
@@ -2978,6 +3228,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
         .collect::<Result<Vec<_>, _>>()?;
     for output in &block.final_output_values {
         transfer_runtime_array_return(state, block, &output.value, &output.ty);
+        transfer_automatic_return_result(state, &output.value);
     }
     build_aggregate(context, state, &outputs, values)
 }
@@ -5207,17 +5458,105 @@ where
     }
 }
 
+fn transfer_automatic_return_result(
+    state: &mut EmitState<'_, '_>,
+    expression: &ScalarExpression,
+) {
+    if let ScalarExpression::Name { name, .. } = expression {
+        if let Some(result) = state.automatic_return_result_owners.get_mut(name) {
+            result.state = ScalarAutomaticReturnResultState::Transferred;
+        }
+        state.automatic_return_result_owners.remove(name);
+    }
+}
+
+fn automatic_return_result_materialization_type(
+    state: &EmitState<'_, '_>,
+    expression: &ScalarExpression,
+    output: &ScalarType,
+    visited: &mut BTreeSet<String>,
+) -> Option<ScalarType> {
+    let ScalarType::CheckedReference { inner, .. } = output else {
+        return None;
+    };
+    let ScalarType::Struct(_) = inner.as_ref() else {
+        return None;
+    };
+    match expression {
+        ScalarExpression::CheckedAddress { .. } => Some(*inner.clone()),
+        ScalarExpression::Name { name, .. } if visited.insert(name.clone()) => state
+            .return_bindings
+            .get(name)
+            .and_then(|value| {
+                automatic_return_result_materialization_type(state, value, output, visited)
+            }),
+        _ => None,
+    }
+}
+
+fn emit_automatic_return_result<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    value: BasicValueEnum<'ctx>,
+    aggregate_type: &ScalarType,
+) -> Result<BasicValueEnum<'ctx>, String> {
+    let destination = emit_runtime_array_allocation(
+        context,
+        state,
+        aggregate_type,
+        context.i64_type().const_int(1, false),
+    )?;
+    let source = state
+        .builder
+        .build_int_to_ptr(
+            value.into_int_value(),
+            context.ptr_type(AddressSpace::default()),
+            "return_result_source",
+        )
+        .map_err(builder_error)?;
+    let aggregate = storage_type(context, aggregate_type, state.structs, state.target_layout)?;
+    let copied = state
+        .builder
+        .build_load(aggregate, source, "return_result_value")
+        .map_err(builder_error)?;
+    state
+        .builder
+        .build_store(destination, copied)
+        .map_err(builder_error)?;
+    state
+        .builder
+        .build_ptr_to_int(
+            destination,
+            pointer_integer_type(context, state.target_layout),
+            "return_result_address",
+        )
+        .map_err(builder_error)
+        .map(Into::into)
+}
+
 fn emit_return<'ctx, 'module>(
+    context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     value: EmitValue<'ctx>,
     outputs: &crate::ScalarOutputSequence,
+    expression: Option<&ScalarExpression>,
 ) -> Result<(), String> {
     match outputs.outputs.as_slice() {
         [] => {
             state.builder.build_return(None).map_err(builder_error)?;
         }
         [output] if output.ty != ScalarType::Unit => {
-            let value = take_basic(value)?;
+            let mut value = take_basic(value)?;
+            if let Some(expression) = expression {
+                if let Some(aggregate_type) = automatic_return_result_materialization_type(
+                    state,
+                    expression,
+                    &output.ty,
+                    &mut BTreeSet::new(),
+                ) {
+                    value = emit_automatic_return_result(context, state, value, &aggregate_type)?;
+                }
+            }
             state
                 .builder
                 .build_return(Some(&value))

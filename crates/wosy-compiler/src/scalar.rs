@@ -73,6 +73,25 @@ pub struct ScalarStructId {
     pub index: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct ScalarAllocationIdentity {
+    pub binding: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarAutomaticReturnResultState {
+    Live,
+    Transferred,
+    Released,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarAutomaticReturnResult {
+    pub aggregate_type: ScalarStructId,
+    pub allocation_identity: ScalarAllocationIdentity,
+    pub state: ScalarAutomaticReturnResultState,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarEnumId {
     pub source: SourceIdentity,
