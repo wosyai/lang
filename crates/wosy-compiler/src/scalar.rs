@@ -1816,6 +1816,11 @@ fn resolve_program_types(program: &mut ScalarProgram, diagnostics: &mut Vec<supe
                 if function.generic_parameters.is_empty() {
                     function.signature = resolve_type(&function.signature, &names);
                 }
+                for arm in &mut function.overload_arms {
+                    if arm.generic_parameters.is_empty() {
+                        arm.signature = resolve_type(&arm.signature, &names);
+                    }
+                }
                 if let ScalarType::Callable { outputs, .. } = &function.signature {
                     for (value, output) in function
                         .body
@@ -2689,6 +2694,12 @@ fn resolve_module_types_in_project(module: &mut ScalarModule, modules: &[ScalarM
                 if function.generic_parameters.is_empty() {
                     function.signature =
                         resolve_type_in_project(&function.signature, &names, &context, modules);
+                }
+                for arm in &mut function.overload_arms {
+                    if arm.generic_parameters.is_empty() {
+                        arm.signature =
+                            resolve_type_in_project(&arm.signature, &names, &context, modules);
+                    }
                 }
                 if let ScalarType::Callable { outputs, .. } = &function.signature {
                     for (value, output) in function
@@ -14046,6 +14057,80 @@ bool integer_inversion = !1;
         let program = module_from_text(source.clone(), text);
         let project = validate_scalar_project(ScalarProject::new(
             vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn resolves_struct_typed_overload_arm_in_single_file_and_project() {
+        let text = "%%start\nstruct utf8 {\n\t*?u8 data;\n\tu64 length;\n}\nparse = overload {\n    *u64(utf8) => fn(text) {\n        *u64 result = null;\n        result\n    };\n};\nutf8 input = { .data = null; .length = 0; };\n*u64 parsed = parse(input);\n%%end";
+        let single = validate_text(text);
+        assert!(
+            !single
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"),
+            "{:?}",
+            single.diagnostics
+        );
+        assert!(
+            !single
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0004"),
+            "{:?}",
+            single.diagnostics
+        );
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(program, Vec::new())],
+            vec![source],
+        ));
+        assert!(
+            !project
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"),
+            "{:?}",
+            project.diagnostics
+        );
+        assert!(
+            !project
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0004"),
+            "{:?}",
+            project.diagnostics
+        );
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn keeps_generic_overload_arm_placeholders_when_resolving_struct_typed_arms() {
+        let text = "%%start\nstruct utf8 {\n\t*?u8 data;\n\tu64 length;\n}\nconvert = overload {\n    u64(utf8) => fn(text) { text.length };\n    generic T;\n    T(T) => fn(value) { value };\n};\nutf8 input = { .data = null; .length = 0; };\nu64 width = convert(input);\n%%end";
+        let single = validate_text(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let ScalarItem::Function(overload) = &single.program.items[0] else {
+            panic!("overload declaration");
+        };
+        assert_eq!(overload.overload_arms.len(), 2);
+        let ScalarType::Callable { parameters, .. } = &overload.overload_arms[1].signature else {
+            panic!("generic arm signature");
+        };
+        assert!(
+            matches!(&parameters[0], ScalarType::Named { name, .. } if name == "T"),
+            "{:?}",
+            overload.overload_arms[1].signature
+        );
+
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(program, Vec::new())],
             vec![source],
         ));
         assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
