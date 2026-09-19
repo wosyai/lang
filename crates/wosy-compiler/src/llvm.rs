@@ -3586,7 +3586,7 @@ fn pointer_target_type<'ctx, 'module>(
                 })
                 .and_then(|output| match &output.ty {
                     ScalarType::CheckedReference { inner, .. } => Some(*inner.clone()),
-                    ScalarType::RawPointer(_) => None,
+                    ScalarType::RawPointer(inner) => Some(*inner.clone()),
                     _ => None,
                 })
         }
@@ -4005,6 +4005,12 @@ fn emit_expression<'ctx, 'module>(
             {
                 return emit_int_conversion(context, state, name, type_arguments, arguments);
             }
+            if receiver.as_deref() == Some("core") && name == "offset" {
+                return emit_core_offset(context, state, type_arguments, arguments);
+            }
+            if receiver.as_deref() == Some("core") && name == "load" {
+                return emit_core_load(context, state, type_arguments, arguments);
+            }
             emit_call(
                 context,
                 state,
@@ -4172,6 +4178,26 @@ fn emit_project_expression<'ctx, 'module>(
                     context,
                     state,
                     name,
+                    type_arguments,
+                    arguments,
+                    module,
+                    modules,
+                );
+            }
+            if receiver.as_deref() == Some("core") && name == "offset" {
+                return emit_core_offset_project(
+                    context,
+                    state,
+                    type_arguments,
+                    arguments,
+                    module,
+                    modules,
+                );
+            }
+            if receiver.as_deref() == Some("core") && name == "load" {
+                return emit_core_load_project(
+                    context,
+                    state,
                     type_arguments,
                     arguments,
                     module,
@@ -4708,6 +4734,160 @@ fn emit_int_conversion_project<'ctx, 'module>(
     }
     .map_err(builder_error)?;
     Ok(EmitValue::Basic(converted.into()))
+}
+
+fn emit_core_offset<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    type_arguments: &[crate::scalar::ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+) -> Result<EmitValue<'ctx>, String> {
+    let [type_argument] = type_arguments else {
+        return Err("core.offset has invalid type argument arity".to_owned());
+    };
+    let [pointer, count] = arguments else {
+        return Err("core.offset has invalid argument arity".to_owned());
+    };
+    let pointer = take_basic(emit_expression(context, state, pointer)?)?.into_int_value();
+    let count = take_basic(emit_typed_expression(
+        context,
+        state,
+        count,
+        &ScalarType::I64,
+    )?)?
+    .into_int_value();
+    emit_core_offset_values(context, state, pointer, count, &type_argument.ty)
+}
+
+fn emit_core_offset_project<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    type_arguments: &[crate::scalar::ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    let [type_argument] = type_arguments else {
+        return Err("core.offset has invalid type argument arity".to_owned());
+    };
+    let [pointer, count] = arguments else {
+        return Err("core.offset has invalid argument arity".to_owned());
+    };
+    let pointer = take_basic(emit_project_expression(
+        context, state, pointer, module, modules,
+    )?)?
+    .into_int_value();
+    let count = take_basic(emit_project_typed_expression(
+        context,
+        state,
+        count,
+        &ScalarType::I64,
+        module,
+        modules,
+    )?)?
+    .into_int_value();
+    emit_core_offset_values(context, state, pointer, count, &type_argument.ty)
+}
+
+fn emit_core_offset_values<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    pointer: inkwell::values::IntValue<'ctx>,
+    count: inkwell::values::IntValue<'ctx>,
+    pointee: &ScalarType,
+) -> Result<EmitValue<'ctx>, String> {
+    let element = storage_type(context, pointee, state.structs, state.target_layout)?;
+    let base = state
+        .builder
+        .build_int_to_ptr(
+            pointer,
+            context.ptr_type(AddressSpace::default()),
+            "offset_base",
+        )
+        .map_err(builder_error)?;
+    let advanced = unsafe {
+        state
+            .builder
+            .build_in_bounds_gep(element, base, &[count], "offset")
+    }
+    .map_err(builder_error)?;
+    let address = state
+        .builder
+        .build_ptr_to_int(
+            advanced,
+            pointer_integer_type(context, state.target_layout),
+            "offset_address",
+        )
+        .map_err(builder_error)?;
+    Ok(EmitValue::Basic(address.into()))
+}
+
+fn emit_core_load<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    type_arguments: &[crate::scalar::ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+) -> Result<EmitValue<'ctx>, String> {
+    let [type_argument] = type_arguments else {
+        return Err("core.load has invalid type argument arity".to_owned());
+    };
+    let [pointer] = arguments else {
+        return Err("core.load has invalid argument arity".to_owned());
+    };
+    let pointer = take_basic(emit_expression(context, state, pointer)?)?.into_int_value();
+    emit_core_load_values(context, state, pointer, &type_argument.ty)
+}
+
+fn emit_core_load_project<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    type_arguments: &[crate::scalar::ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    let [type_argument] = type_arguments else {
+        return Err("core.load has invalid type argument arity".to_owned());
+    };
+    let [pointer] = arguments else {
+        return Err("core.load has invalid argument arity".to_owned());
+    };
+    let pointer = take_basic(emit_project_expression(
+        context, state, pointer, module, modules,
+    )?)?
+    .into_int_value();
+    emit_core_load_values(context, state, pointer, &type_argument.ty)
+}
+
+fn emit_core_load_values<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    pointer: inkwell::values::IntValue<'ctx>,
+    pointee: &ScalarType,
+) -> Result<EmitValue<'ctx>, String> {
+    let base = state
+        .builder
+        .build_int_to_ptr(
+            pointer,
+            context.ptr_type(AddressSpace::default()),
+            "load_base",
+        )
+        .map_err(builder_error)?;
+    if matches!(
+        pointee,
+        ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }
+    ) {
+        return Ok(EmitValue::Basic(base.into()));
+    }
+    let value = state
+        .builder
+        .build_load(
+            basic_type(context, pointee, state.target_layout)?,
+            base,
+            "load",
+        )
+        .map_err(builder_error)?;
+    Ok(EmitValue::Basic(value))
 }
 
 fn is_signed_integer_type(ty: &ScalarType) -> bool {
@@ -7459,6 +7639,49 @@ count, complete = read_into(buffer, requested_capacity);
         assert!(project.contains("sext i64"), "{project}");
         assert!(project.contains("zext i64"), "{project}");
         assert!(project.contains("trunc i128"), "{project}");
+    }
+
+    #[test]
+    fn emits_raw_offset_and_load_for_single_file_and_project() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let program = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\nu8(*?u8, i64) read = fn(pointer, index) { unsafe { core.load<u8>(core.offset<u8>(pointer, index)) } };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+        let single = emit_scalar_llvm(&program)
+            .expect("single-file offset and load LLVM")
+            .to_text();
+        assert!(single.contains("inttoptr"), "{single}");
+        assert!(single.contains("getelementptr inbounds i8"), "{single}");
+        assert!(single.contains("ptrtoint"), "{single}");
+        assert!(single.contains("load i8"), "{single}");
+
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(program.program, Vec::new())],
+            vec![source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let project = emit_scalar_project_llvm(&validation)
+            .expect("project offset and load LLVM")
+            .to_text();
+        assert!(project.contains("inttoptr"), "{project}");
+        assert!(project.contains("getelementptr inbounds i8"), "{project}");
+        assert!(project.contains("ptrtoint"), "{project}");
+        assert!(project.contains("load i8"), "{project}");
     }
 
     #[test]

@@ -5009,6 +5009,265 @@ fn type_core_int_conversion(
     }
 }
 
+fn type_core_raw_memory_in_module(
+    operation: &str,
+    type_arguments: &[ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if !unsafe_context {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0012",
+            &format!("core.{operation} requires an unsafe block"),
+            span,
+        ));
+    }
+    if type_arguments.len() != 1 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            &format!("core.{operation} requires one pointee type argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let pointee = &type_arguments[0].ty;
+    if operation == "load"
+        && matches!(
+            pointee,
+            ScalarType::Unit | ScalarType::Callable { .. } | ScalarType::Error
+        )
+    {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            "core.load has an invalid pointee type",
+            type_arguments[0].span,
+        ));
+        return ScalarType::Error;
+    }
+    if operation == "offset" && arguments.len() != 2 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            "core.offset requires a pointer and an offset",
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    if operation == "load" && arguments.len() != 1 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            "core.load requires one pointer",
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let pointer = expression_type_in_module(
+        &arguments[0],
+        scope,
+        visible_names,
+        folded_names,
+        module,
+        modules,
+        diagnostics,
+        unsafe_context,
+    );
+    let mut valid = true;
+    if !is_error_type(&pointer) {
+        match &pointer {
+            ScalarType::RawPointer(inner) => {
+                if !is_error_type(pointee) && !scalar_type_equal(inner, pointee) {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0003",
+                        &format!("core.{operation} requires a raw pointer to the pointee type"),
+                        expression_span(&arguments[0]),
+                    ));
+                    valid = false;
+                }
+            }
+            _ => {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    &format!("core.{operation} requires a raw pointer"),
+                    expression_span(&arguments[0]),
+                ));
+                valid = false;
+            }
+        }
+    }
+    if operation == "offset" {
+        let count = expression_type_in_module_expected(
+            &arguments[1],
+            Some(&ScalarType::I64),
+            scope,
+            visible_names,
+            folded_names,
+            module,
+            modules,
+            diagnostics,
+            unsafe_context,
+        );
+        expect_module_type(
+            module,
+            &ScalarType::I64,
+            &count,
+            expression_span(&arguments[1]),
+            diagnostics,
+        );
+        if is_error_type(&count) {
+            valid = false;
+        }
+    }
+    if !valid || is_error_type(&pointer) || is_error_type(pointee) {
+        return ScalarType::Error;
+    }
+    if operation == "offset" {
+        ScalarType::RawPointer(Box::new(pointee.clone()))
+    } else {
+        pointee.clone()
+    }
+}
+
+fn type_core_raw_memory(
+    operation: &str,
+    type_arguments: &[ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if !unsafe_context {
+        diagnostics.push(diagnostic(
+            program,
+            "B0012",
+            &format!("core.{operation} requires an unsafe block"),
+            span,
+        ));
+    }
+    if type_arguments.len() != 1 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            &format!("core.{operation} requires one pointee type argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let pointee = &type_arguments[0].ty;
+    if operation == "load"
+        && matches!(
+            pointee,
+            ScalarType::Unit | ScalarType::Callable { .. } | ScalarType::Error
+        )
+    {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            "core.load has an invalid pointee type",
+            type_arguments[0].span,
+        ));
+        return ScalarType::Error;
+    }
+    if operation == "offset" && arguments.len() != 2 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            "core.offset requires a pointer and an offset",
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    if operation == "load" && arguments.len() != 1 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            "core.load requires one pointer",
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let pointer = expression_type(
+        &arguments[0],
+        scope,
+        visible_names,
+        folded_names,
+        program,
+        diagnostics,
+        unsafe_context,
+    );
+    let mut valid = true;
+    if !is_error_type(&pointer) {
+        match &pointer {
+            ScalarType::RawPointer(inner) => {
+                if !is_error_type(pointee) && !scalar_type_equal(inner, pointee) {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "B0003",
+                        &format!("core.{operation} requires a raw pointer to the pointee type"),
+                        expression_span(&arguments[0]),
+                    ));
+                    valid = false;
+                }
+            }
+            _ => {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    &format!("core.{operation} requires a raw pointer"),
+                    expression_span(&arguments[0]),
+                ));
+                valid = false;
+            }
+        }
+    }
+    if operation == "offset" {
+        let count = expression_type_expected(
+            &arguments[1],
+            &ScalarType::I64,
+            scope,
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+            unsafe_context,
+        );
+        expect_type(
+            program,
+            &ScalarType::I64,
+            &count,
+            expression_span(&arguments[1]),
+            diagnostics,
+        );
+        if is_error_type(&count) {
+            valid = false;
+        }
+    }
+    if !valid || is_error_type(&pointer) || is_error_type(pointee) {
+        return ScalarType::Error;
+    }
+    if operation == "offset" {
+        ScalarType::RawPointer(Box::new(pointee.clone()))
+    } else {
+        pointee.clone()
+    }
+}
+
 fn integer_conversion_source_context(
     operation: &str,
     destination: &ScalarType,
@@ -5515,6 +5774,21 @@ fn expression_type_in_module(
                 && matches!(name.as_str(), "int_trunc" | "int_extend")
             {
                 return type_core_int_conversion_in_module(
+                    name,
+                    type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
+            if receiver.as_deref() == Some("core") && matches!(name.as_str(), "offset" | "load") {
+                return type_core_raw_memory_in_module(
                     name,
                     type_arguments,
                     arguments,
@@ -11280,6 +11554,20 @@ fn expression_type(
                     unsafe_context,
                 );
             }
+            if receiver.as_deref() == Some("core") && matches!(name.as_str(), "offset" | "load") {
+                return type_core_raw_memory(
+                    name,
+                    type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
             if let Some(overload) = program.items.iter().find_map(|item| match item {
                 ScalarItem::Function(function)
                     if receiver.is_none()
@@ -13997,6 +14285,78 @@ bool integer_inversion = !1;
                     .diagnostics
                     .iter()
                     .any(|diagnostic| diagnostic.code == "B0003" || diagnostic.code == "B0004"),
+                "{text}: {:?}",
+                invalid.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn validates_raw_offset_and_load_under_unsafe_in_single_file_and_project() {
+        let text = "%%start\nu8(*?u8, i64) read = fn(pointer, index) { unsafe { core.load<u8>(core.offset<u8>(pointer, index)) } };\n%%end";
+        let single = validate_text(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+
+        let missing_unsafe = validate_text(
+            "%%start\nu8(*?u8, i64) read = fn(pointer, index) { core.load<u8>(core.offset<u8>(pointer, index)) };\n%%end",
+        );
+        assert!(
+            missing_unsafe
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0012"),
+            "{:?}",
+            missing_unsafe.diagnostics
+        );
+
+        for (text, code) in [
+            (
+                "%%start\nu8(*?u8, i64) read = fn(pointer, index) { unsafe { core.load<u8>(core.offset<u8>(pointer)) } };\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\nu8(*?u8, i64) read = fn(pointer, index) { unsafe { core.load<u8>(core.offset<u8>(pointer, index, index)) } };\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\nu8(*?u8, i64) read = fn(pointer, index) { unsafe { core.load<u8>(core.offset(pointer, index)) } };\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\nu8(*?u8, i64) read = fn(pointer, index) { unsafe { core.load<u8>(pointer, index) } };\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\nu8(*?u8, u64) read = fn(pointer, index) { unsafe { core.load<u8>(core.offset<u8>(pointer, index)) } };\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nu8(u8, i64) read = fn(value, index) { unsafe { core.load<u8>(core.offset<u8>(value, index)) } };\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nu8(*?u8, i64) read = fn(pointer, index) { unsafe { core.load<u16>(core.offset<u8>(pointer, index)) } };\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nunit(*?u8) consume = fn(pointer) { unsafe { core.load<unit>(pointer) } };\n%%end",
+                "B0003",
+            ),
+        ] {
+            let invalid = validate_text(text);
+            assert!(
+                invalid
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == code),
                 "{text}: {:?}",
                 invalid.diagnostics
             );
