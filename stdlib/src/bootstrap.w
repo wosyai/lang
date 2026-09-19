@@ -226,4 +226,209 @@ ReadLineStatus() _read_line_discard = fn {
 	}
 };
 
+u8(u8) _parse_digit_value = fn(byte) {
+	u8 value = 255;
+	u8 zero_digit = 48;
+	u8 lower_base = 87;
+	u8 upper_base = 55;
+	if (byte >= 48 && byte <= 57) { value = byte - zero_digit; };
+	if (byte >= 97 && byte <= 102) { value = byte - lower_base; };
+	if (byte >= 65 && byte <= 70) { value = byte - upper_base; };
+	value
+};
+
+bool(u8, u8) _parse_is_digit_valid = fn(byte, radix) {
+	u8 value = _parse_digit_value(byte);
+	value < radix
+};
+
+bool(u8) _parse_is_underscore = fn(byte) {
+	byte == 95
+};
+
+bool(u8) _parse_is_sign = fn(byte) {
+	byte == 45
+};
+
+bool(u8) _parse_is_plus = fn(byte) {
+	byte == 43
+};
+
+bool(u8) _parse_is_zero = fn(byte) {
+	byte == 48
+};
+
+bool(u8) _parse_is_x = fn(byte) {
+	byte == 120 || byte == 88
+};
+
+bool(u8) _parse_is_b = fn(byte) {
+	byte == 98 || byte == 66
+};
+
+bool(u8) _parse_is_o = fn(byte) {
+	byte == 111 || byte == 79
+};
+
+u8(u8, u8) _parse_radix_from_prefix = fn(first, second) {
+	u8 radix = 10;
+	bool leading = _parse_is_zero(first);
+	if (leading && _parse_is_x(second)) { radix = 16; };
+	if (leading && _parse_is_b(second)) { radix = 2; };
+	if (leading && _parse_is_o(second)) { radix = 8; };
+	radix
+};
+
+(u128, bool)(*?u8, u64, u64, u8) _parse_accumulate_u128 = fn(data, start, end, radix) {
+	u64 one = core.int_extend<u64>(1);
+	u128 result = core.int_extend<u128>(0);
+	u128 maximum = 340282366920938463463374607431768211455;
+	u64 index = start;
+	bool valid = true;
+	bool saw_digit = false;
+	bool last_underscore = false;
+	while (index < end && valid) {
+		u128 wide_index = core.int_extend<u128>(index);
+		i64 position = core.int_trunc<i64>(wide_index);
+		u8 byte = 0;
+		unsafe { byte = core.load<u8>(core.offset<u8>(data, position)); };
+		bool underscore = _parse_is_underscore(byte);
+		u8 digit = _parse_digit_value(byte);
+		bool digit_ok = _parse_is_digit_valid(byte, radix);
+		if (digit_ok) {
+			u128 digit_wide = core.int_extend<u128>(digit);
+			u128 radix_wide = core.int_extend<u128>(radix);
+			u128 limit = (maximum - digit_wide) / radix_wide;
+			if (result > limit) { valid = false; } else { result = result * radix_wide + digit_wide; };
+			last_underscore = false;
+			saw_digit = true;
+		} else {
+			if (underscore && index == start) { valid = false; };
+			if (underscore && last_underscore) { valid = false; };
+			if (underscore) { last_underscore = true; } else { valid = false; };
+		};
+		index = index + one;
+	}
+	if (!saw_digit) { valid = false; };
+	if (last_underscore) { valid = false; };
+	result, valid
+};
+
+(u128, bool)(*?u8, u64, u64, u8) _parse_accumulate_i128_neg = fn(data, start, end, radix) {
+	u64 one = core.int_extend<u64>(1);
+	u128 result = core.int_extend<u128>(0);
+	u128 maximum = 170141183460469231731687303715884105728;
+	u64 index = start;
+	bool valid = true;
+	bool saw_digit = false;
+	bool last_underscore = false;
+	while (index < end && valid) {
+		u128 wide_index = core.int_extend<u128>(index);
+		i64 position = core.int_trunc<i64>(wide_index);
+		u8 byte = 0;
+		unsafe { byte = core.load<u8>(core.offset<u8>(data, position)); };
+		bool underscore = _parse_is_underscore(byte);
+		u8 digit = _parse_digit_value(byte);
+		bool digit_ok = _parse_is_digit_valid(byte, radix);
+		if (digit_ok) {
+			u128 digit_wide = core.int_extend<u128>(digit);
+			u128 radix_wide = core.int_extend<u128>(radix);
+			u128 limit = (maximum - digit_wide) / radix_wide;
+			if (result > limit) { valid = false; } else { result = result * radix_wide + digit_wide; };
+			last_underscore = false;
+			saw_digit = true;
+		} else {
+			if (underscore && index == start) { valid = false; };
+			if (underscore && last_underscore) { valid = false; };
+			if (underscore) { last_underscore = true; } else { valid = false; };
+		};
+		index = index + one;
+	}
+	if (!saw_digit) { valid = false; };
+	if (last_underscore) { valid = false; };
+	result, valid
+};
+
+bool(u128) _parse_check_u8 = fn(value) {
+	u8 bound = 255;
+	u128 limit = core.int_extend<u128>(bound);
+	value <= limit
+};
+
+bool(u128) _parse_check_u16 = fn(value) {
+	u16 bound = 65535;
+	u128 limit = core.int_extend<u128>(bound);
+	value <= limit
+};
+
+bool(u128) _parse_check_u32 = fn(value) {
+	u32 bound = 4294967295;
+	u128 limit = core.int_extend<u128>(bound);
+	value <= limit
+};
+
+bool(u128) _parse_check_u64 = fn(value) {
+	u64 bound = 18446744073709551615;
+	u128 limit = core.int_extend<u128>(bound);
+	value <= limit
+};
+
+bool(u128) _parse_check_u128 = fn(value) {
+	u128 zero = core.int_extend<u128>(0);
+	value >= zero
+};
+
+bool(u128, bool) _parse_check_i8 = fn(magnitude, negative) {
+	u8 positive_bound = 127;
+	u8 negative_bound = 128;
+	u128 positive_limit = core.int_extend<u128>(positive_bound);
+	u128 negative_limit = core.int_extend<u128>(negative_bound);
+	bool fits = false;
+	if (!negative && magnitude <= positive_limit) { fits = true; };
+	if (negative && magnitude <= negative_limit) { fits = true; };
+	fits
+};
+
+bool(u128, bool) _parse_check_i16 = fn(magnitude, negative) {
+	u16 positive_bound = 32767;
+	u16 negative_bound = 32768;
+	u128 positive_limit = core.int_extend<u128>(positive_bound);
+	u128 negative_limit = core.int_extend<u128>(negative_bound);
+	bool fits = false;
+	if (!negative && magnitude <= positive_limit) { fits = true; };
+	if (negative && magnitude <= negative_limit) { fits = true; };
+	fits
+};
+
+bool(u128, bool) _parse_check_i32 = fn(magnitude, negative) {
+	u32 positive_bound = 2147483647;
+	u32 negative_bound = 2147483648;
+	u128 positive_limit = core.int_extend<u128>(positive_bound);
+	u128 negative_limit = core.int_extend<u128>(negative_bound);
+	bool fits = false;
+	if (!negative && magnitude <= positive_limit) { fits = true; };
+	if (negative && magnitude <= negative_limit) { fits = true; };
+	fits
+};
+
+bool(u128, bool) _parse_check_i64 = fn(magnitude, negative) {
+	u64 positive_bound = 9223372036854775807;
+	u64 negative_bound = 9223372036854775808;
+	u128 positive_limit = core.int_extend<u128>(positive_bound);
+	u128 negative_limit = core.int_extend<u128>(negative_bound);
+	bool fits = false;
+	if (!negative && magnitude <= positive_limit) { fits = true; };
+	if (negative && magnitude <= negative_limit) { fits = true; };
+	fits
+};
+
+bool(u128, bool) _parse_check_i128 = fn(magnitude, negative) {
+	u128 positive_limit = 170141183460469231731687303715884105727;
+	u128 negative_limit = 170141183460469231731687303715884105728;
+	bool fits = false;
+	if (!negative && magnitude <= positive_limit) { fits = true; };
+	if (negative && magnitude <= negative_limit) { fits = true; };
+	fits
+};
+
 %%end
