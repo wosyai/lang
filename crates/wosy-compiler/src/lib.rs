@@ -50,12 +50,14 @@ mod tests {
         assert!(core_runtime("llvm", "native")
             .expect("native runtime")
             .contains("__wosy_core_alloc"));
-        assert!(core_runtime("llvm", "wasm-wasip1")
-            .expect("WASI preview 1 runtime")
-            .contains("wasm32-wasi"));
-        assert!(core_runtime("llvm", "wasm-wasip2")
-            .expect("WASI preview 2 runtime")
-            .contains("wasm32-wasi"));
+        for output in ["wasm-wasip1", "wasm-wasip2"] {
+            let runtime = core_runtime("llvm", output).expect("Wasm runtime");
+            assert!(runtime.contains("wasm32-wasi"));
+            assert!(runtime.contains("%free_header_end = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %free_header64, i64 16)"));
+            assert!(runtime.contains("%reused_pointer_address = and i64 %free_aligned_sum_value, %free_alignment_inverse"));
+            assert!(runtime.contains("%back_pointer = getelementptr i8, ptr %payload, i32 -4"));
+            assert!(!runtime.contains("payload_address_slot"));
+        }
     }
 
     #[test]

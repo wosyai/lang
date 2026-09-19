@@ -11,6 +11,21 @@ declare void @proc_exit(i32) #0
 attributes #0 = { \"wasm-import-module\"=\"wasi_snapshot_preview1\" \"wasm-import-name\"=\"proc_exit\" }
 define void @_start() {
 entry:
+  %unit_pointer = call ptr @__wosy_core_alloc(i64 1, i64 1)
+  %unit_allocated = icmp ne ptr %unit_pointer, null
+  br i1 %unit_allocated, label %release_unit, label %failed
+release_unit:
+  call void @__wosy_core_free(ptr %unit_pointer)
+  %reused_unit = call ptr @__wosy_core_alloc(i64 1, i64 1)
+  %reused_unit_allocated = icmp ne ptr %reused_unit, null
+  br i1 %reused_unit_allocated, label %reuse_unit, label %failed
+reuse_unit:
+  %reused_unit_matches = icmp eq ptr %unit_pointer, %reused_unit
+  br i1 %reused_unit_matches, label %release_reused_unit, label %failed
+release_reused_unit:
+  call void @__wosy_core_free(ptr %reused_unit)
+  br label %allocate_aligned
+allocate_aligned:
   %pointer = call ptr @__wosy_core_alloc(i64 1, i64 64)
   %allocated = icmp ne ptr %pointer, null
   br i1 %allocated, label %alignment, label %failed

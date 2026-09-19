@@ -50,6 +50,42 @@ reuse_continue:
   br i1 %has_next_free, label %reuse_search, label %extend_header
 
 reuse:
+  %free_alignment_fits = icmp ule i64 %free_alignment64, 2147483648
+  %free_alignment_is_zero = icmp eq i64 %free_alignment64, 0
+  %free_alignment_minus_one = sub i64 %free_alignment64, 1
+  %free_alignment_power_mask = and i64 %free_alignment64, %free_alignment_minus_one
+  %free_alignment_is_power_of_two = icmp eq i64 %free_alignment_power_mask, 0
+  %free_alignment_is_not_power_of_two = xor i1 %free_alignment_is_power_of_two, true
+  %free_alignment_is_invalid = or i1 %free_alignment_is_zero, %free_alignment_is_not_power_of_two
+  %free_alignment_is_valid = xor i1 %free_alignment_is_invalid, true
+  %free_alignment_can_derive = and i1 %free_alignment_fits, %free_alignment_is_valid
+  br i1 %free_alignment_can_derive, label %reuse_header_end, label %reuse_continue
+
+reuse_header_end:
+  %free_header64 = zext i32 %current_address to i64
+  %free_header_end = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %free_header64, i64 16)
+  %free_header_end_value = extractvalue { i64, i1 } %free_header_end, 0
+  %free_header_end_overflow = extractvalue { i64, i1 } %free_header_end, 1
+  br i1 %free_header_end_overflow, label %reuse_continue, label %reuse_alignment
+
+reuse_alignment:
+  %free_aligned_sum = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %free_header_end_value, i64 %free_alignment_minus_one)
+  %free_aligned_sum_value = extractvalue { i64, i1 } %free_aligned_sum, 0
+  %free_aligned_sum_overflow = extractvalue { i64, i1 } %free_aligned_sum, 1
+  br i1 %free_aligned_sum_overflow, label %reuse_continue, label %reuse_size
+
+reuse_size:
+  %free_alignment_inverse = xor i64 %free_alignment_minus_one, -1
+  %reused_pointer_address = and i64 %free_aligned_sum_value, %free_alignment_inverse
+  %reused_allocation_end = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %reused_pointer_address, i64 %free_size64)
+  %reused_allocation_end_value = extractvalue { i64, i1 } %reused_allocation_end, 0
+  %reused_allocation_end_overflow = extractvalue { i64, i1 } %reused_allocation_end, 1
+  %reused_address_space_end = icmp ule i64 %reused_allocation_end_value, 4294967296
+  %reused_exceeds_address_space = xor i1 %reused_address_space_end, true
+  %reused_extends_address_space = or i1 %reused_allocation_end_overflow, %reused_exceeds_address_space
+  br i1 %reused_extends_address_space, label %reuse_continue, label %reuse_unlink
+
+reuse_unlink:
   %selected_next_free = load i32, ptr %free_header, align 4
   %selects_head = icmp eq i32 %previous_address, 0
   br i1 %selects_head, label %reuse_head, label %reuse_after
@@ -64,9 +100,8 @@ reuse_after:
   br label %reuse_return
 
 reuse_return:
-  %free_payload_address = getelementptr i8, ptr %free_header, i32 12
-  %free_payload = load i32, ptr %free_payload_address, align 4
-  %reused_pointer = inttoptr i32 %free_payload to ptr
+  %reused_payload_address = trunc i64 %reused_pointer_address to i32
+  %reused_pointer = inttoptr i32 %reused_payload_address to ptr
   ret ptr %reused_pointer
 
 extend_header:
@@ -132,8 +167,6 @@ commit:
   %alignment_address = getelementptr i8, ptr %header, i32 8
   %alignment32 = trunc i64 %alignment to i32
   store i32 %alignment32, ptr %alignment_address, align 4
-  %payload_address_slot = getelementptr i8, ptr %header, i32 12
-  store i32 %payload_address, ptr %payload_address_slot, align 4
   store i64 %allocation_end_value, ptr @__wosy_core_heap_cursor
   ret ptr %payload
 
