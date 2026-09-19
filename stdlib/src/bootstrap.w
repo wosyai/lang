@@ -431,4 +431,42 @@ bool(u128, bool) _parse_check_i128 = fn(magnitude, negative) {
 	fits
 };
 
+*u8(utf8) _parse_u8 = fn(text) {
+	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
+	u64 two = core.int_extend<u64>(2);
+	u8 radix = 10;
+	u64 start = zero;
+	u8 out = 0;
+	*u8 result = null;
+	if (text.data == null || text.length == zero) {
+		result = null;
+	} else {
+		u128 wide_zero = core.int_extend<u128>(zero);
+		i64 position_zero = core.int_trunc<i64>(wide_zero);
+		u8 first = 0;
+		unsafe { first = core.load<u8>(core.offset<u8>(text.data, position_zero)); };
+		if (text.length >= two) {
+			u128 wide_one = core.int_extend<u128>(one);
+			i64 position_one = core.int_trunc<i64>(wide_one);
+			u8 second = 0;
+			unsafe { second = core.load<u8>(core.offset<u8>(text.data, position_one)); };
+			u8 detected = _parse_radix_from_prefix(first, second);
+			radix = detected;
+			if (detected != 10) { start = two; };
+		};
+		u128 magnitude, bool valid = _parse_accumulate_u128(text.data, start, text.length, radix);
+		bool fits = _parse_check_u8(magnitude);
+		if (valid && fits) {
+			out = core.int_trunc<u8>(magnitude);
+			result = &out;
+		};
+	};
+	result
+};
+
+parse = overload {
+	*u8(utf8) => fn(text) { _parse_u8(text) };
+};
+
 %%end
