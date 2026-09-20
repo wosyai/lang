@@ -4018,6 +4018,9 @@ fn emit_expression<'ctx, 'module>(
             {
                 return emit_float_conversion(context, state, name, type_arguments, arguments);
             }
+            if receiver.as_deref() == Some("core") && name == "bitcast" {
+                return emit_bitcast(context, state, name, type_arguments, arguments);
+            }
             if receiver.as_deref() == Some("core") && name == "offset" {
                 return emit_core_offset(context, state, type_arguments, arguments);
             }
@@ -4209,6 +4212,17 @@ fn emit_project_expression<'ctx, 'module>(
                 )
             {
                 return emit_float_conversion_project(
+                    context,
+                    state,
+                    name,
+                    type_arguments,
+                    arguments,
+                    module,
+                    modules,
+                );
+            }
+            if receiver.as_deref() == Some("core") && name == "bitcast" {
+                return emit_bitcast_project(
                     context,
                     state,
                     name,
@@ -4702,6 +4716,137 @@ fn emit_int_conversion<'ctx, 'module>(
     Ok(EmitValue::Basic(converted.into()))
 }
 
+fn is_bitcast_scalar_type(ty: &ScalarType) -> bool {
+    integer_width(ty).is_some()
+        || matches!(
+            ty,
+            ScalarType::Char | ScalarType::Bool | ScalarType::F32 | ScalarType::F64
+        )
+}
+
+fn bitcast_source_type(
+    state: &EmitState<'_, '_>,
+    expression: &ScalarExpression,
+    project_module: Option<&ScalarModule>,
+) -> Result<ScalarType, String> {
+    let ty = match expression {
+        ScalarExpression::Name { name, .. } => state
+            .storage
+            .get(name)
+            .map(|(_, ty)| ty.clone())
+            .or_else(|| state.globals.get(name).map(|(_, ty)| ty.clone())),
+        ScalarExpression::Member { receiver, name, .. } => {
+            match struct_member_place(state, receiver, name)? {
+                Some(crate::ScalarPlace::Field {
+                    field: ScalarFieldReference::Resolved(field),
+                    ..
+                }) => structure(state.structs, field.structure.clone())?
+                    .fields
+                    .get(field.index)
+                    .filter(|candidate| candidate.id == field)
+                    .map(|field| field.ty.clone()),
+                Some(_) | None => None,
+            }
+        }
+        ScalarExpression::Dereference { place, .. } => assignment_place_type(state, place),
+        ScalarExpression::Integer { .. } => Some(ScalarType::I32),
+        ScalarExpression::Char { .. } => Some(ScalarType::Char),
+        ScalarExpression::Boolean { .. } => Some(ScalarType::Bool),
+        ScalarExpression::Float { .. } => Some(ScalarType::F64),
+        ScalarExpression::Unary { operand, .. } => {
+            bitcast_source_type(state, operand, project_module).ok()
+        }
+        ScalarExpression::Binary { left, .. } => {
+            bitcast_source_type(state, left, project_module).ok()
+        }
+        ScalarExpression::Call {
+            receiver,
+            name,
+            type_arguments,
+            ..
+        } if receiver.as_deref() == Some("core")
+            && matches!(
+                name.as_str(),
+                "int_trunc"
+                    | "int_extend"
+                    | "uint_to_float"
+                    | "sint_to_float"
+                    | "float_to_sint_trunc"
+                    | "float_to_uint_trunc"
+                    | "float_trunc"
+                    | "float_extend"
+                    | "bitcast"
+            ) =>
+        {
+            type_arguments.first().map(|argument| argument.ty.clone())
+        }
+        ScalarExpression::Call {
+            receiver,
+            name,
+            type_arguments,
+            overload_selection,
+            ..
+        } => {
+            let qualified = receiver.as_ref().map_or_else(
+                || {
+                    project_module.map_or_else(
+                        || name.clone(),
+                        |module| project_function_name(&module.source, name),
+                    )
+                },
+                |receiver| format!("{receiver}.{name}"),
+            );
+            let lookup = overload_selection
+                .as_ref()
+                .map(|selection| selected_overload_lookup_key(&qualified, selection));
+            state
+                .call_targets
+                .get(lookup.as_ref().unwrap_or(&qualified))
+                .or_else(|| {
+                    state
+                        .call_targets
+                        .get(&specialization_lookup_key(&qualified, type_arguments))
+                })
+                .or_else(|| state.call_targets.get(&qualified))
+                .and_then(|target| state.signatures.get(target))
+                .and_then(|signature| match signature {
+                    ScalarType::Callable { outputs, .. } => outputs.outputs.first(),
+                    _ => None,
+                })
+                .map(|output| output.ty.clone())
+        }
+        _ => None,
+    };
+    ty.filter(|ty| is_bitcast_scalar_type(ty))
+        .ok_or_else(|| "core bitcast has an unknown source type".to_owned())
+}
+
+fn emit_bitcast<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    operation: &str,
+    type_arguments: &[crate::scalar::ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+) -> Result<EmitValue<'ctx>, String> {
+    let [type_argument] = type_arguments else {
+        return Err(format!("core.{operation} has invalid type argument arity"));
+    };
+    let [value] = arguments else {
+        return Err(format!("core.{operation} has invalid argument arity"));
+    };
+    let source = bitcast_source_type(state, value, None)?;
+    let destination = &type_argument.ty;
+    let value = take_basic(emit_typed_expression(context, state, value, &source)?)?;
+    let converted = state
+        .builder
+        .build_bit_cast(
+            value,
+            basic_type(context, destination, state.target_layout)?,
+            "bitcast",
+        )
+        .map_err(builder_error)?;
+    Ok(EmitValue::Basic(converted))
+}
 fn emit_cast_project_values<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -4770,6 +4915,36 @@ fn emit_int_conversion_project<'ctx, 'module>(
     Ok(EmitValue::Basic(converted.into()))
 }
 
+fn emit_bitcast_project<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    operation: &str,
+    type_arguments: &[crate::scalar::ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    let [type_argument] = type_arguments else {
+        return Err(format!("core.{operation} has invalid type argument arity"));
+    };
+    let [value] = arguments else {
+        return Err(format!("core.{operation} has invalid argument arity"));
+    };
+    let source = bitcast_source_type(state, value, Some(module))?;
+    let destination = &type_argument.ty;
+    let value = take_basic(emit_project_typed_expression(
+        context, state, value, &source, module, modules,
+    )?)?;
+    let converted = state
+        .builder
+        .build_bit_cast(
+            value,
+            basic_type(context, destination, state.target_layout)?,
+            "bitcast",
+        )
+        .map_err(builder_error)?;
+    Ok(EmitValue::Basic(converted))
+}
 fn emit_float_conversion<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -8011,6 +8186,43 @@ count, complete = read_into(buffer, requested_capacity);
         assert!(project.contains("fptoui"), "{project}");
         assert!(project.contains("fptrunc"), "{project}");
         assert!(project.contains("fpext"), "{project}");
+    }
+
+    #[test]
+    fn emits_bitcast_for_single_file_and_project() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let program = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\nchar letter = 'A';\nu32 code = core.bitcast<u32>(letter);\nf32 bits = core.bitcast<f32>(code);\nu32 roundtrip = core.bitcast<u32>(bits);\ni64 wider = 42;\nf64 dwbits = core.bitcast<f64>(wider);\ni64 back = core.bitcast<i64>(dwbits);\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+        let single = emit_scalar_llvm(&program)
+            .expect("single-file bitcast LLVM")
+            .to_text();
+        assert!(single.contains("bitcast"), "{single}");
+
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(program.program, Vec::new())],
+            vec![source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let project = emit_scalar_project_llvm(&validation)
+            .expect("project bitcast LLVM")
+            .to_text();
+        assert!(project.contains("bitcast"), "{project}");
     }
 
     #[test]

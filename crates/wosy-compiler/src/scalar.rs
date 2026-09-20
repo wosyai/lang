@@ -4916,6 +4916,96 @@ fn type_core_int_conversion_in_module(
     }
 }
 
+fn is_bitcast_scalar(ty: &ScalarType) -> bool {
+    is_integer_type(ty)
+        || matches!(
+            ty,
+            ScalarType::Char | ScalarType::Bool | ScalarType::F32 | ScalarType::F64
+        )
+}
+
+fn type_core_bitcast_in_module(
+    operation: &str,
+    type_arguments: &[ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if type_arguments.len() != 1 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            &format!("core.{operation} requires one destination type argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let destination = &type_arguments[0].ty;
+    if !is_bitcast_scalar(destination) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            &format!("core.{operation} has an invalid bitcast destination type"),
+            type_arguments[0].span,
+        ));
+        return ScalarType::Error;
+    }
+    if arguments.len() != 1 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            &format!("core.{operation} requires one value argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let actual = expression_type_in_module_expected(
+        &arguments[0],
+        None,
+        scope,
+        visible_names,
+        folded_names,
+        module,
+        modules,
+        diagnostics,
+        unsafe_context,
+    );
+    if is_error_type(&actual) {
+        return ScalarType::Error;
+    }
+    if !is_bitcast_scalar(&actual) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            &format!("core.{operation} requires a compatible scalar source type"),
+            expression_span(&arguments[0]),
+        ));
+        return ScalarType::Error;
+    }
+    let sizes_match = match (
+        layout_for_type(&actual, module.target_layout),
+        layout_for_type(destination, module.target_layout),
+    ) {
+        (Ok(source), Ok(destination)) => source.size == destination.size,
+        _ => false,
+    };
+    if !sizes_match {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            &format!("core.{operation} requires source and destination types of equal size"),
+            type_arguments[0].span,
+        ));
+        return ScalarType::Error;
+    }
+    destination.clone()
+}
 fn float_conversion_destination_matches(operation: &str, destination: &ScalarType) -> bool {
     match operation {
         "uint_to_float" | "sint_to_float" => is_float_type(destination),
@@ -5221,6 +5311,85 @@ fn type_core_int_conversion(
     }
 }
 
+fn type_core_bitcast(
+    operation: &str,
+    type_arguments: &[ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if type_arguments.len() != 1 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            &format!("core.{operation} requires one destination type argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let destination = &type_arguments[0].ty;
+    if !is_bitcast_scalar(destination) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            &format!("core.{operation} has an invalid bitcast destination type"),
+            type_arguments[0].span,
+        ));
+        return ScalarType::Error;
+    }
+    if arguments.len() != 1 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            &format!("core.{operation} requires one value argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let actual = expression_type(
+        &arguments[0],
+        scope,
+        visible_names,
+        folded_names,
+        program,
+        diagnostics,
+        unsafe_context,
+    );
+    if is_error_type(&actual) {
+        return ScalarType::Error;
+    }
+    if !is_bitcast_scalar(&actual) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            &format!("core.{operation} requires a compatible scalar source type"),
+            expression_span(&arguments[0]),
+        ));
+        return ScalarType::Error;
+    }
+    let sizes_match = match (
+        layout_for_type(&actual, program.target_layout),
+        layout_for_type(destination, program.target_layout),
+    ) {
+        (Ok(source), Ok(destination)) => source.size == destination.size,
+        _ => false,
+    };
+    if !sizes_match {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            &format!("core.{operation} requires source and destination types of equal size"),
+            type_arguments[0].span,
+        ));
+        return ScalarType::Error;
+    }
+    destination.clone()
+}
 fn type_core_raw_memory_in_module(
     operation: &str,
     type_arguments: &[ScalarTypeArgument],
@@ -6073,6 +6242,21 @@ fn expression_type_in_module(
                 )
             {
                 return type_core_float_conversion_in_module(
+                    name,
+                    type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
+            if receiver.as_deref() == Some("core") && name == "bitcast" {
+                return type_core_bitcast_in_module(
                     name,
                     type_arguments,
                     arguments,
@@ -11881,6 +12065,20 @@ fn expression_type(
                     unsafe_context,
                 );
             }
+            if receiver.as_deref() == Some("core") && name == "bitcast" {
+                return type_core_bitcast(
+                    name,
+                    type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
             if receiver.as_deref() == Some("core") && matches!(name.as_str(), "offset" | "load") {
                 return type_core_raw_memory(
                     name,
@@ -14714,6 +14912,89 @@ bool integer_inversion = !1;
             ),
             (
                 "%%start\nu64 source = 1;\nf64 value = core.sint_to_float<f64>(source, source);\n%%end",
+                "B0004",
+            ),
+        ] {
+            let invalid = validate_text(text);
+            assert!(
+                invalid
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == code),
+                "{text}: {:?}",
+                invalid.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn validates_bitcast_in_single_file_and_project() {
+        let text = "%%start\nchar letter = 'A';\nu32 code = core.bitcast<u32>(letter);\nf32 bits = core.bitcast<f32>(code);\nu32 roundtrip = core.bitcast<u32>(bits);\ni32 signed = core.bitcast<i32>(roundtrip);\nf64 wide = 1.5;\nu64 wbits = core.bitcast<u64>(wide);\nf64 back = core.bitcast<f64>(wbits);\ni64 sbits = core.bitcast<i64>(wide);\nbool flag = true;\nbool same = core.bitcast<bool>(flag);\nu8 small = 7;\ni8 tiny = core.bitcast<i8>(small);\n%%end";
+        let single = validate_text(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+
+        for (text, code) in [
+            (
+                "%%start\nu32 source = 1;\nu64 value = core.bitcast<u64>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nu32 source = 1;\nu16 value = core.bitcast<u16>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nchar letter = 'A';\nu64 value = core.bitcast<u64>(letter);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf32 narrow = 1.5;\nf64 value = core.bitcast<f64>(narrow);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf64 wide = 1.5;\nf32 value = core.bitcast<f32>(wide);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nf32 narrow = 1.5;\ni64 value = core.bitcast<i64>(narrow);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nu32 source = 1;\n*?u8 value = core.bitcast<*?u8>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\n*?u8 storage = null;\nu64 value = core.bitcast<u64>(storage);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nstruct Pair {\n\ti32 x;\n\ti32 y;\n}\nPair holder = { .x = 1; .y = 2; };\nu64 value = core.bitcast<u64>(holder);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nstruct Pair {\n\ti32 x;\n\ti32 y;\n}\nu32 source = 1;\nPair value = core.bitcast<Pair>(source);\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nu32 source = 1;\nu32 value = core.bitcast(source);\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\nu32 source = 1;\nu32 value = core.bitcast<u32, u32>(source);\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\nchar letter = 'A';\nu32 value = core.bitcast<u32>();\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\nchar letter = 'A';\nu32 value = core.bitcast<u32>(letter, letter);\n%%end",
                 "B0004",
             ),
         ] {
