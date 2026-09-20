@@ -13,5 +13,9 @@ u128 big = 1000000;
 std.utf8 out2 = std.format(big);
 std.print(out2);
 std.print("\n");
+u128 max = 340282366920938463463374607431768211455;
+std.utf8 out3 = std.format(max);
+std.print(out3);
+std.print("\n");
 std.exit(0);
 %%end
