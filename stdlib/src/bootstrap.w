@@ -1172,6 +1172,50 @@ utf8(bool) _format_bool = fn(value) {
 	text
 };
 
+utf8(char) _format_char = fn(value) {
+	u32 scalar = core.bitcast<u32>(value);
+	u8[4] scratch;
+	u64 one = core.int_extend<u64>(1);
+	u64 two = core.int_extend<u64>(2);
+	u64 three = core.int_extend<u64>(3);
+	u64 four = core.int_extend<u64>(4);
+	u32 ascii_limit = 128;
+	u32 two_byte_limit = 2048;
+	u32 three_byte_limit = 65536;
+	u32 continuation_prefix = 128;
+	u32 two_byte_prefix = 192;
+	u32 three_byte_prefix = 224;
+	u32 four_byte_prefix = 240;
+	u32 payload_mask = 63;
+	u32 shift_six = 6;
+	u32 shift_twelve = 12;
+	u32 shift_eighteen = 18;
+	u64 length = one;
+	if (scalar >= ascii_limit) { length = two; };
+	if (scalar >= two_byte_limit) { length = three; };
+	if (scalar >= three_byte_limit) { length = four; };
+	if (length == one) { scratch[0] = core.int_trunc<u8>(scalar); };
+	if (length == two) {
+		scratch[0] = core.int_trunc<u8>(two_byte_prefix | (scalar >> shift_six));
+		scratch[one] = core.int_trunc<u8>(continuation_prefix | (scalar & payload_mask));
+	};
+	if (length == three) {
+		scratch[0] = core.int_trunc<u8>(three_byte_prefix | (scalar >> shift_twelve));
+		scratch[one] = core.int_trunc<u8>(continuation_prefix | ((scalar >> shift_six) & payload_mask));
+		scratch[two] = core.int_trunc<u8>(continuation_prefix | (scalar & payload_mask));
+	};
+	if (length == four) {
+		scratch[0] = core.int_trunc<u8>(four_byte_prefix | (scalar >> shift_eighteen));
+		scratch[one] = core.int_trunc<u8>(continuation_prefix | ((scalar >> shift_twelve) & payload_mask));
+		scratch[two] = core.int_trunc<u8>(continuation_prefix | ((scalar >> shift_six) & payload_mask));
+		scratch[three] = core.int_trunc<u8>(continuation_prefix | (scalar & payload_mask));
+	};
+	*?u8 data = null;
+	unsafe { data = &?scratch[0]; };
+	utf8 text = { .data = data; .length = length; };
+	text
+};
+
 utf8(i8) _format_i8 = fn(value) {
 	u8[4] scratch;
 	u64 capacity = core.int_extend<u64>(4);
@@ -1837,6 +1881,7 @@ utf8(f64) _format_f64 = fn(value) {
 
 format = overload {
 	utf8(bool) => fn(value) { _format_bool(value) };
+	utf8(char) => fn(value) { _format_char(value) };
 	utf8(i8) => fn(value) { _format_i8(value) };
 	utf8(i16) => fn(value) { _format_i16(value) };
 	utf8(i32) => fn(value) { _format_i32(value) };
