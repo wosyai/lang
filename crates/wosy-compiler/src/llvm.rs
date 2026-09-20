@@ -1259,6 +1259,9 @@ fn place_pointer<'ctx, 'module>(
             .into_int_value();
             pointer_target_type(state, pointer, project)
                 .ok_or_else(|| "unknown LLVM dereference target type".to_owned())?;
+            if dereference_requires_null_guard(state, pointer, project) {
+                emit_checked_dereference_guard(context, state, pointer_value)?;
+            }
             state
                 .builder
                 .build_int_to_ptr(
@@ -3631,6 +3634,115 @@ fn pointer_target_type<'ctx, 'module>(
         }
         _ => None,
     }
+}
+
+fn dereference_requires_null_guard<'ctx, 'module>(
+    state: &EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
+    project: Option<ProjectCallScope<'_>>,
+) -> bool {
+    match expression {
+        ScalarExpression::Name { name, .. } => state
+            .storage
+            .get(name)
+            .map(|(_, ty)| ty)
+            .or_else(|| state.globals.get(name).map(|(_, ty)| ty))
+            .is_some_and(|ty| matches!(ty, ScalarType::CheckedReference { .. })),
+        ScalarExpression::Call {
+            receiver,
+            name,
+            type_arguments,
+            overload_selection,
+            ..
+        } => {
+            let qualified = project.map_or_else(
+                || {
+                    receiver
+                        .as_ref()
+                        .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"))
+                },
+                |project| {
+                    let target = receiver
+                        .as_ref()
+                        .and_then(|binding| {
+                            project
+                                .module
+                                .namespace_bindings
+                                .iter()
+                                .find(|namespace| namespace.binding == *binding)
+                                .and_then(|namespace| {
+                                    project
+                                        .modules
+                                        .iter()
+                                        .find(|candidate| candidate.source == namespace.target)
+                                        .copied()
+                                })
+                        })
+                        .unwrap_or(project.module);
+                    project_function_name(&target.source, name)
+                },
+            );
+            let lookup = overload_selection
+                .as_ref()
+                .map(|selection| selected_overload_lookup_key(&qualified, selection));
+            state
+                .call_targets
+                .get(lookup.as_ref().unwrap_or(&qualified))
+                .or_else(|| {
+                    state
+                        .call_targets
+                        .get(&specialization_lookup_key(&qualified, type_arguments))
+                })
+                .or_else(|| state.call_targets.get(&qualified))
+                .and_then(|target| state.signatures.get(target))
+                .and_then(|signature| match signature {
+                    ScalarType::Callable { outputs, .. } => outputs.outputs.first(),
+                    _ => None,
+                })
+                .is_some_and(|output| matches!(&output.ty, ScalarType::CheckedReference { .. }))
+        }
+        _ => false,
+    }
+}
+
+fn emit_checked_dereference_guard<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    address: inkwell::values::IntValue<'ctx>,
+) -> Result<(), String> {
+    declare_core_runtime(context, state.module);
+    let is_null = state
+        .builder
+        .build_int_compare(
+            IntPredicate::EQ,
+            address,
+            address.get_type().const_int(0, false),
+            "deref_is_null",
+        )
+        .map_err(builder_error)?;
+    let function = state
+        .builder
+        .get_insert_block()
+        .and_then(|block| block.get_parent())
+        .ok_or_else(|| "checked dereference has no containing function".to_owned())?;
+    let panic_block = context.append_basic_block(function, "deref_null_panic");
+    let continue_block = context.append_basic_block(function, "deref_null_continue");
+    state
+        .builder
+        .build_conditional_branch(is_null, panic_block, continue_block)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(panic_block);
+    let panic = state
+        .module
+        .get_function(CORE_SYSTEM_PANIC_SYMBOL)
+        .ok_or_else(|| "core system-panic runtime declaration is missing".to_owned())?;
+    state
+        .builder
+        .build_call(panic, &[], "system_panic")
+        .map_err(builder_error)?;
+    state.builder.build_unreachable().map_err(builder_error)?;
+    state.builder.position_at_end(continue_block);
+    Ok(())
 }
 
 fn materialize_assignment_values<'ctx, 'module>(
