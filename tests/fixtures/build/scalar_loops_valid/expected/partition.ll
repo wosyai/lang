@@ -5,10 +5,11 @@ source_filename = "src/main.w"
 
 define i32 @loop(i32 %start) {
 entry:
+  %assignment_value = alloca i32, align 4
+  %value = alloca i32, align 4
   %start1 = alloca i32, align 4
   store i32 %start, ptr %start1, align 4
   %start2 = load i32, ptr %start1, align 4
-  %value = alloca i32, align 4
   store i32 %start2, ptr %value, align 4
   br label %while.cond.0
 
@@ -20,7 +21,6 @@ while.cond.0:                                     ; preds = %while.body.1, %entr
 while.body.1:                                     ; preds = %while.cond.0
   %value4 = load i32, ptr %value, align 4
   %add = add i32 %value4, 1
-  %assignment_value = alloca i32, align 4
   store i32 %add, ptr %assignment_value, align 4
   %assignment_value5 = load i32, ptr %assignment_value, align 4
   store i32 %assignment_value5, ptr %value, align 4
