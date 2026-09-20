@@ -38,3 +38,29 @@ source = "project/src/classify.w"
 fd_read = [{ capacity = 1, bytes = [], errno = 0 }]
 stdout = "expected/eof.stdout"
 exact = true
+
+[[assert]]
+source = "project/src/echo_number.w"
+fd_read = [
+  { capacity = 1, bytes = [55], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/echo_number.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/echo_number.w"
+fd_read = [
+  { capacity = 1, bytes = [49], errno = 0 },
+  { capacity = 1, bytes = [50], errno = 0 },
+  { capacity = 1, bytes = [120], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/echo_invalid.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/echo_number.w"
+fd_read = [{ capacity = 1, bytes = [], errno = 0 }]
+stdout = "expected/echo_eof.stdout"
+exact = true

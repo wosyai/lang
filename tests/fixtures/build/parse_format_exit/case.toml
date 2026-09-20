@@ -18,3 +18,27 @@ exit = 3
 stdout = "expected/invalid.stdout"
 stderr = "expected/empty"
 exact = true
+
+[[assert]]
+source = "project/src/format_char.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/format_char.stdout"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/format_appcall.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/format_appcall.stdout"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/parse_u128_boundary.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/parse_u128_boundary.stdout"
+stderr = "expected/empty"
+exact = true
