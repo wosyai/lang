@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Golden-partition gate for the u128_libcall fixture.
+
+The compiler bakes the absolute module paths of the temporary build
+directory into project-qualified symbol names (including a nested encoding
+inside overload-instance names), so partition.ll differs on every harness
+run by construction and no raw byte golden can match. This script:
+
+1. Verifies the properties the golden carries:
+   - the u128-selecting source pulls the u128/i128 parse and format arms
+     into the partition (their definitions are present);
+   - the lowering emits `mul i128` / `udiv i128` at the accumulate and
+     halves sites. LLVM codegen expands exactly these instructions into
+     the `__multi3` / `__udivti3` libcalls on wasm32; the linked runtime.o
+     definitions resolve them (proven by the green run asserts);
+   - the partition itself carries no `__multi3` / `__udivti3` references:
+     the libcalls materialize only at codegen into the object file, never
+     as IR-level declares.
+2. Writes the path-normalized partition for the exact-compare file assert
+   in case.toml. Normalization replaces only absolute path material
+   (recursively, because overload-instance names nest the encoding) plus
+   the ModuleID/source_filename header lines; everything else is
+   byte-preserved, so the golden still pins the full IR.
+
+Reads `.wosy/artifacts/app/dev/main/partition.ll`, writes
+`partition.normalized.ll`. Exits 0 when every property holds, 1 with
+diagnostics otherwise.
+"""
+
+import re
+import sys
+
+PARTITION = ".wosy/artifacts/app/dev/main/partition.ll"
+NORMALIZED = "partition.normalized.ll"
+
+ARMS = [
+    "_parse_u128",
+    "_parse_accumulate_u128",
+    "_parse_check_u128",
+    "_format_u128",
+    "_parse_i128",
+    "_parse_accumulate_i128_neg",
+    "_format_i128",
+]
+
+ABS = r"[A-Za-z]:\\[^\"\s]*"
+
+
+def deep_norm_run(run):
+    try:
+        decoded = bytes.fromhex(run).decode()
+    except Exception:
+        return run
+
+    flags = []
+
+    def inner(match):
+        result = deep_norm_run(match.group(0))
+        if result != match.group(0):
+            flags.append(True)
+        return result
+
+    decoded, _ = re.subn(r"[0-9a-f]{32,}", inner, decoded)
+    decoded, n_path = re.subn(ABS, "__WOSY_PATH__", decoded)
+    if not flags and n_path == 0:
+        return run
+    return decoded.encode().hex()
+
+
+def normalize(text):
+    lines = []
+    for line in text.split("\n"):
+        if line.startswith("; ModuleID = ") or line.startswith("source_filename = "):
+            lines.append("__WOSY_HEADER__")
+            continue
+        lines.append(re.sub(r"[0-9a-f]{32,}", lambda m: deep_norm_run(m.group(0)), line))
+    return "\n".join(lines)
+
+
+def main():
+    try:
+        with open(PARTITION, encoding="utf-8") as file:
+            text = file.read()
+    except OSError as error:
+        print(f"check-partition: cannot read {PARTITION}: {error}")
+        return 1
+    failures = []
+    for arm in ARMS:
+        if re.search("define [^\n]*" + arm.encode().hex(), text) is None:
+            failures.append(f"missing definition for selected arm {arm}")
+    mul_sites = re.findall(r"mul i128", text)
+    udiv_sites = re.findall(r"udiv i128", text)
+    if not mul_sites:
+        failures.append("missing mul i128 libcall trigger site")
+    if not udiv_sites:
+        failures.append("missing udiv i128 libcall trigger site")
+    for symbol in ("__multi3", "__udivti3"):
+        if symbol in text:
+            failures.append(f"unexpected {symbol} reference in partition.ll")
+    if failures:
+        for failure in failures:
+            print(f"check-partition: {failure}")
+        return 1
+    try:
+        with open(NORMALIZED, "w", encoding="utf-8", newline="") as file:
+            file.write(normalize(text))
+    except OSError as error:
+        print(f"check-partition: cannot write {NORMALIZED}: {error}")
+        return 1
+    print(
+        "check-partition: selected arms present "
+        f"({len(ARMS)}), mul i128 x{len(mul_sites)}, "
+        f"udiv i128 x{len(udiv_sites)}, no libcall declares"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

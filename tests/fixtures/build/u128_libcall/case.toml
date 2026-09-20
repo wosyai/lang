@@ -1,0 +1,61 @@
+shared_stdlib = true
+
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[steps]]
+source = "project/src/parse_u128_dec.w"
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[steps]]
+command = ["python", "scripts/check-partition"]
+exit = 0
+
+[[assert]]
+source = "project/src/parse_u128_dec.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/parse_u128_dec.stdout"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/parse_i128_dec.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/parse_i128_dec.stdout"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/parse_radix.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/parse_radix.stdout"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/format_u128.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/format_u128.stdout"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/format_i128.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/format_i128.stdout"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/parse_u128_dec.w"
+command = ["wosy", "run", "app"]
+exit = 0
+file = "partition.normalized.ll"
+contents = "expected/partition_u128.ll"
