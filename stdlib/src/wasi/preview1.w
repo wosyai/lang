@@ -20,6 +20,7 @@ struct _Nread {
 _wasi = extern wasm "wasi_snapshot_preview1" {
 	unsafe i32(i32, *?_ReadIovec, i32, *?_Nread) _fd_read;
 	unsafe i32(i32, *?Iovec, i32, *?Nwritten) fd_write;
+	unsafe unit(i32) _proc_exit;
 };
 
 (u64, bool)(*?u8, u64) _fd_read_once = fn(destination, capacity) {
@@ -72,5 +73,12 @@ i32(i32, *?Iovec, *?Nwritten) fd_write_once = fn(
 		};
 	};
 	reported, complete
+};
+
+unit(u32) exit = fn(code) {
+	i32 slot = core.int_trunc<i32>(core.int_extend<u64>(code));
+	unsafe {
+		_wasi._proc_exit(slot);
+	};
 };
 %%end

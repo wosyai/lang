@@ -1,0 +1,20 @@
+shared_stdlib = true
+
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "app"]
+exit = 7
+stdout = "expected/valid.stdout"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/invalid.w"
+command = ["wosy", "run", "app"]
+exit = 3
+stdout = "expected/invalid.stdout"
+stderr = "expected/empty"
+exact = true

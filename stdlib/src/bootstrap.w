@@ -76,6 +76,10 @@ preview1 = namespace std "wasi/preview1.w";
 	preview1.read_into(destination, capacity)
 };
 
+unit(u32) exit = fn(code) {
+	preview1.exit(code);
+};
+
 enum ReadLineStatus {
 	line;
 	eof;
