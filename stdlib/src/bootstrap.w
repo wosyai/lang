@@ -867,24 +867,271 @@ bool(u128, bool) _parse_check_i128 = fn(magnitude, negative) {
 	result
 };
 
+u8(*?u8, u64) _parse_float_byte = fn(data, index) {
+	u128 wide = core.int_extend<u128>(index);
+	i64 position = core.int_trunc<i64>(wide);
+	u8 byte = 0;
+	unsafe { byte = core.load<u8>(core.offset<u8>(data, position)); };
+	byte
+};
+
+bool(u8) _parse_is_dot = fn(byte) {
+	byte == 46
+};
+
+bool(u8) _parse_is_e = fn(byte) {
+	byte == 101 || byte == 69
+};
+
+bool(u8) _parse_is_digit10 = fn(byte) {
+	byte >= 48 && byte <= 57
+};
+
+(f64, bool)(*?u8, u64, u64) _parse_float_f64 = fn(data, start, end) {
+	u64 one = core.int_extend<u64>(1);
+	f64 zero_value = 0.0;
+	f64 ten_value = 10.0;
+	f64 big_limit = 1.0e300;
+	f64 f64_max = 1.7976931348623157e308;
+	u8 zero_digit = 48;
+	i32 zero_count = 0;
+	i32 one_count = 1;
+	i32 ten_count = 10;
+	i32 cap = 1000000;
+	i32 limit = 1000;
+	i32 neg_limit = zero_count - limit;
+	f64 mant = zero_value;
+	i32 extra_scale = zero_count;
+	u64 pos = start;
+	bool valid = true;
+	bool saw_int = false;
+	bool last_underscore = false;
+	i32 frac_count = zero_count;
+	i32 exp_value = zero_count;
+	bool exp_negative = false;
+	bool int_done = false;
+	while (pos < end && valid && !int_done) {
+		u8 byte = _parse_float_byte(data, pos);
+		bool digit = _parse_is_digit10(byte);
+		bool underscore = _parse_is_underscore(byte);
+		if (digit) {
+			u8 small_int = byte - zero_digit;
+			u64 wide_digit = core.int_extend<u64>(small_int);
+			f64 digit_value = core.uint_to_float<f64>(wide_digit);
+			mant = mant * ten_value + digit_value;
+			if (mant > big_limit) {
+				mant = mant / ten_value;
+				extra_scale = extra_scale + one_count;
+			};
+			last_underscore = false;
+			saw_int = true;
+			pos = pos + one;
+		} else {
+			if (underscore) {
+				if (!saw_int) { valid = false; };
+				if (last_underscore) { valid = false; };
+				last_underscore = true;
+				pos = pos + one;
+			} else {
+				int_done = true;
+			};
+		}
+	}
+	if (last_underscore) { valid = false; };
+	if (!saw_int) { valid = false; };
+	bool has_dot = false;
+	if (valid && pos < end) {
+		u8 byte = _parse_float_byte(data, pos);
+		if (_parse_is_dot(byte)) {
+			has_dot = true;
+			pos = pos + one;
+		};
+	};
+	if (valid && has_dot) {
+		bool frac_started = false;
+		bool frac_trail = false;
+		bool frac_done = false;
+		while (pos < end && valid && !frac_done) {
+			u8 byte = _parse_float_byte(data, pos);
+			bool digit = _parse_is_digit10(byte);
+			bool underscore = _parse_is_underscore(byte);
+			if (digit) {
+				u8 small_frac = byte - zero_digit;
+				u64 wide_digit = core.int_extend<u64>(small_frac);
+				f64 digit_value = core.uint_to_float<f64>(wide_digit);
+				mant = mant * ten_value + digit_value;
+				if (mant > big_limit) {
+					mant = mant / ten_value;
+					extra_scale = extra_scale + one_count;
+				};
+				if (frac_count < cap) { frac_count = frac_count + one_count; };
+				frac_started = true;
+				frac_trail = false;
+				pos = pos + one;
+			} else {
+				if (underscore) {
+					if (!frac_started) { valid = false; };
+					if (frac_trail) { valid = false; };
+					frac_trail = true;
+					pos = pos + one;
+				} else {
+					frac_done = true;
+				};
+			}
+		}
+		if (frac_trail) { valid = false; };
+	};
+	bool has_exp = false;
+	if (valid && pos < end) {
+		u8 byte = _parse_float_byte(data, pos);
+		if (_parse_is_e(byte)) {
+			has_exp = true;
+			pos = pos + one;
+		};
+	};
+	if (valid && has_exp) {
+		if (pos < end) {
+			u8 byte = _parse_float_byte(data, pos);
+			if (_parse_is_sign(byte)) {
+				exp_negative = true;
+				pos = pos + one;
+			} else {
+				if (_parse_is_plus(byte)) { pos = pos + one; };
+			};
+		};
+		bool exp_started = false;
+		bool exp_trail = false;
+		bool exp_done = false;
+		while (pos < end && valid && !exp_done) {
+			u8 byte = _parse_float_byte(data, pos);
+			bool digit = _parse_is_digit10(byte);
+			bool underscore = _parse_is_underscore(byte);
+			if (digit) {
+				u8 small = byte - zero_digit;
+				i32 piece = core.int_extend<i32>(small);
+				if (exp_value < cap) { exp_value = exp_value * ten_count + piece; };
+				exp_started = true;
+				exp_trail = false;
+				pos = pos + one;
+			} else {
+				if (underscore) {
+					if (!exp_started) { valid = false; };
+					if (exp_trail) { valid = false; };
+					exp_trail = true;
+					pos = pos + one;
+				} else {
+					exp_done = true;
+				};
+			}
+		}
+		if (!exp_started) { valid = false; };
+		if (exp_trail) { valid = false; };
+	};
+	f64 scaled = mant;
+	if (valid) {
+		if (mant == zero_value) {
+			scaled = zero_value;
+		} else {
+			i32 exp_signed = exp_value;
+			if (exp_negative) { exp_signed = zero_count - exp_value; };
+			i32 adjusted = exp_signed - frac_count + extra_scale;
+			if (adjusted > limit) {
+				valid = false;
+			} else {
+				if (adjusted < neg_limit) {
+					scaled = zero_value;
+				} else {
+					i32 steps = adjusted;
+					if (steps < zero_count) { steps = zero_count - steps; };
+					if (adjusted > zero_count) {
+						while (steps > zero_count) {
+							scaled = scaled * ten_value;
+							steps = steps - one_count;
+						}
+					} else {
+						while (steps > zero_count) {
+							scaled = scaled / ten_value;
+							steps = steps - one_count;
+						}
+					};
+				};
+			};
+		};
+	};
+	if (valid && scaled > f64_max) { valid = false; };
+	if (valid && pos != end) { valid = false; };
+	scaled, valid
+};
+
 *f32(utf8) _parse_f32 = fn(text) {
 	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
+	f64 f64_max = 1.7976931348623157e308;
 	*f32 result = null;
 	if (text.data == null || text.length == zero) {
 		result = null;
 	} else {
-		result = null;
+		u8 first = _parse_float_byte(text.data, zero);
+		bool rejected = _parse_is_plus(first);
+		u64 pos = zero;
+		bool negative = false;
+		if (_parse_is_sign(first)) {
+			negative = true;
+			pos = one;
+		};
+		if (!rejected) {
+			f64 magnitude, bool valid = _parse_float_f64(text.data, pos, text.length);
+			if (valid) {
+				f32 narrowed = core.float_trunc<f32>(magnitude);
+				f64 back = core.float_extend<f64>(narrowed);
+				bool overflowed = back > f64_max;
+				bool fits = !overflowed;
+				if (fits) {
+					f32 value = narrowed;
+					if (negative) {
+						f32 zero_single = 0.0;
+						f32 one_single = 1.0;
+						f32 neg_one = zero_single - one_single;
+						value = narrowed * neg_one;
+					};
+					f32 out = value;
+					result = &out;
+				};
+			};
+		};
 	};
 	result
 };
 
 *f64(utf8) _parse_f64 = fn(text) {
 	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
+	f64 zero_value = 0.0;
+	f64 one_value = 1.0;
 	*f64 result = null;
 	if (text.data == null || text.length == zero) {
 		result = null;
 	} else {
-		result = null;
+		u8 first = _parse_float_byte(text.data, zero);
+		bool rejected = _parse_is_plus(first);
+		u64 pos = zero;
+		bool negative = false;
+		if (_parse_is_sign(first)) {
+			negative = true;
+			pos = one;
+		};
+		if (!rejected) {
+			f64 magnitude, bool valid = _parse_float_f64(text.data, pos, text.length);
+			if (valid) {
+				f64 value = magnitude;
+				if (negative) {
+					f64 neg_one = zero_value - one_value;
+					value = magnitude * neg_one;
+				};
+				f64 out = value;
+				result = &out;
+			};
+		};
 	};
 	result
 };
