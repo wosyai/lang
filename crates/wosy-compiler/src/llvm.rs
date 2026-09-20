@@ -1163,6 +1163,34 @@ fn builder_error(error: BuilderError) -> String {
     error.to_string()
 }
 
+fn entry_alloca<'ctx, 'module>(
+    state: &EmitState<'ctx, 'module>,
+    ty: BasicTypeEnum<'ctx>,
+    name: &str,
+) -> Result<PointerValue<'ctx>, String> {
+    let insert = state
+        .builder
+        .get_insert_block()
+        .ok_or_else(|| "missing insertion block".to_owned())?;
+    let function = insert
+        .get_parent()
+        .ok_or_else(|| "missing function".to_owned())?;
+    let entry = function
+        .get_first_basic_block()
+        .ok_or_else(|| "missing entry block".to_owned())?;
+    if let Some(first) = entry.get_first_instruction() {
+        state.builder.position_before(&first);
+    } else {
+        state.builder.position_at_end(entry);
+    }
+    let slot = state
+        .builder
+        .build_alloca(ty, name)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(insert);
+    Ok(slot)
+}
+
 fn structure<'a>(
     structs: &'a [ScalarStruct],
     id: crate::ScalarStructId,
@@ -1420,10 +1448,7 @@ fn emit_struct_literal<'ctx, 'module>(
     let storage = context.i8_type().array_type(
         u32::try_from(layout.size).map_err(|_| "struct layout exceeds LLVM array size")?,
     );
-    let destination = state
-        .builder
-        .build_alloca(storage, "struct_literal")
-        .map_err(builder_error)?;
+    let destination = entry_alloca(state, storage.into(), "struct_literal")?;
     let mut values = BTreeMap::new();
     for field in fields {
         values.insert(
@@ -1480,10 +1505,7 @@ fn emit_array_literal<'ctx, 'module>(
         return Err("array literal element count does not match fixed array length".to_owned());
     }
     let storage = storage_type(context, expected, state.structs, state.target_layout)?;
-    let destination = state
-        .builder
-        .build_alloca(storage, "array_literal")
-        .map_err(builder_error)?;
+    let destination = entry_alloca(state, storage, "array_literal")?;
     let element_storage = storage_type(context, element, state.structs, state.target_layout)?;
     for (index, expression) in elements.iter().enumerate() {
         let pointer = unsafe {
@@ -1573,13 +1595,11 @@ fn emit_utf8_literal<'ctx, 'module>(
         .map(|byte| byte_type.const_int(u64::from(*byte), false))
         .collect::<Vec<_>>();
     literal.set_initializer(&byte_type.const_array(&bytes));
-    let destination = state
-        .builder
-        .build_alloca(
-            storage_type(context, expected, state.structs, state.target_layout)?,
-            "utf8_literal",
-        )
-        .map_err(builder_error)?;
+    let destination = entry_alloca(
+        state,
+        storage_type(context, expected, state.structs, state.target_layout)?,
+        "utf8_literal",
+    )?;
     let data = unsafe {
         state.builder.build_in_bounds_gep(
             byte_type,
@@ -1788,13 +1808,11 @@ fn store_binding_outputs<'ctx, 'module>(
             state.values.insert(name.clone(), EmitValue::Unit);
             continue;
         }
-        let slot = state
-            .builder
-            .build_alloca(
-                storage_type(context, ty, state.structs, state.target_layout)?,
-                name,
-            )
-            .map_err(builder_error)?;
+        let slot = entry_alloca(
+            state,
+            storage_type(context, ty, state.structs, state.target_layout)?,
+            name,
+        )?;
         store_value(context, state, slot, ty, value)?;
         state.storage.insert(name.clone(), (slot, ty.clone()));
         transition_runtime_array_binding_initialization(state, name, ty, &binding.value);
@@ -3344,13 +3362,11 @@ fn emit_assignment<'ctx, 'module>(
                 }) {
                     Some(destination) => destination,
                     None => {
-                        let slot = state
-                            .builder
-                            .build_alloca(
-                                storage_type(context, &ty, state.structs, state.target_layout)?,
-                                name,
-                            )
-                            .map_err(builder_error)?;
+                        let slot = entry_alloca(
+                            state,
+                            storage_type(context, &ty, state.structs, state.target_layout)?,
+                            name,
+                        )?;
                         state.storage.insert(name.clone(), (slot, ty.clone()));
                         slot
                     }
@@ -3426,13 +3442,11 @@ fn emit_project_assignment<'ctx, 'module>(
                     }) {
                         Some(destination) => destination,
                         None => {
-                            let slot = state
-                                .builder
-                                .build_alloca(
-                                    storage_type(context, &ty, state.structs, state.target_layout)?,
-                                    name,
-                                )
-                                .map_err(builder_error)?;
+                            let slot = entry_alloca(
+                                state,
+                                storage_type(context, &ty, state.structs, state.target_layout)?,
+                                name,
+                            )?;
                             state.storage.insert(name.clone(), (slot, ty.clone()));
                             slot
                         }
@@ -3638,13 +3652,11 @@ fn materialize_assignment_values<'ctx, 'module>(
                 position += 1;
                 continue;
             }
-            let temporary = state
-                .builder
-                .build_alloca(
-                    storage_type(context, &ty, state.structs, state.target_layout)?,
-                    "assignment_value",
-                )
-                .map_err(builder_error)?;
+            let temporary = entry_alloca(
+                state,
+                storage_type(context, &ty, state.structs, state.target_layout)?,
+                "assignment_value",
+            )?;
             store_value(context, state, temporary, &ty, value)?;
             let value = if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
                 EmitValue::Basic(temporary.into())
