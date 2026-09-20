@@ -87,7 +87,7 @@ pub enum ScalarAutomaticReturnResultState {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarAutomaticReturnResult {
-    pub aggregate_type: ScalarStructId,
+    pub aggregate_type: ScalarType,
     pub allocation_identity: ScalarAllocationIdentity,
     pub state: ScalarAutomaticReturnResultState,
 }

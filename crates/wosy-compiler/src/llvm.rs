@@ -1830,9 +1830,9 @@ fn transition_automatic_return_result_binding_initialization(
     let ScalarType::CheckedReference { inner, .. } = ty else {
         return;
     };
-    let ScalarType::Struct(aggregate_type) = inner.as_ref() else {
+    if !automatic_return_result_copy_pointee(inner) {
         return;
-    };
+    }
     let source = match value {
         ScalarExpression::Call {
             receiver, name, ..
@@ -1854,7 +1854,7 @@ fn transition_automatic_return_result_binding_initialization(
         state.automatic_return_result_owners.insert(
             name.to_owned(),
             ScalarAutomaticReturnResult {
-                aggregate_type: aggregate_type.clone(),
+                aggregate_type: inner.as_ref().clone(),
                 allocation_identity: ScalarAllocationIdentity {
                     binding: name.to_owned(),
                 },
@@ -2013,6 +2013,27 @@ fn automatic_return_result_functions<'a>(
     }
 }
 
+fn automatic_return_result_copy_pointee(inner: &ScalarType) -> bool {
+    matches!(
+        inner,
+        ScalarType::Bool
+            | ScalarType::I8
+            | ScalarType::I16
+            | ScalarType::I32
+            | ScalarType::I64
+            | ScalarType::I128
+            | ScalarType::U8
+            | ScalarType::U16
+            | ScalarType::U32
+            | ScalarType::U64
+            | ScalarType::U128
+            | ScalarType::F32
+            | ScalarType::F64
+            | ScalarType::Char
+            | ScalarType::Struct(_)
+    )
+}
+
 fn automatic_return_result_function(
     function: &ScalarFunction,
     results: &BTreeSet<String>,
@@ -2027,7 +2048,7 @@ fn automatic_return_result_function(
     let ScalarType::CheckedReference { inner, .. } = &output.ty else {
         return false;
     };
-    if !matches!(inner.as_ref(), ScalarType::Struct(_)) {
+    if !automatic_return_result_copy_pointee(inner) {
         return false;
     }
     let bindings = return_bindings(&function.body);
@@ -3130,6 +3151,8 @@ fn emit_final_outputs<'ctx, 'module>(
     if block.final_output_values.len() == 1 {
         let output = &block.final_output_values[0];
         if matches!(&output.value, ScalarExpression::Call { .. }) {
+            transfer_runtime_array_return(state, block, &output.value, &output.ty);
+            transfer_automatic_return_result(state, &output.value);
             return emit_expression(context, state, &output.value);
         }
         let value = emit_typed_expression(context, state, &output.value, &output.ty)?;
@@ -3186,6 +3209,8 @@ fn emit_project_final_outputs<'ctx, 'module>(
     if block.final_output_values.len() == 1 {
         let output = &block.final_output_values[0];
         if matches!(&output.value, ScalarExpression::Call { .. }) {
+            transfer_runtime_array_return(state, block, &output.value, &output.ty);
+            transfer_automatic_return_result(state, &output.value);
             return emit_project_expression(context, state, &output.value, module, modules);
         }
         let value = emit_project_typed_expression(
@@ -6171,9 +6196,9 @@ fn automatic_return_result_materialization_type(
     let ScalarType::CheckedReference { inner, .. } = output else {
         return None;
     };
-    let ScalarType::Struct(_) = inner.as_ref() else {
+    if !automatic_return_result_copy_pointee(inner) {
         return None;
-    };
+    }
     match expression {
         ScalarExpression::CheckedAddress { .. } => Some(*inner.clone()),
         ScalarExpression::Name { name, .. } if visited.insert(name.clone()) => state
@@ -6192,6 +6217,47 @@ fn emit_automatic_return_result<'ctx, 'module>(
     value: BasicValueEnum<'ctx>,
     aggregate_type: &ScalarType,
 ) -> Result<BasicValueEnum<'ctx>, String> {
+    let address = value.into_int_value();
+    let function = state
+        .builder
+        .get_insert_block()
+        .ok_or_else(|| "missing insertion block".to_owned())?
+        .get_parent()
+        .ok_or_else(|| "missing function".to_owned())?;
+    let null_block = context.append_basic_block(
+        function,
+        &format!("return_result_null_{}", state.next_block),
+    );
+    state.next_block += 1;
+    let copy_block = context.append_basic_block(
+        function,
+        &format!("return_result_copy_{}", state.next_block),
+    );
+    state.next_block += 1;
+    let merge_block = context.append_basic_block(
+        function,
+        &format!("return_result_merge_{}", state.next_block),
+    );
+    state.next_block += 1;
+    let is_null = state
+        .builder
+        .build_int_compare(
+            IntPredicate::EQ,
+            address,
+            address.get_type().const_int(0, false),
+            "return_result_is_null",
+        )
+        .map_err(builder_error)?;
+    state
+        .builder
+        .build_conditional_branch(is_null, null_block, copy_block)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(null_block);
+    state
+        .builder
+        .build_unconditional_branch(merge_block)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(copy_block);
     let destination = emit_runtime_array_allocation(
         context,
         state,
@@ -6201,7 +6267,7 @@ fn emit_automatic_return_result<'ctx, 'module>(
     let source = state
         .builder
         .build_int_to_ptr(
-            value.into_int_value(),
+            address,
             context.ptr_type(AddressSpace::default()),
             "return_result_source",
         )
@@ -6215,15 +6281,35 @@ fn emit_automatic_return_result<'ctx, 'module>(
         .builder
         .build_store(destination, copied)
         .map_err(builder_error)?;
-    state
+    let heap_address = state
         .builder
         .build_ptr_to_int(
             destination,
             pointer_integer_type(context, state.target_layout),
             "return_result_address",
         )
-        .map_err(builder_error)
-        .map(Into::into)
+        .map_err(builder_error)?;
+    let copy_end = state
+        .builder
+        .get_insert_block()
+        .ok_or_else(|| "missing insertion block".to_owned())?;
+    state
+        .builder
+        .build_unconditional_branch(merge_block)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(merge_block);
+    let phi = state
+        .builder
+        .build_phi(address.get_type(), "return_result")
+        .map_err(builder_error)?;
+    phi.add_incoming(&[
+        (
+            &BasicValueEnum::IntValue(address.get_type().const_int(0, false)),
+            null_block,
+        ),
+        (&BasicValueEnum::IntValue(heap_address), copy_end),
+    ]);
+    Ok(phi.as_basic_value())
 }
 
 fn emit_return<'ctx, 'module>(
