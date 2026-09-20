@@ -1567,18 +1567,34 @@ fn record_overload_selections(program: &mut ScalarProgram) {
         })
         .collect::<BTreeMap<_, _>>();
     for item in &mut program.items {
-        if let ScalarItem::Binding(binding) = item {
-            let expected = binding
-                .receivers
-                .first()
-                .map(|receiver| &receiver.ty)
-                .unwrap_or(&binding.declared_type);
-            record_expression_overload_selection(
-                &mut binding.value,
-                Some(expected),
-                &scope,
-                &overloads,
-            );
+        match item {
+            ScalarItem::Binding(binding) => {
+                let expected = binding
+                    .receivers
+                    .first()
+                    .map(|receiver| &receiver.ty)
+                    .unwrap_or(&binding.declared_type);
+                record_expression_overload_selection(
+                    &mut binding.value,
+                    Some(expected),
+                    &scope,
+                    &overloads,
+                );
+            }
+            ScalarItem::Function(function) => {
+                let mut body_scope = scope.clone();
+                if let ScalarType::Callable { parameters, .. } = &function.signature {
+                    for (name, ty) in function.parameters.iter().zip(parameters) {
+                        body_scope.insert(name.clone(), ty.clone());
+                    }
+                }
+                record_block_overload_selections(&mut function.body, &body_scope, &overloads);
+            }
+            ScalarItem::Executable(item) => {
+                let mut item_scope = scope.clone();
+                record_block_item_overload_selections(item, &mut item_scope, &overloads);
+            }
+            ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
         }
     }
 }
@@ -1726,46 +1742,57 @@ fn record_block_overload_selections(
 ) {
     let mut scope = scope.clone();
     for item in &mut block.items {
-        match item {
-            ScalarBlockItem::LocalBinding(binding) => {
-                let expected = binding
-                    .receivers
-                    .first()
-                    .map(|receiver| &receiver.ty)
-                    .unwrap_or(&binding.declared_type);
+        record_block_item_overload_selections(item, &mut scope, overloads);
+    }
+    for output in &mut block.final_output_values {
+        record_expression_overload_selection(&mut output.value, None, &scope, overloads);
+    }
+}
+
+fn record_block_item_overload_selections(
+    item: &mut ScalarBlockItem,
+    scope: &mut BTreeMap<String, ScalarType>,
+    overloads: &BTreeMap<String, ScalarFunction>,
+) {
+    match item {
+        ScalarBlockItem::LocalBinding(binding) => {
+            let expected = binding
+                .receivers
+                .first()
+                .map(|receiver| &receiver.ty)
+                .unwrap_or(&binding.declared_type);
+            record_expression_overload_selection(
+                &mut binding.value,
+                Some(expected),
+                &scope,
+                overloads,
+            );
+            scope.insert(binding.name.clone(), binding.declared_type.clone());
+            for receiver in &binding.receivers {
+                scope.insert(receiver.name.clone(), receiver.ty.clone());
+            }
+        }
+        ScalarBlockItem::Expression(expression) => {
+            record_expression_overload_selection(expression, None, &scope, overloads)
+        }
+        ScalarBlockItem::Assignment(assignment) => {
+            record_expression_overload_selection(
+                &mut assignment.value,
+                scope.get(&assignment.target),
+                &scope,
+                overloads,
+            );
+            for (value, target) in assignment.values.iter_mut().zip(&assignment.targets) {
                 record_expression_overload_selection(
-                    &mut binding.value,
-                    Some(expected),
+                    value,
+                    scope.get(&target.target),
                     &scope,
                     overloads,
                 );
-                scope.insert(binding.name.clone(), binding.declared_type.clone());
-                for receiver in &binding.receivers {
-                    scope.insert(receiver.name.clone(), receiver.ty.clone());
-                }
             }
-            ScalarBlockItem::Expression(expression) => {
-                record_expression_overload_selection(expression, None, &scope, overloads)
-            }
-            ScalarBlockItem::Assignment(assignment) => {
-                record_expression_overload_selection(
-                    &mut assignment.value,
-                    scope.get(&assignment.target),
-                    &scope,
-                    overloads,
-                );
-                for (value, target) in assignment.values.iter_mut().zip(&assignment.targets) {
-                    record_expression_overload_selection(
-                        value,
-                        scope.get(&target.target),
-                        &scope,
-                        overloads,
-                    );
-                }
-            }
-            ScalarBlockItem::While(while_expression) => {
-                record_block_overload_selections(&mut while_expression.body, &scope, overloads)
-            }
+        }
+        ScalarBlockItem::While(while_expression) => {
+            record_block_overload_selections(&mut while_expression.body, &scope, overloads)
         }
     }
 }
@@ -2641,18 +2668,34 @@ fn record_project_overload_selections(project: &mut ScalarProject) {
             }
         }
         for item in &mut module.items {
-            if let ScalarItem::Binding(binding) = item {
-                let expected = binding
-                    .receivers
-                    .first()
-                    .map(|receiver| &receiver.ty)
-                    .unwrap_or(&binding.declared_type);
-                record_expression_overload_selection(
-                    &mut binding.value,
-                    Some(expected),
-                    &scope,
-                    &overloads,
-                );
+            match item {
+                ScalarItem::Binding(binding) => {
+                    let expected = binding
+                        .receivers
+                        .first()
+                        .map(|receiver| &receiver.ty)
+                        .unwrap_or(&binding.declared_type);
+                    record_expression_overload_selection(
+                        &mut binding.value,
+                        Some(expected),
+                        &scope,
+                        &overloads,
+                    );
+                }
+                ScalarItem::Function(function) => {
+                    let mut body_scope = scope.clone();
+                    if let ScalarType::Callable { parameters, .. } = &function.signature {
+                        for (name, ty) in function.parameters.iter().zip(parameters) {
+                            body_scope.insert(name.clone(), ty.clone());
+                        }
+                    }
+                    record_block_overload_selections(&mut function.body, &body_scope, &overloads);
+                }
+                ScalarItem::Executable(item) => {
+                    let mut item_scope = scope.clone();
+                    record_block_item_overload_selections(item, &mut item_scope, &overloads);
+                }
+                ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
             }
         }
     }
