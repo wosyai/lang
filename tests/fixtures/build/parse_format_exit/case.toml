@@ -42,3 +42,11 @@ exit = 0
 stdout = "expected/parse_u128_boundary.stdout"
 stderr = "expected/empty"
 exact = true
+
+[[assert]]
+source = "project/src/parse_reject_matrix.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/parse_reject_matrix.stdout"
+stderr = "expected/empty"
+exact = true
