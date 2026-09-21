@@ -1837,9 +1837,7 @@ fn transition_automatic_return_result_binding_initialization(
         return;
     }
     let source = match value {
-        ScalarExpression::Call {
-            receiver, name, ..
-        } => {
+        ScalarExpression::Call { receiver, name, .. } => {
             let lookup = receiver
                 .as_ref()
                 .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"));
@@ -1848,9 +1846,9 @@ fn transition_automatic_return_result_binding_initialization(
                 .get(&lookup)
                 .is_some_and(|target| state.automatic_return_result_results.contains(target))
         }
-        ScalarExpression::Name { name: source, .. } => state
-            .automatic_return_result_owners
-            .contains_key(source),
+        ScalarExpression::Name { name: source, .. } => {
+            state.automatic_return_result_owners.contains_key(source)
+        }
         _ => false,
     };
     if source {
@@ -1889,12 +1887,20 @@ fn release_automatic_return_result_owners<'ctx, 'module>(
             .ok_or_else(|| format!("missing automatic return-result storage for {name}"))?;
         let pointer = state
             .builder
-            .build_load(basic_type(context, &ty, state.target_layout)?, slot, "return_result_owner")
+            .build_load(
+                basic_type(context, &ty, state.target_layout)?,
+                slot,
+                "return_result_owner",
+            )
             .map_err(builder_error)?
             .into_int_value();
         let pointer = state
             .builder
-            .build_int_to_ptr(pointer, context.ptr_type(AddressSpace::default()), "return_result_release")
+            .build_int_to_ptr(
+                pointer,
+                context.ptr_type(AddressSpace::default()),
+                "return_result_release",
+            )
             .map_err(builder_error)?;
         declare_core_runtime(context, state.module);
         let release = state
@@ -2072,11 +2078,19 @@ fn automatic_return_result_expression(
     visited: &mut BTreeSet<String>,
 ) -> bool {
     match expression {
-        ScalarExpression::CheckedAddress { place, .. } => matches!(place, crate::ScalarPlace::Name { name, .. } if bindings.contains_key(name)),
+        ScalarExpression::CheckedAddress { place, .. } => {
+            matches!(place, crate::ScalarPlace::Name { name, .. } if bindings.contains_key(name))
+        }
         ScalarExpression::Name { name, .. } => {
             visited.insert(name.clone())
                 && bindings.get(name).is_some_and(|value| {
-                    automatic_return_result_expression(value, bindings, results, call_targets, visited)
+                    automatic_return_result_expression(
+                        value,
+                        bindings,
+                        results,
+                        call_targets,
+                        visited,
+                    )
                 })
         }
         ScalarExpression::Call { receiver, name, .. } => {
@@ -2635,7 +2649,11 @@ fn emit_function<'ctx, 'module>(
         &mut state,
         result,
         outputs,
-        function.body.final_output_values.first().map(|output| &output.value),
+        function
+            .body
+            .final_output_values
+            .first()
+            .map(|output| &output.value),
     )
 }
 
@@ -2848,7 +2866,11 @@ fn emit_project_function<'ctx, 'module>(
         &mut state,
         result,
         outputs,
-        function.body.final_output_values.first().map(|output| &output.value),
+        function
+            .body
+            .final_output_values
+            .first()
+            .map(|output| &output.value),
     )
 }
 
@@ -3084,11 +3106,7 @@ fn emit_block<'ctx, 'module>(
         result = emit_final_outputs(context, state, block)?;
     }
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
-    release_automatic_return_result_owners(
-        context,
-        state,
-        &automatic_return_result_owners,
-    )?;
+    release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
     state.storage = storage;
     state.values = values;
     state.runtime_array_owners = runtime_array_owners;
@@ -3133,11 +3151,7 @@ fn emit_project_block<'ctx, 'module>(
         result = emit_project_final_outputs(context, state, block, module, modules)?;
     }
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
-    release_automatic_return_result_owners(
-        context,
-        state,
-        &automatic_return_result_owners,
-    )?;
+    release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
     state.storage = storage;
     state.values = values;
     state.runtime_array_owners = runtime_array_owners;
@@ -6287,10 +6301,7 @@ where
     }
 }
 
-fn transfer_automatic_return_result(
-    state: &mut EmitState<'_, '_>,
-    expression: &ScalarExpression,
-) {
+fn transfer_automatic_return_result(state: &mut EmitState<'_, '_>, expression: &ScalarExpression) {
     if let ScalarExpression::Name { name, .. } = expression {
         if let Some(result) = state.automatic_return_result_owners.get_mut(name) {
             result.state = ScalarAutomaticReturnResultState::Transferred;
@@ -6313,12 +6324,11 @@ fn automatic_return_result_materialization_type(
     }
     match expression {
         ScalarExpression::CheckedAddress { .. } => Some(*inner.clone()),
-        ScalarExpression::Name { name, .. } if visited.insert(name.clone()) => state
-            .return_bindings
-            .get(name)
-            .and_then(|value| {
+        ScalarExpression::Name { name, .. } if visited.insert(name.clone()) => {
+            state.return_bindings.get(name).and_then(|value| {
                 automatic_return_result_materialization_type(state, value, output, visited)
-            }),
+            })
+        }
         _ => None,
     }
 }
