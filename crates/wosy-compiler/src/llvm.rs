@@ -449,7 +449,7 @@ pub fn emit_scalar_project_llvm(
         .first()
         .ok_or_else(|| "project has no reachable modules".to_owned())?
         .source
-        .project
+        .path
         .clone();
     let context = Context::create();
     let module = ManuallyDrop::new(context.create_module(&module_name));
@@ -6481,7 +6481,6 @@ fn emit_return<'ctx, 'module>(
 fn project_function_name(source: &wosy_syntax::SourceIdentity, name: &str) -> String {
     let mut symbol = String::from("wosy_fn");
     for component in [
-        source.project.as_str(),
         source.package.as_str(),
         source.path.as_str(),
         source.revision.as_str(),
@@ -9224,7 +9223,7 @@ count, complete = read_into(buffer, requested_capacity);
             .to_text();
         let main = text.split("define i32 @main").nth(1).expect("main");
         let read = text
-            .split("define i32 @wosy_fn__70726f6a656374__7061636b616765__7372632f6d61696e2e77__7231__72656164")
+            .split("define i32 @wosy_fn__7061636b616765__7372632f6d61696e2e77__7231__72656164")
             .nth(1)
             .expect("read");
         assert!(main.contains("store i32 41"));
@@ -9461,7 +9460,7 @@ count, complete = read_into(buffer, requested_capacity);
                     .find("store i32 1")
                     .expect("project assignment store")
         );
-        assert!(project_text.contains("load i32, ptr @wosy_fn__70726f6a656374__7061636b616765__7372632f6d61696e2e77__7231__676c6f62616c5f76616c7565"));
+        assert!(project_text.contains("load i32, ptr @wosy_fn__7061636b616765__7372632f6d61696e2e77__7231__676c6f62616c5f76616c7565"));
     }
 
     #[test]

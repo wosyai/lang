@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """Golden-partition gate for the u128_libcall fixture.
 
-The compiler bakes the absolute module paths of the temporary build
-directory into project-qualified symbol names (including a nested encoding
-inside overload-instance names), so partition.ll differs on every harness
-run by construction and no raw byte golden can match. This script:
+Project IR symbol names are stable: they encode only
+`[package, path, revision, name]` (never the absolute temporary build
+directory), and the module header carries the entry `source.path`. The
+partition is therefore byte-identical on every harness run, so the golden
+in `expected/partition_u128.ll` pins the full IR with an exact compare.
+This script:
 
 1. Verifies the properties the golden carries:
-   - the u128-selecting source pulls the u128/i128 parse and format arms
-     into the partition (their definitions are present);
-   - the lowering emits `mul i128` / `udiv i128` at the accumulate and
-     halves sites. LLVM codegen expands exactly these instructions into
-     the `__multi3` / `__udivti3` libcalls on wasm32; the linked runtime.o
-     definitions resolve them (proven by the green run asserts);
-   - the partition itself carries no `__multi3` / `__udivti3` references:
-     the libcalls materialize only at codegen into the object file, never
-     as IR-level declares.
-2. Writes the path-normalized partition for the exact-compare file assert
-   in case.toml. Normalization replaces only absolute path material
-   (recursively, because overload-instance names nest the encoding) plus
-   the ModuleID/source_filename header lines; everything else is
-   byte-preserved, so the golden still pins the full IR.
+    - the u128-selecting source pulls the u128/i128 parse and format arms
+      into the partition (their definitions are present);
+    - the lowering emits `mul i128` / `udiv i128` at the accumulate and
+      halves sites. LLVM codegen expands exactly these instructions into
+      the `__multi3` / `__udivti3` libcalls on wasm32; the linked runtime.o
+      definitions resolve them (proven by the green run asserts);
+    - the partition itself carries no `__multi3` / `__udivti3` references:
+      the libcalls materialize only at codegen into the object file, never
+      as IR-level declares.
+2. Copies the partition verbatim to `partition.normalized.ll` for the
+   exact-compare file assert in case.toml. No normalization remains: there
+   is no absolute path material left to strip.
 
 Reads `.wosy/artifacts/app/dev/main/partition.ll`, writes
 `partition.normalized.ll`. Exits 0 when every property holds, 1 with
@@ -28,6 +28,7 @@ diagnostics otherwise.
 """
 
 import re
+import shutil
 import sys
 
 PARTITION = ".wosy/artifacts/app/dev/main/partition.ll"
@@ -42,39 +43,6 @@ ARMS = [
     "_parse_accumulate_i128_neg",
     "_format_i128",
 ]
-
-ABS = r"[A-Za-z]:\\[^\"\s]*"
-
-
-def deep_norm_run(run):
-    try:
-        decoded = bytes.fromhex(run).decode()
-    except Exception:
-        return run
-
-    flags = []
-
-    def inner(match):
-        result = deep_norm_run(match.group(0))
-        if result != match.group(0):
-            flags.append(True)
-        return result
-
-    decoded, _ = re.subn(r"[0-9a-f]{32,}", inner, decoded)
-    decoded, n_path = re.subn(ABS, "__WOSY_PATH__", decoded)
-    if not flags and n_path == 0:
-        return run
-    return decoded.encode().hex()
-
-
-def normalize(text):
-    lines = []
-    for line in text.split("\n"):
-        if line.startswith("; ModuleID = ") or line.startswith("source_filename = "):
-            lines.append("__WOSY_HEADER__")
-            continue
-        lines.append(re.sub(r"[0-9a-f]{32,}", lambda m: deep_norm_run(m.group(0)), line))
-    return "\n".join(lines)
 
 
 def main():
@@ -102,8 +70,7 @@ def main():
             print(f"check-partition: {failure}")
         return 1
     try:
-        with open(NORMALIZED, "w", encoding="utf-8", newline="") as file:
-            file.write(normalize(text))
+        shutil.copyfile(PARTITION, NORMALIZED)
     except OSError as error:
         print(f"check-partition: cannot write {NORMALIZED}: {error}")
         return 1
