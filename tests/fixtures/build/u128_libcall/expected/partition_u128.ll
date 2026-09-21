@@ -10578,52 +10578,52 @@ entry:
 
 define i32 @main() {
 entry:
-  %utf8_literal583 = alloca [16 x i8], align 1
-  %utf8_literal575 = alloca [16 x i8], align 1
-  %struct_literal567 = alloca [16 x i8], align 1
-  %assignment_value565 = alloca i32, align 4
-  %array_literal559 = alloca [4 x i8], align 1
-  %utf8_literal555 = alloca [16 x i8], align 1
-  %utf8_literal547 = alloca [16 x i8], align 1
-  %struct_literal539 = alloca [16 x i8], align 1
-  %assignment_value537 = alloca i32, align 4
-  %array_literal533 = alloca [2 x i8], align 1
-  %utf8_literal529 = alloca [16 x i8], align 1
-  %utf8_literal521 = alloca [16 x i8], align 1
-  %struct_literal513 = alloca [16 x i8], align 1
-  %assignment_value511 = alloca i32, align 4
-  %array_literal507 = alloca [2 x i8], align 1
-  %utf8_literal503 = alloca [16 x i8], align 1
-  %struct_literal493 = alloca [16 x i8], align 1
-  %assignment_value491 = alloca i32, align 4
-  %array_literal484 = alloca [5 x i8], align 1
-  %utf8_literal480 = alloca [16 x i8], align 1
-  %utf8_literal472 = alloca [16 x i8], align 1
-  %struct_literal463 = alloca [16 x i8], align 1
-  %assignment_value461 = alloca i32, align 4
-  %array_literal424 = alloca [35 x i8], align 1
-  %utf8_literal420 = alloca [16 x i8], align 1
-  %utf8_literal411 = alloca [16 x i8], align 1
-  %struct_literal401 = alloca [16 x i8], align 1
-  %assignment_value399 = alloca i32, align 4
-  %array_literal352 = alloca [45 x i8], align 1
+  %utf8_literal598 = alloca [16 x i8], align 1
+  %utf8_literal590 = alloca [16 x i8], align 1
+  %struct_literal582 = alloca [16 x i8], align 1
+  %assignment_value580 = alloca i32, align 4
+  %array_literal574 = alloca [4 x i8], align 1
+  %utf8_literal570 = alloca [16 x i8], align 1
+  %utf8_literal562 = alloca [16 x i8], align 1
+  %struct_literal554 = alloca [16 x i8], align 1
+  %assignment_value552 = alloca i32, align 4
+  %array_literal548 = alloca [2 x i8], align 1
+  %utf8_literal544 = alloca [16 x i8], align 1
+  %utf8_literal536 = alloca [16 x i8], align 1
+  %struct_literal528 = alloca [16 x i8], align 1
+  %assignment_value526 = alloca i32, align 4
+  %array_literal522 = alloca [2 x i8], align 1
+  %utf8_literal518 = alloca [16 x i8], align 1
+  %struct_literal505 = alloca [16 x i8], align 1
+  %assignment_value503 = alloca i32, align 4
+  %array_literal496 = alloca [5 x i8], align 1
+  %utf8_literal492 = alloca [16 x i8], align 1
+  %utf8_literal484 = alloca [16 x i8], align 1
+  %struct_literal475 = alloca [16 x i8], align 1
+  %assignment_value473 = alloca i32, align 4
+  %array_literal436 = alloca [35 x i8], align 1
+  %utf8_literal432 = alloca [16 x i8], align 1
+  %utf8_literal423 = alloca [16 x i8], align 1
+  %struct_literal410 = alloca [16 x i8], align 1
+  %assignment_value408 = alloca i32, align 4
+  %array_literal361 = alloca [45 x i8], align 1
+  %utf8_literal357 = alloca [16 x i8], align 1
   %utf8_literal348 = alloca [16 x i8], align 1
-  %utf8_literal339 = alloca [16 x i8], align 1
-  %struct_literal329 = alloca [16 x i8], align 1
-  %assignment_value327 = alloca i32, align 4
-  %array_literal195 = alloca [130 x i8], align 1
-  %utf8_literal191 = alloca [16 x i8], align 1
-  %utf8_literal182 = alloca [16 x i8], align 1
-  %struct_literal172 = alloca [16 x i8], align 1
-  %assignment_value170 = alloca i32, align 4
-  %array_literal134 = alloca [34 x i8], align 1
-  %utf8_literal130 = alloca [16 x i8], align 1
-  %utf8_literal122 = alloca [16 x i8], align 1
-  %struct_literal114 = alloca [16 x i8], align 1
-  %assignment_value112 = alloca i32, align 4
-  %array_literal71 = alloca [39 x i8], align 1
-  %utf8_literal67 = alloca [16 x i8], align 1
-  %utf8_literal59 = alloca [16 x i8], align 1
+  %struct_literal335 = alloca [16 x i8], align 1
+  %assignment_value333 = alloca i32, align 4
+  %array_literal201 = alloca [130 x i8], align 1
+  %utf8_literal197 = alloca [16 x i8], align 1
+  %utf8_literal188 = alloca [16 x i8], align 1
+  %struct_literal175 = alloca [16 x i8], align 1
+  %assignment_value173 = alloca i32, align 4
+  %array_literal137 = alloca [34 x i8], align 1
+  %utf8_literal133 = alloca [16 x i8], align 1
+  %utf8_literal125 = alloca [16 x i8], align 1
+  %struct_literal117 = alloca [16 x i8], align 1
+  %assignment_value115 = alloca i32, align 4
+  %array_literal74 = alloca [39 x i8], align 1
+  %utf8_literal70 = alloca [16 x i8], align 1
+  %utf8_literal62 = alloca [16 x i8], align 1
   %struct_literal52 = alloca [16 x i8], align 1
   %assignment_value50 = alloca i32, align 4
   %array_literal9 = alloca [39 x i8], align 1
@@ -10649,6 +10649,14 @@ entry:
   %call = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787430)
   store i32 %call, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756530, align 4
   %value0 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756530, align 4
+  %deref_is_null = icmp eq i32 %value0, 0
+  br i1 %deref_is_null, label %deref_null_panic, label %deref_null_continue
+
+deref_null_panic:                                 ; preds = %entry
+  call void @__wosy_core_system_panic()
+  unreachable
+
+deref_null_continue:                              ; preds = %entry
   %deref = inttoptr i32 %value0 to ptr
   %place = load i128, ptr %deref, align 4
   store i128 %place, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657230, align 4
@@ -10756,1008 +10764,1048 @@ entry:
   %call56 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787431)
   store i32 %call56, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756531, align 4
   %value1 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756531, align 4
-  %deref57 = inttoptr i32 %value1 to ptr
-  %place58 = load i128, ptr %deref57, align 4
-  store i128 %place58, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657231, align 4
+  %deref_is_null57 = icmp eq i32 %value1, 0
+  br i1 %deref_is_null57, label %deref_null_panic58, label %deref_null_continue59
+
+deref_null_panic58:                               ; preds = %deref_null_continue
+  call void @__wosy_core_system_panic()
+  unreachable
+
+deref_null_continue59:                            ; preds = %deref_null_continue
+  %deref60 = inttoptr i32 %value1 to ptr
+  %place61 = load i128, ptr %deref60, align 4
+  store i128 %place61, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657231, align 4
   store i128 -1, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656431, align 4
   %number1 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657231, align 4
   %expected1 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656431, align 4
   %eq = icmp eq i128 %number1, %expected1
   br i1 %eq, label %if.then, label %if.merge
 
-if.then:                                          ; preds = %entry
-  %data60 = getelementptr inbounds i8, ptr %utf8_literal59, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_1 to i32), ptr %data60, align 4
-  %length61 = getelementptr inbounds i8, ptr %utf8_literal59, i8 8
-  store i64 6, ptr %length61, align 4
-  %call62 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal59)
+if.then:                                          ; preds = %deref_null_continue59
+  %data63 = getelementptr inbounds i8, ptr %utf8_literal62, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_1 to i32), ptr %data63, align 4
+  %length64 = getelementptr inbounds i8, ptr %utf8_literal62, i8 8
+  store i64 6, ptr %length64, align 4
+  %call65 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal62)
   br label %if.merge
 
-if.merge:                                         ; preds = %if.then, %entry
-  %number163 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657231, align 4
-  %expected164 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656431, align 4
-  %ne = icmp ne i128 %number163, %expected164
-  br i1 %ne, label %if.then65, label %if.merge66
+if.merge:                                         ; preds = %if.then, %deref_null_continue59
+  %number166 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657231, align 4
+  %expected167 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656431, align 4
+  %ne = icmp ne i128 %number166, %expected167
+  br i1 %ne, label %if.then68, label %if.merge69
 
-if.then65:                                        ; preds = %if.merge
-  %data68 = getelementptr inbounds i8, ptr %utf8_literal67, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_2 to i32), ptr %data68, align 4
-  %length69 = getelementptr inbounds i8, ptr %utf8_literal67, i8 8
-  store i64 9, ptr %length69, align 4
-  %call70 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal67)
-  br label %if.merge66
+if.then68:                                        ; preds = %if.merge
+  %data71 = getelementptr inbounds i8, ptr %utf8_literal70, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_2 to i32), ptr %data71, align 4
+  %length72 = getelementptr inbounds i8, ptr %utf8_literal70, i8 8
+  store i64 9, ptr %length72, align 4
+  %call73 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal70)
+  br label %if.merge69
 
-if.merge66:                                       ; preds = %if.then65, %if.merge
-  %array_element72 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 0
-  store i8 51, ptr %array_element72, align 1
-  %array_element73 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 1
-  store i8 52, ptr %array_element73, align 1
-  %array_element74 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 2
-  store i8 48, ptr %array_element74, align 1
-  %array_element75 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 3
-  store i8 50, ptr %array_element75, align 1
-  %array_element76 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 4
-  store i8 56, ptr %array_element76, align 1
-  %array_element77 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 5
-  store i8 50, ptr %array_element77, align 1
-  %array_element78 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 6
-  store i8 51, ptr %array_element78, align 1
-  %array_element79 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 7
-  store i8 54, ptr %array_element79, align 1
-  %array_element80 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 8
-  store i8 54, ptr %array_element80, align 1
-  %array_element81 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 9
-  store i8 57, ptr %array_element81, align 1
-  %array_element82 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 10
-  store i8 50, ptr %array_element82, align 1
-  %array_element83 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 11
-  store i8 48, ptr %array_element83, align 1
-  %array_element84 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 12
+if.merge69:                                       ; preds = %if.then68, %if.merge
+  %array_element75 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 0
+  store i8 51, ptr %array_element75, align 1
+  %array_element76 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 1
+  store i8 52, ptr %array_element76, align 1
+  %array_element77 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 2
+  store i8 48, ptr %array_element77, align 1
+  %array_element78 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 3
+  store i8 50, ptr %array_element78, align 1
+  %array_element79 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 4
+  store i8 56, ptr %array_element79, align 1
+  %array_element80 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 5
+  store i8 50, ptr %array_element80, align 1
+  %array_element81 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 6
+  store i8 51, ptr %array_element81, align 1
+  %array_element82 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 7
+  store i8 54, ptr %array_element82, align 1
+  %array_element83 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 8
+  store i8 54, ptr %array_element83, align 1
+  %array_element84 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 9
   store i8 57, ptr %array_element84, align 1
-  %array_element85 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 13
-  store i8 51, ptr %array_element85, align 1
-  %array_element86 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 14
-  store i8 56, ptr %array_element86, align 1
-  %array_element87 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 15
-  store i8 52, ptr %array_element87, align 1
-  %array_element88 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 16
-  store i8 54, ptr %array_element88, align 1
-  %array_element89 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 17
-  store i8 51, ptr %array_element89, align 1
-  %array_element90 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 18
+  %array_element85 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 10
+  store i8 50, ptr %array_element85, align 1
+  %array_element86 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 11
+  store i8 48, ptr %array_element86, align 1
+  %array_element87 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 12
+  store i8 57, ptr %array_element87, align 1
+  %array_element88 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 13
+  store i8 51, ptr %array_element88, align 1
+  %array_element89 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 14
+  store i8 56, ptr %array_element89, align 1
+  %array_element90 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 15
   store i8 52, ptr %array_element90, align 1
-  %array_element91 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 19
+  %array_element91 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 16
   store i8 54, ptr %array_element91, align 1
-  %array_element92 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 20
+  %array_element92 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 17
   store i8 51, ptr %array_element92, align 1
-  %array_element93 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 21
-  store i8 51, ptr %array_element93, align 1
-  %array_element94 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 22
-  store i8 55, ptr %array_element94, align 1
-  %array_element95 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 23
-  store i8 52, ptr %array_element95, align 1
-  %array_element96 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 24
-  store i8 54, ptr %array_element96, align 1
-  %array_element97 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 25
-  store i8 48, ptr %array_element97, align 1
-  %array_element98 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 26
-  store i8 55, ptr %array_element98, align 1
-  %array_element99 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 27
-  store i8 52, ptr %array_element99, align 1
-  %array_element100 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 28
-  store i8 51, ptr %array_element100, align 1
-  %array_element101 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 29
-  store i8 49, ptr %array_element101, align 1
-  %array_element102 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 30
-  store i8 55, ptr %array_element102, align 1
-  %array_element103 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 31
-  store i8 54, ptr %array_element103, align 1
-  %array_element104 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 32
-  store i8 56, ptr %array_element104, align 1
-  %array_element105 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 33
-  store i8 50, ptr %array_element105, align 1
-  %array_element106 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 34
-  store i8 49, ptr %array_element106, align 1
-  %array_element107 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 35
-  store i8 49, ptr %array_element107, align 1
-  %array_element108 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 36
-  store i8 52, ptr %array_element108, align 1
-  %array_element109 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 37
-  store i8 53, ptr %array_element109, align 1
-  %array_element110 = getelementptr inbounds [39 x i8], ptr %array_literal71, i32 0, i32 38
-  store i8 54, ptr %array_element110, align 1
-  %struct_value111 = load [39 x i8], ptr %array_literal71, align 1
-  store [39 x i8] %struct_value111, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657332, align 1
+  %array_element93 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 18
+  store i8 52, ptr %array_element93, align 1
+  %array_element94 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 19
+  store i8 54, ptr %array_element94, align 1
+  %array_element95 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 20
+  store i8 51, ptr %array_element95, align 1
+  %array_element96 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 21
+  store i8 51, ptr %array_element96, align 1
+  %array_element97 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 22
+  store i8 55, ptr %array_element97, align 1
+  %array_element98 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 23
+  store i8 52, ptr %array_element98, align 1
+  %array_element99 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 24
+  store i8 54, ptr %array_element99, align 1
+  %array_element100 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 25
+  store i8 48, ptr %array_element100, align 1
+  %array_element101 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 26
+  store i8 55, ptr %array_element101, align 1
+  %array_element102 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 27
+  store i8 52, ptr %array_element102, align 1
+  %array_element103 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 28
+  store i8 51, ptr %array_element103, align 1
+  %array_element104 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 29
+  store i8 49, ptr %array_element104, align 1
+  %array_element105 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 30
+  store i8 55, ptr %array_element105, align 1
+  %array_element106 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 31
+  store i8 54, ptr %array_element106, align 1
+  %array_element107 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 32
+  store i8 56, ptr %array_element107, align 1
+  %array_element108 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 33
+  store i8 50, ptr %array_element108, align 1
+  %array_element109 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 34
+  store i8 49, ptr %array_element109, align 1
+  %array_element110 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 35
+  store i8 49, ptr %array_element110, align 1
+  %array_element111 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 36
+  store i8 52, ptr %array_element111, align 1
+  %array_element112 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 37
+  store i8 53, ptr %array_element112, align 1
+  %array_element113 = getelementptr inbounds [39 x i8], ptr %array_literal74, i32 0, i32 38
+  store i8 54, ptr %array_element113, align 1
+  %struct_value114 = load [39 x i8], ptr %array_literal74, align 1
+  store [39 x i8] %struct_value114, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657332, align 1
   store i32 0, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746132, align 4
-  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657332 to i32), ptr %assignment_value112, align 4
-  %assignment_value113 = load i32, ptr %assignment_value112, align 4
-  store i32 %assignment_value113, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746132, align 4
+  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657332 to i32), ptr %assignment_value115, align 4
+  %assignment_value116 = load i32, ptr %assignment_value115, align 4
+  store i32 %assignment_value116, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746132, align 4
   %data2 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746132, align 4
-  %data115 = getelementptr inbounds i8, ptr %struct_literal114, i8 0
-  store i32 %data2, ptr %data115, align 4
-  %length116 = getelementptr inbounds i8, ptr %struct_literal114, i8 8
-  store i64 39, ptr %length116, align 4
-  %struct_value117 = load [16 x i8], ptr %struct_literal114, align 1
-  store [16 x i8] %struct_value117, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787432, align 1
-  %call118 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787432)
-  store i32 %call118, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756532, align 4
+  %data118 = getelementptr inbounds i8, ptr %struct_literal117, i8 0
+  store i32 %data2, ptr %data118, align 4
+  %length119 = getelementptr inbounds i8, ptr %struct_literal117, i8 8
+  store i64 39, ptr %length119, align 4
+  %struct_value120 = load [16 x i8], ptr %struct_literal117, align 1
+  store [16 x i8] %struct_value120, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787432, align 1
+  %call121 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787432)
+  store i32 %call121, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756532, align 4
   %value2 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756532, align 4
-  %eq119 = icmp eq i32 %value2, 0
-  br i1 %eq119, label %if.then120, label %if.merge121
+  %eq122 = icmp eq i32 %value2, 0
+  br i1 %eq122, label %if.then123, label %if.merge124
 
-if.then120:                                       ; preds = %if.merge66
-  %data123 = getelementptr inbounds i8, ptr %utf8_literal122, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_3 to i32), ptr %data123, align 4
-  %length124 = getelementptr inbounds i8, ptr %utf8_literal122, i8 8
-  store i64 5, ptr %length124, align 4
-  %call125 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal122)
-  br label %if.merge121
+if.then123:                                       ; preds = %if.merge69
+  %data126 = getelementptr inbounds i8, ptr %utf8_literal125, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_3 to i32), ptr %data126, align 4
+  %length127 = getelementptr inbounds i8, ptr %utf8_literal125, i8 8
+  store i64 5, ptr %length127, align 4
+  %call128 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal125)
+  br label %if.merge124
 
-if.merge121:                                      ; preds = %if.then120, %if.merge66
-  %value2126 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756532, align 4
-  %ne127 = icmp ne i32 %value2126, 0
-  br i1 %ne127, label %if.then128, label %if.merge129
+if.merge124:                                      ; preds = %if.then123, %if.merge69
+  %value2129 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756532, align 4
+  %ne130 = icmp ne i32 %value2129, 0
+  br i1 %ne130, label %if.then131, label %if.merge132
 
-if.then128:                                       ; preds = %if.merge121
-  %data131 = getelementptr inbounds i8, ptr %utf8_literal130, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_4 to i32), ptr %data131, align 4
-  %length132 = getelementptr inbounds i8, ptr %utf8_literal130, i8 8
-  store i64 11, ptr %length132, align 4
-  %call133 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal130)
-  br label %if.merge129
+if.then131:                                       ; preds = %if.merge124
+  %data134 = getelementptr inbounds i8, ptr %utf8_literal133, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_4 to i32), ptr %data134, align 4
+  %length135 = getelementptr inbounds i8, ptr %utf8_literal133, i8 8
+  store i64 11, ptr %length135, align 4
+  %call136 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal133)
+  br label %if.merge132
 
-if.merge129:                                      ; preds = %if.then128, %if.merge121
-  %array_element135 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 0
-  store i8 48, ptr %array_element135, align 1
-  %array_element136 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 1
-  store i8 120, ptr %array_element136, align 1
-  %array_element137 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 2
-  store i8 70, ptr %array_element137, align 1
-  %array_element138 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 3
-  store i8 70, ptr %array_element138, align 1
-  %array_element139 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 4
-  store i8 70, ptr %array_element139, align 1
-  %array_element140 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 5
+if.merge132:                                      ; preds = %if.then131, %if.merge124
+  %array_element138 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 0
+  store i8 48, ptr %array_element138, align 1
+  %array_element139 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 1
+  store i8 120, ptr %array_element139, align 1
+  %array_element140 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 2
   store i8 70, ptr %array_element140, align 1
-  %array_element141 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 6
+  %array_element141 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 3
   store i8 70, ptr %array_element141, align 1
-  %array_element142 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 7
+  %array_element142 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 4
   store i8 70, ptr %array_element142, align 1
-  %array_element143 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 8
+  %array_element143 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 5
   store i8 70, ptr %array_element143, align 1
-  %array_element144 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 9
+  %array_element144 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 6
   store i8 70, ptr %array_element144, align 1
-  %array_element145 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 10
+  %array_element145 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 7
   store i8 70, ptr %array_element145, align 1
-  %array_element146 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 11
+  %array_element146 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 8
   store i8 70, ptr %array_element146, align 1
-  %array_element147 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 12
+  %array_element147 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 9
   store i8 70, ptr %array_element147, align 1
-  %array_element148 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 13
+  %array_element148 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 10
   store i8 70, ptr %array_element148, align 1
-  %array_element149 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 14
+  %array_element149 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 11
   store i8 70, ptr %array_element149, align 1
-  %array_element150 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 15
+  %array_element150 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 12
   store i8 70, ptr %array_element150, align 1
-  %array_element151 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 16
+  %array_element151 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 13
   store i8 70, ptr %array_element151, align 1
-  %array_element152 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 17
+  %array_element152 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 14
   store i8 70, ptr %array_element152, align 1
-  %array_element153 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 18
+  %array_element153 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 15
   store i8 70, ptr %array_element153, align 1
-  %array_element154 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 19
+  %array_element154 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 16
   store i8 70, ptr %array_element154, align 1
-  %array_element155 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 20
+  %array_element155 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 17
   store i8 70, ptr %array_element155, align 1
-  %array_element156 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 21
+  %array_element156 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 18
   store i8 70, ptr %array_element156, align 1
-  %array_element157 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 22
+  %array_element157 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 19
   store i8 70, ptr %array_element157, align 1
-  %array_element158 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 23
+  %array_element158 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 20
   store i8 70, ptr %array_element158, align 1
-  %array_element159 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 24
+  %array_element159 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 21
   store i8 70, ptr %array_element159, align 1
-  %array_element160 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 25
+  %array_element160 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 22
   store i8 70, ptr %array_element160, align 1
-  %array_element161 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 26
+  %array_element161 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 23
   store i8 70, ptr %array_element161, align 1
-  %array_element162 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 27
+  %array_element162 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 24
   store i8 70, ptr %array_element162, align 1
-  %array_element163 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 28
+  %array_element163 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 25
   store i8 70, ptr %array_element163, align 1
-  %array_element164 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 29
+  %array_element164 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 26
   store i8 70, ptr %array_element164, align 1
-  %array_element165 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 30
+  %array_element165 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 27
   store i8 70, ptr %array_element165, align 1
-  %array_element166 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 31
+  %array_element166 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 28
   store i8 70, ptr %array_element166, align 1
-  %array_element167 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 32
+  %array_element167 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 29
   store i8 70, ptr %array_element167, align 1
-  %array_element168 = getelementptr inbounds [34 x i8], ptr %array_literal134, i32 0, i32 33
+  %array_element168 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 30
   store i8 70, ptr %array_element168, align 1
-  %struct_value169 = load [34 x i8], ptr %array_literal134, align 1
-  store [34 x i8] %struct_value169, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657333, align 1
+  %array_element169 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 31
+  store i8 70, ptr %array_element169, align 1
+  %array_element170 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 32
+  store i8 70, ptr %array_element170, align 1
+  %array_element171 = getelementptr inbounds [34 x i8], ptr %array_literal137, i32 0, i32 33
+  store i8 70, ptr %array_element171, align 1
+  %struct_value172 = load [34 x i8], ptr %array_literal137, align 1
+  store [34 x i8] %struct_value172, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657333, align 1
   store i32 0, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746133, align 4
-  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657333 to i32), ptr %assignment_value170, align 4
-  %assignment_value171 = load i32, ptr %assignment_value170, align 4
-  store i32 %assignment_value171, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746133, align 4
+  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657333 to i32), ptr %assignment_value173, align 4
+  %assignment_value174 = load i32, ptr %assignment_value173, align 4
+  store i32 %assignment_value174, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746133, align 4
   %data3 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746133, align 4
-  %data173 = getelementptr inbounds i8, ptr %struct_literal172, i8 0
-  store i32 %data3, ptr %data173, align 4
-  %length174 = getelementptr inbounds i8, ptr %struct_literal172, i8 8
-  store i64 34, ptr %length174, align 4
-  %struct_value175 = load [16 x i8], ptr %struct_literal172, align 1
-  store [16 x i8] %struct_value175, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787433, align 1
-  %call176 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787433)
-  store i32 %call176, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756533, align 4
+  %data176 = getelementptr inbounds i8, ptr %struct_literal175, i8 0
+  store i32 %data3, ptr %data176, align 4
+  %length177 = getelementptr inbounds i8, ptr %struct_literal175, i8 8
+  store i64 34, ptr %length177, align 4
+  %struct_value178 = load [16 x i8], ptr %struct_literal175, align 1
+  store [16 x i8] %struct_value178, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787433, align 1
+  %call179 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787433)
+  store i32 %call179, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756533, align 4
   %value3 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756533, align 4
-  %deref177 = inttoptr i32 %value3 to ptr
-  %place178 = load i128, ptr %deref177, align 4
-  store i128 %place178, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657233, align 4
+  %deref_is_null180 = icmp eq i32 %value3, 0
+  br i1 %deref_is_null180, label %deref_null_panic181, label %deref_null_continue182
+
+deref_null_panic181:                              ; preds = %if.merge132
+  call void @__wosy_core_system_panic()
+  unreachable
+
+deref_null_continue182:                           ; preds = %if.merge132
+  %deref183 = inttoptr i32 %value3 to ptr
+  %place184 = load i128, ptr %deref183, align 4
+  store i128 %place184, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657233, align 4
   store i128 -1, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656433, align 4
   %number3 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657233, align 4
   %expected3 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656433, align 4
-  %eq179 = icmp eq i128 %number3, %expected3
-  br i1 %eq179, label %if.then180, label %if.merge181
+  %eq185 = icmp eq i128 %number3, %expected3
+  br i1 %eq185, label %if.then186, label %if.merge187
 
-if.then180:                                       ; preds = %if.merge129
-  %data183 = getelementptr inbounds i8, ptr %utf8_literal182, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_5 to i32), ptr %data183, align 4
-  %length184 = getelementptr inbounds i8, ptr %utf8_literal182, i8 8
-  store i64 6, ptr %length184, align 4
-  %call185 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal182)
-  br label %if.merge181
+if.then186:                                       ; preds = %deref_null_continue182
+  %data189 = getelementptr inbounds i8, ptr %utf8_literal188, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_5 to i32), ptr %data189, align 4
+  %length190 = getelementptr inbounds i8, ptr %utf8_literal188, i8 8
+  store i64 6, ptr %length190, align 4
+  %call191 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal188)
+  br label %if.merge187
 
-if.merge181:                                      ; preds = %if.then180, %if.merge129
-  %number3186 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657233, align 4
-  %expected3187 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656433, align 4
-  %ne188 = icmp ne i128 %number3186, %expected3187
-  br i1 %ne188, label %if.then189, label %if.merge190
+if.merge187:                                      ; preds = %if.then186, %deref_null_continue182
+  %number3192 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657233, align 4
+  %expected3193 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656433, align 4
+  %ne194 = icmp ne i128 %number3192, %expected3193
+  br i1 %ne194, label %if.then195, label %if.merge196
 
-if.then189:                                       ; preds = %if.merge181
-  %data192 = getelementptr inbounds i8, ptr %utf8_literal191, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_6 to i32), ptr %data192, align 4
-  %length193 = getelementptr inbounds i8, ptr %utf8_literal191, i8 8
-  store i64 9, ptr %length193, align 4
-  %call194 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal191)
-  br label %if.merge190
+if.then195:                                       ; preds = %if.merge187
+  %data198 = getelementptr inbounds i8, ptr %utf8_literal197, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_6 to i32), ptr %data198, align 4
+  %length199 = getelementptr inbounds i8, ptr %utf8_literal197, i8 8
+  store i64 9, ptr %length199, align 4
+  %call200 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal197)
+  br label %if.merge196
 
-if.merge190:                                      ; preds = %if.then189, %if.merge181
-  %array_element196 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 0
-  store i8 48, ptr %array_element196, align 1
-  %array_element197 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 1
-  store i8 98, ptr %array_element197, align 1
-  %array_element198 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 2
-  store i8 49, ptr %array_element198, align 1
-  %array_element199 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 3
-  store i8 49, ptr %array_element199, align 1
-  %array_element200 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 4
-  store i8 49, ptr %array_element200, align 1
-  %array_element201 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 5
-  store i8 49, ptr %array_element201, align 1
-  %array_element202 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 6
-  store i8 49, ptr %array_element202, align 1
-  %array_element203 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 7
-  store i8 49, ptr %array_element203, align 1
-  %array_element204 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 8
+if.merge196:                                      ; preds = %if.then195, %if.merge187
+  %array_element202 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 0
+  store i8 48, ptr %array_element202, align 1
+  %array_element203 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 1
+  store i8 98, ptr %array_element203, align 1
+  %array_element204 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 2
   store i8 49, ptr %array_element204, align 1
-  %array_element205 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 9
+  %array_element205 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 3
   store i8 49, ptr %array_element205, align 1
-  %array_element206 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 10
+  %array_element206 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 4
   store i8 49, ptr %array_element206, align 1
-  %array_element207 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 11
+  %array_element207 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 5
   store i8 49, ptr %array_element207, align 1
-  %array_element208 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 12
+  %array_element208 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 6
   store i8 49, ptr %array_element208, align 1
-  %array_element209 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 13
+  %array_element209 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 7
   store i8 49, ptr %array_element209, align 1
-  %array_element210 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 14
+  %array_element210 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 8
   store i8 49, ptr %array_element210, align 1
-  %array_element211 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 15
+  %array_element211 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 9
   store i8 49, ptr %array_element211, align 1
-  %array_element212 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 16
+  %array_element212 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 10
   store i8 49, ptr %array_element212, align 1
-  %array_element213 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 17
+  %array_element213 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 11
   store i8 49, ptr %array_element213, align 1
-  %array_element214 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 18
+  %array_element214 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 12
   store i8 49, ptr %array_element214, align 1
-  %array_element215 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 19
+  %array_element215 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 13
   store i8 49, ptr %array_element215, align 1
-  %array_element216 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 20
+  %array_element216 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 14
   store i8 49, ptr %array_element216, align 1
-  %array_element217 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 21
+  %array_element217 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 15
   store i8 49, ptr %array_element217, align 1
-  %array_element218 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 22
+  %array_element218 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 16
   store i8 49, ptr %array_element218, align 1
-  %array_element219 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 23
+  %array_element219 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 17
   store i8 49, ptr %array_element219, align 1
-  %array_element220 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 24
+  %array_element220 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 18
   store i8 49, ptr %array_element220, align 1
-  %array_element221 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 25
+  %array_element221 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 19
   store i8 49, ptr %array_element221, align 1
-  %array_element222 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 26
+  %array_element222 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 20
   store i8 49, ptr %array_element222, align 1
-  %array_element223 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 27
+  %array_element223 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 21
   store i8 49, ptr %array_element223, align 1
-  %array_element224 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 28
+  %array_element224 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 22
   store i8 49, ptr %array_element224, align 1
-  %array_element225 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 29
+  %array_element225 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 23
   store i8 49, ptr %array_element225, align 1
-  %array_element226 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 30
+  %array_element226 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 24
   store i8 49, ptr %array_element226, align 1
-  %array_element227 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 31
+  %array_element227 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 25
   store i8 49, ptr %array_element227, align 1
-  %array_element228 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 32
+  %array_element228 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 26
   store i8 49, ptr %array_element228, align 1
-  %array_element229 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 33
+  %array_element229 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 27
   store i8 49, ptr %array_element229, align 1
-  %array_element230 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 34
+  %array_element230 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 28
   store i8 49, ptr %array_element230, align 1
-  %array_element231 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 35
+  %array_element231 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 29
   store i8 49, ptr %array_element231, align 1
-  %array_element232 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 36
+  %array_element232 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 30
   store i8 49, ptr %array_element232, align 1
-  %array_element233 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 37
+  %array_element233 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 31
   store i8 49, ptr %array_element233, align 1
-  %array_element234 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 38
+  %array_element234 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 32
   store i8 49, ptr %array_element234, align 1
-  %array_element235 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 39
+  %array_element235 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 33
   store i8 49, ptr %array_element235, align 1
-  %array_element236 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 40
+  %array_element236 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 34
   store i8 49, ptr %array_element236, align 1
-  %array_element237 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 41
+  %array_element237 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 35
   store i8 49, ptr %array_element237, align 1
-  %array_element238 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 42
+  %array_element238 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 36
   store i8 49, ptr %array_element238, align 1
-  %array_element239 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 43
+  %array_element239 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 37
   store i8 49, ptr %array_element239, align 1
-  %array_element240 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 44
+  %array_element240 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 38
   store i8 49, ptr %array_element240, align 1
-  %array_element241 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 45
+  %array_element241 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 39
   store i8 49, ptr %array_element241, align 1
-  %array_element242 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 46
+  %array_element242 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 40
   store i8 49, ptr %array_element242, align 1
-  %array_element243 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 47
+  %array_element243 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 41
   store i8 49, ptr %array_element243, align 1
-  %array_element244 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 48
+  %array_element244 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 42
   store i8 49, ptr %array_element244, align 1
-  %array_element245 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 49
+  %array_element245 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 43
   store i8 49, ptr %array_element245, align 1
-  %array_element246 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 50
+  %array_element246 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 44
   store i8 49, ptr %array_element246, align 1
-  %array_element247 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 51
+  %array_element247 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 45
   store i8 49, ptr %array_element247, align 1
-  %array_element248 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 52
+  %array_element248 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 46
   store i8 49, ptr %array_element248, align 1
-  %array_element249 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 53
+  %array_element249 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 47
   store i8 49, ptr %array_element249, align 1
-  %array_element250 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 54
+  %array_element250 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 48
   store i8 49, ptr %array_element250, align 1
-  %array_element251 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 55
+  %array_element251 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 49
   store i8 49, ptr %array_element251, align 1
-  %array_element252 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 56
+  %array_element252 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 50
   store i8 49, ptr %array_element252, align 1
-  %array_element253 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 57
+  %array_element253 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 51
   store i8 49, ptr %array_element253, align 1
-  %array_element254 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 58
+  %array_element254 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 52
   store i8 49, ptr %array_element254, align 1
-  %array_element255 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 59
+  %array_element255 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 53
   store i8 49, ptr %array_element255, align 1
-  %array_element256 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 60
+  %array_element256 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 54
   store i8 49, ptr %array_element256, align 1
-  %array_element257 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 61
+  %array_element257 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 55
   store i8 49, ptr %array_element257, align 1
-  %array_element258 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 62
+  %array_element258 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 56
   store i8 49, ptr %array_element258, align 1
-  %array_element259 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 63
+  %array_element259 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 57
   store i8 49, ptr %array_element259, align 1
-  %array_element260 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 64
+  %array_element260 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 58
   store i8 49, ptr %array_element260, align 1
-  %array_element261 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 65
+  %array_element261 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 59
   store i8 49, ptr %array_element261, align 1
-  %array_element262 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 66
+  %array_element262 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 60
   store i8 49, ptr %array_element262, align 1
-  %array_element263 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 67
+  %array_element263 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 61
   store i8 49, ptr %array_element263, align 1
-  %array_element264 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 68
+  %array_element264 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 62
   store i8 49, ptr %array_element264, align 1
-  %array_element265 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 69
+  %array_element265 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 63
   store i8 49, ptr %array_element265, align 1
-  %array_element266 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 70
+  %array_element266 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 64
   store i8 49, ptr %array_element266, align 1
-  %array_element267 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 71
+  %array_element267 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 65
   store i8 49, ptr %array_element267, align 1
-  %array_element268 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 72
+  %array_element268 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 66
   store i8 49, ptr %array_element268, align 1
-  %array_element269 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 73
+  %array_element269 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 67
   store i8 49, ptr %array_element269, align 1
-  %array_element270 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 74
+  %array_element270 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 68
   store i8 49, ptr %array_element270, align 1
-  %array_element271 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 75
+  %array_element271 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 69
   store i8 49, ptr %array_element271, align 1
-  %array_element272 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 76
+  %array_element272 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 70
   store i8 49, ptr %array_element272, align 1
-  %array_element273 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 77
+  %array_element273 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 71
   store i8 49, ptr %array_element273, align 1
-  %array_element274 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 78
+  %array_element274 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 72
   store i8 49, ptr %array_element274, align 1
-  %array_element275 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 79
+  %array_element275 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 73
   store i8 49, ptr %array_element275, align 1
-  %array_element276 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 80
+  %array_element276 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 74
   store i8 49, ptr %array_element276, align 1
-  %array_element277 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 81
+  %array_element277 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 75
   store i8 49, ptr %array_element277, align 1
-  %array_element278 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 82
+  %array_element278 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 76
   store i8 49, ptr %array_element278, align 1
-  %array_element279 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 83
+  %array_element279 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 77
   store i8 49, ptr %array_element279, align 1
-  %array_element280 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 84
+  %array_element280 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 78
   store i8 49, ptr %array_element280, align 1
-  %array_element281 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 85
+  %array_element281 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 79
   store i8 49, ptr %array_element281, align 1
-  %array_element282 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 86
+  %array_element282 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 80
   store i8 49, ptr %array_element282, align 1
-  %array_element283 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 87
+  %array_element283 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 81
   store i8 49, ptr %array_element283, align 1
-  %array_element284 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 88
+  %array_element284 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 82
   store i8 49, ptr %array_element284, align 1
-  %array_element285 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 89
+  %array_element285 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 83
   store i8 49, ptr %array_element285, align 1
-  %array_element286 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 90
+  %array_element286 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 84
   store i8 49, ptr %array_element286, align 1
-  %array_element287 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 91
+  %array_element287 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 85
   store i8 49, ptr %array_element287, align 1
-  %array_element288 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 92
+  %array_element288 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 86
   store i8 49, ptr %array_element288, align 1
-  %array_element289 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 93
+  %array_element289 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 87
   store i8 49, ptr %array_element289, align 1
-  %array_element290 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 94
+  %array_element290 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 88
   store i8 49, ptr %array_element290, align 1
-  %array_element291 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 95
+  %array_element291 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 89
   store i8 49, ptr %array_element291, align 1
-  %array_element292 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 96
+  %array_element292 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 90
   store i8 49, ptr %array_element292, align 1
-  %array_element293 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 97
+  %array_element293 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 91
   store i8 49, ptr %array_element293, align 1
-  %array_element294 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 98
+  %array_element294 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 92
   store i8 49, ptr %array_element294, align 1
-  %array_element295 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 99
+  %array_element295 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 93
   store i8 49, ptr %array_element295, align 1
-  %array_element296 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 100
+  %array_element296 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 94
   store i8 49, ptr %array_element296, align 1
-  %array_element297 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 101
+  %array_element297 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 95
   store i8 49, ptr %array_element297, align 1
-  %array_element298 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 102
+  %array_element298 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 96
   store i8 49, ptr %array_element298, align 1
-  %array_element299 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 103
+  %array_element299 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 97
   store i8 49, ptr %array_element299, align 1
-  %array_element300 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 104
+  %array_element300 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 98
   store i8 49, ptr %array_element300, align 1
-  %array_element301 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 105
+  %array_element301 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 99
   store i8 49, ptr %array_element301, align 1
-  %array_element302 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 106
+  %array_element302 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 100
   store i8 49, ptr %array_element302, align 1
-  %array_element303 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 107
+  %array_element303 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 101
   store i8 49, ptr %array_element303, align 1
-  %array_element304 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 108
+  %array_element304 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 102
   store i8 49, ptr %array_element304, align 1
-  %array_element305 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 109
+  %array_element305 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 103
   store i8 49, ptr %array_element305, align 1
-  %array_element306 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 110
+  %array_element306 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 104
   store i8 49, ptr %array_element306, align 1
-  %array_element307 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 111
+  %array_element307 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 105
   store i8 49, ptr %array_element307, align 1
-  %array_element308 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 112
+  %array_element308 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 106
   store i8 49, ptr %array_element308, align 1
-  %array_element309 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 113
+  %array_element309 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 107
   store i8 49, ptr %array_element309, align 1
-  %array_element310 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 114
+  %array_element310 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 108
   store i8 49, ptr %array_element310, align 1
-  %array_element311 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 115
+  %array_element311 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 109
   store i8 49, ptr %array_element311, align 1
-  %array_element312 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 116
+  %array_element312 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 110
   store i8 49, ptr %array_element312, align 1
-  %array_element313 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 117
+  %array_element313 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 111
   store i8 49, ptr %array_element313, align 1
-  %array_element314 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 118
+  %array_element314 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 112
   store i8 49, ptr %array_element314, align 1
-  %array_element315 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 119
+  %array_element315 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 113
   store i8 49, ptr %array_element315, align 1
-  %array_element316 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 120
+  %array_element316 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 114
   store i8 49, ptr %array_element316, align 1
-  %array_element317 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 121
+  %array_element317 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 115
   store i8 49, ptr %array_element317, align 1
-  %array_element318 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 122
+  %array_element318 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 116
   store i8 49, ptr %array_element318, align 1
-  %array_element319 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 123
+  %array_element319 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 117
   store i8 49, ptr %array_element319, align 1
-  %array_element320 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 124
+  %array_element320 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 118
   store i8 49, ptr %array_element320, align 1
-  %array_element321 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 125
+  %array_element321 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 119
   store i8 49, ptr %array_element321, align 1
-  %array_element322 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 126
+  %array_element322 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 120
   store i8 49, ptr %array_element322, align 1
-  %array_element323 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 127
+  %array_element323 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 121
   store i8 49, ptr %array_element323, align 1
-  %array_element324 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 128
+  %array_element324 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 122
   store i8 49, ptr %array_element324, align 1
-  %array_element325 = getelementptr inbounds [130 x i8], ptr %array_literal195, i32 0, i32 129
+  %array_element325 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 123
   store i8 49, ptr %array_element325, align 1
-  %struct_value326 = load [130 x i8], ptr %array_literal195, align 1
-  store [130 x i8] %struct_value326, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657334, align 1
+  %array_element326 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 124
+  store i8 49, ptr %array_element326, align 1
+  %array_element327 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 125
+  store i8 49, ptr %array_element327, align 1
+  %array_element328 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 126
+  store i8 49, ptr %array_element328, align 1
+  %array_element329 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 127
+  store i8 49, ptr %array_element329, align 1
+  %array_element330 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 128
+  store i8 49, ptr %array_element330, align 1
+  %array_element331 = getelementptr inbounds [130 x i8], ptr %array_literal201, i32 0, i32 129
+  store i8 49, ptr %array_element331, align 1
+  %struct_value332 = load [130 x i8], ptr %array_literal201, align 1
+  store [130 x i8] %struct_value332, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657334, align 1
   store i32 0, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746134, align 4
-  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657334 to i32), ptr %assignment_value327, align 4
-  %assignment_value328 = load i32, ptr %assignment_value327, align 4
-  store i32 %assignment_value328, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746134, align 4
+  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657334 to i32), ptr %assignment_value333, align 4
+  %assignment_value334 = load i32, ptr %assignment_value333, align 4
+  store i32 %assignment_value334, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746134, align 4
   %data4 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746134, align 4
-  %data330 = getelementptr inbounds i8, ptr %struct_literal329, i8 0
-  store i32 %data4, ptr %data330, align 4
-  %length331 = getelementptr inbounds i8, ptr %struct_literal329, i8 8
-  store i64 130, ptr %length331, align 4
-  %struct_value332 = load [16 x i8], ptr %struct_literal329, align 1
-  store [16 x i8] %struct_value332, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787434, align 1
-  %call333 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787434)
-  store i32 %call333, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756534, align 4
+  %data336 = getelementptr inbounds i8, ptr %struct_literal335, i8 0
+  store i32 %data4, ptr %data336, align 4
+  %length337 = getelementptr inbounds i8, ptr %struct_literal335, i8 8
+  store i64 130, ptr %length337, align 4
+  %struct_value338 = load [16 x i8], ptr %struct_literal335, align 1
+  store [16 x i8] %struct_value338, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787434, align 1
+  %call339 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787434)
+  store i32 %call339, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756534, align 4
   %value4 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756534, align 4
-  %deref334 = inttoptr i32 %value4 to ptr
-  %place335 = load i128, ptr %deref334, align 4
-  store i128 %place335, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657234, align 4
+  %deref_is_null340 = icmp eq i32 %value4, 0
+  br i1 %deref_is_null340, label %deref_null_panic341, label %deref_null_continue342
+
+deref_null_panic341:                              ; preds = %if.merge196
+  call void @__wosy_core_system_panic()
+  unreachable
+
+deref_null_continue342:                           ; preds = %if.merge196
+  %deref343 = inttoptr i32 %value4 to ptr
+  %place344 = load i128, ptr %deref343, align 4
+  store i128 %place344, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657234, align 4
   store i128 -1, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656434, align 4
   %number4 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657234, align 4
   %expected4 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656434, align 4
-  %eq336 = icmp eq i128 %number4, %expected4
-  br i1 %eq336, label %if.then337, label %if.merge338
+  %eq345 = icmp eq i128 %number4, %expected4
+  br i1 %eq345, label %if.then346, label %if.merge347
 
-if.then337:                                       ; preds = %if.merge190
-  %data340 = getelementptr inbounds i8, ptr %utf8_literal339, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_7 to i32), ptr %data340, align 4
-  %length341 = getelementptr inbounds i8, ptr %utf8_literal339, i8 8
-  store i64 6, ptr %length341, align 4
-  %call342 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal339)
-  br label %if.merge338
-
-if.merge338:                                      ; preds = %if.then337, %if.merge190
-  %number4343 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657234, align 4
-  %expected4344 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656434, align 4
-  %ne345 = icmp ne i128 %number4343, %expected4344
-  br i1 %ne345, label %if.then346, label %if.merge347
-
-if.then346:                                       ; preds = %if.merge338
+if.then346:                                       ; preds = %deref_null_continue342
   %data349 = getelementptr inbounds i8, ptr %utf8_literal348, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_8 to i32), ptr %data349, align 4
+  store i32 ptrtoint (ptr @wosy_utf8_literal_7 to i32), ptr %data349, align 4
   %length350 = getelementptr inbounds i8, ptr %utf8_literal348, i8 8
-  store i64 9, ptr %length350, align 4
+  store i64 6, ptr %length350, align 4
   %call351 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal348)
   br label %if.merge347
 
-if.merge347:                                      ; preds = %if.then346, %if.merge338
-  %array_element353 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 0
-  store i8 48, ptr %array_element353, align 1
-  %array_element354 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 1
-  store i8 111, ptr %array_element354, align 1
-  %array_element355 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 2
-  store i8 51, ptr %array_element355, align 1
-  %array_element356 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 3
-  store i8 55, ptr %array_element356, align 1
-  %array_element357 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 4
-  store i8 55, ptr %array_element357, align 1
-  %array_element358 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 5
-  store i8 55, ptr %array_element358, align 1
-  %array_element359 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 6
-  store i8 55, ptr %array_element359, align 1
-  %array_element360 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 7
-  store i8 55, ptr %array_element360, align 1
-  %array_element361 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 8
-  store i8 55, ptr %array_element361, align 1
-  %array_element362 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 9
-  store i8 55, ptr %array_element362, align 1
-  %array_element363 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 10
-  store i8 55, ptr %array_element363, align 1
-  %array_element364 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 11
-  store i8 55, ptr %array_element364, align 1
-  %array_element365 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 12
+if.merge347:                                      ; preds = %if.then346, %deref_null_continue342
+  %number4352 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657234, align 4
+  %expected4353 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656434, align 4
+  %ne354 = icmp ne i128 %number4352, %expected4353
+  br i1 %ne354, label %if.then355, label %if.merge356
+
+if.then355:                                       ; preds = %if.merge347
+  %data358 = getelementptr inbounds i8, ptr %utf8_literal357, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_8 to i32), ptr %data358, align 4
+  %length359 = getelementptr inbounds i8, ptr %utf8_literal357, i8 8
+  store i64 9, ptr %length359, align 4
+  %call360 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal357)
+  br label %if.merge356
+
+if.merge356:                                      ; preds = %if.then355, %if.merge347
+  %array_element362 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 0
+  store i8 48, ptr %array_element362, align 1
+  %array_element363 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 1
+  store i8 111, ptr %array_element363, align 1
+  %array_element364 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 2
+  store i8 51, ptr %array_element364, align 1
+  %array_element365 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 3
   store i8 55, ptr %array_element365, align 1
-  %array_element366 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 13
+  %array_element366 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 4
   store i8 55, ptr %array_element366, align 1
-  %array_element367 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 14
+  %array_element367 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 5
   store i8 55, ptr %array_element367, align 1
-  %array_element368 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 15
+  %array_element368 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 6
   store i8 55, ptr %array_element368, align 1
-  %array_element369 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 16
+  %array_element369 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 7
   store i8 55, ptr %array_element369, align 1
-  %array_element370 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 17
+  %array_element370 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 8
   store i8 55, ptr %array_element370, align 1
-  %array_element371 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 18
+  %array_element371 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 9
   store i8 55, ptr %array_element371, align 1
-  %array_element372 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 19
+  %array_element372 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 10
   store i8 55, ptr %array_element372, align 1
-  %array_element373 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 20
+  %array_element373 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 11
   store i8 55, ptr %array_element373, align 1
-  %array_element374 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 21
+  %array_element374 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 12
   store i8 55, ptr %array_element374, align 1
-  %array_element375 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 22
+  %array_element375 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 13
   store i8 55, ptr %array_element375, align 1
-  %array_element376 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 23
+  %array_element376 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 14
   store i8 55, ptr %array_element376, align 1
-  %array_element377 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 24
+  %array_element377 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 15
   store i8 55, ptr %array_element377, align 1
-  %array_element378 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 25
+  %array_element378 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 16
   store i8 55, ptr %array_element378, align 1
-  %array_element379 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 26
+  %array_element379 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 17
   store i8 55, ptr %array_element379, align 1
-  %array_element380 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 27
+  %array_element380 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 18
   store i8 55, ptr %array_element380, align 1
-  %array_element381 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 28
+  %array_element381 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 19
   store i8 55, ptr %array_element381, align 1
-  %array_element382 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 29
+  %array_element382 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 20
   store i8 55, ptr %array_element382, align 1
-  %array_element383 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 30
+  %array_element383 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 21
   store i8 55, ptr %array_element383, align 1
-  %array_element384 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 31
+  %array_element384 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 22
   store i8 55, ptr %array_element384, align 1
-  %array_element385 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 32
+  %array_element385 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 23
   store i8 55, ptr %array_element385, align 1
-  %array_element386 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 33
+  %array_element386 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 24
   store i8 55, ptr %array_element386, align 1
-  %array_element387 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 34
+  %array_element387 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 25
   store i8 55, ptr %array_element387, align 1
-  %array_element388 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 35
+  %array_element388 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 26
   store i8 55, ptr %array_element388, align 1
-  %array_element389 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 36
+  %array_element389 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 27
   store i8 55, ptr %array_element389, align 1
-  %array_element390 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 37
+  %array_element390 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 28
   store i8 55, ptr %array_element390, align 1
-  %array_element391 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 38
+  %array_element391 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 29
   store i8 55, ptr %array_element391, align 1
-  %array_element392 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 39
+  %array_element392 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 30
   store i8 55, ptr %array_element392, align 1
-  %array_element393 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 40
+  %array_element393 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 31
   store i8 55, ptr %array_element393, align 1
-  %array_element394 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 41
+  %array_element394 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 32
   store i8 55, ptr %array_element394, align 1
-  %array_element395 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 42
+  %array_element395 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 33
   store i8 55, ptr %array_element395, align 1
-  %array_element396 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 43
+  %array_element396 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 34
   store i8 55, ptr %array_element396, align 1
-  %array_element397 = getelementptr inbounds [45 x i8], ptr %array_literal352, i32 0, i32 44
+  %array_element397 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 35
   store i8 55, ptr %array_element397, align 1
-  %struct_value398 = load [45 x i8], ptr %array_literal352, align 1
-  store [45 x i8] %struct_value398, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657335, align 1
+  %array_element398 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 36
+  store i8 55, ptr %array_element398, align 1
+  %array_element399 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 37
+  store i8 55, ptr %array_element399, align 1
+  %array_element400 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 38
+  store i8 55, ptr %array_element400, align 1
+  %array_element401 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 39
+  store i8 55, ptr %array_element401, align 1
+  %array_element402 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 40
+  store i8 55, ptr %array_element402, align 1
+  %array_element403 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 41
+  store i8 55, ptr %array_element403, align 1
+  %array_element404 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 42
+  store i8 55, ptr %array_element404, align 1
+  %array_element405 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 43
+  store i8 55, ptr %array_element405, align 1
+  %array_element406 = getelementptr inbounds [45 x i8], ptr %array_literal361, i32 0, i32 44
+  store i8 55, ptr %array_element406, align 1
+  %struct_value407 = load [45 x i8], ptr %array_literal361, align 1
+  store [45 x i8] %struct_value407, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657335, align 1
   store i32 0, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746135, align 4
-  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657335 to i32), ptr %assignment_value399, align 4
-  %assignment_value400 = load i32, ptr %assignment_value399, align 4
-  store i32 %assignment_value400, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746135, align 4
+  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657335 to i32), ptr %assignment_value408, align 4
+  %assignment_value409 = load i32, ptr %assignment_value408, align 4
+  store i32 %assignment_value409, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746135, align 4
   %data5 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746135, align 4
-  %data402 = getelementptr inbounds i8, ptr %struct_literal401, i8 0
-  store i32 %data5, ptr %data402, align 4
-  %length403 = getelementptr inbounds i8, ptr %struct_literal401, i8 8
-  store i64 45, ptr %length403, align 4
-  %struct_value404 = load [16 x i8], ptr %struct_literal401, align 1
-  store [16 x i8] %struct_value404, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787435, align 1
-  %call405 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787435)
-  store i32 %call405, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756535, align 4
+  %data411 = getelementptr inbounds i8, ptr %struct_literal410, i8 0
+  store i32 %data5, ptr %data411, align 4
+  %length412 = getelementptr inbounds i8, ptr %struct_literal410, i8 8
+  store i64 45, ptr %length412, align 4
+  %struct_value413 = load [16 x i8], ptr %struct_literal410, align 1
+  store [16 x i8] %struct_value413, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787435, align 1
+  %call414 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787435)
+  store i32 %call414, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756535, align 4
   %value5 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756535, align 4
-  %deref406 = inttoptr i32 %value5 to ptr
-  %place407 = load i128, ptr %deref406, align 4
-  store i128 %place407, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657235, align 4
+  %deref_is_null415 = icmp eq i32 %value5, 0
+  br i1 %deref_is_null415, label %deref_null_panic416, label %deref_null_continue417
+
+deref_null_panic416:                              ; preds = %if.merge356
+  call void @__wosy_core_system_panic()
+  unreachable
+
+deref_null_continue417:                           ; preds = %if.merge356
+  %deref418 = inttoptr i32 %value5 to ptr
+  %place419 = load i128, ptr %deref418, align 4
+  store i128 %place419, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657235, align 4
   store i128 -1, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656435, align 4
   %number5 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657235, align 4
   %expected5 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656435, align 4
-  %eq408 = icmp eq i128 %number5, %expected5
-  br i1 %eq408, label %if.then409, label %if.merge410
+  %eq420 = icmp eq i128 %number5, %expected5
+  br i1 %eq420, label %if.then421, label %if.merge422
 
-if.then409:                                       ; preds = %if.merge347
-  %data412 = getelementptr inbounds i8, ptr %utf8_literal411, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_9 to i32), ptr %data412, align 4
-  %length413 = getelementptr inbounds i8, ptr %utf8_literal411, i8 8
-  store i64 6, ptr %length413, align 4
-  %call414 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal411)
-  br label %if.merge410
+if.then421:                                       ; preds = %deref_null_continue417
+  %data424 = getelementptr inbounds i8, ptr %utf8_literal423, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_9 to i32), ptr %data424, align 4
+  %length425 = getelementptr inbounds i8, ptr %utf8_literal423, i8 8
+  store i64 6, ptr %length425, align 4
+  %call426 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal423)
+  br label %if.merge422
 
-if.merge410:                                      ; preds = %if.then409, %if.merge347
-  %number5415 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657235, align 4
-  %expected5416 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656435, align 4
-  %ne417 = icmp ne i128 %number5415, %expected5416
-  br i1 %ne417, label %if.then418, label %if.merge419
+if.merge422:                                      ; preds = %if.then421, %deref_null_continue417
+  %number5427 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657235, align 4
+  %expected5428 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f657870656374656435, align 4
+  %ne429 = icmp ne i128 %number5427, %expected5428
+  br i1 %ne429, label %if.then430, label %if.merge431
 
-if.then418:                                       ; preds = %if.merge410
-  %data421 = getelementptr inbounds i8, ptr %utf8_literal420, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_10 to i32), ptr %data421, align 4
-  %length422 = getelementptr inbounds i8, ptr %utf8_literal420, i8 8
-  store i64 9, ptr %length422, align 4
-  %call423 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal420)
-  br label %if.merge419
+if.then430:                                       ; preds = %if.merge422
+  %data433 = getelementptr inbounds i8, ptr %utf8_literal432, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_10 to i32), ptr %data433, align 4
+  %length434 = getelementptr inbounds i8, ptr %utf8_literal432, i8 8
+  store i64 9, ptr %length434, align 4
+  %call435 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal432)
+  br label %if.merge431
 
-if.merge419:                                      ; preds = %if.then418, %if.merge410
-  %array_element425 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 0
-  store i8 48, ptr %array_element425, align 1
-  %array_element426 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 1
-  store i8 120, ptr %array_element426, align 1
-  %array_element427 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 2
-  store i8 49, ptr %array_element427, align 1
-  %array_element428 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 3
-  store i8 48, ptr %array_element428, align 1
-  %array_element429 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 4
-  store i8 48, ptr %array_element429, align 1
-  %array_element430 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 5
-  store i8 48, ptr %array_element430, align 1
-  %array_element431 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 6
-  store i8 48, ptr %array_element431, align 1
-  %array_element432 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 7
-  store i8 48, ptr %array_element432, align 1
-  %array_element433 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 8
-  store i8 48, ptr %array_element433, align 1
-  %array_element434 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 9
-  store i8 48, ptr %array_element434, align 1
-  %array_element435 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 10
-  store i8 48, ptr %array_element435, align 1
-  %array_element436 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 11
-  store i8 48, ptr %array_element436, align 1
-  %array_element437 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 12
+if.merge431:                                      ; preds = %if.then430, %if.merge422
+  %array_element437 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 0
   store i8 48, ptr %array_element437, align 1
-  %array_element438 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 13
-  store i8 48, ptr %array_element438, align 1
-  %array_element439 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 14
-  store i8 48, ptr %array_element439, align 1
-  %array_element440 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 15
+  %array_element438 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 1
+  store i8 120, ptr %array_element438, align 1
+  %array_element439 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 2
+  store i8 49, ptr %array_element439, align 1
+  %array_element440 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 3
   store i8 48, ptr %array_element440, align 1
-  %array_element441 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 16
+  %array_element441 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 4
   store i8 48, ptr %array_element441, align 1
-  %array_element442 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 17
+  %array_element442 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 5
   store i8 48, ptr %array_element442, align 1
-  %array_element443 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 18
+  %array_element443 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 6
   store i8 48, ptr %array_element443, align 1
-  %array_element444 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 19
+  %array_element444 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 7
   store i8 48, ptr %array_element444, align 1
-  %array_element445 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 20
+  %array_element445 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 8
   store i8 48, ptr %array_element445, align 1
-  %array_element446 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 21
+  %array_element446 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 9
   store i8 48, ptr %array_element446, align 1
-  %array_element447 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 22
+  %array_element447 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 10
   store i8 48, ptr %array_element447, align 1
-  %array_element448 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 23
+  %array_element448 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 11
   store i8 48, ptr %array_element448, align 1
-  %array_element449 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 24
+  %array_element449 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 12
   store i8 48, ptr %array_element449, align 1
-  %array_element450 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 25
+  %array_element450 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 13
   store i8 48, ptr %array_element450, align 1
-  %array_element451 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 26
+  %array_element451 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 14
   store i8 48, ptr %array_element451, align 1
-  %array_element452 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 27
+  %array_element452 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 15
   store i8 48, ptr %array_element452, align 1
-  %array_element453 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 28
+  %array_element453 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 16
   store i8 48, ptr %array_element453, align 1
-  %array_element454 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 29
+  %array_element454 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 17
   store i8 48, ptr %array_element454, align 1
-  %array_element455 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 30
+  %array_element455 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 18
   store i8 48, ptr %array_element455, align 1
-  %array_element456 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 31
+  %array_element456 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 19
   store i8 48, ptr %array_element456, align 1
-  %array_element457 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 32
+  %array_element457 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 20
   store i8 48, ptr %array_element457, align 1
-  %array_element458 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 33
+  %array_element458 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 21
   store i8 48, ptr %array_element458, align 1
-  %array_element459 = getelementptr inbounds [35 x i8], ptr %array_literal424, i32 0, i32 34
+  %array_element459 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 22
   store i8 48, ptr %array_element459, align 1
-  %struct_value460 = load [35 x i8], ptr %array_literal424, align 1
-  store [35 x i8] %struct_value460, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657336, align 1
+  %array_element460 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 23
+  store i8 48, ptr %array_element460, align 1
+  %array_element461 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 24
+  store i8 48, ptr %array_element461, align 1
+  %array_element462 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 25
+  store i8 48, ptr %array_element462, align 1
+  %array_element463 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 26
+  store i8 48, ptr %array_element463, align 1
+  %array_element464 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 27
+  store i8 48, ptr %array_element464, align 1
+  %array_element465 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 28
+  store i8 48, ptr %array_element465, align 1
+  %array_element466 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 29
+  store i8 48, ptr %array_element466, align 1
+  %array_element467 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 30
+  store i8 48, ptr %array_element467, align 1
+  %array_element468 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 31
+  store i8 48, ptr %array_element468, align 1
+  %array_element469 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 32
+  store i8 48, ptr %array_element469, align 1
+  %array_element470 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 33
+  store i8 48, ptr %array_element470, align 1
+  %array_element471 = getelementptr inbounds [35 x i8], ptr %array_literal436, i32 0, i32 34
+  store i8 48, ptr %array_element471, align 1
+  %struct_value472 = load [35 x i8], ptr %array_literal436, align 1
+  store [35 x i8] %struct_value472, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657336, align 1
   store i32 0, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746136, align 4
-  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657336 to i32), ptr %assignment_value461, align 4
-  %assignment_value462 = load i32, ptr %assignment_value461, align 4
-  store i32 %assignment_value462, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746136, align 4
-  %data6464 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746136, align 4
-  %data465 = getelementptr inbounds i8, ptr %struct_literal463, i8 0
-  store i32 %data6464, ptr %data465, align 4
-  %length466 = getelementptr inbounds i8, ptr %struct_literal463, i8 8
-  store i64 35, ptr %length466, align 4
-  %struct_value467 = load [16 x i8], ptr %struct_literal463, align 1
-  store [16 x i8] %struct_value467, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787436, align 1
-  %call468 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787436)
-  store i32 %call468, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756536, align 4
+  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657336 to i32), ptr %assignment_value473, align 4
+  %assignment_value474 = load i32, ptr %assignment_value473, align 4
+  store i32 %assignment_value474, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746136, align 4
+  %data6476 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746136, align 4
+  %data477 = getelementptr inbounds i8, ptr %struct_literal475, i8 0
+  store i32 %data6476, ptr %data477, align 4
+  %length478 = getelementptr inbounds i8, ptr %struct_literal475, i8 8
+  store i64 35, ptr %length478, align 4
+  %struct_value479 = load [16 x i8], ptr %struct_literal475, align 1
+  store [16 x i8] %struct_value479, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787436, align 1
+  %call480 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787436)
+  store i32 %call480, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756536, align 4
   %value6 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756536, align 4
-  %eq469 = icmp eq i32 %value6, 0
-  br i1 %eq469, label %if.then470, label %if.merge471
+  %eq481 = icmp eq i32 %value6, 0
+  br i1 %eq481, label %if.then482, label %if.merge483
 
-if.then470:                                       ; preds = %if.merge419
-  %data473 = getelementptr inbounds i8, ptr %utf8_literal472, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_11 to i32), ptr %data473, align 4
-  %length474 = getelementptr inbounds i8, ptr %utf8_literal472, i8 8
-  store i64 5, ptr %length474, align 4
-  %call475 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal472)
-  br label %if.merge471
+if.then482:                                       ; preds = %if.merge431
+  %data485 = getelementptr inbounds i8, ptr %utf8_literal484, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_11 to i32), ptr %data485, align 4
+  %length486 = getelementptr inbounds i8, ptr %utf8_literal484, i8 8
+  store i64 5, ptr %length486, align 4
+  %call487 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal484)
+  br label %if.merge483
 
-if.merge471:                                      ; preds = %if.then470, %if.merge419
-  %value6476 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756536, align 4
-  %ne477 = icmp ne i32 %value6476, 0
-  br i1 %ne477, label %if.then478, label %if.merge479
+if.merge483:                                      ; preds = %if.then482, %if.merge431
+  %value6488 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756536, align 4
+  %ne489 = icmp ne i32 %value6488, 0
+  br i1 %ne489, label %if.then490, label %if.merge491
 
-if.then478:                                       ; preds = %if.merge471
-  %data481 = getelementptr inbounds i8, ptr %utf8_literal480, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_12 to i32), ptr %data481, align 4
-  %length482 = getelementptr inbounds i8, ptr %utf8_literal480, i8 8
-  store i64 11, ptr %length482, align 4
-  %call483 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal480)
-  br label %if.merge479
+if.then490:                                       ; preds = %if.merge483
+  %data493 = getelementptr inbounds i8, ptr %utf8_literal492, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_12 to i32), ptr %data493, align 4
+  %length494 = getelementptr inbounds i8, ptr %utf8_literal492, i8 8
+  store i64 11, ptr %length494, align 4
+  %call495 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal492)
+  br label %if.merge491
 
-if.merge479:                                      ; preds = %if.then478, %if.merge471
-  %array_element485 = getelementptr inbounds [5 x i8], ptr %array_literal484, i32 0, i32 0
-  store i8 49, ptr %array_element485, align 1
-  %array_element486 = getelementptr inbounds [5 x i8], ptr %array_literal484, i32 0, i32 1
-  store i8 95, ptr %array_element486, align 1
-  %array_element487 = getelementptr inbounds [5 x i8], ptr %array_literal484, i32 0, i32 2
-  store i8 48, ptr %array_element487, align 1
-  %array_element488 = getelementptr inbounds [5 x i8], ptr %array_literal484, i32 0, i32 3
-  store i8 48, ptr %array_element488, align 1
-  %array_element489 = getelementptr inbounds [5 x i8], ptr %array_literal484, i32 0, i32 4
-  store i8 48, ptr %array_element489, align 1
-  %struct_value490 = load [5 x i8], ptr %array_literal484, align 1
-  store [5 x i8] %struct_value490, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657337, align 1
+if.merge491:                                      ; preds = %if.then490, %if.merge483
+  %array_element497 = getelementptr inbounds [5 x i8], ptr %array_literal496, i32 0, i32 0
+  store i8 49, ptr %array_element497, align 1
+  %array_element498 = getelementptr inbounds [5 x i8], ptr %array_literal496, i32 0, i32 1
+  store i8 95, ptr %array_element498, align 1
+  %array_element499 = getelementptr inbounds [5 x i8], ptr %array_literal496, i32 0, i32 2
+  store i8 48, ptr %array_element499, align 1
+  %array_element500 = getelementptr inbounds [5 x i8], ptr %array_literal496, i32 0, i32 3
+  store i8 48, ptr %array_element500, align 1
+  %array_element501 = getelementptr inbounds [5 x i8], ptr %array_literal496, i32 0, i32 4
+  store i8 48, ptr %array_element501, align 1
+  %struct_value502 = load [5 x i8], ptr %array_literal496, align 1
+  store [5 x i8] %struct_value502, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657337, align 1
   store i32 0, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746137, align 4
-  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657337 to i32), ptr %assignment_value491, align 4
-  %assignment_value492 = load i32, ptr %assignment_value491, align 4
-  store i32 %assignment_value492, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746137, align 4
+  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657337 to i32), ptr %assignment_value503, align 4
+  %assignment_value504 = load i32, ptr %assignment_value503, align 4
+  store i32 %assignment_value504, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746137, align 4
   %data7 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746137, align 4
-  %data494 = getelementptr inbounds i8, ptr %struct_literal493, i8 0
-  store i32 %data7, ptr %data494, align 4
-  %length495 = getelementptr inbounds i8, ptr %struct_literal493, i8 8
-  store i64 5, ptr %length495, align 4
-  %struct_value496 = load [16 x i8], ptr %struct_literal493, align 1
-  store [16 x i8] %struct_value496, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787437, align 1
-  %call497 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787437)
-  store i32 %call497, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756537, align 4
+  %data506 = getelementptr inbounds i8, ptr %struct_literal505, i8 0
+  store i32 %data7, ptr %data506, align 4
+  %length507 = getelementptr inbounds i8, ptr %struct_literal505, i8 8
+  store i64 5, ptr %length507, align 4
+  %struct_value508 = load [16 x i8], ptr %struct_literal505, align 1
+  store [16 x i8] %struct_value508, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787437, align 1
+  %call509 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787437)
+  store i32 %call509, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756537, align 4
   %value7 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756537, align 4
-  %deref498 = inttoptr i32 %value7 to ptr
-  %place499 = load i128, ptr %deref498, align 4
-  store i128 %place499, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657237, align 4
+  %deref_is_null510 = icmp eq i32 %value7, 0
+  br i1 %deref_is_null510, label %deref_null_panic511, label %deref_null_continue512
+
+deref_null_panic511:                              ; preds = %if.merge491
+  call void @__wosy_core_system_panic()
+  unreachable
+
+deref_null_continue512:                           ; preds = %if.merge491
+  %deref513 = inttoptr i32 %value7 to ptr
+  %place514 = load i128, ptr %deref513, align 4
+  store i128 %place514, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657237, align 4
   %number7 = load i128, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6e756d62657237, align 4
-  %call500 = call ptr @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663335363633353636333533373334363633353333333533393335363633353330333433313335333433343338333536363335363635663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333337333633343333333433333330333333383333333633333337333333353336333133333338333633323336333133333333333633363333333033333335333633323336333133333330333333343333333733363335333333343336333633363333333333373336333233333339333333383333333533333339333633343333333433333333333333303336333133333331333333353336333633333333333333363333333333333331333333313336333233333332333333303336333133363335333333323333333333333335333333333333333933333337333633323333333533363331333633363336333333333335333633323333333533333332356635663336333633363636333733323336363433363331333733345f5f33313331__(i128 %number7)
-  %struct_value501 = load [16 x i8], ptr %call500, align 1
-  store [16 x i8] %struct_value501, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6f757437, align 1
-  %call502 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6f757437)
-  %data504 = getelementptr inbounds i8, ptr %utf8_literal503, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_13 to i32), ptr %data504, align 4
-  %length505 = getelementptr inbounds i8, ptr %utf8_literal503, i8 8
-  store i64 1, ptr %length505, align 4
-  %call506 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal503)
-  %array_element508 = getelementptr inbounds [2 x i8], ptr %array_literal507, i32 0, i32 0
-  store i8 49, ptr %array_element508, align 1
-  %array_element509 = getelementptr inbounds [2 x i8], ptr %array_literal507, i32 0, i32 1
-  store i8 95, ptr %array_element509, align 1
-  %struct_value510 = load [2 x i8], ptr %array_literal507, align 1
-  store [2 x i8] %struct_value510, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657338, align 1
+  %call515 = call ptr @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663335363633353636333533373334363633353333333533393335363633353330333433313335333433343338333536363335363635663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333337333633343333333433333330333333383333333633333337333333353336333133333338333633323336333133333333333633363333333033333335333633323336333133333330333333343333333733363335333333343336333633363333333333373336333233333339333333383333333533333339333633343333333433333333333333303336333133333331333333353336333633333333333333363333333333333331333333313336333233333332333333303336333133363335333333323333333333333335333333333333333933333337333633323333333533363331333633363336333333333335333633323333333533333332356635663336333633363636333733323336363433363331333733345f5f33313331__(i128 %number7)
+  %struct_value516 = load [16 x i8], ptr %call515, align 1
+  store [16 x i8] %struct_value516, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6f757437, align 1
+  %call517 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6f757437)
+  %data519 = getelementptr inbounds i8, ptr %utf8_literal518, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_13 to i32), ptr %data519, align 4
+  %length520 = getelementptr inbounds i8, ptr %utf8_literal518, i8 8
+  store i64 1, ptr %length520, align 4
+  %call521 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal518)
+  %array_element523 = getelementptr inbounds [2 x i8], ptr %array_literal522, i32 0, i32 0
+  store i8 49, ptr %array_element523, align 1
+  %array_element524 = getelementptr inbounds [2 x i8], ptr %array_literal522, i32 0, i32 1
+  store i8 95, ptr %array_element524, align 1
+  %struct_value525 = load [2 x i8], ptr %array_literal522, align 1
+  store [2 x i8] %struct_value525, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657338, align 1
   store i32 0, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746138, align 4
-  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657338 to i32), ptr %assignment_value511, align 4
-  %assignment_value512 = load i32, ptr %assignment_value511, align 4
-  store i32 %assignment_value512, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746138, align 4
+  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657338 to i32), ptr %assignment_value526, align 4
+  %assignment_value527 = load i32, ptr %assignment_value526, align 4
+  store i32 %assignment_value527, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746138, align 4
   %data8 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746138, align 4
-  %data514 = getelementptr inbounds i8, ptr %struct_literal513, i8 0
-  store i32 %data8, ptr %data514, align 4
-  %length515 = getelementptr inbounds i8, ptr %struct_literal513, i8 8
-  store i64 2, ptr %length515, align 4
-  %struct_value516 = load [16 x i8], ptr %struct_literal513, align 1
-  store [16 x i8] %struct_value516, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787438, align 1
-  %call517 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787438)
-  store i32 %call517, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756538, align 4
+  %data529 = getelementptr inbounds i8, ptr %struct_literal528, i8 0
+  store i32 %data8, ptr %data529, align 4
+  %length530 = getelementptr inbounds i8, ptr %struct_literal528, i8 8
+  store i64 2, ptr %length530, align 4
+  %struct_value531 = load [16 x i8], ptr %struct_literal528, align 1
+  store [16 x i8] %struct_value531, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787438, align 1
+  %call532 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787438)
+  store i32 %call532, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756538, align 4
   %value8 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756538, align 4
-  %eq518 = icmp eq i32 %value8, 0
-  br i1 %eq518, label %if.then519, label %if.merge520
+  %eq533 = icmp eq i32 %value8, 0
+  br i1 %eq533, label %if.then534, label %if.merge535
 
-if.then519:                                       ; preds = %if.merge479
-  %data522 = getelementptr inbounds i8, ptr %utf8_literal521, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_14 to i32), ptr %data522, align 4
-  %length523 = getelementptr inbounds i8, ptr %utf8_literal521, i8 8
-  store i64 5, ptr %length523, align 4
-  %call524 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal521)
-  br label %if.merge520
+if.then534:                                       ; preds = %deref_null_continue512
+  %data537 = getelementptr inbounds i8, ptr %utf8_literal536, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_14 to i32), ptr %data537, align 4
+  %length538 = getelementptr inbounds i8, ptr %utf8_literal536, i8 8
+  store i64 5, ptr %length538, align 4
+  %call539 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal536)
+  br label %if.merge535
 
-if.merge520:                                      ; preds = %if.then519, %if.merge479
-  %value8525 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756538, align 4
-  %ne526 = icmp ne i32 %value8525, 0
-  br i1 %ne526, label %if.then527, label %if.merge528
+if.merge535:                                      ; preds = %if.then534, %deref_null_continue512
+  %value8540 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756538, align 4
+  %ne541 = icmp ne i32 %value8540, 0
+  br i1 %ne541, label %if.then542, label %if.merge543
 
-if.then527:                                       ; preds = %if.merge520
-  %data530 = getelementptr inbounds i8, ptr %utf8_literal529, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_15 to i32), ptr %data530, align 4
-  %length531 = getelementptr inbounds i8, ptr %utf8_literal529, i8 8
-  store i64 11, ptr %length531, align 4
-  %call532 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal529)
-  br label %if.merge528
+if.then542:                                       ; preds = %if.merge535
+  %data545 = getelementptr inbounds i8, ptr %utf8_literal544, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_15 to i32), ptr %data545, align 4
+  %length546 = getelementptr inbounds i8, ptr %utf8_literal544, i8 8
+  store i64 11, ptr %length546, align 4
+  %call547 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal544)
+  br label %if.merge543
 
-if.merge528:                                      ; preds = %if.then527, %if.merge520
-  %array_element534 = getelementptr inbounds [2 x i8], ptr %array_literal533, i32 0, i32 0
-  store i8 95, ptr %array_element534, align 1
-  %array_element535 = getelementptr inbounds [2 x i8], ptr %array_literal533, i32 0, i32 1
-  store i8 49, ptr %array_element535, align 1
-  %struct_value536 = load [2 x i8], ptr %array_literal533, align 1
-  store [2 x i8] %struct_value536, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657339, align 1
+if.merge543:                                      ; preds = %if.then542, %if.merge535
+  %array_element549 = getelementptr inbounds [2 x i8], ptr %array_literal548, i32 0, i32 0
+  store i8 95, ptr %array_element549, align 1
+  %array_element550 = getelementptr inbounds [2 x i8], ptr %array_literal548, i32 0, i32 1
+  store i8 49, ptr %array_element550, align 1
+  %struct_value551 = load [2 x i8], ptr %array_literal548, align 1
+  store [2 x i8] %struct_value551, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657339, align 1
   store i32 0, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746139, align 4
-  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657339 to i32), ptr %assignment_value537, align 4
-  %assignment_value538 = load i32, ptr %assignment_value537, align 4
-  store i32 %assignment_value538, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746139, align 4
+  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f627974657339 to i32), ptr %assignment_value552, align 4
+  %assignment_value553 = load i32, ptr %assignment_value552, align 4
+  store i32 %assignment_value553, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746139, align 4
   %data9 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f6461746139, align 4
-  %data540 = getelementptr inbounds i8, ptr %struct_literal539, i8 0
-  store i32 %data9, ptr %data540, align 4
-  %length541 = getelementptr inbounds i8, ptr %struct_literal539, i8 8
-  store i64 2, ptr %length541, align 4
-  %struct_value542 = load [16 x i8], ptr %struct_literal539, align 1
-  store [16 x i8] %struct_value542, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787439, align 1
-  %call543 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787439)
-  store i32 %call543, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756539, align 4
+  %data555 = getelementptr inbounds i8, ptr %struct_literal554, i8 0
+  store i32 %data9, ptr %data555, align 4
+  %length556 = getelementptr inbounds i8, ptr %struct_literal554, i8 8
+  store i64 2, ptr %length556, align 4
+  %struct_value557 = load [16 x i8], ptr %struct_literal554, align 1
+  store [16 x i8] %struct_value557, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787439, align 1
+  %call558 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f7465787439)
+  store i32 %call558, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756539, align 4
   %value9 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756539, align 4
-  %eq544 = icmp eq i32 %value9, 0
-  br i1 %eq544, label %if.then545, label %if.merge546
+  %eq559 = icmp eq i32 %value9, 0
+  br i1 %eq559, label %if.then560, label %if.merge561
 
-if.then545:                                       ; preds = %if.merge528
-  %data548 = getelementptr inbounds i8, ptr %utf8_literal547, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_16 to i32), ptr %data548, align 4
-  %length549 = getelementptr inbounds i8, ptr %utf8_literal547, i8 8
-  store i64 5, ptr %length549, align 4
-  %call550 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal547)
-  br label %if.merge546
+if.then560:                                       ; preds = %if.merge543
+  %data563 = getelementptr inbounds i8, ptr %utf8_literal562, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_16 to i32), ptr %data563, align 4
+  %length564 = getelementptr inbounds i8, ptr %utf8_literal562, i8 8
+  store i64 5, ptr %length564, align 4
+  %call565 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal562)
+  br label %if.merge561
 
-if.merge546:                                      ; preds = %if.then545, %if.merge528
-  %value9551 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756539, align 4
-  %ne552 = icmp ne i32 %value9551, 0
-  br i1 %ne552, label %if.then553, label %if.merge554
+if.merge561:                                      ; preds = %if.then560, %if.merge543
+  %value9566 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c756539, align 4
+  %ne567 = icmp ne i32 %value9566, 0
+  br i1 %ne567, label %if.then568, label %if.merge569
 
-if.then553:                                       ; preds = %if.merge546
-  %data556 = getelementptr inbounds i8, ptr %utf8_literal555, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_17 to i32), ptr %data556, align 4
-  %length557 = getelementptr inbounds i8, ptr %utf8_literal555, i8 8
-  store i64 11, ptr %length557, align 4
-  %call558 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal555)
-  br label %if.merge554
+if.then568:                                       ; preds = %if.merge561
+  %data571 = getelementptr inbounds i8, ptr %utf8_literal570, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_17 to i32), ptr %data571, align 4
+  %length572 = getelementptr inbounds i8, ptr %utf8_literal570, i8 8
+  store i64 11, ptr %length572, align 4
+  %call573 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal570)
+  br label %if.merge569
 
-if.merge554:                                      ; preds = %if.then553, %if.merge546
-  %array_element560 = getelementptr inbounds [4 x i8], ptr %array_literal559, i32 0, i32 0
-  store i8 49, ptr %array_element560, align 1
-  %array_element561 = getelementptr inbounds [4 x i8], ptr %array_literal559, i32 0, i32 1
-  store i8 95, ptr %array_element561, align 1
-  %array_element562 = getelementptr inbounds [4 x i8], ptr %array_literal559, i32 0, i32 2
-  store i8 95, ptr %array_element562, align 1
-  %array_element563 = getelementptr inbounds [4 x i8], ptr %array_literal559, i32 0, i32 3
-  store i8 48, ptr %array_element563, align 1
-  %struct_value564 = load [4 x i8], ptr %array_literal559, align 1
-  store [4 x i8] %struct_value564, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f62797465733130, align 1
+if.merge569:                                      ; preds = %if.then568, %if.merge561
+  %array_element575 = getelementptr inbounds [4 x i8], ptr %array_literal574, i32 0, i32 0
+  store i8 49, ptr %array_element575, align 1
+  %array_element576 = getelementptr inbounds [4 x i8], ptr %array_literal574, i32 0, i32 1
+  store i8 95, ptr %array_element576, align 1
+  %array_element577 = getelementptr inbounds [4 x i8], ptr %array_literal574, i32 0, i32 2
+  store i8 95, ptr %array_element577, align 1
+  %array_element578 = getelementptr inbounds [4 x i8], ptr %array_literal574, i32 0, i32 3
+  store i8 48, ptr %array_element578, align 1
+  %struct_value579 = load [4 x i8], ptr %array_literal574, align 1
+  store [4 x i8] %struct_value579, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f62797465733130, align 1
   store i32 0, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f646174613130, align 4
-  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f62797465733130 to i32), ptr %assignment_value565, align 4
-  %assignment_value566 = load i32, ptr %assignment_value565, align 4
-  store i32 %assignment_value566, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f646174613130, align 4
+  store i32 ptrtoint (ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f62797465733130 to i32), ptr %assignment_value580, align 4
+  %assignment_value581 = load i32, ptr %assignment_value580, align 4
+  store i32 %assignment_value581, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f646174613130, align 4
   %data10 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f646174613130, align 4
-  %data568 = getelementptr inbounds i8, ptr %struct_literal567, i8 0
-  store i32 %data10, ptr %data568, align 4
-  %length569 = getelementptr inbounds i8, ptr %struct_literal567, i8 8
-  store i64 4, ptr %length569, align 4
-  %struct_value570 = load [16 x i8], ptr %struct_literal567, align 1
-  store [16 x i8] %struct_value570, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f746578743130, align 1
-  %call571 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f746578743130)
-  store i32 %call571, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c75653130, align 4
+  %data583 = getelementptr inbounds i8, ptr %struct_literal582, i8 0
+  store i32 %data10, ptr %data583, align 4
+  %length584 = getelementptr inbounds i8, ptr %struct_literal582, i8 8
+  store i64 4, ptr %length584, align 4
+  %struct_value585 = load [16 x i8], ptr %struct_literal582, align 1
+  store [16 x i8] %struct_value585, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f746578743130, align 1
+  %call586 = call i32 @wosy_generic__776f73795f6f7665726c6f61645f5f37373666373337393566363636653566356633353636333536363335333733343636333533333335333933353636333533303334333133353334333433383335363633353636356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333373336333433333334333333303333333833333336333333373333333533363331333333383336333233363331333333333336333633333330333333353336333233363331333333303333333433333337333633353333333433363336333633333333333733363332333333393333333833333335333333393336333433333334333333333333333033363331333333313333333533363336333333333333333633333333333333313333333133363332333333323333333033363331333633353333333233333333333333353333333333333339333333373336333233333335333633313336333633363333333333353336333233333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f746578743130)
+  store i32 %call586, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c75653130, align 4
   %value10 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c75653130, align 4
-  %eq572 = icmp eq i32 %value10, 0
-  br i1 %eq572, label %if.then573, label %if.merge574
+  %eq587 = icmp eq i32 %value10, 0
+  br i1 %eq587, label %if.then588, label %if.merge589
 
-if.then573:                                       ; preds = %if.merge554
-  %data576 = getelementptr inbounds i8, ptr %utf8_literal575, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_18 to i32), ptr %data576, align 4
-  %length577 = getelementptr inbounds i8, ptr %utf8_literal575, i8 8
-  store i64 5, ptr %length577, align 4
-  %call578 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal575)
-  br label %if.merge574
+if.then588:                                       ; preds = %if.merge569
+  %data591 = getelementptr inbounds i8, ptr %utf8_literal590, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_18 to i32), ptr %data591, align 4
+  %length592 = getelementptr inbounds i8, ptr %utf8_literal590, i8 8
+  store i64 5, ptr %length592, align 4
+  %call593 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal590)
+  br label %if.merge589
 
-if.merge574:                                      ; preds = %if.then573, %if.merge554
-  %value10579 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c75653130, align 4
-  %ne580 = icmp ne i32 %value10579, 0
-  br i1 %ne580, label %if.then581, label %if.merge582
+if.merge589:                                      ; preds = %if.then588, %if.merge569
+  %value10594 = load i32, ptr @wosy_fn__5f5f574f53595f504154485f5f__753132385f6c696263616c6c__7372632f6d61696e2e77__64373263303165386235323032646438366232663538386637623638356666316130626661336661353131643362616231633931633365386635306537326363__676c6f62616c5f76616c75653130, align 4
+  %ne595 = icmp ne i32 %value10594, 0
+  br i1 %ne595, label %if.then596, label %if.merge597
 
-if.then581:                                       ; preds = %if.merge574
-  %data584 = getelementptr inbounds i8, ptr %utf8_literal583, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_19 to i32), ptr %data584, align 4
-  %length585 = getelementptr inbounds i8, ptr %utf8_literal583, i8 8
-  store i64 11, ptr %length585, align 4
-  %call586 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal583)
-  br label %if.merge582
+if.then596:                                       ; preds = %if.merge589
+  %data599 = getelementptr inbounds i8, ptr %utf8_literal598, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_19 to i32), ptr %data599, align 4
+  %length600 = getelementptr inbounds i8, ptr %utf8_literal598, i8 8
+  store i64 11, ptr %length600, align 4
+  %call601 = call { i64, i1 } @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__7072696e74(ptr %utf8_literal598)
+  br label %if.merge597
 
-if.merge582:                                      ; preds = %if.then581, %if.merge574
+if.merge597:                                      ; preds = %if.then596, %if.merge589
   call void @wosy_fn__5f5f574f53595f504154485f5f__737464__7372632f626f6f7473747261702e77__37643430383637356138626133663035626130343765346663376239383539643433306131356633363331316232306165323335333937623561666335623532__65786974(i32 0)
   ret i32 0
 }
@@ -11923,3 +11971,39 @@ declare ptr @__wosy_core_alloc.76(i64, i64)
 declare void @__wosy_core_free.77(ptr)
 
 declare void @__wosy_core_system_panic.78()
+
+declare ptr @__wosy_core_alloc.79(i64, i64)
+
+declare void @__wosy_core_free.80(ptr)
+
+declare void @__wosy_core_system_panic.81()
+
+declare ptr @__wosy_core_alloc.82(i64, i64)
+
+declare void @__wosy_core_free.83(ptr)
+
+declare void @__wosy_core_system_panic.84()
+
+declare ptr @__wosy_core_alloc.85(i64, i64)
+
+declare void @__wosy_core_free.86(ptr)
+
+declare void @__wosy_core_system_panic.87()
+
+declare ptr @__wosy_core_alloc.88(i64, i64)
+
+declare void @__wosy_core_free.89(ptr)
+
+declare void @__wosy_core_system_panic.90()
+
+declare ptr @__wosy_core_alloc.91(i64, i64)
+
+declare void @__wosy_core_free.92(ptr)
+
+declare void @__wosy_core_system_panic.93()
+
+declare ptr @__wosy_core_alloc.94(i64, i64)
+
+declare void @__wosy_core_free.95(ptr)
+
+declare void @__wosy_core_system_panic.96()

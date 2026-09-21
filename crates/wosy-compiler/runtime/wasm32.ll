@@ -1,6 +1,7 @@
 target triple = "wasm32-wasi"
 
-@__wosy_core_heap_cursor = internal global i64 65536
+; Heap starts above the default 64 KiB stack-last region so the bump region never grows through live frames.
+@__wosy_core_heap_cursor = internal global i64 131072
 @__wosy_core_free_head = internal global i32 0
 
 declare i32 @llvm.wasm.memory.size.i32(i32)
