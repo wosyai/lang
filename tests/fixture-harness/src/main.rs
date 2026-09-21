@@ -62,6 +62,72 @@ fn worker_count() -> Result<usize, String> {
     parse_worker_count(env::var("FIXTURE_WORKERS").ok())
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Lane {
+    Fast,
+    Slow,
+}
+
+fn parse_lane_filter(raw: Option<String>) -> Result<Option<Lane>, String> {
+    match raw {
+        None => Ok(None),
+        Some(text) => match text.as_str() {
+            "all" => Ok(None),
+            "fast" => Ok(Some(Lane::Fast)),
+            "slow" => Ok(Some(Lane::Slow)),
+            _ => Err("LANE must be one of fast, slow, all".to_owned()),
+        },
+    }
+}
+
+fn is_fast_command(command: &[String]) -> bool {
+    if command.first().map(String::as_str) == Some("wosy")
+        && command.get(1).map(String::as_str) == Some("parse")
+    {
+        return true;
+    }
+    if command.first().map(String::as_str) == Some("python")
+        && command.get(1).map(String::as_str) == Some("-c")
+    {
+        return true;
+    }
+    false
+}
+
+fn case_lane(document: &DocumentMut) -> Lane {
+    for key in ["steps", "assert"] {
+        let Some(tables) = document.get(key).and_then(Item::as_array_of_tables) else {
+            continue;
+        };
+        for table in tables.iter() {
+            if table.get("fd_read").is_some()
+                || table.get("partial_fd_write_count").is_some()
+                || table.get("stdin").is_some()
+                || table.get("source_observations").is_some()
+            {
+                return Lane::Slow;
+            }
+            if let Some(command) = table
+                .get("command")
+                .and_then(Item::as_value)
+                .and_then(|value| value.as_array())
+            {
+                let mut words = Vec::new();
+                for value in command.iter() {
+                    let Some(word) = value.as_str() else {
+                        return Lane::Slow;
+                    };
+                    words.push(word.to_owned());
+                }
+                if !is_fast_command(&words) {
+                    return Lane::Slow;
+                }
+            }
+        }
+    }
+    Lane::Fast
+}
+
 fn temp_dir_for_case(case: &Path) -> PathBuf {
     let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let thread = format!("{:?}", std::thread::current().id());
@@ -112,6 +178,17 @@ fn main() -> Result<(), String> {
         cases.retain(|case| {
             case.file_name()
                 .is_some_and(|name| name == std::ffi::OsStr::new(&selected))
+        });
+    }
+    if let Some(selected) = parse_lane_filter(env::var("LANE").ok())? {
+        cases.retain(|case| {
+            let Ok(contents) = fs::read_to_string(case.join("case.toml")) else {
+                return true;
+            };
+            let Ok(document) = contents.parse::<DocumentMut>() else {
+                return true;
+            };
+            case_lane(&document) == selected
         });
     }
     cases.sort();
@@ -1352,9 +1429,10 @@ fn collect_cases(directory: &Path, cases: &mut Vec<PathBuf>) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_partial_fd_write_result, can_reuse_built_artifact, is_wosy_build_command,
-        link_shared_stdlib, parse_worker_count, partial_fd_write_count,
-        requires_selected_source_build, run_case, source_key, temp_dir_for_case, WriteRecord,
+        assert_partial_fd_write_result, can_reuse_built_artifact, case_lane, is_fast_command,
+        is_wosy_build_command, link_shared_stdlib, parse_lane_filter, parse_worker_count,
+        partial_fd_write_count, requires_selected_source_build, run_case, source_key,
+        temp_dir_for_case, Lane, WriteRecord,
     };
     use std::{env, fs, path::Path};
     use toml_edit::DocumentMut;
@@ -1586,5 +1664,138 @@ mod tests {
         }
 
         assert_eq!(builds, 2);
+    }
+
+    #[test]
+    fn lane_filter_defaults_to_all() {
+        assert_eq!(parse_lane_filter(None), Ok(None));
+        assert_eq!(parse_lane_filter(Some("all".to_owned())), Ok(None));
+    }
+
+    #[test]
+    fn lane_filter_selects_fast_and_slow() {
+        assert_eq!(
+            parse_lane_filter(Some("fast".to_owned())),
+            Ok(Some(Lane::Fast))
+        );
+        assert_eq!(
+            parse_lane_filter(Some("slow".to_owned())),
+            Ok(Some(Lane::Slow))
+        );
+    }
+
+    #[test]
+    fn lane_filter_rejects_unknown_values() {
+        assert!(parse_lane_filter(Some("medium".to_owned())).is_err());
+        assert!(parse_lane_filter(Some(String::new())).is_err());
+    }
+
+    #[test]
+    fn fast_commands_cover_parse_and_cst_cat() {
+        let parse = vec!["wosy".to_owned(), "parse".to_owned(), "app".to_owned()];
+        let parse_bare = vec!["wosy".to_owned(), "parse".to_owned()];
+        let cst_cat = vec![
+            "python".to_owned(),
+            "-c".to_owned(),
+            "import sys; sys.stdout.buffer.write(open('.wosy/cst/current.json', 'rb').read())"
+                .to_owned(),
+        ];
+
+        assert!(is_fast_command(&parse));
+        assert!(is_fast_command(&parse_bare));
+        assert!(is_fast_command(&cst_cat));
+    }
+
+    #[test]
+    fn build_run_and_script_commands_are_slow() {
+        let build = vec!["wosy".to_owned(), "build".to_owned()];
+        let run = vec!["wosy".to_owned(), "run".to_owned(), "app".to_owned()];
+        let script = vec!["python".to_owned(), "scripts/check-partition".to_owned()];
+
+        assert!(!is_fast_command(&build));
+        assert!(!is_fast_command(&run));
+        assert!(!is_fast_command(&script));
+        assert!(!is_fast_command(&[]));
+    }
+
+    #[test]
+    fn parse_only_case_is_fast() {
+        let document = "[[steps]]\ncommand = [\"wosy\", \"parse\", \"app\"]\nexit = 0\n\n[[assert]]\ncommand = [\"python\", \"-c\", \"cat\"]\nexit = 0\n"
+            .parse::<DocumentMut>()
+            .expect("lane document");
+
+        assert_eq!(case_lane(&document), Lane::Fast);
+    }
+
+    #[test]
+    fn manifest_mutation_steps_without_commands_stay_fast() {
+        let document = "[[steps]]\ncommand = [\"wosy\", \"parse\", \"app\"]\nexit = 0\n\n[[steps]]\nwrite = \"src/main.w\"\ncontents = \"def main(): pass\"\n\n[[assert]]\ncommand = [\"wosy\", \"parse\", \"app\"]\nexit = 0\n"
+            .parse::<DocumentMut>()
+            .expect("lane document");
+
+        assert_eq!(case_lane(&document), Lane::Fast);
+    }
+
+    #[test]
+    fn build_command_case_is_slow() {
+        let document = "[[steps]]\ncommand = [\"wosy\", \"build\"]\nexit = 0\n\n[[assert]]\ncommand = [\"wosy\", \"build\"]\nexit = 0\n"
+            .parse::<DocumentMut>()
+            .expect("lane document");
+
+        assert_eq!(case_lane(&document), Lane::Slow);
+    }
+
+    #[test]
+    fn run_command_case_is_slow() {
+        let document = "[[steps]]\ncommand = [\"wosy\", \"parse\", \"app\"]\nexit = 0\n\n[[assert]]\ncommand = [\"wosy\", \"run\", \"app\"]\nexit = 0\n"
+            .parse::<DocumentMut>()
+            .expect("lane document");
+
+        assert_eq!(case_lane(&document), Lane::Slow);
+    }
+
+    #[test]
+    fn script_command_case_is_slow() {
+        let document = "[[steps]]\ncommand = [\"wosy\", \"build\"]\nexit = 0\n\n[[assert]]\ncommand = [\"python\", \"scripts/check-partition\"]\nexit = 0\n"
+            .parse::<DocumentMut>()
+            .expect("lane document");
+
+        assert_eq!(case_lane(&document), Lane::Slow);
+    }
+
+    #[test]
+    fn fd_read_case_is_slow() {
+        let document = "[[steps]]\ncommand = [\"wosy\", \"parse\", \"app\"]\nexit = 0\n\n[[assert]]\nsource = \"project/src/echo_stdin.w\"\nfd_read = [{ capacity = 8, bytes = [104, 105], errno = 0 }]\n"
+            .parse::<DocumentMut>()
+            .expect("lane document");
+
+        assert_eq!(case_lane(&document), Lane::Slow);
+    }
+
+    #[test]
+    fn partial_fd_write_count_case_is_slow() {
+        let document = "[[steps]]\ncommand = [\"wosy\", \"parse\", \"app\"]\nexit = 0\n\n[[assert]]\nsource = \"project/src/public_partial.w\"\npartial_fd_write_count = 3\n"
+            .parse::<DocumentMut>()
+            .expect("lane document");
+
+        assert_eq!(case_lane(&document), Lane::Slow);
+    }
+
+    #[test]
+    fn stdin_case_is_slow() {
+        let document = "[[steps]]\ncommand = [\"wosy\", \"parse\", \"app\"]\nexit = 0\n\n[[assert]]\ncommand = [\"wosy\", \"run\"]\nexit = 0\nstdin = [104, 105]\n"
+            .parse::<DocumentMut>()
+            .expect("lane document");
+
+        assert_eq!(case_lane(&document), Lane::Slow);
+    }
+
+    #[test]
+    fn source_observations_case_is_slow() {
+        let document = "[[steps]]\ncommand = [\"wosy\", \"parse\", \"app\"]\nexit = 0\n\n[[assert]]\ncommand = [\"wosy\", \"parse\", \"app\"]\nexit = 0\n\n[[assert.source_observations]]\npackage = \"app\"\n"
+            .parse::<DocumentMut>()
+            .expect("lane document");
+
+        assert_eq!(case_lane(&document), Lane::Slow);
     }
 }
