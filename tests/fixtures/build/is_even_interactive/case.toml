@@ -1,0 +1,29 @@
+shared_stdlib = true
+
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "app"]
+stdin = [52, 10, 55, 10, 49, 50, 120, 10]
+exit = 0
+stdout = "expected/session.stdout"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "app"]
+stdin = []
+exit = 0
+stdout = "expected/empty_session.stdout"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "app"]
+stdin = [55, 10, 49, 50, 120, 10, 52, 10]
+exit = 0
+stdout = "expected/invalid_mid.stdout"
+stderr = "expected/empty"
+exact = true
