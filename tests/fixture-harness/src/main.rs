@@ -208,6 +208,7 @@ fn run_case_inner(case: &Path, root: &Path, binary: &Path) -> Result<(), String>
         .get("steps")
         .and_then(Item::as_array_of_tables)
         .ok_or_else(|| format!("{} has no [[steps]]", case.display()))?;
+    let mut last_built: Option<Option<String>> = None;
     for step in steps.iter() {
         if let Some(path) = step
             .get("remove")
@@ -215,6 +216,7 @@ fn run_case_inner(case: &Path, root: &Path, binary: &Path) -> Result<(), String>
             .and_then(|value| value.as_str())
         {
             fs::remove_file(temporary.join(path)).map_err(|error| error.to_string())?;
+            last_built = None;
             continue;
         }
         if let Some(path) = step
@@ -237,6 +239,7 @@ fn run_case_inner(case: &Path, root: &Path, binary: &Path) -> Result<(), String>
                 serde_json::to_vec(&manifest).map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
+            last_built = None;
             continue;
         }
         if let Some(path) = step
@@ -264,6 +267,7 @@ fn run_case_inner(case: &Path, root: &Path, binary: &Path) -> Result<(), String>
                 serde_json::to_vec(&manifest).map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
+            last_built = None;
             continue;
         }
         if let Some(path) = step
@@ -281,8 +285,10 @@ fn run_case_inner(case: &Path, root: &Path, binary: &Path) -> Result<(), String>
                 fs::create_dir_all(parent).map_err(|error| error.to_string())?;
             }
             fs::write(destination, contents).map_err(|error| error.to_string())?;
+            last_built = None;
             continue;
         }
+        let step_key = source_key(step);
         select_source(step, &temporary, &case)?;
         let command = command_values(step)?;
         let expected = step
@@ -314,14 +320,29 @@ fn run_case_inner(case: &Path, root: &Path, binary: &Path) -> Result<(), String>
             append_child_output(&mut log, &output);
             return Err(log);
         }
+        if is_wosy_build_command(&command) {
+            if output.status.success() {
+                last_built = Some(step_key);
+            } else {
+                last_built = None;
+            }
+        }
     }
     let assertions = document
         .get("assert")
         .and_then(Item::as_array_of_tables)
         .ok_or_else(|| format!("{} has no [[assert]]", case.display()))?;
+    let mut previous_build: Option<Option<String>> = last_built;
     for assertion in assertions.iter() {
         if let Some(read_assertion) = fd_read_assertion(assertion)? {
-            run_fd_read_assertion(assertion, read_assertion, &temporary, &case, binary)?;
+            run_fd_read_assertion(
+                assertion,
+                read_assertion,
+                &temporary,
+                &case,
+                binary,
+                &mut previous_build,
+            )?;
             assert_source_observations(assertion, &temporary, &case)?;
             continue;
         }
@@ -332,27 +353,29 @@ fn run_case_inner(case: &Path, root: &Path, binary: &Path) -> Result<(), String>
                 &temporary,
                 &case,
                 binary,
+                &mut previous_build,
             )?;
             assert_source_observations(assertion, &temporary, &case)?;
             continue;
         }
-        let has_source_selector = assertion
-            .get("source")
-            .and_then(Item::as_value)
-            .and_then(|value| value.as_str())
-            .is_some();
+        let key = source_key(assertion);
+        let has_source_selector = key.is_some();
         select_source(assertion, &temporary, &case)?;
         let command = command_values(assertion)?;
         if requires_selected_source_build(has_source_selector, &command) {
-            let output = Command::new(binary)
-                .args(["build"])
-                .current_dir(&temporary)
-                .output()
-                .map_err(|error| error.to_string())?;
-            if !output.status.success() {
-                let mut log = format!("failed {}: selected source build failed\n", case.display());
-                append_child_output(&mut log, &output);
-                return Err(log);
+            if !can_reuse_built_artifact(&previous_build, &key) {
+                let output = Command::new(binary)
+                    .args(["build"])
+                    .current_dir(&temporary)
+                    .output()
+                    .map_err(|error| error.to_string())?;
+                if !output.status.success() {
+                    let mut log =
+                        format!("failed {}: selected source build failed\n", case.display());
+                    append_child_output(&mut log, &output);
+                    return Err(log);
+                }
+                previous_build = Some(key.clone());
             }
         }
         let assertion_program = if command[0] == "wosy" {
@@ -412,6 +435,13 @@ fn run_case_inner(case: &Path, root: &Path, binary: &Path) -> Result<(), String>
             );
             append_child_output(&mut log, &output);
             return Err(log);
+        }
+        if is_wosy_build_command(&command) {
+            previous_build = if output.status.success() {
+                Some(key)
+            } else {
+                None
+            };
         }
         let selectors = assertion
             .get("select")
@@ -545,6 +575,7 @@ fn run_fd_read_assertion(
     temporary: &Path,
     case: &Path,
     binary: &Path,
+    previous_build: &mut Option<Option<String>>,
 ) -> Result<(), String> {
     if assertion.get("command").is_some() {
         return Err(format!(
@@ -559,15 +590,19 @@ fn run_fd_read_assertion(
         ));
     }
     select_source(assertion, temporary, case)?;
-    let output = Command::new(binary)
-        .arg("build")
-        .current_dir(temporary)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        let mut log = format!("{}: fd_read source build failed\n", case.display());
-        append_child_output(&mut log, &output);
-        return Err(log);
+    let key = source_key(assertion);
+    if !can_reuse_built_artifact(previous_build, &key) {
+        let output = Command::new(binary)
+            .arg("build")
+            .current_dir(temporary)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            let mut log = format!("{}: fd_read source build failed\n", case.display());
+            append_child_output(&mut log, &output);
+            return Err(log);
+        }
+        *previous_build = Some(key);
     }
     let executable = artifact_executable(temporary, case)?;
     let source = assertion
@@ -857,6 +892,7 @@ fn run_partial_fd_write_assertion(
     temporary: &Path,
     case: &Path,
     binary: &Path,
+    previous_build: &mut Option<Option<String>>,
 ) -> Result<(), String> {
     if assertion.get("command").is_some() {
         return Err(format!(
@@ -882,18 +918,22 @@ fn run_partial_fd_write_assertion(
         ));
     }
     select_source(assertion, temporary, case)?;
-    let output = Command::new(binary)
-        .arg("build")
-        .current_dir(temporary)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        let mut log = format!(
-            "{}: partial_fd_write_count source build failed\n",
-            case.display()
-        );
-        append_child_output(&mut log, &output);
-        return Err(log);
+    let key = source_key(assertion);
+    if !can_reuse_built_artifact(previous_build, &key) {
+        let output = Command::new(binary)
+            .arg("build")
+            .current_dir(temporary)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            let mut log = format!(
+                "{}: partial_fd_write_count source build failed\n",
+                case.display()
+            );
+            append_child_output(&mut log, &output);
+            return Err(log);
+        }
+        *previous_build = Some(key);
     }
     let executable = artifact_executable(temporary, case)?;
     run_partial_fd_write_host(&executable, partial_count, case)
@@ -1070,6 +1110,23 @@ fn requires_selected_source_build(has_source_selector: bool, command: &[String])
     has_source_selector
         && command.first().map(String::as_str) == Some("wosy")
         && command.get(1).map(String::as_str) == Some("run")
+}
+
+fn is_wosy_build_command(command: &[String]) -> bool {
+    command.first().map(String::as_str) == Some("wosy")
+        && command.get(1).map(String::as_str) == Some("build")
+}
+
+fn source_key(table: &toml_edit::Table) -> Option<String> {
+    table
+        .get("source")
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+}
+
+fn can_reuse_built_artifact(previous_build: &Option<Option<String>>, key: &Option<String>) -> bool {
+    key.is_some() && previous_build.as_ref() == Some(key)
 }
 
 fn is_wosy_run_command(command: &[String]) -> bool {
@@ -1295,9 +1352,9 @@ fn collect_cases(directory: &Path, cases: &mut Vec<PathBuf>) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_partial_fd_write_result, link_shared_stdlib, parse_worker_count,
-        partial_fd_write_count, requires_selected_source_build, run_case, temp_dir_for_case,
-        WriteRecord,
+        assert_partial_fd_write_result, can_reuse_built_artifact, is_wosy_build_command,
+        link_shared_stdlib, parse_worker_count, partial_fd_write_count,
+        requires_selected_source_build, run_case, source_key, temp_dir_for_case, WriteRecord,
     };
     use std::{env, fs, path::Path};
     use toml_edit::DocumentMut;
@@ -1436,5 +1493,98 @@ mod tests {
         assert_eq!(report.case, Path::new("missing-fixture"));
         assert!(report.log.starts_with("failed "));
         assert!(report.log.ends_with('\n'));
+    }
+
+    #[test]
+    fn source_key_matches_selector_string() {
+        let document = "[[assert]]\nsource = \"project/src/classify.w\"\n"
+            .parse::<DocumentMut>()
+            .expect("assertion document");
+        let assertion = document
+            .get("assert")
+            .and_then(toml_edit::Item::as_array_of_tables)
+            .and_then(|assertions| assertions.iter().next())
+            .expect("source assertion");
+
+        assert_eq!(
+            source_key(assertion),
+            Some("project/src/classify.w".to_owned())
+        );
+    }
+
+    #[test]
+    fn source_key_is_none_without_selector() {
+        let assertion = toml_edit::Table::new();
+
+        assert_eq!(source_key(&assertion), None);
+    }
+
+    #[test]
+    fn detects_wosy_build_commands() {
+        let build = vec!["wosy".to_owned(), "build".to_owned()];
+        let build_app = vec!["wosy".to_owned(), "build".to_owned(), "app".to_owned()];
+        let run = vec!["wosy".to_owned(), "run".to_owned()];
+        let script = vec!["python".to_owned(), "scripts/evidence".to_owned()];
+
+        assert!(is_wosy_build_command(&build));
+        assert!(is_wosy_build_command(&build_app));
+        assert!(!is_wosy_build_command(&run));
+        assert!(!is_wosy_build_command(&script));
+        assert!(!is_wosy_build_command(&[]));
+    }
+
+    #[test]
+    fn reuses_artifact_for_consecutive_same_source() {
+        let key = Some("project/src/classify.w".to_owned());
+        let mut previous: Option<Option<String>> = None;
+
+        assert!(!can_reuse_built_artifact(&previous, &key));
+        previous = Some(key.clone());
+
+        assert!(can_reuse_built_artifact(&previous, &key));
+    }
+
+    #[test]
+    fn rebuilds_on_source_change_or_unknown_artifact() {
+        let steps_built: Option<Option<String>> = Some(Some("project/src/classify.w".to_owned()));
+        let same = Some("project/src/classify.w".to_owned());
+        let other = Some("project/src/echo_number.w".to_owned());
+        let unknown: Option<Option<String>> = None;
+
+        assert!(can_reuse_built_artifact(&steps_built, &same));
+        assert!(!can_reuse_built_artifact(&steps_built, &other));
+        assert!(!can_reuse_built_artifact(&unknown, &same));
+    }
+
+    #[test]
+    fn sourceless_asserts_never_reuse() {
+        let built_sourceless: Option<Option<String>> = Some(None);
+
+        assert!(!can_reuse_built_artifact(&built_sourceless, &None));
+    }
+
+    #[test]
+    fn consecutive_grouping_counts_builds_like_is_even() {
+        let classify = Some("project/src/classify.w".to_owned());
+        let echo = Some("project/src/echo_number.w".to_owned());
+        let sequence = [
+            classify.clone(),
+            classify.clone(),
+            classify.clone(),
+            classify.clone(),
+            echo.clone(),
+            echo.clone(),
+            echo.clone(),
+        ];
+        let mut previous: Option<Option<String>> = None;
+        let mut builds = 0;
+        for key in &sequence {
+            if !can_reuse_built_artifact(&previous, key) {
+                builds += 1;
+                previous = Some(key.clone());
+            }
+        }
+
+        assert_eq!(builds, 2);
     }
 }
