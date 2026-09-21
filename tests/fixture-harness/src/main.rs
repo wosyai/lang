@@ -1,7 +1,9 @@
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
 use toml_edit::{DocumentMut, Item};
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store};
 use wasmtime_wasi::p1::WasiP1Ctx;
@@ -233,11 +235,42 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
         } else {
             PathBuf::from(&command[0])
         };
-        let output = Command::new(assertion_program)
-            .args(command.iter().skip(1))
-            .current_dir(&temporary)
-            .output()
-            .map_err(|error| error.to_string())?;
+        let piped_stdin = stdin_bytes(assertion)?;
+        if piped_stdin.is_some()
+            && !is_wosy_run_command(&command)
+        {
+            return Err(format!(
+                "{}: stdin assertion requires wosy run command",
+                case.display()
+            ));
+        }
+        let output = match piped_stdin {
+            None => Command::new(assertion_program)
+                .args(command.iter().skip(1))
+                .current_dir(&temporary)
+                .output()
+                .map_err(|error| error.to_string())?,
+            Some(piped_stdin) => {
+                let mut child = Command::new(assertion_program)
+                    .args(command.iter().skip(1))
+                    .current_dir(&temporary)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|error| error.to_string())?;
+                child
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| "assertion stdin is missing".to_owned())?
+                    .write_all(&piped_stdin)
+                    .map_err(|error| error.to_string())?;
+                drop(child.stdin.take());
+                child
+                    .wait_with_output()
+                    .map_err(|error| error.to_string())?
+            }
+        };
         let expected_status = assertion
             .get("exit")
             .and_then(Item::as_value)
@@ -392,6 +425,12 @@ fn run_fd_read_assertion(
     if assertion.get("command").is_some() {
         return Err(format!(
             "{}: fd_read assertion accepts no command",
+            case.display()
+        ));
+    }
+    if stdin_bytes(assertion)?.is_some() {
+        return Err(format!(
+            "{}: fd_read assertion accepts no stdin",
             case.display()
         ));
     }
@@ -652,6 +691,27 @@ fn manifest_field_parent<'a>(
     }
 }
 
+fn stdin_bytes(assertion: &toml_edit::Table) -> Result<Option<Vec<u8>>, String> {
+    let Some(item) = assertion.get("stdin") else {
+        return Ok(None);
+    };
+    let bytes = item
+        .as_value()
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "stdin must be an array".to_owned())?
+        .iter()
+        .map(|value| {
+            value
+                .as_integer()
+                .ok_or_else(|| "stdin values must be integers".to_owned())
+                .and_then(|value| {
+                    u8::try_from(value).map_err(|_| "stdin values must fit in u8".to_owned())
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(bytes))
+}
+
 fn partial_fd_write_count(assertion: &toml_edit::Table) -> Result<Option<u32>, String> {
     let Some(item) = assertion.get("partial_fd_write_count") else {
         return Ok(None);
@@ -675,6 +735,12 @@ fn run_partial_fd_write_assertion(
     if assertion.get("command").is_some() {
         return Err(format!(
             "{}: partial_fd_write_count assertion accepts no command",
+            case.display()
+        ));
+    }
+    if stdin_bytes(assertion)?.is_some() {
+        return Err(format!(
+            "{}: partial_fd_write_count assertion accepts no stdin",
             case.display()
         ));
     }
@@ -875,6 +941,11 @@ fn assert_partial_fd_write_result(
 fn requires_selected_source_build(has_source_selector: bool, command: &[String]) -> bool {
     has_source_selector
         && command.first().map(String::as_str) == Some("wosy")
+        && command.get(1).map(String::as_str) == Some("run")
+}
+
+fn is_wosy_run_command(command: &[String]) -> bool {
+    command.first().map(String::as_str) == Some("wosy")
         && command.get(1).map(String::as_str) == Some("run")
 }
 
