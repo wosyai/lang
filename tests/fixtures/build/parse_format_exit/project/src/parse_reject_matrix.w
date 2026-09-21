@@ -84,6 +84,22 @@ unit() check_u16 = fn {
 	if (v_over != null) {
 		std.print("UNEXPECTED\n");
 	};
+	std.utf8 t_plus = "+1";
+	*u16 v_plus = std.parse(t_plus);
+	if (v_plus == null) {
+		std.print("null\n");
+	};
+	if (v_plus != null) {
+		std.print("UNEXPECTED\n");
+	};
+	std.utf8 t_minus = "-1";
+	*u16 v_minus = std.parse(t_minus);
+	if (v_minus == null) {
+		std.print("null\n");
+	};
+	if (v_minus != null) {
+		std.print("UNEXPECTED\n");
+	};
 };
 unit() check_i16 = fn {
 	std.utf8 t_min = "-32768";
@@ -130,6 +146,22 @@ unit() check_u32 = fn {
 	if (v_over != null) {
 		std.print("UNEXPECTED\n");
 	};
+	std.utf8 t_plus = "+1";
+	*u32 v_plus = std.parse(t_plus);
+	if (v_plus == null) {
+		std.print("null\n");
+	};
+	if (v_plus != null) {
+		std.print("UNEXPECTED\n");
+	};
+	std.utf8 t_minus = "-1";
+	*u32 v_minus = std.parse(t_minus);
+	if (v_minus == null) {
+		std.print("null\n");
+	};
+	if (v_minus != null) {
+		std.print("UNEXPECTED\n");
+	};
 };
 unit() check_i32 = fn {
 	std.utf8 t_min = "-2147483648";
@@ -154,6 +186,52 @@ unit() check_i32 = fn {
 	};
 	std.utf8 t_under = "-2147483649";
 	*i32 v_under = std.parse(t_under);
+	if (v_under == null) {
+		std.print("null\n");
+	};
+	if (v_under != null) {
+		std.print("UNEXPECTED\n");
+	};
+};
+unit() check_u64 = fn {
+	std.utf8 t_max = "18446744073709551615";
+	*u64 v_max = std.parse(t_max);
+	u64 n_max = *v_max;
+	std.utf8 o_max = std.format(n_max);
+	std.print(o_max);
+	std.print("\n");
+	std.utf8 t_over = "18446744073709551616";
+	*u64 v_over = std.parse(t_over);
+	if (v_over == null) {
+		std.print("null\n");
+	};
+	if (v_over != null) {
+		std.print("UNEXPECTED\n");
+	};
+};
+unit() check_i64 = fn {
+	std.utf8 t_min = "-9223372036854775808";
+	*i64 v_min = std.parse(t_min);
+	i64 n_min = *v_min;
+	std.utf8 o_min = std.format(n_min);
+	std.print(o_min);
+	std.print("\n");
+	std.utf8 t_max = "9223372036854775807";
+	*i64 v_max = std.parse(t_max);
+	i64 n_max = *v_max;
+	std.utf8 o_max = std.format(n_max);
+	std.print(o_max);
+	std.print("\n");
+	std.utf8 t_over = "9223372036854775808";
+	*i64 v_over = std.parse(t_over);
+	if (v_over == null) {
+		std.print("null\n");
+	};
+	if (v_over != null) {
+		std.print("UNEXPECTED\n");
+	};
+	std.utf8 t_under = "-9223372036854775809";
+	*i64 v_under = std.parse(t_under);
 	if (v_under == null) {
 		std.print("null\n");
 	};
@@ -192,6 +270,22 @@ unit() check_misc = fn {
 		std.print("null\n");
 	};
 	if (v_nan != null) {
+		std.print("UNEXPECTED\n");
+	};
+	std.utf8 t_inf32 = "inf";
+	*f32 v_inf32 = std.parse(t_inf32);
+	if (v_inf32 == null) {
+		std.print("null\n");
+	};
+	if (v_inf32 != null) {
+		std.print("UNEXPECTED\n");
+	};
+	std.utf8 t_nan32 = "nan";
+	*f32 v_nan32 = std.parse(t_nan32);
+	if (v_nan32 == null) {
+		std.print("null\n");
+	};
+	if (v_nan32 != null) {
 		std.print("UNEXPECTED\n");
 	};
 	std.utf8 t_plus = "+1";
@@ -247,6 +341,8 @@ check_u16();
 check_i16();
 check_u32();
 check_i32();
+check_u64();
+check_i64();
 check_misc();
 check_bad_c3();
 check_bad_ff();
