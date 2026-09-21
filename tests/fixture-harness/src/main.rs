@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use toml_edit::{DocumentMut, Item};
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store};
 use wasmtime_wasi::p1::WasiP1Ctx;
@@ -34,8 +35,76 @@ struct ReadRecord {
     errno: i32,
 }
 
+struct CaseReport {
+    case: PathBuf,
+    passed: bool,
+    log: String,
+}
+
+static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn parse_worker_count(raw: Option<String>) -> Result<usize, String> {
+    match raw {
+        None => Ok(4),
+        Some(text) => {
+            let count: usize = text
+                .parse()
+                .map_err(|_| format!("FIXTURE_WORKERS must be a positive integer"))?;
+            if count < 1 {
+                return Err("FIXTURE_WORKERS must be a positive integer".to_owned());
+            }
+            Ok(count)
+        }
+    }
+}
+
+fn worker_count() -> Result<usize, String> {
+    parse_worker_count(env::var("FIXTURE_WORKERS").ok())
+}
+
+fn temp_dir_for_case(case: &Path) -> PathBuf {
+    let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let thread = format!("{:?}", std::thread::current().id());
+    let thread: String = thread
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    env::temp_dir().join(format!(
+        "wosy-parse-fixture-{}-{thread}-{nonce}-{}",
+        std::process::id(),
+        case.file_name().expect("fixture name").to_string_lossy()
+    ))
+}
+
+fn append_child_output(log: &mut String, output: &std::process::Output) {
+    log.push_str(&format!(
+        "stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    ));
+    if !log.ends_with('\n') {
+        log.push('\n');
+    }
+    log.push_str(&format!(
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    ));
+    if !log.ends_with('\n') {
+        log.push('\n');
+    }
+}
+
 fn main() -> Result<(), String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let binary = env::var("WOSY_BIN")
+        .map(PathBuf::from)
+        .map_err(|_| "WOSY_BIN must point to the wosy executable".to_owned())?;
+    let binary = if binary.is_absolute() {
+        binary
+    } else {
+        env::current_dir()
+            .map_err(|error| error.to_string())?
+            .join(binary)
+    };
     let fixtures = root.join("../fixtures");
     let mut cases = Vec::new();
     collect_cases(&fixtures, &mut cases)?;
@@ -46,22 +115,83 @@ fn main() -> Result<(), String> {
         });
     }
     cases.sort();
-    for case in cases {
-        run_case(&case, &root)?;
+    let total = cases.len();
+    let workers = worker_count()?.min(total.max(1));
+    let next = AtomicUsize::new(0);
+    let mut reports = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            handles.push(scope.spawn(|| {
+                let mut local = Vec::new();
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= cases.len() {
+                        break;
+                    }
+                    local.push(run_case(&cases[index], &root, &binary));
+                }
+                local
+            }));
+        }
+        let mut combined = Vec::new();
+        for handle in handles {
+            combined.extend(handle.join().expect("fixture worker panicked"));
+        }
+        combined
+    });
+    reports.sort_by(|left, right| left.case.cmp(&right.case));
+    let mut failed = Vec::new();
+    for report in &reports {
+        if report.passed {
+            println!("passed {}", report.case.display());
+        } else {
+            print!("{}", report.log);
+            failed.push(report.case.clone());
+        }
     }
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        let mut summary = format!("{} failed / {} total", failed.len(), total);
+        for case in &failed {
+            summary.push_str(&format!("\nfailed {}", case.display()));
+        }
+        Err(summary)
+    }
 }
 
-fn run_case(case: &Path, root: &Path) -> Result<(), String> {
+fn run_case(case: &Path, root: &Path, binary: &Path) -> CaseReport {
+    match run_case_inner(case, root, binary) {
+        Ok(()) => CaseReport {
+            case: case.to_path_buf(),
+            passed: true,
+            log: String::new(),
+        },
+        Err(message) => {
+            let log = if message.starts_with("failed ") {
+                if message.ends_with('\n') {
+                    message
+                } else {
+                    format!("{message}\n")
+                }
+            } else {
+                format!("failed {}: {message}\n", case.display())
+            };
+            CaseReport {
+                case: case.to_path_buf(),
+                passed: false,
+                log,
+            }
+        }
+    }
+}
+
+fn run_case_inner(case: &Path, root: &Path, binary: &Path) -> Result<(), String> {
     let document = fs::read_to_string(case.join("case.toml"))
         .map_err(|error| format!("{}: {error}", case.display()))?
         .parse::<DocumentMut>()
         .map_err(|error| error.to_string())?;
-    let temporary = env::temp_dir().join(format!(
-        "wosy-parse-fixture-{}-{}",
-        std::process::id(),
-        case.file_name().expect("fixture name").to_string_lossy()
-    ));
+    let temporary = temp_dir_for_case(case);
     copy_tree(&case.join("project"), &temporary)?;
     if document
         .get("shared_stdlib")
@@ -74,16 +204,6 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
             fs::canonicalize(repository_root.join("stdlib")).map_err(|error| error.to_string())?;
         link_shared_stdlib(&stdlib, &temporary)?;
     }
-    let binary = env::var("WOSY_BIN")
-        .map(PathBuf::from)
-        .map_err(|_| "WOSY_BIN must point to the wosy executable".to_owned())?;
-    let binary = if binary.is_absolute() {
-        binary
-    } else {
-        env::current_dir()
-            .map_err(|error| error.to_string())?
-            .join(binary)
-    };
     let steps = document
         .get("steps")
         .and_then(Item::as_array_of_tables)
@@ -179,17 +299,20 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
             process.args(command.iter().skip(1));
             process
         };
-        let status = process
+        let output = process
             .current_dir(&temporary)
-            .status()
+            .output()
             .map_err(|error| error.to_string())?;
         if i64::from(
-            status
+            output
+                .status
                 .code()
                 .ok_or_else(|| "step was terminated".to_owned())?,
         ) != expected
         {
-            return Err(format!("{}: unexpected exit status", case.display()));
+            let mut log = format!("failed {}: unexpected exit status\n", case.display());
+            append_child_output(&mut log, &output);
+            return Err(log);
         }
     }
     let assertions = document
@@ -198,7 +321,7 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("{} has no [[assert]]", case.display()))?;
     for assertion in assertions.iter() {
         if let Some(read_assertion) = fd_read_assertion(assertion)? {
-            run_fd_read_assertion(assertion, read_assertion, &temporary, &case, &binary)?;
+            run_fd_read_assertion(assertion, read_assertion, &temporary, &case, binary)?;
             assert_source_observations(assertion, &temporary, &case)?;
             continue;
         }
@@ -208,7 +331,7 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
                 partial_fd_write_count,
                 &temporary,
                 &case,
-                &binary,
+                binary,
             )?;
             assert_source_observations(assertion, &temporary, &case)?;
             continue;
@@ -221,24 +344,24 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
         select_source(assertion, &temporary, &case)?;
         let command = command_values(assertion)?;
         if requires_selected_source_build(has_source_selector, &command) {
-            let status = Command::new(&binary)
+            let output = Command::new(binary)
                 .args(["build"])
                 .current_dir(&temporary)
-                .status()
+                .output()
                 .map_err(|error| error.to_string())?;
-            if !status.success() {
-                return Err(format!("{}: selected source build failed", case.display()));
+            if !output.status.success() {
+                let mut log = format!("failed {}: selected source build failed\n", case.display());
+                append_child_output(&mut log, &output);
+                return Err(log);
             }
         }
         let assertion_program = if command[0] == "wosy" {
-            binary.clone()
+            binary.to_path_buf()
         } else {
             PathBuf::from(&command[0])
         };
         let piped_stdin = stdin_bytes(assertion)?;
-        if piped_stdin.is_some()
-            && !is_wosy_run_command(&command)
-        {
+        if piped_stdin.is_some() && !is_wosy_run_command(&command) {
             return Err(format!(
                 "{}: stdin assertion requires wosy run command",
                 case.display()
@@ -283,10 +406,12 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
                 .ok_or_else(|| "assertion was terminated".to_owned())?,
         ) != expected_status
         {
-            return Err(format!(
-                "{}: unexpected assertion exit status",
+            let mut log = format!(
+                "failed {}: unexpected assertion exit status\n",
                 case.display()
-            ));
+            );
+            append_child_output(&mut log, &output);
+            return Err(log);
         }
         let selectors = assertion
             .get("select")
@@ -348,7 +473,6 @@ fn run_case(case: &Path, root: &Path) -> Result<(), String> {
         assert_source_observations(assertion, &temporary, &case)?;
     }
     fs::remove_dir_all(&temporary).map_err(|error| error.to_string())?;
-    println!("passed {}", case.display());
     Ok(())
 }
 
@@ -435,13 +559,15 @@ fn run_fd_read_assertion(
         ));
     }
     select_source(assertion, temporary, case)?;
-    let status = Command::new(binary)
+    let output = Command::new(binary)
         .arg("build")
         .current_dir(temporary)
-        .status()
+        .output()
         .map_err(|error| error.to_string())?;
-    if !status.success() {
-        return Err(format!("{}: fd_read source build failed", case.display()));
+    if !output.status.success() {
+        let mut log = format!("{}: fd_read source build failed\n", case.display());
+        append_child_output(&mut log, &output);
+        return Err(log);
     }
     let executable = artifact_executable(temporary, case)?;
     let source = assertion
@@ -756,16 +882,18 @@ fn run_partial_fd_write_assertion(
         ));
     }
     select_source(assertion, temporary, case)?;
-    let status = Command::new(binary)
+    let output = Command::new(binary)
         .arg("build")
         .current_dir(temporary)
-        .status()
+        .output()
         .map_err(|error| error.to_string())?;
-    if !status.success() {
-        return Err(format!(
-            "{}: partial_fd_write_count source build failed",
+    if !output.status.success() {
+        let mut log = format!(
+            "{}: partial_fd_write_count source build failed\n",
             case.display()
-        ));
+        );
+        append_child_output(&mut log, &output);
+        return Err(log);
     }
     let executable = artifact_executable(temporary, case)?;
     run_partial_fd_write_host(&executable, partial_count, case)
@@ -1167,8 +1295,9 @@ fn collect_cases(directory: &Path, cases: &mut Vec<PathBuf>) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_partial_fd_write_result, link_shared_stdlib, partial_fd_write_count,
-        requires_selected_source_build, WriteRecord,
+        assert_partial_fd_write_result, link_shared_stdlib, parse_worker_count,
+        partial_fd_write_count, requires_selected_source_build, run_case, temp_dir_for_case,
+        WriteRecord,
     };
     use std::{env, fs, path::Path};
     use toml_edit::DocumentMut;
@@ -1246,9 +1375,15 @@ mod tests {
 
     #[test]
     fn shared_stdlib_link_exposes_its_manifest() {
+        let thread = format!("{:?}", std::thread::current().id());
+        let thread: String = thread
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .collect();
+        let nonce = super::TEMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let temporary = env::temp_dir().join(format!(
-            "wosy-fixture-harness-stdlib-link-{}",
-            std::process::id()
+            "wosy-fixture-harness-stdlib-link-{}-{thread}-{nonce}",
+            std::process::id(),
         ));
         fs::create_dir_all(&temporary).expect("temporary directory");
         let result = (|| -> Result<(), String> {
@@ -1262,5 +1397,44 @@ mod tests {
         fs::remove_dir_all(&temporary).expect("temporary directory cleanup");
         assert!(!temporary.exists(), "temporary directory was not removed");
         result.expect("shared stdlib manifest is readable");
+    }
+
+    #[test]
+    fn worker_count_defaults_to_four() {
+        assert_eq!(parse_worker_count(None), Ok(4));
+    }
+
+    #[test]
+    fn worker_count_accepts_env_override() {
+        assert_eq!(parse_worker_count(Some("2".to_owned())), Ok(2));
+    }
+
+    #[test]
+    fn worker_count_rejects_non_positive_values() {
+        assert!(parse_worker_count(Some("0".to_owned())).is_err());
+        assert!(parse_worker_count(Some("many".to_owned())).is_err());
+    }
+
+    #[test]
+    fn temp_dirs_are_unique_per_case_call() {
+        let case = Path::new("some-fixture");
+        let first = temp_dir_for_case(case);
+        let second = temp_dir_for_case(case);
+
+        assert_ne!(first, second);
+        assert!(first
+            .to_string_lossy()
+            .contains(&std::process::id().to_string()));
+    }
+
+    #[test]
+    fn failed_case_report_carries_buffered_log() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let report = run_case(Path::new("missing-fixture"), root, Path::new("wosy"));
+
+        assert!(!report.passed);
+        assert_eq!(report.case, Path::new("missing-fixture"));
+        assert!(report.log.starts_with("failed "));
+        assert!(report.log.ends_with('\n'));
     }
 }
