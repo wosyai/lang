@@ -64,7 +64,6 @@ Every `.w` file uses explicit boundaries:
 ```wosy
 %%start
 i32 value = 40;
-value;
 %%end
 ```
 
@@ -97,17 +96,12 @@ i32(i32) add_one = fn(value) {
 u8[4] values = [1, 2, 3, 4];
 values[0] = 11;
 u8 item = values[0];
-item;
 Record record = { .value = 3; .bytes = [4, 5]; };
 u8 record_value = record.value;
-record_value;
 i32 result = add_one(41);
-result;
 u8 first = 1;
 u8 second = 2;
 first, second = second, first;
-first;
-second;
 ```
 
 Function types name outputs then parameters: `i32(i32)`, `unit()`, `(u64, bool)(utf8)`. The last value list without `;` is the return: `reported, complete`. `generic T;` plus `overload { }` declare generic and overloaded callables.
@@ -142,10 +136,6 @@ u8[4] fixed = [1, 2, 3, 4];
 *u8 shared = &place;
 *!u8 mutable = &!place;
 u8 item = fixed[0];
-raw;
-shared;
-mutable;
-item;
 ```
 
 `T[N]` has fixed length. `T[n]` with a length expression inside a function allocates runtime storage. `&?`, `&`, `&!` take raw, shared, and mutable addresses. Dereference with `*p`.
@@ -160,13 +150,6 @@ f64 g = core.sint_to_float<f64>(s);
 f64 h = core.float_extend<f64>(f32value);
 *?u8 at = unsafe { core.offset<u8>(base, index) };
 u8 v = unsafe { core.load<u8>(at) };
-wide;
-narrow;
-f;
-g;
-h;
-at;
-v;
 ```
 
 `core.alloc`, `core.free`, `core.offset`, `core.load`, and `&?` require `unsafe`.
@@ -175,9 +158,7 @@ Standard I/O through `std`:
 
 ```wosy
 std = namespace std "bootstrap.w";
-u64 reported, bool complete = std.print("hello\n");
-reported;
-complete;
+std.print("hello\n");
 *std.utf8 text = null;
 std.ReadLineStatus status = std.ReadLineStatus::eof;
 text, status = std.read_line(64);
@@ -189,7 +170,6 @@ if (text != null) {
 };
 std.utf8 line = { .data = content; .length = size; };
 *u64 value = std.parse(line);
-value;
 ```
 
 `std.print` and `std.eprint` return bytes written plus completion. `std.read_line(64)` returns nullable text plus a `ReadLineStatus` of `line, eof, io_error, invalid_utf8, limit_exceeded`. `std.parse(line)` returns a nullable number, integer or float selected by context. Compare optionals against `null` and unwrap with `*value` inside the non-null branch.
