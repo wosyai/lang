@@ -4151,9 +4151,6 @@ fn emit_expression<'ctx, 'module>(
             overload_selection,
             ..
         } => {
-            if receiver.as_deref() == Some("core") && name == "cast" {
-                return emit_cast(context, state, type_arguments, arguments);
-            }
             if receiver.as_deref() == Some("core") && name == "alloc" {
                 return emit_core_alloc(context, state, arguments);
             }
@@ -4330,17 +4327,6 @@ fn emit_project_expression<'ctx, 'module>(
             overload_selection,
             ..
         } => {
-            if receiver.as_deref() == Some("core") && name == "cast" {
-                let values = emit_cast_project_values(
-                    context,
-                    state,
-                    type_arguments,
-                    arguments,
-                    module,
-                    modules,
-                )?;
-                return Ok(values);
-            }
             if receiver.as_deref() == Some("core") && name == "alloc" {
                 return emit_core_alloc_project(context, state, arguments, module, modules);
             }
@@ -4660,31 +4646,6 @@ fn emit_call<'ctx, 'module>(
         .map(|(argument, parameter)| emit_typed_expression(context, state, argument, parameter))
         .collect::<Result<Vec<_>, _>>()?;
     emit_call_values(state, &target, values)
-}
-
-fn emit_cast<'ctx, 'module>(
-    context: &'ctx Context,
-    state: &mut EmitState<'ctx, 'module>,
-    type_arguments: &[crate::scalar::ScalarTypeArgument],
-    arguments: &[ScalarExpression],
-) -> Result<EmitValue<'ctx>, String> {
-    if type_arguments.len() != 1 || type_arguments[0].ty != ScalarType::U32 {
-        return Err("core.cast has an invalid destination type argument".to_owned());
-    }
-    let [value, mode] = arguments else {
-        return Err("core.cast has invalid argument arity".to_owned());
-    };
-    if !matches!(mode, ScalarExpression::Utf8 { value, .. } if value == b"exact") {
-        return Err("core.cast requires the static mode \"exact\"".to_owned());
-    }
-    let value = take_basic(emit_expression(context, state, value)?)?.into_int_value();
-    Ok(EmitValue::Basic(
-        state
-            .builder
-            .build_int_truncate(value, context.i32_type(), "cast")
-            .map_err(builder_error)?
-            .into(),
-    ))
 }
 
 fn emit_core_alloc<'ctx, 'module>(
@@ -5010,36 +4971,6 @@ fn emit_bitcast<'ctx, 'module>(
         .map_err(builder_error)?;
     Ok(EmitValue::Basic(converted))
 }
-fn emit_cast_project_values<'ctx, 'module>(
-    context: &'ctx Context,
-    state: &mut EmitState<'ctx, 'module>,
-    type_arguments: &[crate::scalar::ScalarTypeArgument],
-    arguments: &[ScalarExpression],
-    module: &ScalarModule,
-    modules: &[&ScalarModule],
-) -> Result<EmitValue<'ctx>, String> {
-    if type_arguments.len() != 1 || type_arguments[0].ty != ScalarType::U32 {
-        return Err("core.cast has an invalid destination type argument".to_owned());
-    }
-    let [value, mode] = arguments else {
-        return Err("core.cast has invalid argument arity".to_owned());
-    };
-    if !matches!(mode, ScalarExpression::Utf8 { value, .. } if value == b"exact") {
-        return Err("core.cast requires the static mode \"exact\"".to_owned());
-    }
-    let value = take_basic(emit_project_expression(
-        context, state, value, module, modules,
-    )?)?
-    .into_int_value();
-    Ok(EmitValue::Basic(
-        state
-            .builder
-            .build_int_truncate(value, context.i32_type(), "cast")
-            .map_err(builder_error)?
-            .into(),
-    ))
-}
-
 fn emit_int_conversion_project<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -8779,34 +8710,6 @@ count, complete = read_into(buffer, requested_capacity);
                 "{text}"
             );
         }
-    }
-
-    #[test]
-    fn emits_generic_exact_u64_to_u32_cast_without_runtime_guard() {
-        let source = SourceIdentity::new(
-            "project".into(),
-            "package".into(),
-            "src/main.w".into(),
-            "r1".into(),
-        );
-        let validation = derive_scalar_program(
-            &parse_source(
-                source,
-                "%%start\nu64 source = 42;\nu32 result = core.cast<u32>(source, \"exact\");\n%%end"
-                    .into(),
-                &[],
-            )
-            .result,
-        );
-        assert!(
-            validation.diagnostics.is_empty(),
-            "{:?}",
-            validation.diagnostics
-        );
-        let text = emit_scalar_llvm(&validation).expect("cast LLVM").to_text();
-        assert!(text.contains("trunc i64"), "{text}");
-        assert!(text.contains(" to i32"), "{text}");
-        assert!(!text.contains("icmp"), "{text}");
     }
 
     #[test]
