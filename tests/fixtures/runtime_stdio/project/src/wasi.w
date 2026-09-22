@@ -22,7 +22,7 @@ unit() write_stdout = fn {
 		u64 length = stdout_text.length;
 		WasiIovec iovec = {
 			.buf = bytes;
-			.len = core.cast<u32>(length, "exact");
+			.len = core.int_trunc<u32>(length);
 		};
 		*?WasiIovec iovec_address = &?iovec;
 		WasiNwritten nwritten = { .value = 0; };
@@ -37,7 +37,7 @@ unit() write_stderr = fn {
 		u64 length = stderr_text.length;
 		WasiIovec iovec = {
 			.buf = bytes;
-			.len = core.cast<u32>(length, "exact");
+			.len = core.int_trunc<u32>(length);
 		};
 		*?WasiIovec iovec_address = &?iovec;
 		WasiNwritten nwritten = { .value = 0; };

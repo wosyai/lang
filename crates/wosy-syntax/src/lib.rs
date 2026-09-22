@@ -1217,7 +1217,7 @@ mod tests {
 
     #[test]
     fn generic_call_arguments_are_structural_lossless_and_ordered() {
-        let text = "%%start\nu32 result = core.cast<u32>(value, \"exact\");\n%%end";
+        let text = "%%start\nu32 result = core.wrap<u32>(value, \"exact\");\n%%end";
         let result = parse(identity(), text.into(), &[]);
         assert!(result.is_valid(), "{:?}", result.errors);
         assert_eq!(result.reconstruct(), text);
@@ -1226,7 +1226,7 @@ mod tests {
             .descendants()
             .find(|node| node.kind() == SyntaxKind::Call)
             .expect("generic call");
-        assert_eq!(call.text(), "core.cast<u32>(value, \"exact\")");
+        assert_eq!(call.text(), "core.wrap<u32>(value, \"exact\")");
         let generic = call
             .children()
             .find(|node| node.kind() == SyntaxKind::GenericTypeArguments)
@@ -1381,7 +1381,7 @@ mod tests {
 
     #[test]
     fn qualified_types_preserve_tokens_and_spans_in_every_type_position() {
-        let text = "%%start\nchild = namespace app \"src/child.w\";\n*?child.Pair(child.Pair) convert = fn(value) { value };\nchild.Pair item = { .value = 1; };\ncore.cast<child.Pair>(item, \"exact\");\n%%end";
+        let text = "%%start\nchild = namespace app \"src/child.w\";\n*?child.Pair(child.Pair) convert = fn(value) { value };\nchild.Pair item = { .value = 1; };\ncore.wrap<child.Pair>(item, \"exact\");\n%%end";
         let result = parse(identity(), text.into(), &[]);
         assert!(result.is_valid(), "{:?}", result.errors);
         assert_eq!(result.reconstruct(), text);
@@ -1413,7 +1413,7 @@ mod tests {
 
     #[test]
     fn malformed_generic_call_recovers_losslessly() {
-        let text = "%%start\nu32 result = core.cast<$>(value, \"exact\");\nu32 after = 1;\n%%end";
+        let text = "%%start\nu32 result = core.wrap<$>(value, \"exact\");\nu32 after = 1;\n%%end";
         let result = parse(identity(), text.into(), &[]);
         assert!(!result.is_valid());
         assert_eq!(result.reconstruct(), text);
@@ -1424,7 +1424,7 @@ mod tests {
         assert!(result
             .errors
             .iter()
-            .any(|error| { error.span.start <= text.find("core.cast").expect("call") as u32 }));
+            .any(|error| { error.span.start <= text.find("core.wrap").expect("call") as u32 }));
     }
 
     #[test]

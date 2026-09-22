@@ -22,7 +22,7 @@ unsafe {
 	u64 length = text.length;
 	WasiIovec iovec = {
 		.buf = bytes;
-		.len = core.cast<u32>(length, "exact");
+		.len = core.int_trunc<u32>(length);
 	};
 	*?WasiIovec iovec_address = &?iovec;
 	WasiNwritten nwritten = { .value = 0; };
