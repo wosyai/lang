@@ -17,9 +17,7 @@ Hello, completely:
 ```wosy
 %%start
 std = namespace std "bootstrap.w";
-u64 reported, bool complete = std.print("hello\n");
-reported;
-complete;
+std.print("hello\n");
 %%end
 ```
 
@@ -39,7 +37,6 @@ if (text != null) {
 };
 std.utf8 line = { .data = content; .length = size; };
 *u64 value = std.parse(line);
-value;
 %%end
 ```
 
