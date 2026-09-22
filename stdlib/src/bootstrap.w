@@ -80,6 +80,10 @@ unit(u32) exit = fn(code) {
 	preview1.exit(code);
 };
 
+unit(u64) sleep_ns = fn(nanoseconds) {
+	preview1.sleep_ns(nanoseconds);
+};
+
 enum ReadLineStatus {
 	line;
 	eof;

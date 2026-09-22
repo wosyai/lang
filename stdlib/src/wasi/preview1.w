@@ -17,9 +17,59 @@ struct _Nread {
 	u32 value;
 }
 
+struct _Subscription {
+	u64 userdata;
+	u8 clock_tag;
+	u8 _pad_1;
+	u8 _pad_2;
+	u8 _pad_3;
+	u8 _pad_4;
+	u8 _pad_5;
+	u8 _pad_6;
+	u8 _pad_7;
+	u32 clock_id;
+	u8 _pad_8;
+	u8 _pad_9;
+	u8 _pad_10;
+	u8 _pad_11;
+	u64 timeout;
+	u64 precision;
+	u16 flags;
+	u8 _pad_12;
+	u8 _pad_13;
+	u8 _pad_14;
+	u8 _pad_15;
+	u8 _pad_16;
+	u8 _pad_17;
+}
+
+struct _Event {
+	u64 userdata;
+	u16 error;
+	u8 event_type;
+	u8 _pad_1;
+	u8 _pad_2;
+	u8 _pad_3;
+	u8 _pad_4;
+	u8 _pad_5;
+	u64 nbytes;
+	u16 flags;
+	u8 _pad_6;
+	u8 _pad_7;
+	u8 _pad_8;
+	u8 _pad_9;
+	u8 _pad_10;
+	u8 _pad_11;
+}
+
+struct _Nevents {
+	u32 value;
+}
+
 _wasi = extern wasm "wasi_snapshot_preview1" {
 	unsafe i32(i32, *?_ReadIovec, i32, *?_Nread) _fd_read;
 	unsafe i32(i32, *?Iovec, i32, *?Nwritten) fd_write;
+	unsafe i32(*?_Subscription, *?_Event, i32, *?_Nevents) _poll_oneoff;
 	unsafe unit(i32) _proc_exit;
 };
 
@@ -79,6 +129,56 @@ unit(u32) exit = fn(code) {
 	i32 slot = core.int_trunc<i32>(core.int_extend<u64>(code));
 	unsafe {
 		_wasi._proc_exit(slot);
+	};
+};
+
+unit(u64) sleep_ns = fn(nanoseconds) {
+	_Subscription sub = {
+		.userdata = 0;
+		.clock_tag = 0;
+		._pad_1 = 0;
+		._pad_2 = 0;
+		._pad_3 = 0;
+		._pad_4 = 0;
+		._pad_5 = 0;
+		._pad_6 = 0;
+		._pad_7 = 0;
+		.clock_id = 1;
+		._pad_8 = 0;
+		._pad_9 = 0;
+		._pad_10 = 0;
+		._pad_11 = 0;
+		.timeout = nanoseconds;
+		.precision = 0;
+		.flags = 0;
+		._pad_12 = 0;
+		._pad_13 = 0;
+		._pad_14 = 0;
+		._pad_15 = 0;
+		._pad_16 = 0;
+		._pad_17 = 0;
+	};
+	_Event event = {
+		.userdata = 0;
+		.error = 0;
+		.event_type = 0;
+		._pad_1 = 0;
+		._pad_2 = 0;
+		._pad_3 = 0;
+		._pad_4 = 0;
+		._pad_5 = 0;
+		.nbytes = 0;
+		.flags = 0;
+		._pad_6 = 0;
+		._pad_7 = 0;
+		._pad_8 = 0;
+		._pad_9 = 0;
+		._pad_10 = 0;
+		._pad_11 = 0;
+	};
+	_Nevents fired = { .value = 0; };
+	unsafe {
+		_wasi._poll_oneoff(&?sub, &?event, 1, &?fired);
 	};
 };
 %%end
