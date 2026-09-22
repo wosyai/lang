@@ -1,2 +1,5 @@
 [build]
 rustflags = ["-L", "native=C:\\Users\\natha\\Tools\\llvm-deps\\lib"]
+
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link.exe"

@@ -27,3 +27,6 @@ toml_edit = "0.22"
 wosy-compiler = { path = "crates/wosy-compiler" }
 wosy-project = { path = "crates/wosy-project" }
 wosy-syntax = { path = "crates/wosy-syntax" }
+
+[profile.dev]
+debug = "line-tables-only"
