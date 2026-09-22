@@ -21,7 +21,7 @@ args = []
 root = "src/main.w"
 
 [targets.app.artifacts.main]
-artifact = "WasiReadInto"
+artifact = "WasiSleepNs"
 
 [targets.app.artifacts.main.profiles.dev]
 backend = "llvm"
