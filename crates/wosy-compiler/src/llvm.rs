@@ -3571,6 +3571,28 @@ fn assignment_place_type<'ctx, 'module>(
     }
 }
 
+fn core_pointer_cast_dereference_type(
+    expression: &ScalarExpression,
+) -> Option<(&ScalarType, bool)> {
+    let ScalarExpression::Call {
+        receiver: Some(receiver),
+        name,
+        type_arguments,
+        ..
+    } = expression
+    else {
+        return None;
+    };
+    if receiver != "core" || name != "pointer_cast" {
+        return None;
+    }
+    match &type_arguments.first()?.ty {
+        ScalarType::RawPointer(inner) => Some((inner, false)),
+        ScalarType::CheckedReference { inner, .. } => Some((inner, true)),
+        _ => None,
+    }
+}
+
 fn pointer_target_type<'ctx, 'module>(
     state: &EmitState<'ctx, 'module>,
     expression: &ScalarExpression,
@@ -3596,6 +3618,9 @@ fn pointer_target_type<'ctx, 'module>(
             overload_selection,
             ..
         } => {
+            if let Some((inner, _)) = core_pointer_cast_dereference_type(expression) {
+                return Some(inner.clone());
+            }
             let qualified = project.map_or_else(
                 || {
                     receiver
@@ -3669,6 +3694,9 @@ fn dereference_requires_null_guard<'ctx, 'module>(
             overload_selection,
             ..
         } => {
+            if let Some((_, checked)) = core_pointer_cast_dereference_type(expression) {
+                return checked;
+            }
             let qualified = project.map_or_else(
                 || {
                     receiver
@@ -8499,6 +8527,105 @@ count, complete = read_into(buffer, requested_capacity);
         assert!(project.contains("store i32 %base5, ptr @"), "{project}");
         assert!(!project.contains("inttoptr"), "{project}");
         assert!(!project.contains("deref_null"), "{project}");
+    }
+
+    #[test]
+    fn emits_guard_for_direct_pointer_cast_dereference_in_single_file_and_project() {
+        for (destination, field) in [
+            ("*u8", false),
+            ("*!u8", false),
+            ("*Record", true),
+            ("*!Record", true),
+        ] {
+            let source = SourceIdentity::new(
+                "project".into(),
+                "package".into(),
+                "src/main.w".into(),
+                "r1".into(),
+            );
+            let program = derive_scalar_program(
+                &parse_source(
+                    source.clone(),
+                    format!(
+                        "%%start\n{}u8(*?u8) read = fn(pointer) {{ unsafe {{ {} }} }};\n%%end",
+                        if field {
+                            "struct Record { u8 tag; }\n"
+                        } else {
+                            ""
+                        },
+                        if field {
+                            format!("(*core.pointer_cast<{destination}>(pointer)).tag")
+                        } else {
+                            format!("*core.pointer_cast<{destination}>(pointer)")
+                        },
+                    ),
+                    &[],
+                )
+                .result,
+            );
+            assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+            let single = emit_scalar_llvm(&program)
+                .expect("single-file direct pointer cast dereference LLVM")
+                .to_text();
+            assert!(single.contains("deref_is_null"), "{destination}: {single}");
+            assert!(
+                single.contains("deref_null_panic"),
+                "{destination}: {single}"
+            );
+            assert!(
+                single.contains("deref_null_continue"),
+                "{destination}: {single}"
+            );
+            assert!(
+                single.contains("call void @__wosy_core_system_panic()"),
+                "{destination}: {single}"
+            );
+            assert!(single.contains("inttoptr"), "{destination}: {single}");
+            assert!(single.contains("load i8"), "{destination}: {single}");
+            if field {
+                assert!(
+                    single.contains("getelementptr inbounds"),
+                    "{destination}: {single}"
+                );
+            }
+
+            let validation = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(program.program, Vec::new())],
+                vec![source],
+            ));
+            assert!(
+                validation.diagnostics.is_empty(),
+                "{:?}",
+                validation.diagnostics
+            );
+            let project = emit_scalar_project_llvm(&validation)
+                .expect("project direct pointer cast dereference LLVM")
+                .to_text();
+            assert!(
+                project.contains("deref_is_null"),
+                "{destination}: {project}"
+            );
+            assert!(
+                project.contains("deref_null_panic"),
+                "{destination}: {project}"
+            );
+            assert!(
+                project.contains("deref_null_continue"),
+                "{destination}: {project}"
+            );
+            assert!(
+                project.contains("call void @__wosy_core_system_panic()"),
+                "{destination}: {project}"
+            );
+            assert!(project.contains("inttoptr"), "{destination}: {project}");
+            assert!(project.contains("load i8"), "{destination}: {project}");
+            if field {
+                assert!(
+                    project.contains("getelementptr inbounds"),
+                    "{destination}: {project}"
+                );
+            }
+        }
     }
 
     #[test]
