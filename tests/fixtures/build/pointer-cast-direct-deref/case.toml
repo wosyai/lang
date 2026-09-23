@@ -1,0 +1,43 @@
+shared_stdlib = true
+
+[[steps]]
+source = "project/src/main.w"
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[steps]]
+command = ["python", "scripts/check-partition"]
+exit = 0
+
+[[assert]]
+source = "project/src/main.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/main.stdout"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/null_direct_deref.w"
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "app"]
+exit = 1
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/outside_unsafe.w"
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["B0012"]
+
+[[assert]]
+source = "project/src/main.w"
+command = ["wosy", "run", "app"]
+exit = 0
+file = "partition.normalized.ll"
+contents = "expected/partition_direct_deref.ll"
