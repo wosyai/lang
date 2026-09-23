@@ -4905,6 +4905,85 @@ fn type_core_bitcast_in_module(
     }
     destination.clone()
 }
+
+fn type_core_pointer_cast_in_module(
+    operation: &str,
+    type_arguments: &[ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if !unsafe_context {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0012",
+            &format!("core.{operation} requires an unsafe block"),
+            span,
+        ));
+    }
+    if type_arguments.len() != 1 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            &format!("core.{operation} requires one destination type argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let destination = &type_arguments[0].ty;
+    let source_context = match destination {
+        ScalarType::RawPointer(_) => destination.clone(),
+        ScalarType::CheckedReference { inner, .. } => ScalarType::RawPointer(inner.clone()),
+        _ => {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                &format!("core.{operation} has an invalid pointer destination type"),
+                type_arguments[0].span,
+            ));
+            return ScalarType::Error;
+        }
+    };
+    if arguments.len() != 1 {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0004",
+            &format!("core.{operation} requires one value argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let actual = expression_type_in_module_expected(
+        &arguments[0],
+        Some(&source_context),
+        scope,
+        visible_names,
+        folded_names,
+        module,
+        modules,
+        diagnostics,
+        unsafe_context,
+    );
+    if is_error_type(&actual) {
+        return ScalarType::Error;
+    }
+    if !matches!(actual, ScalarType::RawPointer(_)) {
+        diagnostics.push(module_diagnostic(
+            module,
+            "B0003",
+            &format!("core.{operation} requires a raw pointer source type"),
+            expression_span(&arguments[0]),
+        ));
+        return ScalarType::Error;
+    }
+    destination.clone()
+}
 fn float_conversion_destination_matches(operation: &str, destination: &ScalarType) -> bool {
     match operation {
         "uint_to_float" | "sint_to_float" => is_float_type(destination),
@@ -5284,6 +5363,83 @@ fn type_core_bitcast(
             "B0003",
             &format!("core.{operation} requires source and destination types of equal size"),
             type_arguments[0].span,
+        ));
+        return ScalarType::Error;
+    }
+    destination.clone()
+}
+
+fn type_core_pointer_cast(
+    operation: &str,
+    type_arguments: &[ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    span: ByteSpan,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
+    if !unsafe_context {
+        diagnostics.push(diagnostic(
+            program,
+            "B0012",
+            &format!("core.{operation} requires an unsafe block"),
+            span,
+        ));
+    }
+    if type_arguments.len() != 1 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            &format!("core.{operation} requires one destination type argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let destination = &type_arguments[0].ty;
+    let source_context = match destination {
+        ScalarType::RawPointer(_) => destination.clone(),
+        ScalarType::CheckedReference { inner, .. } => ScalarType::RawPointer(inner.clone()),
+        _ => {
+            diagnostics.push(diagnostic(
+                program,
+                "B0003",
+                &format!("core.{operation} has an invalid pointer destination type"),
+                type_arguments[0].span,
+            ));
+            return ScalarType::Error;
+        }
+    };
+    if arguments.len() != 1 {
+        diagnostics.push(diagnostic(
+            program,
+            "B0004",
+            &format!("core.{operation} requires one value argument"),
+            span,
+        ));
+        return ScalarType::Error;
+    }
+    let actual = expression_type_expected(
+        &arguments[0],
+        &source_context,
+        scope,
+        visible_names,
+        folded_names,
+        program,
+        diagnostics,
+        unsafe_context,
+    );
+    if is_error_type(&actual) {
+        return ScalarType::Error;
+    }
+    if !matches!(actual, ScalarType::RawPointer(_)) {
+        diagnostics.push(diagnostic(
+            program,
+            "B0003",
+            &format!("core.{operation} requires a raw pointer source type"),
+            expression_span(&arguments[0]),
         ));
         return ScalarType::Error;
     }
@@ -6123,6 +6279,21 @@ fn expression_type_in_module(
             }
             if receiver.as_deref() == Some("core") && matches!(name.as_str(), "offset" | "load") {
                 return type_core_raw_memory_in_module(
+                    name,
+                    type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
+            if receiver.as_deref() == Some("core") && name == "pointer_cast" {
+                return type_core_pointer_cast_in_module(
                     name,
                     type_arguments,
                     arguments,
@@ -11931,6 +12102,20 @@ fn expression_type(
                     unsafe_context,
                 );
             }
+            if receiver.as_deref() == Some("core") && name == "pointer_cast" {
+                return type_core_pointer_cast(
+                    name,
+                    type_arguments,
+                    arguments,
+                    *span,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+            }
             if let Some(overload) = program.items.iter().find_map(|item| match item {
                 ScalarItem::Function(function)
                     if receiver.is_none()
@@ -14904,6 +15089,113 @@ bool integer_inversion = !1;
                     .any(|diagnostic| diagnostic.code == code),
                 "{text}: {:?}",
                 invalid.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn validates_pointer_cast_under_unsafe_in_single_file_and_project() {
+        let text = "%%start\nstruct Block {\n\tu8 tag;\n\tu32 value;\n}\n*?u8 base = null;\n*?u8 roundtrip = unsafe { core.pointer_cast<*?u8>(core.pointer_cast<*?Block>(base)) };\n*?u8(*?u8) ident = fn(pointer) { unsafe { core.pointer_cast<*?u8>(pointer) } };\nu8[4] bytes = [1, 2, 3, 4];\n*?u8 addr = unsafe { core.pointer_cast<*?u8>(&?bytes[2]) };\n*u8 shared = unsafe { core.pointer_cast<*u8>(base) };\n*!u8 exclusive = unsafe { core.pointer_cast<*!u8>(base) };\n*?u8 nullraw = unsafe { core.pointer_cast<*?u8>(null) };\n%%end";
+        let single = validate_text(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+
+        let source = module_source("src/main.w");
+        let program = module_from_text(source.clone(), text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+            vec![source],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+
+        let missing_unsafe = validate_text(
+            "%%start\n*?u8(*?u8) cast = fn(pointer) { core.pointer_cast<*?u8>(pointer) };\n%%end",
+        );
+        assert!(
+            missing_unsafe
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0012"),
+            "{:?}",
+            missing_unsafe.diagnostics
+        );
+        let missing_unsafe_source = module_source("src/main.w");
+        let missing_unsafe_program = module_from_text(
+            missing_unsafe_source.clone(),
+            "%%start\n*?u8(*?u8) cast = fn(pointer) { core.pointer_cast<*?u8>(pointer) };\n%%end",
+        );
+        let missing_unsafe_project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(
+                missing_unsafe_source.clone(),
+                missing_unsafe_program.items,
+                Vec::new(),
+            )],
+            vec![missing_unsafe_source],
+        ));
+        assert!(
+            missing_unsafe_project
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0012"),
+            "{:?}",
+            missing_unsafe_project.diagnostics
+        );
+
+        for (text, code) in [
+            (
+                "%%start\n*?u8(*?u8) cast = fn(pointer) { unsafe { core.pointer_cast(pointer) } };\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\n*?u8(*?u8) cast = fn(pointer) { unsafe { core.pointer_cast<*?u8, *?u8>(pointer) } };\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\n*?u8(*?u8) cast = fn(pointer) { unsafe { core.pointer_cast<*?u8>() } };\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\n*?u8(*?u8) cast = fn(pointer) { unsafe { core.pointer_cast<*?u8>(pointer, pointer) } };\n%%end",
+                "B0004",
+            ),
+            (
+                "%%start\nu32(*?u8) cast = fn(pointer) { unsafe { core.pointer_cast<u32>(pointer) } };\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\nstruct Pair {\n\ti32 x;\n\ti32 y;\n}\nPair(*?u8) cast = fn(pointer) { unsafe { core.pointer_cast<Pair>(pointer) } };\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\n*?u8(u8) cast = fn(value) { unsafe { core.pointer_cast<*?u8>(value) } };\n%%end",
+                "B0003",
+            ),
+            (
+                "%%start\n*?u8(*u8) cast = fn(reader) { unsafe { core.pointer_cast<*?u8>(reader) } };\n%%end",
+                "B0003",
+            ),
+        ] {
+            let single = validate_text(text);
+            assert!(
+                single
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == code),
+                "{text}: {:?}",
+                single.diagnostics
+            );
+            let source = module_source("src/main.w");
+            let program = module_from_text(source.clone(), text);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::new(source.clone(), program.items, Vec::new())],
+                vec![source],
+            ));
+            assert!(
+                project
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == code),
+                "{text}: {:?}",
+                project.diagnostics
             );
         }
     }

@@ -4181,6 +4181,9 @@ fn emit_expression<'ctx, 'module>(
             if receiver.as_deref() == Some("core") && name == "bitcast" {
                 return emit_bitcast(context, state, name, type_arguments, arguments);
             }
+            if receiver.as_deref() == Some("core") && name == "pointer_cast" {
+                return emit_core_pointer_cast(context, state, name, type_arguments, arguments);
+            }
             if receiver.as_deref() == Some("core") && name == "offset" {
                 return emit_core_offset(context, state, type_arguments, arguments);
             }
@@ -4372,6 +4375,17 @@ fn emit_project_expression<'ctx, 'module>(
             }
             if receiver.as_deref() == Some("core") && name == "bitcast" {
                 return emit_bitcast_project(
+                    context,
+                    state,
+                    name,
+                    type_arguments,
+                    arguments,
+                    module,
+                    modules,
+                );
+            }
+            if receiver.as_deref() == Some("core") && name == "pointer_cast" {
+                return emit_core_pointer_cast_project(
                     context,
                     state,
                     name,
@@ -5035,6 +5049,60 @@ fn emit_bitcast_project<'ctx, 'module>(
             value,
             basic_type(context, destination, state.target_layout)?,
             "bitcast",
+        )
+        .map_err(builder_error)?;
+    Ok(EmitValue::Basic(converted))
+}
+fn emit_core_pointer_cast<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    operation: &str,
+    type_arguments: &[crate::scalar::ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+) -> Result<EmitValue<'ctx>, String> {
+    let [type_argument] = type_arguments else {
+        return Err(format!("core.{operation} has invalid type argument arity"));
+    };
+    let [value] = arguments else {
+        return Err(format!("core.{operation} has invalid argument arity"));
+    };
+    let value = take_basic(emit_expression(context, state, value)?)?;
+    emit_core_pointer_cast_values(context, state, value, &type_argument.ty)
+}
+
+fn emit_core_pointer_cast_project<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    operation: &str,
+    type_arguments: &[crate::scalar::ScalarTypeArgument],
+    arguments: &[ScalarExpression],
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    let [type_argument] = type_arguments else {
+        return Err(format!("core.{operation} has invalid type argument arity"));
+    };
+    let [value] = arguments else {
+        return Err(format!("core.{operation} has invalid argument arity"));
+    };
+    let value = take_basic(emit_project_expression(
+        context, state, value, module, modules,
+    )?)?;
+    emit_core_pointer_cast_values(context, state, value, &type_argument.ty)
+}
+
+fn emit_core_pointer_cast_values<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    value: BasicValueEnum<'ctx>,
+    destination: &ScalarType,
+) -> Result<EmitValue<'ctx>, String> {
+    let converted = state
+        .builder
+        .build_bit_cast(
+            value,
+            basic_type(context, destination, state.target_layout)?,
+            "pointer_cast",
         )
         .map_err(builder_error)?;
     Ok(EmitValue::Basic(converted))
@@ -8373,6 +8441,64 @@ count, complete = read_into(buffer, requested_capacity);
             .expect("project bitcast LLVM")
             .to_text();
         assert!(project.contains("bitcast"), "{project}");
+    }
+
+    #[test]
+    fn emits_pointer_cast_for_single_file_and_project() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let program = derive_scalar_program(
+            &parse_source(
+                source.clone(),
+                "%%start\nstruct Block {\n\tu8 tag;\n\tu32 value;\n}\n*?u8 base = null;\n*?u8 roundtrip = unsafe { core.pointer_cast<*?u8>(core.pointer_cast<*?Block>(base)) };\n*?u8(*?u8) ident = fn(pointer) { unsafe { core.pointer_cast<*?u8>(pointer) } };\nu8[4] bytes = [1, 2, 3, 4];\n*?u8 addr = unsafe { core.pointer_cast<*?u8>(&?bytes[2]) };\n*u8 shared = unsafe { core.pointer_cast<*u8>(base) };\n*!u8 exclusive = unsafe { core.pointer_cast<*!u8>(base) };\n%%end".into(),
+                &[],
+            )
+            .result,
+        );
+        assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+        let single = emit_scalar_llvm(&program)
+            .expect("single-file pointer cast LLVM")
+            .to_text();
+        assert!(
+            single.contains("define i32 @ident(i32 %pointer)"),
+            "{single}"
+        );
+        assert!(single.contains("ret i32 %pointer"), "{single}");
+        assert!(
+            single.contains("store i32 %base, ptr @roundtrip"),
+            "{single}"
+        );
+        assert!(single.contains("store i32 %base4, ptr @shared"), "{single}");
+        assert!(
+            single.contains("store i32 %base5, ptr @exclusive"),
+            "{single}"
+        );
+        assert!(!single.contains("inttoptr"), "{single}");
+        assert!(!single.contains("deref_null"), "{single}");
+
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(program.program, Vec::new())],
+            vec![source],
+        ));
+        assert!(
+            validation.diagnostics.is_empty(),
+            "{:?}",
+            validation.diagnostics
+        );
+        let project = emit_scalar_project_llvm(&validation)
+            .expect("project pointer cast LLVM")
+            .to_text();
+        assert!(project.contains("(i32 %pointer)"), "{project}");
+        assert!(project.contains("ret i32 %pointer"), "{project}");
+        assert!(project.contains("store i32 %base, ptr @"), "{project}");
+        assert!(project.contains("store i32 %base4, ptr @"), "{project}");
+        assert!(project.contains("store i32 %base5, ptr @"), "{project}");
+        assert!(!project.contains("inttoptr"), "{project}");
+        assert!(!project.contains("deref_null"), "{project}");
     }
 
     #[test]
