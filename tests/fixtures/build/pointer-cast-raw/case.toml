@@ -1,0 +1,80 @@
+shared_stdlib = true
+
+[[steps]]
+source = "project/src/scalar_destination.w"
+command = ["wosy", "build", "app"]
+exit = 1
+
+[[steps]]
+source = "project/src/zero_type_args.w"
+command = ["wosy", "build", "app"]
+exit = 1
+
+[[steps]]
+source = "project/src/two_type_args.w"
+command = ["wosy", "build", "app"]
+exit = 1
+
+[[steps]]
+source = "project/src/zero_value_args.w"
+command = ["wosy", "build", "app"]
+exit = 1
+
+[[steps]]
+source = "project/src/two_value_args.w"
+command = ["wosy", "build", "app"]
+exit = 1
+
+[[steps]]
+source = "project/src/main.w"
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[steps]]
+command = ["python", "scripts/check-partition"]
+exit = 0
+
+[[assert]]
+source = "project/src/main.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/main.stdout"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/scalar_destination.w"
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["B0003"]
+
+[[assert]]
+source = "project/src/zero_type_args.w"
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["B0004"]
+
+[[assert]]
+source = "project/src/two_type_args.w"
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["B0004"]
+
+[[assert]]
+source = "project/src/zero_value_args.w"
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["B0004"]
+
+[[assert]]
+source = "project/src/two_value_args.w"
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["B0004"]
+
+[[assert]]
+source = "project/src/main.w"
+command = ["wosy", "run", "app"]
+exit = 0
+file = "partition.normalized.ll"
+contents = "expected/partition_raw.ll"
