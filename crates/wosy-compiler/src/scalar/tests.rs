@@ -1,3 +1,6 @@
+use super::reference::{
+    record_function_reference_origins, reference_places_overlap, ReferenceFlowBuilder,
+};
 use super::typecheck::block_type;
 use super::*;
 use crate::parse_source;
