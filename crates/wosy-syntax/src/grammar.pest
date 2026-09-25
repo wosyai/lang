@@ -14,8 +14,9 @@ error_item = @{ generic_error | (!(";" | "%%end") ~ ANY)+ ~ ";"? }
 generic_error = { "generic" ~ (!(";") ~ ANY)* ~ ";" }
 malformed_generic_decl = @{ "generic" ~ (!(";") ~ ANY)* ~ ";" }
 top_level_item = { (assignment | expression) ~ ";" }
-struct_decl = { "struct" ~ identifier ~ "{" ~ struct_field* ~ "}" }
-enum_decl = { "enum" ~ identifier ~ "{" ~ enum_variant* ~ "}" }
+struct_decl = { "struct" ~ copy_modifier? ~ identifier ~ "{" ~ struct_field* ~ "}" }
+enum_decl = { "enum" ~ copy_modifier? ~ identifier ~ "{" ~ enum_variant* ~ "}" }
+copy_modifier = @{ "copy" ~ !(ASCII_ALPHANUMERIC | "_") }
 enum_variant = { identifier ~ ";" }
 struct_field = { type_spec ~ identifier ~ ";" }
 namespace_decl = { identifier ~ "=" ~ "namespace" ~ identifier ~ string ~ ";" }
@@ -80,8 +81,9 @@ struct_literal = { "{" ~ struct_literal_field* ~ "}" }
 struct_literal_field = { "." ~ identifier ~ "=" ~ expression ~ ";" }
 array_literal = { "[" ~ (expression ~ ("," ~ expression)*)? ~ "]" }
 raw_address = { "&?" ~ place_target }
-checked_address = { "&" ~ checked_address_mutability? ~ place_target }
+checked_address = { "&" ~ checked_address_mutability? ~ (place_target | parenthesized_dereference_place) }
 checked_address_mutability = { "!" }
+parenthesized_dereference_place = { "(" ~ dereference ~ ")" }
 place_target = { indexed_place | assignment_target }
 indexed_place = { (qualified_member | dereferenced_field | identifier) ~ index_suffix+ }
 index_suffix = { "[" ~ expression ~ "]" }

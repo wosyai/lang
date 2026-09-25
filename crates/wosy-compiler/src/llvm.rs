@@ -16,8 +16,10 @@ use inkwell::{FloatPredicate, IntPredicate};
 use serde::{Deserialize, Serialize};
 
 use crate::scalar::{
-    ScalarAllocationIdentity, ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState,
-    ScalarBindingOutputOrigin, ScalarFieldReference, ScalarOutputValue, ScalarOverloadSelection,
+    CfgPointKind, CoreOperationId, InvalidationCandidate, InvalidationInputs, ReferenceBindingKind,
+    ReferenceOrigin, ReleaseTarget, ResolvedCallTarget, ScalarAllocationIdentity,
+    ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState, ScalarBindingOutputOrigin,
+    ScalarFieldReference, ScalarOutputValue, ScalarOverloadSelection,
 };
 use crate::{
     BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarExpression,
@@ -83,19 +85,125 @@ struct EmitState<'ctx, 'module> {
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
+    dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     values: BTreeMap<String, EmitValue<'ctx>>,
     storage: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
     return_bindings: BTreeMap<String, ScalarExpression>,
+    fresh_return_outputs: BTreeSet<usize>,
+    branch_return_outputs:
+        BTreeMap<(u32, u32), (BTreeSet<usize>, BTreeSet<usize>, BTreeMap<usize, String>)>,
+    joined_return_bindings: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
+    joined_assignment_owners: BTreeMap<(u32, u32), CheckedAssignmentOwner>,
+    return_output_types: Vec<ScalarType>,
+    return_body_span: Option<wosy_syntax::ByteSpan>,
+    checked_call_owners: BTreeMap<(u32, u32, usize), CheckedCallOwner>,
+    checked_owner_flags: BTreeMap<String, inkwell::values::IntValue<'ctx>>,
+    call_owner_flags: BTreeMap<usize, inkwell::values::IntValue<'ctx>>,
+    return_owner_flags: BTreeMap<usize, inkwell::values::IntValue<'ctx>>,
+    return_owner_slots: BTreeMap<usize, PointerValue<'ctx>>,
     runtime_array_owners: BTreeMap<String, bool>,
     runtime_array_allocations: BTreeMap<String, bool>,
+    runtime_array_lengths: BTreeMap<String, PointerValue<'ctx>>,
+    runtime_array_live: BTreeMap<String, PointerValue<'ctx>>,
+    mutable_runtime_allocations: BTreeSet<(u32, u32)>,
+    invalidations: BTreeMap<
+        (u32, u32),
+        (
+            CoreOperationId,
+            Vec<InvalidationCandidate>,
+            InvalidationInputs,
+        ),
+    >,
     automatic_return_result_owners: BTreeMap<String, ScalarAutomaticReturnResult>,
-    automatic_return_result_results: &'ctx BTreeSet<String>,
     globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     all_globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     structs: &'module [ScalarStruct],
     target_layout: ScalarTargetLayout,
     next_literal: usize,
     next_block: usize,
+}
+
+#[derive(Clone, Copy)]
+enum CheckedCallOwner {
+    Fresh,
+    Borrowed,
+    Mixed,
+}
+
+#[derive(Clone, Copy)]
+enum CheckedAssignmentOwner {
+    Local,
+    External,
+    Borrowed,
+}
+
+fn mutable_runtime_allocations(function: &ScalarFunction) -> BTreeSet<(u32, u32)> {
+    let mut result = BTreeSet::new();
+    for point in &function.reference_cfg.points {
+        match &point.kind {
+            CfgPointKind::Assign { target, .. } if target.projections.is_empty() => {
+                result.insert((target.declaration_span.start, target.declaration_span.end));
+            }
+            CfgPointKind::Release {
+                target: ReleaseTarget::Checked { candidates, .. },
+            }
+            | CfgPointKind::Invalidate { candidates, .. } => {
+                for candidate in candidates {
+                    result.insert((
+                        candidate.place.declaration_span.start,
+                        candidate.place.declaration_span.end,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+fn resolved_invalidations(
+    function: &ScalarFunction,
+) -> Result<
+    BTreeMap<
+        (u32, u32),
+        (
+            CoreOperationId,
+            Vec<InvalidationCandidate>,
+            InvalidationInputs,
+        ),
+    >,
+    String,
+> {
+    let mut events = BTreeMap::new();
+    for point in &function.reference_cfg.points {
+        let (operation, candidates, inputs) = match &point.kind {
+            CfgPointKind::Invalidate {
+                operation,
+                candidates,
+                inputs,
+                ..
+            } => (*operation, candidates, inputs.clone()),
+            CfgPointKind::Release {
+                target: ReleaseTarget::Checked { candidates, .. },
+            } => (CoreOperationId::Free, candidates, InvalidationInputs::Free),
+            _ => continue,
+        };
+        if !function.reference_cfg.points.iter().any(|call| {
+            call.source_span == point.source_span && matches!(&call.kind,
+                CfgPointKind::Call { target: ResolvedCallTarget::Core(target), .. } if *target == operation)
+        }) {
+            return Err("core invalidation lacks a resolved call target".to_owned());
+        }
+        if candidates.is_empty() {
+            return Err("core invalidation lacks a resolved allocation place".to_owned());
+        }
+        let range = point.source_span.range;
+        events.insert(
+            (range.start, range.end),
+            (operation, candidates.clone(), inputs),
+        );
+    }
+    Ok(events)
 }
 
 #[derive(Clone, Copy)]
@@ -211,7 +319,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     {
         let value = module.add_function(
             &function.name,
-            function_type(&context, &function.signature, target_layout)?.0,
+            definition_function_type(&context, function, target_layout)?,
             None,
         );
         for (index, name) in function.parameters.iter().enumerate() {
@@ -235,7 +343,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     for (lookup, function, name) in &specializations {
         let value = module.add_function(
             name,
-            function_type(&context, &function.signature, target_layout)?.0,
+            definition_function_type(&context, function, target_layout)?,
             None,
         );
         for (index, parameter) in function.parameters.iter().enumerate() {
@@ -259,7 +367,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     for (lookup, function, name) in &overloads {
         let value = module.add_function(
             name,
-            function_type(&context, &function.signature, target_layout)?.0,
+            definition_function_type(&context, function, target_layout)?,
             None,
         );
         for (index, parameter) in function.parameters.iter().enumerate() {
@@ -304,6 +412,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         module.add_function("main", context.i32_type().fn_type(&[], false), None),
     );
     let mut runtime_array_results = BTreeMap::new();
+    let mut dynamic_owner_outputs = BTreeMap::new();
     for function in validation
         .program
         .items
@@ -315,22 +424,13 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     {
         if let Some(target) = call_targets.get(&function.name) {
             insert_runtime_array_result_provenance(&mut runtime_array_results, target, function);
+            dynamic_owner_outputs.insert(target.clone(), dynamic_return_outputs(function));
         }
     }
     for (_, function, name) in specializations.iter().chain(overloads.iter()) {
         insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
+        dynamic_owner_outputs.insert(name.clone(), dynamic_return_outputs(function));
     }
-    let automatic_return_result_results = automatic_return_result_functions(
-        validation
-            .program
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                ScalarItem::Function(function) => Some((function.name.as_str(), function)),
-                _ => None,
-            }),
-        &call_targets,
-    );
     for function in validation
         .program
         .items
@@ -351,7 +451,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &call_targets,
             &signatures,
             &runtime_array_results,
-            &automatic_return_result_results,
+            &dynamic_owner_outputs,
             &globals,
             function,
             &function.name,
@@ -369,7 +469,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &call_targets,
             &signatures,
             &runtime_array_results,
-            &automatic_return_result_results,
+            &dynamic_owner_outputs,
             &globals,
             function,
             name,
@@ -387,7 +487,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &call_targets,
             &signatures,
             &runtime_array_results,
-            &automatic_return_result_results,
+            &dynamic_owner_outputs,
             &globals,
             function,
             name,
@@ -404,7 +504,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         &call_targets,
         &signatures,
         &runtime_array_results,
-        &automatic_return_result_results,
+        &dynamic_owner_outputs,
         &globals,
         &validation.program.items,
         &module,
@@ -488,7 +588,7 @@ pub fn emit_scalar_project_llvm(
                 let name = project_function_name(&source_module.source, &function.name);
                 let value = module.add_function(
                     &name,
-                    function_type(&context, &function.signature, target_layout)?.0,
+                    definition_function_type(&context, function, target_layout)?,
                     None,
                 );
                 for (index, parameter) in function.parameters.iter().enumerate() {
@@ -548,7 +648,7 @@ pub fn emit_scalar_project_llvm(
         for (lookup, function, name) in specializations {
             let value = module.add_function(
                 &name,
-                function_type(&context, &function.signature, target_layout)?.0,
+                definition_function_type(&context, &function, target_layout)?,
                 None,
             );
             for (index, parameter) in function.parameters.iter().enumerate() {
@@ -587,7 +687,7 @@ pub fn emit_scalar_project_llvm(
         ) {
             let value = module.add_function(
                 &name,
-                function_type(&context, &function.signature, target_layout)?.0,
+                definition_function_type(&context, &function, target_layout)?,
                 None,
             );
             for (index, parameter) in function.parameters.iter().enumerate() {
@@ -606,31 +706,19 @@ pub fn emit_scalar_project_llvm(
         module.add_function("main", context.i32_type().fn_type(&[], false), None),
     );
     let mut runtime_array_results = BTreeMap::new();
+    let mut dynamic_owner_outputs = BTreeMap::new();
     for (_, function, name) in &definitions {
         insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
+        dynamic_owner_outputs.insert(name.clone(), dynamic_return_outputs(function));
     }
     for (_, function, name) in &project_specializations {
         insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
+        dynamic_owner_outputs.insert(name.clone(), dynamic_return_outputs(function));
     }
     for (_, function, name) in &project_overloads {
         insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
+        dynamic_owner_outputs.insert(name.clone(), dynamic_return_outputs(function));
     }
-    let automatic_return_result_results = automatic_return_result_functions(
-        definitions
-            .iter()
-            .map(|(_, function, name)| (name.as_str(), *function))
-            .chain(
-                project_specializations
-                    .iter()
-                    .map(|(_, function, name)| (name.as_str(), function)),
-            )
-            .chain(
-                project_overloads
-                    .iter()
-                    .map(|(_, function, name)| (name.as_str(), function)),
-            ),
-        &call_targets,
-    );
     for (source_module, function, name) in definitions {
         emit_project_function(
             &context,
@@ -639,7 +727,7 @@ pub fn emit_scalar_project_llvm(
             &call_targets,
             &signatures,
             &runtime_array_results,
-            &automatic_return_result_results,
+            &dynamic_owner_outputs,
             function,
             source_module,
             &modules,
@@ -658,7 +746,7 @@ pub fn emit_scalar_project_llvm(
             &call_targets,
             &signatures,
             &runtime_array_results,
-            &automatic_return_result_results,
+            &dynamic_owner_outputs,
             function,
             source_module,
             &modules,
@@ -677,7 +765,7 @@ pub fn emit_scalar_project_llvm(
             &call_targets,
             &signatures,
             &runtime_array_results,
-            &automatic_return_result_results,
+            &dynamic_owner_outputs,
             function,
             source_module,
             &modules,
@@ -695,7 +783,7 @@ pub fn emit_scalar_project_llvm(
         &call_targets,
         &signatures,
         &runtime_array_results,
-        &automatic_return_result_results,
+        &dynamic_owner_outputs,
         &modules,
         &globals,
         &module,
@@ -936,6 +1024,35 @@ fn function_type<'ctx>(
                     .collect::<Result<Vec<_>, _>>()?,
             ),
         )),
+    }
+}
+
+fn definition_function_type<'ctx>(
+    context: &'ctx Context,
+    function: &ScalarFunction,
+    target_layout: ScalarTargetLayout,
+) -> Result<FunctionType<'ctx>, String> {
+    let (ordinary, _) = function_type(context, &function.signature, target_layout)?;
+    if !dynamic_return_owner(function) {
+        return Ok(ordinary);
+    }
+    let ScalarType::Callable {
+        outputs,
+        parameters,
+    } = &function.signature
+    else {
+        return Err("function has no callable signature".to_owned());
+    };
+    let mut arguments = parameters
+        .iter()
+        .map(|ty| basic_type(context, ty, target_layout).map(Into::into))
+        .collect::<Result<Vec<BasicMetadataTypeEnum>, _>>()?;
+    for _ in dynamic_return_outputs(function) {
+        arguments.push(context.ptr_type(AddressSpace::default()).into());
+    }
+    match outputs.outputs.as_slice() {
+        [output] => Ok(basic_type(context, &output.ty, target_layout)?.fn_type(&arguments, false)),
+        _ => Ok(aggregate_type(context, outputs, target_layout)?.fn_type(&arguments, false)),
     }
 }
 
@@ -1793,15 +1910,61 @@ fn store_binding_outputs<'ctx, 'module>(
         )?)?
         .into_int_value();
         let slot = emit_runtime_array_allocation(context, state, element, length)?;
+        if !state
+            .mutable_runtime_allocations
+            .contains(&(receiver.name_span.start, receiver.name_span.end))
+        {
+            state
+                .storage
+                .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
+            state
+                .runtime_array_owners
+                .insert(receiver.name.clone(), true);
+            state
+                .runtime_array_allocations
+                .insert(receiver.name.clone(), true);
+            return Ok(());
+        }
+        let backing = entry_alloca(
+            state,
+            context.ptr_type(AddressSpace::default()).into(),
+            &format!("{}_backing", receiver.name),
+        )?;
+        state
+            .builder
+            .build_store(backing, slot)
+            .map_err(builder_error)?;
+        let length_slot = entry_alloca(
+            state,
+            context.i64_type().into(),
+            &format!("{}_length", receiver.name),
+        )?;
+        state
+            .builder
+            .build_store(length_slot, length)
+            .map_err(builder_error)?;
+        state
+            .runtime_array_lengths
+            .insert(receiver.name.clone(), length_slot);
+        let live = entry_alloca(
+            state,
+            context.bool_type().into(),
+            &format!("{}_live", receiver.name),
+        )?;
+        state
+            .builder
+            .build_store(live, context.bool_type().const_int(1, false))
+            .map_err(builder_error)?;
+        state.runtime_array_live.insert(receiver.name.clone(), live);
         state
             .storage
-            .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
+            .insert(receiver.name.clone(), (backing, receiver.ty.clone()));
         state
             .runtime_array_owners
             .insert(receiver.name.clone(), true);
         state
             .runtime_array_allocations
-            .insert(receiver.name.clone(), true);
+            .insert(receiver.name.clone(), false);
         return Ok(());
     }
     let receivers = binding_receivers(binding);
@@ -1819,7 +1982,13 @@ fn store_binding_outputs<'ctx, 'module>(
         store_value(context, state, slot, ty, value)?;
         state.storage.insert(name.clone(), (slot, ty.clone()));
         transition_runtime_array_binding_initialization(state, name, ty, &binding.value);
-        transition_automatic_return_result_binding_initialization(state, name, ty, &binding.value);
+        transition_automatic_return_result_binding_initialization(
+            state,
+            name,
+            ty,
+            &binding.value,
+            position,
+        )?;
     }
     Ok(())
 }
@@ -1829,29 +1998,42 @@ fn transition_automatic_return_result_binding_initialization(
     name: &str,
     ty: &ScalarType,
     value: &ScalarExpression,
-) {
+    output: usize,
+) -> Result<(), String> {
     let ScalarType::CheckedReference { inner, .. } = ty else {
-        return;
+        return Ok(());
     };
-    if !automatic_return_result_copy_pointee(inner) {
-        return;
-    }
-    let source = match value {
-        ScalarExpression::Call { receiver, name, .. } => {
-            let lookup = receiver
-                .as_ref()
-                .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"));
-            state
-                .call_targets
-                .get(&lookup)
-                .is_some_and(|target| state.automatic_return_result_results.contains(target))
-        }
-        ScalarExpression::Name { name: source, .. } => {
-            state.automatic_return_result_owners.contains_key(source)
-        }
-        _ => false,
+    let (source, owner_flag) = match value {
+        ScalarExpression::Call { span, .. } => match state
+            .checked_call_owners
+            .get(&(span.start, span.end, output))
+            .ok_or_else(|| format!("missing validated checked-call owner at {span:?}"))?
+        {
+            CheckedCallOwner::Fresh => (true, state.call_owner_flags.get(&output).copied()),
+            CheckedCallOwner::Borrowed => (false, None),
+            CheckedCallOwner::Mixed => (
+                true,
+                Some(
+                    state
+                        .call_owner_flags
+                        .get(&output)
+                        .copied()
+                        .ok_or_else(|| format!("missing mixed-call owner flag at {span:?}"))?,
+                ),
+            ),
+        },
+        ScalarExpression::Name { name: source, .. } => (
+            state.automatic_return_result_owners.contains_key(source),
+            state.checked_owner_flags.get(source).copied(),
+        ),
+        _ => (false, None),
     };
     if source {
+        if let Some(owner_flag) = owner_flag {
+            state
+                .checked_owner_flags
+                .insert(name.to_owned(), owner_flag);
+        }
         state.automatic_return_result_owners.insert(
             name.to_owned(),
             ScalarAutomaticReturnResult {
@@ -1864,8 +2046,10 @@ fn transition_automatic_return_result_binding_initialization(
         );
         if let ScalarExpression::Name { name: source, .. } = value {
             state.automatic_return_result_owners.remove(source);
+            state.checked_owner_flags.remove(source);
         }
     }
+    Ok(())
 }
 
 fn release_automatic_return_result_owners<'ctx, 'module>(
@@ -1885,7 +2069,7 @@ fn release_automatic_return_result_owners<'ctx, 'module>(
             .get(&name)
             .cloned()
             .ok_or_else(|| format!("missing automatic return-result storage for {name}"))?;
-        let pointer = state
+        let address = state
             .builder
             .build_load(
                 basic_type(context, &ty, state.target_layout)?,
@@ -1894,10 +2078,39 @@ fn release_automatic_return_result_owners<'ctx, 'module>(
             )
             .map_err(builder_error)?
             .into_int_value();
+        let block = state
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| "missing return-result release block".to_owned())?;
+        let function = block
+            .get_parent()
+            .ok_or_else(|| "missing return-result release function".to_owned())?;
+        let free = context.append_basic_block(function, "return_result_release.live");
+        let next = context.append_basic_block(function, "return_result_release.next");
+        let mut is_live = state
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                address,
+                address.get_type().const_zero(),
+                "return_result_release_live",
+            )
+            .map_err(builder_error)?;
+        if let Some(flag) = state.checked_owner_flags.get(&name) {
+            is_live = state
+                .builder
+                .build_and(is_live, *flag, "return_result_owned")
+                .map_err(builder_error)?;
+        }
+        state
+            .builder
+            .build_conditional_branch(is_live, free, next)
+            .map_err(builder_error)?;
+        state.builder.position_at_end(free);
         let pointer = state
             .builder
             .build_int_to_ptr(
-                pointer,
+                address,
                 context.ptr_type(AddressSpace::default()),
                 "return_result_release",
             )
@@ -1911,7 +2124,13 @@ fn release_automatic_return_result_owners<'ctx, 'module>(
             .builder
             .build_call(release, &[pointer.into()], "return_result_release")
             .map_err(builder_error)?;
+        state
+            .builder
+            .build_unconditional_branch(next)
+            .map_err(builder_error)?;
+        state.builder.position_at_end(next);
         state.automatic_return_result_owners.remove(&name);
+        state.checked_owner_flags.remove(&name);
     }
     Ok(())
 }
@@ -2001,108 +2220,373 @@ fn insert_runtime_array_result_provenance(
     }
 }
 
-fn automatic_return_result_functions<'a>(
-    functions: impl IntoIterator<Item = (&'a str, &'a ScalarFunction)>,
-    call_targets: &BTreeMap<String, String>,
-) -> BTreeSet<String> {
-    let functions = functions.into_iter().collect::<BTreeMap<_, _>>();
-    let mut results = BTreeSet::new();
-    loop {
-        let mut changed = false;
-        for (name, function) in &functions {
-            if automatic_return_result_function(function, &results, call_targets)
-                && results.insert((*name).to_owned())
-            {
-                changed = true;
+fn fresh_return_outputs(
+    function: &ScalarFunction,
+) -> Result<
+    (
+        BTreeSet<usize>,
+        BTreeMap<(u32, u32), (BTreeSet<usize>, BTreeSet<usize>, BTreeMap<usize, String>)>,
+    ),
+    String,
+> {
+    let mut result = BTreeSet::new();
+    let mut external_outputs = BTreeSet::new();
+    for point in &function.reference_cfg.points {
+        let CfgPointKind::ReturnOutput {
+            output,
+            checked: true,
+            ..
+        } = point.kind
+        else {
+            continue;
+        };
+        let origins = point
+            .possible_origins
+            .as_ref()
+            .ok_or_else(|| format!("missing validated return origin at {:?}", point.source_span))?;
+        let mut local = false;
+        let mut external = false;
+        for origin in origins {
+            match &function.reference_cfg.facts[origin.0] {
+                ReferenceOrigin::Fresh { allocation, .. }
+                    if allocation.function_span == function.span
+                        && allocation.source == point.source_span.source =>
+                {
+                    local = true
+                }
+                ReferenceOrigin::Fresh { .. } | ReferenceOrigin::BorrowedFrom { .. } => {
+                    external = true;
+                }
+                ReferenceOrigin::Null { .. } => {}
+                ReferenceOrigin::Invalid { .. } => {
+                    return Err(format!(
+                        "invalid validated return origin at {:?}",
+                        point.source_span
+                    ));
+                }
             }
         }
-        if !changed {
-            return results;
+        if local {
+            result.insert(output);
+        }
+        if external {
+            external_outputs.insert(output);
         }
     }
+    let mixed = result
+        .intersection(&external_outputs)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut branches = BTreeMap::new();
+    for output in &mixed {
+        let final_output = function
+            .body
+            .final_output_values
+            .get(*output)
+            .ok_or_else(|| format!("missing return output {output}"))?;
+        record_return_branches(function, &final_output.value, *output, &mut branches)?;
+    }
+    result.retain(|output| !mixed.contains(output));
+    Ok((result, branches))
 }
 
-fn automatic_return_result_copy_pointee(inner: &ScalarType) -> bool {
-    matches!(
-        inner,
-        ScalarType::Bool
-            | ScalarType::I8
-            | ScalarType::I16
-            | ScalarType::I32
-            | ScalarType::I64
-            | ScalarType::I128
-            | ScalarType::U8
-            | ScalarType::U16
-            | ScalarType::U32
-            | ScalarType::U64
-            | ScalarType::U128
-            | ScalarType::F32
-            | ScalarType::F64
-            | ScalarType::Char
-            | ScalarType::Struct(_)
-    )
+fn dynamic_return_outputs(function: &ScalarFunction) -> BTreeSet<usize> {
+    function
+        .reference_cfg
+        .points
+        .iter()
+        .filter_map(|point| {
+            let CfgPointKind::ReturnOutput {
+                output,
+                checked: true,
+                ..
+            } = point.kind
+            else {
+                return None;
+            };
+            let Some(origins) = &point.possible_origins else {
+                return None;
+            };
+            let fresh = origins.iter().any(|id| {
+                matches!(
+                    function.reference_cfg.facts[id.0],
+                    ReferenceOrigin::Fresh { .. }
+                )
+            });
+            let borrowed = origins.iter().any(|id| matches!(function.reference_cfg.facts[id.0], ReferenceOrigin::BorrowedFrom { .. }));
+            let local = origins.iter().any(|id| matches!(&function.reference_cfg.facts[id.0],
+                ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span == function.span && allocation.source == point.source_span.source));
+            let external_fresh = origins.iter().any(|id| matches!(&function.reference_cfg.facts[id.0],
+                ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span != function.span || allocation.source != point.source_span.source));
+            (fresh && (borrowed || (local && external_fresh))).then_some(output)
+        })
+        .collect()
 }
 
-fn automatic_return_result_function(
+fn dynamic_return_owner(function: &ScalarFunction) -> bool {
+    !dynamic_return_outputs(function).is_empty()
+}
+
+fn joined_return_binding_types(
     function: &ScalarFunction,
-    results: &BTreeSet<String>,
-    call_targets: &BTreeMap<String, String>,
-) -> bool {
+    branches: &BTreeMap<(u32, u32), (BTreeSet<usize>, BTreeSet<usize>, BTreeMap<usize, String>)>,
+) -> Result<BTreeMap<String, ScalarType>, String> {
+    let mut bindings = BTreeMap::new();
     let ScalarType::Callable { outputs, .. } = &function.signature else {
-        return false;
+        return Err("function has no callable signature".to_owned());
     };
-    let Some(output) = outputs.outputs.first() else {
-        return false;
-    };
-    let ScalarType::CheckedReference { inner, .. } = &output.ty else {
-        return false;
-    };
-    if !automatic_return_result_copy_pointee(inner) {
-        return false;
+    for (_, _, joined) in branches.values() {
+        for (output, name) in joined {
+            let ty = outputs
+                .outputs
+                .get(*output)
+                .ok_or_else(|| format!("missing joined return output {output}"))?
+                .ty
+                .clone();
+            bindings.insert(name.clone(), ty);
+        }
     }
-    let bindings = return_bindings(&function.body);
-    automatic_return_result_expression(
-        &function.body.final_output_values[0].value,
-        &bindings,
-        results,
-        call_targets,
-        &mut BTreeSet::new(),
-    )
+    Ok(bindings)
 }
 
-fn automatic_return_result_expression(
-    expression: &ScalarExpression,
-    bindings: &BTreeMap<String, ScalarExpression>,
-    results: &BTreeSet<String>,
-    call_targets: &BTreeMap<String, String>,
-    visited: &mut BTreeSet<String>,
-) -> bool {
-    match expression {
-        ScalarExpression::CheckedAddress { place, .. } => {
-            matches!(place, crate::ScalarPlace::Name { name, .. } if bindings.contains_key(name))
+fn joined_assignment_owners(
+    function: &ScalarFunction,
+    bindings: &BTreeMap<String, ScalarType>,
+) -> Result<BTreeMap<(u32, u32), CheckedAssignmentOwner>, String> {
+    let mut assignments = BTreeMap::new();
+    for point in &function.reference_cfg.points {
+        let CfgPointKind::Assign { target, .. } = &point.kind else {
+            continue;
+        };
+        let crate::ScalarPlace::Name { name, .. } = &target.place else {
+            continue;
+        };
+        if !bindings.contains_key(name) {
+            continue;
         }
-        ScalarExpression::Name { name, .. } => {
-            visited.insert(name.clone())
-                && bindings.get(name).is_some_and(|value| {
-                    automatic_return_result_expression(
-                        value,
-                        bindings,
-                        results,
-                        call_targets,
-                        visited,
-                    )
-                })
-        }
-        ScalarExpression::Call { receiver, name, .. } => {
-            let lookup = receiver
-                .as_ref()
-                .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"));
-            call_targets
-                .get(&lookup)
-                .is_some_and(|target| results.contains(target))
-        }
-        _ => false,
+        let origins = point.possible_origins.as_ref().ok_or_else(|| {
+            format!(
+                "missing validated assignment owner at {:?}",
+                point.source_span
+            )
+        })?;
+        let local = origins.iter().any(|id| matches!(&function.reference_cfg.facts[id.0],
+            ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span == function.span && allocation.source == point.source_span.source));
+        let external = origins.iter().any(|id| matches!(&function.reference_cfg.facts[id.0],
+            ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span != function.span || allocation.source != point.source_span.source));
+        let owner = match (local, external) {
+            (true, false) => CheckedAssignmentOwner::Local,
+            (false, true) => CheckedAssignmentOwner::External,
+            (false, false) => CheckedAssignmentOwner::Borrowed,
+            (true, true) => {
+                return Err(format!(
+                    "assignment at {:?} combines local and external owners",
+                    point.source_span
+                ))
+            }
+        };
+        assignments.insert(
+            (point.source_span.range.start, point.source_span.range.end),
+            owner,
+        );
     }
+    Ok(assignments)
+}
+
+fn initialize_joined_return_bindings<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    bindings: BTreeMap<String, ScalarType>,
+) -> Result<(), String> {
+    for (name, ty) in bindings {
+        let slot = entry_alloca(
+            state,
+            context.bool_type().into(),
+            &format!("{name}_return_owner"),
+        )?;
+        state
+            .builder
+            .build_store(slot, context.bool_type().const_zero())
+            .map_err(builder_error)?;
+        state.joined_return_bindings.insert(name, (slot, ty));
+    }
+    Ok(())
+}
+
+fn record_return_branches(
+    function: &ScalarFunction,
+    expression: &ScalarExpression,
+    output: usize,
+    branches: &mut BTreeMap<
+        (u32, u32),
+        (BTreeSet<usize>, BTreeSet<usize>, BTreeMap<usize, String>),
+    >,
+) -> Result<(), String> {
+    let ScalarExpression::If {
+        then_branch,
+        else_branch,
+        ..
+    } = expression
+    else {
+        if let ScalarExpression::Name { name, .. } = expression {
+            let point = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(point.kind,
+                CfgPointKind::ReturnOutput { output: index, checked: true, .. } if index == output)
+                })
+                .ok_or_else(|| format!("missing checked return output {output}"))?;
+            let origins = point
+                .possible_origins
+                .as_ref()
+                .ok_or_else(|| format!("missing checked return origins for output {output}"))?;
+            let local = origins.iter().any(|id| matches!(&function.reference_cfg.facts[id.0],
+                ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span == function.span && allocation.source == point.source_span.source));
+            let external = origins
+                .iter()
+                .any(|id| match &function.reference_cfg.facts[id.0] {
+                    ReferenceOrigin::BorrowedFrom { .. } => true,
+                    ReferenceOrigin::Fresh { allocation, .. } => {
+                        allocation.function_span != function.span
+                            || allocation.source != point.source_span.source
+                    }
+                    ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
+                });
+            if local && external {
+                let selected = branches
+                    .entry((function.body.span.start, function.body.span.end))
+                    .or_default();
+                selected.1.insert(output);
+                selected.2.insert(output, name.clone());
+                return Ok(());
+            }
+        }
+        return Err(format!(
+            "return output {output} has no typed branch for its joined owners"
+        ));
+    };
+    for branch in [then_branch, else_branch] {
+        let [value] = branch.final_output_values.as_slice() else {
+            return Err(format!("return branch has no unique output {output}"));
+        };
+        if matches!(value.value, ScalarExpression::If { .. }) {
+            record_return_branches(function, &value.value, output, branches)?;
+            continue;
+        }
+        let points = function
+            .reference_cfg
+            .points
+            .iter()
+            .filter(|point| {
+                point.source_span.range == value.span
+                    && match &value.value {
+                        ScalarExpression::CheckedAddress { .. } => {
+                            matches!(point.kind, CfgPointKind::Borrow { .. })
+                        }
+                        ScalarExpression::Name { name, .. } if name == "null" => {
+                            matches!(point.kind, CfgPointKind::Evaluate(_))
+                        }
+                        ScalarExpression::Name { .. } => {
+                            matches!(point.kind, CfgPointKind::Read { .. })
+                        }
+                        ScalarExpression::Call { .. } => {
+                            matches!(point.kind, CfgPointKind::Call { output: 0, .. })
+                        }
+                        _ => matches!(point.kind, CfgPointKind::Evaluate(_)),
+                    }
+                    && point
+                        .possible_origins
+                        .as_ref()
+                        .is_some_and(|origins| !origins.is_empty())
+            })
+            .collect::<Vec<_>>();
+        let [point] = points.as_slice() else {
+            return Err(format!(
+                "return branch at {:?} has {} typed origin points",
+                value.span,
+                points.len()
+            ));
+        };
+        let origins = point
+            .possible_origins
+            .as_ref()
+            .expect("checked typed point");
+        let local = origins.iter().any(|id| matches!(
+            &function.reference_cfg.facts[id.0],
+            ReferenceOrigin::Fresh { allocation, .. }
+                if allocation.function_span == function.span && allocation.source == point.source_span.source
+        ));
+        let external = origins
+            .iter()
+            .any(|id| match &function.reference_cfg.facts[id.0] {
+                ReferenceOrigin::BorrowedFrom { .. } => true,
+                ReferenceOrigin::Fresh { allocation, .. } => {
+                    allocation.function_span != function.span
+                        || allocation.source != point.source_span.source
+                }
+                ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
+            });
+        let selected = branches
+            .entry((branch.span.start, branch.span.end))
+            .or_default();
+        selected.1.insert(output);
+        if local && external {
+            let ScalarExpression::Name { name, .. } = &value.value else {
+                return Err(format!(
+                    "return branch at {:?} has joined owners without a binding",
+                    value.span
+                ));
+            };
+            selected.2.insert(output, name.clone());
+            continue;
+        }
+        if local {
+            selected.0.insert(output);
+        }
+    }
+    Ok(())
+}
+
+fn checked_call_owners(
+    function: &ScalarFunction,
+) -> Result<BTreeMap<(u32, u32, usize), CheckedCallOwner>, String> {
+    let mut owners = BTreeMap::new();
+    for point in &function.reference_cfg.points {
+        let CfgPointKind::Call {
+            expression: ScalarExpression::Call { span, .. },
+            output,
+            ..
+        } = &point.kind
+        else {
+            continue;
+        };
+        let Some(origins) = &point.possible_origins else {
+            continue;
+        };
+        let owned = |id: &crate::scalar::ReferenceOriginId| {
+            matches!(
+                &function.reference_cfg.facts[id.0],
+                ReferenceOrigin::Fresh { loan, .. }
+                    if matches!(loan.origin_place.binding.kind, ReferenceBindingKind::CallOutput { point: origin, output: call_output } if origin == point.id && call_output == *output)
+            )
+        };
+        let fresh = origins.iter().any(owned);
+        let borrowed = origins
+            .iter()
+            .any(|id| match &function.reference_cfg.facts[id.0] {
+                ReferenceOrigin::Null { .. } => false,
+                _ => !owned(id),
+            });
+        let owner = match (fresh, borrowed) {
+            (true, true) => CheckedCallOwner::Mixed,
+            (true, false) => CheckedCallOwner::Fresh,
+            (false, _) => CheckedCallOwner::Borrowed,
+        };
+        owners.insert((span.start, span.end, *output), owner);
+    }
+    Ok(owners)
 }
 
 fn function_runtime_array_result_provenance(
@@ -2187,6 +2671,38 @@ fn release_runtime_array_owner<'ctx, 'module>(
         .module
         .get_function(CORE_FREE_SYMBOL)
         .ok_or_else(|| "core free runtime declaration is missing".to_owned())?;
+    if let Some(live) = state.runtime_array_live.get(name) {
+        let live = state
+            .builder
+            .build_load(context.bool_type(), *live, "allocation_live")
+            .map_err(builder_error)?
+            .into_int_value();
+        let block = state
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| "missing allocation release block".to_owned())?;
+        let function = block
+            .get_parent()
+            .ok_or_else(|| "missing allocation release function".to_owned())?;
+        let free = context.append_basic_block(function, "release.live");
+        let next = context.append_basic_block(function, "release.next");
+        state
+            .builder
+            .build_conditional_branch(live, free, next)
+            .map_err(builder_error)?;
+        state.builder.position_at_end(free);
+        state
+            .builder
+            .build_call(release, &[pointer.into()], "runtime_array_release")
+            .map_err(builder_error)?;
+        state
+            .builder
+            .build_unconditional_branch(next)
+            .map_err(builder_error)?;
+        state.builder.position_at_end(next);
+        state.runtime_array_owners.insert(name.to_owned(), false);
+        return Ok(());
+    }
     state
         .builder
         .build_call(release, &[pointer.into()], "runtime_array_release")
@@ -2548,7 +3064,7 @@ fn emit_function<'ctx, 'module>(
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
-    automatic_return_result_results: &'ctx BTreeSet<String>,
+    dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     function: &ScalarFunction,
     name: &str,
@@ -2562,6 +3078,9 @@ fn emit_function<'ctx, 'module>(
         .ok_or_else(|| format!("unknown LLVM function {name}"))?;
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
+    let (fresh_return_outputs, branch_return_outputs) = fresh_return_outputs(function)?;
+    let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;
+    let joined_assignment_owners = joined_assignment_owners(function, &joined_bindings)?;
     let mut state = EmitState {
         builder,
         module,
@@ -2569,13 +3088,35 @@ fn emit_function<'ctx, 'module>(
         call_targets,
         signatures,
         runtime_array_results,
+        dynamic_owner_outputs,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         return_bindings: return_bindings(&function.body),
+        fresh_return_outputs,
+        branch_return_outputs,
+        joined_return_bindings: BTreeMap::new(),
+        joined_assignment_owners,
+        return_output_types: match &function.signature {
+            ScalarType::Callable { outputs, .. } => outputs
+                .outputs
+                .iter()
+                .map(|output| output.ty.clone())
+                .collect(),
+            _ => return Err("function has no callable signature".to_owned()),
+        },
+        return_body_span: Some(function.body.span),
+        checked_call_owners: checked_call_owners(function)?,
+        checked_owner_flags: BTreeMap::new(),
+        call_owner_flags: BTreeMap::new(),
+        return_owner_flags: BTreeMap::new(),
+        return_owner_slots: BTreeMap::new(),
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
+        runtime_array_lengths: BTreeMap::new(),
+        runtime_array_live: BTreeMap::new(),
+        mutable_runtime_allocations: mutable_runtime_allocations(function),
+        invalidations: resolved_invalidations(function)?,
         automatic_return_result_owners: BTreeMap::new(),
-        automatic_return_result_results,
         globals: globals.clone(),
         all_globals: globals.clone(),
         structs,
@@ -2583,8 +3124,16 @@ fn emit_function<'ctx, 'module>(
         next_literal: 0,
         next_block: 0,
     };
+    initialize_joined_return_bindings(context, &mut state, joined_bindings)?;
     insert_unit_values(&mut state.values, items);
     if let ScalarType::Callable { parameters, .. } = &function.signature {
+        for (position, output) in dynamic_return_outputs(function).into_iter().enumerate() {
+            let slot = value
+                .get_nth_param((parameters.len() + position) as u32)
+                .ok_or_else(|| format!("missing mixed-return owner slot {output}"))?
+                .into_pointer_value();
+            state.return_owner_slots.insert(output, slot);
+        }
         for (index, parameter) in parameters.iter().enumerate() {
             let argument = value
                 .get_nth_param(index as u32)
@@ -2644,17 +3193,13 @@ fn emit_function<'ctx, 'module>(
         }
         _ => emit_block(context, &mut state, &function.body)?,
     };
-    emit_return(
-        context,
-        &mut state,
-        result,
-        outputs,
-        function
-            .body
-            .final_output_values
-            .first()
-            .map(|output| &output.value),
-    )
+    if let [ScalarBlockItem::Expression(expression)] = function.body.items.as_slice() {
+        for output in state.return_owner_slots.keys().copied().collect::<Vec<_>>() {
+            record_forwarded_return_owner(context, &mut state, expression, output)?;
+        }
+    }
+    release_automatic_return_result_owners(context, &mut state, &BTreeMap::new())?;
+    emit_return(context, &mut state, result, outputs)
 }
 
 fn emit_main<'ctx, 'module>(
@@ -2664,7 +3209,7 @@ fn emit_main<'ctx, 'module>(
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
-    automatic_return_result_results: &'ctx BTreeSet<String>,
+    dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     items: &[ScalarItem],
     module: &'module Module<'ctx>,
@@ -2683,13 +3228,28 @@ fn emit_main<'ctx, 'module>(
         call_targets,
         signatures,
         runtime_array_results,
+        dynamic_owner_outputs,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         return_bindings: BTreeMap::new(),
+        fresh_return_outputs: BTreeSet::new(),
+        branch_return_outputs: BTreeMap::new(),
+        joined_return_bindings: BTreeMap::new(),
+        joined_assignment_owners: BTreeMap::new(),
+        return_output_types: Vec::new(),
+        return_body_span: None,
+        checked_call_owners: BTreeMap::new(),
+        checked_owner_flags: BTreeMap::new(),
+        call_owner_flags: BTreeMap::new(),
+        return_owner_flags: BTreeMap::new(),
+        return_owner_slots: BTreeMap::new(),
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
+        runtime_array_lengths: BTreeMap::new(),
+        runtime_array_live: BTreeMap::new(),
+        mutable_runtime_allocations: BTreeSet::new(),
+        invalidations: BTreeMap::new(),
         automatic_return_result_owners: BTreeMap::new(),
-        automatic_return_result_results,
         globals: globals.clone(),
         all_globals: globals.clone(),
         structs,
@@ -2751,7 +3311,7 @@ fn emit_project_function<'ctx, 'module>(
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
-    automatic_return_result_results: &'ctx BTreeSet<String>,
+    dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     function: &ScalarFunction,
     source_module: &ScalarModule,
     modules: &[&'module ScalarModule],
@@ -2766,6 +3326,9 @@ fn emit_project_function<'ctx, 'module>(
         .ok_or_else(|| format!("unknown LLVM function {name}"))?;
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
+    let (fresh_return_outputs, branch_return_outputs) = fresh_return_outputs(function)?;
+    let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;
+    let joined_assignment_owners = joined_assignment_owners(function, &joined_bindings)?;
     let mut state = EmitState {
         builder,
         module,
@@ -2773,13 +3336,35 @@ fn emit_project_function<'ctx, 'module>(
         call_targets,
         signatures,
         runtime_array_results,
+        dynamic_owner_outputs,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         return_bindings: return_bindings(&function.body),
+        fresh_return_outputs,
+        branch_return_outputs,
+        joined_return_bindings: BTreeMap::new(),
+        joined_assignment_owners,
+        return_output_types: match &function.signature {
+            ScalarType::Callable { outputs, .. } => outputs
+                .outputs
+                .iter()
+                .map(|output| output.ty.clone())
+                .collect(),
+            _ => return Err("function has no callable signature".to_owned()),
+        },
+        return_body_span: Some(function.body.span),
+        checked_call_owners: checked_call_owners(function)?,
+        checked_owner_flags: BTreeMap::new(),
+        call_owner_flags: BTreeMap::new(),
+        return_owner_flags: BTreeMap::new(),
+        return_owner_slots: BTreeMap::new(),
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
+        runtime_array_lengths: BTreeMap::new(),
+        runtime_array_live: BTreeMap::new(),
+        mutable_runtime_allocations: mutable_runtime_allocations(function),
+        invalidations: resolved_invalidations(function)?,
         automatic_return_result_owners: BTreeMap::new(),
-        automatic_return_result_results,
         globals: module_globals(source_module, globals),
         all_globals: globals.clone(),
         structs,
@@ -2787,8 +3372,16 @@ fn emit_project_function<'ctx, 'module>(
         next_literal: 0,
         next_block: 0,
     };
+    initialize_joined_return_bindings(context, &mut state, joined_bindings)?;
     insert_unit_values(&mut state.values, &source_module.items);
     if let ScalarType::Callable { parameters, .. } = &function.signature {
+        for (position, output) in dynamic_return_outputs(function).into_iter().enumerate() {
+            let slot = value
+                .get_nth_param((parameters.len() + position) as u32)
+                .ok_or_else(|| format!("missing mixed-return owner slot {output}"))?
+                .into_pointer_value();
+            state.return_owner_slots.insert(output, slot);
+        }
         for (index, parameter) in parameters.iter().enumerate() {
             let argument = value
                 .get_nth_param(index as u32)
@@ -2861,17 +3454,13 @@ fn emit_project_function<'ctx, 'module>(
         }
         _ => emit_project_block(context, &mut state, &function.body, source_module, modules)?,
     };
-    emit_return(
-        context,
-        &mut state,
-        result,
-        outputs,
-        function
-            .body
-            .final_output_values
-            .first()
-            .map(|output| &output.value),
-    )
+    if let [ScalarBlockItem::Expression(expression)] = function.body.items.as_slice() {
+        for output in state.return_owner_slots.keys().copied().collect::<Vec<_>>() {
+            record_forwarded_return_owner(context, &mut state, expression, output)?;
+        }
+    }
+    release_automatic_return_result_owners(context, &mut state, &BTreeMap::new())?;
+    emit_return(context, &mut state, result, outputs)
 }
 
 fn emit_project_main<'ctx, 'module>(
@@ -2881,7 +3470,7 @@ fn emit_project_main<'ctx, 'module>(
     call_targets: &'ctx BTreeMap<String, String>,
     signatures: &'ctx BTreeMap<String, ScalarType>,
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
-    automatic_return_result_results: &'ctx BTreeSet<String>,
+    dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     modules: &[&ScalarModule],
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     module: &'module Module<'ctx>,
@@ -2900,13 +3489,28 @@ fn emit_project_main<'ctx, 'module>(
         call_targets,
         signatures,
         runtime_array_results,
+        dynamic_owner_outputs,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
         return_bindings: BTreeMap::new(),
+        fresh_return_outputs: BTreeSet::new(),
+        branch_return_outputs: BTreeMap::new(),
+        joined_return_bindings: BTreeMap::new(),
+        joined_assignment_owners: BTreeMap::new(),
+        return_output_types: Vec::new(),
+        return_body_span: None,
+        checked_call_owners: BTreeMap::new(),
+        checked_owner_flags: BTreeMap::new(),
+        call_owner_flags: BTreeMap::new(),
+        return_owner_flags: BTreeMap::new(),
+        return_owner_slots: BTreeMap::new(),
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
+        runtime_array_lengths: BTreeMap::new(),
+        runtime_array_live: BTreeMap::new(),
+        mutable_runtime_allocations: BTreeSet::new(),
+        invalidations: BTreeMap::new(),
         automatic_return_result_owners: BTreeMap::new(),
-        automatic_return_result_results,
         globals: BTreeMap::new(),
         all_globals: globals.clone(),
         structs,
@@ -2943,13 +3547,19 @@ fn initialize_project_module<'ctx, 'module>(
     let storage = state.storage.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
     let runtime_array_allocations = state.runtime_array_allocations.clone();
+    let runtime_array_lengths = state.runtime_array_lengths.clone();
+    let runtime_array_live = state.runtime_array_live.clone();
     let automatic_return_result_owners = state.automatic_return_result_owners.clone();
+    let checked_owner_flags = state.checked_owner_flags.clone();
     let current_module_globals = module_globals(module, globals);
     let current_globals = std::mem::replace(&mut state.globals, current_module_globals);
     state.values.clear();
     state.storage.clear();
     state.runtime_array_owners.clear();
     state.runtime_array_allocations.clear();
+    state.runtime_array_lengths.clear();
+    state.runtime_array_live.clear();
+    state.checked_owner_flags.clear();
     state.automatic_return_result_owners.clear();
     insert_unit_values(&mut state.values, &module.items);
 
@@ -3072,9 +3682,24 @@ fn initialize_project_module<'ctx, 'module>(
             }),
     );
     state.runtime_array_allocations = retained_allocations;
+    let mut retained_lengths = runtime_array_lengths;
+    retained_lengths.extend(
+        std::mem::take(&mut state.runtime_array_lengths)
+            .into_iter()
+            .map(|(name, slot)| (project_runtime_array_name(&module.source, &name), slot)),
+    );
+    state.runtime_array_lengths = retained_lengths;
+    let mut retained_live = runtime_array_live;
+    retained_live.extend(
+        std::mem::take(&mut state.runtime_array_live)
+            .into_iter()
+            .map(|(name, slot)| (project_runtime_array_name(&module.source, &name), slot)),
+    );
+    state.runtime_array_live = retained_live;
     let mut retained_return_results = automatic_return_result_owners;
     retained_return_results.extend(std::mem::take(&mut state.automatic_return_result_owners));
     state.automatic_return_result_owners = retained_return_results;
+    state.checked_owner_flags = checked_owner_flags;
     Ok(())
 }
 
@@ -3087,7 +3712,10 @@ fn emit_block<'ctx, 'module>(
     let values = state.values.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
     let runtime_array_allocations = state.runtime_array_allocations.clone();
+    let runtime_array_lengths = state.runtime_array_lengths.clone();
+    let runtime_array_live = state.runtime_array_live.clone();
     let automatic_return_result_owners = state.automatic_return_result_owners.clone();
+    let checked_owner_flags = state.checked_owner_flags.clone();
     let mut result = EmitValue::Unit;
     let final_start = block.items.len() - block.final_output_values.len();
     for item in &block.items[..final_start] {
@@ -3105,13 +3733,40 @@ fn emit_block<'ctx, 'module>(
     if !block.final_output_values.is_empty() {
         result = emit_final_outputs(context, state, block)?;
     }
+    if state.return_body_span == Some(block.span) {
+        result = materialize_return_branch(context, state, block, result)?;
+        let outputs = crate::ScalarOutputSequence {
+            outputs: block
+                .final_output_values
+                .iter()
+                .map(|output| crate::ScalarOutput {
+                    ty: output.ty.clone(),
+                    span: output.span,
+                })
+                .collect(),
+            span: block.span,
+        };
+        result = materialize_fresh_return_outputs(context, state, result, &outputs)?;
+        state.fresh_return_outputs.clear();
+    } else {
+        result = materialize_return_branch(context, state, block, result)?;
+    }
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
     state.storage = storage;
     state.values = values;
-    state.runtime_array_owners = runtime_array_owners;
+    state.runtime_array_owners = runtime_array_owners
+        .into_iter()
+        .map(|(name, owner)| {
+            let updated = *state.runtime_array_owners.get(&name).unwrap_or(&owner);
+            (name, updated)
+        })
+        .collect();
     state.runtime_array_allocations = runtime_array_allocations;
+    state.runtime_array_lengths = runtime_array_lengths;
+    state.runtime_array_live = runtime_array_live;
     state.automatic_return_result_owners = automatic_return_result_owners;
+    state.checked_owner_flags = checked_owner_flags;
     Ok(result)
 }
 
@@ -3126,7 +3781,10 @@ fn emit_project_block<'ctx, 'module>(
     let values = state.values.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
     let runtime_array_allocations = state.runtime_array_allocations.clone();
+    let runtime_array_lengths = state.runtime_array_lengths.clone();
+    let runtime_array_live = state.runtime_array_live.clone();
     let automatic_return_result_owners = state.automatic_return_result_owners.clone();
+    let checked_owner_flags = state.checked_owner_flags.clone();
     let mut result = EmitValue::Unit;
     let final_start = block.items.len() - block.final_output_values.len();
     for item in &block.items[..final_start] {
@@ -3150,13 +3808,40 @@ fn emit_project_block<'ctx, 'module>(
     if !block.final_output_values.is_empty() {
         result = emit_project_final_outputs(context, state, block, module, modules)?;
     }
+    if state.return_body_span == Some(block.span) {
+        result = materialize_return_branch(context, state, block, result)?;
+        let outputs = crate::ScalarOutputSequence {
+            outputs: block
+                .final_output_values
+                .iter()
+                .map(|output| crate::ScalarOutput {
+                    ty: output.ty.clone(),
+                    span: output.span,
+                })
+                .collect(),
+            span: block.span,
+        };
+        result = materialize_fresh_return_outputs(context, state, result, &outputs)?;
+        state.fresh_return_outputs.clear();
+    } else {
+        result = materialize_return_branch(context, state, block, result)?;
+    }
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
     state.storage = storage;
     state.values = values;
-    state.runtime_array_owners = runtime_array_owners;
+    state.runtime_array_owners = runtime_array_owners
+        .into_iter()
+        .map(|(name, owner)| {
+            let updated = *state.runtime_array_owners.get(&name).unwrap_or(&owner);
+            (name, updated)
+        })
+        .collect();
     state.runtime_array_allocations = runtime_array_allocations;
+    state.runtime_array_lengths = runtime_array_lengths;
+    state.runtime_array_live = runtime_array_live;
     state.automatic_return_result_owners = automatic_return_result_owners;
+    state.checked_owner_flags = checked_owner_flags;
     Ok(result)
 }
 
@@ -3170,9 +3855,22 @@ fn emit_final_outputs<'ctx, 'module>(
         if matches!(&output.value, ScalarExpression::Call { .. }) {
             transfer_runtime_array_return(state, block, &output.value, &output.ty);
             transfer_automatic_return_result(state, &output.value);
-            return emit_expression(context, state, &output.value);
+            let value = emit_expression(context, state, &output.value)?;
+            if !state
+                .branch_return_outputs
+                .contains_key(&(block.span.start, block.span.end))
+            {
+                record_forwarded_return_owner(context, state, &output.value, output.position)?;
+            }
+            return Ok(value);
         }
         let value = emit_typed_expression(context, state, &output.value, &output.ty)?;
+        if !state
+            .branch_return_outputs
+            .contains_key(&(block.span.start, block.span.end))
+        {
+            record_forwarded_return_owner(context, state, &output.value, output.position)?;
+        }
         transfer_runtime_array_return(state, block, &output.value, &output.ty);
         transfer_automatic_return_result(state, &output.value);
         return Ok(value);
@@ -3209,6 +3907,14 @@ fn emit_final_outputs<'ctx, 'module>(
         .iter()
         .map(|output| emit_typed_expression(context, state, &output.value, &output.ty))
         .collect::<Result<Vec<_>, _>>()?;
+    if !state
+        .branch_return_outputs
+        .contains_key(&(block.span.start, block.span.end))
+    {
+        for (position, output) in block.final_output_values.iter().enumerate() {
+            record_forwarded_return_owner(context, state, &output.value, position)?;
+        }
+    }
     for output in &block.final_output_values {
         transfer_runtime_array_return(state, block, &output.value, &output.ty);
         transfer_automatic_return_result(state, &output.value);
@@ -3228,7 +3934,14 @@ fn emit_project_final_outputs<'ctx, 'module>(
         if matches!(&output.value, ScalarExpression::Call { .. }) {
             transfer_runtime_array_return(state, block, &output.value, &output.ty);
             transfer_automatic_return_result(state, &output.value);
-            return emit_project_expression(context, state, &output.value, module, modules);
+            let value = emit_project_expression(context, state, &output.value, module, modules)?;
+            if !state
+                .branch_return_outputs
+                .contains_key(&(block.span.start, block.span.end))
+            {
+                record_forwarded_return_owner(context, state, &output.value, output.position)?;
+            }
+            return Ok(value);
         }
         let value = emit_project_typed_expression(
             context,
@@ -3238,6 +3951,12 @@ fn emit_project_final_outputs<'ctx, 'module>(
             module,
             modules,
         )?;
+        if !state
+            .branch_return_outputs
+            .contains_key(&(block.span.start, block.span.end))
+        {
+            record_forwarded_return_owner(context, state, &output.value, output.position)?;
+        }
         transfer_runtime_array_return(state, block, &output.value, &output.ty);
         transfer_automatic_return_result(state, &output.value);
         return Ok(value);
@@ -3286,6 +4005,14 @@ fn emit_project_final_outputs<'ctx, 'module>(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if !state
+        .branch_return_outputs
+        .contains_key(&(block.span.start, block.span.end))
+    {
+        for (position, output) in block.final_output_values.iter().enumerate() {
+            record_forwarded_return_owner(context, state, &output.value, position)?;
+        }
+    }
     for output in &block.final_output_values {
         transfer_runtime_array_return(state, block, &output.value, &output.ty);
         transfer_automatic_return_result(state, &output.value);
@@ -3389,7 +4116,9 @@ fn emit_assignment<'ctx, 'module>(
             None => emit_expression(context, state, value),
         },
     )?;
-    for (target, (value, ty, provenance)) in assignment.targets.iter().zip(values) {
+    for (position, (target, (value, ty, provenance, call_flag))) in
+        assignment.targets.iter().zip(values).enumerate()
+    {
         if ty == ScalarType::Unit {
             state.values.insert(target.target.clone(), EmitValue::Unit);
             continue;
@@ -3416,6 +4145,22 @@ fn emit_assignment<'ctx, 'module>(
             }
             place => place_pointer(context, state, place, None)?,
         };
+        let expression = if assignment.values.len() == 1 {
+            &assignment.values[0]
+        } else {
+            &assignment.values[position]
+        };
+        let value = transition_joined_checked_assignment(
+            context,
+            state,
+            target,
+            expression,
+            position,
+            destination,
+            &ty,
+            value,
+            call_flag,
+        )?;
         transition_runtime_array_assignment(context, state, target, &ty, &provenance)?;
         store_value(context, state, destination, &ty, value)?;
     }
@@ -3457,7 +4202,9 @@ fn emit_project_assignment<'ctx, 'module>(
             None => emit_project_expression(context, state, value, module, modules),
         },
     )?;
-    for (target, (value, ty, provenance)) in assignment.targets.iter().zip(values) {
+    for (position, (target, (value, ty, provenance, call_flag))) in
+        assignment.targets.iter().zip(values).enumerate()
+    {
         if ty == ScalarType::Unit {
             state.values.insert(target.target.clone(), EmitValue::Unit);
             continue;
@@ -3497,10 +4244,215 @@ fn emit_project_assignment<'ctx, 'module>(
                 place => place_pointer(context, state, place, None)?,
             }
         };
+        let expression = if assignment.values.len() == 1 {
+            &assignment.values[0]
+        } else {
+            &assignment.values[position]
+        };
+        let value = transition_joined_checked_assignment(
+            context,
+            state,
+            target,
+            expression,
+            position,
+            destination,
+            &ty,
+            value,
+            call_flag,
+        )?;
         transition_runtime_array_assignment(context, state, target, &ty, &provenance)?;
         store_value(context, state, destination, &ty, value)?;
     }
     Ok(EmitValue::Unit)
+}
+
+fn transition_joined_checked_assignment<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    target: &crate::scalar::ScalarAssignmentTarget,
+    expression: &ScalarExpression,
+    output: usize,
+    destination: PointerValue<'ctx>,
+    ty: &ScalarType,
+    value: EmitValue<'ctx>,
+    call_flag: Option<inkwell::values::IntValue<'ctx>>,
+) -> Result<EmitValue<'ctx>, String> {
+    let crate::ScalarPlace::Name { name, .. } = &target.place else {
+        return Ok(value);
+    };
+    let Some((owner_slot, _)) = state.joined_return_bindings.get(name).cloned() else {
+        return Ok(value);
+    };
+    let classification = *state
+        .joined_assignment_owners
+        .get(&(target.target_span.start, target.target_span.end))
+        .ok_or_else(|| {
+            format!(
+                "missing validated assignment owner at {:?}",
+                target.target_span
+            )
+        })?;
+    let ScalarType::CheckedReference { inner, .. } = ty else {
+        return Err(format!(
+            "joined return binding {name} lacks checked-reference type"
+        ));
+    };
+    let (value, owned) = match classification {
+        CheckedAssignmentOwner::Local => {
+            if let ScalarExpression::Name { name: source, .. } = expression {
+                if let Some((slot, _)) = state.joined_return_bindings.get(source) {
+                    let owned = state
+                        .builder
+                        .build_load(context.bool_type(), *slot, "joined_assignment_owned")
+                        .map_err(builder_error)?
+                        .into_int_value();
+                    (value, owned)
+                } else {
+                    let copied =
+                        emit_automatic_return_result(context, state, take_basic(value)?, inner)?;
+                    (
+                        EmitValue::Basic(copied),
+                        context.bool_type().const_int(1, false),
+                    )
+                }
+            } else {
+                let copied =
+                    emit_automatic_return_result(context, state, take_basic(value)?, inner)?;
+                (
+                    EmitValue::Basic(copied),
+                    context.bool_type().const_int(1, false),
+                )
+            }
+        }
+        CheckedAssignmentOwner::External => {
+            let owned = match expression {
+                ScalarExpression::Call { span, .. } => match state
+                    .checked_call_owners
+                    .get(&(span.start, span.end, output))
+                    .ok_or_else(|| format!("missing validated checked-call owner at {span:?}"))?
+                {
+                    CheckedCallOwner::Fresh => context.bool_type().const_int(1, false),
+                    CheckedCallOwner::Borrowed => context.bool_type().const_zero(),
+                    CheckedCallOwner::Mixed => call_flag
+                        .ok_or_else(|| format!("missing mixed-call owner flag at {span:?}"))?,
+                },
+                ScalarExpression::Name { name: source, .. } => {
+                    if let Some((slot, _)) = state.joined_return_bindings.get(source) {
+                        state
+                            .builder
+                            .build_load(context.bool_type(), *slot, "joined_assignment_owned")
+                            .map_err(builder_error)?
+                            .into_int_value()
+                    } else if let Some(flag) = state.checked_owner_flags.get(source) {
+                        *flag
+                    } else if state.automatic_return_result_owners.contains_key(source) {
+                        context.bool_type().const_int(1, false)
+                    } else {
+                        return Err(format!("missing validated external owner for {source}"));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "joined return assignment at {:?} has no typed owner source",
+                        target.target_span
+                    ))
+                }
+            };
+            (value, owned)
+        }
+        CheckedAssignmentOwner::Borrowed => (value, context.bool_type().const_zero()),
+    };
+    let address = take_basic(value.clone())?.into_int_value();
+    let previous_owner = state
+        .builder
+        .build_load(context.bool_type(), owner_slot, "joined_previous_owner")
+        .map_err(builder_error)?
+        .into_int_value();
+    let previous_address = state
+        .builder
+        .build_load(
+            basic_type(context, ty, state.target_layout)?,
+            destination,
+            "joined_previous_address",
+        )
+        .map_err(builder_error)?
+        .into_int_value();
+    let different = state
+        .builder
+        .build_int_compare(
+            IntPredicate::NE,
+            previous_address,
+            address,
+            "joined_owner_replaced",
+        )
+        .map_err(builder_error)?;
+    let live = state
+        .builder
+        .build_int_compare(
+            IntPredicate::NE,
+            previous_address,
+            previous_address.get_type().const_zero(),
+            "joined_previous_live",
+        )
+        .map_err(builder_error)?;
+    let release = state
+        .builder
+        .build_and(previous_owner, different, "joined_previous_owned")
+        .map_err(builder_error)?;
+    let release = state
+        .builder
+        .build_and(release, live, "joined_previous_release")
+        .map_err(builder_error)?;
+    let function = state
+        .builder
+        .get_insert_block()
+        .ok_or_else(|| "missing joined assignment block".to_owned())?
+        .get_parent()
+        .ok_or_else(|| "missing joined assignment function".to_owned())?;
+    let free = context.append_basic_block(function, "joined_previous_release.live");
+    let next = context.append_basic_block(function, "joined_previous_release.next");
+    state
+        .builder
+        .build_conditional_branch(release, free, next)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(free);
+    let pointer = state
+        .builder
+        .build_int_to_ptr(
+            previous_address,
+            context.ptr_type(AddressSpace::default()),
+            "joined_previous_pointer",
+        )
+        .map_err(builder_error)?;
+    declare_core_runtime(context, state.module);
+    let release = state
+        .module
+        .get_function(CORE_FREE_SYMBOL)
+        .ok_or_else(|| "core free runtime declaration is missing".to_owned())?;
+    state
+        .builder
+        .build_call(release, &[pointer.into()], "joined_previous_free")
+        .map_err(builder_error)?;
+    state
+        .builder
+        .build_unconditional_branch(next)
+        .map_err(builder_error)?;
+    state.builder.position_at_end(next);
+    state
+        .builder
+        .build_store(owner_slot, owned)
+        .map_err(builder_error)?;
+    if let ScalarExpression::Name { name: source, .. } = expression {
+        if source != name {
+            if let Some((slot, _)) = state.joined_return_bindings.get(source) {
+                state
+                    .builder
+                    .build_store(*slot, context.bool_type().const_zero())
+                    .map_err(builder_error)?;
+            }
+        }
+    }
+    Ok(value)
 }
 
 fn transition_runtime_array_assignment<'ctx, 'module>(
@@ -3802,6 +4754,7 @@ fn materialize_assignment_values<'ctx, 'module>(
         EmitValue<'ctx>,
         ScalarType,
         RuntimeArrayAssignmentProvenance,
+        Option<inkwell::values::IntValue<'ctx>>,
     )>,
     String,
 > {
@@ -3815,6 +4768,7 @@ fn materialize_assignment_values<'ctx, 'module>(
             expression,
             expected.get(position).and_then(Option::as_ref),
         )?;
+        let call_flags = state.call_owner_flags.clone();
         let output_types = match &value {
             EmitValue::Aggregate { outputs, .. } => outputs.clone(),
             EmitValue::Unit => vec![ScalarType::Unit],
@@ -3827,7 +4781,7 @@ fn materialize_assignment_values<'ctx, 'module>(
         for (output_position, ty) in output_types.into_iter().enumerate() {
             let value = extract_output(state, value.clone(), output_position)?;
             if ty == ScalarType::Unit {
-                values.push((EmitValue::Unit, ty, provenance.clone()));
+                values.push((EmitValue::Unit, ty, provenance.clone(), None));
                 position += 1;
                 continue;
             }
@@ -3851,7 +4805,12 @@ fn materialize_assignment_values<'ctx, 'module>(
                         .map_err(builder_error)?,
                 )
             };
-            values.push((value, ty, provenance.clone()));
+            values.push((
+                value,
+                ty,
+                provenance.clone(),
+                call_flags.get(&output_position).copied(),
+            ));
             position += 1;
         }
     }
@@ -3933,15 +4892,61 @@ fn emit_project_block_item<'ctx, 'module>(
                 )?)?
                 .into_int_value();
                 let slot = emit_runtime_array_allocation(context, state, element, length)?;
+                if !state
+                    .mutable_runtime_allocations
+                    .contains(&(receiver.name_span.start, receiver.name_span.end))
+                {
+                    state
+                        .storage
+                        .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
+                    state
+                        .runtime_array_owners
+                        .insert(receiver.name.clone(), true);
+                    state
+                        .runtime_array_allocations
+                        .insert(receiver.name.clone(), true);
+                    return Ok(EmitValue::Unit);
+                }
+                let backing = entry_alloca(
+                    state,
+                    context.ptr_type(AddressSpace::default()).into(),
+                    &format!("{}_backing", receiver.name),
+                )?;
+                state
+                    .builder
+                    .build_store(backing, slot)
+                    .map_err(builder_error)?;
+                let length_slot = entry_alloca(
+                    state,
+                    context.i64_type().into(),
+                    &format!("{}_length", receiver.name),
+                )?;
+                state
+                    .builder
+                    .build_store(length_slot, length)
+                    .map_err(builder_error)?;
+                state
+                    .runtime_array_lengths
+                    .insert(receiver.name.clone(), length_slot);
+                let live = entry_alloca(
+                    state,
+                    context.bool_type().into(),
+                    &format!("{}_live", receiver.name),
+                )?;
+                state
+                    .builder
+                    .build_store(live, context.bool_type().const_int(1, false))
+                    .map_err(builder_error)?;
+                state.runtime_array_live.insert(receiver.name.clone(), live);
                 state
                     .storage
-                    .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
+                    .insert(receiver.name.clone(), (backing, receiver.ty.clone()));
                 state
                     .runtime_array_owners
                     .insert(receiver.name.clone(), true);
                 state
                     .runtime_array_allocations
-                    .insert(receiver.name.clone(), true);
+                    .insert(receiver.name.clone(), false);
                 return Ok(EmitValue::Unit);
             }
             let value = emit_project_typed_expression(
@@ -4174,11 +5179,15 @@ fn emit_expression<'ctx, 'module>(
         ScalarExpression::Call {
             receiver,
             name,
+            span,
             type_arguments,
             arguments,
             overload_selection,
             ..
         } => {
+            if state.invalidations.contains_key(&(span.start, span.end)) {
+                return emit_core_invalidation(context, state, *span, arguments, None);
+            }
             if receiver.as_deref() == Some("core") && name == "alloc" {
                 return emit_core_alloc(context, state, arguments);
             }
@@ -4353,11 +5362,21 @@ fn emit_project_expression<'ctx, 'module>(
         ScalarExpression::Call {
             receiver,
             name,
+            span,
             type_arguments,
             arguments,
             overload_selection,
             ..
         } => {
+            if state.invalidations.contains_key(&(span.start, span.end)) {
+                return emit_core_invalidation(
+                    context,
+                    state,
+                    *span,
+                    arguments,
+                    Some(ProjectCallScope { module, modules }),
+                );
+            }
             if receiver.as_deref() == Some("core") && name == "alloc" {
                 return emit_core_alloc_project(context, state, arguments, module, modules);
             }
@@ -4529,7 +5548,7 @@ fn emit_project_expression<'ctx, 'module>(
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            emit_call_values(state, &target, values)
+            emit_call_values(context, state, &target, values)
         }
         ScalarExpression::Name { name, .. } => emit_expression(
             context,
@@ -4687,7 +5706,329 @@ fn emit_call<'ctx, 'module>(
         .zip(parameters)
         .map(|(argument, parameter)| emit_typed_expression(context, state, argument, parameter))
         .collect::<Result<Vec<_>, _>>()?;
-    emit_call_values(state, &target, values)
+    emit_call_values(context, state, &target, values)
+}
+
+fn allocation_root_name(place: &crate::ScalarPlace) -> Result<&str, String> {
+    match place {
+        crate::ScalarPlace::Name { name, .. } => Ok(name),
+        crate::ScalarPlace::Index { base, .. } | crate::ScalarPlace::Field { base, .. } => {
+            allocation_root_name(base)
+        }
+        crate::ScalarPlace::Dereference { .. } => {
+            Err("core allocation place requires a named owner".to_owned())
+        }
+    }
+}
+
+fn core_effect_owners<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    address: inkwell::values::IntValue<'ctx>,
+    candidates: &[InvalidationCandidate],
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<Vec<(String, inkwell::values::IntValue<'ctx>)>, String> {
+    let distinct = candidates
+        .iter()
+        .map(|candidate| &candidate.place.binding)
+        .collect::<BTreeSet<_>>();
+    let multiple = distinct.len() > 1;
+    let mut owners = BTreeMap::new();
+    for candidate in candidates {
+        let name = allocation_root_name(&candidate.place.place)?.to_owned();
+        let selected = if multiple {
+            let pointer = place_pointer(context, state, &candidate.place.place, project)?;
+            let pointer = state
+                .builder
+                .build_ptr_to_int(pointer, address.get_type(), "candidate_address")
+                .map_err(builder_error)?;
+            state
+                .builder
+                .build_int_compare(IntPredicate::EQ, pointer, address, "core_effect_target")
+                .map_err(builder_error)?
+        } else {
+            context.bool_type().const_int(1, false)
+        };
+        if let Some((_, previous)) = owners.get_mut(&candidate.place.binding) {
+            *previous = state
+                .builder
+                .build_or(*previous, selected, "core_effect_owner")
+                .map_err(builder_error)?;
+        } else {
+            owners.insert(candidate.place.binding.clone(), (name, selected));
+        }
+    }
+    Ok(owners.into_values().collect())
+}
+
+fn emit_core_invalidation<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    span: wosy_syntax::ByteSpan,
+    arguments: &[ScalarExpression],
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<EmitValue<'ctx>, String> {
+    let (operation, candidates, inputs) = state
+        .invalidations
+        .get(&(span.start, span.end))
+        .cloned()
+        .ok_or_else(|| "core invalidation lacks a typed CFG event".to_owned())?;
+    let address = take_basic(match project {
+        Some(scope) => {
+            emit_project_expression(context, state, &arguments[0], scope.module, scope.modules)?
+        }
+        None => emit_expression(context, state, &arguments[0])?,
+    })?
+    .into_int_value();
+    if operation == CoreOperationId::Invalidate {
+        if !matches!(inputs, InvalidationInputs::Invalidate) {
+            return Err("inconsistent core.invalidate inputs".to_owned());
+        }
+        let owners = core_effect_owners(context, state, address, &candidates, project)?;
+        let multiple = owners.len() > 1;
+        for (name, selected) in owners {
+            let live = *state
+                .runtime_array_live
+                .get(&name)
+                .ok_or_else(|| format!("missing allocation state for {name}"))?;
+            if multiple {
+                let (_, ty) = state
+                    .storage
+                    .get(&name)
+                    .cloned()
+                    .ok_or_else(|| format!("missing allocation storage for {name}"))?;
+                if !matches!(ty, ScalarType::RuntimeArray { .. }) {
+                    return Err(format!("invalid allocation target {name}"));
+                }
+                let block = state
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| "missing invalidation block".to_owned())?;
+                let function = block
+                    .get_parent()
+                    .ok_or_else(|| "missing invalidation function".to_owned())?;
+                let update = context.append_basic_block(function, "invalidate.update");
+                let next = context.append_basic_block(function, "invalidate.next");
+                state
+                    .builder
+                    .build_conditional_branch(selected, update, next)
+                    .map_err(builder_error)?;
+                state.builder.position_at_end(update);
+                state
+                    .builder
+                    .build_store(live, context.bool_type().const_zero())
+                    .map_err(builder_error)?;
+                state
+                    .builder
+                    .build_unconditional_branch(next)
+                    .map_err(builder_error)?;
+                state.builder.position_at_end(next);
+            } else {
+                state
+                    .builder
+                    .build_store(live, context.bool_type().const_zero())
+                    .map_err(builder_error)?;
+            }
+        }
+        return Ok(EmitValue::Unit);
+    }
+    if operation == CoreOperationId::Free {
+        if !matches!(inputs, InvalidationInputs::Free) || arguments.len() != 1 {
+            return Err("inconsistent checked core.free inputs".to_owned());
+        }
+        declare_core_runtime(context, state.module);
+        let deallocator = state
+            .module
+            .get_function(CORE_FREE_SYMBOL)
+            .ok_or_else(|| "core free runtime declaration is missing".to_owned())?;
+        let owners = core_effect_owners(context, state, address, &candidates, project)?;
+        let multiple = owners.len() > 1;
+        for (name, selected) in owners {
+            let (slot, ty) = state
+                .storage
+                .get(&name)
+                .cloned()
+                .ok_or_else(|| format!("missing checked release storage for {name}"))?;
+            if !matches!(ty, ScalarType::RuntimeArray { .. })
+                || state.runtime_array_allocations.get(&name) != Some(&false)
+            {
+                return Err(format!(
+                    "checked core.free requires an allocation owner {name}"
+                ));
+            }
+            let live_slot = *state
+                .runtime_array_live
+                .get(&name)
+                .ok_or_else(|| format!("missing checked release owner state for {name}"))?;
+            if multiple {
+                let block = state
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| "missing checked release block".to_owned())?;
+                let function = block
+                    .get_parent()
+                    .ok_or_else(|| "missing checked release function".to_owned())?;
+                let update = context.append_basic_block(function, "checked_release.selected");
+                let next = context.append_basic_block(function, "checked_release.next");
+                state
+                    .builder
+                    .build_conditional_branch(selected, update, next)
+                    .map_err(builder_error)?;
+                state.builder.position_at_end(update);
+                let live = state
+                    .builder
+                    .build_load(context.bool_type(), live_slot, "checked_release_live")
+                    .map_err(builder_error)?
+                    .into_int_value();
+                let release = context.append_basic_block(function, "checked_release.live");
+                state
+                    .builder
+                    .build_conditional_branch(live, release, next)
+                    .map_err(builder_error)?;
+                state.builder.position_at_end(release);
+                let backing = state
+                    .builder
+                    .build_load(
+                        context.ptr_type(AddressSpace::default()),
+                        slot,
+                        "checked_release_backing",
+                    )
+                    .map_err(builder_error)?;
+                state
+                    .builder
+                    .build_call(deallocator, &[backing.into()], "checked_release")
+                    .map_err(builder_error)?;
+                state
+                    .builder
+                    .build_store(live_slot, context.bool_type().const_zero())
+                    .map_err(builder_error)?;
+                state
+                    .builder
+                    .build_unconditional_branch(next)
+                    .map_err(builder_error)?;
+                state.builder.position_at_end(next);
+            } else {
+                let backing = state
+                    .builder
+                    .build_load(
+                        context.ptr_type(AddressSpace::default()),
+                        slot,
+                        "checked_release_backing",
+                    )
+                    .map_err(builder_error)?;
+                state
+                    .builder
+                    .build_call(deallocator, &[backing.into()], "checked_release")
+                    .map_err(builder_error)?;
+                state
+                    .builder
+                    .build_store(live_slot, context.bool_type().const_zero())
+                    .map_err(builder_error)?;
+            }
+        }
+        return Ok(EmitValue::Unit);
+    }
+    let InvalidationInputs::Rebind {
+        raw_address,
+        length,
+        ..
+    } = inputs
+    else {
+        return Err("inconsistent core.rebind inputs".to_owned());
+    };
+    if operation != CoreOperationId::Rebind
+        || arguments.len() != 3
+        || arguments[1] != raw_address
+        || arguments[2] != length
+    {
+        return Err("core.rebind inputs differ from resolved CFG event".to_owned());
+    }
+    let raw = take_basic(match project {
+        Some(scope) => {
+            emit_project_expression(context, state, &raw_address, scope.module, scope.modules)?
+        }
+        None => emit_expression(context, state, &raw_address)?,
+    })?
+    .into_int_value();
+    let length = take_basic(match project {
+        Some(scope) => emit_project_typed_expression(
+            context,
+            state,
+            &length,
+            &ScalarType::U64,
+            scope.module,
+            scope.modules,
+        )?,
+        None => emit_typed_expression(context, state, &length, &ScalarType::U64)?,
+    })?
+    .into_int_value();
+    let pointer = state
+        .builder
+        .build_int_to_ptr(
+            raw,
+            context.ptr_type(AddressSpace::default()),
+            "rebound_address",
+        )
+        .map_err(builder_error)?;
+    let owners = core_effect_owners(context, state, address, &candidates, project)?;
+    let multiple = owners.len() > 1;
+    for (name, selected) in owners {
+        let (slot, ty) = state
+            .storage
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| format!("missing rebind storage for {name}"))?;
+        if !matches!(ty, ScalarType::RuntimeArray { .. })
+            || state.runtime_array_allocations.get(&name) != Some(&false)
+        {
+            return Err(format!(
+                "core.rebind requires writable runtime allocation {name}"
+            ));
+        }
+        let length_slot = *state
+            .runtime_array_lengths
+            .get(&name)
+            .ok_or_else(|| format!("missing runtime length for {name}"))?;
+        if multiple {
+            let current = state
+                .builder
+                .get_insert_block()
+                .ok_or_else(|| "missing rebind block".to_owned())?;
+            let function = current
+                .get_parent()
+                .ok_or_else(|| "missing rebind function".to_owned())?;
+            let update = context.append_basic_block(function, "rebind.update");
+            let next = context.append_basic_block(function, "rebind.next");
+            state
+                .builder
+                .build_conditional_branch(selected, update, next)
+                .map_err(builder_error)?;
+            state.builder.position_at_end(update);
+            state
+                .builder
+                .build_store(slot, pointer)
+                .map_err(builder_error)?;
+            state
+                .builder
+                .build_store(length_slot, length)
+                .map_err(builder_error)?;
+            state
+                .builder
+                .build_unconditional_branch(next)
+                .map_err(builder_error)?;
+            state.builder.position_at_end(next);
+        } else {
+            state
+                .builder
+                .build_store(slot, pointer)
+                .map_err(builder_error)?;
+            state
+                .builder
+                .build_store(length_slot, length)
+                .map_err(builder_error)?;
+        }
+    }
+    Ok(EmitValue::Unit)
 }
 
 fn emit_core_alloc<'ctx, 'module>(
@@ -5671,6 +7012,7 @@ fn float_conversion_source_type(
 }
 
 fn emit_call_values<'ctx, 'module>(
+    context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     name: &str,
     values: Vec<EmitValue<'ctx>>,
@@ -5679,7 +7021,7 @@ fn emit_call_values<'ctx, 'module>(
         .functions
         .get(name)
         .ok_or_else(|| format!("unknown LLVM callable {name}"))?;
-    let arguments = values
+    let mut arguments = values
         .into_iter()
         .map(|value| match value {
             EmitValue::Basic(value) => Ok(BasicMetadataValueEnum::from(value)),
@@ -5687,10 +7029,49 @@ fn emit_call_values<'ctx, 'module>(
             EmitValue::Aggregate { .. } => Err("aggregate argument is invalid".into()),
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let ScalarType::Callable { parameters, .. } = state
+        .signatures
+        .get(name)
+        .ok_or_else(|| format!("unknown LLVM callable signature {name}"))?
+    else {
+        return Err(format!("LLVM callable {name} has no callable signature"));
+    };
+    let owner_outputs = if function.count_params() as usize > parameters.len() {
+        state
+            .dynamic_owner_outputs
+            .get(name)
+            .ok_or_else(|| format!("missing owner signature for {name}"))?
+    } else {
+        &BTreeSet::new()
+    };
+    let mut owner_slots = BTreeMap::new();
+    for output in owner_outputs {
+        let slot = entry_alloca(
+            state,
+            context.bool_type().into(),
+            &format!("checked_return_owner_{output}"),
+        )?;
+        arguments.push(slot.into());
+        owner_slots.insert(*output, slot);
+    }
     let call = state
         .builder
         .build_call(function, &arguments, "call")
         .map_err(builder_error)?;
+    state.call_owner_flags = owner_slots
+        .into_iter()
+        .map(|(output, slot)| {
+            state
+                .builder
+                .build_load(
+                    context.bool_type(),
+                    slot,
+                    &format!("checked_return_owned_{output}"),
+                )
+                .map(|value| (output, value.into_int_value()))
+                .map_err(builder_error)
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
     let outputs = match state.signatures.get(name) {
         Some(ScalarType::Callable { outputs, .. }) => outputs,
         _ => return Err(format!("unknown LLVM callable signature {name}")),
@@ -6280,20 +7661,46 @@ where
         .build_conditional_branch(condition, then_block, else_block)
         .map_err(builder_error)?;
     state.builder.position_at_end(then_block);
+    let incoming_owners = state.return_owner_flags.clone();
+    state.return_owner_flags = incoming_owners.clone();
     let then_value = emit(state, then_branch)?;
+    let then_owners = state.return_owner_flags.clone();
     state
         .builder
         .build_unconditional_branch(merge)
         .map_err(builder_error)?;
     let then_end = state.builder.get_insert_block().expect("then block");
     state.builder.position_at_end(else_block);
+    state.return_owner_flags = incoming_owners.clone();
     let else_value = emit(state, else_branch)?;
+    let else_owners = state.return_owner_flags.clone();
     state
         .builder
         .build_unconditional_branch(merge)
         .map_err(builder_error)?;
     let else_end = state.builder.get_insert_block().expect("else block");
     state.builder.position_at_end(merge);
+    state.return_owner_flags = incoming_owners;
+    for output in state.return_owner_slots.keys().copied().collect::<Vec<_>>() {
+        match (then_owners.get(&output), else_owners.get(&output)) {
+            (Some(then_owner), Some(else_owner)) => {
+                let phi = state
+                    .builder
+                    .build_phi(context.bool_type(), &format!("return_owner_{output}"))
+                    .map_err(builder_error)?;
+                phi.add_incoming(&[(then_owner, then_end), (else_owner, else_end)]);
+                state
+                    .return_owner_flags
+                    .insert(output, phi.as_basic_value().into_int_value());
+            }
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "conditional return lacks owner for output {output}"
+                ))
+            }
+        }
+    }
     match (then_value, else_value) {
         (EmitValue::Unit, EmitValue::Unit) => Ok(EmitValue::Unit),
         (EmitValue::Basic(then_value), EmitValue::Basic(else_value)) => {
@@ -6337,27 +7744,40 @@ fn transfer_automatic_return_result(state: &mut EmitState<'_, '_>, expression: &
     }
 }
 
-fn automatic_return_result_materialization_type(
-    state: &EmitState<'_, '_>,
+fn record_forwarded_return_owner<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
     expression: &ScalarExpression,
-    output: &ScalarType,
-    visited: &mut BTreeSet<String>,
-) -> Option<ScalarType> {
-    let ScalarType::CheckedReference { inner, .. } = output else {
-        return None;
+    output: usize,
+) -> Result<(), String> {
+    if !state.return_owner_slots.contains_key(&output) {
+        return Ok(());
+    }
+    let owner = match expression {
+        ScalarExpression::Call { span, .. } => match state
+            .checked_call_owners
+            .get(&(span.start, span.end, output))
+            .ok_or_else(|| format!("missing checked return call at {span:?}"))?
+        {
+            CheckedCallOwner::Mixed => state
+                .call_owner_flags
+                .get(&output)
+                .copied()
+                .ok_or_else(|| format!("missing mixed return owner at {span:?}"))?,
+            CheckedCallOwner::Fresh => context.bool_type().const_int(1, false),
+            CheckedCallOwner::Borrowed => context.bool_type().const_zero(),
+        },
+        ScalarExpression::Name { name, .. } => match state.checked_owner_flags.get(name) {
+            Some(flag) => *flag,
+            None if state.automatic_return_result_owners.contains_key(name) => {
+                context.bool_type().const_int(1, false)
+            }
+            None => return Err(format!("missing validated return owner for {name}")),
+        },
+        _ => return Ok(()),
     };
-    if !automatic_return_result_copy_pointee(inner) {
-        return None;
-    }
-    match expression {
-        ScalarExpression::CheckedAddress { .. } => Some(*inner.clone()),
-        ScalarExpression::Name { name, .. } if visited.insert(name.clone()) => {
-            state.return_bindings.get(name).and_then(|value| {
-                automatic_return_result_materialization_type(state, value, output, visited)
-            })
-        }
-        _ => None,
-    }
+    state.return_owner_flags.insert(output, owner);
+    Ok(())
 }
 
 fn emit_automatic_return_result<'ctx, 'module>(
@@ -6466,24 +7886,25 @@ fn emit_return<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     value: EmitValue<'ctx>,
     outputs: &crate::ScalarOutputSequence,
-    expression: Option<&ScalarExpression>,
 ) -> Result<(), String> {
+    let value = materialize_fresh_return_outputs(context, state, value, outputs)?;
+    for (output, slot) in &state.return_owner_slots {
+        let owned = state
+            .return_owner_flags
+            .get(output)
+            .copied()
+            .ok_or_else(|| format!("mixed return output {output} lacks path-specific owner"))?;
+        state
+            .builder
+            .build_store(*slot, owned)
+            .map_err(builder_error)?;
+    }
     match outputs.outputs.as_slice() {
         [] => {
             state.builder.build_return(None).map_err(builder_error)?;
         }
         [output] if output.ty != ScalarType::Unit => {
-            let mut value = take_basic(value)?;
-            if let Some(expression) = expression {
-                if let Some(aggregate_type) = automatic_return_result_materialization_type(
-                    state,
-                    expression,
-                    &output.ty,
-                    &mut BTreeSet::new(),
-                ) {
-                    value = emit_automatic_return_result(context, state, value, &aggregate_type)?;
-                }
-            }
+            let value = take_basic(value)?;
             state
                 .builder
                 .build_return(Some(&value))
@@ -6503,6 +7924,106 @@ fn emit_return<'ctx, 'module>(
         }
     }
     Ok(())
+}
+
+fn materialize_fresh_return_outputs<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    value: EmitValue<'ctx>,
+    outputs: &crate::ScalarOutputSequence,
+) -> Result<EmitValue<'ctx>, String> {
+    if state.fresh_return_outputs.is_empty() {
+        return Ok(value);
+    }
+    if outputs.outputs.len() == 1 {
+        let ScalarType::CheckedReference { inner, .. } = &outputs.outputs[0].ty else {
+            return Err("fresh return output lacks checked-reference type".to_owned());
+        };
+        return Ok(EmitValue::Basic(emit_automatic_return_result(
+            context,
+            state,
+            take_basic(value)?,
+            inner,
+        )?));
+    }
+    let EmitValue::Aggregate { value, .. } = value else {
+        return Err("multi-output function requires an aggregate value".to_owned());
+    };
+    let mut values = Vec::new();
+    for (index, output) in outputs.outputs.iter().enumerate() {
+        let extracted = state
+            .builder
+            .build_extract_value(value, index as u32, "return_output")
+            .map_err(builder_error)?;
+        let mut extracted = extracted.into();
+        if state.fresh_return_outputs.contains(&index) {
+            let ScalarType::CheckedReference { inner, .. } = &output.ty else {
+                return Err(format!(
+                    "fresh return output {index} lacks checked-reference type"
+                ));
+            };
+            extracted = emit_automatic_return_result(context, state, extracted, inner)?;
+        }
+        values.push(EmitValue::Basic(extracted));
+    }
+    build_aggregate(context, state, outputs, values)
+}
+
+fn materialize_return_branch<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    block: &ScalarBlock,
+    value: EmitValue<'ctx>,
+) -> Result<EmitValue<'ctx>, String> {
+    let Some((indices, covered, joined)) = state
+        .branch_return_outputs
+        .get(&(block.span.start, block.span.end))
+        .cloned()
+    else {
+        return Ok(value);
+    };
+    for output in covered {
+        let owner = if let Some(name) = joined.get(&output) {
+            let (slot, _) = state
+                .joined_return_bindings
+                .get(name)
+                .ok_or_else(|| format!("missing joined return binding {name}"))?;
+            state
+                .builder
+                .build_load(context.bool_type(), *slot, "joined_return_owned")
+                .map_err(builder_error)?
+                .into_int_value()
+        } else {
+            context
+                .bool_type()
+                .const_int(u64::from(indices.contains(&output)), false)
+        };
+        state.return_owner_flags.insert(output, owner);
+    }
+    if indices.is_empty() {
+        return Ok(value);
+    }
+    let outputs = crate::ScalarOutputSequence {
+        outputs: block
+            .final_output_values
+            .iter()
+            .enumerate()
+            .map(|(position, output)| crate::ScalarOutput {
+                ty: state.return_output_types[if block.final_output_values.len() == 1 {
+                    *indices.iter().next().expect("selected return output")
+                } else {
+                    position
+                }]
+                .clone(),
+                span: output.span,
+            })
+            .collect(),
+        span: block.span,
+    };
+    let previous = std::mem::replace(&mut state.fresh_return_outputs, indices);
+    let result = materialize_fresh_return_outputs(context, state, value, &outputs);
+    state.fresh_return_outputs = previous;
+    result
 }
 
 fn project_function_name(source: &wosy_syntax::SourceIdentity, name: &str) -> String {
@@ -7222,13 +8743,774 @@ mod tests {
     use super::project_global_name;
     use super::storage_type;
     use super::{LlvmFunction, LlvmFunctionAttributes, LlvmPartition, LlvmValueType};
-    use crate::scalar::ScalarOverloadSelection;
+    use crate::scalar::{CfgPointKind, CoreOperationId, ReleaseTarget, ScalarOverloadSelection};
     use crate::{
         derive_scalar_program, derive_scalar_program_with_layout, parse_source,
         validate_scalar_project, ScalarModule, ScalarOutput, ScalarOutputSequence, ScalarProject,
         ScalarTargetLayout, ScalarType,
     };
     use wosy_syntax::{ByteSpan, SourceIdentity};
+
+    #[test]
+    fn checked_aggregate_reads_materialize_sized_values_on_both_targets_and_pipelines() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nstruct copy Point { u8 first; u32 second; }\n*Point(*Point) forward = fn(value) { value };\nu32(*Point) read = fn(value) { u32 field = (*value).second; Point copied_point = *value; copied_point.second + field };\nu8(*(u8[2])) read_array = fn(value) { u8[2] copied_bytes = *value; u8 item = copied_bytes[0]; copied_bytes[1] + item };\nPoint sample = { .first = 3; .second = 8; };\n*Point checked = &sample;\nu32 result = read(forward(checked));\nu8[2] bytes = [4, 5];\n*(u8[2]) array = &bytes;\nu8 array_result = read_array(array);\n%%end";
+        for (layout, pointer_width) in [
+            (ScalarTargetLayout::WASM32, "i32"),
+            (ScalarTargetLayout::NATIVE64, "i64"),
+        ] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for llvm in [
+                emit_scalar_llvm(&single).expect("single LLVM").to_text(),
+                emit_scalar_project_llvm(&project)
+                    .expect("project LLVM")
+                    .to_text(),
+            ] {
+                assert!(llvm.contains("load [8 x i8], ptr %deref"), "{llvm}");
+                assert!(llvm.contains("load [2 x i8], ptr %deref"), "{llvm}");
+                assert!(
+                    llvm.contains("getelementptr inbounds i8, ptr %deref, i8 4"),
+                    "{llvm}"
+                );
+                assert!(
+                    llvm.contains(&format!("inttoptr {pointer_width}")),
+                    "{llvm}"
+                );
+                assert!(
+                    llvm.contains("call void @__wosy_core_system_panic"),
+                    "{llvm}"
+                );
+                assert!(!llvm.contains("alloca ptr, align 1"), "{llvm}");
+            }
+        }
+    }
+
+    #[test]
+    fn checked_aggregate_return_reads_in_caller_on_both_targets_and_pipelines() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nstruct copy Point { u8 first; u32 second; }\n*Point() make = fn { Point local = { .first = 3; .second = 8; }; &local };\n*(u8[2])() make_array = fn { u8[2] local = [4, 5]; &local };\nu32() read = fn { *Point result = make(); u32 field = (*result).second; Point whole = *result; whole.second + field };\nu8() read_array = fn { *(u8[2]) result = make_array(); u8[2] whole = *result; whole[0] + whole[1] };\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for llvm in [
+                emit_scalar_llvm(&single).expect("single LLVM").to_text(),
+                emit_scalar_project_llvm(&project)
+                    .expect("project LLVM")
+                    .to_text(),
+            ] {
+                assert!(llvm.contains("load [8 x i8], ptr %deref"), "{llvm}");
+                assert!(llvm.contains("load [2 x i8], ptr %deref"), "{llvm}");
+                assert!(
+                    llvm.contains("%return_result_value = load [2 x i8]"),
+                    "{llvm}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validated_return_origins_materialize_local_pointees_and_forward_existing_owners() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nstruct copy Point { u8 value; }\nstruct Payload { u8 value; }\n*u8(u8) scalar = fn(v) { unsafe { &v } };\n*Point() make_point = fn { Point local = { .value = 3; }; &local };\n*(u8[2])() make_array = fn { u8[2] local = [4, 5]; &local };\n*!Payload() make_payload = fn { Payload local = { .value = 6; }; &!local };\n*!(Payload[2])() make_payloads = fn { Payload[2] local = [{ .value = 7; }, { .value = 8; }]; &!local };\n*Point() forward = fn { make_point() };\n(*u8, *Point)() pair = fn { u8 first = 9; Point second = { .value = 10; }; &first, &second };\n*u8(*u8) borrow = fn(v) { v };\n*u8() empty = fn { null };\nunit() caller = fn { *Point held = forward(); Point read = *held; read.value; };\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for llvm in [
+                emit_scalar_llvm(&single).expect("single LLVM").to_text(),
+                emit_scalar_project_llvm(&project)
+                    .expect("project LLVM")
+                    .to_text(),
+            ] {
+                assert!(llvm.contains("return_result_value = load i8"), "{llvm}");
+                assert!(
+                    llvm.contains("return_result_value = load [1 x i8]"),
+                    "{llvm}"
+                );
+                assert!(
+                    llvm.contains("return_result_value = load [2 x i8]"),
+                    "{llvm}"
+                );
+                assert!(
+                    llvm.contains("return_result_value = load [2 x [1 x i8]]"),
+                    "{llvm}"
+                );
+                assert_eq!(
+                    llvm.matches("load [1 x i8], ptr %return_result_source")
+                        .count(),
+                    3,
+                    "{llvm}"
+                );
+                assert_eq!(
+                    llvm.matches("call void @__wosy_core_free(ptr %return_result_release)")
+                        .count(),
+                    1,
+                    "{llvm}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_checked_return_escape_is_diagnosed_before_llvm_on_both_layouts() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nstruct Payload { u8 value; }\n*Payload() escape = fn { Payload local = { .value = 1; }; *Payload held = &local; Payload moved = local; moved; held };\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == "B0003"
+                            && diagnostic.labels[0].span.range.start
+                                == text.rfind("held };").unwrap() as u32
+                            && diagnostic.labels.iter().any(|label| label.span.range.start
+                                == text.find("&local").unwrap() as u32)),
+                    "{diagnostics:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_or_null_checked_return_releases_only_live_caller_allocation() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nstruct copy Point { u8 value; }\n*Point(bool) choose = fn(flag) { Point sample = { .value = 1; }; if (flag) { &sample } else { null } };\nunit() caller = fn { *Point result = choose(true); if (result != null) { Point value = *result; value.value; }; };\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for llvm in [
+                emit_scalar_llvm(&single).expect("single LLVM").to_text(),
+                emit_scalar_project_llvm(&project)
+                    .expect("project LLVM")
+                    .to_text(),
+            ] {
+                assert!(
+                    llvm.contains("return_result_release_live = icmp ne"),
+                    "{llvm}"
+                );
+                assert!(llvm.contains("return_result_release.next"), "{llvm}");
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_fresh_and_borrowed_return_materializes_only_fresh_branch() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nstruct copy Point { u8 value; }\n*Point(*Point, bool) choose = fn(input, flag) { Point local = { .value = 1; }; if (flag) { &local } else { input } };\n*Point(*Point, bool) forward = fn(input, flag) { choose(input, flag) };\nunit() caller = fn { Point outside = { .value = 2; }; *Point borrowed = &outside; *Point fresh = forward(borrowed, true); Point first = *fresh; *Point same = forward(borrowed, false); Point second = *same; first.value; second.value; };\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for llvm in [
+                emit_scalar_llvm(&single).expect("single LLVM").to_text(),
+                emit_scalar_project_llvm(&project)
+                    .expect("project LLVM")
+                    .to_text(),
+            ] {
+                assert_eq!(
+                    llvm.matches("return_result_value = load [1 x i8]").count(),
+                    1,
+                    "{llvm}"
+                );
+                assert!(llvm.contains("return_owner_0 = phi i1"), "{llvm}");
+                assert!(llvm.contains("checked_return_owned_0 = load i1"), "{llvm}");
+                assert!(llvm.contains("return_result_owned = and i1"), "{llvm}");
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_multi_output_checked_returns_transfer_each_owner_independently() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nstruct copy Point { u8 value; }\n(*Point, *Point)(*Point, *Point, bool, bool) choose = fn(left, right, flag, nullable) { Point local_left = { .value = 11; }; Point local_right = { .value = 22; }; if (flag) { &local_left, right } else { if (nullable) { left, null } else { left, &local_right } } };\n(*Point, *Point)(*Point, *Point, bool, bool) forward = fn(left, right, flag, nullable) { *Point from_left, *Point from_right = choose(left, right, flag, nullable); from_left, from_right };\nunit() caller = fn { Point base_left = { .value = 3; }; Point base_right = { .value = 4; }; *Point first_left, *Point first_right = forward(&base_left, &base_right, true, false); Point sample_one = *first_left; Point sample_two = *first_right; *Point second_left, *Point second_right = forward(&base_left, &base_right, false, false); Point sample_three = *second_left; Point sample_four = *second_right; *Point third_left, *Point third_right = forward(&base_left, &base_right, false, true); Point sample_five = *third_left; if (sample_one.value != 11 || sample_two.value != 4 || sample_three.value != 3 || sample_four.value != 22 || sample_five.value != 3 || third_right != null || base_left.value != 3 || base_right.value != 4) { core.system_panic(); }; };\ncaller();\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for llvm in [
+                emit_scalar_llvm(&single).expect("single LLVM").to_text(),
+                emit_scalar_project_llvm(&project)
+                    .expect("project LLVM")
+                    .to_text(),
+            ] {
+                for position in 0..2 {
+                    assert!(
+                        llvm.contains(&format!("return_owner_{position} = phi i1")),
+                        "{llvm}"
+                    );
+                    assert!(
+                        llvm.contains(&format!("checked_return_owner_{position}")),
+                        "{llvm}"
+                    );
+                    assert!(
+                        llvm.contains(&format!("checked_return_owned_{position} = load i1")),
+                        "{llvm}"
+                    );
+                }
+                assert_eq!(
+                    llvm.matches(" = and i1 %return_result_release_live")
+                        .count(),
+                    6,
+                    "{llvm}"
+                );
+                assert_eq!(
+                    llvm.matches("call void @__wosy_core_free(ptr %return_result_release")
+                        .count(),
+                    6,
+                    "{llvm}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn joined_local_and_forwarded_checked_assignment_returns_by_runtime_owner() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nstruct copy Point { u8 value; }\n*Point(bool) allocate = fn(flag) { Point local = { .value = 22; }; if (flag) { &local } else { null } };\n*Point(bool, bool) choose = fn(local, external) { *Point result = null; if (local) { Point owned = { .value = 11; }; result = &owned; }; if (external) { result = allocate(true); }; result };\n*Point(*Point, bool, bool) choose_borrow = fn(input, local, borrowed) { *Point result = null; if (local) { Point owned = { .value = 44; }; result = &owned; }; if (borrowed) { result = input; }; result };\nunit() caller = fn { *Point first = choose(true, false); Point one = *first; *Point second = choose(false, true); Point two = *second; *Point absent = choose(false, false); Point outside = { .value = 33; }; *Point local = choose_borrow(&outside, true, false); Point three = *local; *Point borrowed = choose_borrow(&outside, false, true); Point four = *borrowed; *Point replaced = choose_borrow(&outside, true, true); Point five = *replaced; *Point empty = choose_borrow(&outside, false, false); if (one.value != 11 || two.value != 22 || absent != null || three.value != 44 || four.value != 33 || five.value != 33 || empty != null || outside.value != 33) { core.system_panic(); }; };\ncaller();\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for llvm in [
+                emit_scalar_llvm(&single).expect("single LLVM").to_text(),
+                emit_scalar_project_llvm(&project)
+                    .expect("project LLVM")
+                    .to_text(),
+            ] {
+                assert!(llvm.contains("return_result_owned"), "{llvm}");
+                assert!(llvm.contains("checked_return_owned_0"), "{llvm}");
+            }
+        }
+    }
+
+    #[test]
+    fn move_only_checked_aggregate_is_consumed_as_one_sized_value() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nstruct Payload { u8 value; }\nunit(Payload) consume = fn(item) { *!Payload writer = &!item; u8 prior = (*writer).value; Payload taken = *writer; prior; taken; };\nunit(Payload[2]) consume_array = fn(items) { *!(Payload[2]) writer = &!items; Payload[2] taken = *writer; taken; };\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for llvm in [
+                emit_scalar_llvm(&single).expect("single LLVM").to_text(),
+                emit_scalar_project_llvm(&project)
+                    .expect("project LLVM")
+                    .to_text(),
+            ] {
+                assert!(llvm.contains("load [1 x i8], ptr %deref"), "{llvm}");
+                assert!(llvm.contains("load [2 x [1 x i8]], ptr %deref"), "{llvm}");
+                assert!(
+                    !llvm.contains("call void @__wosy_core_free(ptr %deref"),
+                    "{llvm}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checked_core_free_releases_backing_once_and_preserves_raw_abi_on_both_targets_and_pipelines()
+    {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nunit(u64) checked = fn(count) { u8[count] bytes; *u8 reader = &bytes[0]; reader; unsafe { core.free(&bytes); } };\nunit() raw = fn { unsafe { *?u8 pointer = core.alloc(1, 1); core.free(pointer); core.free(core.alloc(1, 1)); } };\n%%end";
+        for (layout, width) in [
+            (ScalarTargetLayout::WASM32, "i32"),
+            (ScalarTargetLayout::NATIVE64, "i64"),
+        ] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for (llvm, checked_name, raw_name) in [
+                (
+                    emit_scalar_llvm(&single).expect("single LLVM").to_text(),
+                    "checked".to_owned(),
+                    "raw".to_owned(),
+                ),
+                (
+                    emit_scalar_project_llvm(&project)
+                        .expect("project LLVM")
+                        .to_text(),
+                    project_function_name(&source, "checked"),
+                    project_function_name(&source, "raw"),
+                ),
+            ] {
+                let checked = &llvm[llvm.find(&format!("@{checked_name}(")).unwrap()..];
+                let checked = &checked[..checked.find("\n}").unwrap()];
+                assert!(
+                    checked.contains("%checked_release_backing = load ptr, ptr %bytes_backing"),
+                    "{llvm}"
+                );
+                assert!(
+                    checked.contains("call void @__wosy_core_free(ptr %checked_release_backing)"),
+                    "{llvm}"
+                );
+                assert!(
+                    checked.contains("store i1 false, ptr %bytes_live"),
+                    "{llvm}"
+                );
+                assert!(
+                    checked.contains(
+                        "br i1 %allocation_live, label %release.live, label %release.next"
+                    ),
+                    "{llvm}"
+                );
+                assert!(!checked.contains("@core.free"), "{llvm}");
+                let raw = &llvm[llvm.find(&format!("@{raw_name}(")).unwrap()..];
+                let raw = &raw[..raw.find("\n}").unwrap()];
+                assert!(raw.contains(&format!("inttoptr {width}")), "{llvm}");
+                assert_eq!(
+                    raw.matches("call void @__wosy_core_free(ptr %free_pointer")
+                        .count(),
+                    2,
+                    "{llvm}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checked_core_free_selects_joined_owner_without_freeing_other_allocation() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nunit(u64, bool) release = fn(count, flag) { u8[count] first; u8[count] second; *u8 alias = &first[0]; if (flag) { alias = &second[0]; }; unsafe { core.free(alias); } };\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for llvm in [
+                emit_scalar_llvm(&single).expect("single LLVM").to_text(),
+                emit_scalar_project_llvm(&project)
+                    .expect("project LLVM")
+                    .to_text(),
+            ] {
+                assert_eq!(
+                    llvm.lines()
+                        .filter(
+                            |line| line.contains("core_effect_target") && line.contains("icmp eq")
+                        )
+                        .count(),
+                    2,
+                    "{llvm}"
+                );
+                assert!(llvm.contains("load ptr, ptr %first_backing"), "{llvm}");
+                assert!(llvm.contains("load ptr, ptr %second_backing"), "{llvm}");
+                assert_eq!(
+                    llvm.matches("call void @__wosy_core_free(ptr %checked_release_backing")
+                        .count(),
+                    2,
+                    "{llvm}"
+                );
+                assert_eq!(
+                    llvm.matches("br i1 %checked_release_live").count(),
+                    2,
+                    "{llvm}"
+                );
+                assert_eq!(
+                    llvm.matches("call void @__wosy_core_free(ptr %runtime_array_owner")
+                        .count(),
+                    2,
+                    "{llvm}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn joined_projections_of_one_owner_apply_each_core_effect_once() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nunit(u64, bool) release = fn(count, flag) { u8[count] bytes; *u8 alias = &bytes[0]; if (flag) { alias = &bytes[1]; }; unsafe { core.free(alias); } };\nunit(u64, bool, *?u8) relocate = fn(count, flag, raw) { u8[count] bytes; *u8 alias = &bytes[0]; if (flag) { alias = &bytes[1]; }; unsafe { core.rebind(alias, raw, count); } };\nunit(u64, bool) discard = fn(count, flag) { u8[count] bytes; *u8 alias = &bytes[0]; if (flag) { alias = &bytes[1]; }; unsafe { core.invalidate(alias); } };\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            for (item, operation) in single.program.items.iter().zip([
+                CoreOperationId::Free,
+                CoreOperationId::Rebind,
+                CoreOperationId::Invalidate,
+            ]) {
+                let crate::ScalarItem::Function(function) = item else {
+                    panic!("core effect function")
+                };
+                let candidates = function
+                    .reference_cfg
+                    .points
+                    .iter()
+                    .find_map(|point| match &point.kind {
+                        CfgPointKind::Release {
+                            target: ReleaseTarget::Checked { candidates, .. },
+                        } if operation == CoreOperationId::Free => Some(candidates),
+                        CfgPointKind::Invalidate {
+                            candidates,
+                            operation: actual,
+                            ..
+                        } if *actual == operation => Some(candidates),
+                        _ => None,
+                    })
+                    .expect("typed core effect candidates");
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidates[0].place.binding, candidates[1].place.binding);
+                assert_ne!(
+                    candidates[0].place.projections,
+                    candidates[1].place.projections
+                );
+            }
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for (llvm, names) in [
+                (
+                    emit_scalar_llvm(&single).expect("single LLVM").to_text(),
+                    [
+                        "release".to_owned(),
+                        "relocate".to_owned(),
+                        "discard".to_owned(),
+                    ],
+                ),
+                (
+                    emit_scalar_project_llvm(&project)
+                        .expect("project LLVM")
+                        .to_text(),
+                    [
+                        project_function_name(&source, "release"),
+                        project_function_name(&source, "relocate"),
+                        project_function_name(&source, "discard"),
+                    ],
+                ),
+            ] {
+                let bodies = names.map(|name| {
+                    let body = &llvm[llvm.find(&format!("@{name}(")).unwrap()..];
+                    &body[..body.find("\n}").unwrap()]
+                });
+                assert_eq!(
+                    bodies[0]
+                        .matches("call void @__wosy_core_free(ptr %checked_release_backing")
+                        .count(),
+                    1,
+                    "{llvm}"
+                );
+                assert_eq!(
+                    bodies[0].matches("store i1 false, ptr %bytes_live").count(),
+                    1,
+                    "{llvm}"
+                );
+                assert_eq!(
+                    bodies[1]
+                        .matches("store ptr %rebound_address, ptr %bytes_backing")
+                        .count(),
+                    1,
+                    "{llvm}"
+                );
+                assert_eq!(
+                    bodies[1]
+                        .lines()
+                        .filter(
+                            |line| line.contains("store i64") && line.contains("ptr %bytes_length")
+                        )
+                        .count(),
+                    2,
+                    "{llvm}"
+                );
+                assert_eq!(
+                    bodies[2].matches("store i1 false, ptr %bytes_live").count(),
+                    1,
+                    "{llvm}"
+                );
+                for body in bodies {
+                    assert!(!body.contains("%core_effect_target"), "{llvm}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emits_typed_invalidation_and_rebind_effects_in_both_pipelines_and_targets() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nunit(u64) discard = fn(count) { u8[count] bytes; bytes[0] = 3; unsafe { core.invalidate(&bytes); } };\nu8(u64, *?u8, u64) replace = fn(count, raw, next) { u8[count] bytes; unsafe { core.rebind(&bytes, raw, next); }; bytes[0] = 9; bytes[0] };\n%%end";
+        for (layout, width) in [
+            (ScalarTargetLayout::WASM32, "i32"),
+            (ScalarTargetLayout::NATIVE64, "i64"),
+        ] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for (llvm, discard_name, replace_name) in [
+                (
+                    emit_scalar_llvm(&single).expect("single LLVM").to_text(),
+                    "discard".to_owned(),
+                    "replace".to_owned(),
+                ),
+                (
+                    emit_scalar_project_llvm(&project)
+                        .expect("project LLVM")
+                        .to_text(),
+                    project_function_name(&source, "discard"),
+                    project_function_name(&source, "replace"),
+                ),
+            ] {
+                let discard = &llvm[llvm.find(&format!("@{discard_name}(")).unwrap()..];
+                let discard = &discard[..discard.find("\n}").unwrap()];
+                assert!(
+                    discard.contains("store i1 false, ptr %bytes_live"),
+                    "{llvm}"
+                );
+                assert!(
+                    discard.contains(
+                        "br i1 %allocation_live, label %release.live, label %release.next"
+                    ),
+                    "{llvm}"
+                );
+                assert!(
+                    discard.find("store i1 false, ptr %bytes_live").unwrap()
+                        < discard.find("br i1 %allocation_live").unwrap(),
+                    "{llvm}"
+                );
+                assert!(!discard.contains("@core.invalidate"), "{llvm}");
+                let replace = &llvm[llvm.find(&format!("@{replace_name}(")).unwrap()..];
+                let replace = &replace[..replace.find("\n}").unwrap()];
+                assert!(replace.contains("%bytes_backing = alloca ptr"), "{llvm}");
+                assert!(replace.contains("%bytes_length = alloca i64"), "{llvm}");
+                assert!(replace.contains(&format!("inttoptr {width}")), "{llvm}");
+                assert!(
+                    replace.contains("store ptr %rebound_address, ptr %bytes_backing"),
+                    "{llvm}"
+                );
+                assert!(
+                    replace.contains("store i64 %next6, ptr %bytes_length"),
+                    "{llvm}"
+                );
+                assert!(replace.contains("load ptr, ptr %bytes_backing"), "{llvm}");
+                assert!(!replace.contains("@core.rebind"), "{llvm}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalidation_of_joined_alias_selects_exact_runtime_owner_on_both_targets() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = "%%start\nunit(u64, bool) discard_one = fn(count, flag) { u8[count] first; u8[count] second; *u8 alias = &first[0]; if (flag) { alias = &second[0]; }; unsafe { core.invalidate(alias); } };\n%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for llvm in [
+                emit_scalar_llvm(&single).expect("single LLVM").to_text(),
+                emit_scalar_project_llvm(&project)
+                    .expect("project LLVM")
+                    .to_text(),
+            ] {
+                assert_eq!(
+                    llvm.lines()
+                        .filter(
+                            |line| line.contains("core_effect_target") && line.contains("icmp eq")
+                        )
+                        .count(),
+                    2,
+                    "{llvm}"
+                );
+                assert!(llvm.contains("%first_live = alloca i1"), "{llvm}");
+                assert!(llvm.contains("%second_live = alloca i1"), "{llvm}");
+                assert_eq!(
+                    llvm.matches("store i1 false, ptr %first_live").count(),
+                    1,
+                    "{llvm}"
+                );
+                assert_eq!(
+                    llvm.matches("store i1 false, ptr %second_live").count(),
+                    1,
+                    "{llvm}"
+                );
+                assert_eq!(
+                    llvm.lines()
+                        .filter(|line| line.contains("br i1 %allocation_live"))
+                        .count(),
+                    2,
+                    "{llvm}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn rejects_fixed_array_lengths_that_exceed_llvm_array_size() {
@@ -7441,24 +9723,43 @@ mod tests {
                 "{:?}",
                 validation.diagnostics
             );
-            let llvm = emit_scalar_llvm(&validation)
-                .expect("runtime array LLVM")
-                .to_text();
-            assert!(
-                llvm.contains("declare ptr @__wosy_core_alloc(i64, i64)"),
-                "{llvm}"
-            );
-            assert!(
-                llvm.contains("call ptr @__wosy_core_alloc(i64 %allocation_size, i64 1)"),
-                "{llvm}"
-            );
-            assert!(llvm.contains("icmp eq ptr %allocation, null"), "{llvm}");
-            assert!(
-                llvm.contains("call void @__wosy_core_system_panic()\n  unreachable"),
-                "{llvm}"
-            );
-            assert!(llvm.contains("getelementptr inbounds i8"), "{llvm}");
-            assert!(!llvm.contains("icmp ult"), "{llvm}");
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    validation.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for llvm in [
+                emit_scalar_llvm(&validation)
+                    .expect("runtime array LLVM")
+                    .to_text(),
+                emit_scalar_project_llvm(&project)
+                    .expect("project runtime array LLVM")
+                    .to_text(),
+            ] {
+                assert!(
+                    llvm.contains("declare ptr @__wosy_core_alloc(i64, i64)"),
+                    "{llvm}"
+                );
+                assert!(
+                    llvm.contains("call ptr @__wosy_core_alloc(i64 %allocation_size, i64 1)"),
+                    "{llvm}"
+                );
+                assert!(llvm.contains("icmp eq ptr %allocation, null"), "{llvm}");
+                assert!(
+                    llvm.contains("call void @__wosy_core_system_panic()\n  unreachable"),
+                    "{llvm}"
+                );
+                assert!(llvm.contains("getelementptr inbounds i8"), "{llvm}");
+                assert!(
+                    llvm.contains("getelementptr inbounds i8, ptr %allocation, i64 0"),
+                    "{llvm}"
+                );
+                assert!(!llvm.contains("%bytes_backing"), "{llvm}");
+                assert!(!llvm.contains("icmp ult"), "{llvm}");
+            }
         }
     }
 

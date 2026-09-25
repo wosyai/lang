@@ -1300,7 +1300,9 @@ if.else:                                          ; preds = %if.merge167
 
 if.merge176:                                      ; preds = %if.else, %if.merge181
   %if = phi { i32, i32 } [ %output194, %if.merge181 ], [ %output196, %if.else ]
-  ret { i32, i32 } %if
+  %return_output = extractvalue { i32, i32 } %if, 0
+  %return_result_is_null = icmp eq i32 %return_output, 0
+  br i1 %return_result_is_null, label %return_result_null_3, label %return_result_copy_4
 
 if.then180:                                       ; preds = %if.then175
   %array_element182 = getelementptr inbounds i8, ptr %allocation, i64 0
@@ -1324,11 +1326,37 @@ if.merge181:                                      ; preds = %if.then180, %if.the
   %output193 = insertvalue { i32, i32 } zeroinitializer, i32 %address191, 0
   %output194 = insertvalue { i32, i32 } %output193, i32 %status192, 1
   br label %if.merge176
+
+return_result_null_3:                             ; preds = %if.merge176
+  br label %return_result_merge_5
+
+return_result_copy_4:                             ; preds = %if.merge176
+  %allocation197 = call ptr @__wosy_core_alloc(i64 16, i64 8)
+  %allocation_failed198 = icmp eq ptr %allocation197, null
+  br i1 %allocation_failed198, label %allocation_panic199, label %allocation_continue200
+
+return_result_merge_5:                            ; preds = %allocation_continue200, %return_result_null_3
+  %return_result = phi i32 [ 0, %return_result_null_3 ], [ %return_result_address, %allocation_continue200 ]
+  %return_output201 = extractvalue { i32, i32 } %if, 1
+  %output202 = insertvalue { i32, i32 } zeroinitializer, i32 %return_result, 0
+  %output203 = insertvalue { i32, i32 } %output202, i32 %return_output201, 1
+  ret { i32, i32 } %output203
+
+allocation_panic199:                              ; preds = %return_result_copy_4
+  call void @__wosy_core_system_panic()
+  unreachable
+
+allocation_continue200:                           ; preds = %return_result_copy_4
+  %return_result_source = inttoptr i32 %return_output to ptr
+  %return_result_value = load [16 x i8], ptr %return_result_source, align 1
+  store [16 x i8] %return_result_value, ptr %allocation197, align 1
+  %return_result_address = ptrtoint ptr %allocation197 to i32
+  br label %return_result_merge_5
 }
 
-define { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__34366235313639353366343431376238663133323532353962656662653664653363343164653731363665313933393934633238336632383738373430643631__726561645f6c696e65(i64 %max_bytes) {
+define { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__34366235313639353366343431376238663133323532353962656662653664653363343164653731363665313933393934633238336632383738373430643631__726561645f6c696e65(i64 %max_bytes, ptr %0) {
 entry:
-  %assignment_value111 = alloca i1, align 1
+  %assignment_value120 = alloca i1, align 1
   %assignment_value109 = alloca i32, align 4
   %assignment_value106 = alloca i32, align 4
   %assignment_value75 = alloca i1, align 1
@@ -1355,6 +1383,8 @@ entry:
   %maximum_u32_value = alloca i32, align 4
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
+  %text_return_owner = alloca i1, align 1
+  store i1 false, ptr %text_return_owner, align 1
   %max_bytes1 = alloca i64, align 8
   store i64 %max_bytes, ptr %max_bytes1, align 4
   store i64 0, ptr %zero, align 4
@@ -1382,7 +1412,9 @@ if.else:                                          ; preds = %entry
   br label %while.cond.0
 
 if.merge:                                         ; preds = %while.exit.2, %if.then
-  %if = phi { i32, i32 } [ { i32 0, i32 4 }, %if.then ], [ %output116, %while.exit.2 ]
+  %return_owner_0 = phi i1 [ false, %if.then ], [ %joined_return_owned, %while.exit.2 ]
+  %if = phi { i32, i32 } [ { i32 0, i32 4 }, %if.then ], [ %output125, %while.exit.2 ]
+  store i1 %return_owner_0, ptr %0, align 1
   ret { i32, i32 } %if
 
 while.cond.0:                                     ; preds = %if.merge97, %if.else
@@ -1410,10 +1442,11 @@ while.body.1:                                     ; preds = %while.cond.0
   br i1 %not, label %if.then14, label %if.merge15
 
 while.exit.2:                                     ; preds = %while.cond.0
-  %text113 = load i32, ptr %text, align 4
-  %status114 = load i32, ptr %status, align 4
-  %output115 = insertvalue { i32, i32 } zeroinitializer, i32 %text113, 0
-  %output116 = insertvalue { i32, i32 } %output115, i32 %status114, 1
+  %text122 = load i32, ptr %text, align 4
+  %status123 = load i32, ptr %status, align 4
+  %output124 = insertvalue { i32, i32 } zeroinitializer, i32 %text122, 0
+  %output125 = insertvalue { i32, i32 } %output124, i32 %status123, 1
+  %joined_return_owned = load i1, ptr %text_return_owner, align 1
   br label %if.merge
 
 if.then14:                                        ; preds = %while.body.1
@@ -1483,7 +1516,50 @@ if.then40:                                        ; preds = %short_circuit.merge
   %address44 = ptrtoint ptr %empty to i32
   store i32 %address44, ptr %assignment_value45, align 4
   %assignment_value46 = load i32, ptr %assignment_value45, align 4
-  store i32 %assignment_value46, ptr %text, align 4
+  %return_result_is_null = icmp eq i32 %assignment_value46, 0
+  br i1 %return_result_is_null, label %return_result_null_3, label %return_result_copy_4
+
+if.merge41:                                       ; preds = %joined_previous_release.next, %short_circuit.merge36
+  %complete51 = load i1, ptr %complete, align 1
+  br i1 %complete51, label %short_circuit.rhs52, label %short_circuit.merge53
+
+return_result_null_3:                             ; preds = %if.then40
+  br label %return_result_merge_5
+
+return_result_copy_4:                             ; preds = %if.then40
+  %allocation = call ptr @__wosy_core_alloc(i64 16, i64 8)
+  %allocation_failed = icmp eq ptr %allocation, null
+  br i1 %allocation_failed, label %allocation_panic, label %allocation_continue
+
+return_result_merge_5:                            ; preds = %allocation_continue, %return_result_null_3
+  %return_result = phi i32 [ 0, %return_result_null_3 ], [ %return_result_address, %allocation_continue ]
+  %joined_previous_owner = load i1, ptr %text_return_owner, align 1
+  %joined_previous_address = load i32, ptr %text, align 4
+  %joined_owner_replaced = icmp ne i32 %joined_previous_address, %return_result
+  %joined_previous_live = icmp ne i32 %joined_previous_address, 0
+  %joined_previous_owned = and i1 %joined_previous_owner, %joined_owner_replaced
+  %joined_previous_release = and i1 %joined_previous_owned, %joined_previous_live
+  br i1 %joined_previous_release, label %joined_previous_release.live, label %joined_previous_release.next
+
+allocation_panic:                                 ; preds = %return_result_copy_4
+  call void @__wosy_core_system_panic()
+  unreachable
+
+allocation_continue:                              ; preds = %return_result_copy_4
+  %return_result_source = inttoptr i32 %assignment_value46 to ptr
+  %return_result_value = load [16 x i8], ptr %return_result_source, align 1
+  store [16 x i8] %return_result_value, ptr %allocation, align 1
+  %return_result_address = ptrtoint ptr %allocation to i32
+  br label %return_result_merge_5
+
+joined_previous_release.live:                     ; preds = %return_result_merge_5
+  %joined_previous_pointer = inttoptr i32 %joined_previous_address to ptr
+  call void @__wosy_core_free(ptr %joined_previous_pointer)
+  br label %joined_previous_release.next
+
+joined_previous_release.next:                     ; preds = %joined_previous_release.live, %return_result_merge_5
+  store i1 true, ptr %text_return_owner, align 1
+  store i32 %return_result, ptr %text, align 4
   store i32 0, ptr %assignment_value47, align 4
   %assignment_value48 = load i32, ptr %assignment_value47, align 4
   store i32 %assignment_value48, ptr %status, align 4
@@ -1491,10 +1567,6 @@ if.then40:                                        ; preds = %short_circuit.merge
   %assignment_value50 = load i1, ptr %assignment_value49, align 1
   store i1 %assignment_value50, ptr %reading, align 1
   br label %if.merge41
-
-if.merge41:                                       ; preds = %if.then40, %short_circuit.merge36
-  %complete51 = load i1, ptr %complete, align 1
-  br i1 %complete51, label %short_circuit.rhs52, label %short_circuit.merge53
 
 short_circuit.rhs52:                              ; preds = %if.merge41
   %count54 = load i64, ptr %count, align 4
@@ -1584,15 +1656,30 @@ if.then96:                                        ; preds = %short_circuit.merge
   %output108 = extractvalue { i32, i32 } %call104, 1
   store i32 %output108, ptr %assignment_value109, align 4
   %assignment_value110 = load i32, ptr %assignment_value109, align 4
+  %joined_previous_owner111 = load i1, ptr %text_return_owner, align 1
+  %joined_previous_address112 = load i32, ptr %text, align 4
+  %joined_owner_replaced113 = icmp ne i32 %joined_previous_address112, %assignment_value107
+  %joined_previous_live114 = icmp ne i32 %joined_previous_address112, 0
+  %joined_previous_owned115 = and i1 %joined_previous_owner111, %joined_owner_replaced113
+  %joined_previous_release116 = and i1 %joined_previous_owned115, %joined_previous_live114
+  br i1 %joined_previous_release116, label %joined_previous_release.live117, label %joined_previous_release.next118
+
+if.merge97:                                       ; preds = %joined_previous_release.next118, %short_circuit.merge91
+  br label %while.cond.0
+
+joined_previous_release.live117:                  ; preds = %if.then96
+  %joined_previous_pointer119 = inttoptr i32 %joined_previous_address112 to ptr
+  call void @__wosy_core_free(ptr %joined_previous_pointer119)
+  br label %joined_previous_release.next118
+
+joined_previous_release.next118:                  ; preds = %joined_previous_release.live117, %if.then96
+  store i1 true, ptr %text_return_owner, align 1
   store i32 %assignment_value107, ptr %text, align 4
   store i32 %assignment_value110, ptr %status, align 4
-  store i1 false, ptr %assignment_value111, align 1
-  %assignment_value112 = load i1, ptr %assignment_value111, align 1
-  store i1 %assignment_value112, ptr %reading, align 1
+  store i1 false, ptr %assignment_value120, align 1
+  %assignment_value121 = load i1, ptr %assignment_value120, align 1
+  store i1 %assignment_value121, ptr %reading, align 1
   br label %if.merge97
-
-if.merge97:                                       ; preds = %if.then96, %short_circuit.merge91
-  br label %while.cond.0
 }
 
 define i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__34366235313639353366343431376238663133323532353962656662653664653363343164653731363665313933393934633238336632383738373430643631__5f70617273655f64696769745f76616c7565(i8 %byte) {
@@ -10970,3 +11057,27 @@ declare ptr @__wosy_core_alloc.100(i64, i64)
 declare void @__wosy_core_free.101(ptr)
 
 declare void @__wosy_core_system_panic.102()
+
+declare ptr @__wosy_core_alloc.103(i64, i64)
+
+declare void @__wosy_core_free.104(ptr)
+
+declare void @__wosy_core_system_panic.105()
+
+declare ptr @__wosy_core_alloc.106(i64, i64)
+
+declare void @__wosy_core_free.107(ptr)
+
+declare void @__wosy_core_system_panic.108()
+
+declare ptr @__wosy_core_alloc.109(i64, i64)
+
+declare void @__wosy_core_free.110(ptr)
+
+declare void @__wosy_core_system_panic.111()
+
+declare ptr @__wosy_core_alloc.112(i64, i64)
+
+declare void @__wosy_core_free.113(ptr)
+
+declare void @__wosy_core_system_panic.114()

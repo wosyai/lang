@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use num_bigint::BigInt;
 use rowan::NodeOrToken;
@@ -65,6 +66,566 @@ pub enum ScalarType {
 pub enum ScalarReferenceMutability {
     Shared,
     Mutable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CopyPolicy {
+    Copy,
+    Move,
+    Deferred,
+}
+
+pub fn copy_policy(
+    ty: &ScalarType,
+    structs: &[ScalarStruct],
+    enums: &[ScalarEnum],
+    generic_parameters: &BTreeSet<String>,
+) -> Result<CopyPolicy, ScalarType> {
+    match ty {
+        ScalarType::Unit
+        | ScalarType::Bool
+        | ScalarType::I8
+        | ScalarType::I16
+        | ScalarType::I32
+        | ScalarType::I64
+        | ScalarType::I128
+        | ScalarType::U8
+        | ScalarType::U16
+        | ScalarType::U32
+        | ScalarType::U64
+        | ScalarType::U128
+        | ScalarType::F32
+        | ScalarType::F64
+        | ScalarType::Char
+        | ScalarType::ArtifactId
+        | ScalarType::RawPointer(_)
+        | ScalarType::Callable { .. }
+        | ScalarType::CheckedReference {
+            mutability: ScalarReferenceMutability::Shared,
+            ..
+        } => Ok(CopyPolicy::Copy),
+        ScalarType::Struct(id) => structs
+            .iter()
+            .find(|structure| structure.id == *id)
+            .map(|structure| structure.copy_policy)
+            .ok_or_else(|| ty.clone()),
+        ScalarType::Enum(id) => enums
+            .iter()
+            .find(|enumeration| enumeration.id == *id)
+            .map(|enumeration| enumeration.copy_policy)
+            .ok_or_else(|| ty.clone()),
+        ScalarType::Array { element, .. } => {
+            copy_policy(element, structs, enums, generic_parameters)
+        }
+        ScalarType::CheckedReference {
+            mutability: ScalarReferenceMutability::Mutable,
+            ..
+        }
+        | ScalarType::RuntimeArray { .. } => Ok(CopyPolicy::Move),
+        ScalarType::Named { name, .. } if generic_parameters.contains(name) => {
+            Ok(CopyPolicy::Deferred)
+        }
+        ScalarType::Named { .. } | ScalarType::Qualified { .. } | ScalarType::Error => {
+            Err(ty.clone())
+        }
+    }
+}
+
+fn resolve_copy_policies(
+    structs: &mut [ScalarStruct],
+    enums: &mut [ScalarEnum],
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    for enumeration in enums.iter_mut() {
+        if enumeration.copy_modifier_span.is_some() {
+            enumeration.copy_policy = CopyPolicy::Copy;
+        }
+    }
+    loop {
+        let promotable = structs
+            .iter()
+            .enumerate()
+            .filter(|(_, structure)| {
+                structure.copy_modifier_span.is_some()
+                    && structure.copy_policy == CopyPolicy::Move
+                    && structure.fields.iter().all(|field| {
+                        copy_policy(&field.ty, structs, enums, &BTreeSet::new())
+                            == Ok(CopyPolicy::Copy)
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if promotable.is_empty() {
+            break;
+        }
+        for index in promotable {
+            structs[index].copy_policy = CopyPolicy::Copy;
+        }
+    }
+    for structure in structs.iter() {
+        if let Some(span) = structure.copy_modifier_span {
+            if structure.copy_policy == CopyPolicy::Copy {
+                continue;
+            }
+            if structure
+                .fields
+                .iter()
+                .any(|field| copy_policy(&field.ty, structs, enums, &BTreeSet::new()).is_err())
+            {
+                continue;
+            }
+            diagnostics.push(super::Diagnostic {
+                code: "B0003".to_owned(),
+                severity: super::DiagnosticSeverity::Error,
+                message: "copy declaration contains a move-only member".to_owned(),
+                labels: vec![super::DiagnosticLabel {
+                    kind: super::DiagnosticLabelKind::Primary,
+                    span: SourceSpan::new(structure.id.source.clone(), span),
+                    message: "copy declaration contains a move-only member".to_owned(),
+                }],
+                notes: Vec::new(),
+            });
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferencePlaceId {
+    pub source: SourceIdentity,
+    pub function_span: ByteSpan,
+    pub declaration_span: ByteSpan,
+    pub block_span: ByteSpan,
+    pub binding: ReferenceBindingId,
+    pub projections: Vec<ReferencePlaceProjection>,
+    pub place: ScalarPlace,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceBindingId {
+    pub source: SourceIdentity,
+    pub function_span: ByteSpan,
+    pub declaration_span: ByteSpan,
+    pub block_span: ByteSpan,
+    pub kind: ReferenceBindingKind,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum ReferenceBindingKind {
+    Declared,
+    CallOutput { point: CfgPointId, output: usize },
+}
+
+impl Ord for ReferenceBindingId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            &self.source.project,
+            &self.source.package,
+            &self.source.path,
+            &self.source.revision,
+            self.function_span.start,
+            self.function_span.end,
+            self.declaration_span.start,
+            self.declaration_span.end,
+            self.block_span.start,
+            self.block_span.end,
+            &self.kind,
+        )
+            .cmp(&(
+                &other.source.project,
+                &other.source.package,
+                &other.source.path,
+                &other.source.revision,
+                other.function_span.start,
+                other.function_span.end,
+                other.declaration_span.start,
+                other.declaration_span.end,
+                other.block_span.start,
+                other.block_span.end,
+                &other.kind,
+            ))
+    }
+}
+
+impl PartialOrd for ReferenceBindingId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReferencePlaceProjection {
+    Field(ScalarFieldReference),
+    Index(ScalarExpression),
+    Dereference(Box<ReferenceLoanId>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceLoanId {
+    pub mode: ScalarReferenceMutability,
+    pub origin_place: ReferencePlaceId,
+    pub creation_span: ByteSpan,
+    pub parent: Option<Box<ReferenceLoanId>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReturnedAllocationId {
+    pub source: SourceIdentity,
+    pub function_span: ByteSpan,
+    pub declaration_span: ByteSpan,
+    pub creation_span: ByteSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceOrigin {
+    Fresh {
+        allocation: ReturnedAllocationId,
+        loan: ReferenceLoanId,
+    },
+    BorrowedFrom {
+        parameter: usize,
+        loan: ReferenceLoanId,
+    },
+    Null {
+        span: ByteSpan,
+    },
+    Invalid {
+        origin_span: ByteSpan,
+        conflict_span: ByteSpan,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceFlowPoint {
+    pub id: CfgPointId,
+    pub kind: CfgPointKind,
+    pub source_span: SourceSpan,
+    pub scope: ReferenceScopeId,
+    pub possible_origins: Option<BTreeSet<ReferenceOriginId>>,
+    pub successors: Vec<CfgPointId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct ReferenceOriginId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct CfgPointId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceScopeId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CoreOperationId {
+    Alloc,
+    Free,
+    Invalidate,
+    Rebind,
+    SystemPanic,
+    ThisArtifactId,
+    DeclareArtifact,
+    IntTrunc,
+    IntExtend,
+    UintToFloat,
+    SintToFloat,
+    FloatToSintTrunc,
+    FloatToUintTrunc,
+    FloatTrunc,
+    FloatExtend,
+    Bitcast,
+    Offset,
+    Load,
+    PointerCast,
+}
+
+impl CoreOperationId {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "alloc" => Self::Alloc,
+            "free" => Self::Free,
+            "invalidate" => Self::Invalidate,
+            "rebind" => Self::Rebind,
+            "system_panic" => Self::SystemPanic,
+            "this_artifact_id" => Self::ThisArtifactId,
+            "declare_artifact" => Self::DeclareArtifact,
+            "int_trunc" => Self::IntTrunc,
+            "int_extend" => Self::IntExtend,
+            "uint_to_float" => Self::UintToFloat,
+            "sint_to_float" => Self::SintToFloat,
+            "float_to_sint_trunc" => Self::FloatToSintTrunc,
+            "float_to_uint_trunc" => Self::FloatToUintTrunc,
+            "float_trunc" => Self::FloatTrunc,
+            "float_extend" => Self::FloatExtend,
+            "bitcast" => Self::Bitcast,
+            "offset" => Self::Offset,
+            "load" => Self::Load,
+            "pointer_cast" => Self::PointerCast,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ConcreteCallSelection {
+    Declaration,
+    Overload(ScalarOverloadSelection),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ResolvedCallTarget {
+    Core(CoreOperationId),
+    LocalCallable(ReferenceBindingId),
+    ModuleCallable {
+        source: SourceIdentity,
+        declaration_span: ByteSpan,
+        concrete: ConcreteCallSelection,
+    },
+    ExternCallable {
+        source: SourceIdentity,
+        declaration_span: ByteSpan,
+    },
+    CallableField {
+        receiver_place: ReferencePlaceId,
+        field: ScalarStructFieldId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedCallSite {
+    source_span: SourceSpan,
+    target: ResolvedCallTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum InvalidationInputs {
+    Invalidate,
+    Free,
+    Rebind {
+        raw_address: ScalarExpression,
+        raw_span: SourceSpan,
+        length: ScalarExpression,
+        length_span: SourceSpan,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InvalidationCandidate {
+    pub origin: ReferenceOriginId,
+    pub place: ReferencePlaceId,
+    pub loan: ReferenceLoanId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReleaseTarget {
+    Raw {
+        binding: ReferenceBindingId,
+    },
+    Checked {
+        address_point: CfgPointId,
+        candidates: Vec<InvalidationCandidate>,
+        address_span: SourceSpan,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CfgPointKind {
+    Entry,
+    ScopeEnter,
+    ScopeExit,
+    Evaluate(ScalarExpression),
+    Borrow {
+        place: ReferencePlaceId,
+        loan: ReferenceLoanId,
+    },
+    Bind {
+        binding: ReferenceBindingId,
+    },
+    Assign {
+        target: ReferencePlaceId,
+        rhs_point: CfgPointId,
+        previous_origins: BTreeSet<ReferenceOriginId>,
+        previous_loans: Vec<ReferenceLoanId>,
+    },
+    AssignThrough {
+        place: ScalarPlace,
+        pointer_point: CfgPointId,
+        rhs_point: CfgPointId,
+        candidates: Vec<InvalidationCandidate>,
+        previous_origins: BTreeSet<ReferenceOriginId>,
+        previous_loans: Vec<ReferenceLoanId>,
+    },
+    Read {
+        binding: ReferenceBindingId,
+    },
+    ReadPlace {
+        place: ScalarPlace,
+        pointer_point: Option<CfgPointId>,
+        candidates: Vec<ReferencePlaceId>,
+        reads_origin: bool,
+    },
+    Call {
+        expression: ScalarExpression,
+        output: usize,
+        target: ResolvedCallTarget,
+        argument_points: Vec<CfgPointId>,
+    },
+    Move {
+        place: ReferencePlaceId,
+        ty: ScalarType,
+        owner: ReferenceBindingId,
+    },
+    DeferredMove {
+        place: ReferencePlaceId,
+        ty: ScalarType,
+        owner: ReferenceBindingId,
+    },
+    DeferredArrayElement {
+        place: ScalarPlace,
+        ty: ScalarType,
+    },
+    MoveThrough {
+        place: ScalarPlace,
+        ty: ScalarType,
+        pointer_point: CfgPointId,
+        candidates: Vec<InvalidationCandidate>,
+    },
+    DeferredMoveThrough {
+        place: ScalarPlace,
+        ty: ScalarType,
+        pointer_point: CfgPointId,
+        candidates: Vec<InvalidationCandidate>,
+    },
+    Release {
+        target: ReleaseTarget,
+    },
+    Invalidate {
+        address_point: CfgPointId,
+        candidates: Vec<InvalidationCandidate>,
+        operation: CoreOperationId,
+        address_span: SourceSpan,
+        inputs: InvalidationInputs,
+    },
+    Branch {
+        condition: ScalarExpression,
+    },
+    Join,
+    LoopTest {
+        condition: ScalarExpression,
+    },
+    ReturnOutput {
+        output: usize,
+        value_point: CfgPointId,
+        checked: bool,
+    },
+    Return,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarReferenceCfg {
+    pub facts: Vec<ReferenceOrigin>,
+    pub points: Vec<ReferenceFlowPoint>,
+    pub initial_points: Vec<ReferenceFlowPoint>,
+    pub allocations: BTreeSet<ReferenceBindingId>,
+    #[serde(skip)]
+    pub specialized_policies: Vec<SpecializedCopyPolicy>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpecializedCopyPolicy {
+    pub call_point: CfgPointId,
+    pub template_source: SourceIdentity,
+    pub template_function_span: ByteSpan,
+    pub template_point: CfgPointId,
+    pub ty: ScalarType,
+    pub policy: CopyPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceAnalysisErrorReason {
+    MissingResolvedBinding,
+    MissingResolvedCallTarget,
+    MissingCheckedReferenceOrigin,
+    MissingRequiredDereferenceOrigin,
+    MoveFromArrayElement,
+    MovedPlace,
+}
+
+impl ReferenceAnalysisErrorReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::MissingResolvedBinding => "missing resolved binding",
+            Self::MissingResolvedCallTarget => "missing resolved call target",
+            Self::MissingCheckedReferenceOrigin => "missing checked-reference origin",
+            Self::MissingRequiredDereferenceOrigin => "missing required dereference origin",
+            Self::MoveFromArrayElement => "array elements cannot be moved individually",
+            Self::MovedPlace => "read or move of unavailable place",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReferenceAnalysisError {
+    MissingBinding {
+        source_span: SourceSpan,
+        name: String,
+    },
+    MissingOrigin {
+        source_span: SourceSpan,
+        binding_id: ReferenceBindingId,
+        reason: ReferenceAnalysisErrorReason,
+    },
+    MissingContext {
+        source_span: SourceSpan,
+        reason: ReferenceAnalysisErrorReason,
+    },
+    ConflictingPlace {
+        source_span: SourceSpan,
+        origins: Vec<SourceSpan>,
+    },
+}
+
+impl ReferenceAnalysisError {
+    fn source_span(&self) -> &SourceSpan {
+        match self {
+            Self::MissingBinding { source_span, .. }
+            | Self::MissingOrigin { source_span, .. }
+            | Self::MissingContext { source_span, .. }
+            | Self::ConflictingPlace { source_span, .. } => source_span,
+        }
+    }
+
+    fn reason(&self) -> ReferenceAnalysisErrorReason {
+        match self {
+            Self::MissingBinding { .. } => ReferenceAnalysisErrorReason::MissingResolvedBinding,
+            Self::MissingOrigin { reason, .. } | Self::MissingContext { reason, .. } => *reason,
+            Self::ConflictingPlace { .. } => ReferenceAnalysisErrorReason::MovedPlace,
+        }
+    }
+
+    fn diagnostic(&self) -> super::Diagnostic {
+        let message = self.reason().message().to_owned();
+        let mut labels = vec![super::DiagnosticLabel {
+            kind: super::DiagnosticLabelKind::Primary,
+            span: self.source_span().clone(),
+            message: message.clone(),
+        }];
+        if let Self::ConflictingPlace { origins, .. } = self {
+            for origin in origins {
+                if !labels.iter().any(|label| label.span == *origin) {
+                    labels.push(super::DiagnosticLabel {
+                        kind: super::DiagnosticLabelKind::Secondary,
+                        span: origin.clone(),
+                        message: "origin of conflicting place or loan".to_owned(),
+                    });
+                }
+            }
+        }
+        super::Diagnostic {
+            code: "B0003".to_owned(),
+            severity: super::DiagnosticSeverity::Error,
+            message,
+            labels,
+            notes: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -567,8 +1128,26 @@ pub struct ScalarStruct {
     pub name: String,
     pub name_span: ByteSpan,
     pub fields: Vec<ScalarStructField>,
+    pub copy_policy: CopyPolicy,
+    pub copy_modifier_span: Option<ByteSpan>,
     pub span: ByteSpan,
     pub layout: Option<ScalarLayout>,
+}
+
+fn resolved_struct_field<'a>(
+    receiver_type: &ScalarType,
+    field_name: &str,
+    structs: &'a [ScalarStruct],
+) -> Option<&'a ScalarStructField> {
+    let ScalarType::Struct(id) = receiver_type else {
+        return None;
+    };
+    structs
+        .iter()
+        .find(|structure| structure.id == *id)?
+        .fields
+        .iter()
+        .find(|field| field.name == field_name)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -584,6 +1163,8 @@ pub struct ScalarEnum {
     pub name: String,
     pub name_span: ByteSpan,
     pub variants: Vec<ScalarEnumVariant>,
+    pub copy_policy: CopyPolicy,
+    pub copy_modifier_span: Option<ByteSpan>,
     pub span: ByteSpan,
 }
 
@@ -1204,6 +1785,54 @@ pub struct ScalarAssignmentTarget {
     pub place: ScalarPlace,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ResolvedAssignmentOutputId {
+    pub source: SourceIdentity,
+    pub function_span: ByteSpan,
+    pub target_span: ByteSpan,
+    pub output_index: usize,
+}
+
+fn assignment_function_span(items: &[ScalarItem], assignment_span: ByteSpan) -> Option<ByteSpan> {
+    items.iter().find_map(|item| {
+        let ScalarItem::Function(function) = item else {
+            return None;
+        };
+        std::iter::once(function)
+            .chain(&function.overload_arms)
+            .find(|candidate| {
+                candidate.body.span.start <= assignment_span.start
+                    && assignment_span.end <= candidate.body.span.end
+            })
+            .map(|candidate| candidate.span)
+    })
+}
+
+fn record_assignment_outputs(
+    facts: &RefCell<HashMap<ResolvedAssignmentOutputId, ScalarType>>,
+    source: &SourceIdentity,
+    items: &[ScalarItem],
+    assignment: &ScalarAssignment,
+    outputs: &ScalarOutputSequence,
+) {
+    let Some(function_span) = assignment_function_span(items, assignment.span) else {
+        return;
+    };
+    for (output_index, (target, output)) in
+        assignment.targets.iter().zip(&outputs.outputs).enumerate()
+    {
+        facts.borrow_mut().insert(
+            ResolvedAssignmentOutputId {
+                source: source.clone(),
+                function_span,
+                target_span: target.target_span,
+                output_index,
+            },
+            output.ty.clone(),
+        );
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarWhile {
     pub condition: ScalarExpression,
@@ -1247,6 +1876,7 @@ pub struct ScalarFunction {
     pub span: ByteSpan,
     pub generic_parameters: Vec<ScalarGenericParameter>,
     pub overload_arms: Vec<ScalarFunction>,
+    pub reference_cfg: ScalarReferenceCfg,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1292,6 +1922,8 @@ pub struct ScalarProgram {
     pub structs: Vec<ScalarStruct>,
     pub enums: Vec<ScalarEnum>,
     pub target_layout: ScalarTargetLayout,
+    #[serde(skip)]
+    pub resolved_assignment_outputs: RefCell<HashMap<ResolvedAssignmentOutputId, ScalarType>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1317,6 +1949,8 @@ pub struct ScalarModule {
     pub structs: Vec<ScalarStruct>,
     pub enums: Vec<ScalarEnum>,
     pub target_layout: ScalarTargetLayout,
+    #[serde(skip)]
+    pub resolved_assignment_outputs: RefCell<HashMap<ResolvedAssignmentOutputId, ScalarType>>,
 }
 
 impl ScalarModule {
@@ -1360,6 +1994,7 @@ impl ScalarModule {
             structs: Vec::new(),
             enums: Vec::new(),
             target_layout: ScalarTargetLayout::WASM32,
+            resolved_assignment_outputs: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1371,6 +2006,7 @@ impl ScalarModule {
         module.structs = program.structs;
         module.enums = program.enums;
         module.target_layout = program.target_layout;
+        module.resolved_assignment_outputs = program.resolved_assignment_outputs;
         module
     }
 }
@@ -1527,6 +2163,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
         structs,
         enums,
         target_layout,
+        resolved_assignment_outputs: RefCell::new(HashMap::new()),
     };
     resolve_program_types(&mut program, &mut diagnostics);
     resolve_program_places(&mut program);
@@ -1535,6 +2172,30 @@ pub fn derive_scalar_program_from_cst_with_layout(
     diagnostics.append(&mut validation_diagnostics);
     if diagnostics.is_empty() {
         record_overload_selections(&mut program);
+    }
+    if diagnostics.is_empty() {
+        let module = ScalarModule::from_program(program.clone(), Vec::new());
+        let call_sites = resolve_module_call_sites(&program.source, &program.items, &[module]);
+        diagnostics.extend(
+            call_sites
+                .map(|sites| record_program_reference_origins(&mut program, &sites))
+                .unwrap_or_else(|error| vec![error])
+                .into_iter()
+                .map(|error| error.diagnostic()),
+        );
+    }
+    if diagnostics.is_empty() {
+        let module = ScalarModule::from_program(program.clone(), Vec::new());
+        diagnostics.extend(
+            record_specialized_copy_policies(
+                &mut program.items,
+                &[module],
+                &program.structs,
+                &program.enums,
+            )
+            .into_iter()
+            .map(|error| error.diagnostic()),
+        );
     }
     ScalarValidation {
         program,
@@ -1822,6 +2483,7 @@ fn resolve_program_types(program: &mut ScalarProgram, diagnostics: &mut Vec<supe
         compute_initial_struct_layout(structure, program.target_layout);
     }
     resolve_program_struct_layouts(program, &source, diagnostics);
+    resolve_copy_policies(&mut program.structs, &mut program.enums, diagnostics);
     for item in &mut program.items {
         match item {
             ScalarItem::Binding(binding) => {
@@ -2291,17 +2953,52 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
     let mut project = project;
     let mut diagnostics = Vec::new();
+    for module in &project.modules {
+        module.resolved_assignment_outputs.borrow_mut().clear();
+    }
     let struct_lookup = project.modules.clone();
     for module in &mut project.modules {
         resolve_module_types_in_project(module, &struct_lookup);
     }
     resolve_project_struct_layouts(&mut project, &mut diagnostics);
+    let mut structs = project
+        .modules
+        .iter()
+        .flat_map(|module| module.structs.clone())
+        .collect::<Vec<_>>();
+    let mut enums = project
+        .modules
+        .iter()
+        .flat_map(|module| module.enums.clone())
+        .collect::<Vec<_>>();
+    resolve_copy_policies(&mut structs, &mut enums, &mut diagnostics);
+    for module in &mut project.modules {
+        for structure in &mut module.structs {
+            structure.copy_policy = structs
+                .iter()
+                .find(|item| item.id == structure.id)
+                .expect("project struct policy")
+                .copy_policy;
+        }
+        for enumeration in &mut module.enums {
+            enumeration.copy_policy = enums
+                .iter()
+                .find(|item| item.id == enumeration.id)
+                .expect("project enum policy")
+                .copy_policy;
+        }
+    }
     let struct_lookup = project.modules.clone();
     for module in &mut project.modules {
         resolve_module_places(module, &struct_lookup);
     }
     for module in &project.modules {
         validate_unit_if_positions_in_module(module, &mut diagnostics);
+        for structure in &module.structs {
+            for field in &structure.fields {
+                validate_module_type(module, &field.ty, field.name_span, &mut diagnostics);
+            }
+        }
         let mut declarations = BTreeMap::new();
         let mut declaration_names = BTreeSet::new();
         let mut folded_declarations = BTreeMap::new();
@@ -2685,6 +3382,61 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
     }
     if diagnostics.is_empty() {
         record_project_overload_selections(&mut project);
+    }
+    if diagnostics.is_empty() {
+        let modules = project.modules.clone();
+        for module in &mut project.modules {
+            let call_sites = resolve_module_call_sites(&module.source, &module.items, &modules);
+            diagnostics.extend(
+                call_sites
+                    .map(|sites| {
+                        let structs = modules
+                            .iter()
+                            .flat_map(|module| module.structs.clone())
+                            .collect::<Vec<_>>();
+                        let enums = modules
+                            .iter()
+                            .flat_map(|module| module.enums.clone())
+                            .collect::<Vec<_>>();
+                        record_module_reference_origins(
+                            &module.source,
+                            &mut module.items,
+                            &sites,
+                            &structs,
+                            &enums,
+                            &module.resolved_assignment_outputs.borrow(),
+                        )
+                    })
+                    .unwrap_or_else(|error| vec![error])
+                    .into_iter()
+                    .map(|error| error.diagnostic()),
+            );
+        }
+    }
+    if diagnostics.is_empty() {
+        diagnostics.extend(
+            resolve_reference_output_contracts(&mut project.modules)
+                .into_iter()
+                .map(|error| error.diagnostic()),
+        );
+    }
+    if diagnostics.is_empty() {
+        let modules = project.modules.clone();
+        let structs = modules
+            .iter()
+            .flat_map(|module| module.structs.clone())
+            .collect::<Vec<_>>();
+        let enums = modules
+            .iter()
+            .flat_map(|module| module.enums.clone())
+            .collect::<Vec<_>>();
+        for module in &mut project.modules {
+            diagnostics.extend(
+                record_specialized_copy_policies(&mut module.items, &modules, &structs, &enums)
+                    .into_iter()
+                    .map(|error| error.diagnostic()),
+            );
+        }
     }
     ScalarProjectValidation {
         project,
@@ -3814,8 +4566,8 @@ fn validate_module_type(
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     match ty {
-        ScalarType::Named { .. } | ScalarType::Qualified { .. } => diagnostics.push(
-            module_diagnostic(module, "B0003", "unknown scalar type", span),
+        ScalarType::Named { span, .. } | ScalarType::Qualified { span, .. } => diagnostics.push(
+            module_diagnostic(module, "B0003", "unknown scalar type", *span),
         ),
         ScalarType::Callable {
             outputs,
@@ -4552,7 +5304,11 @@ fn assignment_type_in_module(
             );
             match call_output_sequence_in_module(value, scope, module, modules) {
                 Some(outputs) => Some(outputs.outputs),
-                None if matches!(value, ScalarExpression::Call { .. }) => None,
+                None if matches!(value, ScalarExpression::Call { .. })
+                    && is_error_type(&actual) =>
+                {
+                    None
+                }
                 None => Some(vec![ScalarOutput {
                     ty: actual,
                     span: expression_span(value),
@@ -4565,6 +5321,13 @@ fn assignment_type_in_module(
             span: assignment.span,
         });
     if let Some(outputs) = outputs {
+        record_assignment_outputs(
+            &module.resolved_assignment_outputs,
+            &module.source,
+            &module.items,
+            assignment,
+            &outputs,
+        );
         if assignment.targets.len() > outputs.outputs.len() {
             diagnostics.push(module_diagnostic(
                 module,
@@ -4761,7 +5524,7 @@ fn type_core_memory_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
-    if matches!(operation, "alloc" | "free") && !unsafe_context {
+    if matches!(operation, "alloc" | "free" | "invalidate" | "rebind") && !unsafe_context {
         diagnostics.push(module_diagnostic(
             module,
             "B0012",
@@ -4822,14 +5585,104 @@ fn type_core_memory_in_module(
                 diagnostics,
                 unsafe_context,
             );
-            if !matches!(actual, ScalarType::RawPointer(_)) && !is_error_type(&actual) {
+            if !matches!(
+                actual,
+                ScalarType::RawPointer(_) | ScalarType::CheckedReference { .. }
+            ) && !is_error_type(&actual)
+            {
                 diagnostics.push(module_diagnostic(
                     module,
                     "B0003",
-                    "core.free requires a raw pointer",
+                    "core.free requires a raw pointer or checked allocation place",
                     expression_span(pointer),
                 ));
                 return ScalarType::Error;
+            }
+            if matches!(actual, ScalarType::CheckedReference { .. })
+                && !matches!(
+                    pointer,
+                    ScalarExpression::CheckedAddress { .. } | ScalarExpression::Name { .. }
+                )
+            {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "core.free requires a checked allocation place",
+                    expression_span(pointer),
+                ));
+                return ScalarType::Error;
+            }
+            ScalarType::Unit
+        }
+        "invalidate" | "rebind" => {
+            let expected_arity = if operation == "invalidate" { 1 } else { 3 };
+            if arguments.len() != expected_arity {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0004",
+                    &format!("core.{operation} requires {expected_arity} arguments"),
+                    span,
+                ));
+                return ScalarType::Error;
+            }
+            let address = &arguments[0];
+            let actual = expression_type_in_module(
+                address,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            );
+            if !is_error_type(&actual) && !matches!(actual, ScalarType::CheckedReference { .. }) {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    &format!("core.{operation} requires a checked reference to an allocation"),
+                    expression_span(address),
+                ));
+            }
+            if operation == "rebind" {
+                let raw = &arguments[1];
+                let raw_type = expression_type_in_module(
+                    raw,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+                if !is_error_type(&raw_type) && !matches!(raw_type, ScalarType::RawPointer(_)) {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0003",
+                        "core.rebind requires a raw backing address",
+                        expression_span(raw),
+                    ));
+                }
+                let length = &arguments[2];
+                let length_type = expression_type_in_module_expected(
+                    length,
+                    Some(&ScalarType::U64),
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                );
+                expect_module_type(
+                    module,
+                    &ScalarType::U64,
+                    &length_type,
+                    expression_span(length),
+                    diagnostics,
+                );
             }
             ScalarType::Unit
         }
@@ -4860,7 +5713,7 @@ fn type_core_memory(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
-    if matches!(operation, "alloc" | "free") && !unsafe_context {
+    if matches!(operation, "alloc" | "free" | "invalidate" | "rebind") && !unsafe_context {
         diagnostics.push(diagnostic(
             program,
             "B0012",
@@ -4919,14 +5772,101 @@ fn type_core_memory(
                 diagnostics,
                 unsafe_context,
             );
-            if !matches!(actual, ScalarType::RawPointer(_)) && !is_error_type(&actual) {
+            if !matches!(
+                actual,
+                ScalarType::RawPointer(_) | ScalarType::CheckedReference { .. }
+            ) && !is_error_type(&actual)
+            {
                 diagnostics.push(diagnostic(
                     program,
                     "B0003",
-                    "core.free requires a raw pointer",
+                    "core.free requires a raw pointer or checked allocation place",
                     expression_span(pointer),
                 ));
                 return ScalarType::Error;
+            }
+            if matches!(actual, ScalarType::CheckedReference { .. })
+                && !matches!(
+                    pointer,
+                    ScalarExpression::CheckedAddress { .. } | ScalarExpression::Name { .. }
+                )
+            {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "core.free requires a checked allocation place",
+                    expression_span(pointer),
+                ));
+                return ScalarType::Error;
+            }
+            ScalarType::Unit
+        }
+        "invalidate" | "rebind" => {
+            let expected_arity = if operation == "invalidate" { 1 } else { 3 };
+            if arguments.len() != expected_arity {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0004",
+                    &format!("core.{operation} requires {expected_arity} arguments"),
+                    span,
+                ));
+                return ScalarType::Error;
+            }
+            let address = &arguments[0];
+            let actual = expression_type(
+                address,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            if !is_error_type(&actual) && !matches!(actual, ScalarType::CheckedReference { .. }) {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    &format!("core.{operation} requires a checked reference to an allocation"),
+                    expression_span(address),
+                ));
+            }
+            if operation == "rebind" {
+                let raw = &arguments[1];
+                let raw_type = expression_type(
+                    raw,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                if !is_error_type(&raw_type) && !matches!(raw_type, ScalarType::RawPointer(_)) {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "B0003",
+                        "core.rebind requires a raw backing address",
+                        expression_span(raw),
+                    ));
+                }
+                let length = &arguments[2];
+                let length_type = expression_type_expected(
+                    length,
+                    &ScalarType::U64,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                expect_type(
+                    program,
+                    &ScalarType::U64,
+                    &length_type,
+                    expression_span(length),
+                    diagnostics,
+                );
             }
             ScalarType::Unit
         }
@@ -6426,7 +7366,10 @@ fn expression_type_in_module(
                 };
             }
             if receiver.as_deref() == Some("core")
-                && matches!(name.as_str(), "alloc" | "free" | "system_panic")
+                && matches!(
+                    name.as_str(),
+                    "alloc" | "free" | "invalidate" | "rebind" | "system_panic"
+                )
             {
                 return type_core_memory_in_module(
                     name,
@@ -6527,6 +7470,77 @@ fn expression_type_in_module(
                     diagnostics,
                     unsafe_context,
                 );
+            }
+            if let Some(receiver_type) = receiver.as_ref().and_then(|binding| scope.get(binding)) {
+                if let ScalarType::Struct(id) = receiver_type {
+                    let structure = modules.iter().find_map(|candidate| {
+                        candidate
+                            .structs
+                            .iter()
+                            .find(|structure| structure.id == *id)
+                    });
+                    let field = structure.and_then(|structure| {
+                        resolved_struct_field(receiver_type, name, std::slice::from_ref(structure))
+                    });
+                    let Some(field) = field else {
+                        diagnostics.push(module_diagnostic(
+                            module,
+                            "B0001",
+                            "unknown callable field",
+                            *name_span,
+                        ));
+                        return ScalarType::Error;
+                    };
+                    let ScalarType::Callable {
+                        outputs,
+                        parameters,
+                    } = &field.ty
+                    else {
+                        diagnostics.push(module_diagnostic(
+                            module,
+                            "B0003",
+                            "struct field is not callable",
+                            *name_span,
+                        ));
+                        return ScalarType::Error;
+                    };
+                    if !type_arguments.is_empty() || arguments.len() != parameters.len() {
+                        diagnostics.push(module_diagnostic(
+                            module,
+                            "B0004",
+                            "call argument arity does not match callable type",
+                            *span,
+                        ));
+                        return ScalarType::Error;
+                    }
+                    let mut error_argument = false;
+                    for (argument, parameter) in arguments.iter().zip(parameters) {
+                        let actual = expression_type_in_module_expected(
+                            argument,
+                            Some(parameter),
+                            scope,
+                            visible_names,
+                            folded_names,
+                            module,
+                            modules,
+                            diagnostics,
+                            unsafe_context,
+                        );
+                        expect_module_type(
+                            module,
+                            parameter,
+                            &actual,
+                            expression_span(argument),
+                            diagnostics,
+                        );
+                        error_argument |= is_error_type(&actual);
+                    }
+                    return if error_argument {
+                        ScalarType::Error
+                    } else {
+                        scalar_call_result_in_module(outputs)
+                    };
+                }
             }
             let overload = match receiver {
                 None => module.items.iter().find_map(|item| match item {
@@ -7551,7 +8565,7 @@ fn is_supported_checked_address_place(place: &ScalarPlace) -> bool {
     match place {
         ScalarPlace::Name { .. } => true,
         ScalarPlace::Field { base, .. } => matches!(base.as_ref(), ScalarPlace::Name { .. }),
-        ScalarPlace::Dereference { .. } => false,
+        ScalarPlace::Dereference { .. } => true,
         ScalarPlace::Index { base, .. } => is_supported_checked_address_place(base),
     }
 }
@@ -7580,7 +8594,46 @@ fn checked_address_type(
         ));
         return ScalarType::Error;
     }
-    let inner = place_type(place, scope, program, diagnostics);
+    let inner = if let ScalarPlace::Dereference { pointer, .. } = place {
+        match expression_type(
+            pointer,
+            scope,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            program,
+            diagnostics,
+            false,
+        ) {
+            ScalarType::CheckedReference {
+                mutability: parent_mode,
+                inner,
+            } if mutability == ScalarReferenceMutability::Shared
+                || parent_mode == ScalarReferenceMutability::Mutable =>
+            {
+                *inner
+            }
+            ScalarType::RawPointer(_) => {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "checked address requires a storage name or direct storage field",
+                    span,
+                ));
+                return ScalarType::Error;
+            }
+            _ => {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0003",
+                    "checked reborrow requires a compatible checked reference",
+                    span,
+                ));
+                return ScalarType::Error;
+            }
+        }
+    } else {
+        place_type(place, scope, program, diagnostics)
+    };
     if !is_addressable_checked_reference_type(&inner) {
         diagnostics.push(diagnostic(
             program,
@@ -7614,7 +8667,47 @@ fn checked_address_type_in_module(
         ));
         return ScalarType::Error;
     }
-    let inner = place_type_in_module(place, scope, module, modules, diagnostics);
+    let inner = if let ScalarPlace::Dereference { pointer, .. } = place {
+        match expression_type_in_module(
+            pointer,
+            scope,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            module,
+            modules,
+            diagnostics,
+            false,
+        ) {
+            ScalarType::CheckedReference {
+                mutability: parent_mode,
+                inner,
+            } if mutability == ScalarReferenceMutability::Shared
+                || parent_mode == ScalarReferenceMutability::Mutable =>
+            {
+                *inner
+            }
+            ScalarType::RawPointer(_) => {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "checked address requires a storage name or direct storage field",
+                    span,
+                ));
+                return ScalarType::Error;
+            }
+            _ => {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "checked reborrow requires a compatible checked reference",
+                    span,
+                ));
+                return ScalarType::Error;
+            }
+        }
+    } else {
+        place_type_in_module(place, scope, module, modules, diagnostics)
+    };
     if !is_addressable_checked_reference_type(&inner) {
         diagnostics.push(module_diagnostic(
             module,
@@ -8220,7 +9313,6 @@ fn place_type_in_module(
 fn checked_dereference_target_type(
     pointer: &ScalarExpression,
     span: ByteSpan,
-    allow_aggregate: bool,
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -8241,15 +9333,6 @@ fn checked_dereference_target_type(
                     program,
                     "B0003",
                     "cannot read unit through checked reference",
-                    span,
-                ));
-                ScalarType::Error
-            }
-            ScalarType::Struct(_) | ScalarType::Array { .. } if !allow_aggregate => {
-                diagnostics.push(diagnostic(
-                    program,
-                    "B0003",
-                    "whole aggregate checked dereference read is not supported",
                     span,
                 ));
                 ScalarType::Error
@@ -8289,7 +9372,6 @@ fn checked_dereference_type(
         ScalarPlace::Dereference { pointer, span } => checked_dereference_target_type(
             pointer,
             *span,
-            false,
             scope,
             program,
             diagnostics,
@@ -8312,7 +9394,6 @@ fn checked_dereference_type(
             let base_type = checked_dereference_target_type(
                 pointer,
                 *span,
-                true,
                 scope,
                 program,
                 diagnostics,
@@ -8435,7 +9516,6 @@ fn checked_dereference_type_in_module(
             return ScalarType::Error;
         }
     };
-    let allow_aggregate = field.is_some();
     let inner = match expression_type_in_module(
         pointer,
         scope,
@@ -8452,15 +9532,6 @@ fn checked_dereference_type_in_module(
                     module,
                     "B0003",
                     "cannot read unit through checked reference",
-                    dereference_span,
-                ));
-                return ScalarType::Error;
-            }
-            ScalarType::Struct(_) | ScalarType::Array { .. } if !allow_aggregate => {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0003",
-                    "whole aggregate checked dereference read is not supported",
                     dereference_span,
                 ));
                 return ScalarType::Error;
@@ -8949,6 +10020,8 @@ fn derive_struct(
     target_layout: ScalarTargetLayout,
 ) -> ScalarStruct {
     let name = direct_token(&node, SyntaxKind::Identifier).expect("struct name");
+    let copy_modifier_span =
+        direct_token(&node, SyntaxKind::CopyModifier).map(|token| token_span(&token));
     let mut fields = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::StructField)
@@ -8977,6 +10050,8 @@ fn derive_struct(
         name: name.text().to_owned(),
         name_span: token_span(&name),
         fields,
+        copy_policy: CopyPolicy::Move,
+        copy_modifier_span,
         span: wosy_syntax::byte_span(&node),
         layout,
     }
@@ -8984,6 +10059,8 @@ fn derive_struct(
 
 fn derive_enum(node: CstNode, id: ScalarEnumId) -> ScalarEnum {
     let name = direct_token(&node, SyntaxKind::Identifier).expect("enum name");
+    let copy_modifier_span =
+        direct_token(&node, SyntaxKind::CopyModifier).map(|token| token_span(&token));
     let variants = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::EnumVariant)
@@ -9002,6 +10079,8 @@ fn derive_enum(node: CstNode, id: ScalarEnumId) -> ScalarEnum {
         name: name.text().to_owned(),
         name_span: token_span(&name),
         variants,
+        copy_policy: CopyPolicy::Move,
+        copy_modifier_span,
         span: wosy_syntax::byte_span(&node),
     }
 }
@@ -9268,7 +10347,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         .map(|node| derive_block(node))
         .expect("function block");
     if let ScalarType::Callable { outputs, .. } = &signature {
-        expand_conditional_final_outputs(&mut body, outputs.outputs.len());
+        expand_conditional_final_outputs(&mut body, &outputs.outputs);
         for (value, output) in body.final_output_values.iter_mut().zip(&outputs.outputs) {
             value.ty = output.ty.clone();
         }
@@ -9283,6 +10362,13 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         span: wosy_syntax::byte_span(node),
         generic_parameters: Vec::new(),
         overload_arms: Vec::new(),
+        reference_cfg: ScalarReferenceCfg {
+            facts: Vec::new(),
+            points: Vec::new(),
+            initial_points: Vec::new(),
+            allocations: BTreeSet::new(),
+            specialized_policies: Vec::new(),
+        },
     }
 }
 
@@ -9360,7 +10446,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                     .expect("overload arm block"),
             );
             if let ScalarType::Callable { outputs, .. } = &signature {
-                expand_conditional_final_outputs(&mut body, outputs.outputs.len());
+                expand_conditional_final_outputs(&mut body, &outputs.outputs);
                 for (value, output) in body.final_output_values.iter_mut().zip(&outputs.outputs) {
                     value.ty = output.ty.clone();
                 }
@@ -9378,6 +10464,13 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                     .find(|child| child.kind() == SyntaxKind::GenericDecl)
                     .map_or_else(Vec::new, derive_generic_parameters),
                 overload_arms: Vec::new(),
+                reference_cfg: ScalarReferenceCfg {
+                    facts: Vec::new(),
+                    points: Vec::new(),
+                    initial_points: Vec::new(),
+                    allocations: BTreeSet::new(),
+                    specialized_policies: Vec::new(),
+                },
             }
         })
         .collect();
@@ -9399,10 +10492,4106 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
         span: wosy_syntax::byte_span(node),
         generic_parameters: Vec::new(),
         overload_arms: arms,
+        reference_cfg: ScalarReferenceCfg {
+            facts: Vec::new(),
+            points: Vec::new(),
+            initial_points: Vec::new(),
+            allocations: BTreeSet::new(),
+            specialized_policies: Vec::new(),
+        },
     }
 }
 
-fn expand_conditional_final_outputs(block: &mut ScalarBlock, output_count: usize) {
+fn record_program_reference_origins(
+    program: &mut ScalarProgram,
+    call_sites: &[ResolvedCallSite],
+) -> Vec<ReferenceAnalysisError> {
+    let mut errors = record_module_reference_origins(
+        &program.source,
+        &mut program.items,
+        call_sites,
+        &program.structs,
+        &program.enums,
+        &program.resolved_assignment_outputs.borrow(),
+    );
+    if errors.is_empty() {
+        let mut modules = vec![ScalarModule::from_program(program.clone(), Vec::new())];
+        errors.extend(resolve_reference_output_contracts(&mut modules));
+        program.items = modules.remove(0).items;
+    }
+    errors
+}
+
+struct ReferenceFlowBuilder {
+    source: SourceIdentity,
+    function_span: ByteSpan,
+    names: BTreeMap<String, ReferenceBindingId>,
+    module_names: HashSet<String>,
+    call_sites: Vec<ResolvedCallSite>,
+    origins: HashMap<ReferenceBindingId, BTreeSet<ReferenceOriginId>>,
+    checked: HashSet<ReferenceBindingId>,
+    binding_types: HashMap<ReferenceBindingId, ScalarType>,
+    structs: Vec<ScalarStruct>,
+    enums: Vec<ScalarEnum>,
+    generic_parameters: BTreeSet<String>,
+    assignment_outputs: HashMap<ResolvedAssignmentOutputId, ScalarType>,
+    dereference_points: HashMap<ByteSpan, CfgPointId>,
+    cfg: ScalarReferenceCfg,
+    next_scope: usize,
+    cursor: Option<CfgPointId>,
+}
+
+#[derive(Debug)]
+enum ReferenceValue {
+    Other,
+    Checked(BTreeSet<ReferenceOriginId>),
+    Uncomputed,
+}
+
+impl ReferenceFlowBuilder {
+    fn assignment_output_types(
+        &self,
+        assignment: &ScalarAssignment,
+    ) -> Result<Vec<ScalarType>, ReferenceAnalysisError> {
+        assignment
+            .targets
+            .iter()
+            .enumerate()
+            .map(|(output_index, target)| {
+                let key = ResolvedAssignmentOutputId {
+                    source: self.source.clone(),
+                    function_span: self.function_span,
+                    target_span: target.target_span,
+                    output_index,
+                };
+                self.assignment_outputs.get(&key).cloned().ok_or_else(|| {
+                    self.missing_context(
+                        target.target_span,
+                        ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn call_target(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Result<ResolvedCallTarget, ReferenceAnalysisError> {
+        let span = expression_span(expression);
+        self.call_sites
+            .iter()
+            .find(|site| site.source_span == SourceSpan::new(self.source.clone(), span))
+            .map(|site| site.target.clone())
+            .ok_or_else(|| {
+                self.missing_context(
+                    span,
+                    ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
+                )
+            })
+    }
+
+    fn intern(&mut self, origin: ReferenceOrigin) -> ReferenceOriginId {
+        if let Some(index) = self.cfg.facts.iter().position(|fact| fact == &origin) {
+            ReferenceOriginId(index)
+        } else {
+            let id = ReferenceOriginId(self.cfg.facts.len());
+            self.cfg.facts.push(origin);
+            id
+        }
+    }
+
+    fn point(
+        &mut self,
+        kind: CfgPointKind,
+        span: ByteSpan,
+        scope: ReferenceScopeId,
+        possible_origins: BTreeSet<ReferenceOriginId>,
+    ) -> CfgPointId {
+        self.point_with_origins(kind, span, scope, Some(possible_origins))
+    }
+
+    fn point_with_origins(
+        &mut self,
+        kind: CfgPointKind,
+        span: ByteSpan,
+        scope: ReferenceScopeId,
+        possible_origins: Option<BTreeSet<ReferenceOriginId>>,
+    ) -> CfgPointId {
+        let id = CfgPointId(self.cfg.points.len());
+        if let Some(previous) = self.cursor {
+            self.cfg.points[previous.0].successors.push(id);
+        }
+        self.cfg.points.push(ReferenceFlowPoint {
+            id,
+            kind,
+            source_span: SourceSpan::new(self.source.clone(), span),
+            scope,
+            possible_origins,
+            successors: Vec::new(),
+        });
+        self.cursor = Some(id);
+        id
+    }
+
+    fn uncomputed_point(&mut self, kind: CfgPointKind, span: ByteSpan, scope: ReferenceScopeId) {
+        self.point_with_origins(kind, span, scope, None);
+    }
+
+    fn missing_origin(
+        &self,
+        span: ByteSpan,
+        binding_id: ReferenceBindingId,
+        reason: ReferenceAnalysisErrorReason,
+    ) -> ReferenceAnalysisError {
+        ReferenceAnalysisError::MissingOrigin {
+            source_span: SourceSpan::new(self.source.clone(), span),
+            binding_id,
+            reason,
+        }
+    }
+
+    fn missing_context(
+        &self,
+        span: ByteSpan,
+        reason: ReferenceAnalysisErrorReason,
+    ) -> ReferenceAnalysisError {
+        ReferenceAnalysisError::MissingContext {
+            source_span: SourceSpan::new(self.source.clone(), span),
+            reason,
+        }
+    }
+
+    fn binding(
+        &self,
+        name: &str,
+        span: ByteSpan,
+    ) -> Result<ReferenceBindingId, ReferenceAnalysisError> {
+        self.names
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ReferenceAnalysisError::MissingBinding {
+                source_span: SourceSpan::new(self.source.clone(), span),
+                name: name.to_owned(),
+            })
+    }
+
+    fn assignment_place(
+        &self,
+        place: &ScalarPlace,
+        target_span: ByteSpan,
+    ) -> Result<ReferencePlaceId, ReferenceAnalysisError> {
+        let root = reference_root(place);
+        let (binding, parent) = match root {
+            ScalarPlace::Name { name, span } => (self.binding(name, *span)?, None),
+            ScalarPlace::Dereference { pointer, .. } => {
+                let ScalarExpression::Name { name, span } = pointer.as_ref() else {
+                    return Err(self.missing_context(
+                        target_span,
+                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                    ));
+                };
+                let pointer_binding = self.binding(name, *span)?;
+                let origins = self.required(&pointer_binding, *span)?;
+                let loans = origins
+                    .iter()
+                    .map(|origin| match &self.cfg.facts[origin.0] {
+                        ReferenceOrigin::Fresh { loan, .. }
+                        | ReferenceOrigin::BorrowedFrom { loan, .. } => Ok(loan),
+                        ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => Err(self
+                            .missing_context(
+                                *span,
+                                ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                            )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let [loan] = loans.as_slice() else {
+                    return Err(self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                    ));
+                };
+                (loan.origin_place.binding.clone(), Some(*loan))
+            }
+            ScalarPlace::Field { .. } | ScalarPlace::Index { .. } => unreachable!(),
+        };
+        let mut projections = Vec::new();
+        collect_reference_projections(place, parent, &mut projections);
+        Ok(ReferencePlaceId {
+            source: self.source.clone(),
+            function_span: self.function_span,
+            declaration_span: binding.declaration_span,
+            block_span: binding.block_span,
+            binding,
+            projections,
+            place: place.clone(),
+        })
+    }
+
+    fn required(
+        &self,
+        id: &ReferenceBindingId,
+        span: ByteSpan,
+    ) -> Result<BTreeSet<ReferenceOriginId>, ReferenceAnalysisError> {
+        self.origins
+            .get(id)
+            .filter(|set| !set.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                self.missing_origin(
+                    span,
+                    id.clone(),
+                    ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                )
+            })
+    }
+
+    fn pointer_cast_origins(
+        &mut self,
+        raw: &ScalarExpression,
+        mutability: ScalarReferenceMutability,
+        span: ByteSpan,
+    ) -> Result<BTreeSet<ReferenceOriginId>, ReferenceAnalysisError> {
+        let fact = if matches!(raw, ScalarExpression::Name { name, .. } if name == "null") {
+            ReferenceOrigin::Null { span }
+        } else {
+            let binding = match raw {
+                ScalarExpression::Name {
+                    name,
+                    span: raw_span,
+                } => self.binding(name, *raw_span)?,
+                ScalarExpression::RawAddress { place, .. }
+                    if matches!(reference_root(place), ScalarPlace::Name { .. }) =>
+                {
+                    let ScalarPlace::Name {
+                        name,
+                        span: raw_span,
+                    } = reference_root(place)
+                    else {
+                        unreachable!()
+                    };
+                    self.binding(name, *raw_span)?
+                }
+                _ => ReferenceBindingId {
+                    source: self.source.clone(),
+                    function_span: self.function_span,
+                    declaration_span: span,
+                    block_span: self.function_span,
+                    kind: ReferenceBindingKind::CallOutput {
+                        point: CfgPointId(self.cfg.points.len()),
+                        output: 0,
+                    },
+                },
+            };
+            let place = match raw {
+                ScalarExpression::Name {
+                    name,
+                    span: raw_span,
+                } => ScalarPlace::Name {
+                    name: name.clone(),
+                    span: *raw_span,
+                },
+                ScalarExpression::RawAddress { place, .. } => place.clone(),
+                _ => ScalarPlace::Name {
+                    name: "core.pointer_cast".to_owned(),
+                    span,
+                },
+            };
+            ReferenceOrigin::Fresh {
+                allocation: ReturnedAllocationId {
+                    source: binding.source.clone(),
+                    function_span: binding.function_span,
+                    declaration_span: binding.declaration_span,
+                    creation_span: span,
+                },
+                loan: ReferenceLoanId {
+                    mode: mutability,
+                    origin_place: ReferencePlaceId {
+                        source: binding.source.clone(),
+                        function_span: binding.function_span,
+                        declaration_span: binding.declaration_span,
+                        block_span: binding.block_span,
+                        binding,
+                        projections: Vec::new(),
+                        place,
+                    },
+                    creation_span: span,
+                    parent: None,
+                },
+            }
+        };
+        Ok(BTreeSet::from([self.intern(fact)]))
+    }
+
+    fn conditional(
+        &mut self,
+        condition: &ScalarExpression,
+        then_branch: &ScalarBlock,
+        else_branch: Option<&ScalarBlock>,
+        span: ByteSpan,
+        scope: ReferenceScopeId,
+    ) -> Result<ReferenceValue, ReferenceAnalysisError> {
+        self.expression(condition, scope)?;
+        let branch = self.point(
+            CfgPointKind::Branch {
+                condition: condition.clone(),
+            },
+            expression_span(condition),
+            scope,
+            BTreeSet::new(),
+        );
+        let incoming_names = self.names.clone();
+        let incoming_origins = self.origins.clone();
+        let incoming_checked = self.checked.clone();
+        let then_value = self.block(then_branch)?;
+        let then_end = self.cursor.expect("then branch terminal");
+        let then_checked = self.checked.clone();
+
+        self.names = incoming_names;
+        self.origins = incoming_origins.clone();
+        self.checked = incoming_checked.clone();
+        self.cursor = Some(branch);
+        let (else_value, else_end) = if let Some(else_branch) = else_branch {
+            let result = self.block(else_branch)?;
+            (result, self.cursor.expect("else branch terminal"))
+        } else {
+            (None, branch)
+        };
+        self.checked.extend(then_checked);
+        self.origins.clear();
+        self.cursor = None;
+        let joined_value = then_value.is_some() && else_value.is_some();
+        let join = if joined_value {
+            self.point_with_origins(CfgPointKind::Join, span, scope, None)
+        } else {
+            self.point(CfgPointKind::Join, span, scope, BTreeSet::new())
+        };
+        self.cfg.points[then_end.0].successors.push(join);
+        if else_end != branch {
+            self.cfg.points[else_end.0].successors.push(join);
+        } else {
+            self.cfg.points[branch.0].successors.push(join);
+        }
+        Ok(if joined_value {
+            ReferenceValue::Uncomputed
+        } else {
+            ReferenceValue::Other
+        })
+    }
+
+    fn expression(
+        &mut self,
+        expression: &ScalarExpression,
+        scope: ReferenceScopeId,
+    ) -> Result<ReferenceValue, ReferenceAnalysisError> {
+        let span = expression_span(expression);
+        match expression {
+            ScalarExpression::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => self.conditional(condition, then_branch, Some(else_branch), span, scope),
+            ScalarExpression::UnitIf {
+                condition,
+                then_branch,
+                ..
+            } => self.conditional(condition, then_branch, None, span, scope),
+            ScalarExpression::Block(block) => match self.block(block)? {
+                Some(ReferenceValue::Checked(origins)) => {
+                    self.point(
+                        CfgPointKind::Evaluate(expression.clone()),
+                        span,
+                        scope,
+                        origins.clone(),
+                    );
+                    Ok(ReferenceValue::Checked(origins))
+                }
+                Some(ReferenceValue::Uncomputed) => {
+                    self.uncomputed_point(CfgPointKind::Evaluate(expression.clone()), span, scope);
+                    Ok(ReferenceValue::Uncomputed)
+                }
+                _ => {
+                    self.point(
+                        CfgPointKind::Evaluate(expression.clone()),
+                        span,
+                        scope,
+                        BTreeSet::new(),
+                    );
+                    Ok(ReferenceValue::Other)
+                }
+            },
+            ScalarExpression::Call { arguments, .. } => {
+                let target = self.call_target(expression)?;
+                let mut address = None;
+                let mut checked_release_address = None;
+                let mut argument_points = Vec::new();
+                for (position, argument) in arguments.iter().enumerate() {
+                    self.expression(argument, scope)?;
+                    argument_points.push(self.cursor.expect("evaluated call argument"));
+                    if position == 0
+                        && target == ResolvedCallTarget::Core(CoreOperationId::Free)
+                        && (matches!(argument, ScalarExpression::CheckedAddress { .. })
+                            || matches!(argument, ScalarExpression::Name { name, .. } if self.names.get(name).is_some_and(|binding| self.checked.contains(binding))))
+                    {
+                        checked_release_address = self.cursor;
+                    }
+                    if position == 0
+                        && matches!(
+                            target,
+                            ResolvedCallTarget::Core(
+                                CoreOperationId::Invalidate | CoreOperationId::Rebind
+                            )
+                        )
+                    {
+                        address = self.cursor;
+                    }
+                    self.move_value(argument, scope)?;
+                }
+                if let ResolvedCallTarget::Core(
+                    operation @ (CoreOperationId::Invalidate | CoreOperationId::Rebind),
+                ) = &target
+                {
+                    let address_point = address.expect("validated core address argument point");
+                    let inputs = match operation {
+                        CoreOperationId::Invalidate => InvalidationInputs::Invalidate,
+                        CoreOperationId::Rebind => InvalidationInputs::Rebind {
+                            raw_address: arguments[1].clone(),
+                            raw_span: SourceSpan::new(
+                                self.source.clone(),
+                                expression_span(&arguments[1]),
+                            ),
+                            length: arguments[2].clone(),
+                            length_span: SourceSpan::new(
+                                self.source.clone(),
+                                expression_span(&arguments[2]),
+                            ),
+                        },
+                        _ => unreachable!("invalidation operation"),
+                    };
+                    self.point(
+                        CfgPointKind::Invalidate {
+                            address_point,
+                            candidates: Vec::new(),
+                            operation: *operation,
+                            address_span: SourceSpan::new(
+                                self.source.clone(),
+                                expression_span(&arguments[0]),
+                            ),
+                            inputs,
+                        },
+                        span,
+                        scope,
+                        BTreeSet::new(),
+                    );
+                }
+                if target == ResolvedCallTarget::Core(CoreOperationId::Free) {
+                    if let Some(address_point) = checked_release_address {
+                        self.point(
+                            CfgPointKind::Release {
+                                target: ReleaseTarget::Checked {
+                                    address_point,
+                                    candidates: Vec::new(),
+                                    address_span: SourceSpan::new(
+                                        self.source.clone(),
+                                        expression_span(&arguments[0]),
+                                    ),
+                                },
+                            },
+                            span,
+                            scope,
+                            BTreeSet::new(),
+                        );
+                    } else if let [ScalarExpression::Name {
+                        name: place_name,
+                        span: argument_span,
+                    }] = arguments.as_slice()
+                    {
+                        let binding = self.binding(place_name, *argument_span)?;
+                        self.point(
+                            CfgPointKind::Release {
+                                target: ReleaseTarget::Raw { binding },
+                            },
+                            span,
+                            scope,
+                            BTreeSet::new(),
+                        );
+                    }
+                }
+                let cast_origins = match (&target, expression) {
+                    (
+                        ResolvedCallTarget::Core(CoreOperationId::PointerCast),
+                        ScalarExpression::Call { type_arguments, .. },
+                    ) => match type_arguments.as_slice() {
+                        [argument] => match &argument.ty {
+                            ScalarType::CheckedReference { mutability, .. } => {
+                                Some(self.pointer_cast_origins(&arguments[0], *mutability, span)?)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let call = CfgPointKind::Call {
+                    expression: expression.clone(),
+                    output: 0,
+                    target,
+                    argument_points,
+                };
+                if let Some(origins) = cast_origins {
+                    self.point(call, span, scope, origins.clone());
+                    Ok(ReferenceValue::Checked(origins))
+                } else {
+                    self.uncomputed_point(call, span, scope);
+                    Ok(ReferenceValue::Uncomputed)
+                }
+            }
+            ScalarExpression::Binary { left, right, .. } => {
+                self.expression(left, scope)?;
+                self.expression(right, scope)?;
+                self.point(
+                    CfgPointKind::Evaluate(expression.clone()),
+                    span,
+                    scope,
+                    BTreeSet::new(),
+                );
+                Ok(ReferenceValue::Other)
+            }
+            ScalarExpression::Unary { operand, .. } => {
+                self.expression(operand, scope)?;
+                self.point(
+                    CfgPointKind::Evaluate(expression.clone()),
+                    span,
+                    scope,
+                    BTreeSet::new(),
+                );
+                Ok(ReferenceValue::Other)
+            }
+            ScalarExpression::ArrayLiteral { elements, .. } => {
+                for element in elements {
+                    self.expression(element, scope)?;
+                    self.move_value(element, scope)?;
+                }
+                self.point(
+                    CfgPointKind::Evaluate(expression.clone()),
+                    span,
+                    scope,
+                    BTreeSet::new(),
+                );
+                Ok(ReferenceValue::Other)
+            }
+            ScalarExpression::StructLiteral { fields, .. } => {
+                for field in fields {
+                    self.expression(&field.value, scope)?;
+                    self.move_value(&field.value, scope)?;
+                }
+                self.point(
+                    CfgPointKind::Evaluate(expression.clone()),
+                    span,
+                    scope,
+                    BTreeSet::new(),
+                );
+                Ok(ReferenceValue::Other)
+            }
+            ScalarExpression::Dereference { place, .. }
+            | ScalarExpression::IndexedRead { place, .. } => {
+                self.checked_place_read(place, expression, span, scope)
+            }
+            ScalarExpression::RawAddress { place, .. } => {
+                self.place_expressions(place, scope)?;
+                self.point(
+                    CfgPointKind::Evaluate(expression.clone()),
+                    span,
+                    scope,
+                    BTreeSet::new(),
+                );
+                Ok(ReferenceValue::Other)
+            }
+            ScalarExpression::Member {
+                receiver,
+                name,
+                receiver_span,
+                ..
+            } if self
+                .names
+                .get(receiver)
+                .and_then(|binding| self.binding_types.get(binding))
+                .is_some_and(|ty| matches!(ty, ScalarType::Struct(_))) =>
+            {
+                let binding = self.binding(receiver, *receiver_span)?;
+                let ScalarType::Struct(id) = self.binding_types.get(&binding).ok_or_else(|| {
+                    self.missing_context(span, ReferenceAnalysisErrorReason::MissingResolvedBinding)
+                })?
+                else {
+                    unreachable!()
+                };
+                let structure = self
+                    .structs
+                    .iter()
+                    .find(|structure| structure.id == *id)
+                    .ok_or_else(|| {
+                        self.missing_context(
+                            span,
+                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                        )
+                    })?;
+                let field = structure
+                    .fields
+                    .iter()
+                    .find(|field| field.name == *name)
+                    .ok_or_else(|| {
+                        self.missing_context(
+                            span,
+                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                        )
+                    })?;
+                let place = ScalarPlace::Field {
+                    base: Box::new(ScalarPlace::Name {
+                        name: receiver.clone(),
+                        span: *receiver_span,
+                    }),
+                    field: ScalarFieldReference::Resolved(field.id.clone()),
+                    span,
+                };
+                self.checked_place_read(&place, expression, span, scope)
+            }
+            ScalarExpression::Name { name, .. } if name == "null" => {
+                let id = self.intern(ReferenceOrigin::Null { span });
+                let origins = BTreeSet::from([id]);
+                self.point(
+                    CfgPointKind::Evaluate(expression.clone()),
+                    span,
+                    scope,
+                    origins.clone(),
+                );
+                Ok(ReferenceValue::Checked(origins))
+            }
+            ScalarExpression::Name { name, .. } => {
+                if self.module_names.contains(name) && !self.names.contains_key(name) {
+                    self.point(
+                        CfgPointKind::Evaluate(expression.clone()),
+                        span,
+                        scope,
+                        BTreeSet::new(),
+                    );
+                    return Ok(ReferenceValue::Other);
+                }
+                let binding = self.binding(name, span)?;
+                if self.checked.contains(&binding) {
+                    if self.origins.contains_key(&binding) {
+                        let origins = self.required(&binding, span)?;
+                        self.point(CfgPointKind::Read { binding }, span, scope, origins.clone());
+                        Ok(ReferenceValue::Checked(origins))
+                    } else {
+                        self.uncomputed_point(CfgPointKind::Read { binding }, span, scope);
+                        Ok(ReferenceValue::Uncomputed)
+                    }
+                } else {
+                    self.point(CfgPointKind::Read { binding }, span, scope, BTreeSet::new());
+                    Ok(ReferenceValue::Other)
+                }
+            }
+            ScalarExpression::CheckedAddress {
+                mutability, place, ..
+            } => {
+                let root = reference_root(place);
+                let parents = match root {
+                    ScalarPlace::Dereference { pointer, .. } => {
+                        let ReferenceValue::Checked(origins) = self.expression(pointer, scope)?
+                        else {
+                            let binding = match pointer.as_ref() {
+                                ScalarExpression::Name { name, span } => {
+                                    self.binding(name, *span)?
+                                }
+                                _ => return Err(self.missing_context(
+                                    span,
+                                    ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                                )),
+                            };
+                            return Err(self.missing_origin(
+                                span,
+                                binding,
+                                ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                            ));
+                        };
+                        Some(origins)
+                    }
+                    _ => None,
+                };
+                self.place_indices(place, scope)?;
+                let parent_ids = match &parents {
+                    Some(ids) => ids.iter().copied().map(Some).collect::<Vec<_>>(),
+                    None => vec![None],
+                };
+                let mut origins = BTreeSet::new();
+                for parent_id in parent_ids {
+                    let parent = parent_id.map(|id| self.cfg.facts[id.0].clone());
+                    if let Some(
+                        ReferenceOrigin::Null { span: origin_span }
+                        | ReferenceOrigin::Invalid { origin_span, .. },
+                    ) = &parent
+                    {
+                        let id = self.intern(ReferenceOrigin::Invalid {
+                            origin_span: *origin_span,
+                            conflict_span: span,
+                        });
+                        origins.insert(id);
+                        self.point(
+                            CfgPointKind::Evaluate(expression.clone()),
+                            span,
+                            scope,
+                            BTreeSet::from([id]),
+                        );
+                        continue;
+                    }
+                    let (binding, declaration_span, declaration_block, parent_loan) =
+                        match (root, &parent) {
+                            (
+                                ScalarPlace::Name {
+                                    name,
+                                    span: name_span,
+                                },
+                                _,
+                            ) => {
+                                let binding = self.binding(name, *name_span)?;
+                                (
+                                    binding.clone(),
+                                    binding.declaration_span,
+                                    binding.block_span,
+                                    None,
+                                )
+                            }
+                            (
+                                ScalarPlace::Dereference { .. },
+                                Some(
+                                    ReferenceOrigin::Fresh { loan, .. }
+                                    | ReferenceOrigin::BorrowedFrom { loan, .. },
+                                ),
+                            ) => (
+                                loan.origin_place.binding.clone(),
+                                loan.origin_place.declaration_span,
+                                loan.origin_place.block_span,
+                                Some(loan.clone()),
+                            ),
+                            _ => {
+                                return Err(self.missing_context(
+                                    span,
+                                    ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                                ));
+                            }
+                        };
+                    let mut projections = Vec::new();
+                    collect_reference_projections(place, parent_loan.as_ref(), &mut projections);
+                    let loan = ReferenceLoanId {
+                        mode: *mutability,
+                        origin_place: ReferencePlaceId {
+                            source: self.source.clone(),
+                            function_span: self.function_span,
+                            declaration_span,
+                            block_span: declaration_block,
+                            binding,
+                            projections,
+                            place: place.clone(),
+                        },
+                        creation_span: span,
+                        parent: parent_loan.map(Box::new),
+                    };
+                    let fact = match parent {
+                        Some(ReferenceOrigin::BorrowedFrom { parameter, .. }) => {
+                            ReferenceOrigin::BorrowedFrom {
+                                parameter,
+                                loan: loan.clone(),
+                            }
+                        }
+                        Some(ReferenceOrigin::Fresh { allocation, .. }) => ReferenceOrigin::Fresh {
+                            allocation,
+                            loan: loan.clone(),
+                        },
+                        None => ReferenceOrigin::Fresh {
+                            allocation: ReturnedAllocationId {
+                                source: self.source.clone(),
+                                function_span: self.function_span,
+                                declaration_span,
+                                creation_span: span,
+                            },
+                            loan: loan.clone(),
+                        },
+                        Some(ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. }) => {
+                            unreachable!()
+                        }
+                    };
+                    let id = self.intern(fact);
+                    origins.insert(id);
+                    self.point(
+                        CfgPointKind::Borrow {
+                            place: loan.origin_place.clone(),
+                            loan,
+                        },
+                        span,
+                        scope,
+                        BTreeSet::from([id]),
+                    );
+                }
+                Ok(ReferenceValue::Checked(origins))
+            }
+            _ => {
+                self.point(
+                    CfgPointKind::Evaluate(expression.clone()),
+                    span,
+                    scope,
+                    BTreeSet::new(),
+                );
+                Ok(ReferenceValue::Other)
+            }
+        }
+    }
+
+    fn place_expressions(
+        &mut self,
+        place: &ScalarPlace,
+        scope: ReferenceScopeId,
+    ) -> Result<(), ReferenceAnalysisError> {
+        match place {
+            ScalarPlace::Name { name, span } => {
+                if self.names.contains_key(name)
+                    && self.checked.contains(&self.binding(name, *span)?)
+                {
+                    let binding = self.binding(name, *span)?;
+                    self.point(
+                        CfgPointKind::Read { binding },
+                        *span,
+                        scope,
+                        BTreeSet::new(),
+                    );
+                } else if !self.names.contains_key(name) && !self.module_names.contains(name) {
+                    return Err(self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                    ));
+                }
+            }
+            ScalarPlace::Dereference { pointer, .. } => {
+                self.expression(pointer, scope)?;
+                let ScalarPlace::Dereference { span, .. } = place else {
+                    unreachable!()
+                };
+                let point = self.cursor.ok_or_else(|| {
+                    self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                    )
+                })?;
+                self.dereference_points.insert(*span, point);
+            }
+            ScalarPlace::Field { base, .. } => self.place_expressions(base, scope)?,
+            ScalarPlace::Index { base, index, .. } => {
+                self.place_expressions(base, scope)?;
+                self.expression(index, scope)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn checked_place_read(
+        &mut self,
+        place: &ScalarPlace,
+        expression: &ScalarExpression,
+        span: ByteSpan,
+        scope: ReferenceScopeId,
+    ) -> Result<ReferenceValue, ReferenceAnalysisError> {
+        if let ScalarPlace::Name { name, .. } = reference_root(place) {
+            if self.module_names.contains(name) && !self.names.contains_key(name) {
+                self.point(
+                    CfgPointKind::Evaluate(expression.clone()),
+                    span,
+                    scope,
+                    BTreeSet::new(),
+                );
+                return Ok(ReferenceValue::Other);
+            }
+        }
+        let reads_checked_value = matches!(
+            self.indexed_move_type(place)?,
+            ScalarType::CheckedReference { .. }
+        );
+        let reads_checked_aggregate = if let ScalarPlace::Dereference { pointer, .. } =
+            reference_root(place)
+        {
+            matches!(
+                pointer.as_ref(),
+                ScalarExpression::Name { name, .. }
+                    if matches!(self.binding_types.get(&self.binding(name, span)?),
+                        Some(ScalarType::CheckedReference { inner, .. })
+                            if matches!(inner.as_ref(), ScalarType::Struct(_) | ScalarType::Array { .. }))
+            )
+        } else {
+            false
+        };
+        if !reads_checked_value
+            && !reads_checked_aggregate
+            && matches!(reference_root(place), ScalarPlace::Dereference { pointer, .. } if !matches!(pointer.as_ref(), ScalarExpression::Name { .. }))
+        {
+            self.place_expressions(place, scope)?;
+            self.point(
+                CfgPointKind::Evaluate(expression.clone()),
+                span,
+                scope,
+                BTreeSet::new(),
+            );
+            return Ok(ReferenceValue::Other);
+        }
+        self.place_expressions(place, scope)?;
+        let pointer_point = match reference_root(place) {
+            ScalarPlace::Dereference { span, .. } => {
+                Some(*self.dereference_points.get(span).ok_or_else(|| {
+                    self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                    )
+                })?)
+            }
+            ScalarPlace::Name { .. } => None,
+            ScalarPlace::Field { .. } | ScalarPlace::Index { .. } => unreachable!(),
+        };
+        let candidates = if pointer_point.is_none() {
+            vec![self.assignment_place(place, span)?]
+        } else {
+            Vec::new()
+        };
+        let event = CfgPointKind::ReadPlace {
+            place: place.clone(),
+            pointer_point,
+            candidates,
+            reads_origin: reads_checked_value,
+        };
+        if reads_checked_value || reads_checked_aggregate {
+            self.uncomputed_point(event, span, scope);
+            Ok(ReferenceValue::Uncomputed)
+        } else {
+            self.point(event, span, scope, BTreeSet::new());
+            Ok(ReferenceValue::Other)
+        }
+    }
+
+    fn place_indices(
+        &mut self,
+        place: &ScalarPlace,
+        scope: ReferenceScopeId,
+    ) -> Result<(), ReferenceAnalysisError> {
+        match place {
+            ScalarPlace::Name { .. } | ScalarPlace::Dereference { .. } => {}
+            ScalarPlace::Field { base, .. } => self.place_indices(base, scope)?,
+            ScalarPlace::Index { base, index, .. } => {
+                self.place_indices(base, scope)?;
+                self.expression(index, scope)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn indexed_move_type(&self, place: &ScalarPlace) -> Result<ScalarType, ReferenceAnalysisError> {
+        match place {
+            ScalarPlace::Name { name, span } => {
+                let binding = self.binding(name, *span)?;
+                self.binding_types.get(&binding).cloned().ok_or_else(|| {
+                    self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                    )
+                })
+            }
+            ScalarPlace::Field { base, field, span } => {
+                let ScalarType::Struct(id) = self.indexed_move_type(base)? else {
+                    return Err(self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                    ));
+                };
+                let ScalarFieldReference::Resolved(field) = field else {
+                    return Err(self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                    ));
+                };
+                self.structs
+                    .iter()
+                    .find(|structure| structure.id == id)
+                    .and_then(|structure| {
+                        structure
+                            .fields
+                            .iter()
+                            .find(|candidate| candidate.id == *field)
+                    })
+                    .map(|field| field.ty.clone())
+                    .ok_or_else(|| {
+                        self.missing_context(
+                            *span,
+                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                        )
+                    })
+            }
+            ScalarPlace::Index { base, span, .. } => match self.indexed_move_type(base)? {
+                ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
+                    Ok(*element)
+                }
+                _ => Err(self
+                    .missing_context(*span, ReferenceAnalysisErrorReason::MissingResolvedBinding)),
+            },
+            ScalarPlace::Dereference { pointer, span } => {
+                let pointer_type = match pointer.as_ref() {
+                    ScalarExpression::Name { name, .. } => {
+                        self.indexed_move_type(&ScalarPlace::Name {
+                            name: name.clone(),
+                            span: *span,
+                        })?
+                    }
+                    ScalarExpression::Call {
+                        receiver: Some(receiver),
+                        name,
+                        type_arguments,
+                        ..
+                    } if receiver == "core"
+                        && name == "pointer_cast"
+                        && type_arguments.len() == 1 =>
+                    {
+                        type_arguments[0].ty.clone()
+                    }
+                    _ => {
+                        return Err(self.missing_context(
+                            *span,
+                            ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                        ));
+                    }
+                };
+                match pointer_type {
+                    ScalarType::CheckedReference { inner, .. } => Ok(*inner),
+                    ScalarType::RawPointer(inner) => Ok(*inner),
+                    _ => Err(self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                    )),
+                }
+            }
+        }
+    }
+
+    fn move_value(
+        &mut self,
+        value: &ScalarExpression,
+        scope: ReferenceScopeId,
+    ) -> Result<(), ReferenceAnalysisError> {
+        let (name, place, ty, span) = match value {
+            ScalarExpression::Name { name, span } => {
+                let Some(binding) = self.names.get(name) else {
+                    return Ok(());
+                };
+                (
+                    name,
+                    ScalarPlace::Name {
+                        name: name.clone(),
+                        span: *span,
+                    },
+                    self.binding_types.get(binding).cloned().ok_or_else(|| {
+                        self.missing_context(
+                            *span,
+                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                        )
+                    })?,
+                    *span,
+                )
+            }
+            ScalarExpression::Member {
+                receiver,
+                name,
+                receiver_span,
+                span,
+                ..
+            } => {
+                let Some(binding) = self.names.get(receiver) else {
+                    return Ok(());
+                };
+                let Some(receiver_type) = self.binding_types.get(binding) else {
+                    return Err(self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                    ));
+                };
+                let ScalarType::Struct(id) = receiver_type else {
+                    return Ok(());
+                };
+                let field = self
+                    .structs
+                    .iter()
+                    .find(|item| item.id == *id)
+                    .ok_or_else(|| {
+                        self.missing_context(
+                            *span,
+                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                        )
+                    })?
+                    .fields
+                    .iter()
+                    .find(|field| field.name == *name)
+                    .ok_or_else(|| {
+                        self.missing_context(
+                            *span,
+                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                        )
+                    })?;
+                (
+                    receiver,
+                    ScalarPlace::Field {
+                        base: Box::new(ScalarPlace::Name {
+                            name: receiver.clone(),
+                            span: *receiver_span,
+                        }),
+                        field: ScalarFieldReference::Resolved(field.id.clone()),
+                        span: *span,
+                    },
+                    field.ty.clone(),
+                    *span,
+                )
+            }
+            ScalarExpression::IndexedRead { place, span } => {
+                if let ScalarPlace::Name { name, .. } = reference_root(place) {
+                    if self.module_names.contains(name) && !self.names.contains_key(name) {
+                        return Ok(());
+                    }
+                }
+                let ty = self.indexed_move_type(place)?;
+                let policy = copy_policy(&ty, &self.structs, &self.enums, &self.generic_parameters)
+                    .map_err(|_| {
+                        self.missing_context(
+                            *span,
+                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                        )
+                    })?;
+                match policy {
+                    CopyPolicy::Copy => return Ok(()),
+                    CopyPolicy::Move => {
+                        return Err(self.missing_context(
+                            *span,
+                            ReferenceAnalysisErrorReason::MoveFromArrayElement,
+                        ));
+                    }
+                    CopyPolicy::Deferred => {
+                        self.point(
+                            CfgPointKind::DeferredArrayElement {
+                                place: place.clone(),
+                                ty,
+                            },
+                            *span,
+                            scope,
+                            BTreeSet::new(),
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            ScalarExpression::Dereference { place, span } => {
+                let ScalarPlace::Dereference {
+                    pointer,
+                    span: root_span,
+                } = reference_root(place)
+                else {
+                    return Err(self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                    ));
+                };
+                let ty = self.indexed_move_type(place)?;
+                let policy = copy_policy(&ty, &self.structs, &self.enums, &self.generic_parameters)
+                    .map_err(|_| {
+                        self.missing_context(
+                            *span,
+                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                        )
+                    })?;
+                if policy == CopyPolicy::Copy {
+                    return Ok(());
+                }
+                let ScalarExpression::Name { name, .. } = pointer.as_ref() else {
+                    return Err(self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                    ));
+                };
+                let binding = self.binding(name, *span)?;
+                let Some(ScalarType::CheckedReference {
+                    mutability: ScalarReferenceMutability::Mutable,
+                    ..
+                }) = self.binding_types.get(&binding)
+                else {
+                    return Err(self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                    ));
+                };
+                let pointer_point = *self.dereference_points.get(root_span).ok_or_else(|| {
+                    self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                    )
+                })?;
+                self.point(
+                    if policy == CopyPolicy::Deferred {
+                        CfgPointKind::DeferredMoveThrough {
+                            place: place.clone(),
+                            ty,
+                            pointer_point,
+                            candidates: Vec::new(),
+                        }
+                    } else {
+                        CfgPointKind::MoveThrough {
+                            place: place.clone(),
+                            ty,
+                            pointer_point,
+                            candidates: Vec::new(),
+                        }
+                    },
+                    *span,
+                    scope,
+                    BTreeSet::new(),
+                );
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        let policy = copy_policy(&ty, &self.structs, &self.enums, &self.generic_parameters)
+            .map_err(|_| {
+                self.missing_context(span, ReferenceAnalysisErrorReason::MissingResolvedBinding)
+            })?;
+        if policy == CopyPolicy::Copy {
+            return Ok(());
+        }
+        let binding = self
+            .names
+            .get(name)
+            .expect("validated move binding")
+            .clone();
+        let mut projections = Vec::new();
+        collect_reference_projections(&place, None, &mut projections);
+        let place = ReferencePlaceId {
+            source: self.source.clone(),
+            function_span: self.function_span,
+            declaration_span: binding.declaration_span,
+            block_span: binding.block_span,
+            binding: binding.clone(),
+            projections,
+            place,
+        };
+        self.point(
+            if policy == CopyPolicy::Deferred {
+                CfgPointKind::DeferredMove {
+                    place,
+                    ty,
+                    owner: binding,
+                }
+            } else {
+                CfgPointKind::Move {
+                    place,
+                    ty,
+                    owner: binding,
+                }
+            },
+            span,
+            scope,
+            BTreeSet::new(),
+        );
+        Ok(())
+    }
+
+    fn additional_receivers(
+        &mut self,
+        binding: &ScalarBinding,
+        block: &ScalarBlock,
+        scope: ReferenceScopeId,
+        declared: &mut Vec<(String, ReferenceBindingId, Option<ReferenceBindingId>)>,
+    ) -> Result<(), ReferenceAnalysisError> {
+        for (position, receiver) in binding.receivers.iter().enumerate().skip(1) {
+            let value = &binding.output_values[position].value;
+            if binding.output_origin == ScalarBindingOutputOrigin::IndependentExpressions {
+                self.expression(value, scope)?;
+            } else if matches!(value, ScalarExpression::Call { .. }) {
+                let argument_points = self
+                    .cfg
+                    .points
+                    .iter()
+                    .rev()
+                    .find_map(|point| match &point.kind {
+                        CfgPointKind::Call {
+                            expression,
+                            output: 0,
+                            argument_points,
+                            ..
+                        } if expression == value => Some(argument_points.clone()),
+                        _ => None,
+                    })
+                    .expect("evaluated multi-output call");
+                self.uncomputed_point(
+                    CfgPointKind::Call {
+                        expression: value.clone(),
+                        output: position,
+                        target: self.call_target(value)?,
+                        argument_points,
+                    },
+                    expression_span(value),
+                    scope,
+                );
+            }
+            let id = ReferenceBindingId {
+                source: self.source.clone(),
+                function_span: self.function_span,
+                declaration_span: receiver.name_span,
+                block_span: block.span,
+                kind: ReferenceBindingKind::Declared,
+            };
+            let previous = self.names.insert(receiver.name.clone(), id.clone());
+            self.binding_types.insert(id.clone(), receiver.ty.clone());
+            declared.push((receiver.name.clone(), id.clone(), previous));
+            if matches!(receiver.ty, ScalarType::CheckedReference { .. }) {
+                self.checked.insert(id.clone());
+                self.uncomputed_point(
+                    CfgPointKind::Bind { binding: id },
+                    receiver.name_span,
+                    scope,
+                );
+            } else {
+                self.point(
+                    CfgPointKind::Bind { binding: id },
+                    receiver.name_span,
+                    scope,
+                    BTreeSet::new(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn block(
+        &mut self,
+        block: &ScalarBlock,
+    ) -> Result<Option<ReferenceValue>, ReferenceAnalysisError> {
+        let scope = ReferenceScopeId(self.next_scope);
+        self.next_scope += 1;
+        self.point(CfgPointKind::ScopeEnter, block.span, scope, BTreeSet::new());
+        let mut declared = Vec::new();
+        let mut result = None;
+        let mut return_values = Vec::new();
+        for (index, item) in block.items.iter().enumerate() {
+            match item {
+                ScalarBlockItem::LocalBinding(binding) => {
+                    let value = if matches!(binding.declared_type, ScalarType::RawPointer(_))
+                        && matches!(&binding.value, ScalarExpression::Name { name, .. } if name == "null")
+                    {
+                        self.point(
+                            CfgPointKind::Evaluate(binding.value.clone()),
+                            expression_span(&binding.value),
+                            scope,
+                            BTreeSet::new(),
+                        );
+                        ReferenceValue::Other
+                    } else {
+                        self.expression(&binding.value, scope)?
+                    };
+                    self.move_value(&binding.value, scope)?;
+                    let id = ReferenceBindingId {
+                        source: self.source.clone(),
+                        function_span: self.function_span,
+                        declaration_span: binding.name_span,
+                        block_span: block.span,
+                        kind: ReferenceBindingKind::Declared,
+                    };
+                    self.binding_types
+                        .insert(id.clone(), binding.declared_type.clone());
+                    if binding.is_allocation {
+                        self.cfg.allocations.insert(id.clone());
+                    }
+                    let origins = match value {
+                        ReferenceValue::Checked(origins) => Some(origins),
+                        ReferenceValue::Other
+                            if matches!(
+                                binding.declared_type,
+                                ScalarType::CheckedReference { .. }
+                            ) =>
+                        {
+                            return Err(self.missing_origin(
+                                binding.name_span,
+                                id,
+                                ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                            ));
+                        }
+                        ReferenceValue::Other => None,
+                        ReferenceValue::Uncomputed
+                            if matches!(
+                                binding.declared_type,
+                                ScalarType::CheckedReference { .. }
+                            ) =>
+                        {
+                            self.checked.insert(id.clone());
+                            self.origins.remove(&id);
+                            self.uncomputed_point(
+                                CfgPointKind::Bind {
+                                    binding: id.clone(),
+                                },
+                                binding.name_span,
+                                scope,
+                            );
+                            let old = self.names.insert(binding.name.clone(), id.clone());
+                            declared.push((binding.name.clone(), id, old));
+                            self.additional_receivers(binding, block, scope, &mut declared)?;
+                            continue;
+                        }
+                        ReferenceValue::Uncomputed => None,
+                    };
+                    let old = self.names.insert(binding.name.clone(), id.clone());
+                    if let Some(origins) = origins {
+                        self.checked.insert(id.clone());
+                        self.origins.insert(id.clone(), origins.clone());
+                        self.point(
+                            CfgPointKind::Bind {
+                                binding: id.clone(),
+                            },
+                            binding.name_span,
+                            scope,
+                            origins,
+                        );
+                    } else {
+                        self.point(
+                            CfgPointKind::Bind {
+                                binding: id.clone(),
+                            },
+                            binding.name_span,
+                            scope,
+                            BTreeSet::new(),
+                        );
+                    }
+                    declared.push((binding.name.clone(), id, old));
+                    self.additional_receivers(binding, block, scope, &mut declared)?;
+                }
+                ScalarBlockItem::Expression(expression) => {
+                    let value = self.expression(expression, scope)?;
+                    let value_point = self.cursor.expect("evaluated output expression");
+                    self.move_value(expression, scope)?;
+                    if index >= block.items.len() - block.final_output_values.len() {
+                        return_values.push(value_point);
+                        if matches!(value, ReferenceValue::Checked(_)) {
+                            result = Some(value);
+                        } else if matches!(value, ReferenceValue::Uncomputed)
+                            && matches!(
+                                block.final_output_values
+                                    [index - (block.items.len() - block.final_output_values.len())]
+                                .ty,
+                                ScalarType::CheckedReference { .. }
+                            )
+                        {
+                            result = Some(value);
+                        }
+                    }
+                }
+                ScalarBlockItem::Assignment(assignment) => {
+                    let output_types = self.assignment_output_types(assignment)?;
+                    let mut values = Vec::new();
+                    for value in &assignment.values {
+                        let result = self.expression(value, scope)?;
+                        let rhs_point = self.cursor.expect("evaluated assignment output");
+                        self.move_value(value, scope)?;
+                        values.push((result, rhs_point));
+                    }
+                    if assignment.values.len() == 1 {
+                        if let ScalarExpression::Call { .. } = &assignment.values[0] {
+                            let argument_points = self
+                                .cfg
+                                .points
+                                .iter()
+                                .rev()
+                                .find_map(|point| match &point.kind {
+                                    CfgPointKind::Call {
+                                        expression,
+                                        output: 0,
+                                        argument_points,
+                                        ..
+                                    } if expression == &assignment.values[0] => {
+                                        Some(argument_points.clone())
+                                    }
+                                    _ => None,
+                                })
+                                .expect("evaluated assignment call");
+                            for position in 1..assignment.targets.len() {
+                                let rhs_point = self.point_with_origins(
+                                    CfgPointKind::Call {
+                                        expression: assignment.values[0].clone(),
+                                        output: position,
+                                        target: self.call_target(&assignment.values[0])?,
+                                        argument_points: argument_points.clone(),
+                                    },
+                                    expression_span(&assignment.values[0]),
+                                    scope,
+                                    None,
+                                );
+                                values.push((ReferenceValue::Uncomputed, rhs_point));
+                            }
+                        }
+                    }
+                    for (position, (target, (value, rhs_point))) in
+                        assignment.targets.iter().zip(values).enumerate()
+                    {
+                        if let ScalarPlace::Name { name, span } = &target.place {
+                            let id = if let Some(id) = self.names.get(name) {
+                                id.clone()
+                            } else if self.module_names.contains(name) {
+                                if matches!(value, ReferenceValue::Checked(_)) {
+                                    return Err(self.missing_context(
+                                        *span,
+                                        ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                                    ));
+                                }
+                                self.point(
+                                    CfgPointKind::Evaluate(ScalarExpression::Name {
+                                        name: name.clone(),
+                                        span: *span,
+                                    }),
+                                    *span,
+                                    scope,
+                                    BTreeSet::new(),
+                                );
+                                continue;
+                            } else {
+                                let id = ReferenceBindingId {
+                                    source: self.source.clone(),
+                                    function_span: self.function_span,
+                                    declaration_span: target.target_span,
+                                    block_span: block.span,
+                                    kind: ReferenceBindingKind::Declared,
+                                };
+                                self.names.insert(name.clone(), id.clone());
+                                let ty = output_types.get(position).ok_or_else(|| {
+                                    self.missing_context(
+                                        target.target_span,
+                                        ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                                    )
+                                })?;
+                                self.binding_types.insert(id.clone(), ty.clone());
+                                declared.push((name.clone(), id.clone(), None));
+                                id
+                            };
+                            let target_place =
+                                self.assignment_place(&target.place, target.target_span)?;
+                            let previous_origins =
+                                self.origins.get(&id).cloned().unwrap_or_default();
+                            let previous_loans = previous_origins
+                                .iter()
+                                .filter_map(|origin| match &self.cfg.facts[origin.0] {
+                                    ReferenceOrigin::Fresh { loan, .. }
+                                    | ReferenceOrigin::BorrowedFrom { loan, .. } => {
+                                        Some(loan.clone())
+                                    }
+                                    ReferenceOrigin::Null { .. }
+                                    | ReferenceOrigin::Invalid { .. } => None,
+                                })
+                                .collect();
+                            let assign = CfgPointKind::Assign {
+                                target: target_place,
+                                rhs_point,
+                                previous_origins,
+                                previous_loans,
+                            };
+                            if let ReferenceValue::Checked(origins) = value {
+                                self.checked.insert(id.clone());
+                                self.origins.insert(id.clone(), origins.clone());
+                                self.point(assign, *span, scope, origins);
+                            } else if matches!(value, ReferenceValue::Uncomputed)
+                                && self.checked.contains(&id)
+                            {
+                                self.checked.insert(id.clone());
+                                self.origins.remove(&id);
+                                self.uncomputed_point(assign, *span, scope);
+                            } else {
+                                if self.checked.contains(&id) {
+                                    return Err(self.missing_origin(
+                                        *span,
+                                        id,
+                                        ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                                    ));
+                                }
+                                self.origins.remove(&id);
+                                self.point(assign, *span, scope, BTreeSet::new());
+                            }
+                        } else {
+                            if let ScalarPlace::Name { name, span } = reference_root(&target.place)
+                            {
+                                if self.module_names.contains(name)
+                                    && !self.names.contains_key(name)
+                                {
+                                    self.point(
+                                        CfgPointKind::Evaluate(ScalarExpression::Name {
+                                            name: name.clone(),
+                                            span: *span,
+                                        }),
+                                        target.target_span,
+                                        scope,
+                                        BTreeSet::new(),
+                                    );
+                                    continue;
+                                }
+                            }
+                            self.place_expressions(&target.place, scope)?;
+                            if let ScalarPlace::Dereference { span, .. } =
+                                reference_root(&target.place)
+                            {
+                                let pointer_point = *self.dereference_points.get(span).ok_or_else(|| {
+                                    self.missing_context(
+                                        target.target_span,
+                                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                                    )
+                                })?;
+                                let assign = CfgPointKind::AssignThrough {
+                                    place: target.place.clone(),
+                                    pointer_point,
+                                    rhs_point,
+                                    candidates: Vec::new(),
+                                    previous_origins: BTreeSet::new(),
+                                    previous_loans: Vec::new(),
+                                };
+                                match value {
+                                    ReferenceValue::Checked(origins) => {
+                                        self.point(assign, target.target_span, scope, origins);
+                                    }
+                                    ReferenceValue::Uncomputed
+                                        if matches!(
+                                            output_types[position],
+                                            ScalarType::CheckedReference { .. }
+                                        ) =>
+                                    {
+                                        self.uncomputed_point(assign, target.target_span, scope);
+                                    }
+                                    _ => {
+                                        self.point(
+                                            assign,
+                                            target.target_span,
+                                            scope,
+                                            BTreeSet::new(),
+                                        );
+                                    }
+                                }
+                            } else {
+                                let target_place =
+                                    self.assignment_place(&target.place, target.target_span)?;
+                                let assign = CfgPointKind::Assign {
+                                    target: target_place,
+                                    rhs_point,
+                                    previous_origins: BTreeSet::new(),
+                                    previous_loans: Vec::new(),
+                                };
+                                match value {
+                                    ReferenceValue::Checked(origins) => {
+                                        self.point(assign, target.target_span, scope, origins);
+                                    }
+                                    ReferenceValue::Uncomputed
+                                        if matches!(
+                                            output_types[position],
+                                            ScalarType::CheckedReference { .. }
+                                        ) =>
+                                    {
+                                        self.uncomputed_point(assign, target.target_span, scope);
+                                    }
+                                    _ => {
+                                        self.point(
+                                            assign,
+                                            target.target_span,
+                                            scope,
+                                            BTreeSet::new(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ScalarBlockItem::While(loop_) => {
+                    let loop_head = self.point(
+                        CfgPointKind::LoopTest {
+                            condition: loop_.condition.clone(),
+                        },
+                        expression_span(&loop_.condition),
+                        scope,
+                        BTreeSet::new(),
+                    );
+                    self.expression(&loop_.condition, scope)?;
+                    let branch = self.point(
+                        CfgPointKind::Branch {
+                            condition: loop_.condition.clone(),
+                        },
+                        expression_span(&loop_.condition),
+                        scope,
+                        BTreeSet::new(),
+                    );
+                    let names = self.names.clone();
+                    let origins = self.origins.clone();
+                    let checked = self.checked.clone();
+                    self.block(&loop_.body)?;
+                    let back = self.cursor.expect("loop body terminal");
+                    self.cfg.points[back.0].successors.push(loop_head);
+                    self.names = names;
+                    self.origins = origins;
+                    self.checked = checked;
+                    self.cursor = Some(branch);
+                    self.point(CfgPointKind::Join, loop_.span, scope, BTreeSet::new());
+                }
+            }
+        }
+        if scope == ReferenceScopeId(0) {
+            for (output, value_point) in return_values.into_iter().enumerate() {
+                self.uncomputed_point(
+                    CfgPointKind::ReturnOutput {
+                        output,
+                        value_point,
+                        checked: matches!(
+                            block.final_output_values[output].ty,
+                            ScalarType::CheckedReference { .. }
+                        ),
+                    },
+                    block.final_output_values[output].span,
+                    scope,
+                );
+            }
+        }
+        self.point(CfgPointKind::ScopeExit, block.span, scope, BTreeSet::new());
+        if scope == ReferenceScopeId(0) && !block.final_output_values.is_empty() {
+            let return_span = ByteSpan::new(
+                block
+                    .final_output_values
+                    .first()
+                    .expect("output")
+                    .span
+                    .start,
+                block.final_output_values.last().expect("output").span.end,
+            );
+            if let Some(value) = &result {
+                match value {
+                    ReferenceValue::Checked(origins) => {
+                        self.point(CfgPointKind::Return, return_span, scope, origins.clone());
+                    }
+                    ReferenceValue::Uncomputed => {
+                        self.uncomputed_point(CfgPointKind::Return, return_span, scope);
+                    }
+                    ReferenceValue::Other => {
+                        self.point(CfgPointKind::Return, return_span, scope, BTreeSet::new());
+                    }
+                }
+            } else {
+                self.point(CfgPointKind::Return, return_span, scope, BTreeSet::new());
+            }
+        }
+        for (name, id, previous) in declared.into_iter().rev() {
+            self.origins.remove(&id);
+            self.checked.remove(&id);
+            self.binding_types.remove(&id);
+            if let Some(previous) = previous {
+                self.names.insert(name, previous);
+            } else {
+                self.names.remove(&name);
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Clone, Default, PartialEq)]
+struct ReferenceEdgeState {
+    bindings: BTreeMap<ReferenceBindingId, BTreeSet<ReferenceOriginId>>,
+    projected: Vec<ReferenceProjectedState>,
+    uninitialized: HashSet<ReferenceBindingId>,
+    value: Option<BTreeSet<ReferenceOriginId>>,
+    released: BTreeSet<ReferenceBindingId>,
+    invalidated: BTreeSet<ReferenceBindingId>,
+    point_values: Vec<Option<BTreeSet<ReferenceOriginId>>>,
+    return_outputs: BTreeMap<usize, BTreeSet<ReferenceOriginId>>,
+    moved: Vec<(ReferencePlaceId, SourceSpan)>,
+}
+
+#[derive(Clone, PartialEq)]
+struct ReferenceProjectedState {
+    place: ReferencePlaceId,
+    origins: BTreeSet<ReferenceOriginId>,
+    uninitialized: bool,
+}
+
+fn reference_places_same(left: &ReferencePlaceId, right: &ReferencePlaceId) -> bool {
+    left.binding == right.binding
+        && left.projections.len() == right.projections.len()
+        && left
+            .projections
+            .iter()
+            .zip(&right.projections)
+            .all(|(left, right)| match (left, right) {
+                (
+                    ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(left)),
+                    ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(right)),
+                ) => left == right,
+                (
+                    ReferencePlaceProjection::Index(ScalarExpression::Integer {
+                        value: left, ..
+                    }),
+                    ReferencePlaceProjection::Index(ScalarExpression::Integer {
+                        value: right, ..
+                    }),
+                ) => left == right,
+                (
+                    ReferencePlaceProjection::Dereference(left),
+                    ReferencePlaceProjection::Dereference(right),
+                ) => left == right,
+                _ => false,
+            })
+}
+
+fn available_place(place: &ReferencePlaceId) -> ReferencePlaceId {
+    let mut resolved = place.clone();
+    let mut projections = Vec::new();
+    for projection in &place.projections {
+        match projection {
+            ReferencePlaceProjection::Dereference(loan) => {
+                let owner = available_place(&loan.origin_place);
+                resolved.binding = owner.binding;
+                projections = owner.projections;
+            }
+            projection => projections.push(projection.clone()),
+        }
+    }
+    resolved.projections = projections;
+    resolved
+}
+
+fn unavailable_place(state: &ReferenceEdgeState, place: &ReferencePlaceId) -> bool {
+    let place = available_place(place);
+    state
+        .moved
+        .iter()
+        .any(|(moved, _)| reference_places_overlap(moved, &place))
+}
+
+fn unavailable_origins(state: &ReferenceEdgeState, place: &ReferencePlaceId) -> Vec<SourceSpan> {
+    let place = available_place(place);
+    state
+        .moved
+        .iter()
+        .filter(|(moved, _)| reference_places_overlap(moved, &place))
+        .map(|(_, origin)| origin.clone())
+        .collect()
+}
+
+fn reference_read_reachable(
+    points: &[ReferenceFlowPoint],
+    from: CfgPointId,
+    binding: &ReferenceBindingId,
+) -> bool {
+    let mut pending = points[from.0].successors.clone();
+    let mut visited = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id.0) {
+            continue;
+        }
+        if matches!(&points[id.0].kind, CfgPointKind::Read { binding: read } if read == binding) {
+            return true;
+        }
+        if matches!(&points[id.0].kind, CfgPointKind::Assign { target, .. } if target.binding == *binding && target.projections.is_empty())
+            || matches!(&points[id.0].kind, CfgPointKind::Bind { binding: bound } if bound == binding)
+            || matches!(&points[id.0].kind, CfgPointKind::ScopeExit if points[id.0].source_span.range == binding.block_span)
+        {
+            continue;
+        }
+        pending.extend(&points[id.0].successors);
+    }
+    false
+}
+
+fn loan_borrows_place(loan: &ReferenceLoanId, place: &ReferencePlaceId) -> bool {
+    reference_places_overlap(&available_place(&loan.origin_place), place)
+        || loan
+            .parent
+            .as_ref()
+            .is_some_and(|parent| loan_borrows_place(parent, place))
+}
+
+fn conflicting_live_loan(
+    points: &[ReferenceFlowPoint],
+    facts: &[ReferenceOrigin],
+    state: &ReferenceEdgeState,
+    point: CfgPointId,
+    place: &ReferencePlaceId,
+    consuming_origin: Option<ReferenceOriginId>,
+) -> Vec<SourceSpan> {
+    let place = available_place(place);
+    state
+        .bindings
+        .iter()
+        .filter(|(binding, _)| reference_read_reachable(points, point, binding))
+        .flat_map(|(_, origins)| origins.iter())
+        .filter_map(|origin| {
+            if Some(*origin) == consuming_origin {
+                return None;
+            }
+            match &facts[origin.0] {
+                ReferenceOrigin::Fresh { loan, .. }
+                | ReferenceOrigin::BorrowedFrom { loan, .. }
+                    if loan_borrows_place(loan, &place) =>
+                {
+                    Some(SourceSpan::new(
+                        loan.origin_place.source.clone(),
+                        loan.creation_span,
+                    ))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn write_projected_reference(
+    state: &mut ReferenceEdgeState,
+    place: &ReferencePlaceId,
+    origins: &BTreeSet<ReferenceOriginId>,
+) {
+    state
+        .projected
+        .retain(|known| !reference_places_overlap(&known.place, place));
+    state.projected.push(ReferenceProjectedState {
+        place: place.clone(),
+        origins: origins.clone(),
+        uninitialized: false,
+    });
+}
+
+fn transfer_reference_facts(
+    cfg: &mut ScalarReferenceCfg,
+    deferred_policies: &BTreeMap<usize, CopyPolicy>,
+    contracts: &[ConcreteReferenceOutputContract],
+) -> Vec<ReferenceAnalysisError> {
+    let original_points = cfg.points.clone();
+    let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
+    for point in &original_points {
+        let dependencies = match &point.kind {
+            CfgPointKind::Invalidate { address_point, .. }
+            | CfgPointKind::Release {
+                target: ReleaseTarget::Checked { address_point, .. },
+            } => vec![*address_point],
+            CfgPointKind::MoveThrough { pointer_point, .. }
+            | CfgPointKind::DeferredMoveThrough { pointer_point, .. } => vec![*pointer_point],
+            CfgPointKind::Assign { rhs_point, .. } => vec![*rhs_point],
+            CfgPointKind::ReturnOutput { value_point, .. } => vec![*value_point],
+            CfgPointKind::Call {
+                argument_points, ..
+            } => argument_points.clone(),
+            CfgPointKind::AssignThrough {
+                rhs_point,
+                pointer_point,
+                ..
+            } => {
+                vec![*rhs_point, *pointer_point]
+            }
+            CfgPointKind::ReadPlace { pointer_point, .. } => {
+                pointer_point.iter().copied().collect()
+            }
+            _ => Vec::new(),
+        };
+        for dependency in dependencies {
+            last_use[dependency.0] = point.id.0;
+        }
+    }
+    let mut observed = vec![None::<ReferenceFlowPoint>; cfg.points.len()];
+    let mut incoming = vec![Vec::<ReferenceEdgeState>::new(); cfg.points.len()];
+    incoming[0].push(ReferenceEdgeState {
+        point_values: vec![None; cfg.points.len()],
+        ..ReferenceEdgeState::default()
+    });
+    let mut visited = vec![Vec::<ReferenceEdgeState>::new(); cfg.points.len()];
+    let mut queued = vec![false; cfg.points.len()];
+    queued[0] = true;
+    let mut ready = std::collections::VecDeque::from([CfgPointId(0)]);
+    let mut errors = Vec::new();
+    while let Some(id) = ready.pop_front() {
+        queued[id.0] = false;
+        let multiple_paths = incoming[id.0].len() > 1;
+        for mut state in std::mem::take(&mut incoming[id.0]) {
+            if visited[id.0].contains(&state) {
+                continue;
+            }
+            visited[id.0].push(state.clone());
+            let mut move_alternatives = Vec::new();
+            cfg.points[id.0] = original_points[id.0].clone();
+            let invalidation_address = match &cfg.points[id.0].kind {
+                CfgPointKind::Invalidate {
+                    address_point,
+                    address_span,
+                    ..
+                } => Some((
+                    address_span.clone(),
+                    state.point_values[address_point.0].clone(),
+                )),
+                CfgPointKind::Release {
+                    target:
+                        ReleaseTarget::Checked {
+                            address_point,
+                            address_span,
+                            ..
+                        },
+                } => Some((
+                    address_span.clone(),
+                    state.point_values[address_point.0].clone(),
+                )),
+                _ => None,
+            };
+            let move_pointer = match &cfg.points[id.0].kind {
+                CfgPointKind::MoveThrough { pointer_point, .. }
+                | CfgPointKind::DeferredMoveThrough { pointer_point, .. } => {
+                    Some(state.point_values[pointer_point.0].clone())
+                }
+                _ => None,
+            };
+            let assignment_rhs = match &cfg.points[id.0].kind {
+                CfgPointKind::Assign { rhs_point, .. }
+                | CfgPointKind::AssignThrough { rhs_point, .. } => {
+                    Some(state.point_values[rhs_point.0].clone())
+                }
+                _ => None,
+            };
+            let assignment_pointer = match &cfg.points[id.0].kind {
+                CfgPointKind::AssignThrough { pointer_point, .. } => {
+                    Some(state.point_values[pointer_point.0].clone())
+                }
+                _ => None,
+            };
+            let place_read_pointer = match &cfg.points[id.0].kind {
+                CfgPointKind::ReadPlace { pointer_point, .. } => {
+                    pointer_point.map(|pointer_point| state.point_values[pointer_point.0].clone())
+                }
+                _ => None,
+            };
+            let call_origins = if let CfgPointKind::Call {
+                expression: ScalarExpression::Call { type_arguments, .. },
+                output,
+                target:
+                    ResolvedCallTarget::ModuleCallable {
+                        source,
+                        declaration_span,
+                        concrete,
+                    },
+                argument_points,
+                ..
+            } = &cfg.points[id.0].kind
+            {
+                let contract = contracts.iter().find(|contract| {
+                    contract.source == *source
+                        && contract.declaration_span == *declaration_span
+                        && contract.selection == *concrete
+                        && contract.type_arguments
+                            == type_arguments
+                                .iter()
+                                .map(|argument| argument.ty.clone())
+                                .collect::<Vec<_>>()
+                        && contract.output == *output
+                });
+                contract.map(|contract| {
+                    let mut results = BTreeSet::new();
+                    for origin in &contract.origins {
+                        let actual = match origin {
+                            ReferenceOrigin::BorrowedFrom { parameter, .. } => {
+                                if let Some(argument) = state.point_values[argument_points[*parameter].0].as_ref() {
+                                    results.extend(argument);
+                                } else {
+                                    errors.push(ReferenceAnalysisError::MissingContext {
+                                        source_span: cfg.points[id.0].source_span.clone(),
+                                        reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                                    });
+                                }
+                                continue;
+                            }
+                            ReferenceOrigin::Fresh { allocation, loan } => {
+                                let mut loan = loan.clone();
+                                let binding = ReferenceBindingId {
+                                    source: cfg.points[id.0].source_span.source.clone(),
+                                    function_span: cfg.points[0].source_span.range,
+                                    declaration_span: cfg.points[id.0].source_span.range,
+                                    block_span: cfg.points[0].source_span.range,
+                                    kind: ReferenceBindingKind::CallOutput {
+                                        point: id,
+                                        output: *output,
+                                    },
+                                };
+                                loan.origin_place.source = binding.source.clone();
+                                loan.origin_place.function_span = binding.function_span;
+                                loan.origin_place.declaration_span = binding.declaration_span;
+                                loan.origin_place.block_span = binding.block_span;
+                                loan.origin_place.binding = binding;
+                                loan.creation_span = cfg.points[id.0].source_span.range;
+                                ReferenceOrigin::Fresh {
+                                    allocation: allocation.clone(),
+                                    loan,
+                                }
+                            }
+                            ReferenceOrigin::Null { .. } => ReferenceOrigin::Null {
+                                span: cfg.points[id.0].source_span.range,
+                            },
+                            ReferenceOrigin::Invalid {
+                                origin_span,
+                                conflict_span,
+                            } => ReferenceOrigin::Invalid {
+                                origin_span: *origin_span,
+                                conflict_span: *conflict_span,
+                            },
+                        };
+                        let origin_id = if let Some(index) = cfg.facts.iter().position(|fact| fact == &actual) {
+                            ReferenceOriginId(index)
+                        } else {
+                            let index = cfg.facts.len();
+                            cfg.facts.push(actual);
+                            ReferenceOriginId(index)
+                        };
+                        results.insert(origin_id);
+                    }
+                    results
+                })
+            } else {
+                None
+            };
+            let point = &mut cfg.points[id.0];
+            if let Some(origins) = call_origins {
+                point.possible_origins = Some(origins);
+            }
+            if let CfgPointKind::ReadPlace {
+                place,
+                candidates,
+                reads_origin,
+                ..
+            } = &mut point.kind
+            {
+                if let Some(origins) = place_read_pointer {
+                    if let Some(origins) = origins.filter(|origins| !origins.is_empty()) {
+                        if !*reads_origin {
+                            point.possible_origins = Some(origins.clone());
+                        }
+                        for origin in origins {
+                            match &cfg.facts[origin.0] {
+                                ReferenceOrigin::Fresh { loan, .. }
+                                | ReferenceOrigin::BorrowedFrom { loan, .. } => {
+                                    let mut resolved = loan.origin_place.clone();
+                                    resolved.place = place.clone();
+                                    collect_reference_projections(
+                                        place,
+                                        Some(loan),
+                                        &mut resolved.projections,
+                                    );
+                                    candidates.push(resolved);
+                                }
+                                ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => {
+                                    if *reads_origin {
+                                        errors.push(ReferenceAnalysisError::MissingContext {
+                                            source_span: point.source_span.clone(),
+                                            reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        errors.push(ReferenceAnalysisError::MissingContext {
+                            source_span: point.source_span.clone(),
+                            reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                        });
+                    }
+                }
+            }
+            if let Some(origins) = assignment_pointer {
+                if let Some(origins) = origins.filter(|origins| !origins.is_empty()) {
+                    let CfgPointKind::AssignThrough {
+                        place, candidates, ..
+                    } = &mut point.kind
+                    else {
+                        unreachable!()
+                    };
+                    for origin in &origins {
+                        let loan = match &cfg.facts[origin.0] {
+                            ReferenceOrigin::Fresh { loan, .. }
+                            | ReferenceOrigin::BorrowedFrom { loan, .. } => loan,
+                            ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => {
+                                errors.push(ReferenceAnalysisError::MissingContext {
+                                source_span: point.source_span.clone(),
+                                reason:
+                                    ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                            });
+                                continue;
+                            }
+                        };
+                        let mut resolved_place = loan.origin_place.clone();
+                        resolved_place.place = place.clone();
+                        collect_reference_projections(place, None, &mut resolved_place.projections);
+                        candidates.push(InvalidationCandidate {
+                            origin: *origin,
+                            place: resolved_place,
+                            loan: loan.clone(),
+                        });
+                    }
+                } else {
+                    errors.push(ReferenceAnalysisError::MissingContext {
+                        source_span: point.source_span.clone(),
+                        reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                    });
+                }
+            }
+            if let Some(origins) = move_pointer {
+                match origins.filter(|origins| !origins.is_empty()) {
+                    Some(origins) => {
+                        let (place, ty) = match &point.kind {
+                            CfgPointKind::MoveThrough { place, ty, .. }
+                            | CfgPointKind::DeferredMoveThrough { place, ty, .. } => {
+                                (place.clone(), ty.clone())
+                            }
+                            _ => unreachable!(),
+                        };
+                        let mut candidates = Vec::new();
+                        for origin in &origins {
+                            let loan = match &cfg.facts[origin.0] {
+                                ReferenceOrigin::Fresh { loan, .. }
+                                | ReferenceOrigin::BorrowedFrom { loan, .. } => loan,
+                                ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => {
+                                    errors.push(ReferenceAnalysisError::MissingContext {
+                                    source_span: point.source_span.clone(),
+                                    reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                                });
+                                    continue;
+                                }
+                            };
+                            let mut resolved_place = loan.origin_place.clone();
+                            resolved_place.place = place.clone();
+                            collect_reference_projections(
+                                &place,
+                                Some(loan),
+                                &mut resolved_place.projections,
+                            );
+                            candidates.push(InvalidationCandidate {
+                                origin: *origin,
+                                place: resolved_place,
+                                loan: loan.clone(),
+                            });
+                        }
+                        let all_candidates_resolved = candidates.len() == origins.len();
+                        point.possible_origins = Some(origins);
+                        if !matches!(place, ScalarPlace::Dereference { .. })
+                            && candidates.len() == 1
+                            && all_candidates_resolved
+                            && !multiple_paths
+                            && matches!(point.kind, CfgPointKind::MoveThrough { .. })
+                        {
+                            let candidate = &candidates[0];
+                            point.kind = CfgPointKind::Move {
+                                place: candidate.place.clone(),
+                                ty,
+                                owner: candidate.place.binding.clone(),
+                            };
+                        } else if let CfgPointKind::MoveThrough {
+                            candidates: event_candidates,
+                            ..
+                        } = &mut point.kind
+                        {
+                            *event_candidates = candidates;
+                        } else if let CfgPointKind::DeferredMoveThrough {
+                            candidates: event_candidates,
+                            ..
+                        } = &mut point.kind
+                        {
+                            *event_candidates = candidates;
+                        }
+                    }
+                    None => errors.push(ReferenceAnalysisError::MissingContext {
+                        source_span: point.source_span.clone(),
+                        reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                    }),
+                }
+            }
+            if let Some((address_span, origins)) = invalidation_address {
+                if let Some(origins) = origins.filter(|origins| !origins.is_empty()) {
+                    let mut candidates = Vec::new();
+                    for origin in &origins {
+                        let loan = match &cfg.facts[origin.0] {
+                            ReferenceOrigin::Fresh { loan, .. }
+                            | ReferenceOrigin::BorrowedFrom { loan, .. } => loan,
+                            ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => {
+                                errors.push(ReferenceAnalysisError::MissingContext {
+                                source_span: address_span.clone(),
+                                reason:
+                                    ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                            });
+                                continue;
+                            }
+                        };
+                        candidates.push(InvalidationCandidate {
+                            origin: *origin,
+                            place: loan.origin_place.clone(),
+                            loan: loan.clone(),
+                        });
+                    }
+                    if let CfgPointKind::Invalidate {
+                        candidates: event_candidates,
+                        ..
+                    } = &mut point.kind
+                    {
+                        *event_candidates = candidates;
+                    } else if let CfgPointKind::Release {
+                        target:
+                            ReleaseTarget::Checked {
+                                candidates: event_candidates,
+                                ..
+                            },
+                    } = &mut point.kind
+                    {
+                        *event_candidates = candidates;
+                    }
+                    point.possible_origins = Some(origins);
+                } else {
+                    errors.push(ReferenceAnalysisError::MissingContext {
+                        source_span: address_span,
+                        reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                    });
+                }
+            }
+            let affected = match &point.kind {
+                CfgPointKind::Invalidate { candidates, .. } => Some(candidates.as_slice()),
+                CfgPointKind::Release {
+                    target: ReleaseTarget::Checked { candidates, .. },
+                } => Some(candidates.as_slice()),
+                _ => None,
+            };
+            if let Some(candidates) = affected {
+                for candidate in candidates {
+                    let origins = conflicting_live_loan(
+                        &original_points,
+                        &cfg.facts,
+                        &state,
+                        id,
+                        &candidate.place,
+                        Some(candidate.origin),
+                    );
+                    if !origins.is_empty() {
+                        errors.push(ReferenceAnalysisError::ConflictingPlace {
+                            source_span: point.source_span.clone(),
+                            origins,
+                        });
+                    }
+                }
+                if let CfgPointKind::Invalidate { operation, .. } = &point.kind {
+                    for binding in candidates.iter().map(|candidate| &candidate.place.binding) {
+                        match operation {
+                            CoreOperationId::Invalidate => {
+                                state.invalidated.insert(binding.clone());
+                            }
+                            CoreOperationId::Rebind => {
+                                state.invalidated.remove(binding);
+                            }
+                            _ => unreachable!("resolved invalidation operation"),
+                        }
+                    }
+                }
+                if let CfgPointKind::Release {
+                    target: ReleaseTarget::Checked { address_span, .. },
+                } = &point.kind
+                {
+                    for binding in candidates
+                        .iter()
+                        .map(|candidate| &candidate.place.binding)
+                        .collect::<BTreeSet<_>>()
+                    {
+                        if !cfg.allocations.contains(binding) {
+                            errors.push(ReferenceAnalysisError::MissingContext {
+                                source_span: address_span.clone(),
+                                reason:
+                                    ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                            });
+                        } else if !state.released.insert(binding.clone()) {
+                            errors.push(ReferenceAnalysisError::MissingContext {
+                                source_span: point.source_span.clone(),
+                                reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                            });
+                        }
+                    }
+                }
+                for origins in state.bindings.values_mut() {
+                    origins.retain(|origin| {
+                        let place = match &cfg.facts[origin.0] {
+                            ReferenceOrigin::Fresh { loan, .. }
+                            | ReferenceOrigin::BorrowedFrom { loan, .. } => &loan.origin_place,
+                            ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => {
+                                return true;
+                            }
+                        };
+                        !candidates.iter().any(|candidate| {
+                            place.binding == candidate.place.binding
+                                && place.projections.starts_with(&candidate.place.projections)
+                        })
+                    });
+                }
+                state.projected.retain(|known| {
+                    !candidates
+                        .iter()
+                        .any(|candidate| reference_places_overlap(&known.place, &candidate.place))
+                });
+            }
+            if let CfgPointKind::Release {
+                target: ReleaseTarget::Raw { binding },
+            } = &point.kind
+            {
+                if !state.released.insert(binding.clone()) {
+                    errors.push(ReferenceAnalysisError::MissingContext {
+                        source_span: point.source_span.clone(),
+                        reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                    });
+                }
+                for origins in state.bindings.values_mut() {
+                    origins.retain(|origin| match &cfg.facts[origin.0] {
+                        ReferenceOrigin::Fresh { loan, .. }
+                        | ReferenceOrigin::BorrowedFrom { loan, .. } => {
+                            &loan.origin_place.binding != binding
+                        }
+                        ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => true,
+                    });
+                }
+                state
+                    .projected
+                    .retain(|known| &known.place.binding != binding);
+            }
+            if let CfgPointKind::Assign {
+                target,
+                previous_origins,
+                previous_loans,
+                ..
+            } = &mut point.kind
+            {
+                *previous_origins = if target.projections.is_empty() {
+                    state
+                        .bindings
+                        .get(&target.binding)
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    state
+                        .bindings
+                        .values()
+                        .flat_map(|origins| origins.iter().copied())
+                        .filter(|origin| match &cfg.facts[origin.0] {
+                            ReferenceOrigin::Fresh { loan, .. }
+                            | ReferenceOrigin::BorrowedFrom { loan, .. } => {
+                                reference_places_overlap(&loan.origin_place, target)
+                            }
+                            ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
+                        })
+                        .collect()
+                };
+                *previous_loans = previous_origins
+                    .iter()
+                    .filter_map(|origin| match &cfg.facts[origin.0] {
+                        ReferenceOrigin::Fresh { loan, .. }
+                        | ReferenceOrigin::BorrowedFrom { loan, .. } => Some(loan.clone()),
+                        ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => None,
+                    })
+                    .collect();
+            }
+            if let CfgPointKind::AssignThrough {
+                candidates,
+                previous_origins,
+                previous_loans,
+                ..
+            } = &mut point.kind
+            {
+                *previous_origins = state
+                    .bindings
+                    .values()
+                    .flat_map(|origins| origins.iter().copied())
+                    .filter(|origin| match &cfg.facts[origin.0] {
+                        ReferenceOrigin::Fresh { loan, .. }
+                        | ReferenceOrigin::BorrowedFrom { loan, .. } => {
+                            !candidates
+                                .iter()
+                                .any(|candidate| candidate.origin == *origin)
+                                && candidates.iter().any(|candidate| {
+                                    reference_places_overlap(&loan.origin_place, &candidate.place)
+                                })
+                        }
+                        ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
+                    })
+                    .collect();
+                *previous_loans = previous_origins
+                    .iter()
+                    .filter_map(|origin| match &cfg.facts[origin.0] {
+                        ReferenceOrigin::Fresh { loan, .. }
+                        | ReferenceOrigin::BorrowedFrom { loan, .. } => Some(loan.clone()),
+                        ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => None,
+                    })
+                    .collect();
+            }
+            let read_places = match &point.kind {
+                CfgPointKind::ReadPlace { candidates, .. } => candidates.as_slice(),
+                _ => &[],
+            };
+            for place in read_places {
+                if unavailable_place(&state, place)
+                    || state.released.contains(&place.binding)
+                    || state.invalidated.contains(&place.binding)
+                {
+                    errors.push(ReferenceAnalysisError::ConflictingPlace {
+                        source_span: point.source_span.clone(),
+                        origins: unavailable_origins(&state, place),
+                    });
+                }
+            }
+            match &point.kind {
+                CfgPointKind::Move {
+                    place,
+                    ty:
+                        ScalarType::Struct(_)
+                        | ScalarType::Array { .. }
+                        | ScalarType::RuntimeArray { .. },
+                    ..
+                }
+                | CfgPointKind::DeferredMove { place, .. }
+                    if matches!(point.kind, CfgPointKind::Move { .. })
+                        || deferred_policies.get(&id.0) == Some(&CopyPolicy::Move) =>
+                {
+                    let place = available_place(place);
+                    let mut origins = unavailable_origins(&state, &place);
+                    origins.extend(conflicting_live_loan(
+                        &original_points,
+                        &cfg.facts,
+                        &state,
+                        id,
+                        &place,
+                        None,
+                    ));
+                    if !origins.is_empty() {
+                        errors.push(ReferenceAnalysisError::ConflictingPlace {
+                            source_span: point.source_span.clone(),
+                            origins,
+                        });
+                    }
+                    if !state.moved.iter().any(|(moved, _)| moved == &place) {
+                        state.moved.push((place, point.source_span.clone()));
+                    }
+                }
+                CfgPointKind::MoveThrough { candidates, .. }
+                | CfgPointKind::DeferredMoveThrough { candidates, .. }
+                    if matches!(point.kind, CfgPointKind::MoveThrough { .. })
+                        || deferred_policies.get(&id.0) == Some(&CopyPolicy::Move) =>
+                {
+                    for candidate in candidates {
+                        let place = available_place(&candidate.place);
+                        let mut origins = unavailable_origins(&state, &place);
+                        origins.extend(conflicting_live_loan(
+                            &original_points,
+                            &cfg.facts,
+                            &state,
+                            id,
+                            &place,
+                            Some(candidate.origin),
+                        ));
+                        if !origins.is_empty() {
+                            errors.push(ReferenceAnalysisError::ConflictingPlace {
+                                source_span: point.source_span.clone(),
+                                origins,
+                            });
+                        }
+                        if !move_alternatives.iter().any(|(moved, _)| moved == &place) {
+                            move_alternatives.push((
+                                place,
+                                SourceSpan::new(
+                                    candidate.place.source.clone(),
+                                    candidate.loan.creation_span,
+                                ),
+                            ));
+                        }
+                    }
+                }
+                CfgPointKind::Assign { target, .. } => {
+                    let target = available_place(target);
+                    if !target.projections.is_empty() {
+                        let origins = conflicting_live_loan(
+                            &original_points,
+                            &cfg.facts,
+                            &state,
+                            id,
+                            &target,
+                            None,
+                        );
+                        if !origins.is_empty() {
+                            errors.push(ReferenceAnalysisError::ConflictingPlace {
+                                source_span: point.source_span.clone(),
+                                origins,
+                            });
+                        }
+                    }
+                    state.moved.retain(|(moved, _)| {
+                        moved.binding != target.binding
+                            || !moved.projections.starts_with(&target.projections)
+                    });
+                }
+                CfgPointKind::AssignThrough { candidates, .. } => {
+                    for candidate in candidates {
+                        let target = available_place(&candidate.place);
+                        let origins = conflicting_live_loan(
+                            &original_points,
+                            &cfg.facts,
+                            &state,
+                            id,
+                            &target,
+                            Some(candidate.origin),
+                        );
+                        if !origins.is_empty() {
+                            errors.push(ReferenceAnalysisError::ConflictingPlace {
+                                source_span: point.source_span.clone(),
+                                origins,
+                            });
+                        }
+                        state.moved.retain(|(moved, _)| {
+                            moved.binding != target.binding
+                                || !moved.projections.starts_with(&target.projections)
+                        });
+                    }
+                }
+                _ => {}
+            }
+            let checked_value = match &point.kind {
+                CfgPointKind::ReturnOutput { value_point, .. } => {
+                    state.point_values[value_point.0].clone()
+                }
+                CfgPointKind::ReadPlace {
+                    reads_origin: false,
+                    ..
+                } => None,
+                CfgPointKind::ReadPlace {
+                    candidates,
+                    reads_origin: true,
+                    ..
+                } => {
+                    let mut read = BTreeSet::new();
+                    for candidate in candidates {
+                        let matching = state
+                            .projected
+                            .iter()
+                            .filter(|known| {
+                                reference_places_same(&known.place, candidate)
+                                    && !known.uninitialized
+                            })
+                            .collect::<Vec<_>>();
+                        if matching.is_empty() {
+                            errors.push(ReferenceAnalysisError::MissingOrigin {
+                                source_span: point.source_span.clone(),
+                                binding_id: candidate.binding.clone(),
+                                reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                            });
+                        }
+                        for known in matching {
+                            read.extend(&known.origins);
+                        }
+                    }
+                    if read.is_empty() {
+                        None
+                    } else {
+                        Some(read)
+                    }
+                }
+                CfgPointKind::Read { binding } => {
+                    if state
+                        .moved
+                        .iter()
+                        .any(|(place, _)| &place.binding == binding)
+                    {
+                        errors.push(ReferenceAnalysisError::ConflictingPlace {
+                            source_span: point.source_span.clone(),
+                            origins: state
+                                .moved
+                                .iter()
+                                .filter(|(place, _)| &place.binding == binding)
+                                .map(|(_, origin)| origin.clone())
+                                .collect(),
+                        });
+                    }
+                    if state.released.contains(binding) || state.invalidated.contains(binding) {
+                        errors.push(ReferenceAnalysisError::MissingOrigin {
+                            source_span: point.source_span.clone(),
+                            binding_id: binding.clone(),
+                            reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                        });
+                    }
+                    if point
+                        .possible_origins
+                        .as_ref()
+                        .is_some_and(BTreeSet::is_empty)
+                    {
+                        None
+                    } else {
+                        match state.bindings.get(binding).filter(|origins| {
+                            !origins.is_empty() && !state.uninitialized.contains(binding)
+                        }) {
+                            Some(origins) => Some(origins.clone()),
+                            None => {
+                                errors.push(ReferenceAnalysisError::MissingOrigin {
+                                    source_span: point.source_span.clone(),
+                                    binding_id: binding.clone(),
+                                    reason:
+                                        ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                                });
+                                None
+                            }
+                        }
+                    }
+                }
+                CfgPointKind::Bind { binding }
+                    if point.possible_origins.is_none()
+                        || point
+                            .possible_origins
+                            .as_ref()
+                            .is_some_and(|set| !set.is_empty()) =>
+                {
+                    let rhs = if point.possible_origins.is_none() {
+                        state.value.as_ref()
+                    } else {
+                        point.possible_origins.as_ref()
+                    };
+                    match rhs.filter(|origins| !origins.is_empty()) {
+                        Some(origins) => {
+                            let origins = origins.clone();
+                            state.bindings.insert(binding.clone(), origins.clone());
+                            state.uninitialized.remove(binding);
+                            Some(origins)
+                        }
+                        None => {
+                            errors.push(ReferenceAnalysisError::MissingOrigin {
+                                source_span: point.source_span.clone(),
+                                binding_id: binding.clone(),
+                                reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                            });
+                            None
+                        }
+                    }
+                }
+                CfgPointKind::Assign {
+                    target,
+                    previous_origins,
+                    ..
+                } => {
+                    let binding = &target.binding;
+                    if target.projections.is_empty() {
+                        state.bindings.remove(binding);
+                        state
+                            .projected
+                            .retain(|known| &known.place.binding != binding);
+                        state.uninitialized.remove(binding);
+                        state.released.remove(binding);
+                        state.invalidated.remove(binding);
+                    } else {
+                        for origins in state.bindings.values_mut() {
+                            origins.retain(|origin| !previous_origins.contains(origin));
+                        }
+                        state
+                            .projected
+                            .retain(|known| !reference_places_overlap(&known.place, target));
+                    }
+                    if point.possible_origins.is_none()
+                        || point
+                            .possible_origins
+                            .as_ref()
+                            .is_some_and(|set| !set.is_empty())
+                    {
+                        match assignment_rhs
+                            .flatten()
+                            .filter(|origins| !origins.is_empty())
+                        {
+                            Some(origins) => {
+                                if target.projections.is_empty() {
+                                    state.bindings.insert(binding.clone(), origins.clone());
+                                } else {
+                                    write_projected_reference(&mut state, target, &origins);
+                                }
+                                Some(origins)
+                            }
+                            None => {
+                                errors.push(ReferenceAnalysisError::MissingOrigin {
+                                    source_span: point.source_span.clone(),
+                                    binding_id: binding.clone(),
+                                    reason:
+                                        ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                                });
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                }
+                CfgPointKind::AssignThrough {
+                    candidates,
+                    previous_origins,
+                    ..
+                } => {
+                    for origins in state.bindings.values_mut() {
+                        origins.retain(|origin| !previous_origins.contains(origin));
+                    }
+                    let rhs = assignment_rhs
+                        .flatten()
+                        .filter(|origins| !origins.is_empty());
+                    for candidate in candidates {
+                        state.projected.retain(|known| {
+                            !reference_places_overlap(&known.place, &candidate.place)
+                        });
+                    }
+                    if point
+                        .possible_origins
+                        .as_ref()
+                        .is_none_or(|origins| !origins.is_empty())
+                    {
+                        if let Some(origins) = &rhs {
+                            for candidate in candidates {
+                                write_projected_reference(&mut state, &candidate.place, origins);
+                            }
+                        } else {
+                            errors.push(ReferenceAnalysisError::MissingContext {
+                                source_span: point.source_span.clone(),
+                                reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                            });
+                        }
+                    }
+                    rhs
+                }
+                CfgPointKind::Evaluate(_)
+                | CfgPointKind::Borrow { .. }
+                | CfgPointKind::Call { .. } => {
+                    if let CfgPointKind::Borrow { place, .. } = &point.kind {
+                        if state.released.contains(&place.binding) {
+                            errors.push(ReferenceAnalysisError::MissingContext {
+                                source_span: point.source_span.clone(),
+                                reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                            });
+                        }
+                    }
+                    if point.possible_origins.is_none() {
+                        state.value.clone()
+                    } else {
+                        point.possible_origins.clone().filter(|set| !set.is_empty())
+                    }
+                }
+                CfgPointKind::Join if point.possible_origins.is_none() => state.value.clone(),
+                CfgPointKind::Return => Some(
+                    state
+                        .return_outputs
+                        .values()
+                        .flat_map(|origins| origins.iter().copied())
+                        .collect(),
+                ),
+                _ => None,
+            };
+            if matches!(point.kind, CfgPointKind::ReturnOutput { checked: true, .. })
+                && checked_value.as_ref().is_none_or(BTreeSet::is_empty)
+            {
+                errors.push(ReferenceAnalysisError::MissingContext {
+                    source_span: point.source_span.clone(),
+                    reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                });
+            }
+            if let (CfgPointKind::ReturnOutput { checked: true, .. }, Some(origins)) =
+                (&point.kind, &checked_value)
+            {
+                for origin in origins {
+                    let loan = match &cfg.facts[origin.0] {
+                        ReferenceOrigin::Fresh { loan, .. }
+                        | ReferenceOrigin::BorrowedFrom { loan, .. } => loan,
+                        ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => continue,
+                    };
+                    if unavailable_place(&state, &loan.origin_place)
+                        || state.released.contains(&loan.origin_place.binding)
+                        || state.invalidated.contains(&loan.origin_place.binding)
+                    {
+                        errors.push(ReferenceAnalysisError::ConflictingPlace {
+                            source_span: point.source_span.clone(),
+                            origins: vec![SourceSpan::new(
+                                loan.origin_place.source.clone(),
+                                loan.creation_span,
+                            )],
+                        });
+                    }
+                }
+            }
+            if let (CfgPointKind::ReturnOutput { output, .. }, Some(origins)) =
+                (&point.kind, &checked_value)
+            {
+                if !origins.is_empty() {
+                    state.return_outputs.insert(*output, origins.clone());
+                }
+            }
+            if matches!(
+                point.kind,
+                CfgPointKind::Read { .. }
+                    | CfgPointKind::ReadPlace {
+                        reads_origin: true,
+                        ..
+                    }
+                    | CfgPointKind::Bind { .. }
+                    | CfgPointKind::Assign { .. }
+                    | CfgPointKind::AssignThrough { .. }
+                    | CfgPointKind::ReturnOutput { .. }
+                    | CfgPointKind::Return
+            ) || point.possible_origins.is_none()
+            {
+                point.possible_origins = checked_value.clone();
+            }
+            match &point.kind {
+                CfgPointKind::ScopeExit => {
+                    state
+                        .bindings
+                        .retain(|binding, _| binding.block_span != point.source_span.range);
+                    state
+                        .uninitialized
+                        .retain(|binding| binding.block_span != point.source_span.range);
+                    state
+                        .moved
+                        .retain(|(place, _)| place.binding.block_span != point.source_span.range);
+                    state
+                        .released
+                        .retain(|binding| binding.block_span != point.source_span.range);
+                    state
+                        .invalidated
+                        .retain(|binding| binding.block_span != point.source_span.range);
+                    state
+                        .projected
+                        .retain(|known| known.place.binding.block_span != point.source_span.range);
+                }
+                CfgPointKind::Read { .. }
+                | CfgPointKind::ReadPlace { .. }
+                | CfgPointKind::Join
+                | CfgPointKind::Evaluate(_)
+                | CfgPointKind::Call { .. }
+                | CfgPointKind::Borrow { .. }
+                | CfgPointKind::Bind { .. }
+                | CfgPointKind::Assign { .. } => state.value = checked_value,
+                CfgPointKind::AssignThrough { .. } => state.value = checked_value,
+                _ => {}
+            }
+            state.point_values[id.0] = point.possible_origins.clone();
+            for (index, value) in state.point_values.iter_mut().enumerate().take(id.0 + 1) {
+                if last_use[index] <= id.0 {
+                    *value = None;
+                }
+            }
+            if let Some(previous) = &mut observed[id.0] {
+                if let Some(origins) = &point.possible_origins {
+                    previous
+                        .possible_origins
+                        .get_or_insert_with(BTreeSet::new)
+                        .extend(origins);
+                }
+                match (&mut previous.kind, &point.kind) {
+                    (
+                        CfgPointKind::Release {
+                            target:
+                                ReleaseTarget::Checked {
+                                    candidates: known, ..
+                                },
+                        },
+                        CfgPointKind::Release {
+                            target: ReleaseTarget::Checked { candidates, .. },
+                        },
+                    )
+                    | (
+                        CfgPointKind::Invalidate {
+                            candidates: known, ..
+                        },
+                        CfgPointKind::Invalidate { candidates, .. },
+                    )
+                    | (
+                        CfgPointKind::AssignThrough {
+                            candidates: known, ..
+                        },
+                        CfgPointKind::AssignThrough { candidates, .. },
+                    )
+                    | (
+                        CfgPointKind::MoveThrough {
+                            candidates: known, ..
+                        },
+                        CfgPointKind::MoveThrough { candidates, .. },
+                    )
+                    | (
+                        CfgPointKind::DeferredMoveThrough {
+                            candidates: known, ..
+                        },
+                        CfgPointKind::DeferredMoveThrough { candidates, .. },
+                    ) => {
+                        for candidate in candidates {
+                            if !known.contains(candidate) {
+                                known.push(candidate.clone());
+                            }
+                        }
+                    }
+                    (
+                        CfgPointKind::ReadPlace {
+                            candidates: known, ..
+                        },
+                        CfgPointKind::ReadPlace { candidates, .. },
+                    ) => {
+                        for candidate in candidates {
+                            if !known.contains(candidate) {
+                                known.push(candidate.clone());
+                            }
+                        }
+                    }
+                    (
+                        CfgPointKind::Assign {
+                            previous_origins: known,
+                            previous_loans: loans,
+                            ..
+                        },
+                        CfgPointKind::Assign {
+                            previous_origins,
+                            previous_loans,
+                            ..
+                        },
+                    ) => {
+                        known.extend(previous_origins);
+                        for loan in previous_loans {
+                            if !loans.contains(loan) {
+                                loans.push(loan.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if let (
+                    CfgPointKind::AssignThrough {
+                        previous_origins: known,
+                        previous_loans: loans,
+                        ..
+                    },
+                    CfgPointKind::AssignThrough {
+                        previous_origins,
+                        previous_loans,
+                        ..
+                    },
+                ) = (&mut previous.kind, &point.kind)
+                {
+                    known.extend(previous_origins);
+                    for loan in previous_loans {
+                        if !loans.contains(loan) {
+                            loans.push(loan.clone());
+                        }
+                    }
+                }
+            } else {
+                observed[id.0] = Some(point.clone());
+            }
+            for successor in &point.successors {
+                let slot = &mut incoming[successor.0];
+                if move_alternatives.is_empty() {
+                    let mut next = state.clone();
+                    if successor.0 <= id.0 {
+                        next.point_values[successor.0..].fill(None);
+                    }
+                    if !visited[successor.0].contains(&next) && !slot.contains(&next) {
+                        slot.push(next);
+                    }
+                } else {
+                    for (place, origin) in &move_alternatives {
+                        let mut next = state.clone();
+                        if !next.moved.iter().any(|(moved, _)| moved == place) {
+                            next.moved.push((place.clone(), origin.clone()));
+                        }
+                        if successor.0 <= id.0 {
+                            next.point_values[successor.0..].fill(None);
+                        }
+                        if !visited[successor.0].contains(&next) && !slot.contains(&next) {
+                            slot.push(next);
+                        }
+                    }
+                }
+                if !slot.is_empty() && !queued[successor.0] {
+                    queued[successor.0] = true;
+                    ready.push_back(*successor);
+                }
+            }
+        }
+    }
+    for (point, observed) in cfg.points.iter_mut().zip(observed) {
+        if let Some(observed) = observed {
+            *point = observed;
+        }
+    }
+    let mut unique = Vec::new();
+    for error in errors {
+        if !unique.contains(&error) {
+            unique.push(error);
+        }
+    }
+    unique
+}
+
+fn reference_root(place: &ScalarPlace) -> &ScalarPlace {
+    match place {
+        ScalarPlace::Name { .. } | ScalarPlace::Dereference { .. } => place,
+        ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } => reference_root(base),
+    }
+}
+
+fn collect_reference_projections(
+    place: &ScalarPlace,
+    parent: Option<&ReferenceLoanId>,
+    projections: &mut Vec<ReferencePlaceProjection>,
+) {
+    match place {
+        ScalarPlace::Name { .. } => {}
+        ScalarPlace::Dereference { .. } => {
+            if let Some(parent) = parent {
+                projections.push(ReferencePlaceProjection::Dereference(Box::new(
+                    parent.clone(),
+                )));
+            }
+        }
+        ScalarPlace::Field { base, field, .. } => {
+            collect_reference_projections(base, parent, projections);
+            projections.push(ReferencePlaceProjection::Field(field.clone()));
+        }
+        ScalarPlace::Index { base, index, .. } => {
+            collect_reference_projections(base, parent, projections);
+            projections.push(ReferencePlaceProjection::Index(*index.clone()));
+        }
+    }
+}
+
+fn reference_places_overlap(left: &ReferencePlaceId, right: &ReferencePlaceId) -> bool {
+    if left.binding != right.binding {
+        return false;
+    }
+    for (left, right) in left.projections.iter().zip(&right.projections) {
+        match (left, right) {
+            (
+                ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(left)),
+                ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(right)),
+            ) if left != right => return false,
+            (
+                ReferencePlaceProjection::Index(ScalarExpression::Integer { value: left, .. }),
+                ReferencePlaceProjection::Index(ScalarExpression::Integer { value: right, .. }),
+            ) if left != right => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+struct ValidatedCallResolver<'a> {
+    source: &'a SourceIdentity,
+    function_span: ByteSpan,
+    module_callables: &'a BTreeMap<(Option<String>, String), (SourceIdentity, ByteSpan)>,
+    extern_callables: &'a BTreeMap<(String, String), (SourceIdentity, ByteSpan)>,
+    modules: &'a [ScalarModule],
+    sites: Vec<ResolvedCallSite>,
+}
+
+impl ValidatedCallResolver<'_> {
+    fn expression(
+        &mut self,
+        expression: &ScalarExpression,
+        names: &BTreeMap<String, ReferenceBindingId>,
+        types: &BTreeMap<String, ScalarType>,
+    ) -> Result<(), ReferenceAnalysisError> {
+        match expression {
+            ScalarExpression::Call {
+                receiver,
+                receiver_span,
+                name,
+                arguments,
+                overload_selection,
+                span,
+                ..
+            } => {
+                let target = if receiver.as_deref() == Some("core") {
+                    CoreOperationId::from_name(name).map(ResolvedCallTarget::Core)
+                } else if receiver.is_none() {
+                    names
+                        .get(name)
+                        .cloned()
+                        .map(ResolvedCallTarget::LocalCallable)
+                        .or_else(|| {
+                            self.module_callables.get(&(None, name.clone())).map(
+                                |(source, declaration_span)| ResolvedCallTarget::ModuleCallable {
+                                    source: source.clone(),
+                                    declaration_span: *declaration_span,
+                                    concrete: match overload_selection {
+                                        Some(selection) => {
+                                            ConcreteCallSelection::Overload(selection.clone())
+                                        }
+                                        None => ConcreteCallSelection::Declaration,
+                                    },
+                                },
+                            )
+                        })
+                } else if let Some(receiver_type) =
+                    receiver.as_ref().and_then(|binding| types.get(binding))
+                {
+                    let ScalarType::Struct(id) = receiver_type else {
+                        return Err(ReferenceAnalysisError::MissingContext {
+                            source_span: SourceSpan::new(self.source.clone(), *span),
+                            reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
+                        });
+                    };
+                    let field = self
+                        .modules
+                        .iter()
+                        .find_map(|module| {
+                            module.structs.iter().find(|structure| structure.id == *id)
+                        })
+                        .and_then(|structure| {
+                            resolved_struct_field(
+                                receiver_type,
+                                name,
+                                std::slice::from_ref(structure),
+                            )
+                        })
+                        .expect("validated callable field");
+                    let binding_name = receiver.as_ref().expect("typed field receiver");
+                    let binding = names.get(binding_name).expect("validated receiver binding");
+                    let receiver_span = receiver_span.expect("validated receiver source span");
+                    Some(ResolvedCallTarget::CallableField {
+                        receiver_place: ReferencePlaceId {
+                            source: self.source.clone(),
+                            function_span: self.function_span,
+                            declaration_span: binding.declaration_span,
+                            block_span: binding.block_span,
+                            binding: binding.clone(),
+                            projections: Vec::new(),
+                            place: ScalarPlace::Name {
+                                name: binding_name.clone(),
+                                span: receiver_span,
+                            },
+                        },
+                        field: field.id.clone(),
+                    })
+                } else {
+                    self.module_callables
+                        .get(&(receiver.clone(), name.clone()))
+                        .map(
+                            |(source, declaration_span)| ResolvedCallTarget::ModuleCallable {
+                                source: source.clone(),
+                                declaration_span: *declaration_span,
+                                concrete: match overload_selection {
+                                    Some(selection) => {
+                                        ConcreteCallSelection::Overload(selection.clone())
+                                    }
+                                    None => ConcreteCallSelection::Declaration,
+                                },
+                            },
+                        )
+                        .or_else(|| {
+                            self.extern_callables
+                                .get(&(receiver.clone().expect("qualified call"), name.clone()))
+                                .map(|(source, declaration_span)| {
+                                    ResolvedCallTarget::ExternCallable {
+                                        source: source.clone(),
+                                        declaration_span: *declaration_span,
+                                    }
+                                })
+                        })
+                };
+                let target = target.ok_or_else(|| ReferenceAnalysisError::MissingContext {
+                    source_span: SourceSpan::new(self.source.clone(), *span),
+                    reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
+                })?;
+                let site = ResolvedCallSite {
+                    source_span: SourceSpan::new(self.source.clone(), *span),
+                    target,
+                };
+                if let Some(existing) = self
+                    .sites
+                    .iter()
+                    .find(|existing| existing.source_span == site.source_span)
+                {
+                    if existing.target != site.target {
+                        return Err(ReferenceAnalysisError::MissingContext {
+                            source_span: site.source_span,
+                            reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
+                        });
+                    }
+                } else {
+                    self.sites.push(site);
+                }
+                for argument in arguments {
+                    self.expression(argument, names, types)?;
+                }
+            }
+            ScalarExpression::Binary { left, right, .. } => {
+                self.expression(left, names, types)?;
+                self.expression(right, names, types)?;
+            }
+            ScalarExpression::Unary { operand, .. } => self.expression(operand, names, types)?,
+            ScalarExpression::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.expression(condition, names, types)?;
+                self.block(then_branch, names, types)?;
+                self.block(else_branch, names, types)?;
+            }
+            ScalarExpression::UnitIf {
+                condition,
+                then_branch,
+                ..
+            } => {
+                self.expression(condition, names, types)?;
+                self.block(then_branch, names, types)?;
+            }
+            ScalarExpression::Block(block) => self.block(block, names, types)?,
+            ScalarExpression::RawAddress { place, .. }
+            | ScalarExpression::CheckedAddress { place, .. }
+            | ScalarExpression::Dereference { place, .. }
+            | ScalarExpression::IndexedRead { place, .. } => self.place(place, names, types)?,
+            ScalarExpression::StructLiteral { fields, .. } => {
+                for field in fields {
+                    self.expression(&field.value, names, types)?;
+                }
+            }
+            ScalarExpression::ArrayLiteral { elements, .. } => {
+                for element in elements {
+                    self.expression(element, names, types)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn place(
+        &mut self,
+        place: &ScalarPlace,
+        names: &BTreeMap<String, ReferenceBindingId>,
+        types: &BTreeMap<String, ScalarType>,
+    ) -> Result<(), ReferenceAnalysisError> {
+        match place {
+            ScalarPlace::Name { .. } => {}
+            ScalarPlace::Field { base, .. } => self.place(base, names, types)?,
+            ScalarPlace::Index { base, index, .. } => {
+                self.place(base, names, types)?;
+                self.expression(index, names, types)?;
+            }
+            ScalarPlace::Dereference { pointer, .. } => self.expression(pointer, names, types)?,
+        }
+        Ok(())
+    }
+
+    fn block(
+        &mut self,
+        block: &ScalarBlock,
+        outer: &BTreeMap<String, ReferenceBindingId>,
+        outer_types: &BTreeMap<String, ScalarType>,
+    ) -> Result<(), ReferenceAnalysisError> {
+        let mut names = outer.clone();
+        let mut types = outer_types.clone();
+        for item in &block.items {
+            match item {
+                ScalarBlockItem::LocalBinding(binding) => {
+                    self.expression(&binding.value, &names, &types)?;
+                    if binding.output_origin == ScalarBindingOutputOrigin::IndependentExpressions {
+                        for output in binding.output_values.iter().skip(1) {
+                            self.expression(&output.value, &names, &types)?;
+                        }
+                    }
+                    for receiver in &binding.receivers {
+                        types.insert(receiver.name.clone(), receiver.ty.clone());
+                        names.insert(
+                            receiver.name.clone(),
+                            ReferenceBindingId {
+                                source: self.source.clone(),
+                                function_span: self.function_span,
+                                declaration_span: receiver.name_span,
+                                block_span: block.span,
+                                kind: ReferenceBindingKind::Declared,
+                            },
+                        );
+                    }
+                }
+                ScalarBlockItem::Expression(expression) => {
+                    self.expression(expression, &names, &types)?
+                }
+                ScalarBlockItem::Assignment(assignment) => {
+                    for value in &assignment.values {
+                        self.expression(value, &names, &types)?;
+                    }
+                    for target in &assignment.targets {
+                        self.place(&target.place, &names, &types)?;
+                    }
+                    for target in &assignment.targets {
+                        if let ScalarPlace::Name { name, .. } = &target.place {
+                            if !names.contains_key(name) {
+                                if let ScalarExpression::Name { name: source, .. } =
+                                    &assignment.value
+                                {
+                                    if let Some(ty) = types.get(source).cloned() {
+                                        types.insert(name.clone(), ty);
+                                    }
+                                }
+                                names.insert(
+                                    name.clone(),
+                                    ReferenceBindingId {
+                                        source: self.source.clone(),
+                                        function_span: self.function_span,
+                                        declaration_span: target.target_span,
+                                        block_span: block.span,
+                                        kind: ReferenceBindingKind::Declared,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                ScalarBlockItem::While(while_expression) => {
+                    self.expression(&while_expression.condition, &names, &types)?;
+                    self.block(&while_expression.body, &names, &types)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn resolve_module_call_sites(
+    source: &SourceIdentity,
+    items: &[ScalarItem],
+    modules: &[ScalarModule],
+) -> Result<Vec<ResolvedCallSite>, ReferenceAnalysisError> {
+    let current = modules.iter().find(|module| &module.source == source);
+    let mut module_callables = BTreeMap::new();
+    let mut extern_callables = BTreeMap::new();
+    for module in modules {
+        let receiver = if &module.source == source {
+            None
+        } else {
+            current.and_then(|current| {
+                current
+                    .namespace_bindings
+                    .iter()
+                    .find(|binding| binding.target == module.source)
+                    .map(|binding| binding.binding.clone())
+            })
+        };
+        if &module.source != source && receiver.is_none() {
+            continue;
+        }
+        for item in &module.items {
+            match item {
+                ScalarItem::Function(function) => {
+                    module_callables.insert(
+                        (receiver.clone(), function.name.clone()),
+                        (module.source.clone(), function.name_span),
+                    );
+                }
+                ScalarItem::Binding(binding)
+                    if matches!(binding.declared_type, ScalarType::Callable { .. }) =>
+                {
+                    module_callables.insert(
+                        (receiver.clone(), binding.name.clone()),
+                        (module.source.clone(), binding.name_span),
+                    );
+                }
+                ScalarItem::Extern(extern_decl) if &module.source == source => {
+                    for function in &extern_decl.functions {
+                        extern_callables.insert(
+                            (extern_decl.binding.clone(), function.name.clone()),
+                            (module.source.clone(), function.name_span),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut sites = Vec::new();
+    for item in items {
+        if let ScalarItem::Function(function) = item {
+            resolve_function_call_sites(
+                source,
+                function,
+                &module_callables,
+                &extern_callables,
+                modules,
+                &mut sites,
+            )?;
+        }
+    }
+    Ok(sites)
+}
+
+fn resolve_function_call_sites(
+    source: &SourceIdentity,
+    function: &ScalarFunction,
+    module_callables: &BTreeMap<(Option<String>, String), (SourceIdentity, ByteSpan)>,
+    extern_callables: &BTreeMap<(String, String), (SourceIdentity, ByteSpan)>,
+    modules: &[ScalarModule],
+    sites: &mut Vec<ResolvedCallSite>,
+) -> Result<(), ReferenceAnalysisError> {
+    for arm in &function.overload_arms {
+        resolve_function_call_sites(
+            source,
+            arm,
+            module_callables,
+            extern_callables,
+            modules,
+            sites,
+        )?;
+    }
+    let mut resolver = ValidatedCallResolver {
+        source,
+        function_span: function.span,
+        module_callables,
+        extern_callables,
+        modules,
+        sites: Vec::new(),
+    };
+    let mut parameter_names = BTreeMap::new();
+    let mut parameter_types = BTreeMap::new();
+    let ScalarType::Callable { parameters, .. } = &function.signature else {
+        unreachable!("validated function signature")
+    };
+    for (index, (name, span)) in function
+        .parameters
+        .iter()
+        .zip(&function.parameter_spans)
+        .enumerate()
+    {
+        parameter_types.insert(name.clone(), parameters[index].clone());
+        parameter_names.insert(
+            name.clone(),
+            ReferenceBindingId {
+                source: source.clone(),
+                function_span: function.span,
+                declaration_span: *span,
+                block_span: function.body.span,
+                kind: ReferenceBindingKind::Declared,
+            },
+        );
+    }
+    resolver.block(&function.body, &parameter_names, &parameter_types)?;
+    sites.extend(resolver.sites);
+    Ok(())
+}
+
+fn record_module_reference_origins(
+    source: &SourceIdentity,
+    items: &mut [ScalarItem],
+    call_sites: &[ResolvedCallSite],
+    structs: &[ScalarStruct],
+    enums: &[ScalarEnum],
+    assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
+) -> Vec<ReferenceAnalysisError> {
+    let module_names = items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarItem::Binding(binding) => Some(binding.name.clone()),
+            ScalarItem::Function(function) => Some(function.name.clone()),
+            ScalarItem::Namespace(namespace) => Some(namespace.binding.clone()),
+            ScalarItem::Extern(extern_decl) => Some(extern_decl.binding.clone()),
+            ScalarItem::Executable(_) => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut errors = Vec::new();
+    for item in items {
+        if let ScalarItem::Function(function) = item {
+            errors.extend(record_function_reference_origins(
+                source,
+                function,
+                &module_names,
+                call_sites,
+                structs,
+                enums,
+                assignment_outputs,
+            ));
+        }
+    }
+    errors
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReferenceCallableBody {
+    Declaration,
+    Overload(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReferenceOutputContract {
+    source: SourceIdentity,
+    declaration_span: ByteSpan,
+    body: ReferenceCallableBody,
+    output: usize,
+    origins: Vec<ReferenceOrigin>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConcreteReferenceOutputContract {
+    source: SourceIdentity,
+    declaration_span: ByteSpan,
+    selection: ConcreteCallSelection,
+    type_arguments: Vec<ScalarType>,
+    output: usize,
+    origins: Vec<ReferenceOrigin>,
+}
+
+fn collect_concrete_output_contracts(
+    function: &ScalarFunction,
+    templates: &[ReferenceOutputContract],
+    concrete: &mut Vec<ConcreteReferenceOutputContract>,
+) {
+    for arm in &function.overload_arms {
+        collect_concrete_output_contracts(arm, templates, concrete);
+    }
+    for point in &function.reference_cfg.initial_points {
+        let CfgPointKind::Call {
+            expression: ScalarExpression::Call { type_arguments, .. },
+            output,
+            target:
+                ResolvedCallTarget::ModuleCallable {
+                    source,
+                    declaration_span,
+                    concrete: selection,
+                },
+            ..
+        } = &point.kind
+        else {
+            continue;
+        };
+        let body = match selection {
+            ConcreteCallSelection::Declaration => ReferenceCallableBody::Declaration,
+            ConcreteCallSelection::Overload(arm) => ReferenceCallableBody::Overload(arm.arm_index),
+        };
+        let Some(template) = templates.iter().find(|template| {
+            template.source == *source
+                && template.declaration_span == *declaration_span
+                && template.body == body
+                && template.output == *output
+        }) else {
+            continue;
+        };
+        let contract = ConcreteReferenceOutputContract {
+            source: source.clone(),
+            declaration_span: *declaration_span,
+            selection: selection.clone(),
+            type_arguments: type_arguments
+                .iter()
+                .map(|argument| argument.ty.clone())
+                .collect(),
+            output: *output,
+            origins: template.origins.clone(),
+        };
+        if !concrete.contains(&contract) {
+            concrete.push(contract);
+        }
+    }
+}
+
+fn collect_function_output_contracts(
+    source: &SourceIdentity,
+    function: &ScalarFunction,
+    declaration_span: ByteSpan,
+    body: ReferenceCallableBody,
+    contracts: &mut Vec<ReferenceOutputContract>,
+) {
+    for point in &function.reference_cfg.points {
+        let CfgPointKind::ReturnOutput { output, .. } = point.kind else {
+            continue;
+        };
+        let Some(origins) = &point.possible_origins else {
+            continue;
+        };
+        if !matches!(&function.signature, ScalarType::Callable { outputs, .. } if matches!(outputs.outputs[output].ty, ScalarType::CheckedReference { .. }))
+        {
+            continue;
+        }
+        contracts.push(ReferenceOutputContract {
+            source: source.clone(),
+            declaration_span,
+            body: body.clone(),
+            output,
+            origins: origins
+                .iter()
+                .map(|id| function.reference_cfg.facts[id.0].clone())
+                .collect(),
+        });
+    }
+    for (index, arm) in function.overload_arms.iter().enumerate() {
+        collect_function_output_contracts(
+            source,
+            arm,
+            declaration_span,
+            ReferenceCallableBody::Overload(index),
+            contracts,
+        );
+    }
+}
+
+fn transfer_function_output_contracts(
+    function: &mut ScalarFunction,
+    contracts: &[ConcreteReferenceOutputContract],
+) -> Vec<ReferenceAnalysisError> {
+    let mut errors = Vec::new();
+    for arm in &mut function.overload_arms {
+        errors.extend(transfer_function_output_contracts(arm, contracts));
+    }
+    if !function.reference_cfg.initial_points.is_empty() {
+        function.reference_cfg.points = function.reference_cfg.initial_points.clone();
+        errors.extend(transfer_reference_facts(
+            &mut function.reference_cfg,
+            &BTreeMap::new(),
+            contracts,
+        ));
+    }
+    errors
+}
+
+fn resolve_reference_output_contracts(modules: &mut [ScalarModule]) -> Vec<ReferenceAnalysisError> {
+    let mut contracts = Vec::new();
+    loop {
+        let mut concrete = Vec::new();
+        for module in modules.iter() {
+            for item in &module.items {
+                if let ScalarItem::Function(function) = item {
+                    collect_concrete_output_contracts(function, &contracts, &mut concrete);
+                }
+            }
+        }
+        let mut errors = Vec::new();
+        for module in modules.iter_mut() {
+            for item in &mut module.items {
+                if let ScalarItem::Function(function) = item {
+                    errors.extend(transfer_function_output_contracts(function, &concrete));
+                }
+            }
+        }
+        let mut next = Vec::new();
+        for module in modules.iter() {
+            for item in &module.items {
+                if let ScalarItem::Function(function) = item {
+                    collect_function_output_contracts(
+                        &module.source,
+                        function,
+                        function.name_span,
+                        ReferenceCallableBody::Declaration,
+                        &mut next,
+                    );
+                }
+            }
+        }
+        if next == contracts {
+            return errors;
+        }
+        contracts = next;
+    }
+}
+
+fn record_specialized_copy_policies(
+    items: &mut [ScalarItem],
+    modules: &[ScalarModule],
+    structs: &[ScalarStruct],
+    enums: &[ScalarEnum],
+) -> Vec<ReferenceAnalysisError> {
+    let mut errors = Vec::new();
+    for item in items {
+        if let ScalarItem::Function(function) = item {
+            errors.extend(record_function_specialized_copy_policies(
+                function, modules, structs, enums,
+            ));
+        }
+    }
+    errors
+}
+
+fn record_function_specialized_copy_policies(
+    function: &mut ScalarFunction,
+    modules: &[ScalarModule],
+    structs: &[ScalarStruct],
+    enums: &[ScalarEnum],
+) -> Vec<ReferenceAnalysisError> {
+    let mut errors = Vec::new();
+    for arm in &mut function.overload_arms {
+        errors.extend(record_function_specialized_copy_policies(
+            arm, modules, structs, enums,
+        ));
+    }
+    let generic_parameters = function
+        .generic_parameters
+        .iter()
+        .map(|parameter| parameter.name.clone())
+        .collect::<BTreeSet<_>>();
+    for point in &function.reference_cfg.points {
+        let CfgPointKind::Call {
+            expression: ScalarExpression::Call { type_arguments, .. },
+            output: 0,
+            target:
+                ResolvedCallTarget::ModuleCallable {
+                    source,
+                    declaration_span,
+                    concrete,
+                },
+            ..
+        } = &point.kind
+        else {
+            continue;
+        };
+        let error = || ReferenceAnalysisError::MissingContext {
+            source_span: point.source_span.clone(),
+            reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
+        };
+        let Some(declaration) = modules
+            .iter()
+            .find(|module| module.source == *source)
+            .and_then(|module| {
+                module.items.iter().find_map(|item| match item {
+                    ScalarItem::Function(candidate) if candidate.name_span == *declaration_span => {
+                        Some(candidate)
+                    }
+                    _ => None,
+                })
+            })
+        else {
+            errors.push(error());
+            continue;
+        };
+        let template = match concrete {
+            ConcreteCallSelection::Overload(selection) => {
+                declaration.overload_arms.get(selection.arm_index)
+            }
+            ConcreteCallSelection::Declaration => Some(declaration),
+        };
+        let Some(template) = template else {
+            errors.push(error());
+            continue;
+        };
+        if template.generic_parameters.is_empty() {
+            continue;
+        }
+        let substitutions = match concrete {
+            ConcreteCallSelection::Overload(selection) => selection.substitutions.clone(),
+            ConcreteCallSelection::Declaration => {
+                if type_arguments.len() != template.generic_parameters.len() {
+                    errors.push(error());
+                    continue;
+                }
+                template
+                    .generic_parameters
+                    .iter()
+                    .zip(type_arguments)
+                    .map(|(parameter, argument)| (parameter.name.clone(), argument.ty.clone()))
+                    .collect()
+            }
+        };
+        if template
+            .generic_parameters
+            .iter()
+            .any(|parameter| !substitutions.contains_key(&parameter.name))
+        {
+            errors.push(error());
+            continue;
+        }
+        let mut deferred = BTreeMap::new();
+        for template_point in &template.reference_cfg.points {
+            let ty = match &template_point.kind {
+                CfgPointKind::DeferredMove { ty, .. }
+                | CfgPointKind::DeferredMoveThrough { ty, .. }
+                | CfgPointKind::DeferredArrayElement { ty, .. } => ty,
+                _ => continue,
+            };
+            let concrete_ty = substitute_type(ty, &substitutions);
+            match copy_policy(&concrete_ty, structs, enums, &generic_parameters) {
+                Ok(CopyPolicy::Move)
+                    if matches!(
+                        template_point.kind,
+                        CfgPointKind::DeferredArrayElement { .. }
+                    ) =>
+                {
+                    errors.push(ReferenceAnalysisError::MissingContext {
+                        source_span: point.source_span.clone(),
+                        reason: ReferenceAnalysisErrorReason::MoveFromArrayElement,
+                    })
+                }
+                Ok(policy) => {
+                    deferred.insert(template_point.id.0, policy);
+                    function
+                        .reference_cfg
+                        .specialized_policies
+                        .push(SpecializedCopyPolicy {
+                            call_point: point.id,
+                            template_source: source.clone(),
+                            template_function_span: template.span,
+                            template_point: template_point.id,
+                            ty: concrete_ty,
+                            policy,
+                        })
+                }
+                Err(_) => errors.push(error()),
+            }
+        }
+        if !deferred.is_empty() {
+            let mut concrete_cfg = template.reference_cfg.clone();
+            concrete_cfg.points = concrete_cfg.initial_points.clone();
+            let transferred = transfer_reference_facts(&mut concrete_cfg, &deferred, &[]);
+            errors.extend(transferred.into_iter().map(|error| {
+                ReferenceAnalysisError::MissingContext {
+                    source_span: point.source_span.clone(),
+                    reason: error.reason(),
+                }
+            }));
+        }
+    }
+    errors
+}
+
+fn record_function_reference_origins(
+    source: &SourceIdentity,
+    function: &mut ScalarFunction,
+    module_names: &HashSet<String>,
+    call_sites: &[ResolvedCallSite],
+    structs: &[ScalarStruct],
+    enums: &[ScalarEnum],
+    assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
+) -> Vec<ReferenceAnalysisError> {
+    let mut errors = Vec::new();
+    for arm in &mut function.overload_arms {
+        errors.extend(record_function_reference_origins(
+            source,
+            arm,
+            module_names,
+            call_sites,
+            structs,
+            enums,
+            assignment_outputs,
+        ));
+    }
+    let mut builder = ReferenceFlowBuilder {
+        source: source.clone(),
+        function_span: function.span,
+        names: BTreeMap::new(),
+        module_names: module_names.clone(),
+        call_sites: call_sites.to_vec(),
+        origins: HashMap::new(),
+        checked: HashSet::new(),
+        binding_types: HashMap::new(),
+        structs: structs.to_vec(),
+        enums: enums.to_vec(),
+        generic_parameters: function
+            .generic_parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect(),
+        assignment_outputs: assignment_outputs.clone(),
+        dereference_points: HashMap::new(),
+        cfg: ScalarReferenceCfg {
+            facts: Vec::new(),
+            points: Vec::new(),
+            initial_points: Vec::new(),
+            allocations: BTreeSet::new(),
+            specialized_policies: Vec::new(),
+        },
+        next_scope: 0,
+        cursor: None,
+    };
+    builder.point(
+        CfgPointKind::Entry,
+        function.span,
+        ReferenceScopeId(0),
+        BTreeSet::new(),
+    );
+    for (name, span) in function.parameters.iter().zip(&function.parameter_spans) {
+        builder.names.insert(
+            name.clone(),
+            ReferenceBindingId {
+                source: source.clone(),
+                function_span: function.span,
+                declaration_span: *span,
+                block_span: function.body.span,
+                kind: ReferenceBindingKind::Declared,
+            },
+        );
+    }
+    if let ScalarType::Callable { parameters, .. } = &function.signature {
+        for (index, ((name, span), ty)) in function
+            .parameters
+            .iter()
+            .zip(&function.parameter_spans)
+            .zip(parameters)
+            .enumerate()
+        {
+            builder
+                .binding_types
+                .insert(builder.names[name].clone(), ty.clone());
+            if let ScalarType::CheckedReference { mutability, .. } = ty {
+                let binding = builder.names[name].clone();
+                let loan = ReferenceLoanId {
+                    mode: *mutability,
+                    origin_place: ReferencePlaceId {
+                        source: source.clone(),
+                        function_span: function.span,
+                        declaration_span: *span,
+                        block_span: function.body.span,
+                        binding: binding.clone(),
+                        projections: Vec::new(),
+                        place: ScalarPlace::Name {
+                            name: name.clone(),
+                            span: *span,
+                        },
+                    },
+                    creation_span: *span,
+                    parent: None,
+                };
+                let id = builder.intern(ReferenceOrigin::BorrowedFrom {
+                    parameter: index,
+                    loan,
+                });
+                builder.checked.insert(binding.clone());
+                builder
+                    .origins
+                    .insert(binding.clone(), BTreeSet::from([id]));
+                builder.point(
+                    CfgPointKind::Bind { binding },
+                    *span,
+                    ReferenceScopeId(0),
+                    BTreeSet::from([id]),
+                );
+            }
+        }
+    }
+    match builder.block(&function.body) {
+        Err(error) => errors.push(error),
+        Ok(result) => {
+            if let ScalarType::Callable { outputs, .. } = &function.signature {
+                if matches!(
+                    outputs.outputs.first(),
+                    Some(ScalarOutput {
+                        ty: ScalarType::CheckedReference { .. },
+                        ..
+                    })
+                ) && result.is_none()
+                    && !function.body.final_output_values.is_empty()
+                {
+                    let span = function.body.final_output_values[0].span;
+                    errors.push(builder.missing_context(
+                        span,
+                        ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                    ));
+                }
+            }
+        }
+    }
+    if errors.is_empty() && !builder.cfg.points.is_empty() {
+        builder.cfg.initial_points = builder.cfg.points.clone();
+        let _ = transfer_reference_facts(&mut builder.cfg, &BTreeMap::new(), &[]);
+    }
+    function.reference_cfg = builder.cfg;
+    errors
+}
+
+fn expand_conditional_final_outputs(block: &mut ScalarBlock, outputs: &[ScalarOutput]) {
+    let output_count = outputs.len();
     if block.final_output_values.len() != 1 || output_count < 2 {
         return;
     }
@@ -9417,8 +14606,8 @@ fn expand_conditional_final_outputs(block: &mut ScalarBlock, output_count: usize
     };
     let mut then_branch = then_branch.clone();
     let mut else_branch = else_branch.clone();
-    expand_conditional_final_outputs(&mut then_branch, output_count);
-    expand_conditional_final_outputs(&mut else_branch, output_count);
+    expand_conditional_final_outputs(&mut then_branch, outputs);
+    expand_conditional_final_outputs(&mut else_branch, outputs);
     if then_branch.final_output_values.len() != output_count
         || else_branch.final_output_values.len() != output_count
     {
@@ -9430,8 +14619,8 @@ fn expand_conditional_final_outputs(block: &mut ScalarBlock, output_count: usize
         .map(|position| {
             let value = ScalarExpression::If {
                 condition: condition.clone(),
-                then_branch: select_final_output(&then_branch, position),
-                else_branch: select_final_output(&else_branch, position),
+                then_branch: select_final_output(&then_branch, position, &outputs[position].ty),
+                else_branch: select_final_output(&else_branch, position, &outputs[position].ty),
                 span: conditional_span,
             };
             ScalarOutputValue {
@@ -9463,12 +14652,13 @@ fn expand_conditional_final_outputs(block: &mut ScalarBlock, output_count: usize
         .collect();
 }
 
-fn select_final_output(block: &ScalarBlock, position: usize) -> ScalarBlock {
+fn select_final_output(block: &ScalarBlock, position: usize, ty: &ScalarType) -> ScalarBlock {
     let mut selected = block.clone();
     let final_start = selected.items.len() - selected.final_output_values.len();
     selected.items.truncate(final_start);
     selected.terminated_items.truncate(final_start);
     selected.final_output_values = vec![block.final_output_values[position].clone()];
+    selected.final_output_values[0].ty = ty.clone();
     selected.items.push(ScalarBlockItem::Expression(
         selected.final_output_values[0].value.clone(),
     ));
@@ -9951,12 +15141,15 @@ fn derive_block(node: &CstNode) -> ScalarBlock {
 }
 
 fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBlock {
-    let mut items: Vec<ScalarBlockItem> = node
+    let block_items = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::BlockItem)
-        .map(|item| derive_block_item(&item))
-        .collect();
-    let final_output_values = direct_nodes(node)
+        .collect::<Vec<_>>();
+    let mut items = block_items
+        .iter()
+        .map(derive_block_item)
+        .collect::<Vec<_>>();
+    let mut final_output_values = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::FinalOutputList)
         .map(|final_list| {
@@ -9980,14 +15173,8 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    items.extend(
-        final_output_values
-            .iter()
-            .map(|output| ScalarBlockItem::Expression(output.value.clone())),
-    );
-    let terminated_items = node
-        .children()
-        .filter(|child| child.kind() == SyntaxKind::BlockItem)
+    let mut terminated_items = block_items
+        .iter()
         .map(|item| {
             item.children_with_tokens().any(|element| {
                 matches!(
@@ -9997,8 +15184,37 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
                 )
             })
         })
-        .chain(final_output_values.iter().map(|_| false))
-        .collect();
+        .collect::<Vec<_>>();
+    if final_output_values.is_empty() {
+        if let Some((item, ScalarBlockItem::Expression(value), false)) = block_items
+            .last()
+            .zip(items.last())
+            .zip(terminated_items.last())
+            .map(|((item, value), terminated)| (item, value, *terminated))
+        {
+            if let Some(expression) = direct_nodes(item).into_iter().find(|child| {
+                child.kind() == SyntaxKind::Expression
+                    && direct_nodes(child)
+                        .into_iter()
+                        .any(|actual| actual.kind() == SyntaxKind::Unsafe)
+            }) {
+                final_output_values.push(ScalarOutputValue {
+                    position: 0,
+                    ty: ScalarType::Error,
+                    span: wosy_syntax::byte_span(&expression),
+                    value: value.clone(),
+                });
+                items.pop();
+                terminated_items.pop();
+            }
+        }
+    }
+    items.extend(
+        final_output_values
+            .iter()
+            .map(|output| ScalarBlockItem::Expression(output.value.clone())),
+    );
+    terminated_items.extend(final_output_values.iter().map(|_| false));
     let expressions = items
         .iter()
         .filter_map(|item| match item {
@@ -10326,7 +15542,12 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
         SyntaxKind::CheckedAddress => {
             let target = direct_nodes(&actual)
                 .into_iter()
-                .find(|child| child.kind() == SyntaxKind::PlaceTarget)
+                .find(|child| {
+                    matches!(
+                        child.kind(),
+                        SyntaxKind::PlaceTarget | SyntaxKind::ParenthesizedDereferencePlace
+                    )
+                })
                 .expect("checked address target");
             ScalarExpression::CheckedAddress {
                 mutability: if actual.children_with_tokens().any(
@@ -10385,6 +15606,12 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
 
 fn derive_place(node: &CstNode) -> ScalarPlace {
     match node.kind() {
+        SyntaxKind::ParenthesizedDereferencePlace => derive_place(
+            &direct_nodes(node)
+                .into_iter()
+                .find(|child| child.kind() == SyntaxKind::Dereference)
+                .expect("parenthesized dereference place"),
+        ),
         SyntaxKind::PlaceTarget => {
             derive_place(&direct_nodes(node).into_iter().next().expect("place target"))
         }
@@ -11455,10 +16682,10 @@ fn validate_type(
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     match ty {
-        ScalarType::Named { name, .. }
+        ScalarType::Named { name, span }
             if !program.structs.iter().any(|item| item.name == *name) =>
         {
-            diagnostics.push(diagnostic(program, "B0003", "unknown scalar type", span))
+            diagnostics.push(diagnostic(program, "B0003", "unknown scalar type", *span))
         }
         ScalarType::Named { .. } | ScalarType::Qualified { .. } => {}
         ScalarType::Struct(_) | ScalarType::Enum(_) => {}
@@ -11789,7 +17016,11 @@ fn assignment_type(
             };
             match call_output_sequence(value, scope, program) {
                 Some(outputs) => Some(outputs.outputs),
-                None if matches!(value, ScalarExpression::Call { .. }) => None,
+                None if matches!(value, ScalarExpression::Call { .. })
+                    && is_error_type(&actual) =>
+                {
+                    None
+                }
                 None => Some(vec![ScalarOutput {
                     ty: actual,
                     span: expression_span(value),
@@ -11802,6 +17033,13 @@ fn assignment_type(
             span: assignment.span,
         });
     if let Some(outputs) = outputs {
+        record_assignment_outputs(
+            &program.resolved_assignment_outputs,
+            &program.source,
+            &program.items,
+            assignment,
+            &outputs,
+        );
         if assignment.targets.len() > outputs.outputs.len() {
             diagnostics.push(diagnostic(
                 program,
@@ -12257,7 +17495,10 @@ fn expression_type(
                 };
             }
             if receiver.as_deref() == Some("core")
-                && matches!(name.as_str(), "alloc" | "free" | "system_panic")
+                && matches!(
+                    name.as_str(),
+                    "alloc" | "free" | "invalidate" | "rebind" | "system_panic"
+                )
             {
                 return type_core_memory(
                     name,
@@ -12352,6 +17593,68 @@ fn expression_type(
                     diagnostics,
                     unsafe_context,
                 );
+            }
+            if let Some(receiver_type) = receiver.as_ref().and_then(|binding| scope.get(binding)) {
+                if matches!(receiver_type, ScalarType::Struct(_)) {
+                    let Some(field) = resolved_struct_field(receiver_type, name, &program.structs)
+                    else {
+                        diagnostics.push(diagnostic(
+                            program,
+                            "B0001",
+                            "unknown callable field",
+                            *name_span,
+                        ));
+                        return ScalarType::Error;
+                    };
+                    let ScalarType::Callable {
+                        outputs,
+                        parameters,
+                    } = &field.ty
+                    else {
+                        diagnostics.push(diagnostic(
+                            program,
+                            "B0003",
+                            "struct field is not callable",
+                            *name_span,
+                        ));
+                        return ScalarType::Error;
+                    };
+                    if !type_arguments.is_empty() || arguments.len() != parameters.len() {
+                        diagnostics.push(diagnostic(
+                            program,
+                            "B0004",
+                            "call argument arity does not match callable type",
+                            *span,
+                        ));
+                        return ScalarType::Error;
+                    }
+                    let mut error_argument = false;
+                    for (argument, parameter) in arguments.iter().zip(parameters) {
+                        let actual = expression_type_expected(
+                            argument,
+                            parameter,
+                            scope,
+                            visible_names,
+                            folded_names,
+                            program,
+                            diagnostics,
+                            unsafe_context,
+                        );
+                        expect_type(
+                            program,
+                            parameter,
+                            &actual,
+                            expression_span(argument),
+                            diagnostics,
+                        );
+                        error_argument |= is_error_type(&actual);
+                    }
+                    return if error_argument {
+                        ScalarType::Error
+                    } else {
+                        scalar_call_result(outputs)
+                    };
+                }
             }
             if let Some(overload) = program.items.iter().find_map(|item| match item {
                 ScalarItem::Function(function)
@@ -13533,6 +18836,4212 @@ mod tests {
     }
 
     #[test]
+    fn source_aggregate_copy_policies_in_both_validators() {
+        for (text, expected, invalid_modifier) in [
+            (
+                "%%start\nstruct Plain { i32 value; }\nstruct copy Point { i32 value; }\nenum copy Status { ok; }\n%%end",
+                vec![CopyPolicy::Move, CopyPolicy::Copy],
+                false,
+            ),
+            (
+                "%%start\nstruct copy Inner { i32 value; }\nstruct copy Outer { Inner nested; Inner[2] values; }\n%%end",
+                vec![CopyPolicy::Copy, CopyPolicy::Copy],
+                false,
+            ),
+            (
+                "%%start\nstruct Plain { i32 value; }\nstruct copy Invalid { Plain nested; }\n%%end",
+                vec![CopyPolicy::Move, CopyPolicy::Move],
+                true,
+            ),
+            (
+                "%%start\nstruct copy Invalid { *!i32 value; }\n%%end",
+                vec![CopyPolicy::Move],
+                true,
+            ),
+        ] {
+            let single = validate_text(text);
+            let parsed = parse_source(source(), text.to_owned(), &[]);
+            let module = ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            );
+            let project = validate_scalar_project(ScalarProject::new(vec![module], vec![source()]));
+            for (structs, enums, diagnostics) in [
+                (
+                    &single.program.structs,
+                    &single.program.enums,
+                    &single.diagnostics,
+                ),
+                (
+                    &project.project.modules[0].structs,
+                    &project.project.modules[0].enums,
+                    &project.diagnostics,
+                ),
+            ] {
+                assert_eq!(
+                    structs
+                        .iter()
+                        .map(|item| item.copy_policy)
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                if text.contains("enum copy") {
+                    assert_eq!(enums[0].copy_policy, CopyPolicy::Copy);
+                }
+                let invalid = diagnostics
+                    .iter()
+                    .find(|item| item.code == "B0003" && item.message.contains("copy declaration"));
+                if invalid_modifier {
+                    assert_eq!(
+                        invalid.unwrap().labels[0].span.range.start,
+                        text.find("copy").unwrap() as u32
+                    );
+                } else {
+                    assert!(invalid.is_none(), "{diagnostics:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn imported_aggregate_policies_and_moves_use_source_identity() {
+        let library_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/library.w".into(),
+            "r1".into(),
+        );
+        let library_text = "%%start\nstruct copy Copied { i32 value; }\nstruct Plain { i32 value; }\nenum Status { ok; }\n%%end";
+        let main_text = "%%start\nlibrary = namespace package \"src/library.w\";\nstruct copy Wrapper { library.Copied value; }\nlibrary.Copied(library.Copied) copy_imported = fn(item) { item };\nlibrary.Plain(library.Plain) move_imported = fn(item) { item };\nlibrary.Status(library.Status) move_imported_enum = fn(item) { item };\n%%end";
+        let main = parse_source(source(), main_text.to_owned(), &[]);
+        let library = parse_source(library_source.clone(), library_text.to_owned(), &[]);
+        assert!(main.diagnostics.is_empty(), "{:?}", main.diagnostics);
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    derive_scalar_program(&main.result).program,
+                    vec![ScalarNamespaceBinding {
+                        binding: "library".to_owned(),
+                        target: library_source.clone(),
+                        span: ByteSpan::new(0, 0),
+                    }],
+                ),
+                ScalarModule::from_program(
+                    derive_scalar_program(&library.result).program,
+                    Vec::new(),
+                ),
+            ],
+            vec![source(), library_source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        assert_eq!(
+            project.project.modules[0].structs[0].copy_policy,
+            CopyPolicy::Copy
+        );
+        for item in &project.project.modules[0].items {
+            let ScalarItem::Function(function) = item else {
+                continue;
+            };
+            let moves = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter_map(|point| match &point.kind {
+                    CfgPointKind::Move { place, ty, owner } => Some((point, place, ty, owner)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if function.name == "copy_imported" {
+                assert!(moves.is_empty(), "{moves:?}");
+            } else {
+                assert_eq!(moves.len(), 1, "{}: {moves:?}", function.name);
+                let (point, place, ty, owner) = moves[0];
+                assert_eq!(place.binding, *owner);
+                assert_eq!(place.declaration_span, function.parameter_spans[0]);
+                assert_eq!(
+                    point.source_span.range,
+                    scalar_place_target_span(&place.place)
+                );
+                assert_eq!(
+                    copy_policy(
+                        ty,
+                        &project.project.modules[1].structs,
+                        &project.project.modules[1].enums,
+                        &BTreeSet::new()
+                    ),
+                    Ok(CopyPolicy::Move)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generic_template_copy_policy_resolves_at_concrete_call_points_in_both_validators() {
+        let text = "%%start\nstruct copy Point { i32 value; }\nstruct Payload { i32 value; }\nidentity = overload { generic T; T(T) => fn(value) { value }; };\nu8(u8) copy_byte = fn(value) { identity(value) };\nPoint(Point) copy_point = fn(value) { identity(value) };\nPayload(Payload) move_payload = fn(value) { identity(value) };\nu8[](u8[]) move_runtime = fn(value) { identity(value) };\n*u8(*u8) copy_shared = fn(value) { identity(value) };\n*!u8(*!u8) move_mutable = fn(value) { identity(value) };\n%%end";
+        let single = validate_text(text);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(template) = &items[0] else {
+                panic!("generic template")
+            };
+            let deferred = template.overload_arms[0]
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| matches!(point.kind, CfgPointKind::DeferredMove { .. }))
+                .expect("symbolic template event");
+            assert!(!template.overload_arms[0]
+                .reference_cfg
+                .points
+                .iter()
+                .any(|point| matches!(point.kind, CfgPointKind::Move { .. })));
+            for (function, expected) in items.iter().skip(1).zip([
+                CopyPolicy::Copy,
+                CopyPolicy::Copy,
+                CopyPolicy::Move,
+                CopyPolicy::Move,
+                CopyPolicy::Copy,
+                CopyPolicy::Move,
+            ]) {
+                let ScalarItem::Function(function) = function else {
+                    panic!("caller")
+                };
+                let call = function
+                    .reference_cfg
+                    .points
+                    .iter()
+                    .find(|point| {
+                        matches!(
+                            &point.kind,
+                            CfgPointKind::Call {
+                                output: 0,
+                                target: ResolvedCallTarget::ModuleCallable { .. },
+                                ..
+                            }
+                        )
+                    })
+                    .expect("concrete call");
+                let CfgPointKind::Call {
+                    target:
+                        ResolvedCallTarget::ModuleCallable {
+                            source: target_source,
+                            declaration_span,
+                            concrete: ConcreteCallSelection::Overload(selection),
+                        },
+                    ..
+                } = &call.kind
+                else {
+                    panic!("selected generic arm")
+                };
+                assert_eq!(target_source, &source());
+                assert_eq!(*declaration_span, template.name_span);
+                assert_eq!(selection.arm_index, 0);
+                let specialized = function
+                    .reference_cfg
+                    .specialized_policies
+                    .iter()
+                    .find(|fact| fact.call_point == call.id)
+                    .expect("concrete policy at call point");
+                assert_eq!(specialized.template_source, source());
+                assert_eq!(
+                    specialized.template_function_span,
+                    template.overload_arms[0].span
+                );
+                assert_eq!(specialized.template_point, deferred.id);
+                assert_eq!(specialized.policy, expected);
+                assert_eq!(selection.substitutions.get("T"), Some(&specialized.ty));
+                let moves = function.reference_cfg.points.iter().filter(|point| matches!(&point.kind, CfgPointKind::Move { owner, .. } if owner.declaration_span == function.parameter_spans[0])).collect::<Vec<_>>();
+                assert_eq!(
+                    moves.len(),
+                    usize::from(expected == CopyPolicy::Move),
+                    "{}: {moves:?}",
+                    function.name
+                );
+                if let Some(moved) = moves.first() {
+                    assert_eq!(
+                        moved.source_span.range.start,
+                        call.source_span.range.start + "identity(".len() as u32
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn imported_generic_arm_specialization_retains_declaring_source() {
+        let library_source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/library.w".into(),
+            "r1".into(),
+        );
+        let library = parse_source(
+            library_source.clone(),
+            "%%start\nidentity = overload { generic T; T(T) => fn(value) { value }; };\n%%end"
+                .to_owned(),
+            &[],
+        );
+        let main_text = "%%start\nlibrary = namespace package \"src/library.w\";\nstruct copy Point { i32 value; }\nstruct Payload { i32 value; }\nPoint(Point) copy_point = fn(value) { library.identity(value) };\nPayload(Payload) move_payload = fn(value) { library.identity(value) };\n%%end";
+        let main = parse_source(source(), main_text.to_owned(), &[]);
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(main.diagnostics.is_empty(), "{:?}", main.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    derive_scalar_program(&main.result).program,
+                    vec![ScalarNamespaceBinding {
+                        binding: "library".into(),
+                        target: library_source.clone(),
+                        span: ByteSpan::new(0, 0),
+                    }],
+                ),
+                ScalarModule::from_program(
+                    derive_scalar_program(&library.result).program,
+                    Vec::new(),
+                ),
+            ],
+            vec![source(), library_source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        let ScalarItem::Function(template) = &project.project.modules[1].items[0] else {
+            panic!("template")
+        };
+        for (item, expected) in project.project.modules[0]
+            .items
+            .iter()
+            .filter(|item| matches!(item, ScalarItem::Function(_)))
+            .zip([CopyPolicy::Copy, CopyPolicy::Move])
+        {
+            let ScalarItem::Function(function) = item else {
+                unreachable!()
+            };
+            let call = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(
+                        &point.kind,
+                        CfgPointKind::Call {
+                            output: 0,
+                            target: ResolvedCallTarget::ModuleCallable { .. },
+                            ..
+                        }
+                    )
+                })
+                .expect("qualified call");
+            let CfgPointKind::Call {
+                target:
+                    ResolvedCallTarget::ModuleCallable {
+                        source: target_source,
+                        declaration_span,
+                        concrete: ConcreteCallSelection::Overload(selection),
+                    },
+                ..
+            } = &call.kind
+            else {
+                panic!("selected arm")
+            };
+            assert_eq!(target_source, &library_source);
+            assert_eq!(*declaration_span, template.name_span);
+            assert_eq!(selection.arm_index, 0);
+            let fact = function
+                .reference_cfg
+                .specialized_policies
+                .iter()
+                .find(|fact| fact.call_point == call.id)
+                .expect("specialized policy");
+            assert_eq!(fact.template_source, library_source);
+            assert_eq!(fact.template_function_span, template.overload_arms[0].span);
+            assert_eq!(fact.policy, expected);
+            assert_eq!(selection.substitutions.get("T"), Some(&fact.ty));
+            assert_eq!(
+                function
+                    .reference_cfg
+                    .points
+                    .iter()
+                    .filter(|point| matches!(point.kind, CfgPointKind::Move { .. }))
+                    .count(),
+                usize::from(expected == CopyPolicy::Move)
+            );
+        }
+    }
+
+    #[test]
+    fn explicitly_instantiated_generic_declaration_has_concrete_copy_policy() {
+        let text = "%%start\ngeneric T;\nT(T) identity = fn(value) { value };\nu8(u8) copy_byte = fn(value) { identity<u8>(value) };\nu8[](u8[]) move_runtime = fn(value) { identity<u8[]>(value) };\n%%end";
+        let single = validate_text(text);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(template) = &items[0] else {
+                panic!("template")
+            };
+            assert!(template
+                .reference_cfg
+                .points
+                .iter()
+                .any(|point| matches!(point.kind, CfgPointKind::DeferredMove { .. })));
+            for (item, expected) in items
+                .iter()
+                .skip(1)
+                .zip([CopyPolicy::Copy, CopyPolicy::Move])
+            {
+                let ScalarItem::Function(function) = item else {
+                    panic!("caller")
+                };
+                let call = function
+                    .reference_cfg
+                    .points
+                    .iter()
+                    .find(|point| {
+                        matches!(
+                            &point.kind,
+                            CfgPointKind::Call {
+                                output: 0,
+                                target: ResolvedCallTarget::ModuleCallable { .. },
+                                ..
+                            }
+                        )
+                    })
+                    .expect("generic call");
+                let fact = function
+                    .reference_cfg
+                    .specialized_policies
+                    .iter()
+                    .find(|fact| fact.call_point == call.id)
+                    .expect("specialized policy");
+                assert_eq!(fact.policy, expected);
+                assert_eq!(fact.template_function_span, template.span);
+                assert_eq!(fact.template_source, source());
+            }
+        }
+    }
+
+    #[test]
+    fn generic_array_element_policy_defers_until_concrete_call() {
+        let text = "%%start\nstruct Payload { i32 value; }\npick = overload { generic T; T(T[2], u64) => fn(values, index) { values[index] }; };\nu8(u8[2], u64) copy_byte = fn(values, index) { pick(values, index) };\nPayload(Payload[2], u64) move_payload = fn(values, index) { pick(values, index) };\n%%end";
+        let single = validate_text(text);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.message == "array elements cannot be moved individually"
+                })
+                .expect("specialized array guard");
+            assert_eq!(
+                diagnostic.labels[0].span.range.start,
+                text.find("pick(values, index) };\n%%end").unwrap() as u32
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_copy_member_preserves_original_diagnostic_and_required_policy_errors() {
+        let text = "%%start\nstruct copy Broken { Missing value; }\n%%end";
+        let single = validate_text(text);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        assert!(
+            !single.diagnostics.is_empty(),
+            "single: {:?}",
+            single.program.structs[0].fields
+        );
+        assert!(
+            !project.diagnostics.is_empty(),
+            "project: {:?}",
+            project.project.modules[0].structs[0].fields
+        );
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.labels.iter().any(
+                        |label| label.span.range.start == text.find("Missing").unwrap() as u32
+                    )),
+                "{diagnostics:?}"
+            );
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("copy declaration")),
+                "{diagnostics:?}"
+            );
+        }
+        assert!(copy_policy(&ScalarType::Error, &[], &[], &BTreeSet::new()).is_err());
+        assert!(copy_policy(
+            &ScalarType::Struct(single.program.structs[0].id.clone()),
+            &[],
+            &[],
+            &BTreeSet::new()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn missing_aggregate_policy_table_reports_spanned_invariant() {
+        let text = "%%start\nstruct Payload { i32 value; }\nPayload(Payload) take = fn(value) { value };\n%%end";
+        let validated = validate_text(text);
+        assert!(
+            validated.diagnostics.is_empty(),
+            "{:?}",
+            validated.diagnostics
+        );
+        let ScalarItem::Function(function) = &validated.program.items[0] else {
+            panic!("function")
+        };
+        let mut function = function.clone();
+        let read_span = expression_span(&function.body.expressions[0]);
+        let errors = record_function_reference_origins(
+            &validated.program.source,
+            &mut function,
+            &HashSet::new(),
+            &[],
+            &[],
+            &[],
+            &HashMap::new(),
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(
+            errors[0].reason(),
+            ReferenceAnalysisErrorReason::MissingResolvedBinding
+        );
+        assert_eq!(
+            errors[0].source_span(),
+            &SourceSpan::new(validated.program.source, read_span)
+        );
+    }
+
+    #[test]
+    fn mutable_checked_dereference_of_move_only_pointee_is_a_typed_move() {
+        let text = "%%start\nstruct Payload { i32 value; }\nPayload(Payload) take = fn(value) { *!Payload writer = &!value; Payload moved = *writer; moved };\n%%end";
+        let single = validate_text(text);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let event = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(
+                        &point.kind,
+                        CfgPointKind::MoveThrough {
+                            place: ScalarPlace::Dereference { .. },
+                            ..
+                        }
+                    )
+                })
+                .expect("whole aggregate move");
+            let CfgPointKind::MoveThrough { candidates, ty, .. } = &event.kind else {
+                unreachable!()
+            };
+            assert!(matches!(ty, ScalarType::Struct(_)));
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(event.possible_origins.as_ref().map(BTreeSet::len), Some(1));
+            assert_eq!(
+                candidates[0].place.binding.declaration_span,
+                function.parameter_spans[0]
+            );
+            assert!(
+                matches!(&candidates[0].place.projections[..], [ReferencePlaceProjection::Dereference(loan)] if loan.creation_span.start == text.find("&!value").unwrap() as u32)
+            );
+            let start = text.find("*writer; moved").unwrap() as u32;
+            assert_eq!(
+                event.source_span.range,
+                ByteSpan::new(start, start + "*writer".len() as u32)
+            );
+        }
+    }
+
+    #[test]
+    fn whole_checked_aggregate_reads_preserve_source_places_in_both_validators() {
+        let text = "%%start\nstruct copy Point { u8 value; }\nstruct Payload { u8 value; }\nunit(Point, u8[2], Payload, Payload[2]) inspect = fn(item, bytes, value, items) { *Point reader = &item; Point first = *reader; Point second = *reader; u8 field = (*reader).value; *(u8[2]) array_reader = &bytes; u8[2] array = *array_reader; u8 element = array[0]; *!Payload writer = &!value; u8 prior = (*writer).value; Payload taken = *writer; *!(Payload[2]) array_writer = &!items; Payload[2] moved_array = *array_writer; first; second; field; element; prior; taken; moved_array; } ;\n%%end";
+        let single = validate_text(text);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let cfg = &function.reference_cfg;
+            for (spelling, parameter) in [
+                ("*reader;", 0),
+                ("(*reader).value", 0),
+                ("*array_reader;", 1),
+                ("(*writer).value", 2),
+            ] {
+                let start = text.find(spelling).unwrap() as u32;
+                let reads = cfg
+                    .points
+                    .iter()
+                    .filter(|point| {
+                        point.source_span.range.start == start
+                            && matches!(
+                                &point.kind,
+                                CfgPointKind::ReadPlace {
+                                    reads_origin: false,
+                                    ..
+                                }
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                assert!(!reads.is_empty(), "{spelling}: {:?}", cfg.points);
+                for read in reads {
+                    let CfgPointKind::ReadPlace { candidates, .. } = &read.kind else {
+                        unreachable!()
+                    };
+                    assert_eq!(candidates.len(), 1, "{spelling}");
+                    assert_eq!(
+                        candidates[0].binding.declaration_span,
+                        function.parameter_spans[parameter]
+                    );
+                    assert!(matches!(
+                        candidates[0].projections.first(),
+                        Some(ReferencePlaceProjection::Dereference(_))
+                    ));
+                    assert_eq!(read.possible_origins.as_ref().map(BTreeSet::len), Some(1));
+                }
+            }
+            for (spelling, parameter) in [("*writer;", 2), ("*array_writer;", 3)] {
+                let start = text.find(spelling).unwrap() as u32;
+                let event = cfg
+                    .points
+                    .iter()
+                    .find(|point| {
+                        point.source_span.range.start == start
+                            && matches!(
+                                &point.kind,
+                                CfgPointKind::MoveThrough {
+                                    place: ScalarPlace::Dereference { .. },
+                                    ..
+                                }
+                            )
+                    })
+                    .expect("whole move");
+                let CfgPointKind::MoveThrough { candidates, ty, .. } = &event.kind else {
+                    unreachable!()
+                };
+                assert!(matches!(
+                    ty,
+                    ScalarType::Struct(_) | ScalarType::Array { .. }
+                ));
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(
+                    candidates[0].place.binding.declaration_span,
+                    function.parameter_spans[parameter]
+                );
+                assert!(matches!(
+                    candidates[0].place.projections.first(),
+                    Some(ReferencePlaceProjection::Dereference(_))
+                ));
+                assert_eq!(event.possible_origins.as_ref().map(BTreeSet::len), Some(1));
+            }
+            assert!(!cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::MoveThrough { place: ScalarPlace::Dereference { pointer, .. }, .. } if matches!(pointer.as_ref(), ScalarExpression::Name { name, .. } if name == "reader" || name == "array_reader"))));
+        }
+    }
+
+    #[test]
+    fn whole_checked_aggregate_move_keeps_joined_owner_candidates() {
+        let text = "%%start\nstruct Payload { u8 value; }\nPayload(*!Payload, *!Payload, bool) choose = fn(first, second, flag) { *!Payload writer = first; if (flag) { writer = first; } else { writer = second; }; Payload moved = *writer; moved };\n%%end";
+        let single = validate_text(text);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let event = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(
+                        &point.kind,
+                        CfgPointKind::MoveThrough {
+                            place: ScalarPlace::Dereference { .. },
+                            ..
+                        }
+                    )
+                })
+                .expect("joined whole move");
+            let CfgPointKind::MoveThrough { candidates, ty, .. } = &event.kind else {
+                unreachable!()
+            };
+            assert!(matches!(ty, ScalarType::Struct(_)));
+            assert_eq!(
+                event.source_span.range.start,
+                text.find("*writer; moved").unwrap() as u32
+            );
+            assert_eq!(event.possible_origins.as_ref().map(BTreeSet::len), Some(2));
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.place.binding.declaration_span)
+                    .collect::<HashSet<_>>(),
+                HashSet::from([function.parameter_spans[0], function.parameter_spans[1]])
+            );
+            assert!(candidates.iter().all(|candidate| matches!(candidate.place.projections.first(), Some(ReferencePlaceProjection::Dereference(loan)) if loan.as_ref() == &candidate.loan)));
+        }
+    }
+
+    #[test]
+    fn checked_aggregate_edge_availability_in_both_validators() {
+        let cases = [
+            ("struct copy Point { u8 value; } unit(Point) f = fn(p) { *Point reader = &p; Point a = *reader; Point b = *reader; u8 field = (*reader).value; a; b; field; };", None),
+            ("unit(u8[2]) f = fn(bytes) { *(u8[2]) reader = &bytes; u8[2] a = *reader; u8[2] b = *reader; u8 element = b[0]; a; element; };", None),
+            ("struct Payload { u8 value; } unit(Payload) f = fn(p) { *!Payload writer = &!p; u8 before = (*writer).value; Payload taken = *writer; before; taken; };", None),
+            ("struct Payload { u8 value; } unit(Payload) f = fn(p) { *!Payload writer = &!p; Payload taken = *writer; Payload again = *writer; taken; again; };", Some("*writer; taken")),
+            ("struct Payload { u8 value; } unit(Payload) f = fn(p) { *!Payload writer = &!p; Payload taken = *writer; u8 after = (*writer).value; taken; after; };", Some("(*writer).value")),
+            ("struct Payload { u8 value; } unit(Payload[2]) f = fn(items) { *!(Payload[2]) writer = &!items; Payload[2] taken = *writer; taken; };", None),
+            ("struct Payload { u8 value; } unit(Payload[2]) f = fn(items) { *!(Payload[2]) writer = &!items; Payload[2] taken = *writer; Payload[2] again = *writer; taken; again; };", Some("*writer; taken")),
+            ("struct Payload { u8 value; } struct Pair { Payload left; Payload right; } unit(Pair) f = fn(source) { Payload left = source.left; Payload right = source.right; left; right; };", None),
+            ("struct Payload { u8 value; } struct Pair { Payload left; Payload right; } unit(Pair) f = fn(source) { Payload left = source.left; Pair again = source; left; again; };", Some("source; left")),
+            ("struct Payload { u8 value; } unit(Payload) f = fn(source) { *Payload retained = &source; Payload moved = source; retained; moved; };", Some("source; retained")),
+            ("struct Payload { u8 value; } struct Pair { Payload left; Payload right; } unit(Pair) f = fn(source) { *Payload retained = &source.right; Payload taken = source.left; retained; taken; };", None),
+            ("unit(u64) f = fn(index) { u8[2] bytes = [1, 2]; *u8 retained = &bytes[1]; index; bytes[index] = 3; retained; };", Some("retained;")),
+        ];
+        for (body, conflicting) in cases {
+            let text = format!(
+                "%%start\n{}\n%%end",
+                body.replace("} unit(", "}\nunit(")
+                    .replace("} struct ", "}\nstruct ")
+            );
+            let single = validate_text(&text);
+            let parsed = parse_source(source(), text.clone(), &[]);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{body}: {:?}",
+                parsed.diagnostics
+            );
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    derive_scalar_program(&parsed.result).program,
+                    Vec::new(),
+                )],
+                vec![source()],
+            ));
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                match conflicting {
+                    Some(spelling) => {
+                        let start = text.find(spelling).expect("conflict spelling") as u32;
+                        assert!(
+                            diagnostics.iter().any(|diagnostic| {
+                                diagnostic.code == "B0003"
+                                    && (diagnostic.message == "read or move of unavailable place"
+                                        || (spelling == "retained;"
+                                            && diagnostic.message
+                                                == "missing checked-reference origin"))
+                                    && diagnostic.labels[0].span.range.start == start
+                            }),
+                            "{body}: {diagnostics:?}"
+                        );
+                    }
+                    None => assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn specialized_checked_aggregate_reads_transfer_deferred_policy() {
+        let text = "%%start\nstruct copy Point { u8 value; }\nstruct Payload { u8 value; }\nread_twice = overload { generic T; T(T) => fn(value) { *!T writer = &!value; T first = *writer; T second = *writer; first; second }; };\nPoint(Point) copied = fn(value) { read_twice(value) };\nPayload(Payload) moved = fn(value) { read_twice(value) };\n%%end";
+        let single = validate_text(text);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(template) = &items[0] else {
+                panic!("template")
+            };
+            assert!(template.overload_arms[0]
+                .reference_cfg
+                .points
+                .iter()
+                .any(|point| matches!(point.kind, CfgPointKind::DeferredMoveThrough { .. })));
+            let copy_call = text.find("read_twice(value) }").unwrap() as u32;
+            let move_call = text.rfind("read_twice(value) }").unwrap() as u32;
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.labels[0].span.range.start == copy_call),
+                "{diagnostics:?}"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels[0].span.range.start == move_call),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_copyable_checked_aggregate_null_keeps_existing_guard_policy() {
+        let text = "%%start\nstruct copy Point { u8 value; }\nPoint() take = fn { *Point reader = null; Point result = *reader; result };\n%%end";
+        let single = validate_text(text);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn checked_dereference_field_move_uses_parent_loan_and_original_owner() {
+        let text = "%%start\nstruct Payload { i32 value; }\nstruct Holder { Payload nested; }\nPayload(Holder) take = fn(value) { *!Holder writer = &!value; Payload moved = (*writer).nested; moved };\n%%end";
+        let single = validate_text(text);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for items in [&single.program.items, &project.project.modules[0].items] {
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let moves = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter_map(|point| match &point.kind {
+                    CfgPointKind::Move { place, ty, owner } if !place.projections.is_empty() => {
+                        Some((point, place, ty, owner))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(moves.len(), 1, "{moves:?}");
+            let (point, place, ty, owner) = moves[0];
+            assert!(matches!(ty, ScalarType::Struct(_)));
+            assert_eq!(place.binding, *owner);
+            assert_eq!(owner.declaration_span, function.parameter_spans[0]);
+            assert_eq!(
+                point.source_span.range.start,
+                text.find("(*writer).nested").unwrap() as u32
+            );
+            assert!(
+                matches!(&place.projections[..], [ReferencePlaceProjection::Dereference(loan), ReferencePlaceProjection::Field(_)] if loan.origin_place.binding == *owner && loan.mode == ScalarReferenceMutability::Mutable)
+            );
+        }
+    }
+
+    #[test]
+    fn joined_checked_dereference_move_preserves_both_parent_loans() {
+        let text = "%%start\nstruct Payload { i32 value; }\nstruct Holder { Payload nested; }\nPayload(*!Holder, *!Holder, bool) choose = fn(first, second, flag) { *!Holder writer = first; if (flag) { writer = first; } else { writer = second; }; Payload moved = (*writer).nested; moved };\n%%end";
+        let single = validate_text(text);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let event = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| matches!(point.kind, CfgPointKind::MoveThrough { .. }))
+                .expect("joined move");
+            let CfgPointKind::MoveThrough { candidates, ty, .. } = &event.kind else {
+                unreachable!()
+            };
+            assert!(matches!(ty, ScalarType::Struct(_)));
+            assert_eq!(candidates.len(), 2, "{candidates:?}");
+            assert_eq!(event.possible_origins.as_ref().map(BTreeSet::len), Some(2));
+            assert_eq!(
+                event.source_span.range.start,
+                text.find("(*writer).nested").unwrap() as u32
+            );
+            let owners = candidates
+                .iter()
+                .map(|candidate| candidate.place.binding.declaration_span)
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                owners,
+                HashSet::from([function.parameter_spans[0], function.parameter_spans[1]])
+            );
+            for candidate in candidates {
+                assert!(
+                    matches!(&candidate.place.projections[..], [ReferencePlaceProjection::Dereference(loan), ReferencePlaceProjection::Field(_)] if loan.as_ref() == &candidate.loan)
+                );
+                assert!(event
+                    .possible_origins
+                    .as_ref()
+                    .unwrap()
+                    .contains(&candidate.origin));
+            }
+        }
+    }
+
+    #[test]
+    fn copyable_checked_dereference_remains_a_read_in_both_validators() {
+        let text = "%%start\nstruct copy Point { i32 value; }\ni32(Point) take = fn(value) { *Point reader = &value; (*reader).value };\ni32(i32) read_scalar = fn(value) { *i32 reader = &value; *reader };\n%%end";
+        let single = validate_text(text);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            for item in items {
+                let ScalarItem::Function(function) = item else {
+                    continue;
+                };
+                assert!(!function.reference_cfg.points.iter().any(|point| matches!(
+                    point.kind,
+                    CfgPointKind::Move { .. } | CfgPointKind::MoveThrough { .. }
+                )));
+                assert!(function.reference_cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Read { binding } if binding.declaration_span == function.body.items.iter().find_map(|item| match item { ScalarBlockItem::LocalBinding(binding) => Some(binding.name_span), _ => None }).unwrap())));
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_dereference_of_fixed_array_is_rejected_by_current_grammar() {
+        let text = "%%start\nstruct Payload { i32 value; }\nPayload(Payload[2], u64) take = fn(values, index) { *!(Payload[2]) writer = &!values; (*writer)[index] };\n%%end";
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "S0001"),
+            "{:?}",
+            parsed.diagnostics
+        );
+    }
+
+    #[test]
+    fn typed_move_events_from_source_in_both_validators() {
+        let text = "%%start\nstruct Payload { i32 value; }\nstruct Holder { Payload nested; }\nstruct copy Point { i32 value; }\nenum DefaultStatus { ok; }\nenum copy CopyStatus { ok; }\nPayload(Payload) move_payload = fn(value) { value };\nPayload(Holder) move_field = fn(container) { container.nested };\nPoint(Point) copy_point = fn(item) { item };\nDefaultStatus(DefaultStatus) move_enum = fn(item) { item };\nCopyStatus(CopyStatus) copy_enum = fn(item) { item };\nPayload[2](Payload[2]) move_fixed = fn(values) { values };\ni32[2](i32[2]) copy_fixed = fn(values) { values };\nu8[](u8[]) move_runtime = fn(values) { values };\n*!i32(*!i32) move_mutable = fn(value) { value };\ni32(Payload) read_only = fn(value) { value.value };\n%%end";
+        let single = validate_text(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        let module =
+            ScalarModule::from_program(derive_scalar_program(&parsed.result).program, Vec::new());
+        let project = validate_scalar_project(ScalarProject::new(vec![module], vec![source()]));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for items in [&single.program.items, &project.project.modules[0].items] {
+            for item in items {
+                let ScalarItem::Function(function) = item else {
+                    continue;
+                };
+                let moves = function
+                    .reference_cfg
+                    .points
+                    .iter()
+                    .filter_map(|point| match &point.kind {
+                        CfgPointKind::Move { place, ty, owner } => Some((point, place, ty, owner)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                match function.name.as_str() {
+                    "copy_point" | "copy_fixed" | "copy_enum" | "read_only" => {
+                        assert!(moves.is_empty(), "{}: {moves:?}", function.name)
+                    }
+                    _ => {
+                        assert_eq!(moves.len(), 1, "{}: {moves:?}", function.name);
+                        let (point, place, ty, owner) = moves[0];
+                        assert_eq!(&place.binding, owner);
+                        assert_eq!(place.binding.declaration_span, function.parameter_spans[0]);
+                        assert_eq!(
+                            point.source_span.range,
+                            scalar_place_target_span(&place.place)
+                        );
+                        assert_eq!(
+                            copy_policy(
+                                ty,
+                                &single.program.structs,
+                                &single.program.enums,
+                                &BTreeSet::new()
+                            ),
+                            Ok(CopyPolicy::Move)
+                        );
+                        if function.name == "move_field" {
+                            assert!(
+                                matches!(&place.projections[..], [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] if field.index == 0 && field.structure == single.program.structs[1].id)
+                            );
+                        } else {
+                            assert!(place.projections.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_aggregate_element_move_is_rejected_in_both_validators() {
+        let text = "%%start\nstruct Payload { i32 value; }\nPayload(Payload[2], u64) take = fn(values, index) { values[index] };\n%%end";
+        let single = validate_text(text);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.message == "array elements cannot be moved individually"
+                })
+                .expect("individual array move guard");
+            assert_eq!(
+                diagnostic.labels[0].span.range.start,
+                text.find("values[index]").unwrap() as u32
+            );
+        }
+    }
+
+    #[test]
+    fn inferred_bindings_preserve_resolved_copy_and_move_types_in_both_validators() {
+        let text = "%%start\nstruct Payload { i32 value; }\nPayload(Payload, Payload) restore = fn(first, second) { next = first; saved = next; saved; next = second; next };\nu8[](u8[]) transfer = fn(values) { next = values; next };\ni32(i32) copy_value = fn(value) { next = value; next + value };\n%%end";
+        let single = validate_text(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for items in [&single.program.items, &project.project.modules[0].items] {
+            for item in items {
+                let ScalarItem::Function(function) = item else {
+                    continue;
+                };
+                let moves = function
+                    .reference_cfg
+                    .points
+                    .iter()
+                    .filter_map(|point| match &point.kind {
+                        CfgPointKind::Move { place, ty, owner } => Some((point, place, ty, owner)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                match function.name.as_str() {
+                    "copy_value" => assert!(moves.is_empty(), "{moves:?}"),
+                    "transfer" => {
+                        assert_eq!(moves.len(), 2, "{moves:?}");
+                        assert_eq!(
+                            moves[0].1.binding.declaration_span,
+                            function.parameter_spans[0]
+                        );
+                        let ScalarBlockItem::Assignment(assignment) = &function.body.items[0]
+                        else {
+                            panic!("inferred assignment")
+                        };
+                        assert_eq!(
+                            moves[1].1.binding.declaration_span,
+                            assignment.targets[0].target_span
+                        );
+                    }
+                    "restore" => {
+                        assert_eq!(moves.len(), 5, "{moves:?}");
+                        assert_eq!(
+                            moves[1].1.binding.declaration_span,
+                            moves[4].1.binding.declaration_span
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                for (point, place, ty, owner) in moves {
+                    assert_eq!(&place.binding, owner);
+                    assert_eq!(
+                        point.source_span.range,
+                        scalar_place_target_span(&place.place)
+                    );
+                    assert_eq!(
+                        copy_policy(
+                            ty,
+                            &single.program.structs,
+                            &single.program.enums,
+                            &BTreeSet::new()
+                        ),
+                        Ok(CopyPolicy::Move)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inferred_multi_output_call_keeps_each_output_type_and_owner() {
+        let text = "%%start\nstruct Payload { i32 value; }\n(Payload, u8[])(Payload, u8[]) pair = fn(left, right) { left, right };\nPayload(Payload, u8[]) consume = fn(left, right) { first, second = pair(left, right); second; first };\n%%end";
+        let single = validate_text(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (items, facts) in [
+            (
+                &single.program.items,
+                &single.program.resolved_assignment_outputs,
+            ),
+            (
+                &project.project.modules[0].items,
+                &project.project.modules[0].resolved_assignment_outputs,
+            ),
+        ] {
+            let ScalarItem::Function(function) = &items[1] else {
+                panic!("consumer")
+            };
+            let ScalarBlockItem::Assignment(assignment) = &function.body.items[0] else {
+                panic!("inferred outputs")
+            };
+            for (output_index, target) in assignment.targets.iter().enumerate() {
+                let key = ResolvedAssignmentOutputId {
+                    source: source(),
+                    function_span: function.span,
+                    target_span: target.target_span,
+                    output_index,
+                };
+                let facts = facts.borrow();
+                let ty = facts.get(&key).expect("resolved output fact");
+                if output_index == 0 {
+                    assert!(matches!(ty, ScalarType::Struct(_)));
+                } else {
+                    assert!(matches!(ty, ScalarType::RuntimeArray { .. }));
+                }
+            }
+            let moves = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter_map(|point| match &point.kind {
+                    CfgPointKind::Move { place, ty, owner } => Some((place, ty, owner)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(moves.len(), 4, "{moves:?}");
+            assert_eq!(
+                moves[2].0.binding.declaration_span,
+                assignment.targets[1].target_span
+            );
+            assert!(matches!(moves[2].1, ScalarType::RuntimeArray { .. }));
+            assert_eq!(
+                moves[3].0.binding.declaration_span,
+                assignment.targets[0].target_span
+            );
+            assert!(matches!(moves[3].1, ScalarType::Struct(_)));
+            assert_eq!(&moves[2].0.binding, moves[2].2);
+            assert_eq!(&moves[3].0.binding, moves[3].2);
+        }
+        let serialized = serde_json::to_value(&project.project).expect("serialized project");
+        let restored: ScalarProject = serde_json::from_value(serialized).expect("restored project");
+        assert!(restored.modules[0]
+            .resolved_assignment_outputs
+            .borrow()
+            .is_empty());
+        let revalidated = validate_scalar_project(restored);
+        assert!(
+            revalidated.diagnostics.is_empty(),
+            "{:?}",
+            revalidated.diagnostics
+        );
+        assert_eq!(
+            revalidated.project.modules[0]
+                .resolved_assignment_outputs
+                .borrow()
+                .len(),
+            project.project.modules[0]
+                .resolved_assignment_outputs
+                .borrow()
+                .len()
+        );
+    }
+
+    #[test]
+    fn absent_resolved_assignment_output_is_a_spanned_invariant_error() {
+        let text = "%%start\nu8[](u8[]) transfer = fn(values) { next = values; next };\n%%end";
+        let validated = validate_text(text);
+        assert!(
+            validated.diagnostics.is_empty(),
+            "{:?}",
+            validated.diagnostics
+        );
+        let ScalarItem::Function(function) = &validated.program.items[0] else {
+            panic!("function")
+        };
+        let mut function = function.clone();
+        let ScalarBlockItem::Assignment(assignment) = &function.body.items[0] else {
+            panic!("assignment")
+        };
+        let target_span = assignment.targets[0].target_span;
+        let errors = record_function_reference_origins(
+            &validated.program.source,
+            &mut function,
+            &HashSet::new(),
+            &[],
+            &validated.program.structs,
+            &validated.program.enums,
+            &HashMap::new(),
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].reason(),
+            ReferenceAnalysisErrorReason::MissingResolvedBinding
+        );
+        assert_eq!(
+            errors[0].source_span(),
+            &SourceSpan::new(validated.program.source, target_span)
+        );
+    }
+
+    #[test]
+    fn terminal_unsafe_block_derives_one_final_output() {
+        for (source_text, final_expression, item_count) in [
+            (
+                "%%start\n*u8(u8) f = fn(v) { unsafe { &v } };\n%%end",
+                "unsafe { &v }",
+                1,
+            ),
+            (
+                "%%start\n*u8(u8) f = fn(v) { unsafe { unsafe { &v } } };\n%%end",
+                "unsafe { unsafe { &v } }",
+                1,
+            ),
+            (
+                "%%start\n*u8(u8) f = fn(v) { unsafe { &v } unsafe { &v } };\n%%end",
+                "unsafe { &v }",
+                2,
+            ),
+        ] {
+            let result = validate_text(source_text);
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            let module_source = module_source("src/main.w");
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::new(
+                    module_source.clone(),
+                    module_from_text(module_source.clone(), source_text).items,
+                    Vec::new(),
+                )],
+                vec![module_source],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for items in [&result.program.items, &project.project.modules[0].items] {
+                let ScalarItem::Function(function) = &items[0] else {
+                    panic!("expected function");
+                };
+                let body = &function.body;
+                assert_eq!(body.final_output_values.len(), 1);
+                assert_eq!(body.items.len(), item_count);
+                assert_eq!(body.terminated_items, vec![false; item_count]);
+                assert_eq!(body.expressions.len(), item_count);
+                let output = &body.final_output_values[0];
+                assert_eq!(output.position, 0);
+                let start = source_text.rfind(final_expression).expect("final unsafe") as u32;
+                assert_eq!(
+                    output.span,
+                    ByteSpan::new(start, start + final_expression.len() as u32)
+                );
+                assert_eq!(
+                    body.items.last(),
+                    Some(&ScalarBlockItem::Expression(output.value.clone()))
+                );
+                assert!(matches!(
+                    &output.value,
+                    ScalarExpression::Block(block)
+                        if block.unsafe_context && block.final_output_values.len() == 1
+                ));
+            }
+        }
+    }
+
+    fn both_reference_functions(text: &str) -> (ScalarValidation, ScalarProjectValidation) {
+        let single = validate_text(text);
+        let source = module_source("src/main.w");
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                module_from_text(source.clone(), text),
+                Vec::new(),
+            )],
+            vec![source],
+        ));
+        (single, project)
+    }
+
+    #[test]
+    fn loop_local_move_state_ends_with_its_scope_in_both_validators() {
+        let text = "%%start\nstruct Payload { u64 length; }\nu64(Payload) parse = fn(text) { text.length };\nunit() run = fn { bool running = true; while (running) { Payload line = { .length = 1; }; u64 value = parse(line); value; running = false; } };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let function = items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) if function.name == "run" => Some(function),
+                    _ => None,
+                })
+                .expect("run function");
+            let moved = function.reference_cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Move { place, .. } if place.binding.declaration_span.start == text.find("line =").unwrap() as u32)).expect("typed argument move");
+            assert_eq!(
+                moved.source_span.range.start,
+                text.find("parse(line)").unwrap() as u32 + "parse(".len() as u32
+            );
+        }
+    }
+
+    #[test]
+    fn move_only_argument_to_multi_output_call_is_consumed_once_in_both_validators() {
+        let text = "%%start\nstruct Payload { u64 length; }\n(u64, bool)(Payload) inspect = fn(text) { text.length, true };\nunit() run = fn { Payload line = { .length = 1; }; u64 size = 0; bool valid = false; size, valid = inspect(line); size; valid; u64 again = line.length; again; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        let first = text.find("inspect(line)").unwrap() as u32 + "inspect(".len() as u32;
+        let second = text.find("line.length; again").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let function = items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) if function.name == "run" => Some(function),
+                    _ => None,
+                })
+                .expect("run function");
+            assert_eq!(
+                function
+                    .reference_cfg
+                    .points
+                    .iter()
+                    .filter(|point| matches!(point.kind, CfgPointKind::Move { .. })
+                        && point.source_span.range.start == first)
+                    .count(),
+                1
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range.start == second),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inner_scope_exit_preserves_outer_owner_move_in_both_validators() {
+        let text = "%%start\nstruct Payload { u64 length; }\nunit() run = fn { Payload outer = { .length = 1; }; if (true) { Payload moved = outer; moved.length; }; outer.length; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        let read = text.rfind("outer.length").unwrap() as u32;
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range.start == read),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_aggregate_conflicts_label_the_initiating_loan_in_both_pipelines() {
+        for (text, primary, origin) in [
+            ("%%start\nstruct Payload { u8 value; }\nunit() f = fn { Payload specimen = { .value = 1; }; *!Payload writer = &!specimen; Payload taken = *writer; Payload again = *writer; taken; again; };\n%%end", "*writer; taken", "&!specimen"),
+            ("%%start\nstruct Payload { u8 value; }\nunit() f = fn { Payload specimen = { .value = 1; }; *Payload retained = &specimen; Payload moved = specimen; retained; moved; };\n%%end", "= specimen; retained", "&specimen"),
+            ("%%start\nstruct Payload { u8 value; }\nstruct Holder { Payload nested; u8 other; }\nunit() f = fn { Holder specimen = { .nested = { .value = 1; }; .other = 2; }; *!Holder reader = &!specimen; Payload taken = specimen.nested; Holder whole = *reader; taken; whole; };\n%%end", "*reader; taken", "specimen.nested; Holder"),
+            ("%%start\nunit(u64) f = fn(length) { u8[length] bytes; *u8 borrowed = &bytes[0]; u8[] moved = bytes; borrowed; moved; };\n%%end", "= bytes; borrowed", "&bytes[0]"),
+            ("%%start\nunit(u64) f = fn(length) { u8[length] bytes; *u8 borrowed = &bytes[0]; unsafe { core.free(&bytes); }; borrowed; };\n%%end", "core.free(&bytes)", "&bytes[0]"),
+        ] {
+            let (single, project) = both_reference_functions(text);
+            for (diagnostics, source) in [
+                (&single.diagnostics, &single.program.source),
+                (&project.diagnostics, &project.project.modules[0].source),
+            ] {
+                let primary_start = text.find(primary).unwrap() as u32 + if primary.starts_with("= ") { 2 } else { 0 };
+                let diagnostic = diagnostics.iter().find(|diagnostic| diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place" && diagnostic.labels[0].span.range.start == primary_start).unwrap_or_else(|| panic!("{text}: {diagnostics:?}"));
+                assert_eq!(&diagnostic.labels[0].span.source, source);
+                let secondary = diagnostic.labels.iter().find(|label| label.kind == super::super::DiagnosticLabelKind::Secondary && label.span.range.start == text.find(origin).unwrap() as u32).unwrap_or_else(|| panic!("{text}: {diagnostic:?}"));
+                assert_eq!(&secondary.span.source, source);
+            }
+        }
+    }
+
+    #[test]
+    fn checked_aggregate_copy_and_single_move_are_accepted_in_both_pipelines() {
+        for text in [
+            "%%start\nstruct copy Point { u8 value; }\nunit() f = fn { Point sample = { .value = 1; }; *Point reader = &sample; Point a = *reader; Point b = *reader; a.value; b.value; };\n%%end",
+            "%%start\nstruct Payload { u8 value; }\nunit() f = fn { Payload specimen = { .value = 1; }; *!Payload writer = &!specimen; u8 prior = (*writer).value; Payload taken = *writer; prior; taken.value; };\n%%end",
+            "%%start\nunit() f = fn { u8[2] bytes = [1, 2]; *(u8[2]) reader = &bytes; u8[2] copy = *reader; copy[0]; bytes[1]; };\n%%end",
+        ] {
+            let (single, project) = both_reference_functions(text);
+            assert!(single.diagnostics.is_empty(), "{text}: {:?}", single.diagnostics);
+            assert!(project.diagnostics.is_empty(), "{text}: {:?}", project.diagnostics);
+        }
+    }
+
+    #[test]
+    fn dynamic_index_write_reports_overlapping_loan_in_both_pipelines() {
+        let text = "%%start\nunit(u64) f = fn(index) { u8[2] bytes = [1, 2]; *u8 reader = &bytes[0]; index; bytes[index] = 3; reader; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (diagnostics, source) in [
+            (&single.diagnostics, &single.program.source),
+            (&project.diagnostics, &project.project.modules[0].source),
+        ] {
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range.start
+                            == text.find("bytes[index] =").unwrap() as u32 + "bytes[".len() as u32
+                })
+                .unwrap_or_else(|| panic!("{diagnostics:?}"));
+            assert_eq!(&diagnostic.labels[0].span.source, source);
+            assert!(
+                diagnostic.labels.iter().any(|label| label.kind
+                    == super::super::DiagnosticLabelKind::Secondary
+                    && label.span.source == *source
+                    && label.span.range.start == text.find("&bytes[0]").unwrap() as u32),
+                "{diagnostic:?}"
+            );
+        }
+    }
+
+    fn sole_fact<'a>(
+        function: &'a ScalarFunction,
+        point: &ReferenceFlowPoint,
+    ) -> &'a ReferenceOrigin {
+        let origins = point.possible_origins.as_ref().expect("computed fact");
+        assert_eq!(origins.len(), 1, "{point:?}");
+        let id = *origins.iter().next().expect("one fact");
+        &function.reference_cfg.facts[id.0]
+    }
+
+    #[test]
+    fn reference_cfg_loop_and_multi_output_call_have_source_points_in_both_validators() {
+        let text = "%%start\n(u8, bool)(bool) pair = fn(flag) { u8 value = 1; value, flag };\n*u8(*u8, bool) loop_ref = fn(input, flag) { *u8 result = input; while (flag) { result = null; } result };\nbool(bool) call_pair = fn(flag) { u8 magnitude, bool valid = pair(flag); magnitude; valid };\nbool(bool) assigned = fn(flag) { u8 magnitude = 0; bool valid = false; magnitude, valid = pair(flag); magnitude; valid };\n(*u8, bool)(bool) nullable = fn(flag) { null, flag };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, source) in [
+            (&single.program.items, &single.program.source),
+            (
+                &project.project.modules[0].items,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            let functions = items
+                .iter()
+                .filter_map(|item| match item {
+                    ScalarItem::Function(function) => Some(function),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let loop_cfg = &functions[1].reference_cfg;
+            let head = loop_cfg
+                .points
+                .iter()
+                .find(|point| matches!(point.kind, CfgPointKind::LoopTest { .. }))
+                .expect("loop head");
+            let test = loop_cfg
+                .points
+                .iter()
+                .find(|point| matches!(point.kind, CfgPointKind::Branch { .. }))
+                .expect("loop test branch");
+            assert_eq!(head.source_span.source, *source);
+            assert_eq!(
+                head.source_span.range,
+                ByteSpan::new(
+                    text.find("while (flag)").unwrap() as u32 + 7,
+                    text.find("while (flag)").unwrap() as u32 + 11
+                )
+            );
+            assert_eq!(test.successors.len(), 2);
+            assert!(loop_cfg
+                .points
+                .iter()
+                .any(|point| point.id.0 > test.id.0 && point.successors.contains(&head.id)));
+            assert!(loop_cfg
+                .points
+                .iter()
+                .any(|point| matches!(point.kind, CfgPointKind::Join)
+                    && test.successors.contains(&point.id)));
+            assert_eq!(
+                loop_cfg
+                    .points
+                    .iter()
+                    .filter(|point| matches!(point.kind, CfgPointKind::Return))
+                    .count(),
+                1
+            );
+            let call_cfg = &functions[2].reference_cfg;
+            let valid = text.find("valid = pair").unwrap() as u32;
+            assert!(call_cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Bind { binding } if binding.declaration_span == ByteSpan::new(valid, valid + 5) && binding.source == *source)));
+            assert!(call_cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Read { binding } if binding.declaration_span.start == valid && point.source_span.range.start > valid)));
+            assert!(call_cfg
+                .points
+                .iter()
+                .any(|point| matches!(&point.kind, CfgPointKind::Call { output: 1, .. })));
+            let assignment_cfg = &functions[3].reference_cfg;
+            let assignment_valid = text.rfind("valid = pair(flag); magnitude").unwrap() as u32;
+            assert!(assignment_cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Assign { target, .. } if target.declaration_span.start < assignment_valid && point.source_span.range.start == assignment_valid)));
+            assert!(assignment_cfg
+                .points
+                .iter()
+                .any(|point| matches!(&point.kind, CfgPointKind::Call { output: 1, .. })));
+            let nullable = &functions[4].reference_cfg;
+            let null_start = text.rfind("null, flag").unwrap() as u32;
+            let return_point = nullable
+                .points
+                .iter()
+                .find(|point| matches!(point.kind, CfgPointKind::Return))
+                .expect("one return");
+            assert_eq!(
+                return_point.source_span.range,
+                ByteSpan::new(null_start, null_start + 10)
+            );
+            assert_eq!(
+                nullable
+                    .points
+                    .iter()
+                    .filter(|point| matches!(point.kind, CfgPointKind::Return))
+                    .count(),
+                1
+            );
+            assert!(return_point.possible_origins.as_ref().is_some_and(|origins| origins.iter().any(|id| matches!(nullable.facts[id.0], ReferenceOrigin::Null { span } if span == ByteSpan::new(null_start, null_start + 4)))));
+            let output_facts = nullable
+                .points
+                .iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(output_facts.len(), 2);
+            assert!(matches!(
+                output_facts[0].kind,
+                CfgPointKind::ReturnOutput { output: 0, .. }
+            ));
+            assert!(
+                matches!(sole_fact(functions[4], output_facts[0]), ReferenceOrigin::Null { span } if *span == ByteSpan::new(null_start, null_start + 4))
+            );
+            assert!(matches!(
+                output_facts[1].kind,
+                CfgPointKind::ReturnOutput { output: 1, .. }
+            ));
+            assert!(output_facts[1].possible_origins.is_none());
+        }
+    }
+
+    #[test]
+    fn returned_checked_aggregate_outputs_keep_distinct_owner_facts_in_both_validators() {
+        let text = "%%start\nstruct copy Point { u8 value; }\n(*Point, *(u8[2]), *Point)(*Point) outputs = fn(borrowed) { Point sample = { .value = 1; }; u8[2] bytes = [2, 3]; &sample, &bytes, borrowed };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (diagnostics, items) in [
+            (&single.diagnostics, &single.program.items),
+            (&project.diagnostics, &project.project.modules[0].items),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("expected function");
+            };
+            let outputs = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(outputs.len(), 3);
+            for (index, point) in outputs.iter().enumerate() {
+                assert!(
+                    matches!(point.kind, CfgPointKind::ReturnOutput { output, .. } if output == index)
+                );
+            }
+            for point in &outputs[..2] {
+                assert!(matches!(
+                    sole_fact(function, point),
+                    ReferenceOrigin::Fresh { .. }
+                ));
+            }
+            assert_ne!(outputs[0].possible_origins, outputs[1].possible_origins);
+            assert!(matches!(
+                sole_fact(function, outputs[2]),
+                ReferenceOrigin::BorrowedFrom { parameter: 0, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn returned_checked_aggregate_branch_preserves_fresh_and_null_facts() {
+        let text = "%%start\nstruct copy Point { u8 value; }\n*Point(bool) choose = fn(flag) { Point sample = { .value = 1; }; if (flag) { &sample } else { null } };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (diagnostics, items) in [
+            (&single.diagnostics, &single.program.items),
+            (&project.diagnostics, &project.project.modules[0].items),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let returned = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+                .expect("return output");
+            let facts = returned.possible_origins.as_ref().expect("branch facts");
+            assert_eq!(facts.len(), 2);
+            assert!(facts.iter().any(|id| matches!(
+                function.reference_cfg.facts[id.0],
+                ReferenceOrigin::Fresh { .. }
+            )));
+            assert!(facts.iter().any(|id| matches!(
+                function.reference_cfg.facts[id.0],
+                ReferenceOrigin::Null { .. }
+            )));
+        }
+    }
+
+    #[test]
+    fn checked_aggregate_call_return_preserves_borrowed_owner_in_both_validators() {
+        let text = "%%start\nstruct copy Point { u8 value; }\n*Point(*Point) forward = fn(input) { input };\nunit() caller = fn { Point sample = { .value = 3; }; *Point result = forward(&sample); Point value = *result; value.value; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn forwarded_borrowed_aggregate_rejects_owner_move_at_caller_with_origin_label() {
+        let text = "%%start\nstruct Payload { u8 value; }\n*Payload(*Payload) forward = fn(input) { input };\nunit() caller = fn { Payload sample = { .value = 3; }; *Payload retained = forward(&sample); Payload moved = sample; retained; moved; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let conflict = diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range.start
+                            == text.find("= sample; retained").unwrap() as u32 + 2
+                })
+                .unwrap_or_else(|| panic!("{diagnostics:?}"));
+            assert!(conflict.labels.iter().any(|label| {
+                label.kind == super::super::DiagnosticLabelKind::Secondary
+                    && label.span.range.start == text.find("&sample").unwrap() as u32
+            }));
+        }
+    }
+
+    #[test]
+    fn checked_return_rejects_escaped_moved_local_at_output_and_labels_address() {
+        let text = "%%start\nstruct Payload { u8 value; }\n*Payload() escape = fn { Payload local = { .value = 1; }; *Payload held = &local; Payload moved = local; moved; held };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let escaped = diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range.start
+                            == text.rfind("held };").unwrap() as u32
+                })
+                .unwrap_or_else(|| panic!("{diagnostics:?}"));
+            assert!(escaped.labels.iter().any(|label| {
+                label.kind == super::super::DiagnosticLabelKind::Secondary
+                    && label.span.range.start == text.find("&local").unwrap() as u32
+            }));
+        }
+    }
+
+    #[test]
+    fn forwarded_fresh_struct_and_array_checked_returns_validate_in_both_pipelines() {
+        let text = "%%start\nstruct copy Point { u8 value; }\n*Point() make_point = fn { Point sample = { .value = 3; }; &sample };\n*Point() forward_point = fn { make_point() };\n*(u8[2])() make_array = fn { u8[2] bytes = [4, 5]; &bytes };\n*(u8[2])() forward_array = fn { make_array() };\nunit() caller = fn { *Point result = forward_point(); Point whole = *result; u8 field = (*result).value; *(u8[2]) values = forward_array(); u8[2] copied = *values; whole.value; field; copied[0]; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn cross_module_checked_aggregate_returns_keep_declaring_source_and_concrete_owner() {
+        let library_source = module_source("src/library.w");
+        let library = module_from_text(
+            library_source.clone(),
+            "%%start\nstruct copy Point { u8 value; }\n*Point() make_point = fn { Point sample = { .value = 7; }; &sample };\n*(u8[2])() make_array = fn { u8[2] bytes = [4, 5]; &bytes };\n%%end",
+        );
+        let main_source = module_source("src/main.w");
+        let main = module_from_text(
+            main_source.clone(),
+            "%%start\nlib = namespace app \"src/library.w\";\n*lib.Point() forward_point = fn { lib.make_point() };\n*(u8[2])() forward_array = fn { lib.make_array() };\nunit() caller = fn { *lib.Point result = forward_point(); lib.Point whole = *result; u8 field = (*result).value; *(u8[2]) values = forward_array(); u8[2] copied = *values; whole.value; field; copied[0]; };\n%%end",
+        );
+        let namespace_span = match &main.items[0] {
+            ScalarItem::Namespace(namespace) => namespace.span,
+            _ => panic!("namespace"),
+        };
+        let result = validate_scalar_project(ScalarProject::new(
+            vec![
+                ScalarModule::from_program(
+                    main,
+                    vec![ScalarNamespaceBinding {
+                        binding: "lib".to_owned(),
+                        target: library_source.clone(),
+                        span: namespace_span,
+                    }],
+                ),
+                ScalarModule::from_program(library, Vec::new()),
+            ],
+            vec![main_source, library_source.clone()],
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Function(forward) = &result.project.modules[0].items[1] else {
+            panic!("forward")
+        };
+        let returned = forward
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("return output");
+        assert!(
+            matches!(sole_fact(forward, returned), ReferenceOrigin::Fresh { allocation, .. } if allocation.source == library_source)
+        );
+    }
+
+    #[test]
+    fn distinct_fresh_calls_and_forwarded_null_keep_independent_output_facts() {
+        let text = "%%start\nstruct copy Point { u8 value; }\n*Point() make_point = fn { Point sample = { .value = 4; }; &sample };\n*Point() empty = fn { null };\n*Point() forward_empty = fn { empty() };\nunit() caller = fn { *Point first = make_point(); *Point second = make_point(); *Point vacant = forward_empty(); Point left = *first; Point right = *second; left.value; right.value; vacant; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let functions = items
+                .iter()
+                .filter_map(|item| match item {
+                    ScalarItem::Function(function) => Some(function),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let calls = functions[3]
+                .reference_cfg
+                .points
+                .iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::Call { output: 0, .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 3);
+            let ReferenceOrigin::Fresh { loan: first, .. } = sole_fact(functions[3], calls[0])
+            else {
+                panic!("first fresh")
+            };
+            let ReferenceOrigin::Fresh { loan: second, .. } = sole_fact(functions[3], calls[1])
+            else {
+                panic!("second fresh")
+            };
+            assert_ne!(first.origin_place.binding, second.origin_place.binding);
+            assert!(matches!(
+                sole_fact(functions[3], calls[2]),
+                ReferenceOrigin::Null { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn two_fresh_outputs_from_one_call_have_distinct_owner_places() {
+        let text = "%%start\nstruct copy Point { u8 value; }\n(*Point, *Point)() pair = fn { Point first = { .value = 1; }; Point second = { .value = 2; }; &first, &second };\nunit() caller = fn { *Point left, *Point right = pair(); Point a = *left; Point b = *right; a.value; b.value; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(caller) = &items[1] else {
+                panic!("caller")
+            };
+            let facts = caller
+                .reference_cfg
+                .points
+                .iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+                .map(|point| sole_fact(caller, point))
+                .collect::<Vec<_>>();
+            let [ReferenceOrigin::Fresh { loan: left, .. }, ReferenceOrigin::Fresh { loan: right, .. }] =
+                facts.as_slice()
+            else {
+                panic!("fresh pair: {facts:?}")
+            };
+            assert_ne!(left.origin_place, right.origin_place);
+            assert!(!reference_places_overlap(
+                &left.origin_place,
+                &right.origin_place,
+            ));
+        }
+    }
+
+    #[test]
+    fn forwarded_move_only_aggregate_checked_result_is_consumed_once() {
+        let text = "%%start\nstruct Payload { u8 value; }\n*!Payload() make_payload = fn { Payload sample = { .value = 4; }; &!sample };\n*!Payload() forward_payload = fn { make_payload() };\nunit() caller = fn { *!Payload result = forward_payload(); u8 field = (*result).value; Payload taken = *result; field; taken.value; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn forwarded_move_only_fixed_array_checked_result_is_consumed_once() {
+        let text = "%%start\nstruct Payload { u8 value; }\n*!(Payload[2])() make_items = fn { Payload[2] items = [{ .value = 1; }, { .value = 2; }]; &!items };\n*!(Payload[2])() forward_items = fn { make_items() };\nunit() caller = fn { *!(Payload[2]) result = forward_items(); Payload[2] taken = *result; taken; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn checked_aggregate_generic_and_overload_outputs_substitute_argument_owner() {
+        let text = "%%start\nstruct copy Point { u8 value; }\ngeneric T;\n*T(*T) generic_forward = fn(input) { input };\nforward = overload { *Point(*Point) => fn(input) { generic_forward<Point>(input) }; *(u8[2])(*(u8[2])) => fn(input) { input }; };\nunit() caller = fn { Point sample = { .value = 8; }; u8[2] bytes = [1, 2]; *Point point_result = forward(&sample); *(u8[2]) array_result = forward(&bytes); Point whole = *point_result; u8[2] copied = *array_result; whole.value; copied[0]; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn returned_reborrow_of_field_preserves_disjoint_caller_place() {
+        let text = "%%start\nstruct Payload { u8 value; }\nstruct Pair { Payload left; Payload right; }\n*Payload(*Payload) select_left = fn(input) { input };\nunit() caller = fn { Pair bundle = { .left = { .value = 1; }; .right = { .value = 2; }; }; *Payload left = select_left(&bundle.left); Payload right = bundle.right; left; right; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn loop_reference_facts_converge_across_zero_and_repeated_iterations_in_both_validators() {
+        let text = "%%start\nunit(bool) repeat = fn(flag) { u8 first = 1; u8 second = 2; *u8 alias = &first; while (flag) { *u8 local = &second; local; alias = &second; alias = &first; } alias; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("repeat function")
+            };
+            let read = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(&point.kind, CfgPointKind::Read { binding } if binding.declaration_span.start == text.find("alias = &first").unwrap() as u32)
+                        && point.source_span.range.start == text.rfind("alias;").unwrap() as u32
+                })
+                .expect("exit read");
+            assert_eq!(read.possible_origins.as_ref().map(BTreeSet::len), Some(2));
+        }
+    }
+
+    #[test]
+    fn loop_carried_loan_conflicts_with_owner_move_after_exit_in_both_validators() {
+        let text = "%%start\nstruct Payload { u8 value; }\nunit(bool) consume = fn(flag) { Payload item = { .value = 1; }; *Payload retained = &item; while (flag) { retained; } Payload taken = item; retained; taken.value; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        let moved = text.find("taken = item").unwrap() as u32 + 8;
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range.start == moved),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_local_loan_ends_before_owner_move_in_both_validators() {
+        let text = "%%start\nstruct Payload { u8 value; }\nunit(bool) consume = fn(flag) { Payload item = { .value = 1; }; while (flag) { *Payload local = &item; local; } Payload taken = item; taken.value; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn loop_aggregate_copy_and_move_preserve_availability_in_both_validators() {
+        let copy = "%%start\nstruct copy Point { u8 value; }\nunit(bool) repeat = fn(flag) { Point item = { .value = 1; }; *Point reader = &item; while (flag) { Point seen = *reader; seen.value; } item.value; };\n%%end";
+        let (single, project) = both_reference_functions(copy);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+
+        let moved = "%%start\nstruct Payload { u8 value; }\nunit(bool) repeat = fn(flag) { Payload item = { .value = 1; }; while (flag) { Payload taken = item; taken.value; } item.value; };\n%%end";
+        let (single, project) = both_reference_functions(moved);
+        let read = moved.rfind("item.value").unwrap() as u32;
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range.start == read),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_cfg_distinguishes_core_release_from_user_free_and_records_runtime_array_moves() {
+        let text = "%%start\nunit(*?u8) free = fn(pointer) { pointer; };\nunit() release = fn { unsafe { *?u8 storage = core.alloc(1, 1); free(storage); core.free(storage); } };\nu8[](u8[]) relay = fn(values) { u8[] next = values; next };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics, source) in [
+            (
+                &single.program.items,
+                &single.diagnostics,
+                &single.program.source,
+            ),
+            (
+                &project.project.modules[0].items,
+                &project.diagnostics,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let functions = items
+                .iter()
+                .filter_map(|item| match item {
+                    ScalarItem::Function(function) => Some(function),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let release_cfg = &functions[1].reference_cfg;
+            let storage = text.find("storage =").unwrap() as u32;
+            let core = text.find("core.free(storage)").unwrap() as u32;
+            let user = text.find("free(storage)").unwrap() as u32;
+            let releases = release_cfg
+                .points
+                .iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::Release { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(releases.len(), 1);
+            assert_eq!(releases[0].source_span.source, *source);
+            assert_eq!(
+                releases[0].source_span.range,
+                ByteSpan::new(core, core + 18)
+            );
+            assert!(
+                matches!(&releases[0].kind, CfgPointKind::Release { target: ReleaseTarget::Raw { binding } } if binding.declaration_span == ByteSpan::new(storage, storage + 7) && binding.source == *source)
+            );
+            assert!(release_cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Call { expression: ScalarExpression::Call { receiver: None, name, .. }, .. } if name == "free") && point.source_span.range.start == user));
+            let move_cfg = &functions[2].reference_cfg;
+            let parameter = text.find("fn(values)").unwrap() as u32 + 3;
+            let moved = text.find("next = values").unwrap() as u32 + 7;
+            assert!(move_cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Move { place, .. } if place.binding.declaration_span == ByteSpan::new(parameter, parameter + 6) && place.binding.source == *source) && point.source_span.range == ByteSpan::new(moved, moved + 6)));
+        }
+    }
+
+    #[test]
+    fn reference_cfg_call_targets_distinguish_core_free_from_local_free_in_both_validators() {
+        let text = "%%start\nunit((unit(*?u8))) release = fn(free) { unsafe { *?u8 storage = core.alloc(1, 1); free(storage); core.free(storage); } };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics, source) in [
+            (
+                &single.program.items,
+                &single.diagnostics,
+                &single.program.source,
+            ),
+            (
+                &project.project.modules[0].items,
+                &project.diagnostics,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("source function")
+            };
+            let calls = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter_map(|point| match &point.kind {
+                    CfgPointKind::Call {
+                        target, output: 0, ..
+                    } => Some((point, target)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 3);
+            let alloc_start = text.find("core.alloc(1, 1)").unwrap() as u32;
+            let local_start = text.find("free(storage)").unwrap() as u32;
+            let core_start = text.find("core.free(storage)").unwrap() as u32;
+            assert_eq!(
+                calls[0].0.source_span,
+                SourceSpan::new(source.clone(), ByteSpan::new(alloc_start, alloc_start + 16))
+            );
+            assert_eq!(
+                calls[0].1,
+                &ResolvedCallTarget::Core(CoreOperationId::Alloc)
+            );
+            let ResolvedCallTarget::LocalCallable(local) = calls[1].1 else {
+                panic!(
+                    "local free call must use resolved lexical binding: {:?}",
+                    calls[1].1
+                )
+            };
+            let parameter_start = text.find("fn(free)").unwrap() as u32 + 3;
+            assert_eq!(
+                local.declaration_span,
+                ByteSpan::new(parameter_start, parameter_start + 4)
+            );
+            assert_eq!(local.function_span, function.span);
+            assert_eq!(local.source, *source);
+            assert_eq!(
+                calls[1].0.source_span.range,
+                ByteSpan::new(local_start, local_start + 13)
+            );
+            assert_eq!(calls[2].1, &ResolvedCallTarget::Core(CoreOperationId::Free));
+            assert_eq!(
+                calls[2].0.source_span.range,
+                ByteSpan::new(core_start, core_start + 18)
+            );
+            let releases = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter_map(|point| match &point.kind {
+                    CfgPointKind::Release {
+                        target: ReleaseTarget::Raw { binding },
+                    } => Some((point, binding)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(releases.len(), 1);
+            let storage_start = text.find("storage =").unwrap() as u32;
+            assert_eq!(
+                releases[0].1.declaration_span,
+                ByteSpan::new(storage_start, storage_start + 7)
+            );
+            assert_eq!(releases[0].1.source, *source);
+            assert_eq!(
+                releases[0].0.source_span.range,
+                calls[2].0.source_span.range
+            );
+        }
+    }
+
+    #[test]
+    fn checked_core_free_records_typed_owner_and_expires_derived_loans_in_both_validators() {
+        let text = "%%start\nunit(u64) release = fn(count) { u8[count] bytes; *u8 reader = &bytes[0]; reader; unsafe { core.free(&bytes); } };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics, source) in [
+            (
+                &single.program.items,
+                &single.diagnostics,
+                &single.program.source,
+            ),
+            (
+                &project.project.modules[0].items,
+                &project.diagnostics,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("release")
+            };
+            let release = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(
+                        &point.kind,
+                        CfgPointKind::Release {
+                            target: ReleaseTarget::Checked { .. }
+                        }
+                    )
+                })
+                .expect("checked release");
+            let CfgPointKind::Release {
+                target:
+                    ReleaseTarget::Checked {
+                        address_point,
+                        candidates,
+                        address_span,
+                    },
+            } = &release.kind
+            else {
+                unreachable!()
+            };
+            assert_eq!(candidates.len(), 1);
+            let candidate = &candidates[0];
+            let bytes_start = text.find("bytes;").unwrap() as u32;
+            assert_eq!(
+                candidate.place.binding.declaration_span,
+                ByteSpan::new(bytes_start, bytes_start + 5)
+            );
+            assert_eq!(candidate.place.source, *source);
+            assert!(candidate.place.projections.is_empty());
+            assert_eq!(candidate.loan.origin_place, candidate.place);
+            assert!(function.reference_cfg.points[address_point.0]
+                .possible_origins
+                .as_ref()
+                .unwrap()
+                .contains(&candidate.origin));
+            let address_start = text.find("&bytes);").unwrap() as u32;
+            assert_eq!(
+                address_span,
+                &SourceSpan::new(
+                    source.clone(),
+                    ByteSpan::new(address_start, address_start + 6)
+                )
+            );
+        }
+        let bad = "%%start\nunit(u64) release = fn(count) { u8[count] bytes; *u8 reader = &bytes[0]; unsafe { core.free(&bytes); }; reader; };\n%%end";
+        let (single, project) = both_reference_functions(bad);
+        let read_start = bad.rfind("reader;").unwrap() as u32;
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range
+                            == ByteSpan::new(read_start, read_start + 6)),
+                "{diagnostics:?}"
+            );
+        }
+        let owner_use = "%%start\nunit(u64) release = fn(count) { u8[count] bytes; unsafe { core.free(&bytes); }; bytes[0]; };\n%%end";
+        let (single, project) = both_reference_functions(owner_use);
+        let use_start = owner_use.rfind("bytes[0]").unwrap() as u32;
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range.start == use_start),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_core_free_retains_all_joined_owner_candidates_in_both_validators() {
+        let text = "%%start\nunit(u64, bool) release = fn(count, flag) { u8[count] first; u8[count] second; *u8 alias = &first[0]; if (flag) { alias = &second[0]; }; unsafe { core.free(alias); } };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics, source) in [
+            (
+                &single.program.items,
+                &single.diagnostics,
+                &single.program.source,
+            ),
+            (
+                &project.project.modules[0].items,
+                &project.diagnostics,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("release")
+            };
+            let point = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(
+                        &point.kind,
+                        CfgPointKind::Release {
+                            target: ReleaseTarget::Checked { .. }
+                        }
+                    )
+                })
+                .expect("checked release");
+            let CfgPointKind::Release {
+                target:
+                    ReleaseTarget::Checked {
+                        candidates,
+                        address_point,
+                        address_span,
+                    },
+            } = &point.kind
+            else {
+                unreachable!()
+            };
+            assert_eq!(candidates.len(), 2);
+            let read = &function.reference_cfg.points[address_point.0];
+            assert_eq!(read.possible_origins.as_ref().map(BTreeSet::len), Some(2));
+            let alias_start = text.rfind("alias);").unwrap() as u32;
+            assert_eq!(
+                address_span,
+                &SourceSpan::new(source.clone(), ByteSpan::new(alias_start, alias_start + 5))
+            );
+            let declarations = [
+                text.find("first;").unwrap() as u32,
+                text.find("second;").unwrap() as u32,
+            ];
+            for candidate in candidates {
+                assert!(read
+                    .possible_origins
+                    .as_ref()
+                    .unwrap()
+                    .contains(&candidate.origin));
+                assert_eq!(candidate.place.source, *source);
+                assert_eq!(candidate.loan.origin_place, candidate.place);
+                assert_eq!(candidate.place.projections.len(), 1);
+                assert!(declarations.contains(&candidate.place.binding.declaration_span.start));
+            }
+            assert_ne!(candidates[0].place.binding, candidates[1].place.binding);
+        }
+    }
+
+    #[test]
+    fn joined_checked_release_preserves_untouched_owner_on_each_branch() {
+        let text = "%%start\nunit(u64, bool) release = fn(count, flag) { u8[count] first; u8[count] second; *u8 alias = &first[0]; if (flag) { alias = &second[0]; unsafe { core.free(alias); }; first[0]; } else { unsafe { core.free(alias); }; second[0]; }; } ;\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn joined_checked_release_rejects_use_of_selected_owner_on_each_branch() {
+        let text = "%%start\nunit(u64, bool) release = fn(count, flag) { u8[count] first; u8[count] second; *u8 alias = &first[0]; if (flag) { alias = &second[0]; unsafe { core.free(alias); }; *u8 used = &second[0]; used; } else { unsafe { core.free(alias); }; *u8 used = &first[0]; used; }; } ;\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            for owner in ["&second[0]; used", "&first[0]; used"] {
+                let start = text.find(owner).unwrap() as u32;
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == "B0003"
+                            && diagnostic.labels[0].span.range.start == start),
+                    "{diagnostics:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn joined_checked_release_reports_second_release_for_each_possible_owner() {
+        let text = "%%start\nunit(u64, bool) release = fn(count, flag) { u8[count] first; u8[count] second; *u8 alias = &first[0]; if (flag) { alias = &second[0]; }; unsafe { core.free(alias); core.free(alias); }; } ;\n%%end";
+        let (single, project) = both_reference_functions(text);
+        let second = text.rfind("alias);").unwrap() as u32;
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range.start == second),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn joined_checked_release_preserves_correlated_untouched_alias() {
+        let text = "%%start\nunit(u64, bool) release = fn(count, flag) { u8[count] first; u8[count] second; *u8 selected = &first[0]; *u8 untouched = &second[0]; if (flag) { selected, untouched = untouched, selected; }; unsafe { core.free(selected); }; untouched; } ;\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn checked_core_free_validates_unsafe_arity_types_and_owner_reuse_in_both_validators() {
+        for (text, code, marker) in [
+            (
+                "%%start\nunit(u64) release = fn(count) { u8[count] bytes; core.free(&bytes); };\n%%end",
+                "B0012",
+                "core.free(&bytes)",
+            ),
+            (
+                "%%start\nunit(u64) release = fn(count) { u8[count] bytes; unsafe { core.free(); }; };\n%%end",
+                "B0004",
+                "core.free()",
+            ),
+            (
+                "%%start\nunit(u64) release = fn(count) { u8[count] bytes; unsafe { core.free(&bytes, &bytes); }; };\n%%end",
+                "B0004",
+                "core.free(&bytes, &bytes)",
+            ),
+            (
+                "%%start\nunit(u64) release = fn(count) { u8[count] bytes; unsafe { core.free(count); }; };\n%%end",
+                "B0003",
+                "count);",
+            ),
+            (
+                "%%start\nunit(u8) release = fn(value) { unsafe { core.free(&value); }; };\n%%end",
+                "B0003",
+                "&value",
+            ),
+            (
+                "%%start\nunit(u64) release = fn(count) { u8[count] bytes; unsafe { core.free(&bytes); core.free(&bytes); }; };\n%%end",
+                "B0003",
+                "core.free(&bytes);",
+            ),
+        ] {
+            let (single, project) = both_reference_functions(text);
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                assert!(
+                    diagnostics.iter().any(|diagnostic| diagnostic.code == code
+                        && diagnostic.labels[0].span.range.start
+                            >= text.find(marker).unwrap() as u32),
+                    "{code}: {diagnostics:?}"
+                );
+            }
+        }
+        let duplicate = "%%start\nunit(u64) release = fn(count) { u8[count] bytes; unsafe { core.free(&bytes); core.free(&bytes); }; };\n%%end";
+        let (single, project) = both_reference_functions(duplicate);
+        let second_address = duplicate.rfind("&bytes").unwrap() as u32;
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range.start == second_address),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn callable_struct_field_free_has_source_identity_in_both_validators() {
+        let text = "%%start\nstruct Pool { unit(*?u8) free; }\nunit(*?u8) release = fn(storage) { storage; };\nunit((unit(*?u8))) invoke = fn(free) { Pool heap = { .free = release; }; unsafe { *?u8 storage = core.alloc(1, 1); free(storage); heap.free(storage); core.free(storage); } };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, structs, diagnostics, source) in [
+            (
+                &single.program.items,
+                &single.program.structs,
+                &single.diagnostics,
+                &single.program.source,
+            ),
+            (
+                &project.project.modules[0].items,
+                &project.project.modules[0].structs,
+                &project.diagnostics,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[1] else {
+                panic!("invoke")
+            };
+            let field = &structs[0].fields[0];
+            let field_start = text.find("free; }").unwrap() as u32;
+            assert_eq!(field.name_span, ByteSpan::new(field_start, field_start + 4));
+            let heap_start = text.find("heap =").unwrap() as u32;
+            let local_start = text.find("free(storage);").unwrap() as u32;
+            let call_start = text.find("heap.free(storage)").unwrap() as u32;
+            let core_start = text.find("core.free(storage)").unwrap() as u32;
+            let calls = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter_map(|point| match &point.kind {
+                    CfgPointKind::Call {
+                        output: 0, target, ..
+                    } => Some((point, target)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 4);
+            assert_eq!(
+                calls[0].1,
+                &ResolvedCallTarget::Core(CoreOperationId::Alloc)
+            );
+            let ResolvedCallTarget::LocalCallable(local) = calls[1].1 else {
+                panic!("local free")
+            };
+            let parameter_start = text.find("fn(free)").unwrap() as u32 + 3;
+            assert_eq!(
+                local.declaration_span,
+                ByteSpan::new(parameter_start, parameter_start + 4)
+            );
+            assert_eq!(local.source, *source);
+            assert_eq!(calls[1].0.source_span.range.start, local_start);
+            let ResolvedCallTarget::CallableField {
+                receiver_place,
+                field: field_id,
+            } = calls[2].1
+            else {
+                panic!("typed field target: {:?}", calls[2].1)
+            };
+            assert_eq!(field_id, &field.id);
+            assert_eq!(field_id.structure, structs[0].id);
+            assert_eq!(receiver_place.source, *source);
+            assert_eq!(receiver_place.function_span, function.span);
+            assert_eq!(
+                receiver_place.declaration_span,
+                ByteSpan::new(heap_start, heap_start + 4)
+            );
+            assert_eq!(
+                receiver_place.binding.declaration_span,
+                receiver_place.declaration_span
+            );
+            assert_eq!(receiver_place.binding.source, *source);
+            assert_eq!(receiver_place.binding.block_span, function.body.span);
+            assert!(receiver_place.projections.is_empty());
+            assert_eq!(
+                receiver_place.place,
+                ScalarPlace::Name {
+                    name: "heap".to_owned(),
+                    span: ByteSpan::new(call_start, call_start + 4)
+                }
+            );
+            assert_eq!(
+                calls[2].0.source_span,
+                SourceSpan::new(source.clone(), ByteSpan::new(call_start, call_start + 18))
+            );
+            assert_eq!(calls[3].1, &ResolvedCallTarget::Core(CoreOperationId::Free));
+            assert_eq!(
+                calls[3].0.source_span.range,
+                ByteSpan::new(core_start, core_start + 18)
+            );
+            assert_eq!(
+                function
+                    .reference_cfg
+                    .points
+                    .iter()
+                    .filter(|point| matches!(point.kind, CfgPointKind::Release { .. }))
+                    .count(),
+                1
+            );
+            assert!(function.reference_cfg.points.iter().any(|point| matches!(
+                &point.kind,
+                CfgPointKind::Release { .. }
+            ) && point
+                .source_span
+                .range
+                .start
+                == core_start));
+        }
+    }
+
+    #[test]
+    fn callable_struct_field_reports_unknown_noncallable_and_argument_errors_in_both_validators() {
+        for (text, code, marker) in [
+            (
+                "%%start\nstruct Pool { unit(*?u8) free; }\nunit(*?u8) release = fn(storage) { storage; };\nunit() invoke = fn { Pool heap = { .free = release; }; heap.missing(); };\n%%end",
+                "B0001",
+                "missing()",
+            ),
+            (
+                "%%start\nstruct Pool { u8 free; }\nunit() invoke = fn { Pool heap = { .free = 1; }; heap.free(); };\n%%end",
+                "B0003",
+                "free()",
+            ),
+            (
+                "%%start\nstruct Pool { unit(*?u8) free; }\nunit(*?u8) release = fn(storage) { storage; };\nunit() invoke = fn { Pool heap = { .free = release; }; heap.free(); };\n%%end",
+                "B0004",
+                "heap.free()",
+            ),
+            (
+                "%%start\nstruct Pool { unit(*?u8) free; }\nunit(*?u8) release = fn(storage) { storage; };\nunit() invoke = fn { Pool heap = { .free = release; }; heap.free(1); };\n%%end",
+                "B0003",
+                "1);",
+            ),
+        ] {
+            let (single, project) = both_reference_functions(text);
+            let start = text.rfind(marker).unwrap() as u32;
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                assert!(
+                    diagnostics.iter().any(|diagnostic| diagnostic.code == code
+                        && diagnostic.labels[0].span.range.start == start),
+                    "{code} {marker}: {diagnostics:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reference_cfg_qualified_overloads_keep_distinct_module_sources_and_arms() {
+        let left_source = module_source("src/left.w");
+        let right_source = module_source("src/right.w");
+        let main_source = module_source("src/main.w");
+        let left_text = "%%start\npick = overload { i32(i32) => fn(value) { value }; i32(i64) => fn(value) { 2 }; };\n%%end";
+        let right_text = "%%start\npick = overload { i32(i32) => fn(value) { value }; i32(i64) => fn(value) { 3 }; };\n%%end";
+        let main_text = "%%start\nleft = namespace app \"src/left.w\";\nright = namespace app \"src/right.w\";\ni32(i32, i64) choose = fn(narrow, wide) { i32 a = left.pick(narrow); i32 b = right.pick(wide); a + b };\n%%end";
+        let left = module_from_text(left_source.clone(), left_text);
+        let right = module_from_text(right_source.clone(), right_text);
+        let main = module_from_text(main_source.clone(), main_text);
+        let namespace_bindings = main
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ScalarItem::Namespace(namespace) => Some(ScalarNamespaceBinding {
+                    binding: namespace.binding.clone(),
+                    target: if namespace.binding == "left" {
+                        left_source.clone()
+                    } else {
+                        right_source.clone()
+                    },
+                    span: namespace.span,
+                }),
+                _ => None,
+            })
+            .collect();
+        let input = ScalarProject::new(
+            vec![
+                ScalarModule::new(main_source.clone(), main.items, namespace_bindings),
+                ScalarModule::new(left_source.clone(), left.items, Vec::new()),
+                ScalarModule::new(right_source.clone(), right.items, Vec::new()),
+            ],
+            vec![
+                main_source.clone(),
+                left_source.clone(),
+                right_source.clone(),
+            ],
+        );
+        let result = validate_scalar_project(input);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Function(function) = &result.project.modules[0].items[2] else {
+            panic!("choose function")
+        };
+        let calls = function
+            .reference_cfg
+            .points
+            .iter()
+            .filter_map(|point| match &point.kind {
+                CfgPointKind::Call {
+                    target:
+                        ResolvedCallTarget::ModuleCallable {
+                            source,
+                            declaration_span,
+                            concrete,
+                        },
+                    output: 0,
+                    ..
+                } => Some((point, source, declaration_span, concrete)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        for (index, (point, source, declaration_span, concrete)) in calls.iter().enumerate() {
+            let (expected_source, text) = if index == 0 {
+                (&left_source, left_text)
+            } else {
+                (&right_source, right_text)
+            };
+            assert_eq!(*source, expected_source);
+            assert_eq!(
+                **declaration_span,
+                ByteSpan::new(
+                    text.find("pick =").unwrap() as u32,
+                    text.find("pick =").unwrap() as u32 + 4
+                )
+            );
+            assert_eq!(point.source_span.source, main_source);
+            let call = if index == 0 {
+                "left.pick(narrow)"
+            } else {
+                "right.pick(wide)"
+            };
+            let start = main_text.find(call).unwrap() as u32;
+            assert_eq!(
+                point.source_span.range,
+                ByteSpan::new(start, start + call.len() as u32)
+            );
+            let ConcreteCallSelection::Overload(selection) = concrete else {
+                panic!("concrete overload arm")
+            };
+            assert_eq!(selection.arm_index, index);
+        }
+    }
+
+    #[test]
+    fn core_invalidate_and_rebind_record_typed_places_and_inputs_in_both_validators() {
+        let text = "%%start\nunit(u64, *?u8) update = fn(count, raw) { u8[count] bytes; *u8 first = &bytes[0]; first; unsafe { core.invalidate(&bytes); core.rebind(&bytes, raw, count); } };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics, source) in [
+            (
+                &single.program.items,
+                &single.diagnostics,
+                &single.program.source,
+            ),
+            (
+                &project.project.modules[0].items,
+                &project.diagnostics,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("update function")
+            };
+            let events = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter_map(|point| match &point.kind {
+                    CfgPointKind::Invalidate {
+                        address_point,
+                        candidates,
+                        operation,
+                        address_span,
+                        inputs,
+                    } => Some((
+                        point,
+                        address_point,
+                        candidates,
+                        operation,
+                        address_span,
+                        inputs,
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(events.len(), 2);
+            let bytes_start = text.find("bytes;").unwrap() as u32;
+            for (index, &(point, address_point, candidates, operation, address_span, inputs)) in
+                events.iter().enumerate()
+            {
+                assert_eq!(candidates.len(), 1);
+                let candidate = &candidates[0];
+                let place = &candidate.place;
+                let call = if index == 0 {
+                    "core.invalidate(&bytes)"
+                } else {
+                    "core.rebind(&bytes, raw, count)"
+                };
+                let call_start = text.find(call).unwrap() as u32;
+                assert_eq!(
+                    point.source_span,
+                    SourceSpan::new(
+                        source.clone(),
+                        ByteSpan::new(call_start, call_start + call.len() as u32)
+                    )
+                );
+                assert_eq!(
+                    address_span,
+                    &SourceSpan::new(
+                        source.clone(),
+                        ByteSpan::new(
+                            call_start + if index == 0 { 16 } else { 12 },
+                            call_start + if index == 0 { 22 } else { 18 }
+                        )
+                    )
+                );
+                assert!(address_point.0 < point.id.0);
+                assert!(function.reference_cfg.points[address_point.0]
+                    .possible_origins
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(&candidate.origin)));
+                assert_eq!(candidate.loan.origin_place, *place);
+                assert_eq!(place.source, *source);
+                assert_eq!(
+                    place.binding.declaration_span,
+                    ByteSpan::new(bytes_start, bytes_start + 5)
+                );
+                assert_eq!(
+                    place.place,
+                    ScalarPlace::Name {
+                        name: "bytes".to_owned(),
+                        span: ByteSpan::new(
+                            call_start + if index == 0 { 17 } else { 13 },
+                            call_start + if index == 0 { 22 } else { 18 }
+                        )
+                    }
+                );
+                assert!(place.projections.is_empty());
+                assert_eq!(
+                    operation,
+                    &if index == 0 {
+                        CoreOperationId::Invalidate
+                    } else {
+                        CoreOperationId::Rebind
+                    }
+                );
+                let call_point = function.reference_cfg.points.iter().find(|candidate| candidate.source_span == point.source_span && matches!(&candidate.kind, CfgPointKind::Call { target: ResolvedCallTarget::Core(core), .. } if core == operation)).expect("resolved core call");
+                assert!(call_point.id.0 > point.id.0);
+                match inputs {
+                    InvalidationInputs::Invalidate => assert_eq!(index, 0),
+                    InvalidationInputs::Free => panic!("free is a release event"),
+                    InvalidationInputs::Rebind {
+                        raw_address,
+                        raw_span,
+                        length,
+                        length_span,
+                    } => {
+                        assert_eq!(index, 1);
+                        assert!(
+                            matches!(raw_address, ScalarExpression::Name { name, .. } if name == "raw")
+                        );
+                        assert!(
+                            matches!(length, ScalarExpression::Name { name, .. } if name == "count")
+                        );
+                        let raw_start = text.find("raw, count);").unwrap() as u32;
+                        assert_eq!(
+                            raw_span,
+                            &SourceSpan::new(
+                                source.clone(),
+                                ByteSpan::new(raw_start, raw_start + 3)
+                            )
+                        );
+                        assert_eq!(
+                            length_span,
+                            &SourceSpan::new(
+                                source.clone(),
+                                ByteSpan::new(raw_start + 5, raw_start + 10)
+                            )
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn core_invalidate_and_rebind_reject_unsafe_arity_and_argument_types_in_both_validators() {
+        let cases = [
+            (
+                "core.invalidate(&bytes);",
+                "B0012",
+                "core.invalidate(&bytes)",
+            ),
+            (
+                "core.rebind(&bytes, raw, count);",
+                "B0012",
+                "core.rebind(&bytes, raw, count)",
+            ),
+            (
+                "unsafe { core.invalidate(); }",
+                "B0004",
+                "core.invalidate()",
+            ),
+            (
+                "unsafe { core.rebind(&bytes, raw); }",
+                "B0004",
+                "core.rebind(&bytes, raw)",
+            ),
+            ("unsafe { core.invalidate(raw); }", "B0003", "raw);"),
+            (
+                "unsafe { core.rebind(&bytes, count, count); }",
+                "B0003",
+                "count, count);",
+            ),
+            (
+                "unsafe { core.rebind(&bytes, raw, raw); }",
+                "B0003",
+                "raw); }",
+            ),
+        ];
+        for (statement, code, fragment) in cases {
+            let text = format!(
+                "%%start\nunit(u64, *?u8) update = fn(count, raw) {{ u8[count] bytes; {statement} }};\n%%end"
+            );
+            let (single, project) = both_reference_functions(&text);
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                let start = text.rfind(fragment).unwrap() as u32;
+                let end = start
+                    + if code == "B0003" {
+                        if fragment == "count, count);" {
+                            5
+                        } else {
+                            3
+                        }
+                    } else {
+                        fragment.len() as u32
+                    };
+                assert!(
+                    diagnostics.iter().any(|diagnostic| diagnostic.code == code
+                        && diagnostic.labels[0].span.range.start == start
+                        && diagnostic.labels[0].span.range.end == end),
+                    "{statement}: {diagnostics:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn core_invalidate_preserves_resolved_index_projection_in_both_validators() {
+        let text = "%%start\nunit(u64) update = fn(count) { u8[count] bytes; unsafe { core.invalidate(&bytes[0]); } };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics, source) in [
+            (
+                &single.program.items,
+                &single.diagnostics,
+                &single.program.source,
+            ),
+            (
+                &project.project.modules[0].items,
+                &project.diagnostics,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let point = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| matches!(&point.kind, CfgPointKind::Invalidate { .. }))
+                .expect("invalidation");
+            let CfgPointKind::Invalidate {
+                candidates,
+                address_span,
+                operation,
+                ..
+            } = &point.kind
+            else {
+                unreachable!()
+            };
+            assert_eq!(operation, &CoreOperationId::Invalidate);
+            assert_eq!(candidates.len(), 1);
+            let place = &candidates[0].place;
+            assert_eq!(place.source, *source);
+            assert_eq!(place.projections.len(), 1);
+            assert!(
+                matches!(&place.projections[0], ReferencePlaceProjection::Index(ScalarExpression::Integer { value, span }) if value == &BigInt::from(0) && *span == ByteSpan::new(text.find("[0]").unwrap() as u32 + 1, text.find("[0]").unwrap() as u32 + 2))
+            );
+            let start = text.find("&bytes[0]").unwrap() as u32;
+            assert_eq!(
+                address_span,
+                &SourceSpan::new(source.clone(), ByteSpan::new(start, start + 9))
+            );
+        }
+    }
+
+    #[test]
+    fn core_invalidate_preserves_both_joined_alias_places_in_both_validators() {
+        let text = "%%start\nunit(u8, u8, bool) invalidate_alias = fn(first, second, flag) { *u8 alias = &first; if (flag) { alias = &second; }; unsafe { core.invalidate(alias); } };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics, source) in [
+            (
+                &single.program.items,
+                &single.diagnostics,
+                &single.program.source,
+            ),
+            (
+                &project.project.modules[0].items,
+                &project.diagnostics,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let event = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| matches!(point.kind, CfgPointKind::Invalidate { .. }))
+                .expect("invalidation event");
+            let CfgPointKind::Invalidate {
+                address_point,
+                candidates,
+                address_span,
+                operation,
+                ..
+            } = &event.kind
+            else {
+                unreachable!()
+            };
+            assert_eq!(operation, &CoreOperationId::Invalidate);
+            let alias_start = text.rfind("alias);").unwrap() as u32;
+            assert_eq!(
+                address_span,
+                &SourceSpan::new(source.clone(), ByteSpan::new(alias_start, alias_start + 5))
+            );
+            let read = &function.reference_cfg.points[address_point.0];
+            assert!(matches!(read.kind, CfgPointKind::Read { .. }));
+            assert_eq!(read.source_span, *address_span);
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(read.possible_origins.as_ref().map(BTreeSet::len), Some(2));
+            let first_start = text.find("fn(first").unwrap() as u32 + 3;
+            let second_start = text.find("second, flag").unwrap() as u32;
+            let mut declarations = candidates
+                .iter()
+                .map(|candidate| {
+                    assert_eq!(candidate.place.source, *source);
+                    assert_eq!(candidate.place.binding.source, *source);
+                    assert_eq!(candidate.loan.origin_place, candidate.place);
+                    assert!(read
+                        .possible_origins
+                        .as_ref()
+                        .unwrap()
+                        .contains(&candidate.origin));
+                    assert!(candidate.place.projections.is_empty());
+                    candidate.place.binding.declaration_span
+                })
+                .collect::<Vec<_>>();
+            declarations.sort_by_key(|span| span.start);
+            assert_eq!(
+                declarations,
+                vec![
+                    ByteSpan::new(first_start, first_start + 5),
+                    ByteSpan::new(second_start, second_start + 6),
+                ]
+            );
+            let creation_spans = candidates
+                .iter()
+                .map(|candidate| candidate.loan.creation_span)
+                .collect::<Vec<_>>();
+            assert!(creation_spans.contains(&ByteSpan::new(
+                text.find("&first").unwrap() as u32,
+                text.find("&first").unwrap() as u32 + 6
+            )));
+            assert!(creation_spans.contains(&ByteSpan::new(
+                text.find("&second").unwrap() as u32,
+                text.find("&second").unwrap() as u32 + 7
+            )));
+        }
+    }
+
+    #[test]
+    fn core_invalidation_and_rebind_expire_derived_reference_reads_in_both_validators() {
+        for (operation, text) in [
+            (
+                "invalidate",
+                "%%start\nunit(u64) expire = fn(count) { u8[count] bytes; *u8 old = &bytes[0]; unsafe { core.invalidate(&bytes); }; old; };\n%%end",
+            ),
+            (
+                "rebind",
+                "%%start\nunit(u64, *?u8) expire = fn(count, raw) { u8[count] bytes; *u8 old = &bytes[0]; unsafe { core.rebind(&bytes, raw, count); }; old; };\n%%end",
+            ),
+        ] {
+            let (single, project) = both_reference_functions(text);
+            let start = text.rfind("old;").unwrap() as u32;
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == "B0003"
+                            && diagnostic.labels[0].span.range == ByteSpan::new(start, start + 3)),
+                    "{operation}: {diagnostics:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_invalidate_callable_has_no_core_invalidation_event() {
+        let text = "%%start\nunit((unit(*u8)), u8) invoke = fn(invalidate, bytes) { invalidate(&bytes); };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            assert!(!function
+                .reference_cfg
+                .points
+                .iter()
+                .any(|point| matches!(point.kind, CfgPointKind::Invalidate { .. })));
+            let call = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+                .expect("local call");
+            assert!(
+                matches!(&call.kind, CfgPointKind::Call { target: ResolvedCallTarget::LocalCallable(binding), .. } if binding.declaration_span.start == text.find("fn(invalidate").unwrap() as u32 + 3)
+            );
+        }
+    }
+
+    #[test]
+    fn reference_cfg_branches_join_before_final_read_in_both_validators() {
+        let text = "%%start\n*u8(*u8, *u8, bool) choose = fn(first, second, flag) { *u8 result = first; if (flag) { result = first; } else { result = second; }; result };\n*u8(*u8, bool) maybe = fn(input, flag) { *u8 result = input; if (flag) { result = null; }; result };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics, source) in [
+            (
+                &single.program.items,
+                &single.diagnostics,
+                &single.program.source,
+            ),
+            (
+                &project.project.modules[0].items,
+                &project.diagnostics,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            let functions = items
+                .iter()
+                .map(|item| match item {
+                    ScalarItem::Function(function) => function,
+                    _ => panic!("expected source function: {item:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(functions.len(), 2, "{diagnostics:?}");
+            for function in functions {
+                let cfg = &function.reference_cfg;
+                let branch = cfg
+                    .points
+                    .iter()
+                    .find(|point| matches!(point.kind, CfgPointKind::Branch { .. }))
+                    .expect("branch");
+                let join = cfg
+                    .points
+                    .iter()
+                    .find(|point| matches!(point.kind, CfgPointKind::Join))
+                    .expect("join");
+                let condition_start = text[function.span.start as usize..]
+                    .find("if (flag)")
+                    .unwrap() as u32
+                    + function.span.start
+                    + 4;
+                assert_eq!(
+                    branch.source_span.range,
+                    ByteSpan::new(condition_start, condition_start + 4)
+                );
+                assert_eq!(&branch.source_span.source, source);
+                assert_eq!(branch.successors.len(), 2);
+                assert_ne!(branch.successors[0], branch.successors[1]);
+                assert_eq!(
+                    cfg.points[branch.successors[0].0].kind,
+                    CfgPointKind::ScopeEnter
+                );
+                if function.name == "choose" {
+                    assert_eq!(
+                        cfg.points[branch.successors[1].0].kind,
+                        CfgPointKind::ScopeEnter
+                    );
+                } else {
+                    assert_eq!(branch.successors[1], join.id);
+                }
+                let predecessors = cfg
+                    .points
+                    .iter()
+                    .filter(|point| point.successors.contains(&join.id))
+                    .collect::<Vec<_>>();
+                assert_eq!(predecessors.len(), 2);
+                assert_ne!(predecessors[0].id, predecessors[1].id);
+                assert!(predecessors
+                    .iter()
+                    .any(|point| matches!(point.kind, CfgPointKind::ScopeExit)));
+                assert!(predecessors.iter().all(|point| matches!(
+                    point.kind,
+                    CfgPointKind::ScopeExit | CfgPointKind::Branch { .. }
+                )));
+                assert_eq!(&join.source_span.source, source);
+                assert_eq!(
+                    join.source_span.range,
+                    function
+                        .body
+                        .items
+                        .iter()
+                        .find_map(|item| match item {
+                            ScalarBlockItem::Expression(
+                                ScalarExpression::If { span, .. }
+                                | ScalarExpression::UnitIf { span, .. },
+                            ) => Some(*span),
+                            _ => None,
+                        })
+                        .expect("typed conditional span")
+                );
+                if function.name == "choose" {
+                    assert_ne!(
+                        cfg.points[branch.successors[0].0].scope,
+                        cfg.points[branch.successors[1].0].scope
+                    );
+                }
+                let declaration = text[function.span.start as usize..]
+                    .find("result = ")
+                    .unwrap() as u32
+                    + function.span.start;
+                let final_read = text[function.span.start as usize..function.span.end as usize]
+                    .rfind("result")
+                    .unwrap() as u32
+                    + function.span.start;
+                let read = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Read { binding } if binding.declaration_span.start == declaration) && point.id.0 > join.id.0).expect("actual final read");
+                assert_eq!(join.successors, vec![read.id]);
+                assert_eq!(read.possible_origins.as_ref().map(BTreeSet::len), Some(2));
+                assert_eq!(
+                    read.source_span.range,
+                    ByteSpan::new(final_read, final_read + 6)
+                );
+                assert_eq!(&read.source_span.source, source);
+                let CfgPointKind::Read { binding } = &read.kind else {
+                    unreachable!()
+                };
+                assert_eq!(&binding.source, source);
+                assert_eq!(binding.function_span, function.span);
+                assert_eq!(
+                    binding.declaration_span,
+                    ByteSpan::new(declaration, declaration + 6)
+                );
+                for (value, expected) in [("result = first;", 0), ("result = second;", 1)] {
+                    if function.name == "choose" {
+                        let target = text[branch.source_span.range.start as usize..]
+                            .find(value)
+                            .unwrap() as u32
+                            + branch.source_span.range.start;
+                        assert!(cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Assign { target: place, .. } if &place.binding == binding) && point.source_span.range == ByteSpan::new(target, target + 6) && point.id.0 > branch.successors[expected].0 && point.id.0 < join.id.0));
+                    }
+                }
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn reference_cfg_joins_source_derived_parameter_and_null_or_distinct_fresh_borrows() {
+        for (text, fresh) in [
+            (
+                "%%start\n*u8(*u8, bool) choose = fn(input, flag) { *u8 result = null; if (flag) { result = input; } else { result = null; }; result };\n%%end",
+                false,
+            ),
+            (
+                "%%start\n*u8(u8, u8, bool) choose = fn(first, second, flag) { *u8 result = null; if (flag) { result = &first; } else { result = &second; }; result };\n%%end",
+                true,
+            ),
+        ] {
+            let (single, project) = both_reference_functions(text);
+            for (items, diagnostics, source) in [
+                (
+                    &single.program.items,
+                    &single.diagnostics,
+                    &single.program.source,
+                ),
+                (
+                    &project.project.modules[0].items,
+                    &project.diagnostics,
+                    &project.project.modules[0].source,
+                ),
+            ] {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                let ScalarItem::Function(function) = &items[0] else {
+                    panic!("source function")
+                };
+                let cfg = &function.reference_cfg;
+                let join = cfg
+                    .points
+                    .iter()
+                    .find(|p| matches!(p.kind, CfgPointKind::Join))
+                    .expect("join");
+                let predecessors = cfg
+                    .points
+                    .iter()
+                    .filter(|p| p.successors.contains(&join.id))
+                    .collect::<Vec<_>>();
+                assert_eq!(predecessors.len(), 2);
+                assert_ne!(predecessors[0].id, predecessors[1].id);
+                let read = cfg
+                    .points
+                    .iter()
+                    .find(|p| p.id.0 > join.id.0 && matches!(p.kind, CfgPointKind::Read { .. }))
+                    .expect("actual final read");
+                assert_eq!(join.successors, vec![read.id]);
+                assert_eq!(read.source_span.source, *source);
+                let final_start = text.rfind("result };").unwrap() as u32;
+                assert_eq!(
+                    read.source_span.range,
+                    ByteSpan::new(final_start, final_start + 6)
+                );
+                let final_origins = read
+                    .possible_origins
+                    .as_ref()
+                    .expect("computed final origins");
+                assert_eq!(final_origins.len(), 2);
+                let assignments = cfg
+                    .points
+                    .iter()
+                    .filter(|p| matches!(p.kind, CfgPointKind::Assign { .. }))
+                    .collect::<Vec<_>>();
+                assert_eq!(assignments.len(), 2);
+                let initial = cfg.points.iter().find(|p| matches!(&p.kind, CfgPointKind::Bind { binding } if binding.declaration_span.start == text.find("result = null").unwrap() as u32)).expect("initial binding");
+                let initial_ids = initial.possible_origins.as_ref().expect("initial null");
+                assert_eq!(initial_ids.len(), 1);
+                for assignment in &assignments {
+                    let ids = assignment
+                        .possible_origins
+                        .as_ref()
+                        .expect("edge-specific assignment");
+                    assert_eq!(ids.len(), 1);
+                    assert!(ids.is_disjoint(initial_ids));
+                    assert!(ids.is_subset(final_origins));
+                    assert_eq!(assignment.source_span.source, *source);
+                }
+                assert_ne!(
+                    assignments[0].possible_origins,
+                    assignments[1].possible_origins
+                );
+                let facts = final_origins
+                    .iter()
+                    .map(|id| &cfg.facts[id.0])
+                    .collect::<Vec<_>>();
+                if fresh {
+                    let fresh_facts = facts
+                        .iter()
+                        .map(|fact| match fact {
+                            ReferenceOrigin::Fresh { allocation, loan } => (allocation, loan),
+                            _ => panic!("fresh branch fact: {fact:?}"),
+                        })
+                        .collect::<Vec<_>>();
+                    assert_ne!(fresh_facts[0].0, fresh_facts[1].0);
+                    assert_ne!(
+                        fresh_facts[0].1.origin_place.binding,
+                        fresh_facts[1].1.origin_place.binding
+                    );
+                    assert_ne!(
+                        fresh_facts[0].1.creation_span,
+                        fresh_facts[1].1.creation_span
+                    );
+                    for (allocation, loan) in fresh_facts {
+                        assert_eq!(allocation.source, *source);
+                        assert_eq!(loan.origin_place.source, *source);
+                        assert_eq!(allocation.creation_span, loan.creation_span);
+                        assert_eq!(
+                            allocation.declaration_span,
+                            loan.origin_place.binding.declaration_span
+                        );
+                        assert!(
+                            loan.creation_span.start == text.find("&first").unwrap() as u32
+                                || loan.creation_span.start == text.find("&second").unwrap() as u32
+                        );
+                    }
+                    assert!(initial_ids.is_disjoint(final_origins));
+                } else {
+                    let borrowed = facts
+                        .iter()
+                        .find_map(|fact| match fact {
+                            ReferenceOrigin::BorrowedFrom { parameter: 0, loan } => Some(loan),
+                            _ => None,
+                        })
+                        .expect("parameter origin");
+                    assert_eq!(borrowed.origin_place.source, *source);
+                    assert_eq!(
+                        borrowed.origin_place.binding.declaration_span.start,
+                        text.find("fn(input").unwrap() as u32 + 3
+                    );
+                    assert_eq!(
+                        borrowed.creation_span,
+                        borrowed.origin_place.binding.declaration_span
+                    );
+                    assert_eq!(borrowed.mode, ScalarReferenceMutability::Shared);
+                    let null_span = facts
+                        .iter()
+                        .find_map(|fact| match fact {
+                            ReferenceOrigin::Null { span } => Some(*span),
+                            _ => None,
+                        })
+                        .expect("null alternative");
+                    assert_eq!(null_span.start, text.rfind("null;").unwrap() as u32);
+                    assert!(initial_ids.is_disjoint(final_origins));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn branch_only_inferred_reference_cannot_be_read_after_join() {
+        let text = "%%start\n*u8(u8, bool) choose = fn(value, flag) { if (flag) { inferred = &value; }; inferred };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        let read_start = text.rfind("inferred };").unwrap() as u32;
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0001"
+                        && diagnostic.labels.iter().any(|label| {
+                            label.span.range == ByteSpan::new(read_start, read_start + 8)
+                        })
+                }),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn straight_line_reference_cfg_has_source_backed_fresh_forward_reborrow_and_null() {
+        let text = "%%start\n*u8(u8) fresh = fn(value) { &value };\n*u8(*u8) forward = fn(input) { *u8 alias = input; alias };\n*!u8(*!u8) reborrow = fn(parent) { &!(*parent) };\n*u8() nullable = fn { null };\n*u8(u8) nested = fn(value) { unsafe { u8 local = value; &local } };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics, source) in [
+            (
+                &single.program.items,
+                &single.diagnostics,
+                &single.program.source,
+            ),
+            (
+                &project.project.modules[0].items,
+                &project.diagnostics,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let functions = items
+                .iter()
+                .map(|item| match item {
+                    ScalarItem::Function(function) => function,
+                    _ => panic!("function"),
+                })
+                .collect::<Vec<_>>();
+            for function in &functions {
+                let cfg = &function.reference_cfg;
+                for (index, point) in cfg.points.iter().enumerate() {
+                    assert_eq!(point.id, CfgPointId(index));
+                    assert_eq!(&point.source_span.source, source);
+                    assert_eq!(
+                        point.successors,
+                        if index + 1 == cfg.points.len() {
+                            vec![]
+                        } else {
+                            vec![CfgPointId(index + 1)]
+                        }
+                    );
+                }
+                assert!(matches!(cfg.points[0].kind, CfgPointKind::Entry));
+            }
+            let fresh = functions[0];
+            let address = fresh.reference_cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Borrow { loan, .. } if loan.creation_span.start == text.find("&value").unwrap() as u32)).expect("fresh borrow");
+            let ReferenceOrigin::Fresh { allocation, loan } = sole_fact(fresh, address) else {
+                panic!("fresh fact")
+            };
+            assert_eq!(allocation.creation_span, loan.creation_span);
+            assert_eq!(&allocation.source, source);
+            assert_eq!(
+                allocation.declaration_span,
+                ByteSpan::new(
+                    text.find("fn(value)").unwrap() as u32 + 3,
+                    text.find("fn(value)").unwrap() as u32 + 8
+                )
+            );
+            assert_eq!(
+                loan.origin_place.binding.declaration_span,
+                allocation.declaration_span
+            );
+            assert_eq!(
+                fresh.reference_cfg.points.last().unwrap().possible_origins,
+                address.possible_origins
+            );
+
+            let forward = functions[1];
+            let read = forward
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(point.kind, CfgPointKind::Read { .. })
+                        && point.source_span.range.start
+                            == text
+                                .find("alias }; ")
+                                .unwrap_or(text.find("alias };").unwrap())
+                                as u32
+                })
+                .expect("forwarded read");
+            let ReferenceOrigin::BorrowedFrom { parameter: 0, loan } = sole_fact(forward, read)
+            else {
+                panic!("forwarded parameter")
+            };
+            assert_eq!(loan.creation_span, loan.origin_place.declaration_span);
+            assert!(loan.parent.is_none());
+            assert_eq!(
+                forward
+                    .reference_cfg
+                    .points
+                    .last()
+                    .unwrap()
+                    .possible_origins,
+                read.possible_origins
+            );
+
+            let reborrow = functions[2];
+            let child = reborrow.reference_cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Borrow { loan, .. } if loan.creation_span.start == text.find("&!(*parent)").unwrap() as u32)).expect("child loan");
+            let ReferenceOrigin::BorrowedFrom { parameter: 0, loan } = sole_fact(reborrow, child)
+            else {
+                panic!("reborrow origin")
+            };
+            assert_eq!(loan.mode, ScalarReferenceMutability::Mutable);
+            assert_eq!(loan.creation_span, child.source_span.range);
+            assert_eq!(loan.origin_place.source, *source);
+            assert_eq!(
+                loan.parent.as_ref().unwrap().creation_span,
+                loan.origin_place.declaration_span
+            );
+            assert_eq!(
+                reborrow
+                    .reference_cfg
+                    .points
+                    .last()
+                    .unwrap()
+                    .possible_origins,
+                child.possible_origins
+            );
+
+            let nullable = functions[3];
+            let point = nullable
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| point.source_span.range.start == text.find("null };").unwrap() as u32)
+                .expect("null point");
+            assert!(
+                matches!(sole_fact(nullable, point), ReferenceOrigin::Null { span } if *span == point.source_span.range)
+            );
+            assert_eq!(
+                nullable
+                    .reference_cfg
+                    .points
+                    .last()
+                    .unwrap()
+                    .possible_origins,
+                point.possible_origins
+            );
+
+            let nested = functions[4];
+            let local = nested.reference_cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Borrow { loan, .. } if loan.creation_span.start == text.find("&local").unwrap() as u32)).expect("nested loan");
+            let ReferenceOrigin::Fresh { allocation, loan } = sole_fact(nested, local) else {
+                panic!("nested fresh")
+            };
+            assert_eq!(
+                allocation.declaration_span,
+                ByteSpan::new(
+                    text.find("local = value").unwrap() as u32,
+                    text.find("local = value").unwrap() as u32 + 5
+                )
+            );
+            assert_ne!(loan.origin_place.block_span, nested.body.span);
+            assert_eq!(
+                nested.reference_cfg.points.last().unwrap().possible_origins,
+                local.possible_origins
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_reads_rhs_before_write_and_shadowed_binding_is_diagnosed() {
+        let text = "%%start\n*u8(u8, u8) f = fn(left, right) { *u8 alias = &left; alias = &right; alias };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let cfg = &function.reference_cfg;
+            let borrows = cfg
+                .points
+                .iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::Borrow { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(borrows.len(), 2);
+            assert_ne!(borrows[0].possible_origins, borrows[1].possible_origins);
+            let last = cfg
+                .points
+                .iter()
+                .rev()
+                .find(|point| matches!(point.kind, CfgPointKind::Read { .. }))
+                .expect("final read");
+            assert_eq!(last.possible_origins, borrows[1].possible_origins);
+            assert!(
+                matches!(sole_fact(function, last), ReferenceOrigin::Fresh { allocation, .. } if allocation.creation_span.start == text.find("&right").unwrap() as u32)
+            );
+        }
+        let shadow = "%%start\n*u8(u8) f = fn(value) { *u8 alias = &value; unsafe { u8 inner = value; *u8 alias = &inner; alias }; alias };\n%%end";
+        let (single, project) = both_reference_functions(shadow);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0002"),
+                "{diagnostics:?}"
+            );
+        }
+        for (items, source) in [
+            (&single.program.items, &single.program.source),
+            (
+                &project.project.modules[0].items,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let mut function = function.clone();
+            assert!(record_function_reference_origins(
+                source,
+                &mut function,
+                &HashSet::new(),
+                &[],
+                &[],
+                &[],
+                &HashMap::new()
+            )
+            .is_empty());
+            let reads = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter(|point| {
+                    matches!(point.kind, CfgPointKind::Read { .. })
+                        && point.source_span.range.start >= shadow.find("&inner").unwrap() as u32
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(reads.len(), 2);
+            let CfgPointKind::Read { binding: inner } = &reads[0].kind else {
+                panic!("inner")
+            };
+            let CfgPointKind::Read { binding: outer } = &reads[1].kind else {
+                panic!("outer")
+            };
+            assert_ne!(inner, outer);
+            assert_ne!(inner.block_span, outer.block_span);
+            assert!(
+                matches!(sole_fact(&function, reads[0]), ReferenceOrigin::Fresh { allocation, .. } if allocation.creation_span.start == shadow.find("&inner").unwrap() as u32)
+            );
+            assert!(
+                matches!(sole_fact(&function, reads[1]), ReferenceOrigin::Fresh { allocation, .. } if allocation.creation_span.start == shadow.find("&value").unwrap() as u32)
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_name_and_deliberately_empty_internal_origin_are_explicit() {
+        let text = "%%start\n*u8() f = fn { &missing };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0001"
+                        && diagnostic
+                            .labels
+                            .iter()
+                            .any(|label| label.span.range.start
+                                == text.find("missing").unwrap() as u32)),
+                "{diagnostics:?}"
+            );
+        }
+        let text = "%%start\n*u8(*u8) f = fn(parent) { parent };\n%%end";
+        let result = validate_text(text);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let ScalarItem::Function(function) = &result.program.items[0] else {
+            panic!("function")
+        };
+        let mut builder = ReferenceFlowBuilder {
+            source: result.program.source.clone(),
+            function_span: function.span,
+            names: BTreeMap::new(),
+            module_names: HashSet::new(),
+            call_sites: Vec::new(),
+            origins: HashMap::new(),
+            checked: HashSet::new(),
+            binding_types: HashMap::new(),
+            structs: Vec::new(),
+            enums: Vec::new(),
+            generic_parameters: BTreeSet::new(),
+            assignment_outputs: HashMap::new(),
+            dereference_points: HashMap::new(),
+            cfg: ScalarReferenceCfg {
+                facts: Vec::new(),
+                points: Vec::new(),
+                initial_points: Vec::new(),
+                allocations: BTreeSet::new(),
+                specialized_policies: Vec::new(),
+            },
+            next_scope: 0,
+            cursor: None,
+        };
+        let binding = ReferenceBindingId {
+            source: result.program.source.clone(),
+            function_span: function.span,
+            declaration_span: function.parameter_spans[0],
+            block_span: function.body.span,
+            kind: ReferenceBindingKind::Declared,
+        };
+        builder.names.insert("parent".to_owned(), binding.clone());
+        builder.checked.insert(binding.clone());
+        builder.origins.insert(binding.clone(), BTreeSet::new());
+        let error = builder
+            .expression(
+                &function.body.final_output_values[0].value,
+                ReferenceScopeId(0),
+            )
+            .expect_err("missing fact");
+        assert!(matches!(&error, ReferenceAnalysisError::MissingOrigin {
+            binding_id,
+            reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+            ..
+        } if binding_id == &binding));
+        assert_eq!(
+            error.source_span().range.start,
+            text.rfind("parent };").unwrap() as u32
+        );
+        builder.names.clear();
+        let error = builder
+            .expression(
+                &function.body.final_output_values[0].value,
+                ReferenceScopeId(0),
+            )
+            .expect_err("missing resolved binding");
+        assert!(
+            matches!(error, ReferenceAnalysisError::MissingBinding { name, .. } if name == "parent")
+        );
+    }
+
+    #[test]
+    fn inferred_assignment_declares_at_target_and_later_assignments_reuse_identity() {
+        let text = "%%start\n*u8(u8) f = fn(value) { inferred = &value; inferred = &value; inferred };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics, source) in [
+            (
+                &single.program.items,
+                &single.diagnostics,
+                &single.program.source,
+            ),
+            (
+                &project.project.modules[0].items,
+                &project.diagnostics,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let assignments = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter_map(|point| match &point.kind {
+                    CfgPointKind::Assign { target, .. } => Some((point, target)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(assignments.len(), 2);
+            let declaration_span = ByteSpan::new(
+                text.find("inferred =").unwrap() as u32,
+                text.find("inferred =").unwrap() as u32 + "inferred".len() as u32,
+            );
+            assert_eq!(assignments[0].1.declaration_span, declaration_span);
+            assert_eq!(assignments[0].1.binding, assignments[1].1.binding);
+            assert_eq!(&assignments[0].1.source, source);
+            assert_eq!(assignments[0].1.function_span, function.span);
+            assert_eq!(assignments[0].1.block_span, function.body.span);
+            let read = function.reference_cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Read { binding } if binding == &assignments[0].1.binding)).expect("inferred read");
+            assert_eq!(read.possible_origins, assignments[1].0.possible_origins);
+            assert!(
+                matches!(sole_fact(function, read), ReferenceOrigin::Fresh { allocation, .. } if allocation.creation_span.start == text.rfind("&value").unwrap() as u32)
+            );
+        }
+    }
+
+    #[test]
+    fn checked_assignment_captures_rhs_before_old_loan_is_replaced() {
+        let text =
+            "%%start\n*u8(u8, u8) f = fn(first, second) { *u8 r = &first; r = &second; r };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let cfg = &function.reference_cfg;
+            let assignment = cfg.points.iter().find(|point| {
+                matches!(&point.kind, CfgPointKind::Assign { target, .. } if target.binding.declaration_span.start == text.find("r = &first").unwrap() as u32)
+            }).expect("assignment");
+            let CfgPointKind::Assign {
+                target,
+                rhs_point,
+                previous_origins,
+                previous_loans,
+            } = &assignment.kind
+            else {
+                unreachable!()
+            };
+            let new_borrow = text.find("&second").unwrap() as u32;
+            assert_eq!(cfg.points[rhs_point.0].source_span.range.start, new_borrow);
+            assert!(rhs_point.0 < assignment.id.0);
+            assert_eq!(
+                target.declaration_span.start,
+                text.find("r = &first").unwrap() as u32
+            );
+            assert!(target.projections.is_empty());
+            assert_eq!(previous_origins.len(), 1);
+            assert_eq!(previous_loans.len(), 1);
+            assert_eq!(
+                previous_loans[0].creation_span.start,
+                text.find("&first").unwrap() as u32
+            );
+            assert!(
+                matches!(sole_fact(function, assignment), ReferenceOrigin::Fresh { loan, .. } if loan.creation_span.start == new_borrow)
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_assignment_borrows_both_outputs_before_either_target_write() {
+        let text = "%%start\n*u8(u8, u8) f = fn(first, second) { *u8 left = &first; *u8 right = &second; left, right = right, left; left };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let cfg = &function.reference_cfg;
+            let assignments = cfg
+                .points
+                .iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::Assign { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(assignments.len(), 2);
+            let rhs_reads = cfg
+                .points
+                .iter()
+                .filter(|point| {
+                    matches!(point.kind, CfgPointKind::Read { .. })
+                        && point.source_span.range.start
+                            >= text.find("= right, left").unwrap() as u32
+                        && point.source_span.range.start < text.find("; left };").unwrap() as u32
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(rhs_reads.len(), 2);
+            assert!(rhs_reads.iter().all(|read| read.id.0 < assignments[0].id.0));
+            for (assignment, read) in assignments.iter().zip(&rhs_reads) {
+                let CfgPointKind::Assign {
+                    rhs_point,
+                    previous_origins,
+                    ..
+                } = &assignment.kind
+                else {
+                    unreachable!()
+                };
+                assert_eq!(rhs_point, &read.id);
+                assert_eq!(previous_origins.len(), 1);
+                assert_eq!(assignment.possible_origins, read.possible_origins);
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_field_assignment_preserves_disjoint_checked_loan() {
+        let text = "%%start\nstruct Bundle { u8 left; u8 right; }\n*u8() f = fn { Bundle pair = { .left = 1; .right = 2; }; *u8 reader = &pair.right; pair.left = 3; reader };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let function = items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) => Some(function),
+                    _ => None,
+                })
+                .expect("function");
+            let cfg = &function.reference_cfg;
+            let assignment = cfg
+                .points
+                .iter()
+                .find(|point| matches!(point.kind, CfgPointKind::Assign { .. }))
+                .expect("field write");
+            let CfgPointKind::Assign {
+                target,
+                previous_origins,
+                ..
+            } = &assignment.kind
+            else {
+                unreachable!()
+            };
+            assert_eq!(target.projections.len(), 1);
+            assert!(matches!(
+                &target.projections[0],
+                ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(_))
+            ));
+            assert!(previous_origins.is_empty());
+            let reader = cfg
+                .points
+                .iter()
+                .rev()
+                .find(|point| matches!(point.kind, CfgPointKind::Read { .. }))
+                .expect("reader");
+            assert_eq!(reader.possible_origins.as_ref().expect("loan").len(), 1);
+        }
+    }
+
+    #[test]
+    fn moving_allocation_records_live_loan_before_move_point() {
+        let text = "%%start\n*u8(u64) f = fn(count) { u8[count] bytes; *u8 borrowed = &bytes[0]; u8[] moved = bytes; moved; borrowed };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003"
+                        && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels[0].span.range.start
+                            == text.find("= bytes; moved").unwrap() as u32 + 2
+                }),
+                "{diagnostics:?}"
+            );
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let cfg = &function.reference_cfg;
+            let moved = cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(point.kind, CfgPointKind::Move { .. })
+                        && point.source_span.range.start
+                            == text.find("= bytes; moved").unwrap() as u32 + 2
+                })
+                .expect("allocation move");
+            let CfgPointKind::Move { place, owner, .. } = &moved.kind else {
+                unreachable!()
+            };
+            assert_eq!(&place.binding, owner);
+            let borrow = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Borrow { place, .. } if place.binding == *owner)).expect("live loan");
+            assert!(borrow.id.0 < moved.id.0);
+            assert_eq!(
+                borrow.source_span.range.start,
+                text.find("&bytes[0]").unwrap() as u32
+            );
+            assert!(cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Read { binding } if binding.declaration_span.start == text.find("borrowed =").unwrap() as u32) && point.id.0 > moved.id.0));
+        }
+    }
+
+    #[test]
+    fn constant_index_write_preserves_loan_to_other_element() {
+        let text = "%%start\n*u8() f = fn { u8[2] bytes = [1, 2]; *u8 reader = &bytes[1]; bytes[0] = 3; reader };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let cfg = &function.reference_cfg;
+            let assignment = cfg
+                .points
+                .iter()
+                .find(|point| matches!(point.kind, CfgPointKind::Assign { .. }))
+                .expect("index assignment");
+            let CfgPointKind::Assign {
+                target,
+                previous_origins,
+                ..
+            } = &assignment.kind
+            else {
+                unreachable!()
+            };
+            assert!(
+                matches!(&target.projections[..], [ReferencePlaceProjection::Index(ScalarExpression::Integer { value, .. })] if value == &0.into())
+            );
+            assert!(previous_origins.is_empty());
+            let final_read = cfg
+                .points
+                .iter()
+                .rev()
+                .find(|point| matches!(point.kind, CfgPointKind::Read { .. }))
+                .expect("reader");
+            assert_eq!(
+                final_read
+                    .possible_origins
+                    .as_ref()
+                    .expect("checked loan")
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn raw_core_free_tracks_owner_release_in_both_validators() {
+        let text = "%%start\nunit() release = fn { unsafe { *?u8 storage = core.alloc(1, 1); core.free(storage); core.free(storage); } };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        let second = text.rfind("core.free(storage)").unwrap() as u32;
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range.start == second),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn projected_checked_assignment_transfers_rhs_to_field_and_preserves_sibling() {
+        let text = "%%start\nstruct Holder { *u8 first; *u8 second; }\nunit(u8, u8, u8) update = fn(a, b, c) { Holder box = { .first = null; .second = null; }; box.first = &a; box.second = &b; box.first = &c; *u8 kept = box.second; *u8 replaced = box.first; kept; replaced; } ;\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let function = items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) => Some(function),
+                    _ => None,
+                })
+                .expect("function");
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let reads = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::ReadPlace { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(reads.len(), 2);
+            for (read, origin) in reads.into_iter().zip(["&b", "&c"]) {
+                let fact = sole_fact(function, read);
+                assert!(
+                    matches!(fact, ReferenceOrigin::Fresh { loan, .. } if loan.creation_span.start == text.find(origin).unwrap() as u32),
+                    "{fact:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn projected_checked_swap_uses_both_original_rhs_origins() {
+        let text = "%%start\nstruct Pair { *u8 left; *u8 right; }\nunit(u8, u8) swap = fn(a, b) { Pair box = { .left = null; .right = null; }; box.left = &a; box.right = &b; box.left, box.right = box.right, box.left; *u8 left = box.left; *u8 right = box.right; left; right; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let function = items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) => Some(function),
+                    _ => None,
+                })
+                .expect("function");
+            let cfg = &function.reference_cfg;
+            let swap_start = text.find("box.left, box.right =").unwrap() as u32;
+            let writes = cfg
+                .points
+                .iter()
+                .filter(|point| {
+                    matches!(point.kind, CfgPointKind::Assign { .. })
+                        && point.source_span.range.start >= swap_start
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(writes.len(), 2);
+            for (write, expected) in writes.iter().zip(["&b", "&a"]) {
+                let CfgPointKind::Assign { rhs_point, .. } = &write.kind else {
+                    unreachable!()
+                };
+                assert!(rhs_point.0 < writes[0].id.0);
+                assert!(
+                    matches!(sole_fact(function, write), ReferenceOrigin::Fresh { loan, .. }
+                    if loan.creation_span.start == text.find(expected).unwrap() as u32)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn projected_checked_constant_indices_preserve_disjoint_origins() {
+        let text = "%%start\nunit(u8, u8, u8) update = fn(a, b, c) { (*u8)[2] refs = [null, null]; refs[0] = &a; refs[1] = &b; refs[0] = &c; *u8 other = refs[1]; *u8 current = refs[0]; other; current; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let reads = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::ReadPlace { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(reads.len(), 2);
+            for (read, origin) in reads.into_iter().zip(["&b", "&c"]) {
+                assert!(
+                    matches!(sole_fact(function, read), ReferenceOrigin::Fresh { loan, .. }
+                    if loan.creation_span.start == text.find(origin).unwrap() as u32)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checked_dereference_field_write_transfers_checked_rhs() {
+        let text = "%%start\nstruct Bag { *u8 item; }\nunit(u8) update = fn(value) { Bag parcel = { .item = null; }; *!Bag writer = &!parcel; (*writer).item = &value; *u8 reader = parcel.item; reader; };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let function = items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) => Some(function),
+                    _ => None,
+                })
+                .expect("function");
+            let cfg = &function.reference_cfg;
+            let write = cfg
+                .points
+                .iter()
+                .find(|point| matches!(point.kind, CfgPointKind::AssignThrough { .. }))
+                .expect("dereference write");
+            let CfgPointKind::AssignThrough { candidates, .. } = &write.kind else {
+                unreachable!()
+            };
+            assert_eq!(candidates.len(), 1);
+            assert!(
+                matches!(sole_fact(function, write), ReferenceOrigin::Fresh { loan, .. }
+                if loan.creation_span.start == text.find("&value").unwrap() as u32)
+            );
+        }
+    }
+
+    #[test]
+    fn core_invalidate_expires_owner_and_rebind_restores_selected_backing() {
+        let invalid = "%%start\nunit(u64) expire = fn(count) { u8[count] bytes; unsafe { core.invalidate(&bytes); }; bytes[0]; };\n%%end";
+        let (single, project) = both_reference_functions(invalid);
+        let read = invalid.rfind("bytes[0]").unwrap() as u32;
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range.start == read),
+                "{diagnostics:?}"
+            );
+        }
+        let rebound = "%%start\nunit(u64, *?u8) update = fn(count, raw) { u8[count] bytes; u8[count] other; unsafe { core.invalidate(&bytes); core.rebind(&bytes, raw, count); }; bytes[0]; other[0]; };\n%%end";
+        let (single, project) = both_reference_functions(rebound);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn joined_checked_assignment_preserves_all_reachable_targets() {
+        let text = "%%start\nunit(u8, u8, bool) update = fn(first, second, choose) { *!u8 selected = &!first; if (choose) { selected = &!second; }; *selected = 3; selected; } ;\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let assignment = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| matches!(point.kind, CfgPointKind::AssignThrough { .. }))
+                .expect("checked place assignment");
+            let CfgPointKind::AssignThrough {
+                candidates,
+                previous_origins,
+                rhs_point,
+                pointer_point,
+                ..
+            } = &assignment.kind
+            else {
+                unreachable!()
+            };
+            assert_eq!(candidates.len(), 2);
+            assert!(previous_origins.is_empty());
+            assert!(rhs_point.0 < pointer_point.0);
+            assert!(pointer_point.0 < assignment.id.0);
+            assert_eq!(
+                assignment.source_span.range.start,
+                text.find("*selected = 3").unwrap() as u32 + 1
+            );
+            assert!(candidates.iter().any(|candidate| candidate
+                .place
+                .binding
+                .declaration_span
+                .start
+                == text.find("fn(first").unwrap() as u32 + 3));
+            assert!(candidates.iter().any(|candidate| candidate
+                .place
+                .binding
+                .declaration_span
+                .start
+                == text.find("second, choose").unwrap() as u32));
+        }
+    }
+
+    #[test]
+    fn null_reborrow_keeps_the_original_and_conflicting_spans() {
+        let text = "%%start\n*u8() f = fn { *u8 empty = null; &*empty };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let point = function.reference_cfg.points.last().expect("return point");
+            assert!(
+                matches!(sole_fact(function, point), ReferenceOrigin::Invalid { origin_span, conflict_span }
+                if origin_span.start == text.find("null;").unwrap() as u32
+                    && conflict_span.start == text.find("&*empty").unwrap() as u32),
+                "{:?}",
+                sole_fact(function, point)
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_statement_and_unit_output_remain_statements_in_both_pipelines() {
+        for (source_text, final_output_count, terminated_items) in [
+            (
+                "%%start\n*u8(u8) f = fn(v) { unsafe { &v }; &v };\n%%end",
+                1,
+                &[true, false][..],
+            ),
+            (
+                "%%start\nunit(u8) f = fn(v) { unsafe { &v }; };\n%%end",
+                0,
+                &[true][..],
+            ),
+            (
+                "%%start\nunit(u8) f = fn(v) { unsafe { &v; } };\n%%end",
+                1,
+                &[false][..],
+            ),
+        ] {
+            let result = validate_text(source_text);
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            let module_source = module_source("src/main.w");
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::new(
+                    module_source.clone(),
+                    module_from_text(module_source.clone(), source_text).items,
+                    Vec::new(),
+                )],
+                vec![module_source],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for items in [&result.program.items, &project.project.modules[0].items] {
+                let ScalarItem::Function(function) = &items[0] else {
+                    panic!("expected function");
+                };
+                let body = &function.body;
+                assert_eq!(body.items.len(), body.terminated_items.len());
+                assert_eq!(body.items.len(), body.expressions.len());
+                assert_eq!(body.final_output_values.len(), final_output_count);
+                assert_eq!(body.terminated_items, terminated_items);
+            }
+        }
+    }
+
+    #[test]
     fn derives_zero_payload_enum_tags_and_equality() {
         let result = validate_text(
             "%%start\nenum Status { first; second; third; }\nStatus value = Status::second;\nbool equal = value == Status::second;\n%%end",
@@ -13611,7 +23120,11 @@ mod tests {
             "%%start\nu8[2] items = [0, 0];\nitems[0], items[1] = 1, 2;\n%%end",
         ] {
             let result = validate_text(text);
-            assert!(result.diagnostics.is_empty(), "{text}: {:?}", result.diagnostics);
+            assert!(
+                result.diagnostics.is_empty(),
+                "{text}: {:?}",
+                result.diagnostics
+            );
         }
         for text in [
             "%%start\nu8[2] items = [0, 0];\nu64 index = 0;\nitems[index], items[0] = 1, 2;\n%%end",
@@ -13707,8 +23220,7 @@ mod tests {
             "%%start\nstruct Record { u8 value; u8[2] bytes; }\nRecord holder = { .value = 0; .bytes = [0, 0]; };\n*!Record writer = &!holder;\n(*writer).value = 1;\n(*writer).bytes[0] = 2;\n%%end",
         );
         assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
-        let raw_text =
-            "%%start\nstruct Record { u8 value; u8[2] bytes; }\nRecord record = { .value = 0; .bytes = [0, 0]; };\nunsafe { *?Record raw = &?record; (*raw).value = 1; (*raw).bytes[0] = 2; };\n%%end";
+        let raw_text = "%%start\nstruct Record { u8 value; u8[2] bytes; }\nRecord record = { .value = 0; .bytes = [0, 0]; };\nunsafe { *?Record raw = &?record; (*raw).value = 1; (*raw).bytes[0] = 2; };\n%%end";
         let raw = validate_project_text(raw_text);
         for target in ["(*raw).value", "(*raw).bytes[0]"] {
             let start = raw_text.find(target).expect("raw assignment target") as u32;
@@ -13780,7 +23292,9 @@ mod tests {
             })
         ));
 
-        let invalid = validate_text("%%start\nu8[1] bytes = [1];\ni32 index = 0;\nu8 value = bytes[index];\nu8 wrong = index[0];\nu8[0] empty = [];\nu8 accepted = empty[0];\n%%end");
+        let invalid = validate_text(
+            "%%start\nu8[1] bytes = [1];\ni32 index = 0;\nu8 value = bytes[index];\nu8 wrong = index[0];\nu8[0] empty = [];\nu8 accepted = empty[0];\n%%end",
+        );
         assert!(
             invalid
                 .diagnostics
@@ -13827,8 +23341,7 @@ mod tests {
 
     #[test]
     fn derives_unit_if_statement_and_requires_bool_condition_span() {
-        let text =
-            "%%start\nunit() touch = fn { 1; };\nunit() run = fn { if (true) { touch(); }; };\n%%end";
+        let text = "%%start\nunit() touch = fn { 1; };\nunit() run = fn { if (true) { touch(); }; };\n%%end";
         let result = validate_text(text);
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         let ScalarItem::Function(function) = &result.program.items[1] else {
@@ -14662,7 +24175,10 @@ bool integer_inversion = !1;
     #[test]
     fn rejects_const_binding_assignments_at_target_span_in_single_file() {
         let cases = [
-            ("%%start\ni32 MAX_VALUE = 1;\nMAX_VALUE = 2;\n%%end", "MAX_VALUE"),
+            (
+                "%%start\ni32 MAX_VALUE = 1;\nMAX_VALUE = 2;\n%%end",
+                "MAX_VALUE",
+            ),
             (
                 "%%start\ni32(i32) f = fn(PARAMETER) { PARAMETER = 1; PARAMETER };\n%%end",
                 "PARAMETER",
@@ -15438,15 +24954,77 @@ bool integer_inversion = !1;
     }
 
     #[test]
+    fn checked_pointer_cast_preserves_deeply_nested_cfg_construction() {
+        let depth = 8;
+        let text = format!(
+            "%%start\nunit(*?u8) nested = fn(raw) {{ {}*!u8 checked = unsafe {{ core.pointer_cast<*!u8>(raw) }}; *checked = 1; {} }};\n%%end",
+            "unsafe { ".repeat(depth),
+            " };".repeat(depth)
+        );
+        let (single, project) = both_reference_functions(&text);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+
+    #[test]
+    fn checked_pointer_cast_records_source_owner_and_loan() {
+        let text = "%%start\n*!u8(*?u8) cast = fn(raw) { unsafe { core.pointer_cast<*!u8>(raw) } };\n%%end";
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("function")
+            };
+            let cast = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(
+                        point.kind,
+                        CfgPointKind::Call {
+                            target: ResolvedCallTarget::Core(CoreOperationId::PointerCast),
+                            ..
+                        }
+                    )
+                })
+                .expect("cast call");
+            let ReferenceOrigin::Fresh { allocation, loan } = sole_fact(function, cast) else {
+                panic!("checked cast origin")
+            };
+            assert_eq!(
+                allocation.declaration_span.start,
+                text.find("raw)").unwrap() as u32
+            );
+            assert_eq!(
+                loan.origin_place.binding.declaration_span,
+                allocation.declaration_span
+            );
+            assert_eq!(
+                loan.creation_span.start,
+                text.find("core.pointer_cast").unwrap() as u32
+            );
+            assert_eq!(loan.mode, ScalarReferenceMutability::Mutable);
+        }
+    }
+
+    #[test]
     fn validates_direct_pointer_cast_dereference_in_single_file_and_project() {
         for destination in ["*u8", "*!u8"] {
             for (text, expected_code) in [
                 (
-                    format!("%%start\nu8(*?u8) read = fn(pointer) {{ unsafe {{ *core.pointer_cast<{destination}>(pointer) }} }};\n%%end"),
+                    format!(
+                        "%%start\nu8(*?u8) read = fn(pointer) {{ unsafe {{ *core.pointer_cast<{destination}>(pointer) }} }};\n%%end"
+                    ),
                     None,
                 ),
                 (
-                    format!("%%start\nu8(*?u8) read = fn(pointer) {{ *core.pointer_cast<{destination}>(pointer) }};\n%%end"),
+                    format!(
+                        "%%start\nu8(*?u8) read = fn(pointer) {{ *core.pointer_cast<{destination}>(pointer) }};\n%%end"
+                    ),
                     Some("B0012"),
                 ),
             ] {
@@ -15459,18 +25037,32 @@ bool integer_inversion = !1;
                 ));
                 if let Some(code) = expected_code {
                     assert!(
-                        single.diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+                        single
+                            .diagnostics
+                            .iter()
+                            .any(|diagnostic| diagnostic.code == code),
                         "{text}: {:?}",
                         single.diagnostics
                     );
                     assert!(
-                        project.diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+                        project
+                            .diagnostics
+                            .iter()
+                            .any(|diagnostic| diagnostic.code == code),
                         "{text}: {:?}",
                         project.diagnostics
                     );
                 } else {
-                    assert!(single.diagnostics.is_empty(), "{text}: {:?}", single.diagnostics);
-                    assert!(project.diagnostics.is_empty(), "{text}: {:?}", project.diagnostics);
+                    assert!(
+                        single.diagnostics.is_empty(),
+                        "{text}: {:?}",
+                        single.diagnostics
+                    );
+                    assert!(
+                        project.diagnostics.is_empty(),
+                        "{text}: {:?}",
+                        project.diagnostics
+                    );
                 }
             }
         }
@@ -15486,7 +25078,9 @@ bool integer_inversion = !1;
                     Some("B0012"),
                 ),
             ] {
-                let text = format!("%%start\nstruct Record {{ u8 tag; }}\nu8(*?u8) read = fn(raw) {{ {body} }};\n%%end");
+                let text = format!(
+                    "%%start\nstruct Record {{ u8 tag; }}\nu8(*?u8) read = fn(raw) {{ {body} }};\n%%end"
+                );
                 let single = validate_text(&text);
                 let source = module_source("src/main.w");
                 let program = module_from_text(source.clone(), &text);
@@ -16895,7 +26489,11 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             "%%start\n(i32, u64)() pair = fn { 1 };\ni32 first = 0;\nu64 second = 0;\nfirst, second = pair();\n%%end",
         ] {
             let valid = validate_text(text);
-            assert!(valid.diagnostics.is_empty(), "{text}: {:?}", valid.diagnostics);
+            assert!(
+                valid.diagnostics.is_empty(),
+                "{text}: {:?}",
+                valid.diagnostics
+            );
         }
 
         let wrong_binding =
@@ -16921,10 +26519,12 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             ),
         ] {
             let invalid = validate_text(text);
-            assert!(invalid
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message == message));
+            assert!(
+                invalid
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message == message)
+            );
             assert!(!invalid.diagnostics.iter().any(|diagnostic| {
                 diagnostic.message == "call has more outputs than receivers"
                     || diagnostic.message == "call has more outputs than assignment targets"
@@ -16971,7 +26571,11 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             "%%start\nstd = namespace app \"src/std.w\";\ni32 first = 0;\nu64 second = 0;\nfirst, second = std.print();\n%%end",
         ] {
             let valid = validate_project_text(text);
-            assert!(valid.diagnostics.is_empty(), "{text}: {:?}", valid.diagnostics);
+            assert!(
+                valid.diagnostics.is_empty(),
+                "{text}: {:?}",
+                valid.diagnostics
+            );
         }
 
         let wrong_type = validate_project_text(
@@ -16992,10 +26596,12 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
             ),
         ] {
             let invalid = validate_project_text(text);
-            assert!(invalid
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message == message));
+            assert!(
+                invalid
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message == message)
+            );
             assert!(!invalid.diagnostics.iter().any(|diagnostic| {
                 diagnostic.message == "call has more outputs than receivers"
                     || diagnostic.message == "call has more outputs than assignment targets"
@@ -17476,11 +27082,13 @@ wasi = extern wasm "\q" { i32(i32, i32) fd_write; };
         }
 
         let aggregate = validate_text(
-            "%%start\nstruct Record {\n\tu32 value;\n}\nRecord record = { .value = 7; };\n*Record reference = &record;\nRecord read = *reference;\n%%end",
+            "%%start\nstruct copy Record {\n\tu32 value;\n}\nRecord sample = { .value = 7; };\n*Record reference = &sample;\nRecord read = *reference;\n%%end",
         );
-        assert!(aggregate.diagnostics.iter().any(|diagnostic| {
-            diagnostic.message == "whole aggregate checked dereference read is not supported"
-        }));
+        assert!(
+            aggregate.diagnostics.is_empty(),
+            "{:?}",
+            aggregate.diagnostics
+        );
 
         let null_reference =
             validate_text("%%start\n*u32 reference = null;\nu32 value = *reference;\n%%end");
