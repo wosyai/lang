@@ -1,3 +1,6 @@
+use super::expression::{
+    emit_expression, emit_project_expression, emit_project_typed_expression, emit_unary_value,
+};
 use super::*;
 
 pub(super) fn integer_width(ty: &ScalarType) -> Option<u32> {
