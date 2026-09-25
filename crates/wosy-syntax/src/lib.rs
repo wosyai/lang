@@ -89,6 +89,8 @@ pub enum SyntaxKind {
     EnumVariant,
     ErasedArraySuffix,
     AllocationBinding,
+    ParenthesizedDereferencePlace,
+    CopyModifier,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -178,6 +180,8 @@ impl Language for WosyLanguage {
             76 => SyntaxKind::EnumVariant,
             77 => SyntaxKind::ErasedArraySuffix,
             78 => SyntaxKind::AllocationBinding,
+            79 => SyntaxKind::ParenthesizedDereferencePlace,
+            80 => SyntaxKind::CopyModifier,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -649,6 +653,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::top_level_item => SyntaxKind::TopLevelItem,
         Rule::struct_decl => SyntaxKind::StructDecl,
         Rule::enum_decl => SyntaxKind::EnumDecl,
+        Rule::copy_modifier => SyntaxKind::CopyModifier,
         Rule::enum_variant => SyntaxKind::EnumVariant,
         Rule::struct_field => SyntaxKind::StructField,
         Rule::callable_output => SyntaxKind::CallableOutput,
@@ -663,6 +668,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::dereference => SyntaxKind::Dereference,
         Rule::raw_address => SyntaxKind::RawAddress,
         Rule::checked_address => SyntaxKind::CheckedAddress,
+        Rule::parenthesized_dereference_place => SyntaxKind::ParenthesizedDereferencePlace,
         Rule::indexed_place => SyntaxKind::IndexedPlace,
         Rule::index_suffix => SyntaxKind::IndexSuffix,
         Rule::place_target => SyntaxKind::PlaceTarget,
@@ -1621,6 +1627,127 @@ mod tests {
     }
 
     #[test]
+    fn parenthesized_checked_reborrows_preserve_place_structure_and_source() {
+        let text = "%%start\n*!u8 parent = &!value;\n*u8 reader = &value;\n&!(*parent).field;\n&!(*parent);\n&(*reader);\n&( *reader );\n&!*parent;\n&*reader;\n(*reader);\n%%end";
+        let source = identity();
+        let result = parse(source.clone(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(result.canonical_cst().source, source);
+        let snapshot = result.canonical_cst().snapshot();
+        let rebuilt = CanonicalCstRoot::from_snapshot(snapshot.clone());
+        assert_eq!(rebuilt.snapshot(), snapshot);
+        assert_eq!(rebuilt.root.text().to_string(), text);
+
+        for (spelling, kind) in [
+            ("&!(*parent).field", SyntaxKind::PlaceTarget),
+            ("&!(*parent)", SyntaxKind::ParenthesizedDereferencePlace),
+            ("&(*reader)", SyntaxKind::ParenthesizedDereferencePlace),
+            ("&( *reader )", SyntaxKind::ParenthesizedDereferencePlace),
+            ("&!*parent", SyntaxKind::PlaceTarget),
+            ("&*reader", SyntaxKind::PlaceTarget),
+        ] {
+            let start = text.rfind(spelling).expect("address") as u32;
+            let address = result
+                .root
+                .descendants()
+                .find(|node| {
+                    node.kind() == SyntaxKind::CheckedAddress
+                        && byte_span(node) == ByteSpan::new(start, start + spelling.len() as u32)
+                })
+                .expect("checked address with exact span");
+            let place = address
+                .children()
+                .find(|node| node.kind() == kind)
+                .expect("place");
+            assert_eq!(place.kind(), kind);
+            assert!(place
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::Dereference));
+            if spelling == "&!(*parent).field" {
+                assert!(place
+                    .descendants()
+                    .any(|node| node.kind() == SyntaxKind::DereferencedField));
+            }
+            if kind == SyntaxKind::ParenthesizedDereferencePlace {
+                let place_start = start + spelling.find('(').expect("opening parenthesis") as u32;
+                assert_eq!(
+                    byte_span(&place),
+                    ByteSpan::new(place_start, start + spelling.len() as u32)
+                );
+                let tokens: Vec<_> = place
+                    .descendants_with_tokens()
+                    .filter_map(|element| element.into_token())
+                    .map(|token| token.text().to_string())
+                    .collect();
+                assert_eq!(tokens.first().map(String::as_str), Some("("));
+                assert_eq!(tokens.last().map(String::as_str), Some(")"));
+                assert_eq!(tokens.concat(), &spelling[spelling.find('(').unwrap()..]);
+            }
+        }
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Parenthesized
+                && node.text().to_string() == "(*reader)"));
+    }
+
+    #[test]
+    fn malformed_parenthesized_checked_reborrows_recover_losslessly() {
+        for spelling in [
+            "&!(*parent",
+            "&(*reader",
+            "^&(*reader)",
+            "&^(*reader)",
+            "&(parent + 1)",
+            "&?(*reader)",
+        ] {
+            let text = format!("%%start\n{spelling};\n%%end");
+            let result = parse(identity(), text.clone(), &[]);
+            assert!(!result.is_valid(), "{spelling}");
+            assert_eq!(result.reconstruct(), text);
+        }
+    }
+
+    #[test]
+    fn checked_reborrow_keeps_parenthesized_comments_and_byte_spans() {
+        let text = "%%start\n&!(# INTENT: Inside the reborrow.\n\t*parent );\n%%end";
+        let result = parse(identity(), text.into(), &["INTENT".into()]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let address = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::CheckedAddress)
+            .expect("checked reborrow");
+        let start = text.find("&!(").unwrap() as u32;
+        assert_eq!(
+            byte_span(&address),
+            ByteSpan::new(start, text.find(");").unwrap() as u32 + 1)
+        );
+        let place = address
+            .children()
+            .find(|node| node.kind() == SyntaxKind::ParenthesizedDereferencePlace)
+            .expect("parenthesized dereference");
+        assert_eq!(byte_span(&place).start, start + 2);
+        let tokens: Vec<_> = place
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .collect();
+        assert!(tokens
+            .iter()
+            .any(|token| token.kind() == SyntaxKind::TypedComment
+                && token.text() == "# INTENT: Inside the reborrow."));
+        assert!(tokens
+            .iter()
+            .any(|token| token.kind() == SyntaxKind::Indentation && token.text() == "\t"));
+        assert_eq!(
+            tokens.iter().map(|token| token.text()).collect::<String>(),
+            place.text().to_string()
+        );
+    }
+
+    #[test]
     fn accepts_indexed_checked_address_formation() {
         let result = parse(
             identity(),
@@ -1881,6 +2008,39 @@ mod tests {
             .root
             .descendants()
             .any(|node| node.kind() == SyntaxKind::AssignmentTarget));
+    }
+
+    #[test]
+    fn aggregate_copy_modifiers_have_canonical_spans() {
+        let text = "%%start\nstruct copy Point { i32 x; }\nenum copy Status { ok; }\nstruct Copycat { i32 x; }\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let modifiers = result
+            .root
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| token.kind() == SyntaxKind::CopyModifier)
+            .collect::<Vec<_>>();
+        assert_eq!(modifiers.len(), 2);
+        for (index, modifier) in modifiers.iter().enumerate() {
+            let start = text.match_indices("copy").nth(index).unwrap().0 as u32;
+            assert_eq!(
+                ByteSpan::new(
+                    modifier.text_range().start().into(),
+                    modifier.text_range().end().into()
+                ),
+                ByteSpan::new(start, start + 4)
+            );
+            assert_eq!(
+                modifier.parent().unwrap().kind(),
+                if index == 0 {
+                    SyntaxKind::StructDecl
+                } else {
+                    SyntaxKind::EnumDecl
+                }
+            );
+        }
     }
 
     #[test]
