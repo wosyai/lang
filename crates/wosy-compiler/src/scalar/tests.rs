@@ -1,3 +1,4 @@
+use super::typecheck::block_type;
 use super::*;
 use crate::parse_source;
 

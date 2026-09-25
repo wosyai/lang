@@ -1,3 +1,6 @@
+use super::typecheck::{
+    expression_type, expression_type_in_module, place_type, place_type_in_module,
+};
 use super::*;
 
 pub(super) fn resolve_program_types(
