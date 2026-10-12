@@ -1,4 +1,7 @@
 use super::*;
+#[path = "typed_place.rs"]
+mod typed_place;
+use typed_place::{typed_place_projection, PlaceAccess, PlaceTypingContext};
 
 pub(super) fn validate_module_type(
     module: &ScalarModule,
@@ -184,12 +187,29 @@ fn contains_fixed_array(ty: &ScalarType) -> bool {
     }
 }
 
+pub(super) mod outputs;
+
 pub(super) fn call_output_sequence_in_module(
     expression: &ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
     module: &ScalarModule,
     modules: &[ScalarModule],
 ) -> Option<ScalarOutputSequence> {
+    if let Some(outputs) = outputs::lookup(
+        &module.resolved_expression_outputs,
+        &module.source,
+        expression_span(expression),
+    ) {
+        return Some(outputs);
+    }
+    if let ScalarExpression::Assignment(assignment) = expression {
+        return module
+            .resolved_assignment_types
+            .borrow()
+            .iter()
+            .find(|fact| fact.occurrence == *assignment.occurrence)
+            .map(|fact| fact.previous.clone());
+    }
     let ScalarExpression::Call {
         receiver,
         name,
@@ -319,6 +339,21 @@ fn call_output_sequence(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
 ) -> Option<ScalarOutputSequence> {
+    if let Some(outputs) = outputs::lookup(
+        &program.resolved_expression_outputs,
+        &program.source,
+        expression_span(expression),
+    ) {
+        return Some(outputs);
+    }
+    if let ScalarExpression::Assignment(assignment) = expression {
+        return program
+            .resolved_assignment_types
+            .borrow()
+            .iter()
+            .find(|fact| fact.occurrence == *assignment.occurrence)
+            .map(|fact| fact.previous.clone());
+    }
     let ScalarExpression::Call {
         receiver,
         name,
@@ -418,7 +453,9 @@ fn scalar_call_result_in_module(outputs: &ScalarOutputSequence) -> ScalarType {
 
 pub(super) fn expression_span(expression: &ScalarExpression) -> ByteSpan {
     match expression {
-        ScalarExpression::Name { span, .. }
+        ScalarExpression::Assignment(assignment) => assignment.span,
+        ScalarExpression::FunctionLiteral { span, .. }
+        | ScalarExpression::Name { span, .. }
         | ScalarExpression::Integer { span, .. }
         | ScalarExpression::InvalidInteger { span, .. }
         | ScalarExpression::Float { span, .. }
@@ -634,9 +671,14 @@ pub(super) fn block_item_type_in_module(
                 }
                 return ScalarType::Unit;
             }
-            let actual = expression_type_in_module_expected(
+            let expected = binding
+                .receivers
+                .iter()
+                .map(|receiver| receiver.ty.clone())
+                .collect::<Vec<_>>();
+            let actual = scalar_call_result(&outputs::sequence_in_module(
                 &binding.value,
-                Some(&binding.declared_type),
+                &expected,
                 scope,
                 visible_names,
                 folded_names,
@@ -644,7 +686,7 @@ pub(super) fn block_item_type_in_module(
                 modules,
                 diagnostics,
                 unsafe_context,
-            );
+            ));
             validate_output_receivers_in_module(
                 &binding.value,
                 &binding.receivers,
@@ -719,6 +761,31 @@ fn assignment_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
+    assignment_output_types_in_module(
+        assignment,
+        scope,
+        visible_names,
+        folded_names,
+        module,
+        modules,
+        diagnostics,
+        unsafe_context,
+        false,
+    );
+    ScalarType::Unit
+}
+
+fn assignment_output_types_in_module(
+    assignment: &ScalarAssignment,
+    scope: &mut BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+    observed: bool,
+) -> ScalarOutputSequence {
     let mut inferred_names = visible_names.clone();
     let mut inferred_folded_names = folded_names.clone();
     let expected = assignment
@@ -727,14 +794,44 @@ fn assignment_type_in_module(
         .map(|target| assignment_target_type_in_module(target, scope, module, modules, diagnostics))
         .collect::<Vec<_>>();
     validate_assignment_target_distinctness_in_module(assignment, module, diagnostics);
+    let previous = ScalarOutputSequence {
+        outputs: assignment
+            .targets
+            .iter()
+            .zip(&expected)
+            .filter_map(|(target, ty)| match ty {
+                Some(ty) => Some(ScalarOutput {
+                    ty: ty.clone(),
+                    span: target.span,
+                }),
+                None => {
+                    if observed {
+                        diagnostics.push(module_diagnostic(
+                            module,
+                            "B0001",
+                            "observed assignment target has no previous value",
+                            target.span,
+                        ));
+                    }
+                    None
+                }
+            })
+            .collect(),
+        span: assignment.span,
+    };
+    let mut destination = 0;
     let outputs = assignment
         .values
         .iter()
-        .enumerate()
-        .map(|(position, value)| {
-            let actual = expression_type_in_module_expected(
+        .map(|value| {
+            let contextual = expected
+                .iter()
+                .skip(destination)
+                .map_while(Clone::clone)
+                .collect::<Vec<_>>();
+            let resolved = outputs::sequence_in_module(
                 value,
-                expected.get(position).and_then(Option::as_ref),
+                &contextual,
                 scope,
                 visible_names,
                 folded_names,
@@ -743,7 +840,8 @@ fn assignment_type_in_module(
                 diagnostics,
                 unsafe_context,
             );
-            match call_output_sequence_in_module(value, scope, module, modules) {
+            let actual = scalar_call_result(&resolved);
+            let outputs = match call_output_sequence_in_module(value, scope, module, modules) {
                 Some(outputs) => Some(outputs.outputs),
                 None if matches!(value, ScalarExpression::Call { .. })
                     && is_error_type(&actual) =>
@@ -754,7 +852,11 @@ fn assignment_type_in_module(
                     ty: actual,
                     span: expression_span(value),
                 }]),
+            };
+            if let Some(outputs) = &outputs {
+                destination += outputs.len();
             }
+            outputs
         })
         .collect::<Option<Vec<_>>>()
         .map(|outputs| ScalarOutputSequence {
@@ -762,6 +864,12 @@ fn assignment_type_in_module(
             span: assignment.span,
         });
     if let Some(outputs) = outputs {
+        record_assignment_type_fact(
+            &module.resolved_assignment_types,
+            assignment,
+            &outputs,
+            &previous,
+        );
         record_assignment_outputs(
             &module.resolved_assignment_outputs,
             &module.source,
@@ -797,6 +905,9 @@ fn assignment_type_in_module(
                     diagnostics,
                 );
             } else if let ScalarPlace::Name { name, span } = &target.place {
+                if observed {
+                    continue;
+                }
                 validate_identifier_style(module, name, *span, diagnostics);
                 if declare_module_name(
                     module,
@@ -811,7 +922,7 @@ fn assignment_type_in_module(
             }
         }
     }
-    ScalarType::Unit
+    previous
 }
 
 fn assignment_target_type_in_module(
@@ -2442,7 +2553,86 @@ pub(super) fn expression_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
+    let ty = expression_type_in_module_worker(
+        expression,
+        scope,
+        visible_names,
+        folded_names,
+        module,
+        modules,
+        diagnostics,
+        unsafe_context,
+    );
+    finish_module_outputs(expression, &ty, module, diagnostics);
+    ty
+}
+
+fn finish_module_outputs(
+    expression: &ScalarExpression,
+    ty: &ScalarType,
+    module: &ScalarModule,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    let disagreements = match outputs::finish(
+        &module.resolved_expression_outputs,
+        &module.resolved_assignment_types,
+        &module.source,
+        expression,
+        ty,
+    ) {
+        Ok(disagreements) => disagreements,
+        Err(error) => {
+            diagnostics.push(error.diagnostic());
+            return;
+        }
+    };
+    for (left, right) in disagreements {
+        diagnostics.push(module_diagnostic(
+            module,
+            if left.outputs.len() == right.outputs.len() {
+                "B0006"
+            } else {
+                "B0004"
+            },
+            "conditional branches must have equal ordered output types and arity",
+            expression_span(expression),
+        ));
+    }
+}
+
+fn expression_type_in_module_worker(
+    expression: &ScalarExpression,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
     match expression {
+        ScalarExpression::Assignment(assignment) => {
+            scalar_call_result_in_module(&assignment_output_types_in_module(
+                assignment,
+                &mut scope.clone(),
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+                true,
+            ))
+        }
+        ScalarExpression::FunctionLiteral { span, .. } => {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "function literal requires a callable context",
+                *span,
+            ));
+            ScalarType::Error
+        }
         ScalarExpression::Name { name, span } if name == "null" => {
             diagnostics.push(module_diagnostic(
                 module,
@@ -2482,7 +2672,7 @@ pub(super) fn expression_type_in_module(
             modules,
             diagnostics,
         ),
-        ScalarExpression::Dereference { place, span } => checked_dereference_type_in_module(
+        ScalarExpression::Dereference { place, span, .. } => checked_dereference_type_in_module(
             place,
             *span,
             scope,
@@ -2491,8 +2681,31 @@ pub(super) fn expression_type_in_module(
             diagnostics,
             unsafe_context,
         ),
-        ScalarExpression::IndexedRead { place, .. } => {
-            place_type_in_module(place, scope, module, modules, diagnostics)
+        ScalarExpression::IndexedRead { place, span, .. } => {
+            if !unsafe_context
+                && writable_place_contains_raw_dereference_in_module(
+                    place,
+                    scope,
+                    module,
+                    modules,
+                    diagnostics,
+                )
+            {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0012",
+                    "raw pointer indexing requires an unsafe block",
+                    *span,
+                ));
+            }
+            typed_place_projection(
+                place,
+                scope,
+                PlaceTypingContext::Module(module, modules),
+                PlaceAccess::Read,
+                diagnostics,
+                unsafe_context,
+            )
         }
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {
@@ -2945,7 +3158,7 @@ pub(super) fn expression_type_in_module(
                         ));
                         return ScalarType::Error;
                     };
-                    if !type_arguments.is_empty() || arguments.len() != parameters.len() {
+                    if !type_arguments.is_empty() || arguments.len() > parameters.len() {
                         diagnostics.push(module_diagnostic(
                             module,
                             "B0004",
@@ -2954,32 +3167,45 @@ pub(super) fn expression_type_in_module(
                         ));
                         return ScalarType::Error;
                     }
-                    let mut error_argument = false;
-                    for (argument, parameter) in arguments.iter().zip(parameters) {
-                        let actual = expression_type_in_module_expected(
-                            argument,
-                            Some(parameter),
-                            scope,
-                            visible_names,
-                            folded_names,
+                    let argument_outputs = outputs::arguments_in_module(
+                        arguments,
+                        parameters,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        module,
+                        modules,
+                        diagnostics,
+                        unsafe_context,
+                    );
+                    if argument_outputs.len() < parameters.len() {
+                        diagnostics.push(module_diagnostic(
                             module,
-                            modules,
-                            diagnostics,
-                            unsafe_context,
-                        );
+                            "B0004",
+                            "call argument arity does not match callable type",
+                            *span,
+                        ));
+                    }
+                    let mut error_argument = false;
+                    for (argument, parameter) in argument_outputs.iter().zip(parameters) {
                         expect_module_type(
                             module,
                             parameter,
-                            &actual,
-                            expression_span(argument),
+                            &argument.ty,
+                            argument.span,
                             diagnostics,
                         );
-                        error_argument |= is_error_type(&actual);
+                        error_argument |= is_error_type(&argument.ty);
                     }
                     return if error_argument {
                         ScalarType::Error
                     } else {
-                        scalar_call_result_in_module(outputs)
+                        outputs::call_result(
+                            &module.resolved_expression_outputs,
+                            &module.source,
+                            expression,
+                            outputs,
+                        )
                     };
                 }
             }
@@ -3159,7 +3385,18 @@ pub(super) fn expression_type_in_module(
                 ));
                 return ScalarType::Error;
             };
-            if arguments.len() != parameters.len() {
+            let argument_outputs = outputs::arguments_in_module(
+                arguments,
+                parameters,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            );
+            if arguments.len() > parameters.len() || argument_outputs.len() < parameters.len() {
                 diagnostics.push(module_diagnostic(
                     module,
                     "B0004",
@@ -3168,20 +3405,9 @@ pub(super) fn expression_type_in_module(
                 ));
             }
             let mut error_argument = false;
-            for (argument, parameter) in arguments.iter().zip(parameters) {
-                let actual = expression_type_in_module_expected(
-                    argument,
-                    Some(parameter),
-                    scope,
-                    visible_names,
-                    folded_names,
-                    module,
-                    modules,
-                    diagnostics,
-                    unsafe_context,
-                );
-                expect_module_type(target, parameter, &actual, *span, diagnostics);
-                error_argument |= is_error_type(&actual);
+            for (argument, parameter) in argument_outputs.iter().zip(parameters) {
+                expect_module_type(target, parameter, &argument.ty, argument.span, diagnostics);
+                error_argument |= is_error_type(&argument.ty);
             }
             if unsafe_callable && !unsafe_context {
                 diagnostics.push(module_diagnostic(
@@ -3194,7 +3420,12 @@ pub(super) fn expression_type_in_module(
             if error_argument {
                 ScalarType::Error
             } else {
-                scalar_call_result_in_module(outputs)
+                outputs::call_result(
+                    &module.resolved_expression_outputs,
+                    &module.source,
+                    expression,
+                    outputs,
+                )
             }
         }
         ScalarExpression::If {
@@ -3318,8 +3549,113 @@ pub(super) fn expression_type_in_module_expected(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
+    if matches!(
+        expression,
+        ScalarExpression::Block(_) | ScalarExpression::If { .. }
+    ) {
+        let expected = expected.into_iter().cloned().collect::<Vec<_>>();
+        return scalar_call_result(&outputs::sequence_in_module(
+            expression,
+            &expected,
+            scope,
+            visible_names,
+            folded_names,
+            module,
+            modules,
+            diagnostics,
+            unsafe_context,
+        ));
+    }
+    let ty = expression_type_in_module_expected_worker(
+        expression,
+        expected,
+        scope,
+        visible_names,
+        folded_names,
+        module,
+        modules,
+        diagnostics,
+        unsafe_context,
+    );
+    finish_module_outputs(expression, &ty, module, diagnostics);
+    ty
+}
+
+fn expression_type_in_module_expected_worker(
+    expression: &ScalarExpression,
+    expected: Option<&ScalarType>,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
     if expected.is_some_and(is_error_type) {
         return ScalarType::Error;
+    }
+    if let ScalarExpression::FunctionLiteral {
+        parameters,
+        parameter_spans,
+        body,
+        span,
+    } = expression
+    {
+        let Some(ScalarType::Callable {
+            outputs,
+            parameters: parameter_types,
+        }) = expected
+        else {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0003",
+                "function literal requires a callable context",
+                *span,
+            ));
+            return ScalarType::Error;
+        };
+        closure::record_signature(
+            &module.resolved_literals,
+            &module.source,
+            *span,
+            expected.expect("validated callable context"),
+        );
+        let mut body_scope = scope.clone();
+        let mut body_names = visible_names.clone();
+        let mut body_folded = folded_names.clone();
+        if parameters.len() != parameter_types.len() {
+            diagnostics.push(module_diagnostic(
+                module,
+                "B0004",
+                "function parameter arity does not match its type",
+                *span,
+            ));
+        }
+        for ((name, name_span), ty) in parameters.iter().zip(parameter_spans).zip(parameter_types) {
+            validate_identifier_style(module, name, *name_span, diagnostics);
+            if declare_module_name(
+                module,
+                name,
+                *name_span,
+                &mut body_names,
+                &mut body_folded,
+                diagnostics,
+            ) {
+                body_scope.insert(name.clone(), ty.clone());
+            }
+        }
+        outputs::validate_function_in_module(
+            body,
+            outputs,
+            &body_scope,
+            &body_names,
+            &body_folded,
+            module,
+            modules,
+            diagnostics,
+        );
+        return expected.cloned().expect("callable context");
     }
     if let ScalarExpression::Call {
         receiver,
@@ -3371,7 +3707,7 @@ pub(super) fn expression_type_in_module_expected(
                 ));
                 return ScalarType::Error;
             }
-            let argument_types = arguments
+            let _argument_types = arguments
                 .iter()
                 .map(|argument| {
                     expression_type_in_module(
@@ -3386,11 +3722,11 @@ pub(super) fn expression_type_in_module_expected(
                     )
                 })
                 .collect::<Vec<_>>();
-            let overload_arguments = arguments
-                .iter()
-                .zip(&argument_types)
-                .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
-                .collect::<Vec<_>>();
+            let overload_arguments = outputs::overload_arguments(
+                arguments,
+                &module.resolved_expression_outputs,
+                &module.source,
+            );
             let callable = match resolve_overload_candidate(overload, &overload_arguments, expected)
             {
                 Ok((callable, _)) => callable,
@@ -3406,27 +3742,26 @@ pub(super) fn expression_type_in_module_expected(
             else {
                 unreachable!("overload arms are callable")
             };
-            for (argument, parameter) in arguments.iter().zip(&parameters) {
-                let actual = expression_type_in_module_expected(
-                    argument,
-                    Some(parameter),
-                    scope,
-                    visible_names,
-                    folded_names,
-                    module,
-                    modules,
-                    diagnostics,
-                    unsafe_context,
-                );
-                expect_module_type(
-                    module,
-                    parameter,
-                    &actual,
-                    expression_span(argument),
-                    diagnostics,
-                );
+            let argument_outputs = outputs::arguments_in_module(
+                arguments,
+                &parameters,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+            );
+            for (argument, parameter) in argument_outputs.iter().zip(&parameters) {
+                expect_module_type(module, parameter, &argument.ty, argument.span, diagnostics);
             }
-            return scalar_call_result_in_module(&outputs);
+            return outputs::call_result(
+                &module.resolved_expression_outputs,
+                &module.source,
+                expression,
+                &outputs,
+            );
         }
     }
     if let ScalarExpression::Unary {
@@ -3563,7 +3898,24 @@ pub(super) fn expression_type_in_module_expected(
             ));
             return ScalarType::Error;
         };
-        if elements.len() as u64 != *length {
+        let mut element_outputs = Vec::new();
+        for value in elements {
+            element_outputs.extend(
+                outputs::sequence_in_module(
+                    value,
+                    std::slice::from_ref(element.as_ref()),
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                )
+                .outputs,
+            );
+        }
+        if element_outputs.len() as u64 != *length {
             diagnostics.push(module_diagnostic(
                 module,
                 "B0003",
@@ -3571,25 +3923,8 @@ pub(super) fn expression_type_in_module_expected(
                 *span,
             ));
         }
-        for value in elements {
-            let actual = expression_type_in_module_expected(
-                value,
-                Some(element),
-                scope,
-                visible_names,
-                folded_names,
-                module,
-                modules,
-                diagnostics,
-                unsafe_context,
-            );
-            expect_module_type(
-                module,
-                element,
-                &actual,
-                expression_span(value),
-                diagnostics,
-            );
+        for value in &element_outputs {
+            expect_module_type(module, element, &value.ty, value.span, diagnostics);
         }
         return expected.cloned().expect("array context");
     }
@@ -4005,17 +4340,21 @@ fn field_type_in_module(
 fn is_supported_checked_address_place(place: &ScalarPlace) -> bool {
     match place {
         ScalarPlace::Name { .. } => true,
-        ScalarPlace::Field { base, .. } => matches!(base.as_ref(), ScalarPlace::Name { .. }),
+        ScalarPlace::Field { base, .. } => is_supported_checked_address_place(base),
         ScalarPlace::Dereference { .. } => true,
         ScalarPlace::Index { base, .. } => is_supported_checked_address_place(base),
     }
 }
 
 fn is_addressable_checked_reference_type(ty: &ScalarType) -> bool {
-    !matches!(
-        ty,
-        ScalarType::Unit | ScalarType::Callable { .. } | ScalarType::Error
-    )
+    !matches!(ty, ScalarType::Unit | ScalarType::Error)
+}
+
+fn typed_place_root(place: &ScalarPlace) -> &ScalarPlace {
+    match place {
+        ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } => typed_place_root(base),
+        ScalarPlace::Name { .. } | ScalarPlace::Dereference { .. } => place,
+    }
 }
 
 fn checked_address_type(
@@ -4035,7 +4374,7 @@ fn checked_address_type(
         ));
         return ScalarType::Error;
     }
-    let inner = if let ScalarPlace::Dereference { pointer, .. } = place {
+    let inner = if let ScalarPlace::Dereference { pointer, .. } = typed_place_root(place) {
         match expression_type(
             pointer,
             scope,
@@ -4051,7 +4390,11 @@ fn checked_address_type(
             } if mutability == ScalarReferenceMutability::Shared
                 || parent_mode == ScalarReferenceMutability::Mutable =>
             {
-                *inner
+                if matches!(place, ScalarPlace::Dereference { .. }) {
+                    *inner
+                } else {
+                    place_type(place, scope, program, diagnostics)
+                }
             }
             ScalarType::RawPointer(_) => {
                 diagnostics.push(diagnostic(
@@ -4108,7 +4451,7 @@ fn checked_address_type_in_module(
         ));
         return ScalarType::Error;
     }
-    let inner = if let ScalarPlace::Dereference { pointer, .. } = place {
+    let inner = if let ScalarPlace::Dereference { pointer, .. } = typed_place_root(place) {
         match expression_type_in_module(
             pointer,
             scope,
@@ -4125,7 +4468,11 @@ fn checked_address_type_in_module(
             } if mutability == ScalarReferenceMutability::Shared
                 || parent_mode == ScalarReferenceMutability::Mutable =>
             {
-                *inner
+                if matches!(place, ScalarPlace::Dereference { .. }) {
+                    *inner
+                } else {
+                    place_type_in_module(place, scope, module, modules, diagnostics)
+                }
             }
             ScalarType::RawPointer(_) => {
                 diagnostics.push(module_diagnostic(
@@ -4290,96 +4637,14 @@ fn writable_path_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
-    match place {
-        ScalarPlace::Name { .. } => place_type(place, scope, program, diagnostics),
-        ScalarPlace::Dereference { pointer, span } => match expression_type(
-            pointer,
-            scope,
-            &BTreeSet::new(),
-            &BTreeMap::new(),
-            program,
-            diagnostics,
-            false,
-        ) {
-            ScalarType::CheckedReference {
-                mutability: ScalarReferenceMutability::Mutable,
-                inner,
-            } => *inner,
-            ScalarType::Error => ScalarType::Error,
-            _ => {
-                diagnostics.push(diagnostic(
-                    program,
-                    "B0003",
-                    "assignment dereference requires a mutable checked reference",
-                    *span,
-                ));
-                ScalarType::Error
-            }
-        },
-        ScalarPlace::Field { base, field, span } => {
-            let ScalarType::Struct(structure) =
-                writable_path_type(base, scope, program, diagnostics)
-            else {
-                diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
-                return ScalarType::Error;
-            };
-            let ScalarFieldReference::Resolved(field) = field else {
-                diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
-                return ScalarType::Error;
-            };
-            let Some(field) = program
-                .structs
-                .iter()
-                .find(|candidate| candidate.id == structure && field.structure == structure)
-                .and_then(|candidate| candidate.fields.get(field.index))
-                .filter(|candidate| candidate.id == *field)
-            else {
-                diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
-                return ScalarType::Error;
-            };
-            field.ty.clone()
-        }
-        ScalarPlace::Index {
-            base,
-            index,
-            span,
-            index_span,
-        } => {
-            let base_type = writable_path_type(base, scope, program, diagnostics);
-            let index_type = expression_type_expected(
-                index,
-                &ScalarType::U64,
-                scope,
-                &BTreeSet::new(),
-                &BTreeMap::new(),
-                program,
-                diagnostics,
-                false,
-            );
-            expect_type(
-                program,
-                &ScalarType::U64,
-                &index_type,
-                *index_span,
-                diagnostics,
-            );
-            match base_type {
-                ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
-                    *element
-                }
-                ScalarType::Error => ScalarType::Error,
-                _ => {
-                    diagnostics.push(diagnostic(
-                        program,
-                        "B0003",
-                        "indexed place requires a fixed array",
-                        *span,
-                    ));
-                    ScalarType::Error
-                }
-            }
-        }
-    }
+    typed_place_projection(
+        place,
+        scope,
+        PlaceTypingContext::Program(program),
+        PlaceAccess::Write,
+        diagnostics,
+        false,
+    )
 }
 
 fn writable_path_type_in_module(
@@ -4389,115 +4654,14 @@ fn writable_path_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
-    match place {
-        ScalarPlace::Name { .. } => {
-            place_type_in_module(place, scope, module, modules, diagnostics)
-        }
-        ScalarPlace::Dereference { pointer, span } => match expression_type_in_module(
-            pointer,
-            scope,
-            &BTreeSet::new(),
-            &BTreeMap::new(),
-            module,
-            modules,
-            diagnostics,
-            false,
-        ) {
-            ScalarType::CheckedReference {
-                mutability: ScalarReferenceMutability::Mutable,
-                inner,
-            } => *inner,
-            ScalarType::Error => ScalarType::Error,
-            _ => {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0003",
-                    "assignment dereference requires a mutable checked reference",
-                    *span,
-                ));
-                ScalarType::Error
-            }
-        },
-        ScalarPlace::Field { base, field, span } => {
-            let ScalarType::Struct(structure) =
-                writable_path_type_in_module(base, scope, module, modules, diagnostics)
-            else {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0003",
-                    "value has no field",
-                    *span,
-                ));
-                return ScalarType::Error;
-            };
-            let ScalarFieldReference::Resolved(field) = field else {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0003",
-                    "value has no field",
-                    *span,
-                ));
-                return ScalarType::Error;
-            };
-            let Some(field) = modules
-                .iter()
-                .flat_map(|candidate| candidate.structs.iter())
-                .find(|candidate| candidate.id == structure && field.structure == structure)
-                .and_then(|candidate| candidate.fields.get(field.index))
-                .filter(|candidate| candidate.id == *field)
-            else {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0003",
-                    "value has no field",
-                    *span,
-                ));
-                return ScalarType::Error;
-            };
-            field.ty.clone()
-        }
-        ScalarPlace::Index {
-            base,
-            index,
-            span,
-            index_span,
-        } => {
-            let base_type = writable_path_type_in_module(base, scope, module, modules, diagnostics);
-            let index_type = expression_type_in_module_expected(
-                index,
-                Some(&ScalarType::U64),
-                scope,
-                &BTreeSet::new(),
-                &BTreeMap::new(),
-                module,
-                modules,
-                diagnostics,
-                false,
-            );
-            expect_module_type(
-                module,
-                &ScalarType::U64,
-                &index_type,
-                *index_span,
-                diagnostics,
-            );
-            match base_type {
-                ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
-                    *element
-                }
-                ScalarType::Error => ScalarType::Error,
-                _ => {
-                    diagnostics.push(module_diagnostic(
-                        module,
-                        "B0003",
-                        "indexed place requires a fixed array",
-                        *span,
-                    ));
-                    ScalarType::Error
-                }
-            }
-        }
-    }
+    typed_place_projection(
+        place,
+        scope,
+        PlaceTypingContext::Module(module, modules),
+        PlaceAccess::Write,
+        diagnostics,
+        false,
+    )
 }
 
 pub(super) fn place_type(
@@ -4506,106 +4670,14 @@ pub(super) fn place_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
-    match place {
-        ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
-            diagnostics.push(diagnostic(program, "B0001", "unknown name", *span));
-            ScalarType::Error
-        }),
-        ScalarPlace::Field {
-            base, field, span, ..
-        } => {
-            let base_type = place_type(base, scope, program, diagnostics);
-            let id = match base_type {
-                ScalarType::Struct(id) => id,
-                ScalarType::RawPointer(inner) => match inner.as_ref() {
-                    ScalarType::Struct(id) => id.clone(),
-                    _ => {
-                        diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
-                        return ScalarType::Error;
-                    }
-                },
-                _ => {
-                    diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
-                    return ScalarType::Error;
-                }
-            };
-            let ScalarFieldReference::Resolved(field) = field else {
-                diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
-                return ScalarType::Error;
-            };
-            let Some(resolved_field) = program
-                .structs
-                .get(id.index)
-                .filter(|structure| field.structure == structure.id)
-                .and_then(|structure| structure.fields.get(field.index))
-                .filter(|resolved_field| resolved_field.id == *field)
-            else {
-                diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
-                return ScalarType::Error;
-            };
-            resolved_field.ty.clone()
-        }
-        ScalarPlace::Dereference { pointer, span } => match expression_type(
-            pointer,
-            scope,
-            &BTreeSet::new(),
-            &BTreeMap::new(),
-            program,
-            diagnostics,
-            true,
-        ) {
-            ScalarType::RawPointer(inner) => *inner,
-            _ => {
-                diagnostics.push(diagnostic(
-                    program,
-                    "B0003",
-                    "cannot dereference value",
-                    *span,
-                ));
-                ScalarType::Error
-            }
-        },
-        ScalarPlace::Index {
-            base,
-            index,
-            span,
-            index_span,
-        } => {
-            let base_type = place_type(base, scope, program, diagnostics);
-            let index_type = expression_type_expected(
-                index,
-                &ScalarType::U64,
-                scope,
-                &BTreeSet::new(),
-                &BTreeMap::new(),
-                program,
-                diagnostics,
-                false,
-            );
-            expect_type(
-                program,
-                &ScalarType::U64,
-                &index_type,
-                *index_span,
-                diagnostics,
-            );
-            match base_type {
-                ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
-                    *element
-                }
-                ScalarType::Error => ScalarType::Error,
-                _ => {
-                    diagnostics.push(diagnostic(
-                        program,
-                        "B0003",
-                        "indexed place requires a fixed array",
-                        *span,
-                    ));
-                    ScalarType::Error
-                }
-            }
-        }
-    }
+    typed_place_projection(
+        place,
+        scope,
+        PlaceTypingContext::Program(program),
+        PlaceAccess::Read,
+        diagnostics,
+        true,
+    )
 }
 
 pub(super) fn place_type_in_module(
@@ -4615,140 +4687,14 @@ pub(super) fn place_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
-    match place {
-        ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
-            diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
-            ScalarType::Error
-        }),
-        ScalarPlace::Dereference { pointer, span } => match expression_type_in_module(
-            pointer,
-            scope,
-            &BTreeSet::new(),
-            &BTreeMap::new(),
-            module,
-            modules,
-            diagnostics,
-            true,
-        ) {
-            ScalarType::RawPointer(inner) => *inner,
-            _ => {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0003",
-                    "cannot dereference value",
-                    *span,
-                ));
-                ScalarType::Error
-            }
-        },
-        ScalarPlace::Field {
-            base, field, span, ..
-        } => {
-            let base_type = place_type_in_module(base, scope, module, modules, diagnostics);
-            let id = match base_type {
-                ScalarType::Struct(id) => id,
-                ScalarType::RawPointer(inner) => match inner.as_ref() {
-                    ScalarType::Struct(id) => id.clone(),
-                    _ => {
-                        diagnostics.push(module_diagnostic(
-                            module,
-                            "B0003",
-                            "value has no field",
-                            *span,
-                        ));
-                        return ScalarType::Error;
-                    }
-                },
-                _ => {
-                    diagnostics.push(module_diagnostic(
-                        module,
-                        "B0003",
-                        "value has no field",
-                        *span,
-                    ));
-                    return ScalarType::Error;
-                }
-            };
-            let ScalarFieldReference::Resolved(field) = field else {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0003",
-                    "value has no field",
-                    *span,
-                ));
-                return ScalarType::Error;
-            };
-            if field.structure != id {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0003",
-                    "value has no field",
-                    *span,
-                ));
-                return ScalarType::Error;
-            }
-            let resolved = modules
-                .iter()
-                .flat_map(|module| module.structs.iter())
-                .find(|structure| field.structure == structure.id)
-                .and_then(|structure| structure.fields.get(field.index))
-                .filter(|resolved_field| resolved_field.id == *field)
-                .map(|field| field.ty.clone());
-            match resolved {
-                Some(ty) => ty,
-                None => {
-                    diagnostics.push(module_diagnostic(
-                        module,
-                        "B0003",
-                        "value has no field",
-                        *span,
-                    ));
-                    ScalarType::Error
-                }
-            }
-        }
-        ScalarPlace::Index {
-            base,
-            index,
-            span,
-            index_span,
-        } => {
-            let base_type = place_type_in_module(base, scope, module, modules, diagnostics);
-            let index_type = expression_type_in_module_expected(
-                index,
-                Some(&ScalarType::U64),
-                scope,
-                &BTreeSet::new(),
-                &BTreeMap::new(),
-                module,
-                modules,
-                diagnostics,
-                false,
-            );
-            expect_module_type(
-                module,
-                &ScalarType::U64,
-                &index_type,
-                *index_span,
-                diagnostics,
-            );
-            match base_type {
-                ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
-                    *element
-                }
-                ScalarType::Error => ScalarType::Error,
-                _ => {
-                    diagnostics.push(module_diagnostic(
-                        module,
-                        "B0003",
-                        "indexed place requires a fixed array",
-                        *span,
-                    ));
-                    ScalarType::Error
-                }
-            }
-        }
-    }
+    typed_place_projection(
+        place,
+        scope,
+        PlaceTypingContext::Module(module, modules),
+        PlaceAccess::Read,
+        diagnostics,
+        true,
+    )
 }
 
 fn checked_dereference_target_type(
@@ -5327,6 +5273,9 @@ fn validate_unit_if_positions_in_item(
             for value in &assignment.values {
                 validate_unit_if_position(value, false, source, diagnostics);
             }
+            for target in &assignment.targets {
+                validate_unit_if_position_in_place(&target.place, source, diagnostics);
+            }
         }
         ScalarBlockItem::While(while_expression) => {
             validate_unit_if_position(&while_expression.condition, false, source, diagnostics);
@@ -5342,6 +5291,17 @@ fn validate_unit_if_position(
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     match expression {
+        ScalarExpression::Assignment(assignment) => {
+            for value in &assignment.values {
+                validate_unit_if_position(value, false, source, diagnostics);
+            }
+            for target in &assignment.targets {
+                validate_unit_if_position_in_place(&target.place, source, diagnostics);
+            }
+        }
+        ScalarExpression::FunctionLiteral { body, .. } => {
+            validate_unit_if_positions_in_block(body, source, diagnostics)
+        }
         ScalarExpression::UnitIf {
             condition,
             then_branch,
@@ -5463,6 +5423,8 @@ pub(super) fn operator(value: &str) -> BinaryOperator {
 }
 
 pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
+    program.resolved_assignment_types.borrow_mut().clear();
+    program.resolved_expression_outputs.borrow_mut().clear();
     let mut diagnostics = Vec::new();
     validate_unit_if_positions(program, &mut diagnostics);
     let mut declarations = BTreeMap::new();
@@ -5620,16 +5582,21 @@ pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     }
                     continue;
                 }
-                let actual = expression_type_expected(
+                let expected = binding
+                    .receivers
+                    .iter()
+                    .map(|receiver| receiver.ty.clone())
+                    .collect::<Vec<_>>();
+                let actual = scalar_call_result(&outputs::sequence(
                     &binding.value,
-                    &binding.declared_type,
+                    &expected,
                     &declarations,
                     &BTreeSet::new(),
                     &BTreeMap::new(),
                     program,
                     &mut diagnostics,
                     false,
-                );
+                ));
                 validate_output_receivers(
                     &binding.value,
                     &binding.receivers,
@@ -5647,198 +5614,66 @@ pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                 );
             }
             ScalarItem::Function(function) => {
-                if !function.overload_arms.is_empty() {
-                    continue;
-                }
-                let ScalarType::Callable {
-                    outputs,
-                    parameters,
-                } = &function.signature
-                else {
-                    continue;
+                let bodies = if function.overload_arms.is_empty() {
+                    vec![function]
+                } else {
+                    function
+                        .overload_arms
+                        .iter()
+                        .filter(|arm| {
+                            arm.generic_parameters.is_empty()
+                                && closure::contains_literal(&arm.body)
+                        })
+                        .collect::<Vec<_>>()
                 };
-                let mut scope = declarations.clone();
-                let mut visible_names = declaration_names.clone();
-                let mut folded_names = folded_declarations.clone();
-                for (index, name) in function.parameters.iter().enumerate() {
-                    validate_program_identifier_style(
-                        program,
-                        name,
-                        function.parameter_spans[index],
-                        &mut diagnostics,
-                    );
-                    if index < parameters.len()
-                        && declare_program_name(
+                for function in bodies {
+                    let ScalarType::Callable {
+                        outputs,
+                        parameters,
+                    } = &function.signature
+                    else {
+                        continue;
+                    };
+                    let mut scope = declarations.clone();
+                    let mut visible_names = declaration_names.clone();
+                    let mut folded_names = folded_declarations.clone();
+                    for (index, name) in function.parameters.iter().enumerate() {
+                        validate_program_identifier_style(
                             program,
                             name,
-                            function.span,
-                            &mut visible_names,
-                            &mut folded_names,
-                            &mut diagnostics,
-                        )
-                    {
-                        scope.insert(name.clone(), parameters[index].clone());
-                    }
-                }
-                if outputs.outputs.len() > 1 && !function.body.final_output_values.is_empty() {
-                    let final_start =
-                        function.body.items.len() - function.body.final_output_values.len();
-                    for item in &function.body.items[..final_start] {
-                        let _ = match item {
-                            ScalarBlockItem::Expression(
-                                expression @ (ScalarExpression::If { .. }
-                                | ScalarExpression::UnitIf { .. }),
-                            ) => expression_type_expected(
-                                expression,
-                                &ScalarType::Unit,
-                                &scope,
-                                &visible_names,
-                                &folded_names,
-                                program,
-                                &mut diagnostics,
-                                false,
-                            ),
-                            _ => block_item_type(
-                                item,
-                                &mut scope,
-                                &mut visible_names,
-                                &mut folded_names,
-                                program,
-                                &mut diagnostics,
-                                false,
-                            ),
-                        };
-                    }
-                    if function.body.final_output_values.len() == 1
-                        && matches!(
-                            function.body.final_output_values[0].value,
-                            ScalarExpression::If { .. }
-                        )
-                    {
-                        validate_conditional_output_arity(
-                            &function.body,
-                            outputs.outputs.len(),
-                            program,
+                            function.parameter_spans[index],
                             &mut diagnostics,
                         );
-                    }
-                    if function.body.final_output_values.len() == 1
-                        && matches!(
-                            &function.body.final_output_values[0].value,
-                            ScalarExpression::Call { .. }
-                        )
-                    {
-                        let value = &function.body.final_output_values[0];
-                        if let Some(actual_outputs) =
-                            call_output_sequence(&value.value, &scope, program)
-                        {
-                            expression_type_expected(
-                                &value.value,
-                                &actual_outputs
-                                    .outputs
-                                    .first()
-                                    .map(|output| &output.ty)
-                                    .expect("multi-output final call has an output"),
-                                &scope,
-                                &visible_names,
-                                &folded_names,
+                        if index < parameters.len()
+                            && declare_program_name(
                                 program,
+                                name,
+                                function.span,
+                                &mut visible_names,
+                                &mut folded_names,
                                 &mut diagnostics,
-                                false,
-                            );
-                            if actual_outputs.outputs.len() != outputs.outputs.len() {
-                                diagnostics.push(diagnostic(
-                                    program,
-                                    "B0004",
-                                    "function output arity does not match its final output list",
-                                    value.span,
-                                ));
-                            }
-                            for (actual, expected) in
-                                actual_outputs.outputs.iter().zip(&outputs.outputs)
-                            {
-                                expect_type(
-                                    program,
-                                    &expected.ty,
-                                    &actual.ty,
-                                    value.span,
-                                    &mut diagnostics,
-                                );
-                            }
-                        }
-                    } else {
-                        if function.body.final_output_values.len() > 1
-                            && function.body.final_output_values.len() != outputs.outputs.len()
+                            )
                         {
-                            diagnostics.push(diagnostic(
-                                program,
-                                "B0004",
-                                "function output arity does not match its final output list",
-                                function.body.span,
-                            ));
-                        }
-                        for (value, output) in function
-                            .body
-                            .final_output_values
-                            .iter()
-                            .zip(&outputs.outputs)
-                        {
-                            let actual = expression_type_expected(
-                                &value.value,
-                                &output.ty,
-                                &scope,
-                                &visible_names,
-                                &folded_names,
-                                program,
-                                &mut diagnostics,
-                                false,
-                            );
-                            expect_type(program, &output.ty, &actual, value.span, &mut diagnostics);
+                            scope.insert(name.clone(), parameters[index].clone());
                         }
                     }
-                } else if let Some(output) = outputs.outputs.first() {
-                    let actual = block_type_expected(
+                    outputs::validate_function(
                         &function.body,
-                        &output.ty,
+                        outputs,
                         &scope,
                         &visible_names,
                         &folded_names,
                         program,
                         &mut diagnostics,
-                        false,
                     );
-                    expect_type(
-                        program,
-                        &output.ty,
-                        &actual,
-                        function.body.span,
-                        &mut diagnostics,
-                    );
-                } else {
-                    let actual = block_type(
-                        &function.body,
-                        &scope,
-                        &visible_names,
-                        &folded_names,
-                        program,
-                        &mut diagnostics,
-                        false,
-                    );
-                    expect_type(
-                        program,
-                        &ScalarType::Unit,
-                        &actual,
-                        function.body.span,
-                        &mut diagnostics,
-                    );
-                }
-                if function.parameters.len() != parameters.len() {
-                    diagnostics.push(diagnostic(
-                        program,
-                        "B0004",
-                        "function parameter arity does not match its type",
-                        function.span,
-                    ));
+                    if function.parameters.len() != parameters.len() {
+                        diagnostics.push(diagnostic(
+                            program,
+                            "B0004",
+                            "function parameter arity does not match its type",
+                            function.span,
+                        ));
+                    }
                 }
             }
             ScalarItem::Executable(executable) => {
@@ -5909,20 +5744,26 @@ impl StaticUseAnalyzer {
                 } else {
                     self.expression(&binding.value, visible);
                 }
-                let id = self.declarations.len();
-                visible.insert(binding.name.clone(), id);
-                self.declarations.push(binding.span);
+                for receiver in &binding.receivers {
+                    let id = self.declarations.len();
+                    visible.insert(receiver.name.clone(), id);
+                    self.declarations.push(receiver.span);
+                }
             }
             ScalarBlockItem::Expression(expression) => self.expression(expression, visible),
             ScalarBlockItem::Assignment(assignment) => {
-                self.expression(&assignment.value, visible);
                 for value in &assignment.values {
                     self.expression(value, visible);
                 }
-                if let Some(receiver) = &assignment.receiver {
-                    self.use_name(receiver, visible);
-                } else {
-                    self.use_name(&assignment.target, visible);
+                for target in &assignment.targets {
+                    match &target.place {
+                        ScalarPlace::Name { name, span } if !visible.contains_key(name) => {
+                            let id = self.declarations.len();
+                            visible.insert(name.clone(), id);
+                            self.declarations.push(*span);
+                        }
+                        place => self.place(place, visible),
+                    }
                 }
             }
             ScalarBlockItem::While(while_expression) => {
@@ -5934,6 +5775,28 @@ impl StaticUseAnalyzer {
 
     fn expression(&mut self, expression: &ScalarExpression, visible: &BTreeMap<String, usize>) {
         match expression {
+            ScalarExpression::Assignment(assignment) => {
+                for value in &assignment.values {
+                    self.expression(value, visible);
+                }
+                for target in &assignment.targets {
+                    self.place(&target.place, visible);
+                }
+            }
+            ScalarExpression::FunctionLiteral {
+                parameters,
+                parameter_spans,
+                body,
+                ..
+            } => {
+                let mut body_visible = visible.clone();
+                for (name, span) in parameters.iter().zip(parameter_spans) {
+                    let id = self.declarations.len();
+                    body_visible.insert(name.clone(), id);
+                    self.declarations.push(*span);
+                }
+                self.block(body, &body_visible);
+            }
             ScalarExpression::Name { name, .. } => self.use_name(name, visible),
             ScalarExpression::Member { receiver, .. } => self.use_name(receiver, visible),
             ScalarExpression::Unary { operand, .. } => self.expression(operand, visible),
@@ -6279,16 +6142,21 @@ fn block_item_type(
                 }
                 return ScalarType::Unit;
             }
-            let actual = expression_type_expected(
+            let expected = binding
+                .receivers
+                .iter()
+                .map(|receiver| receiver.ty.clone())
+                .collect::<Vec<_>>();
+            let actual = scalar_call_result(&outputs::sequence(
                 &binding.value,
-                &binding.declared_type,
+                &expected,
                 scope,
                 visible_names,
                 folded_names,
                 program,
                 diagnostics,
                 unsafe_context,
-            );
+            ));
             validate_output_receivers(
                 &binding.value,
                 &binding.receivers,
@@ -6358,6 +6226,29 @@ fn assignment_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
+    assignment_output_types(
+        assignment,
+        scope,
+        visible_names,
+        folded_names,
+        program,
+        diagnostics,
+        unsafe_context,
+        false,
+    );
+    ScalarType::Unit
+}
+
+pub(super) fn assignment_output_types(
+    assignment: &ScalarAssignment,
+    scope: &mut BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+    observed: bool,
+) -> ScalarOutputSequence {
     let mut inferred_names = visible_names.clone();
     let mut inferred_folded_names = folded_names.clone();
     let expected = assignment
@@ -6366,33 +6257,53 @@ fn assignment_type(
         .map(|target| assignment_target_type(target, scope, program, diagnostics))
         .collect::<Vec<_>>();
     validate_assignment_target_distinctness(assignment, program, diagnostics);
+    let previous = ScalarOutputSequence {
+        outputs: assignment
+            .targets
+            .iter()
+            .zip(&expected)
+            .filter_map(|(target, ty)| match ty {
+                Some(ty) => Some(ScalarOutput {
+                    ty: ty.clone(),
+                    span: target.span,
+                }),
+                None => {
+                    if observed {
+                        diagnostics.push(diagnostic(
+                            program,
+                            "B0001",
+                            "observed assignment target has no previous value",
+                            target.span,
+                        ));
+                    }
+                    None
+                }
+            })
+            .collect(),
+        span: assignment.span,
+    };
+    let mut destination = 0;
     let outputs = assignment
         .values
         .iter()
-        .enumerate()
-        .map(|(position, value)| {
-            let actual = match expected.get(position).and_then(Option::as_ref) {
-                Some(expected) => expression_type_expected(
-                    value,
-                    expected,
-                    scope,
-                    visible_names,
-                    folded_names,
-                    program,
-                    diagnostics,
-                    unsafe_context,
-                ),
-                None => expression_type(
-                    value,
-                    scope,
-                    visible_names,
-                    folded_names,
-                    program,
-                    diagnostics,
-                    unsafe_context,
-                ),
-            };
-            match call_output_sequence(value, scope, program) {
+        .map(|value| {
+            let contextual = expected
+                .iter()
+                .skip(destination)
+                .map_while(Clone::clone)
+                .collect::<Vec<_>>();
+            let resolved = outputs::sequence(
+                value,
+                &contextual,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            let actual = scalar_call_result(&resolved);
+            let outputs = match call_output_sequence(value, scope, program) {
                 Some(outputs) => Some(outputs.outputs),
                 None if matches!(value, ScalarExpression::Call { .. })
                     && is_error_type(&actual) =>
@@ -6403,7 +6314,11 @@ fn assignment_type(
                     ty: actual,
                     span: expression_span(value),
                 }]),
+            };
+            if let Some(outputs) = &outputs {
+                destination += outputs.len();
             }
+            outputs
         })
         .collect::<Option<Vec<_>>>()
         .map(|outputs| ScalarOutputSequence {
@@ -6411,6 +6326,12 @@ fn assignment_type(
             span: assignment.span,
         });
     if let Some(outputs) = outputs {
+        record_assignment_type_fact(
+            &program.resolved_assignment_types,
+            assignment,
+            &outputs,
+            &previous,
+        );
         record_assignment_outputs(
             &program.resolved_assignment_outputs,
             &program.source,
@@ -6446,6 +6367,9 @@ fn assignment_type(
                     diagnostics,
                 );
             } else if let ScalarPlace::Name { name, span } = &target.place {
+                if observed {
+                    continue;
+                }
                 validate_program_identifier_style(program, name, *span, diagnostics);
                 if declare_program_name(
                     program,
@@ -6460,7 +6384,7 @@ fn assignment_type(
             }
         }
     }
-    ScalarType::Unit
+    previous
 }
 
 fn assignment_target_type(
@@ -6578,7 +6502,81 @@ pub(super) fn expression_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
+    let ty = expression_type_worker(
+        expression,
+        scope,
+        visible_names,
+        folded_names,
+        program,
+        diagnostics,
+        unsafe_context,
+    );
+    finish_program_outputs(expression, &ty, program, diagnostics);
+    ty
+}
+
+fn finish_program_outputs(
+    expression: &ScalarExpression,
+    ty: &ScalarType,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) {
+    let disagreements = match outputs::finish(
+        &program.resolved_expression_outputs,
+        &program.resolved_assignment_types,
+        &program.source,
+        expression,
+        ty,
+    ) {
+        Ok(disagreements) => disagreements,
+        Err(error) => {
+            diagnostics.push(error.diagnostic());
+            return;
+        }
+    };
+    for (left, right) in disagreements {
+        diagnostics.push(diagnostic(
+            program,
+            if left.outputs.len() == right.outputs.len() {
+                "B0006"
+            } else {
+                "B0004"
+            },
+            "conditional branches must have equal ordered output types and arity",
+            expression_span(expression),
+        ));
+    }
+}
+
+fn expression_type_worker(
+    expression: &ScalarExpression,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
     match expression {
+        ScalarExpression::Assignment(assignment) => scalar_call_result(&assignment_output_types(
+            assignment,
+            &mut scope.clone(),
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+            unsafe_context,
+            true,
+        )),
+        ScalarExpression::FunctionLiteral { span, .. } => {
+            diagnostics.push(diagnostic(
+                program,
+                "B0003",
+                "function literal requires a callable context",
+                *span,
+            ));
+            ScalarType::Error
+        }
         ScalarExpression::RawAddress { place, span } => {
             if !unsafe_context {
                 diagnostics.push(diagnostic(
@@ -6595,11 +6593,28 @@ pub(super) fn expression_type(
             place,
             span,
         } => checked_address_type(*mutability, place, *span, scope, program, diagnostics),
-        ScalarExpression::Dereference { place, span } => {
+        ScalarExpression::Dereference { place, span, .. } => {
             checked_dereference_type(place, *span, scope, program, diagnostics, unsafe_context)
         }
-        ScalarExpression::IndexedRead { place, .. } => {
-            place_type(place, scope, program, diagnostics)
+        ScalarExpression::IndexedRead { place, span, .. } => {
+            if !unsafe_context
+                && writable_place_contains_raw_dereference(place, scope, program, diagnostics)
+            {
+                diagnostics.push(diagnostic(
+                    program,
+                    "B0012",
+                    "raw pointer indexing requires an unsafe block",
+                    *span,
+                ));
+            }
+            typed_place_projection(
+                place,
+                scope,
+                PlaceTypingContext::Program(program),
+                PlaceAccess::Read,
+                diagnostics,
+                unsafe_context,
+            )
         }
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {
@@ -6997,7 +7012,7 @@ pub(super) fn expression_type(
                         ));
                         return ScalarType::Error;
                     };
-                    if !type_arguments.is_empty() || arguments.len() != parameters.len() {
+                    if !type_arguments.is_empty() || arguments.len() > parameters.len() {
                         diagnostics.push(diagnostic(
                             program,
                             "B0004",
@@ -7006,31 +7021,38 @@ pub(super) fn expression_type(
                         ));
                         return ScalarType::Error;
                     }
+                    let argument_outputs = outputs::arguments(
+                        arguments,
+                        parameters,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                    );
+                    if argument_outputs.len() < parameters.len() {
+                        diagnostics.push(diagnostic(
+                            program,
+                            "B0004",
+                            "call argument arity does not match callable type",
+                            *span,
+                        ));
+                    }
                     let mut error_argument = false;
-                    for (argument, parameter) in arguments.iter().zip(parameters) {
-                        let actual = expression_type_expected(
-                            argument,
-                            parameter,
-                            scope,
-                            visible_names,
-                            folded_names,
-                            program,
-                            diagnostics,
-                            unsafe_context,
-                        );
-                        expect_type(
-                            program,
-                            parameter,
-                            &actual,
-                            expression_span(argument),
-                            diagnostics,
-                        );
-                        error_argument |= is_error_type(&actual);
+                    for (argument, parameter) in argument_outputs.iter().zip(parameters) {
+                        expect_type(program, parameter, &argument.ty, argument.span, diagnostics);
+                        error_argument |= is_error_type(&argument.ty);
                     }
                     return if error_argument {
                         ScalarType::Error
                     } else {
-                        scalar_call_result(outputs)
+                        outputs::call_result(
+                            &program.resolved_expression_outputs,
+                            &program.source,
+                            expression,
+                            outputs,
+                        )
                     };
                 }
             }
@@ -7044,7 +7066,7 @@ pub(super) fn expression_type(
                 }
                 _ => None,
             }) {
-                let argument_types = arguments
+                let _argument_types = arguments
                     .iter()
                     .map(|argument| {
                         expression_type(
@@ -7058,11 +7080,11 @@ pub(super) fn expression_type(
                         )
                     })
                     .collect::<Vec<_>>();
-                let overload_arguments = arguments
-                    .iter()
-                    .zip(&argument_types)
-                    .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
-                    .collect::<Vec<_>>();
+                let overload_arguments = outputs::overload_arguments(
+                    arguments,
+                    &program.resolved_expression_outputs,
+                    &program.source,
+                );
                 let callable = match resolve_overload_candidate(overload, &overload_arguments, None)
                 {
                     Ok((callable, _)) => callable,
@@ -7078,26 +7100,25 @@ pub(super) fn expression_type(
                 else {
                     unreachable!("overload arms are callable")
                 };
-                for (argument, parameter) in arguments.iter().zip(&parameters) {
-                    let actual = expression_type_expected(
-                        argument,
-                        parameter,
-                        scope,
-                        visible_names,
-                        folded_names,
-                        program,
-                        diagnostics,
-                        unsafe_context,
-                    );
-                    expect_type(
-                        program,
-                        parameter,
-                        &actual,
-                        expression_span(argument),
-                        diagnostics,
-                    );
+                let argument_outputs = outputs::arguments(
+                    arguments,
+                    &parameters,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                );
+                for (argument, parameter) in argument_outputs.iter().zip(&parameters) {
+                    expect_type(program, parameter, &argument.ty, argument.span, diagnostics);
                 }
-                return scalar_call_result(&outputs);
+                return outputs::call_result(
+                    &program.resolved_expression_outputs,
+                    &program.source,
+                    expression,
+                    &outputs,
+                );
             }
             let lookup_name = receiver
                 .as_ref()
@@ -7179,7 +7200,17 @@ pub(super) fn expression_type(
                 diagnostics.push(diagnostic(program, "B0001", "unknown callable name", *span));
                 return ScalarType::Error;
             };
-            if arguments.len() != parameters.len() {
+            let argument_outputs = outputs::arguments(
+                arguments,
+                &parameters,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            if arguments.len() > parameters.len() || argument_outputs.len() < parameters.len() {
                 diagnostics.push(diagnostic(
                     program,
                     "B0004",
@@ -7188,19 +7219,9 @@ pub(super) fn expression_type(
                 ));
             }
             let mut error_argument = false;
-            for (argument, parameter) in arguments.iter().zip(parameters) {
-                let actual = expression_type_expected(
-                    argument,
-                    &parameter,
-                    scope,
-                    visible_names,
-                    folded_names,
-                    program,
-                    diagnostics,
-                    unsafe_context,
-                );
-                expect_type(program, &parameter, &actual, *span, diagnostics);
-                error_argument |= is_error_type(&actual);
+            for (argument, parameter) in argument_outputs.iter().zip(&parameters) {
+                expect_type(program, parameter, &argument.ty, argument.span, diagnostics);
+                error_argument |= is_error_type(&argument.ty);
             }
             if unsafe_callable && !unsafe_context {
                 diagnostics.push(diagnostic(
@@ -7213,7 +7234,12 @@ pub(super) fn expression_type(
             if error_argument {
                 ScalarType::Error
             } else {
-                scalar_call_result(&outputs)
+                outputs::call_result(
+                    &program.resolved_expression_outputs,
+                    &program.source,
+                    expression,
+                    &outputs,
+                )
             }
         }
         ScalarExpression::If {
@@ -7409,8 +7435,103 @@ fn expression_type_expected(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
 ) -> ScalarType {
+    if matches!(
+        expression,
+        ScalarExpression::Block(_) | ScalarExpression::If { .. }
+    ) {
+        return scalar_call_result(&outputs::sequence(
+            expression,
+            std::slice::from_ref(expected),
+            scope,
+            visible_names,
+            folded_names,
+            program,
+            diagnostics,
+            unsafe_context,
+        ));
+    }
+    let ty = expression_type_expected_worker(
+        expression,
+        expected,
+        scope,
+        visible_names,
+        folded_names,
+        program,
+        diagnostics,
+        unsafe_context,
+    );
+    finish_program_outputs(expression, &ty, program, diagnostics);
+    ty
+}
+
+fn expression_type_expected_worker(
+    expression: &ScalarExpression,
+    expected: &ScalarType,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    program: &ScalarProgram,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+) -> ScalarType {
     if is_error_type(expected) {
         return ScalarType::Error;
+    }
+    if let ScalarExpression::FunctionLiteral {
+        parameters,
+        parameter_spans,
+        body,
+        span,
+    } = expression
+    {
+        let ScalarType::Callable {
+            outputs,
+            parameters: parameter_types,
+        } = expected
+        else {
+            diagnostics.push(diagnostic(
+                program,
+                "B0003",
+                "function literal requires a callable context",
+                *span,
+            ));
+            return ScalarType::Error;
+        };
+        closure::record_signature(&program.resolved_literals, &program.source, *span, expected);
+        let mut body_scope = scope.clone();
+        let mut body_names = visible_names.clone();
+        let mut body_folded = folded_names.clone();
+        if parameters.len() != parameter_types.len() {
+            diagnostics.push(diagnostic(
+                program,
+                "B0004",
+                "function parameter arity does not match its type",
+                *span,
+            ));
+        }
+        for ((name, name_span), ty) in parameters.iter().zip(parameter_spans).zip(parameter_types) {
+            validate_program_identifier_style(program, name, *name_span, diagnostics);
+            if declare_program_name(
+                program,
+                name,
+                *name_span,
+                &mut body_names,
+                &mut body_folded,
+                diagnostics,
+            ) {
+                body_scope.insert(name.clone(), ty.clone());
+            }
+        }
+        outputs::validate_function(
+            body,
+            outputs,
+            &body_scope,
+            &body_names,
+            &body_folded,
+            program,
+            diagnostics,
+        );
+        return expected.clone();
     }
     if let ScalarExpression::Call {
         receiver: None,
@@ -7438,7 +7559,7 @@ fn expression_type_expected(
                 ));
                 return ScalarType::Error;
             }
-            let argument_types = arguments
+            let _argument_types = arguments
                 .iter()
                 .map(|argument| {
                     expression_type(
@@ -7452,11 +7573,11 @@ fn expression_type_expected(
                     )
                 })
                 .collect::<Vec<_>>();
-            let overload_arguments = arguments
-                .iter()
-                .zip(&argument_types)
-                .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
-                .collect::<Vec<_>>();
+            let overload_arguments = outputs::overload_arguments(
+                arguments,
+                &program.resolved_expression_outputs,
+                &program.source,
+            );
             let callable =
                 match resolve_overload_candidate(overload, &overload_arguments, Some(expected)) {
                     Ok((callable, _)) => callable,
@@ -7472,26 +7593,25 @@ fn expression_type_expected(
             else {
                 unreachable!("overload arms are callable")
             };
-            for (argument, parameter) in arguments.iter().zip(&parameters) {
-                let actual = expression_type_expected(
-                    argument,
-                    parameter,
-                    scope,
-                    visible_names,
-                    folded_names,
-                    program,
-                    diagnostics,
-                    unsafe_context,
-                );
-                expect_type(
-                    program,
-                    parameter,
-                    &actual,
-                    expression_span(argument),
-                    diagnostics,
-                );
+            let argument_outputs = outputs::arguments(
+                arguments,
+                &parameters,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+            );
+            for (argument, parameter) in argument_outputs.iter().zip(&parameters) {
+                expect_type(program, parameter, &argument.ty, argument.span, diagnostics);
             }
-            return scalar_call_result(&outputs);
+            return outputs::call_result(
+                &program.resolved_expression_outputs,
+                &program.source,
+                expression,
+                &outputs,
+            );
         }
     }
     if let ScalarExpression::Unary {
@@ -7877,7 +7997,23 @@ fn expression_type_expected(
                 ));
                 return ScalarType::Error;
             };
-            if elements.len() as u64 != *length {
+            let mut element_outputs = Vec::new();
+            for value in elements {
+                element_outputs.extend(
+                    outputs::sequence(
+                        value,
+                        std::slice::from_ref(element.as_ref()),
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                    )
+                    .outputs,
+                );
+            }
+            if element_outputs.len() as u64 != *length {
                 diagnostics.push(diagnostic(
                     program,
                     "B0003",
@@ -7885,24 +8021,8 @@ fn expression_type_expected(
                     *span,
                 ));
             }
-            for value in elements {
-                let actual = expression_type_expected(
-                    value,
-                    element,
-                    scope,
-                    visible_names,
-                    folded_names,
-                    program,
-                    diagnostics,
-                    unsafe_context,
-                );
-                expect_type(
-                    program,
-                    element,
-                    &actual,
-                    expression_span(value),
-                    diagnostics,
-                );
+            for value in &element_outputs {
+                expect_type(program, element, &value.ty, value.span, diagnostics);
             }
             return expected.clone();
         }

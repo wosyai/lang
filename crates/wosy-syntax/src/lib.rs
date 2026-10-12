@@ -91,6 +91,7 @@ pub enum SyntaxKind {
     AllocationBinding,
     ParenthesizedDereferencePlace,
     CopyModifier,
+    FunctionLiteral,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -182,6 +183,7 @@ impl Language for WosyLanguage {
             78 => SyntaxKind::AllocationBinding,
             79 => SyntaxKind::ParenthesizedDereferencePlace,
             80 => SyntaxKind::CopyModifier,
+            81 => SyntaxKind::FunctionLiteral,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -609,6 +611,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::extern_decl => SyntaxKind::ExternDecl,
         Rule::extern_function => SyntaxKind::ExternFunction,
         Rule::function_decl => SyntaxKind::FunctionDecl,
+        Rule::function_literal => SyntaxKind::FunctionLiteral,
         Rule::generic_decl => SyntaxKind::GenericDecl,
         Rule::generic_function_decl => SyntaxKind::GenericFunctionDecl,
         Rule::overload_decl => SyntaxKind::OverloadDecl,
@@ -714,6 +717,103 @@ mod tests {
     fn identity() -> SourceIdentity {
         SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "r1".into())
     }
+
+    #[test]
+    fn d3_indexed_deref_fixed_runtime_and_composed_roots() {
+        for text in [
+            "%%start\nu8(*(u8[4]), u64) inspect = fn(bytes, index) { (*bytes)[index] };\n%%end",
+            "%%start\nu8(*(u8[]), u64) inspect = fn(bytes, index) { (*bytes)[index] };\n%%end",
+            "%%start\n(*matrix)[row][column]; (*frame).bytes[index]; (*(*frames)[row]).bytes[column];\n&(*bytes)[index]; &!(*bytes)[index]; unsafe { &?(*bytes)[index]; }; (*bytes)[index] = 7;\n%%end",
+        ] {
+            let result = parse(identity(), text.into(), &[]);
+            assert!(result.is_valid(), "{:?}", result.errors);
+            assert_eq!(result.reconstruct(), text);
+            assert!(result.root.descendants().any(|node| {
+                node.kind() == SyntaxKind::IndexedPlace
+                    && node.children().any(|child| {
+                        child.kind() == SyntaxKind::ParenthesizedDereferencePlace
+                    })
+            }));
+        }
+    }
+
+    #[test]
+    fn d3_indexed_deref_spans_trivia_and_serialized_cst() {
+        let text = "%%start\r\n\t(*fetch(bytes))[\r\n\t# INTENT:  exact payload  \r\n\tindex + 1\r\n\t];\r\n%%end";
+        let result = parse(identity(), text.into(), &["INTENT".into()]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(result.comments[0].raw_payload, "  exact payload  ");
+        assert!(result.comments[0].valid);
+        let indexed = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::IndexedPlace)
+            .unwrap();
+        let children = indexed.children().collect::<Vec<_>>();
+        assert_eq!(
+            children.iter().map(|node| node.kind()).collect::<Vec<_>>(),
+            vec![
+                SyntaxKind::ParenthesizedDereferencePlace,
+                SyntaxKind::IndexSuffix
+            ]
+        );
+        assert_eq!(byte_span(&children[0]), ByteSpan::new(10, 25));
+        assert_eq!(children[0].text(), "(*fetch(bytes))");
+        let dereference = children[0].children().next().unwrap();
+        assert_eq!(dereference.kind(), SyntaxKind::Dereference);
+        assert_eq!(byte_span(&dereference), ByteSpan::new(11, 24));
+        assert!(dereference
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Call));
+        let index = children[1].children().next().unwrap();
+        let start = text.find("index + 1").unwrap() as u32;
+        assert_eq!(byte_span(&index), ByteSpan::new(start, start + 12));
+        assert_eq!(index.text(), "index + 1\r\n\t");
+        let snapshot = result.canonical_cst().snapshot();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored = CanonicalCstRoot::from_snapshot(serde_json::from_str(&json).unwrap());
+        assert_eq!(restored.source, identity());
+        assert_eq!(restored.snapshot(), snapshot);
+        assert_eq!(restored.root.text().to_string(), text);
+        assert_eq!(
+            restored
+                .root
+                .descendants()
+                .map(|node| (node.kind(), byte_span(&node)))
+                .collect::<Vec<_>>(),
+            result
+                .root
+                .descendants()
+                .map(|node| (node.kind(), byte_span(&node)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn d3_indexed_deref_malformed_recovery_retains_adjacent_compositions() {
+        let text = "%%start\r\n\t(*bytes)[before];\r\n\t(*bytes)[];\r\n\t(*bytes)[after];\r\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(!result.is_valid());
+        assert_eq!(result.reconstruct(), text);
+        let indexed = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::IndexedPlace)
+            .map(|node| node.text().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(indexed, vec!["(*bytes)[before]", "(*bytes)[after]"]);
+        let error = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::Error)
+            .unwrap();
+        let start = text.find("(*bytes)[];").unwrap() as u32;
+        assert_eq!(byte_span(&error), ByteSpan::new(start, start + 11));
+        assert_eq!(error.text(), "(*bytes)[];");
+        let restored = CanonicalCstRoot::from_snapshot(result.canonical_cst().snapshot());
+        assert_eq!(restored.snapshot(), result.canonical_cst().snapshot());
+    }
     #[test]
     fn baseline_and_lossless() {
         let result = parse(identity(), BASE.into(), &["INTENT".into()]);
@@ -743,6 +843,45 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[test]
+    fn callable_runtime_allocation_receiver_preserves_type_count_and_recovery() {
+        let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers; };\ninvalid source;\nunit(u64) after = fn(count) { u8[count] bytes; bytes; };\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(result.canonical_cst().source, identity());
+        let receiver = result
+            .root
+            .descendants()
+            .find(|node| {
+                node.kind() == SyntaxKind::Receiver && node.text() == "(u8())[count] readers"
+            })
+            .expect("callable allocation receiver");
+        let start = text.find("(u8())[count] readers").unwrap() as u32;
+        assert_eq!(
+            byte_span(&receiver),
+            ByteSpan::new(start, start + u32::from(receiver.text().len()))
+        );
+        let parts = receiver.children().collect::<Vec<_>>();
+        assert_eq!(
+            parts.iter().map(|node| node.kind()).collect::<Vec<_>>(),
+            vec![SyntaxKind::ParenthesizedType, SyntaxKind::Expression]
+        );
+        assert_eq!(parts[0].text(), "(u8())");
+        assert!(parts[0]
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::CallableType));
+        assert_eq!(parts[1].text(), "count");
+        assert_eq!(byte_span(&parts[1]), ByteSpan::new(start + 7, start + 12));
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Error));
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Receiver && node.text() == "u8[count] bytes"));
     }
 
     #[test]
@@ -1264,6 +1403,36 @@ mod tests {
     }
 
     #[test]
+    fn function_literals_in_struct_fields_and_arguments_are_lossless_and_span_exact() {
+        let text = "%%start\nstruct Handler { i32(i32) run; }\nHandler handler = { .run = fn(value) { value + 1 }; };\nconsume(fn(value) { value });\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let literals: Vec<_> = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::FunctionLiteral)
+            .collect();
+        assert_eq!(literals.len(), 2);
+        for literal in literals {
+            let start = text
+                .find(&literal.text().to_string())
+                .expect("literal text") as u32;
+            assert_eq!(
+                byte_span(&literal),
+                ByteSpan::new(start, start + u32::from(literal.text().len()))
+            );
+            assert_eq!(
+                literal
+                    .children()
+                    .map(|child| child.kind())
+                    .collect::<Vec<_>>(),
+                vec![SyntaxKind::Parameters, SyntaxKind::Block]
+            );
+        }
+    }
+
+    #[test]
     fn generic_function_declaration_is_structural_lossless_and_span_exact() {
         let text = "%%start\ngeneric T;\nT(T) identity = fn(value) {\n\tvalue\n};\n%%end";
         let result = parse(identity(), text.into(), &[]);
@@ -1538,6 +1707,92 @@ mod tests {
                     .children()
                     .any(|child| child.kind() == SyntaxKind::QualifiedMember)
         }));
+    }
+
+    #[test]
+    fn numeric_assignment_result_dependency_checked_destination_operand_is_structural() {
+        let text = "%%start\nunit() exercise = fn {\n\tu32 left = 1;\n\tu32 right = 2;\n\t*!u32 target = &!left;\n\t*!u32 replacement = &!right;\n\tu32 old = (*(target = replacement) = 9);\n\told;\n\tleft;\n\t*target;\n};\nexercise();\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let assignments = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::Assignment)
+            .collect::<Vec<_>>();
+        assert_eq!(assignments.len(), 2);
+        let outer = &assignments[0];
+        let inner = &assignments[1];
+        assert_eq!(outer.text(), "*(target = replacement) = 9");
+        assert_eq!(inner.text(), "target = replacement");
+        let targets = outer
+            .children()
+            .find(|node| node.kind() == SyntaxKind::AssignmentTargets)
+            .expect("outer destinations");
+        let destination = targets
+            .children()
+            .find(|node| node.kind() == SyntaxKind::AssignmentTarget)
+            .expect("numeric destination");
+        let dereference = destination
+            .children()
+            .find(|node| node.kind() == SyntaxKind::Dereference)
+            .expect("dereferenced numeric destination");
+        assert!(dereference.descendants().any(|node| node == *inner));
+        let outer_span = byte_span(outer);
+        let inner_span = byte_span(inner);
+        assert!(outer_span.start < inner_span.start);
+        assert!(inner_span.end < outer_span.end);
+        assert_eq!(
+            &text[outer_span.start as usize..outer_span.end as usize],
+            "*(target = replacement) = 9"
+        );
+        assert_eq!(
+            &text[inner_span.start as usize..inner_span.end as usize],
+            "target = replacement"
+        );
+    }
+
+    #[test]
+    fn numeric_assignment_result_ordered_nested_operands_trivia_and_serde() {
+        let text = "%%start\r\nunit() exercise = fn {\r\n\ti32 x = 1;\r\n\ti32 y = 2;\r\n\t(x, y = (x = 3), 4);\r\n};\r\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let assignments = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::Assignment)
+            .collect::<Vec<_>>();
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].text(), "x, y = (x = 3), 4");
+        assert_eq!(assignments[1].text(), "x = 3");
+        let targets = assignments[0]
+            .children()
+            .find(|node| node.kind() == SyntaxKind::AssignmentTargets)
+            .expect("targets");
+        assert_eq!(
+            targets
+                .children()
+                .filter(|node| node.kind() == SyntaxKind::AssignmentTarget)
+                .map(|node| node.text().to_string())
+                .collect::<Vec<_>>(),
+            vec!["x", "y"]
+        );
+        let snapshot = result.canonical_cst().snapshot();
+        let serialized = serde_json::to_vec(&snapshot).expect("serialize canonical CST");
+        let restored =
+            CanonicalCstRoot::from_snapshot(serde_json::from_slice(&serialized).expect("snapshot"));
+        assert_eq!(restored.snapshot(), snapshot);
+        assert_eq!(restored.root.text().to_string(), text);
+        let restored_assignments = restored
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::Assignment)
+            .collect::<Vec<_>>();
+        for (original, restored) in assignments.iter().zip(&restored_assignments) {
+            assert_eq!(byte_span(original), byte_span(restored));
+            assert_eq!(original.text(), restored.text());
+        }
     }
 
     #[test]

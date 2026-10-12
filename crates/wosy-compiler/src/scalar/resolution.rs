@@ -48,6 +48,7 @@ pub(super) fn resolve_program_types(
                         span: output.span,
                     })
                     .collect();
+                resolve_expression_types(&mut binding.value, &names);
             }
             ScalarItem::Function(function) => {
                 if function.generic_parameters.is_empty() {
@@ -88,14 +89,21 @@ fn resolve_item_types(item: &mut ScalarBlockItem, names: &BTreeMap<String, Scala
             for receiver in &mut binding.receivers {
                 receiver.ty = resolve_type(&receiver.ty, names);
             }
+            resolve_expression_types(&mut binding.value, names);
         }
-        ScalarBlockItem::Expression(ScalarExpression::Block(block)) => {
-            resolve_block_types(block, names)
-        }
+        ScalarBlockItem::Expression(expression) => resolve_expression_types(expression, names),
         ScalarBlockItem::While(while_expression) => {
+            resolve_expression_types(&mut while_expression.condition, names);
             resolve_block_types(&mut while_expression.body, names)
         }
-        ScalarBlockItem::Expression(_) | ScalarBlockItem::Assignment(_) => {}
+        ScalarBlockItem::Assignment(assignment) => {
+            for target in &mut assignment.targets {
+                resolve_place_expression_types(&mut target.place, names);
+            }
+            for value in &mut assignment.values {
+                resolve_expression_types(value, names);
+            }
+        }
     }
 }
 
@@ -115,7 +123,9 @@ fn resolve_block_types(block: &mut ScalarBlock, names: &BTreeMap<String, ScalarT
             }
             ScalarBlockItem::Expression(expression) => resolve_expression_types(expression, names),
             ScalarBlockItem::Assignment(assignment) => {
-                resolve_expression_types(&mut assignment.value, names);
+                for target in &mut assignment.targets {
+                    resolve_place_expression_types(&mut target.place, names);
+                }
                 for value in &mut assignment.values {
                     resolve_expression_types(value, names);
                 }
@@ -132,6 +142,48 @@ fn resolve_expression_types(
     names: &BTreeMap<String, ScalarType>,
 ) {
     match expression {
+        ScalarExpression::Assignment(assignment) => {
+            for target in &mut assignment.targets {
+                resolve_place_expression_types(&mut target.place, names);
+            }
+            for value in &mut assignment.values {
+                resolve_expression_types(value, names);
+            }
+        }
+        ScalarExpression::RawAddress { place, .. }
+        | ScalarExpression::CheckedAddress { place, .. }
+        | ScalarExpression::Dereference { place, .. }
+        | ScalarExpression::IndexedRead { place, .. } => {
+            resolve_place_expression_types(place, names)
+        }
+        ScalarExpression::FunctionLiteral { body, .. } => resolve_block_types(body, names),
+        ScalarExpression::Binary { left, right, .. } => {
+            resolve_expression_types(left, names);
+            resolve_expression_types(right, names);
+        }
+        ScalarExpression::Unary { operand, .. } => resolve_expression_types(operand, names),
+        ScalarExpression::Call {
+            type_arguments,
+            arguments,
+            ..
+        } => {
+            for argument in type_arguments {
+                argument.ty = resolve_type(&argument.ty, names);
+            }
+            for argument in arguments {
+                resolve_expression_types(argument, names);
+            }
+        }
+        ScalarExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                resolve_expression_types(&mut field.value, names);
+            }
+        }
+        ScalarExpression::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                resolve_expression_types(element, names);
+            }
+        }
         ScalarExpression::If {
             condition,
             then_branch,
@@ -152,6 +204,47 @@ fn resolve_expression_types(
         }
         ScalarExpression::Block(block) => resolve_block_types(block, names),
         _ => {}
+    }
+}
+
+fn resolve_place_expression_types(place: &mut ScalarPlace, names: &BTreeMap<String, ScalarType>) {
+    match place {
+        ScalarPlace::Name { .. } => {}
+        ScalarPlace::Field { base, .. } => resolve_place_expression_types(base, names),
+        ScalarPlace::Dereference { pointer, .. } => resolve_expression_types(pointer, names),
+        ScalarPlace::Index { base, index, .. } => {
+            resolve_place_expression_types(base, names);
+            resolve_expression_types(index, names);
+        }
+    }
+}
+
+fn resolve_contextual_expression_places(
+    expression: &mut ScalarExpression,
+    expected: &ScalarType,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgram,
+    names: &BTreeMap<String, ScalarType>,
+    unsafe_context: bool,
+) {
+    if let ScalarExpression::FunctionLiteral {
+        parameters, body, ..
+    } = expression
+    {
+        let ScalarType::Callable {
+            parameters: types, ..
+        } = expected
+        else {
+            resolve_block_places(body, &mut scope.clone(), program, names, false);
+            return;
+        };
+        let mut body_scope = scope.clone();
+        for (name, ty) in parameters.iter().zip(types) {
+            body_scope.insert(name.clone(), ty.clone());
+        }
+        resolve_block_places(body, &mut body_scope, program, names, false);
+    } else {
+        resolve_expression_places(expression, scope, program, names, unsafe_context);
     }
 }
 
@@ -180,6 +273,10 @@ fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarType>) -> Scalar
             element: Box::new(resolve_type(element, names)),
             length: *length,
             length_span: *length_span,
+            span: *span,
+        },
+        ScalarType::RuntimeArray { element, span } => ScalarType::RuntimeArray {
+            element: Box::new(resolve_type(element, names)),
             span: *span,
         },
         ScalarType::Callable {
@@ -240,8 +337,9 @@ pub(super) fn resolve_program_places(program: &mut ScalarProgram) {
     for item in &mut program.items {
         match item {
             ScalarItem::Binding(binding) => {
-                resolve_expression_places(
+                resolve_contextual_expression_places(
                     &mut binding.value,
+                    &binding.declared_type,
                     &declarations,
                     &context,
                     &names,
@@ -274,7 +372,14 @@ fn resolve_item_places(
 ) {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            resolve_expression_places(&mut binding.value, scope, program, names, unsafe_context);
+            resolve_contextual_expression_places(
+                &mut binding.value,
+                &binding.declared_type,
+                scope,
+                program,
+                names,
+                unsafe_context,
+            );
             scope.insert(binding.name.clone(), binding.declared_type.clone());
         }
         ScalarBlockItem::Expression(expression) => {
@@ -284,7 +389,6 @@ fn resolve_item_places(
             for target in &mut assignment.targets {
                 resolve_place(&mut target.place, scope, program, names, unsafe_context);
             }
-            resolve_expression_places(&mut assignment.value, scope, program, names, unsafe_context);
             for value in &mut assignment.values {
                 resolve_expression_places(value, scope, program, names, unsafe_context);
             }
@@ -332,6 +436,18 @@ fn resolve_expression_places(
     unsafe_context: bool,
 ) {
     match expression {
+        ScalarExpression::Assignment(assignment) => {
+            for target in &mut assignment.targets {
+                resolve_place(&mut target.place, scope, program, names, unsafe_context);
+            }
+            for value in &mut assignment.values {
+                resolve_expression_places(value, scope, program, names, unsafe_context);
+            }
+        }
+        ScalarExpression::FunctionLiteral { body, .. } => {
+            let mut scope = scope.clone();
+            resolve_block_places(body, &mut scope, program, names, unsafe_context);
+        }
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
         | ScalarExpression::Dereference { place, .. } => {
@@ -520,6 +636,7 @@ pub(super) fn resolve_module_types_in_project(module: &mut ScalarModule, modules
                 for receiver in &mut binding.receivers {
                     receiver.ty = resolve_type_in_project(&receiver.ty, &names, &context, modules);
                 }
+                resolve_expression_types_project(&mut binding.value, &names, &context, modules);
             }
             ScalarItem::Function(function) => {
                 if function.generic_parameters.is_empty() {
@@ -586,14 +703,28 @@ fn resolve_item_types_project(
             for receiver in &mut binding.receivers {
                 receiver.ty = resolve_type_in_project(&receiver.ty, names, module, modules);
             }
+            resolve_expression_types_project(&mut binding.value, names, module, modules);
         }
-        ScalarBlockItem::Expression(ScalarExpression::Block(block)) => {
-            resolve_block_types_project(block, names, module, modules)
+        ScalarBlockItem::Expression(expression) => {
+            resolve_expression_types_project(expression, names, module, modules)
         }
         ScalarBlockItem::While(while_expression) => {
+            resolve_expression_types_project(
+                &mut while_expression.condition,
+                names,
+                module,
+                modules,
+            );
             resolve_block_types_project(&mut while_expression.body, names, module, modules)
         }
-        ScalarBlockItem::Expression(_) | ScalarBlockItem::Assignment(_) => {}
+        ScalarBlockItem::Assignment(assignment) => {
+            for target in &mut assignment.targets {
+                resolve_place_expression_types_project(&mut target.place, names, module, modules);
+            }
+            for value in &mut assignment.values {
+                resolve_expression_types_project(value, names, module, modules);
+            }
+        }
     }
 }
 
@@ -605,6 +736,105 @@ fn resolve_block_types_project(
 ) {
     for item in &mut block.items {
         resolve_item_types_project(item, names, module, modules);
+    }
+    for output in &mut block.final_output_values {
+        resolve_expression_types_project(&mut output.value, names, module, modules);
+    }
+}
+
+fn resolve_expression_types_project(
+    expression: &mut ScalarExpression,
+    names: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+) {
+    match expression {
+        ScalarExpression::Assignment(assignment) => {
+            for target in &mut assignment.targets {
+                resolve_place_expression_types_project(&mut target.place, names, module, modules);
+            }
+            for value in &mut assignment.values {
+                resolve_expression_types_project(value, names, module, modules);
+            }
+        }
+        ScalarExpression::RawAddress { place, .. }
+        | ScalarExpression::CheckedAddress { place, .. }
+        | ScalarExpression::Dereference { place, .. }
+        | ScalarExpression::IndexedRead { place, .. } => {
+            resolve_place_expression_types_project(place, names, module, modules);
+        }
+        ScalarExpression::FunctionLiteral { body, .. } | ScalarExpression::Block(body) => {
+            resolve_block_types_project(body, names, module, modules)
+        }
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            resolve_expression_types_project(condition, names, module, modules);
+            resolve_block_types_project(then_branch, names, module, modules);
+            resolve_block_types_project(else_branch, names, module, modules);
+        }
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => {
+            resolve_expression_types_project(condition, names, module, modules);
+            resolve_block_types_project(then_branch, names, module, modules);
+        }
+        ScalarExpression::Binary { left, right, .. } => {
+            resolve_expression_types_project(left, names, module, modules);
+            resolve_expression_types_project(right, names, module, modules);
+        }
+        ScalarExpression::Unary { operand, .. } => {
+            resolve_expression_types_project(operand, names, module, modules)
+        }
+        ScalarExpression::Call {
+            type_arguments,
+            arguments,
+            ..
+        } => {
+            for argument in type_arguments {
+                argument.ty = resolve_type_in_project(&argument.ty, names, module, modules);
+            }
+            for argument in arguments {
+                resolve_expression_types_project(argument, names, module, modules);
+            }
+        }
+        ScalarExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                resolve_expression_types_project(&mut field.value, names, module, modules);
+            }
+        }
+        ScalarExpression::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                resolve_expression_types_project(element, names, module, modules);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_place_expression_types_project(
+    place: &mut ScalarPlace,
+    names: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+) {
+    match place {
+        ScalarPlace::Name { .. } => {}
+        ScalarPlace::Field { base, .. } => {
+            resolve_place_expression_types_project(base, names, module, modules)
+        }
+        ScalarPlace::Dereference { pointer, .. } => {
+            resolve_expression_types_project(pointer, names, module, modules)
+        }
+        ScalarPlace::Index { base, index, .. } => {
+            resolve_place_expression_types_project(base, names, module, modules);
+            resolve_expression_types_project(index, names, module, modules);
+        }
     }
 }
 
@@ -686,6 +916,10 @@ fn resolve_type_in_project(
             element: Box::new(resolve_type_in_project(element, names, module, modules)),
             length: *length,
             length_span: *length_span,
+            span: *span,
+        },
+        ScalarType::RuntimeArray { element, span } => ScalarType::RuntimeArray {
+            element: Box::new(resolve_type_in_project(element, names, module, modules)),
             span: *span,
         },
         ScalarType::Callable {
@@ -1140,8 +1374,9 @@ pub(super) fn resolve_module_places(module: &mut ScalarModule, modules: &[Scalar
     for item in &mut module.items {
         match item {
             ScalarItem::Binding(binding) => {
-                resolve_expression_module_places(
+                resolve_contextual_expression_module_places(
                     &mut binding.value,
+                    &binding.declared_type,
                     &declarations,
                     &context,
                     modules,
@@ -1184,8 +1419,9 @@ fn resolve_item_module_places(
 ) {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            resolve_expression_module_places(
+            resolve_contextual_expression_module_places(
                 &mut binding.value,
+                &binding.declared_type,
                 scope,
                 module,
                 modules,
@@ -1213,14 +1449,6 @@ fn resolve_item_module_places(
                     unsafe_context,
                 );
             }
-            resolve_expression_module_places(
-                &mut assignment.value,
-                scope,
-                module,
-                modules,
-                names,
-                unsafe_context,
-            );
             for value in &mut assignment.values {
                 resolve_expression_module_places(
                     value,
@@ -1286,6 +1514,32 @@ fn resolve_expression_module_places(
     unsafe_context: bool,
 ) {
     match expression {
+        ScalarExpression::Assignment(assignment) => {
+            for target in &mut assignment.targets {
+                resolve_module_place(
+                    &mut target.place,
+                    scope,
+                    module,
+                    modules,
+                    names,
+                    unsafe_context,
+                );
+            }
+            for value in &mut assignment.values {
+                resolve_expression_module_places(
+                    value,
+                    scope,
+                    module,
+                    modules,
+                    names,
+                    unsafe_context,
+                );
+            }
+        }
+        ScalarExpression::FunctionLiteral { body, .. } => {
+            let mut scope = scope.clone();
+            resolve_block_module_places(body, &mut scope, module, modules, names, unsafe_context);
+        }
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
         | ScalarExpression::Dereference { place, .. } => {
@@ -1431,6 +1685,34 @@ fn resolve_expression_module_places(
         | ScalarExpression::Boolean { .. }
         | ScalarExpression::Char { .. }
         | ScalarExpression::Utf8 { .. } => {}
+    }
+}
+
+fn resolve_contextual_expression_module_places(
+    expression: &mut ScalarExpression,
+    expected: &ScalarType,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModule,
+    modules: &[ScalarModule],
+    names: &BTreeMap<String, ScalarType>,
+    unsafe_context: bool,
+) {
+    if let ScalarExpression::FunctionLiteral {
+        parameters, body, ..
+    } = expression
+    {
+        let mut body_scope = scope.clone();
+        if let ScalarType::Callable {
+            parameters: types, ..
+        } = expected
+        {
+            for (name, ty) in parameters.iter().zip(types) {
+                body_scope.insert(name.clone(), ty.clone());
+            }
+        }
+        resolve_block_module_places(body, &mut body_scope, module, modules, names, false);
+    } else {
+        resolve_expression_module_places(expression, scope, module, modules, names, unsafe_context);
     }
 }
 

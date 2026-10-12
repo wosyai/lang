@@ -149,12 +149,17 @@ pub(super) fn emit_automatic_return_result<'ctx, 'module>(
     Ok(phi.as_basic_value())
 }
 
-pub(super) fn emit_return<'ctx, 'module>(
+pub(super) enum PreparedReturn<'ctx> {
+    Unit,
+    Value(BasicValueEnum<'ctx>),
+}
+
+pub(super) fn prepare_return<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     value: EmitValue<'ctx>,
     outputs: &crate::ScalarOutputSequence,
-) -> Result<(), String> {
+) -> Result<PreparedReturn<'ctx>, String> {
     let value = materialize_fresh_return_outputs(context, state, value, outputs)?;
     for (output, slot) in &state.return_owner_slots {
         let owned = state
@@ -168,29 +173,32 @@ pub(super) fn emit_return<'ctx, 'module>(
             .map_err(builder_error)?;
     }
     match outputs.outputs.as_slice() {
-        [] => {
-            state.builder.build_return(None).map_err(builder_error)?;
-        }
+        [] => Ok(PreparedReturn::Unit),
         [output] if output.ty != ScalarType::Unit => {
             let value = take_basic(value)?;
-            state
-                .builder
-                .build_return(Some(&value))
-                .map_err(builder_error)?;
+            Ok(PreparedReturn::Value(value))
         }
-        [_output] => {
-            state.builder.build_return(None).map_err(builder_error)?;
-        }
+        [_output] => Ok(PreparedReturn::Unit),
         _ => {
             let EmitValue::Aggregate { value, .. } = value else {
                 return Err("multi-output function requires an aggregate value".to_owned());
             };
-            state
-                .builder
-                .build_return(Some(&value))
-                .map_err(builder_error)?;
+            Ok(PreparedReturn::Value(value.into()))
         }
     }
+}
+
+pub(super) fn emit_return(
+    state: &EmitState<'_, '_>,
+    prepared: PreparedReturn<'_>,
+) -> Result<(), String> {
+    match prepared {
+        PreparedReturn::Unit => state.builder.build_return(None).map_err(builder_error)?,
+        PreparedReturn::Value(value) => state
+            .builder
+            .build_return(Some(&value))
+            .map_err(builder_error)?,
+    };
     Ok(())
 }
 

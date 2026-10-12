@@ -1,0 +1,27 @@
+[[steps]]
+command = ["wosy", "build", "native"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "native"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[steps]]
+command = ["wosy", "build", "wasm"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "wasm"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/invalid_fixed_overwrite.w"
+command = ["wosy", "build", "native"]
+exit = 1
+stderr_contains = ["B0003", "src/main.w", "fixed[0]", "&fixed[0]"]

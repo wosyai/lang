@@ -1,5 +1,6 @@
 use super::reference::{
-    record_function_reference_origins, reference_places_overlap, ReferenceFlowBuilder,
+    record_function_reference_origins, reference_places_overlap, resolve_module_call_sites,
+    validate_capture_input_path_fact, ReferenceFlowBuilder,
 };
 use super::typecheck::block_type;
 use super::*;
@@ -22,6 +23,11263 @@ fn validate_text(text: &str) -> ScalarValidation {
         parsed.diagnostics
     );
     derive_scalar_program(&parsed.result)
+}
+
+#[test]
+fn global_callable_field_called_from_function_has_resolved_target() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 7 }; };\nu8() invoke = fn { global_field.action() };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(
+        !single.program.terminal_owners.is_empty(),
+        "single terminal owners: {:?}; exits: {:?}",
+        single.program.terminal_owners,
+        single.program.top_level_reference_cfg.holder_exits
+    );
+    assert_eq!(
+        project.project.terminal_owners,
+        project.project.modules[0].terminal_owners
+    );
+    for owner in &project.project.terminal_owners {
+        let exit = project.project.modules[0]
+            .top_level_reference_cfg
+            .holder_exits
+            .iter()
+            .find(|exit| exit.from == owner.module_exit)
+            .unwrap();
+        assert!(exit.after.contains(&owner.module_relation));
+        assert!(owner.module_relation.holders.contains(&owner.holder));
+        assert!(
+            matches!(&owner.action, CallableHolderAction::Drop { environment, holder, .. }
+            if environment == &owner.environment && holder == &owner.holder)
+        );
+    }
+    assert_eq!(
+        serde_json::from_str::<ScalarProject>(&serde_json::to_string(&project.project).unwrap())
+            .unwrap()
+            .terminal_owners,
+        project.project.terminal_owners
+    );
+    let span = ByteSpan::new(
+        text.find("global_field.action()").unwrap() as u32,
+        (text.find("global_field.action()").unwrap() + "global_field.action()".len()) as u32,
+    );
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let binding = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Binding(binding) if binding.name == "global_field" => Some(binding),
+                _ => None,
+            })
+            .unwrap();
+        assert!(binding.name_span.start < span.start);
+        assert!(cfg.points.iter().any(|point| {
+            point.source_span.range == binding.name_span
+                && matches!(&point.kind, CfgPointKind::Bind { binding: id } if id.declaration_span == binding.name_span)
+                && cfg.top_level.points.iter().any(|entry| {
+                    entry.point == point.id
+                        && matches!(entry.execution, ScalarTopLevelPointExecution::Connected { .. })
+                })
+        }));
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let point = function
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                point.source_span.range == span
+                    && matches!(point.kind, CfgPointKind::Call { output: 0, .. })
+            })
+            .unwrap();
+        assert_eq!(point.source_span.source, source());
+        let CfgPointKind::Call {
+            expression: ScalarExpression::Call { occurrence, .. },
+            ..
+        } = &point.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(occurrence.source_span, point.source_span);
+        assert!(function
+            .reference_cfg
+            .call_points
+            .iter()
+            .any(|call| { call.occurrence == **occurrence && call.evaluated_point == point.id }));
+        assert!(
+            matches!(&point.kind, CfgPointKind::Call { target: ResolvedCallTarget::CallableField { receiver_place, .. }, .. } if receiver_place.binding.declaration_span == binding.name_span && receiver_place.binding.source == source())
+        );
+    }
+}
+
+#[test]
+fn global_fixed_callable_element_selected_inside_function_keeps_origin() {
+    let text = "%%start\nu8()[2] global_actions = [fn { 3 }, fn { 4 }];\nu8() invoke = fn { u8() action = global_actions[0]; action() };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let call = function
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    &point.kind,
+                    CfgPointKind::Call {
+                        output: 0,
+                        target: ResolvedCallTarget::LocalCallable(_),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(call.source_span.source, source());
+        assert_eq!(
+            call.source_span.range.start,
+            text.find("action()").unwrap() as u32
+        );
+    }
+}
+
+#[test]
+fn imported_global_holder_copy_called_inside_function_keeps_module_origin() {
+    let library_source = module_source("src/library.w");
+    let library = module_from_text(
+        library_source.clone(),
+        "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 7 }; };\n%%end",
+    );
+    let main_source = module_source("src/main.w");
+    let main = module_from_text(
+        main_source.clone(),
+        "%%start\nlib = namespace app \"src/library.w\";\nu8() invoke = fn { lib.Dispatch copy = lib.global_field; copy.action() };\n%%end",
+    );
+    let namespace_span = match &main.items[0] {
+        ScalarItem::Namespace(namespace) => namespace.span,
+        _ => panic!("namespace"),
+    };
+    let result = validate_scalar_project(ScalarProject::new(
+        vec![
+            ScalarModule::from_program(
+                main,
+                vec![ScalarNamespaceBinding {
+                    binding: "lib".to_owned(),
+                    target: library_source.clone(),
+                    span: namespace_span,
+                }],
+            ),
+            ScalarModule::from_program(library, Vec::new()),
+        ],
+        vec![main_source.clone(), library_source.clone()],
+    ));
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let function = result.project.modules[0]
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+            _ => None,
+        })
+        .unwrap();
+    assert!(function.reference_cfg.points.iter().any(|point| {
+        point.source_span.source == main_source
+            && matches!(&point.kind, CfgPointKind::Call { target: ResolvedCallTarget::CallableField { field, .. }, .. } if field.structure.source == library_source)
+    }));
+}
+
+#[test]
+fn while_occurrence_identifies_exact_cfg_roles_across_copies_and_serialization() {
+    let text = "%%start\n(i32, bool)() run = fn { bool running = true; if (true) { while (running) { if (running) { running = false; } else { running = false; }; if (running) { running = running; } else { running = running; }; } running = false; 1, true } else { 2, false } };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .expect("run function");
+        let restored: ScalarFunction =
+            serde_json::from_str(&serde_json::to_string(function).unwrap()).unwrap();
+        assert_eq!(function, &restored);
+        let mut occurrences = Vec::new();
+        for (output, item) in function.body.items[1..3].iter().enumerate() {
+            let ScalarBlockItem::Expression(ScalarExpression::If { then_branch, .. }) = item else {
+                panic!("expected output conditional");
+            };
+            let ScalarBlockItem::While(while_expression) = &then_branch.items[0] else {
+                panic!("expected while in output conditional");
+            };
+            assert_eq!(while_expression.occurrence.output_projection, vec![output]);
+            assert_eq!(
+                while_expression.occurrence.source_span.range,
+                while_expression.span
+            );
+            assert_eq!(while_expression.occurrence.source_span.source, source());
+            occurrences.push(while_expression);
+        }
+        assert_eq!(occurrences[0].span, occurrences[1].span);
+        assert_ne!(occurrences[0].occurrence, occurrences[1].occurrence);
+        let loop_points = &function.reference_cfg.while_points;
+        assert_eq!(loop_points.len(), 6, "{loop_points:?}");
+        for while_expression in occurrences {
+            for role in [
+                ScalarWhilePointRole::LoopTest,
+                ScalarWhilePointRole::Branch,
+                ScalarWhilePointRole::BodyScopeExit,
+            ] {
+                let events = loop_points
+                    .iter()
+                    .filter(|event| {
+                        event.occurrence == while_expression.occurrence && event.role == role
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(events.len(), 1, "{loop_points:?}");
+                let point = &function.reference_cfg.points[events[0].point.0];
+                assert_eq!(point.id, events[0].point);
+                assert_eq!(point.source_span.source, source());
+                assert_eq!(
+                    point.source_span.range,
+                    if role == ScalarWhilePointRole::BodyScopeExit {
+                        while_expression.body.span
+                    } else {
+                        expression_span(&while_expression.condition)
+                    }
+                );
+                assert!(match role {
+                    ScalarWhilePointRole::LoopTest =>
+                        matches!(point.kind, CfgPointKind::LoopTest { .. }),
+                    ScalarWhilePointRole::Branch =>
+                        matches!(point.kind, CfgPointKind::Branch { .. }),
+                    ScalarWhilePointRole::BodyScopeExit =>
+                        matches!(point.kind, CfgPointKind::ScopeExit),
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_output_projection_paths_and_unexpanded_while_occurrences() {
+    let nested = validate_text("%%start\n(i32, bool)() run = fn { bool running = true; if (true) { if (true) { while (running) { running = false; } 1, true } else { 2, false } } else { 3, false } };\n%%end");
+    assert!(nested.diagnostics.is_empty(), "{:?}", nested.diagnostics);
+    let ScalarItem::Function(function) = &nested.program.items[0] else {
+        panic!("expected function");
+    };
+    let paths = function
+        .reference_cfg
+        .while_points
+        .iter()
+        .filter(|event| event.role == ScalarWhilePointRole::LoopTest)
+        .map(|event| event.occurrence.output_projection.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec![vec![0, 0], vec![1, 1]]);
+    for (outer, expected) in function
+        .body
+        .items
+        .iter()
+        .skip(1)
+        .zip([vec![0, 0], vec![1, 1]])
+    {
+        let ScalarBlockItem::Expression(ScalarExpression::If { then_branch, .. }) = outer else {
+            panic!("expected outer output projection");
+        };
+        let ScalarBlockItem::Expression(ScalarExpression::If { then_branch, .. }) =
+            &then_branch.items[0]
+        else {
+            panic!("expected inner output projection");
+        };
+        let ScalarBlockItem::While(while_expression) = &then_branch.items[0] else {
+            panic!("expected projected while");
+        };
+        assert_eq!(while_expression.occurrence.output_projection, expected);
+    }
+
+    let unexpanded = validate_text("%%start\nunit() run = fn { bool running = false; while (running) { running = false; } };\n%%end");
+    assert!(
+        unexpanded.diagnostics.is_empty(),
+        "{:?}",
+        unexpanded.diagnostics
+    );
+    let ScalarItem::Function(function) = &unexpanded.program.items[0] else {
+        panic!("expected function");
+    };
+    let ScalarBlockItem::While(while_expression) = &function.body.items[1] else {
+        panic!("expected unexpanded while");
+    };
+    assert!(while_expression.occurrence.output_projection.is_empty());
+    assert!(function.body.occurrence.output_projection.is_empty());
+    assert!(while_expression
+        .body
+        .occurrence
+        .output_projection
+        .is_empty());
+    assert_eq!(
+        function
+            .reference_cfg
+            .block_scope_exits
+            .iter()
+            .filter(|exit| { exit.occurrence == *while_expression.body.occurrence })
+            .count(),
+        1
+    );
+    assert_eq!(function.reference_cfg.while_points.len(), 3);
+    assert!(function
+        .reference_cfg
+        .while_points
+        .iter()
+        .all(|point| point.occurrence == while_expression.occurrence));
+}
+
+#[test]
+fn conditional_scope_exits_and_branch_roles_keep_exact_output_projections() {
+    let text =
+        "%%start\n(i32, bool)() run = fn { if (true) { 1, true } else { 2, false } };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("expected function");
+        };
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(&function.reference_cfg).unwrap()).unwrap();
+        assert_eq!(function.reference_cfg, restored);
+        let conditionals = function
+            .body
+            .items
+            .iter()
+            .map(|item| {
+                let ScalarBlockItem::Expression(ScalarExpression::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                }) = item
+                else {
+                    panic!("expected projected conditional");
+                };
+                (then_branch, else_branch)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(conditionals.len(), 2);
+        assert_eq!(conditionals[0].0.span, conditionals[1].0.span);
+        assert_ne!(conditionals[0].0.occurrence, conditionals[1].0.occurrence);
+        for (position, (then_branch, else_branch)) in conditionals.iter().enumerate() {
+            for block in [then_branch, else_branch] {
+                assert_eq!(block.occurrence.output_projection, vec![position]);
+                assert_eq!(block.occurrence.source_span.source, source());
+                assert_eq!(block.occurrence.source_span.range, block.span);
+                let exits = function
+                    .reference_cfg
+                    .block_scope_exits
+                    .iter()
+                    .filter(|exit| exit.occurrence == *block.occurrence)
+                    .collect::<Vec<_>>();
+                assert_eq!(exits.len(), 1);
+                let point = &function.reference_cfg.points[exits[0].point.0];
+                assert!(matches!(point.kind, CfgPointKind::ScopeExit));
+                assert_eq!(point.source_span, block.occurrence.source_span);
+            }
+            for (role, block) in [
+                (ScalarConditionalPointRole::ThenScopeExit, then_branch),
+                (ScalarConditionalPointRole::ElseScopeExit, else_branch),
+            ] {
+                let mapped = function
+                    .reference_cfg
+                    .conditional_points
+                    .iter()
+                    .filter(|event| {
+                        event.then_block == *then_branch.occurrence && event.role == role
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(mapped.len(), 1);
+                let scope = function
+                    .reference_cfg
+                    .block_scope_exits
+                    .iter()
+                    .find(|exit| exit.occurrence == *block.occurrence)
+                    .unwrap();
+                assert_eq!(mapped[0].point, scope.point);
+            }
+            let branches = function
+                .reference_cfg
+                .conditional_points
+                .iter()
+                .filter(|event| {
+                    event.then_block == *then_branch.occurrence
+                        && event.role == ScalarConditionalPointRole::Branch
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(branches.len(), 1);
+            assert!(matches!(
+                function.reference_cfg.points[branches[0].point.0].kind,
+                CfgPointKind::Branch { .. }
+            ));
+        }
+    }
+}
+
+#[test]
+fn nested_conditional_block_occurrences_retain_outer_to_inner_projection() {
+    let text = "%%start\n(i32, bool)() run = fn { if (true) { if (true) { 1, true } else { 2, false } } else { 3, false } };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("expected function");
+        };
+        for (position, item) in function.body.items.iter().enumerate() {
+            let ScalarBlockItem::Expression(ScalarExpression::If { then_branch, .. }) = item else {
+                panic!("expected outer conditional");
+            };
+            let ScalarBlockItem::Expression(ScalarExpression::If {
+                then_branch: inner, ..
+            }) = &then_branch.items[0]
+            else {
+                panic!("expected inner conditional");
+            };
+            assert_eq!(then_branch.occurrence.output_projection, vec![position]);
+            assert_eq!(inner.occurrence.output_projection, vec![position, position]);
+            for block in [then_branch, inner] {
+                assert_eq!(
+                    function
+                        .reference_cfg
+                        .block_scope_exits
+                        .iter()
+                        .filter(|exit| exit.occurrence == *block.occurrence)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    function
+                        .reference_cfg
+                        .conditional_points
+                        .iter()
+                        .filter(|event| {
+                            event.then_block == *block.occurrence
+                                && event.role == ScalarConditionalPointRole::Branch
+                        })
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn call_occurrences_group_only_produced_cfg_outputs_in_both_validators_and_literals() {
+    let text = "%%start\n(*u8, *u8)() pair = fn { u8 first = 1; u8 second = 2; &first, &second };\nunit() run = fn { *u8 left, *u8 right = pair(); u8 a = *left; u8 b = *right; a; b; unit() inner = fn { pair(); }; inner(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, source) in [
+        (&single.program.items, &single.program.source),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].source,
+        ),
+    ] {
+        let run = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .expect("run function");
+        let ScalarBlockItem::LocalBinding(binding) = &run.body.items[0] else {
+            panic!("expected two-output binding");
+        };
+        let ScalarExpression::Call { occurrence, .. } = &binding.value else {
+            panic!("expected call");
+        };
+        let evaluated = run
+            .reference_cfg
+            .call_points
+            .iter()
+            .filter(|call| call.occurrence == **occurrence)
+            .collect::<Vec<_>>();
+        assert_eq!(evaluated.len(), 1);
+        let call = evaluated[0];
+        assert_eq!(call.occurrence.source_span.source, *source);
+        assert!(call.occurrence.output_projection.is_empty());
+        assert_eq!(
+            call.projections
+                .iter()
+                .map(|projection| projection.output)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(call.evaluated_point, call.projections[0].point);
+        for projection in &call.projections {
+            let point = &run.reference_cfg.points[projection.point.0];
+            assert!(
+                matches!(&point.kind, CfgPointKind::Call { output, expression: ScalarExpression::Call { occurrence: recorded, .. }, .. } if output == &projection.output && recorded == occurrence)
+            );
+            assert_eq!(point.source_span, occurrence.source_span);
+            assert!(matches!(
+                binding.receivers[projection.output].ty,
+                ScalarType::CheckedReference { .. }
+            ));
+            assert!(point.possible_origins.as_ref().expect("validated checked output").iter().any(|origin| {
+                matches!(&run.reference_cfg.facts[origin.0], ReferenceOrigin::Fresh { loan, .. }
+                    if matches!(loan.origin_place.binding.kind, ReferenceBindingKind::CallOutput { point: owner_point, output }
+                        if owner_point == projection.point && output == projection.output))
+            }), "checked owner slot {}: {point:?}", projection.output);
+        }
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(&run.reference_cfg).unwrap()).unwrap();
+        assert_eq!(restored.call_points, run.reference_cfg.call_points);
+
+        let literal = run
+            .reference_cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| literal.captures.is_empty())
+            .expect("inner literal CFG");
+        let calls = literal
+            .reference_cfg
+            .call_points
+            .iter()
+            .filter(|call| {
+                call.occurrence.source_span.source == *source
+                    && call.occurrence.source_span.range.start
+                        == text.rfind("pair();").unwrap() as u32
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1, "{:?}", literal.reference_cfg.call_points);
+        assert_eq!(calls[0].projections.len(), 1);
+        assert_eq!(calls[0].projections[0].output, 0);
+        assert_eq!(calls[0].projections[0].point, calls[0].evaluated_point);
+    }
+}
+
+#[test]
+fn cloned_conditional_call_occurrences_distinguish_same_span_evaluations() {
+    let text = "%%start\n(u8, bool)() pair = fn { 1, true };\n(u8, bool)() run = fn { if (true) { pair(); 2, true } else { 3, false } };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let run = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .expect("run function");
+        let calls = run
+            .body
+            .items
+            .iter()
+            .map(|item| {
+                let ScalarBlockItem::Expression(ScalarExpression::If { then_branch, .. }) = item
+                else {
+                    panic!("expected projected conditional");
+                };
+                let ScalarBlockItem::Expression(ScalarExpression::Call { occurrence, .. }) =
+                    &then_branch.items[0]
+                else {
+                    panic!("expected projected call");
+                };
+                occurrence
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].source_span, calls[1].source_span);
+        assert_eq!(calls[0].output_projection, vec![0]);
+        assert_eq!(calls[1].output_projection, vec![1]);
+        assert_ne!(calls[0], calls[1]);
+        for occurrence in calls {
+            let matching = run
+                .reference_cfg
+                .call_points
+                .iter()
+                .filter(|call| call.occurrence == **occurrence)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1);
+            assert_eq!(matching[0].projections.len(), 1);
+            assert_eq!(
+                matching[0].projections[0].point,
+                matching[0].evaluated_point
+            );
+        }
+    }
+}
+
+#[test]
+fn cloned_literal_capture_occurrences_select_exact_cfg_points_in_both_validators() {
+    let text = "%%start\n((u8()), (u8()))() choose = fn { if (true) { u8() local = fn { 5 }; fn { local() }, fn { local() } } else { u8() other = fn { 6 }; fn { other() }, fn { other() } } };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("expected choose function")
+        };
+        let cfg = &function.reference_cfg;
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.capture_points, cfg.capture_points);
+        assert_eq!(restored.literal_cfgs, cfg.literal_cfgs);
+        let duplicated = cfg
+            .capture_points
+            .iter()
+            .filter(|capture| {
+                cfg.capture_points.iter().any(|other| {
+                    other.occurrence.source_span == capture.occurrence.source_span
+                        && other.occurrence.output_projection
+                            != capture.occurrence.output_projection
+                })
+            })
+            .count();
+        assert_eq!(duplicated, 4);
+        for capture in &cfg.capture_points {
+            assert_eq!(
+                cfg.capture_points
+                    .iter()
+                    .filter(|other| other.occurrence == capture.occurrence)
+                    .count(),
+                1
+            );
+            assert!(
+                matches!(&cfg.points[capture.point.0].kind, CfgPointKind::Capture { environment, .. } if environment.literal == capture.occurrence.source_span)
+            );
+            assert_eq!(
+                cfg.literal_cfgs
+                    .iter()
+                    .filter(|literal| literal.capture_point == capture.point)
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn cloned_checked_reads_have_exact_structural_cfg_occurrences() {
+    let text = "%%start\n(u8, u8)() pair = fn { u8 value = 1; *u8 shared = &value; if (true) { *shared; value, value } else { value, value } };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("expected function")
+        };
+        let cfg = &function.reference_cfg;
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.read_points, cfg.read_points);
+        let reads = cfg
+            .read_points
+            .iter()
+            .filter(|read| {
+                read.occurrence.source_span.range.start == text.find("*shared;").unwrap() as u32
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 2, "{:?}", cfg.read_points);
+        assert_eq!(
+            reads[0].occurrence.source_span,
+            reads[1].occurrence.source_span
+        );
+        assert_eq!(reads[0].occurrence.role, ScalarReadRole::Dereference);
+        assert_eq!(reads[0].occurrence.output_projection, vec![0]);
+        assert_eq!(reads[1].occurrence.output_projection, vec![1]);
+        for read in reads {
+            assert_eq!(read.function_span, function.span);
+            assert!(matches!(
+                &cfg.points[read.point.0].kind,
+                CfgPointKind::ReadPlace { .. }
+            ));
+        }
+    }
+}
+
+#[test]
+fn indexed_and_nested_return_reads_retain_typed_points_in_both_validators() {
+    let text = "%%start\nu8() nested = fn { u8 value = 1; *u8 shared = &value; *shared }; u8() indexed = fn { u8[2] bytes = [1, 2]; bytes[0] };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for item in items {
+            let ScalarItem::Function(function) = item else {
+                continue;
+            };
+            let cfg = &function.reference_cfg;
+            let restored: ScalarReferenceCfg =
+                serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+            assert_eq!(restored.read_points, cfg.read_points);
+            assert_eq!(cfg.read_points.len(), 1);
+            for read in &cfg.read_points {
+                assert_eq!(read.function_span, function.span);
+                assert!(
+                    matches!(&cfg.points[read.point.0].kind, CfgPointKind::ReadPlace { place, .. } if matches!((read.occurrence.role, place), (ScalarReadRole::Dereference, ScalarPlace::Dereference { .. }) | (ScalarReadRole::IndexedRead, ScalarPlace::Index { .. })))
+                );
+            }
+        }
+        let reads = items
+            .iter()
+            .filter_map(|item| match item {
+                ScalarItem::Function(function) => Some(&function.reference_cfg.read_points),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(reads
+            .iter()
+            .any(|read| read.occurrence.role == ScalarReadRole::Dereference));
+        assert!(reads
+            .iter()
+            .any(|read| read.occurrence.role == ScalarReadRole::IndexedRead));
+    }
+}
+
+#[test]
+fn nested_literal_return_read_keeps_function_scoped_occurrence() {
+    let text = "%%start\nu8() outer = fn { u8 value = 1; *u8 shared = &value; u8() inner = fn { *shared }; inner() };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let ScalarItem::Function(outer) = &items[0] else {
+            panic!("expected outer")
+        };
+        let literal = outer
+            .reference_cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| {
+                literal.literal.range.start == text.find("fn { *shared }").unwrap() as u32
+            })
+            .expect("nested literal");
+        let cfg = &literal.reference_cfg;
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.read_points, cfg.read_points);
+        assert_eq!(cfg.read_points.len(), 1);
+        let read = &cfg.read_points[0];
+        assert_eq!(read.function_span, literal.literal.range);
+        assert_eq!(read.occurrence.role, ScalarReadRole::Dereference);
+        assert_eq!(
+            cfg.points[read.point.0].source_span,
+            read.occurrence.source_span
+        );
+    }
+}
+
+#[test]
+fn binding_and_assignment_roles_follow_cloned_conditional_outputs() {
+    let text = "%%start\n(i32, bool)() run = fn { i32 count = 0; bool flag = true; if (true) { i32 local = 1; bool other = true; count, flag = local, other; count, flag } else { 2, false } };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("expected function");
+        };
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(&function.reference_cfg).unwrap()).unwrap();
+        assert_eq!(
+            restored.binding_points,
+            function.reference_cfg.binding_points
+        );
+        assert_eq!(
+            restored.assignment_points,
+            function.reference_cfg.assignment_points
+        );
+        let mut original_span = None;
+        for (projection, item) in function.body.items.iter().skip(2).enumerate() {
+            let ScalarBlockItem::Expression(ScalarExpression::If { then_branch, .. }) = item else {
+                panic!("expected output conditional");
+            };
+            let ScalarBlockItem::LocalBinding(local) = &then_branch.items[0] else {
+                panic!("expected local binding");
+            };
+            let ScalarBlockItem::Assignment(assignment) = &then_branch.items[2] else {
+                panic!("expected projected assignment");
+            };
+            assert_eq!(local.occurrence.output_projection, vec![projection]);
+            assert_eq!(assignment.occurrence.output_projection, vec![projection]);
+            if let Some(span) = &original_span {
+                assert_eq!(&assignment.occurrence.source_span, span);
+            } else {
+                original_span = Some(assignment.occurrence.source_span.clone());
+            }
+            let binding_events = function
+                .reference_cfg
+                .binding_points
+                .iter()
+                .filter(|event| event.occurrence == *local.occurrence && event.output == 0)
+                .collect::<Vec<_>>();
+            assert_eq!(binding_events.len(), 1);
+            assert_eq!(binding_events[0].role, ScalarBindingPointRole::Bind);
+            assert!(matches!(
+                function.reference_cfg.points[binding_events[0].point.0].kind,
+                CfgPointKind::Bind { .. }
+            ));
+            let target_events = function
+                .reference_cfg
+                .assignment_points
+                .iter()
+                .filter(|event| event.occurrence == *assignment.occurrence)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                target_events
+                    .iter()
+                    .map(|event| event.target)
+                    .collect::<Vec<_>>(),
+                vec![0, 1]
+            );
+            for event in target_events {
+                assert_eq!(event.role, ScalarAssignmentPointRole::Assign);
+                let CfgPointKind::Assign { target, .. } =
+                    &function.reference_cfg.points[event.point.0].kind
+                else {
+                    panic!("expected assigned target");
+                };
+                let ScalarBlockItem::LocalBinding(root_binding) =
+                    &function.body.items[event.target]
+                else {
+                    panic!("expected root binding");
+                };
+                assert_eq!(target.binding.declaration_span, root_binding.name_span);
+            }
+        }
+    }
+}
+
+#[test]
+fn multi_binding_and_callable_field_overwrite_have_exact_statement_roles() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\n(u8, u8)() pair = fn { 1, 2 };\nunit() run = fn { u8 first, u8 second = pair(); Reader original = { .read = fn { first }; }; Reader copy = original; copy.read = fn { second }; copy = original; original.read(); copy.read(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let run = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .expect("run function");
+        let ScalarBlockItem::LocalBinding(multi) = &run.body.items[0] else {
+            panic!("expected multi-binding");
+        };
+        let mapped = run
+            .reference_cfg
+            .binding_points
+            .iter()
+            .filter(|event| event.occurrence == *multi.occurrence)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mapped.iter().map(|event| event.output).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        for event in mapped {
+            assert_eq!(event.role, ScalarBindingPointRole::Bind);
+            let CfgPointKind::Bind { binding } = &run.reference_cfg.points[event.point.0].kind
+            else {
+                panic!("expected receiver Bind");
+            };
+            assert_eq!(
+                binding.declaration_span,
+                multi.receivers[event.output].name_span
+            );
+        }
+        let ScalarBlockItem::LocalBinding(original) = &run.body.items[1] else {
+            panic!("expected struct literal binding");
+        };
+        let field_initializers = run
+            .reference_cfg
+            .binding_points
+            .iter()
+            .filter(|event| {
+                event.occurrence == *original.occurrence
+                    && matches!(event.role, ScalarBindingPointRole::FieldAssign(_))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(field_initializers.len(), 1);
+        assert!(matches!(
+            run.reference_cfg.points[field_initializers[0].point.0].kind,
+            CfgPointKind::Assign { .. }
+        ));
+        let ScalarBlockItem::LocalBinding(copy) = &run.body.items[2] else {
+            panic!("expected copied struct binding");
+        };
+        let copied = run
+            .reference_cfg
+            .binding_points
+            .iter()
+            .filter(|event| event.occurrence == *copy.occurrence)
+            .collect::<Vec<_>>();
+        assert_eq!(copied.len(), 2);
+        assert_eq!(copied[0].role, ScalarBindingPointRole::Bind);
+        assert_eq!(copied[1].role, ScalarBindingPointRole::CopyCallableFields);
+        assert_eq!(copied[0].output, 0);
+        assert_eq!(copied[1].output, 0);
+        let ScalarBlockItem::Assignment(field) = &run.body.items[3] else {
+            panic!("expected field overwrite");
+        };
+        let field_points = run
+            .reference_cfg
+            .assignment_points
+            .iter()
+            .filter(|event| event.occurrence == *field.occurrence)
+            .collect::<Vec<_>>();
+        assert_eq!(field_points.len(), 1);
+        assert_eq!(field_points[0].target, 0);
+        assert_eq!(field_points[0].role, ScalarAssignmentPointRole::Assign);
+        let CfgPointKind::Assign { target, .. } =
+            &run.reference_cfg.points[field_points[0].point.0].kind
+        else {
+            panic!("expected projected field write");
+        };
+        assert_eq!(target.projections.len(), 1);
+        let ScalarBlockItem::Assignment(overwrite) = &run.body.items[4] else {
+            panic!("expected struct overwrite");
+        };
+        let overwritten = run
+            .reference_cfg
+            .assignment_points
+            .iter()
+            .filter(|event| event.occurrence == *overwrite.occurrence)
+            .collect::<Vec<_>>();
+        assert_eq!(overwritten.len(), 2);
+        assert_eq!(overwritten[0].role, ScalarAssignmentPointRole::Assign);
+        assert_eq!(
+            overwritten[1].role,
+            ScalarAssignmentPointRole::CopyCallableFields
+        );
+        assert!(matches!(
+            run.reference_cfg.points[overwritten[1].point.0].kind,
+            CfgPointKind::CopyCallableFields { .. }
+        ));
+        let restored: ScalarFunction =
+            serde_json::from_str(&serde_json::to_string(run).unwrap()).unwrap();
+        assert_eq!(*run, restored);
+    }
+}
+
+#[test]
+fn connected_top_level_runtime_binding_and_assignment_keep_output_roles() {
+    let text = "%%start\n(u8[], u8[])(u8[], u64) pair = fn(input, count) { u8[count] fresh; input, fresh };\nu8[2] fixed = [4, 5];\nu8[] first, u8[] second = pair(fixed, 2);\nfirst, second = pair(fixed, 3);\nfixed[0]; first[0]; second[0];\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Binding(binding) = &items[2] else {
+            panic!("expected multi-output module binding");
+        };
+        let bound = cfg
+            .binding_points
+            .iter()
+            .filter(|event| event.occurrence == *binding.occurrence)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bound.iter().map(|event| event.output).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        for event in bound {
+            assert_eq!(event.role, ScalarBindingPointRole::Bind);
+            assert!(
+                matches!(&cfg.points[event.point.0].kind, CfgPointKind::Bind { binding: bound_binding } if bound_binding.declaration_span == binding.receivers[event.output].name_span)
+            );
+        }
+        let ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) = &items[3] else {
+            panic!("expected module assignment");
+        };
+        let written = cfg
+            .assignment_points
+            .iter()
+            .filter(|event| event.occurrence == *assignment.occurrence)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            written.iter().map(|event| event.target).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(written
+            .iter()
+            .all(|event| event.role == ScalarAssignmentPointRole::Assign
+                && matches!(cfg.points[event.point.0].kind, CfgPointKind::Assign { .. })));
+    }
+}
+
+#[test]
+fn top_level_mixed_multi_output_assignment_connects_each_holder_target() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\n(u8[], Reader)(u64) make = fn(count) { u8[count] data; Reader result = { .read = fn { 7 }; }; data, result };\nu8[2] fixed = [4, 5];\nu8[] bytes = fixed;\nReader object = { .read = fn { 1 }; };\nbytes, object = make(3);\nbytes[0]; object.read();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) = &items[4] else {
+            panic!("mixed assignment")
+        };
+        let writes = cfg
+            .assignment_points
+            .iter()
+            .filter(|event| {
+                event.occurrence == *assignment.occurrence
+                    && event.role == ScalarAssignmentPointRole::Assign
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            writes.iter().map(|event| event.target).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(cfg.top_level.assignments.iter().any(|event| event.occurrence == *assignment.occurrence && matches!(&event.execution, ScalarTopLevelAssignmentExecution::Connected { points } if points.contains(&writes[0].point) && points.contains(&writes[1].point))));
+        let copy = cfg
+            .assignment_points
+            .iter()
+            .find(|event| {
+                event.occurrence == *assignment.occurrence
+                    && event.target == 1
+                    && event.role == ScalarAssignmentPointRole::CopyCallableFields
+            })
+            .expect("struct callable fields");
+        assert!(cfg.holder_edges.iter().any(|edge| edge.from == copy.point
+            && edge.actions.iter().any(|action| matches!(
+                action,
+                CallableHolderAction::Move { .. } | CallableHolderAction::Retain { .. }
+            ))));
+    }
+}
+
+#[test]
+fn top_level_projected_runtime_array_assignment_has_connected_backing() {
+    let text = "%%start\nstruct Box { u8[] data; }\nu8[2] fixed = [4, 5];\nBox container = { .data = fixed; };\ncontainer.data = fixed;\ncontainer.data[0];\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) = &items[2] else {
+            panic!("projected array overwrite")
+        };
+        let write = cfg
+            .assignment_points
+            .iter()
+            .find(|event| {
+                event.occurrence == *assignment.occurrence
+                    && event.target == 0
+                    && event.role == ScalarAssignmentPointRole::Assign
+            })
+            .expect("projected array assign");
+        assert!(
+            matches!(&cfg.points[write.point.0].kind, CfgPointKind::Assign { target, .. } if target.projections.len() == 1)
+        );
+        assert!(cfg.points[write.point.0].successors.iter().any(|next| matches!(&cfg.points[next.0].kind, CfgPointKind::BackingPlace { target, .. } if target.projections.len() == 1)));
+        assert!(cfg.top_level.assignments.iter().any(|event| event.occurrence == *assignment.occurrence && matches!(&event.execution, ScalarTopLevelAssignmentExecution::Connected { points } if points.contains(&write.point))));
+    }
+}
+
+#[test]
+fn top_level_projected_checked_assignment_connects_origin() {
+    let text = "%%start\nstruct Holder { *u8 address; }\nu8 first = 1;\nu8 second = 2;\nHolder owner = { .address = &first; };\nowner.address = &second;\n*owner.address;\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) = &items[3] else {
+            panic!("checked field overwrite")
+        };
+        let write = cfg
+            .assignment_points
+            .iter()
+            .find(|event| {
+                event.occurrence == *assignment.occurrence
+                    && event.target == 0
+                    && event.role == ScalarAssignmentPointRole::Assign
+            })
+            .expect("checked field assign");
+        assert!(
+            matches!(&cfg.points[write.point.0].kind, CfgPointKind::Assign { target, .. } if target.projections.len() == 1)
+        );
+        assert!(cfg.top_level.assignments.iter().any(|event| event.occurrence == *assignment.occurrence && matches!(&event.execution, ScalarTopLevelAssignmentExecution::Connected { points } if points.contains(&write.point))));
+    }
+}
+
+#[test]
+fn top_level_multi_checked_assignment_connects_each_return_slot() {
+    let text = "%%start\nu8 first = 1;\nu8 second = 2;\n(*u8, *u8)(*u8, *u8) pair = fn(a, b) { a, b };\n*u8 left = &first;\n*u8 right = &second;\nleft, right = pair(&first, &second);\n*left; *right;\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) = &items[5] else {
+            panic!("checked multi output")
+        };
+        let writes = cfg
+            .assignment_points
+            .iter()
+            .filter(|event| {
+                event.occurrence == *assignment.occurrence
+                    && event.role == ScalarAssignmentPointRole::Assign
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            writes.iter().map(|event| event.target).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let call = cfg
+            .call_points
+            .iter()
+            .find(|call| {
+                call.occurrence.source_span.range == expression_span(&assignment.values[0])
+            })
+            .expect("single evaluated call");
+        assert_eq!(
+            call.projections
+                .iter()
+                .map(|projection| projection.output)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        for write in writes {
+            assert!(
+                matches!(&cfg.points[write.point.0].kind, CfgPointKind::Assign { rhs_point, .. } if *rhs_point == call.projections[write.target].point)
+            );
+        }
+    }
+}
+
+#[test]
+fn top_level_fixed_array_field_write_reports_scalar_leaf_requirement() {
+    let text = "%%start\nstruct Holder { u8[2] data; }\nu8[2] fixed = [1, 2];\nHolder owner = { .data = fixed; };\nowner.data = fixed;\nowner.data[0];\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "assignment place requires a scalar leaf type"),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn top_level_scalar_field_and_index_writes_emit_without_holder_action() {
+    let text = "%%start\nstruct Pair { u8 value; }\nPair item = { .value = 1; };\nu8[2] fixed = [1, 2];\nitem.value = 3;\nfixed[0] = 4;\nitem.value; fixed[0];\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for item in &items[2..4] {
+            let ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) = item else {
+                panic!("ordinary write")
+            };
+            assert!(cfg
+                .top_level
+                .assignments
+                .iter()
+                .any(|event| event.occurrence == *assignment.occurrence
+                    && event.execution
+                        == ScalarTopLevelAssignmentExecution::EmittedWithoutHolderAction));
+        }
+    }
+}
+
+#[test]
+fn top_level_callable_array_element_write_requires_connected_holder() {
+    let text = "%%start\nu8()[2] readers = [fn { 1 }, fn { 2 }];\nu64 slot = 0;\nreaders[slot] = fn { 3 };\nreaders[1];\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) = &items[2] else {
+            panic!("callable array element overwrite")
+        };
+        let assigned = cfg
+            .assignment_points
+            .iter()
+            .find(|event| {
+                event.occurrence == *assignment.occurrence
+                    && event.role == ScalarAssignmentPointRole::Assign
+            })
+            .expect("connected assignment");
+        let selected = cfg
+            .assignment_points
+            .iter()
+            .find(|event| {
+                event.occurrence == *assignment.occurrence
+                    && event.role == ScalarAssignmentPointRole::SelectElement
+            })
+            .expect("evaluated index");
+        assert!(cfg.top_level.assignments.iter().any(|event| event.occurrence == *assignment.occurrence && matches!(&event.execution, ScalarTopLevelAssignmentExecution::Connected { points } if points.contains(&assigned.point) && points.contains(&selected.point))));
+        let CfgPointKind::SelectArrayElement {
+            target,
+            index_point,
+        } = &cfg.points[selected.point.0].kind
+        else {
+            panic!("selected index point")
+        };
+        assert_eq!(target.source, source());
+        let ScalarPlace::Index { index, .. } = &assignment.targets[0].place else {
+            panic!("indexed target")
+        };
+        assert!(
+            matches!(&target.projections[..], [ReferencePlaceProjection::Index(expression)] if expression == index.as_ref())
+        );
+        assert!(matches!(
+            cfg.points[index_point.0].kind,
+            CfgPointKind::Read { .. }
+        ));
+        let actions = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == assigned.point)
+            .map(|edge| &edge.actions)
+            .chain(
+                cfg.holder_exits
+                    .iter()
+                    .filter(|exit| exit.from == assigned.point)
+                    .map(|exit| &exit.actions),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(actions.len(), 2);
+        for actions in actions {
+            let selection = actions
+                .iter()
+                .find_map(|action| match action {
+                    CallableHolderAction::SelectElement {
+                        target: known,
+                        index_point: evaluated,
+                        selected,
+                    } if known == target && evaluated == index_point => Some(selected),
+                    _ => None,
+                })
+                .expect("runtime selection fact");
+            assert!(actions.iter().any(|action| matches!(action, CallableHolderAction::Drop { holder: CallableHolderPlace::Projection(place), .. } if place == selection)));
+            assert!(actions.iter().any(|action| matches!(action, CallableHolderAction::Move { to: CallableHolderPlace::Projection(place), .. } if place == selection)));
+        }
+        assert!(cfg
+            .top_level
+            .points
+            .iter()
+            .filter(
+                |event| event.execution == ScalarTopLevelPointExecution::SupplementalAnalysisOnly
+            )
+            .all(|event| cfg.points[event.point.0].successors.is_empty()
+                && cfg
+                    .holder_edges
+                    .iter()
+                    .all(|edge| edge.from != event.point && edge.to != event.point)));
+        assert!(cfg
+            .assignment_points
+            .iter()
+            .any(|event| event.occurrence == *assignment.occurrence
+                && event.role == ScalarAssignmentPointRole::Assign));
+    }
+}
+
+#[test]
+fn callable_array_selected_overwrites_keep_unselected_elements_and_copied_aliases() {
+    for index in ["0", "1", "slot"] {
+        let text = format!("%%start\nunit() inspect = fn {{ u8 first = 1; u8 second = 2; u8()[2] readers = [fn {{ first }}, fn {{ second }}]; u8()[2] copied = readers; u64 slot = 1; slot; readers[{index}] = fn {{ 3 }}; readers[{index}] = fn {{ 4 }}; copied[0]; copied[1]; }};\ninspect();\n%%end");
+        let parsed = parse_source(source(), text.clone(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program(&parsed.result);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{index}: {diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("inspect")
+            };
+            let ScalarBlockItem::LocalBinding(readers) = &function.body.items[2] else {
+                panic!("readers")
+            };
+            let ScalarBlockItem::LocalBinding(copied) = &function.body.items[3] else {
+                panic!("copied")
+            };
+            let cfg = &function.reference_cfg;
+            let expected = if index == "slot" { 2 } else { 1 };
+            for item in &function.body.items[6..8] {
+                let ScalarBlockItem::Assignment(assignment) = item else {
+                    panic!("overwrite")
+                };
+                let assign = cfg
+                    .assignment_points
+                    .iter()
+                    .find(|point| {
+                        point.occurrence == *assignment.occurrence
+                            && point.role == ScalarAssignmentPointRole::Assign
+                    })
+                    .expect("typed overwrite");
+                let selection = cfg
+                    .assignment_points
+                    .iter()
+                    .find(|point| {
+                        point.occurrence == *assignment.occurrence
+                            && point.role == ScalarAssignmentPointRole::SelectElement
+                    })
+                    .expect("index selection");
+                let CfgPointKind::SelectArrayElement {
+                    target,
+                    index_point,
+                } = &cfg.points[selection.point.0].kind
+                else {
+                    panic!("evaluated index")
+                };
+                assert_eq!(target.binding.declaration_span, readers.name_span);
+                assert_eq!(target.source, source());
+                assert_eq!(cfg.points[index_point.0].source_span.source, source());
+                let edges = cfg
+                    .holder_edges
+                    .iter()
+                    .filter(|edge| edge.from == assign.point)
+                    .collect::<Vec<_>>();
+                assert!(
+                    edges.len() >= expected && edges.len() % expected == 0,
+                    "{index}: {}",
+                    edges.len()
+                );
+                for edge in edges {
+                    let selected = edge
+                        .actions
+                        .iter()
+                        .find_map(|action| match action {
+                            CallableHolderAction::SelectElement { selected, .. } => Some(selected),
+                            _ => None,
+                        })
+                        .expect("selected element");
+                    assert!(edge.actions.iter().any(|action| matches!(action, CallableHolderAction::Drop { holder: CallableHolderPlace::Projection(place), .. } if place == selected)));
+                    assert!(edge.actions.iter().any(|action| matches!(action, CallableHolderAction::Move { to: CallableHolderPlace::Projection(place), .. } if place == selected)));
+                    for relation in &edge.before {
+                        for holder in &relation.holders {
+                            if let CallableHolderPlace::Projection(place) = holder {
+                                if (place.binding.declaration_span == readers.name_span
+                                    && place != selected)
+                                    || place.binding.declaration_span == copied.name_span
+                                {
+                                    assert!(
+                                        edge.after
+                                            .iter()
+                                            .any(|after| after.environment == relation.environment
+                                                && after.holders.contains(holder)),
+                                        "unselected or copied element lost"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let restored: ScalarReferenceCfg =
+                serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+            assert_eq!(restored.holder_edges, cfg.holder_edges);
+            assert_eq!(restored.assignment_points, cfg.assignment_points);
+        }
+    }
+}
+
+#[test]
+fn callable_array_dynamic_index_write_preserves_borrow_conflict_span() {
+    let text = "%%start\nunit() inspect = fn { u8()[2] readers = [fn { 1 }, fn { 2 }]; u64 slot = 0; slot; *(u8()[2]) borrowed = &readers; readers[slot] = fn { 3 }; borrowed; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let write = text.find("readers[slot] =").unwrap() as u32;
+    let borrow = text.find("&readers").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span.range.start >= write
+                    && diagnostic.labels[0].span.range.end <= write + "readers[slot]".len() as u32
+                    && diagnostic
+                        .labels
+                        .iter()
+                        .skip(1)
+                        .any(|label| label.span.range.start == borrow)),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn fixed_callable_element_overwrite_reports_conflicting_loan_on_both_targets() {
+    let text = include_str!(
+        "../../../../tests/fixtures/build/callable-array-local/project/src/invalid_fixed_overwrite.w"
+    );
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let write = text.find("fixed[0] = fn { second }").unwrap() as u32;
+    let loan = text.find("&fixed[0]").unwrap() as u32;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range.start == write
+                        && diagnostic
+                            .labels
+                            .iter()
+                            .skip(1)
+                            .any(|label| label.span.range.start == loan)
+                }),
+                "{diagnostics:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn callable_array_selected_holders_follow_branch_and_loop_paths() {
+    let text = "%%start\nunit() inspect = fn { u8 first = 1; u8 second = 2; u8()[2] readers = [fn { first }, fn { second }]; u64 slot = 0; slot; bool again = true; if (again) { readers[slot] = fn { first }; } else { readers[slot] = fn { second }; }; while (again) { readers[slot] = fn { 3 }; again = false; }; readers[0]; readers[1]; };\ninspect();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        let cfg = &function.reference_cfg;
+        let selected = cfg
+            .assignment_points
+            .iter()
+            .filter(|event| event.role == ScalarAssignmentPointRole::SelectElement)
+            .collect::<Vec<_>>();
+        assert_eq!(selected.len(), 3);
+        for selection in selected {
+            let assigned = cfg
+                .assignment_points
+                .iter()
+                .find(|event| {
+                    event.occurrence == selection.occurrence
+                        && event.role == ScalarAssignmentPointRole::Assign
+                })
+                .expect("connected branch or loop assignment");
+            let edges = cfg
+                .holder_edges
+                .iter()
+                .filter(|edge| edge.from == assigned.point)
+                .collect::<Vec<_>>();
+            assert!(!edges.is_empty());
+            for edge in edges {
+                let selected_place = edge
+                    .actions
+                    .iter()
+                    .find_map(|action| match action {
+                        CallableHolderAction::SelectElement { selected, .. } => Some(selected),
+                        _ => None,
+                    })
+                    .expect("selected path");
+                assert!(edge.actions.iter().any(|action| matches!(action, CallableHolderAction::Drop { holder: CallableHolderPlace::Projection(place), .. } if place == selected_place)));
+                assert!(edge.actions.iter().any(|action| matches!(action, CallableHolderAction::Move { to: CallableHolderPlace::Projection(place), .. } if place == selected_place)));
+            }
+        }
+    }
+}
+
+#[test]
+fn callable_array_parameter_transport_shape() {
+    let text = "%%start\nunit((u8())[], u64) consume = fn(items, index) { items; index; };\nunit() inspect = fn { (u8())[2] fixed = [fn { 1 }, fn { 2 }]; (u8())[] owned = fixed; consume(owned, 1); };\ninspect();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let ScalarItem::Function(consume) = &items[0] else {
+            panic!("consume")
+        };
+        let ScalarType::Callable { parameters, .. } = &consume.signature else {
+            panic!("callable signature")
+        };
+        assert!(
+            matches!(&parameters[0], ScalarType::RuntimeArray { element, .. } if matches!(element.as_ref(), ScalarType::Callable { .. }))
+        );
+        assert!(consume
+            .reference_cfg
+            .backing_input_paths
+            .iter()
+            .flatten()
+            .any(|fact| {
+                fact.owner.declaration_span == consume.parameter_spans[0]
+                    && matches!(&fact.length, RuntimeArrayLengthFact::Fixed { value: 2, .. })
+                    && fact.callable_family.len() == 1
+                    && fact.callable_family[0].elements.len() == 2
+                    && fact.callable_family[0].elements[0].environment
+                        != fact.callable_family[0].elements[1].environment
+            }));
+        let ScalarItem::Function(inspect) = &items[1] else {
+            panic!("inspect")
+        };
+        let ScalarBlockItem::LocalBinding(owned) = &inspect.body.items[1] else {
+            panic!("owned")
+        };
+        assert!(
+            matches!(&owned.declared_type, ScalarType::RuntimeArray { element, .. } if matches!(element.as_ref(), ScalarType::Callable { .. }))
+        );
+        let ScalarBlockItem::LocalBinding(fixed) = &inspect.body.items[0] else {
+            panic!("fixed")
+        };
+        let cfg = &inspect.reference_cfg;
+        let facts = cfg
+            .points
+            .iter()
+            .flat_map(|point| &point.possible_backings)
+            .filter(|fact| {
+                fact.owner.declaration_span == fixed.name_span
+                    || fact.owner.declaration_span == owned.name_span
+            })
+            .collect::<Vec<_>>();
+        assert!(facts
+            .iter()
+            .any(|fact| fact.owner.declaration_span == fixed.name_span
+                && fact.kind == RuntimeBackingKind::FixedValue
+                && matches!(&fact.length, RuntimeArrayLengthFact::Fixed { value: 2, .. })));
+        assert!(facts
+            .iter()
+            .any(|fact| fact.owner.declaration_span == owned.name_span
+                && fact.kind == RuntimeBackingKind::OwnedAllocation
+                && matches!(&fact.length, RuntimeArrayLengthFact::Fixed { value: 2, .. })));
+        assert_ne!(
+            facts
+                .iter()
+                .find(|fact| fact.owner.declaration_span == fixed.name_span)
+                .unwrap()
+                .value,
+            facts
+                .iter()
+                .find(|fact| fact.owner.declaration_span == owned.name_span)
+                .unwrap()
+                .value
+        );
+        let original = facts
+            .iter()
+            .find(|fact| fact.owner.declaration_span == fixed.name_span)
+            .expect("fixed family");
+        let copied = facts
+            .iter()
+            .find(|fact| fact.owner.declaration_span == owned.name_span)
+            .expect("copied family");
+        assert_eq!(original.callable_family.len(), 1);
+        assert_eq!(copied.callable_family.len(), 1);
+        assert_eq!(original.callable_family[0].elements.len(), 2);
+        assert!(original.callable_family[0]
+            .index_relations
+            .iter()
+            .any(|relation| matches!(relation.relation, CallableArrayIndexRelation::Distinct)));
+        assert_eq!(copied.callable_family[0].elements.len(), 2);
+        for (before, after) in original.callable_family[0]
+            .elements
+            .iter()
+            .zip(&copied.callable_family[0].elements)
+        {
+            assert_eq!(before.environment, after.environment);
+            assert_eq!(before.place.binding, original.owner);
+            assert_eq!(after.place.binding, copied.owner);
+        }
+        let call = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Call { output: 0, .. })
+                    && point.source_span.range.start
+                        == text.find("consume(owned, 1)").unwrap() as u32
+            })
+            .expect("call");
+        assert!(call
+            .backing_argument_paths
+            .iter()
+            .flatten()
+            .any(|arg| arg.position == 0
+                && arg.backing.owner.declaration_span == consume.parameter_spans[0]
+                && arg.backing.callable_family.len() == 1
+                && arg.backing.callable_family[0].elements.len() == 2
+                && matches!(
+                    &arg.backing.length,
+                    RuntimeArrayLengthFact::Fixed { value: 2, .. }
+                )));
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .points,
+            cfg.points
+        );
+    }
+}
+
+#[test]
+fn callable_array_family_forwarded_return_keeps_element_relations() {
+    let text = "%%start\n(u8())[]((u8())[], u64) relay = fn(items, unrelated) { unrelated; items };\nunit() inspect = fn { (u8())[2] fixed = [fn { 1 }, fn { 2 }]; (u8())[] owned = fixed; (u8())[] returned = relay(owned, 99); returned; };\ninspect();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(relay) = &items[0] else {
+            panic!("relay")
+        };
+        let inspect = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let ScalarBlockItem::LocalBinding(owned) = &inspect.body.items[1] else {
+            panic!("owned")
+        };
+        let ScalarBlockItem::LocalBinding(returned) = &inspect.body.items[2] else {
+            panic!("returned")
+        };
+        let cfg = &inspect.reference_cfg;
+        let call = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Call { output: 0, .. })
+                    && point.source_span.range.start
+                        == text.find("relay(owned, 99)").unwrap() as u32
+            })
+            .expect("call");
+        let argument = &call.backing_argument_paths[0][0].backing;
+        assert_eq!(argument.owner.declaration_span, relay.parameter_spans[0]);
+        assert!(matches!(
+            argument.length,
+            RuntimeArrayLengthFact::Fixed { value: 2, .. }
+        ));
+        assert_eq!(argument.callable_family[0].elements.len(), 2);
+        let partitions = &argument.callable_family[0].partitions;
+        assert_eq!(partitions.len(), 1);
+        let partition = &partitions[0];
+        assert_eq!(partition.representatives.len(), 2);
+        assert_eq!(partition.relations.len(), 1);
+        assert_eq!(
+            partition.relations[0].relation,
+            CallableArrayIndexRelation::Distinct
+        );
+        assert_eq!(
+            partition.remainder.alternatives,
+            vec![CallableCellCaseFact::Uninitialized]
+        );
+        for representative in &partition.representatives {
+            assert!(matches!(
+                representative.key,
+                CallableIndexKeyFact::Constant(_)
+            ));
+            assert_eq!(representative.cell.alternatives.len(), 1);
+            let CallableCellCaseFact::Initialized {
+                backing,
+                owner,
+                environment_origin,
+                capture_paths,
+                loans,
+                ..
+            } = &representative.cell.alternatives[0]
+            else {
+                panic!("initialized cell")
+            };
+            assert_eq!(backing, &argument.value);
+            assert_eq!(owner, &argument.owner);
+            assert!(argument.callable_family[0]
+                .elements
+                .iter()
+                .any(
+                    |element| &element.environment == environment_origin && &element.loans == loans
+                ));
+            assert_eq!(
+                capture_paths,
+                &inspect.reference_cfg.environments[environment_origin.index].capture_paths
+            );
+        }
+        let input = relay
+            .reference_cfg
+            .backing_input_paths
+            .iter()
+            .flatten()
+            .find(|fact| fact.owner.declaration_span == relay.parameter_spans[0])
+            .expect("parameter family");
+        assert_eq!(input.value, argument.value);
+        assert_eq!(input.length, argument.length);
+        assert_eq!(input.callable_family, argument.callable_family);
+        let result = cfg
+            .points
+            .iter()
+            .flat_map(|point| &point.possible_backings)
+            .find(|fact| fact.owner.declaration_span == returned.name_span)
+            .expect("returned family");
+        assert_eq!(result.value, argument.value);
+        assert_eq!(result.length, input.length);
+        assert_eq!(result.callable_family[0].elements.len(), 2);
+        assert_eq!(
+            result.callable_family[0].elements[0].place.binding,
+            result.owner
+        );
+        assert_ne!(result.owner.declaration_span, owned.name_span);
+        let encoded = serde_json::to_string(cfg).unwrap();
+        let restored: ScalarReferenceCfg = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored.points, cfg.points);
+    }
+}
+
+#[test]
+fn callable_array_family_moves_through_callable_field() {
+    let text = "%%start\nstruct Dispatch { (u8())[]((u8())[], u64) run; }\nunit() inspect = fn { Dispatch runner = { .run = fn(items, unrelated) { unrelated; items }; }; (u8())[2] fixed = [fn { 1 }, fn { 2 }]; (u8())[] owned = fixed; (u8())[] returned = runner.run(owned, 91); returned; };\ninspect();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let inspect = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let call = inspect
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Call { output: 0, .. })
+                    && point.source_span.range.start
+                        == text.find("runner.run(owned, 91)").unwrap() as u32
+            })
+            .expect("field call");
+        assert_eq!(call.backing_argument_paths.len(), 1);
+        assert_eq!(
+            call.backing_argument_paths[0][0].backing.callable_family[0]
+                .elements
+                .len(),
+            2
+        );
+        assert!(matches!(
+            call.backing_argument_paths[0][0].backing.length,
+            RuntimeArrayLengthFact::Fixed { value: 2, .. }
+        ));
+    }
+}
+
+#[test]
+fn callable_runtime_array_allocation_has_typed_receiver() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect function")
+        };
+        let ScalarBlockItem::LocalBinding(binding) = &function.body.items[0] else {
+            panic!("allocation binding")
+        };
+        let ScalarType::RuntimeArray { element, span } = &binding.declared_type else {
+            panic!("runtime array type")
+        };
+        assert!(
+            matches!(element.as_ref(), ScalarType::Callable { parameters, outputs } if parameters.is_empty() && outputs.outputs.len() == 1 && outputs.outputs[0].ty == ScalarType::U8)
+        );
+        assert_eq!(
+            span.start,
+            text.find("(u8())[count] readers").unwrap() as u32
+        );
+        assert_eq!(binding.occurrence.source_span.source, source());
+        assert!(
+            matches!(&binding.receivers[0].allocation_length, Some(ScalarExpression::Name { name, span }) if name == "count" && span.start == text.find("[count]").unwrap() as u32 + 1)
+        );
+    }
+}
+
+#[test]
+fn runtime_callable_array_selected_writes_carry_evaluated_bound() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; readers[1] = fn { 2 }; readers; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(inspect) = &items[0] else {
+            panic!("inspect")
+        };
+        let ScalarBlockItem::LocalBinding(readers) = &inspect.body.items[0] else {
+            panic!("readers")
+        };
+        let fact = inspect
+            .reference_cfg
+            .points
+            .iter()
+            .flat_map(|point| &point.possible_backings)
+            .find(|fact| fact.owner.declaration_span == readers.name_span)
+            .expect("runtime backing");
+        assert!(
+            matches!(&fact.length, RuntimeArrayLengthFact::Evaluated { expression: ScalarExpression::Name { name, .. }, .. } if name == "count")
+        );
+        assert_eq!(fact.callable_family.len(), 1);
+        assert!(fact.callable_family[0].unselected.selected.is_empty());
+    }
+}
+
+#[test]
+fn runtime_callable_array_family_forwards_actual_bound_and_distinct_elements() {
+    let text = "%%start\n(u8())[]((u8())[], u64) relay = fn(items, unrelated) { unrelated; items };\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; readers[1] = fn { 2 }; (u8())[] returned = relay(readers, 99); returned; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(relay) = &items[0] else {
+            panic!("relay")
+        };
+        let ScalarItem::Function(inspect) = &items[1] else {
+            panic!("inspect")
+        };
+        let ScalarBlockItem::LocalBinding(readers) = &inspect.body.items[0] else {
+            panic!("readers")
+        };
+        let ScalarBlockItem::LocalBinding(returned) = &inspect.body.items[3] else {
+            panic!("returned")
+        };
+        let cfg = &inspect.reference_cfg;
+        let call = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Call { output: 0, .. })
+                    && point.source_span.range.start
+                        == text.find("relay(readers, 99)").unwrap() as u32
+            })
+            .expect("relay call");
+        let argument = &call.backing_argument_paths[0][0].backing;
+        let RuntimeArrayLengthFact::Evaluated {
+            occurrence,
+            expression,
+            ..
+        } = &argument.length
+        else {
+            panic!("evaluated array bound")
+        };
+        assert!(matches!(expression, ScalarExpression::Name { name, .. } if name == "count"));
+        assert_eq!(
+            occurrence.range,
+            expression_span(
+                readers.receivers[0]
+                    .allocation_length
+                    .as_ref()
+                    .expect("length expression")
+            )
+        );
+        assert_ne!(occurrence.range.start, text.find("99").unwrap() as u32);
+        assert_eq!(argument.callable_family[0].elements.len(), 2);
+        assert_ne!(
+            argument.callable_family[0].elements[0].environment,
+            argument.callable_family[0].elements[1].environment
+        );
+        let forwarded = relay
+            .reference_cfg
+            .backing_input_paths
+            .iter()
+            .flatten()
+            .find(|fact| fact.owner.declaration_span == relay.parameter_spans[0])
+            .expect("callee input");
+        assert_eq!(forwarded.length, argument.length);
+        assert_eq!(forwarded.value, argument.value);
+        assert_eq!(forwarded.callable_family, argument.callable_family);
+        let result = cfg
+            .points
+            .iter()
+            .flat_map(|point| &point.possible_backings)
+            .find(|fact| fact.owner.declaration_span == returned.name_span)
+            .expect("returned backing");
+        assert_eq!(result.value, argument.value);
+        assert_eq!(result.length, argument.length);
+        assert_eq!(result.callable_family[0].elements.len(), 2);
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.points, cfg.points);
+    }
+}
+
+#[test]
+fn runtime_callable_array_family_loop_tracks_symbolic_index_without_expanding_bound() {
+    let text = "%%start\nunit((u8())[], u64) consume = fn(items, independent) { items; independent; };\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers[0] = fn { 4 }; u64 index = 1; while (index < count) { u8 current = 1; readers[index] = fn { current }; index = index + 1; } consume(readers, 77); };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(consume) = &items[0] else {
+            panic!("consume")
+        };
+        let ScalarItem::Function(inspect) = &items[1] else {
+            panic!("inspect")
+        };
+        let ScalarBlockItem::LocalBinding(readers) = &inspect.body.items[0] else {
+            panic!("readers")
+        };
+        let fact = inspect
+            .reference_cfg
+            .points
+            .iter()
+            .flat_map(|point| &point.possible_backings)
+            .find(|fact| fact.owner.declaration_span == readers.name_span)
+            .expect("array backing");
+        assert!(matches!(
+            fact.length,
+            RuntimeArrayLengthFact::Evaluated { .. }
+        ));
+        assert_eq!(fact.callable_family.len(), 1);
+        let call = inspect
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Call { output: 0, .. })
+                    && point.source_span.range.start
+                        == text.find("consume(readers, 77)").unwrap() as u32
+            })
+            .expect("family transport");
+        let argument = call
+            .backing_argument_paths
+            .iter()
+            .flat_map(|path| path.iter())
+            .map(|input| &input.backing)
+            .find(|backing| backing.callable_family[0].elements.len() == 2)
+            .expect("reachable selected family");
+        assert_eq!(argument.length, fact.length);
+        assert_eq!(argument.callable_family[0].elements.len(), 2);
+        let partition = &argument.callable_family[0].partitions[0];
+        assert_eq!(partition.representatives.len(), 3);
+        assert!(partition.representatives.iter().any(|representative| {
+            matches!(representative.key, CallableIndexKeyFact::Constant(_))
+        }));
+        assert!(partition
+            .remainder
+            .alternatives
+            .contains(&CallableCellCaseFact::Uninitialized));
+        assert!(call.backing_argument_paths.iter().flatten().any(|input| input.backing.callable_family[0].partitions.iter().any(|partition| partition.remainder.alternatives.iter().any(|case| matches!(case,
+            CallableCellCaseFact::Initialized { instance: CallableEnvironmentInstanceClassFact::FreshPerCell, backing, owner, .. }
+                if backing == &input.backing.value && owner == &input.backing.owner
+        )))));
+        assert!(argument.callable_family[0]
+            .elements
+            .iter()
+            .any(|element| matches!(
+                element.instances,
+                CallableArrayEnvironmentInstances::KnownElement
+            )));
+        assert!(argument.callable_family[0]
+            .elements
+            .iter()
+            .any(|element| matches!(
+                element.instances,
+                CallableArrayEnvironmentInstances::PerEvaluatedIndex
+            )));
+        assert_eq!(argument.callable_family[0].unselected.selected.len(), 2);
+        assert!(argument.callable_family[0]
+            .index_relations
+            .iter()
+            .any(|relation| matches!(relation.relation, CallableArrayIndexRelation::MayAlias)));
+        assert!(argument.callable_family[0]
+            .elements
+            .iter()
+            .any(|element| matches!(element.index, CallableArrayIndexFact::Constant(_))));
+        assert!(argument.callable_family[0].elements.iter().any(|element| matches!(element.index, CallableArrayIndexFact::Selected { point, ref occurrence, function_span } if function_span == inspect.span && occurrence.range.start == text.find("readers[index]").unwrap() as u32 + "readers[".len() as u32 && matches!(&inspect.reference_cfg.initial_points[point.0].kind, CfgPointKind::Read { .. }))));
+        assert_ne!(
+            argument.callable_family[0].elements[0].environment,
+            argument.callable_family[0].elements[1].environment
+        );
+        assert!(consume
+            .reference_cfg
+            .backing_input_paths
+            .iter()
+            .flatten()
+            .any(
+                |fact| fact.owner.declaration_span == consume.parameter_spans[0]
+                    && fact.length == argument.length
+                    && fact.callable_family == argument.callable_family
+            ));
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(
+                &serde_json::to_string(&inspect.reference_cfg).unwrap()
+            )
+            .unwrap()
+            .points,
+            inspect.reference_cfg.points
+        );
+    }
+}
+
+#[test]
+fn runtime_callable_array_loop_summarizes_per_cell_instances_from_one_site() {
+    let text = "%%start\nunit((u8())[]) consume = fn(items) { items; };\nunit(u64) inspect = fn(count) { (u8())[count] readers; u64 index = 0; while (index < count) { u8 captured = 7; readers[index] = fn { captured }; index = index + 1; } consume(readers); };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(inspect) = &items[1] else {
+            panic!("inspect")
+        };
+        let call = inspect
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::Call { output: 0, .. })
+                    && point.source_span.range.start
+                        == text.find("consume(readers)").unwrap() as u32
+            })
+            .expect("array call");
+        let facts = call
+            .backing_argument_paths
+            .iter()
+            .flatten()
+            .map(|input| &input.backing)
+            .collect::<Vec<_>>();
+        assert!(!facts.is_empty());
+        assert!(facts.iter().any(|fact| fact.callable_family[0].partitions.iter().any(|partition| partition.remainder.alternatives.iter().any(|case| matches!(case,
+            CallableCellCaseFact::Initialized { instance: CallableEnvironmentInstanceClassFact::FreshPerCell, environment_origin, capture_paths, backing, owner, .. }
+                if environment_origin.literal.range.start == text.find("fn { captured }").unwrap() as u32
+                    && !capture_paths.is_empty() && backing == &fact.value && owner == &fact.owner
+        )))));
+        assert!(facts
+            .iter()
+            .flat_map(|fact| &fact.callable_family[0].partitions)
+            .all(|partition| partition
+                .representatives
+                .iter()
+                .all(|rep| !matches!(rep.key, CallableIndexKeyFact::Evaluated { .. }))));
+        assert!(facts
+            .iter()
+            .all(|fact| fact.callable_family[0].partitions.len() <= 32));
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(&inspect.reference_cfg).unwrap()).unwrap();
+        assert_eq!(restored.points, inspect.reference_cfg.points);
+    }
+}
+
+#[test]
+fn runtime_callable_array_parameter_overwrite_selects_previous_and_new_holder() {
+    let text = "%%start\nunit((u8())[], u64) overwrite = fn(items, index) { index; items[index] = fn { 3 }; items[index] = fn { 4 }; items; };\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; readers[1] = fn { 2 }; u8() kept = readers[1]; overwrite(readers, 1); kept(); };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(overwrite) = &items[0] else {
+            panic!("overwrite")
+        };
+        let cfg = &overwrite.reference_cfg;
+        let input = cfg
+            .backing_input_paths
+            .iter()
+            .flatten()
+            .find(|fact| fact.owner.declaration_span == overwrite.parameter_spans[0])
+            .expect("imported backing");
+        let writes = cfg
+            .assignment_points
+            .iter()
+            .filter(|entry| entry.role == ScalarAssignmentPointRole::Assign)
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 2);
+        for (position, write) in writes.iter().enumerate() {
+            let edges = cfg
+                .holder_edges
+                .iter()
+                .filter(|edge| edge.from == write.point)
+                .collect::<Vec<_>>();
+            assert!(!edges.is_empty());
+            for edge in edges {
+                let selected = edge
+                    .actions
+                    .iter()
+                    .find_map(|action| match action {
+                        CallableHolderAction::SelectElement {
+                            index_point,
+                            selected,
+                            ..
+                        } => Some((index_point, selected)),
+                        _ => None,
+                    })
+                    .expect("one evaluated selected place");
+                let prior = edge
+                    .actions
+                    .iter()
+                    .filter_map(|action| match action {
+                        CallableHolderAction::DropSelected {
+                            holder,
+                            previous,
+                            old,
+                            guard,
+                            span,
+                        } => Some((holder, previous, old, guard, span)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert!(!prior.is_empty(), "selected old slot");
+                for (holder, previous, old, guard, span) in &prior {
+                    assert_eq!(&holder.index_point, selected.0);
+                    assert_eq!(&holder.place, selected.1);
+                    assert_eq!(holder.value, input.value);
+                    assert_eq!(holder.owner, input.owner);
+                    assert_eq!(holder.length, input.length);
+                    assert_eq!(
+                        holder.occurrence.range.start,
+                        text.match_indices("items[index]")
+                            .nth(position)
+                            .expect("indexed write")
+                            .0 as u32
+                            + "items[".len() as u32
+                    );
+                    assert_eq!(span.source, source());
+                    assert_eq!(previous.len(), 1);
+                    assert!(
+                        matches!(old, CallableCellCaseFact::Initialized { environment_origin, .. } if environment_origin == &previous[0].environment)
+                    );
+                    assert!(guard
+                        .iter()
+                        .all(|relation| relation.relation != CallableArrayIndexRelation::MayAlias));
+                }
+                if position == 0 {
+                    assert!(prior.iter().any(|(_, previous, ..)| matches!(previous[0].index, CallableArrayIndexFact::Constant(ref value) if *value == 0.into())));
+                    assert!(prior.iter().any(|(_, previous, ..)| matches!(previous[0].index, CallableArrayIndexFact::Constant(ref value) if *value == 1.into())));
+                } else {
+                    assert!(prior.iter().all(|(_, previous, old, ..)| {
+                        previous[0].environment.literal.range.start == text.find("fn { 3 }").unwrap() as u32
+                            && matches!(old, CallableCellCaseFact::Initialized { environment_origin, .. } if environment_origin.literal.range.start == text.find("fn { 3 }").unwrap() as u32)
+                    }), "the second overwrite reads only the first installed holder: {prior:?}");
+                    assert!(!edge.actions.iter().any(|action| matches!(
+                        action,
+                        CallableHolderAction::SkipUninitializedSelected { .. }
+                    )));
+                }
+                assert!(edge.actions.iter().any(|action| matches!(action, CallableHolderAction::MoveSelected { to, .. } if to == prior[0].0)));
+                assert!(!edge
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action, CallableHolderAction::Drop { .. })));
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .holder_edges,
+            cfg.holder_edges
+        );
+    }
+}
+
+#[test]
+fn runtime_callable_array_index_guard_partitions_survive_both_validators() {
+    let text = "%%start\nunit((u8())[], u64) overwrite = fn(items, index) { index; items[index] = fn { 3 }; items; };\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; readers[1] = fn { 2 }; overwrite(readers, 1); };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(overwrite) = &items[0] else {
+            panic!("overwrite")
+        };
+        let cfg = &overwrite.reference_cfg;
+        let facts = cfg
+            .points
+            .iter()
+            .flat_map(|point| &point.possible_backings)
+            .filter(|fact| fact.owner.declaration_span == overwrite.parameter_spans[0])
+            .collect::<Vec<_>>();
+        assert!(!facts.is_empty());
+        assert!(facts
+            .iter()
+            .flat_map(|fact| &fact.callable_family[0].partitions)
+            .any(|partition| partition
+                .relations
+                .iter()
+                .any(|relation| relation.relation == CallableArrayIndexRelation::Equal)));
+        assert!(facts
+            .iter()
+            .flat_map(|fact| &fact.callable_family[0].partitions)
+            .any(|partition| partition
+                .relations
+                .iter()
+                .any(|relation| relation.relation == CallableArrayIndexRelation::Distinct)));
+        let write = cfg
+            .assignment_points
+            .iter()
+            .find(|entry| entry.role == ScalarAssignmentPointRole::Assign)
+            .expect("dynamic write");
+        let actions = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == write.point)
+            .flat_map(|edge| &edge.actions)
+            .collect::<Vec<_>>();
+        for value in [0, 1] {
+            assert!(actions.iter().any(|action| matches!(action,
+                CallableHolderAction::DropSelected { previous, old: CallableCellCaseFact::Initialized { environment_origin, .. }, guard, .. }
+                    if previous.len() == 1
+                        && matches!(&previous[0].index, CallableArrayIndexFact::Constant(index) if index == &value.into())
+                        && environment_origin == &previous[0].environment
+                        && guard.iter().any(|relation| relation.relation == CallableArrayIndexRelation::Equal)
+            )));
+        }
+        assert!(actions.iter().any(|action| matches!(action,
+            CallableHolderAction::SkipUninitializedSelected { holder, guard, span }
+                if holder.length == cfg.backing_input_paths.iter().flatten().find(|fact| fact.owner.declaration_span == overwrite.parameter_spans[0]).expect("backing").length
+                    && guard.iter().any(|relation| relation.relation == CallableArrayIndexRelation::Distinct)
+                    && span.source == cfg.points[write.point.0].source_span.source
+        )));
+        for partition in facts
+            .iter()
+            .flat_map(|fact| &fact.callable_family[0].partitions)
+        {
+            for equal in partition
+                .relations
+                .iter()
+                .filter(|relation| relation.relation == CallableArrayIndexRelation::Equal)
+            {
+                for other in &partition.representatives {
+                    let left = partition.relations.iter().find(|relation| {
+                        (&relation.left == &equal.left && &relation.right == &other.key)
+                            || (&relation.right == &equal.left && &relation.left == &other.key)
+                    });
+                    let right = partition.relations.iter().find(|relation| {
+                        (&relation.left == &equal.right && &relation.right == &other.key)
+                            || (&relation.right == &equal.right && &relation.left == &other.key)
+                    });
+                    if let (Some(left), Some(right)) = (left, right) {
+                        assert_eq!(left.relation, right.relation);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .points,
+            cfg.points
+        );
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .holder_edges,
+            cfg.holder_edges
+        );
+    }
+}
+
+#[test]
+fn runtime_callable_array_indexed_loan_retains_pointee_type() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; u64 index = 0; index; readers[0] = fn { 1 }; *(u8()) borrowed = &readers[index]; index = 1; readers[1] = fn { 2 }; borrowed; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+    let valid = "%%start\n*u8() inspect = fn { u8[2] bytes = [1, 2]; *u8 borrowed = &bytes[1]; bytes[0] = 3; borrowed };\n%%end";
+    let (single, project) = both_reference_functions(valid);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+}
+
+#[test]
+fn checked_callable_binding_and_field_borrows_preserve_callable_type() {
+    let text = "%%start\nstruct Container { u8() value; }\nunit() inspect = fn { u8() item = fn { 1 }; *(u8()) shared = &item; u8() copied = *shared; copied(); *!(u8()) exclusive = &!item; *exclusive = fn { 2 }; Container holder = { .value = fn { 3 }; }; *(u8()) field = &holder.value; u8() field_copy = *field; field_copy(); *!(u8()) field_writer = &!holder.value; *field_writer = fn { 4 }; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        let edges = &function.reference_cfg.holder_edges;
+        assert!(edges.iter().any(|edge| edge.actions.iter().any(|action| matches!(action,
+            CallableHolderAction::Drop { span, .. } if span.range.start == text.find("*exclusive =").unwrap() as u32 + 1
+        ))));
+        assert!(edges.iter().any(|edge| edge.actions.iter().any(|action| matches!(action,
+            CallableHolderAction::Retain { from: CallableHolderPlace::Binding(binding), to: CallableHolderPlace::Temporary(_), .. }
+                if binding.declaration_span.start == text.find("item =").unwrap() as u32
+        ))));
+        assert!(edges
+            .iter()
+            .any(|edge| edge.actions.iter().any(|action| matches!(action,
+                CallableHolderAction::Move { to: CallableHolderPlace::Binding(binding), .. }
+                    if binding.declaration_span.start == text.find("copied =").unwrap() as u32
+            ))));
+    }
+}
+
+#[test]
+fn checked_callable_index_loan_pins_former_value_and_expires_after_last_use() {
+    let conflicting = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; u64 index = 0; index; readers[0] = fn { 1 }; *(u8()) borrowed = &readers[index]; index = 1; readers[0] = fn { 2 }; borrowed; };\n%%end";
+    let (single, project) = both_reference_functions(conflicting);
+    for (diagnostics, source) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Primary
+                        && label.span.source == *source
+                        && label.span.range.start
+                            == conflicting.find("readers[0] = fn { 2 }").unwrap() as u32)
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Secondary
+                        && label.span.source == *source
+                        && label.span.range.start
+                            == conflicting.find("&readers[index]").unwrap() as u32)),
+            "{diagnostics:?}"
+        );
+    }
+    let expired = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; u64 index = 0; index; readers[0] = fn { 1 }; *(u8()) borrowed = &readers[index]; index = 1; borrowed; readers[0] = fn { 2 }; readers; };\n%%end";
+    let (single, project) = both_reference_functions(expired);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(
+                &serde_json::to_string(&function.reference_cfg).unwrap()
+            )
+            .unwrap()
+            .holder_edges,
+            function.reference_cfg.holder_edges
+        );
+    }
+}
+
+#[test]
+fn checked_mutable_callable_index_write_updates_selected_holder() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; u64 index = 0; index; readers[index] = fn { 1 }; *!(u8()) writer = &!readers[index]; *writer = fn { 2 }; u8() copied = *writer; copied(); readers; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        let cfg = &function.reference_cfg;
+        let edge = cfg
+            .holder_edges
+            .iter()
+            .find(|edge| {
+                matches!(
+                    cfg.points[edge.from.0].kind,
+                    CfgPointKind::AssignThrough { .. }
+                )
+            })
+            .expect("checked write");
+        assert!(edge.actions.iter().any(|action| matches!(action,
+            CallableHolderAction::DropSelected { old: CallableCellCaseFact::Initialized { environment_origin, .. }, .. }
+                if environment_origin.literal.range.start == text.find("fn { 1 }").unwrap() as u32
+        )), "{edge:?}");
+        assert!(edge.actions.iter().any(|action| matches!(action,
+            CallableHolderAction::MoveSelected { environment, .. }
+                if environment.literal.range.start == text.find("fn { 2 }").unwrap() as u32
+        )));
+        assert!(cfg.holder_edges.iter().any(|edge| edge.actions.iter().any(|action| matches!(action,
+            CallableHolderAction::RetainCheckedSelected { old: CallableCellCaseFact::Initialized { environment_origin, .. }, .. }
+                if environment_origin.literal.range.start == text.find("fn { 2 }").unwrap() as u32
+        ))));
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .holder_edges,
+            cfg.holder_edges
+        );
+    }
+}
+
+#[test]
+fn checked_callable_index_loan_rejects_unknown_alias_with_original_span() {
+    let text = "%%start\nunit((u8())[], u64, u64) inspect = fn(items, first, second) { first; second; *(u8()) borrowed = &items[first]; items[second] = fn { 1 }; borrowed; };\nunit(u64, u64, u64) run = fn(count, first, second) { (u8())[count] readers; inspect(readers, first, second); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (diagnostics, source) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Primary
+                        && label.span.source == *source
+                        && label.span.range.start
+                            == text.find("items[second] =").unwrap() as u32
+                                + "items[".len() as u32)
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Secondary
+                        && label.span.source == *source
+                        && label.span.range.start == text.find("&items[first]").unwrap() as u32)),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn checked_callable_indexed_reference_cannot_escape_local_backing() {
+    let text = "%%start\n*(u8())(u64) escape = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; *(u8()) borrowed = &readers[0]; borrowed };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (diagnostics, source) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Primary
+                        && label.span.source == *source
+                        && label.span.range.start == text.rfind("borrowed }").unwrap() as u32)),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn checked_callable_indexed_reference_return_tracks_backing_after_index_reassignment() {
+    let text = "%%start\n*(u8())(u64) escape = fn(count) { (u8())[count] readers; u64 index = 0; index; readers[0] = fn { 1 }; *(u8()) borrowed = &readers[index]; index = 1; borrowed };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (diagnostics, source) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Primary
+                        && label.span.source == *source
+                        && label.span.range.start == text.rfind("borrowed }").unwrap() as u32)
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Secondary
+                        && label.span.source == *source
+                        && label.span.range.start == text.find("&readers[index]").unwrap() as u32)),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn checked_callable_indexed_reference_capture_cannot_escape_local_backing() {
+    let text = "%%start\n(u8())(u64) escape = fn(count) { (u8())[count] readers; u64 index = 0; index; readers[0] = fn { 1 }; *(u8()) borrowed = &readers[index]; index = 1; u8() callback = fn() { u8() copied = *borrowed; copied() }; callback };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (diagnostics, source) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Primary
+                        && label.span.source == *source
+                        && label.span.range.start == text.rfind("callback }").unwrap() as u32)
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Secondary
+                        && label.span.source == *source
+                        && label.span.range.start == text.find("&readers[index]").unwrap() as u32)),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn checked_callable_index_loan_serializes_actual_parameter_backing_and_length() {
+    let text = "%%start\nunit((u8())[], u64, u64) inspect = fn(items, index, unrelated) { index; unrelated; *(u8()) borrowed = &items[index]; borrowed; items; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        let cfg = &function.reference_cfg;
+        let borrowed = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Borrow { .. }))
+            .expect("indexed borrow");
+        let backing = borrowed
+            .possible_backings
+            .iter()
+            .find(|backing| backing.owner.declaration_span == function.parameter_spans[0])
+            .expect("parameter backing");
+        assert!(
+            matches!(&backing.length, RuntimeArrayLengthFact::Parameter { binding } if binding.declaration_span == function.parameter_spans[0])
+        );
+        assert!(backing.callable_family.iter().flat_map(|family| &family.partitions).flat_map(|partition| &partition.representatives).flat_map(|rep| &rep.anchors).any(|anchor| matches!(anchor,
+            CallableIndexAnchorFact::ActiveLoan { loan, backing: value, owner, length, origin }
+                if loan.creation_span.start == text.find("&items[index]").unwrap() as u32
+                    && value == &backing.value && owner == &backing.owner && length == &backing.length
+                    && origin.range.start == loan.creation_span.start
+        )));
+        assert!(backing
+            .callable_family
+            .iter()
+            .flat_map(|family| &family.partitions)
+            .flat_map(|partition| &partition.representatives)
+            .all(|representative| !matches!(
+                representative.key,
+                CallableIndexKeyFact::Constant(_)
+            )));
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .points,
+            cfg.points
+        );
+    }
+}
+
+#[test]
+fn checked_callable_former_index_loan_survives_branch_and_loop_without_sibling_conflict() {
+    let text = "%%start\nunit(u64, bool) inspect = fn(count, choose) { (u8())[count] readers; u64 index = 0; index; readers[0] = fn { 1 }; *(u8()) borrowed = &readers[index]; if (choose) { index = 1; readers[1] = fn { 2 }; } else { index = 2; readers[2] = fn { 3 }; }; while (index < count) { borrowed; index = index + 1; } readers[1] = fn { 4 }; borrowed; readers; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        let cfg = &function.reference_cfg;
+        assert!(cfg
+            .points
+            .iter()
+            .any(|point| matches!(point.kind, CfgPointKind::LoopTest { .. })));
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .points,
+            cfg.points
+        );
+    }
+}
+
+#[test]
+fn checked_mutable_callable_loan_writes_the_former_index_after_variable_changes() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; u64 index = 0; index; readers[0] = fn { 1 }; *!(u8()) writer = &!readers[index]; index = 1; *writer = fn { 2 }; readers[1] = fn { 3 }; u8() copied = *writer; copied(); readers; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        let cfg = &function.reference_cfg;
+        assert!(cfg.holder_edges.iter().filter(|edge| matches!(cfg.points[edge.from.0].kind, CfgPointKind::AssignThrough { .. }))
+            .flat_map(|edge| &edge.actions).any(|action| matches!(action,
+                CallableHolderAction::DropSelected { old: CallableCellCaseFact::Initialized { environment_origin, .. }, .. }
+                    if environment_origin.literal.range.start == text.find("fn { 1 }").unwrap() as u32)));
+        assert!(cfg.holder_edges.iter().flat_map(|edge| &edge.actions).any(|action| matches!(action,
+            CallableHolderAction::RetainCheckedSelected { old: CallableCellCaseFact::Initialized { environment_origin, .. }, .. }
+                if environment_origin.literal.range.start == text.find("fn { 2 }").unwrap() as u32)));
+    }
+}
+
+#[test]
+fn checked_callable_constant_index_read_retains_selected_holder() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; *(u8()) borrowed = &readers[0]; u8() copied = *borrowed; copied(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        assert!(function.reference_cfg.holder_edges.iter().flat_map(|edge| &edge.actions).any(|action| matches!(action,
+            CallableHolderAction::RetainCheckedSelected { old: CallableCellCaseFact::Initialized { environment_origin, .. }, .. }
+                if environment_origin.literal.range.start == text.find("fn { 1 }").unwrap() as u32)));
+    }
+}
+
+#[test]
+fn constant_index_selected_projection_keeps_connected_install_and_capture() {
+    for text in [
+        "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; u8() invoke = fn { u8() copied = readers[0]; copied() }; invoke(); };\n%%end",
+        "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; u8() callback = fn { 1 }; readers[0] = callback; u8() invoke = fn { u8() copied = readers[0]; copied() }; invoke(); };\n%%end",
+    ] {
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items.iter().find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+            _ => None,
+        }).expect("inspect");
+        let cfg = &function.reference_cfg;
+        let assignment = cfg.holder_edges.iter().filter(|edge| {
+            matches!(cfg.points[edge.from.0].kind, CfgPointKind::Assign { .. })
+                && edge.actions.iter().any(|action| matches!(action,
+                    CallableHolderAction::MoveSelected { to, .. } | CallableHolderAction::RetainSelected { to, .. }
+                    if to.place.projections.iter().any(|projection| matches!(projection, ReferencePlaceProjection::Index(ScalarExpression::Integer { value, .. }) if *value == 0.into()))))
+        }).collect::<Vec<_>>();
+        assert_eq!(assignment.len(), 1, "{text}: {:?}", cfg.holder_edges.iter().filter(|edge| matches!(cfg.points[edge.from.0].kind, CfgPointKind::Assign { .. })).collect::<Vec<_>>());
+        let edge = assignment[0];
+        let selected = edge.actions.iter().find_map(|action| match action {
+            CallableHolderAction::MoveSelected { environment, from, to, .. }
+            | CallableHolderAction::RetainSelected { environment, from, to, .. } => Some((environment, from, to)),
+            _ => None,
+        }).expect("selected install");
+        assert!(edge.before.iter().any(|relation| relation.environment == *selected.0 && relation.holders.contains(selected.1)));
+        assert!(edge.actions.iter().any(|action| match action {
+            CallableHolderAction::SkipUninitializedSelected { holder, guard, .. }
+            | CallableHolderAction::DropSelected { holder, guard, .. } =>
+                holder == selected.2 && guard.iter().any(|equality| {
+                    equality.relation == CallableArrayIndexRelation::Equal
+                        && matches!(&equality.left, CallableIndexKeyFact::Constant(index) if *index == 0.into())
+                }),
+            _ => false,
+        }), "{edge:?}");
+        let projections = edge.actions.iter().filter(|action| match action {
+            CallableHolderAction::Move { environment, from, to: CallableHolderPlace::Projection(place), .. }
+            | CallableHolderAction::Retain { environment, from, to: CallableHolderPlace::Projection(place), .. } =>
+                environment == selected.0 && from == selected.1 && place == &selected.2.place,
+            _ => false,
+        }).count();
+        assert_eq!(projections, 1, "{edge:?}");
+        assert!(edge.after.iter().any(|relation| relation.environment == *selected.0 && relation.holders.contains(&CallableHolderPlace::Projection(selected.2.place.clone()))));
+        assert!(cfg.environments.iter().any(|fact| fact.inputs.iter().any(|input| input.binding.declaration_span == selected.2.place.binding.declaration_span && !input.projected.is_empty())));
+    }
+    }
+}
+
+#[test]
+fn checked_mutable_callable_index_loan_excludes_direct_overwrite() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; u64 index = 0; index; readers[0] = fn { 1 }; *!(u8()) writer = &!readers[index]; readers[0] = fn { 2 }; *writer = fn { 3 }; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (diagnostics, source) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Primary
+                        && label.span.source == *source
+                        && label.span.range.start
+                            == text.find("readers[0] = fn { 2 }").unwrap() as u32)
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Secondary
+                        && label.span.source == *source
+                        && label.span.range.start
+                            == text.find("&!readers[index]").unwrap() as u32)),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn checked_callable_expression_index_borrow_keeps_evaluated_selection() {
+    let text = "%%start\nunit(u64, u64) inspect = fn(count, index) { (u8())[count] readers; readers[index + 1] = fn { 1 }; *(u8()) borrowed = &readers[index + 1]; u8() copied = *borrowed; copied(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        assert!(function.reference_cfg.points.iter().any(|point| matches!(
+            point.kind,
+            CfgPointKind::Borrow { .. }
+        ) && point
+            .possible_backings
+            .iter()
+            .flat_map(|backing| &backing.callable_family)
+            .flat_map(|family| &family.partitions)
+            .flat_map(|partition| &partition.representatives)
+            .flat_map(|representative| &representative.anchors)
+            .any(|anchor| matches!(anchor, CallableIndexAnchorFact::ActiveLoan { .. }))));
+        assert!(function.reference_cfg.holder_edges.iter().flat_map(|edge| &edge.actions).any(|action| matches!(action,
+            CallableHolderAction::RetainCheckedSelected { old: CallableCellCaseFact::Initialized { environment_origin, .. }, .. }
+                if environment_origin.literal.range.start == text.find("fn { 1 }").unwrap() as u32)));
+    }
+}
+
+#[test]
+fn callable_runtime_array_scope_exit_has_one_connected_element_walk() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        let cfg = &function.reference_cfg;
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == function.body.span
+            })
+            .expect("connected block exit");
+        let walks = cfg
+            .holder_exits
+            .iter()
+            .filter(|edge| edge.from == exit.id)
+            .flat_map(|edge| &edge.actions)
+            .filter(|action| matches!(action, CallableHolderAction::DropArrayElements { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(walks.len(), 1);
+    }
+}
+
+#[test]
+fn callable_runtime_array_explicit_free_walks_before_release_and_respects_live_loan() {
+    let valid = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; *(u8()) borrowed = &readers[0]; borrowed; unsafe { core.free(&readers); }; };\n%%end";
+    let (single, project) = both_reference_functions(valid);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        let cfg = &function.reference_cfg;
+        let release = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Release { .. }))
+            .expect("free");
+        assert_eq!(
+            cfg.holder_edges
+                .iter()
+                .filter(|edge| edge.from == release.id)
+                .flat_map(|edge| &edge.actions)
+                .filter(|action| matches!(action, CallableHolderAction::DropArrayElements { .. }))
+                .count(),
+            1
+        );
+        assert!(cfg
+            .holder_exits
+            .iter()
+            .filter(|edge| matches!(cfg.points[edge.from.0].kind, CfgPointKind::ScopeExit))
+            .flat_map(|edge| &edge.actions)
+            .all(|action| !matches!(action, CallableHolderAction::DropArrayElements { .. })));
+    }
+    let invalid = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; *(u8()) borrowed = &readers[0]; unsafe { core.free(&readers); }; borrowed; };\n%%end";
+    let (single, project) = both_reference_functions(invalid);
+    for (diagnostics, source) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Primary
+                        && label.span.source == *source
+                        && label.span.range.start
+                            == invalid.find("core.free(&readers)").unwrap() as u32)
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Secondary
+                        && label.span.source == *source
+                        && label.span.range.start == invalid.find("&readers[0]").unwrap() as u32)),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn callable_runtime_array_whole_assignment_cleans_old_backing_once() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; (u8())[count] replacement; replacement[0] = fn { 2 }; readers = replacement; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        let cfg = &function.reference_cfg;
+        let old = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Backing { target, transfer: RuntimeBackingTransfer::Allocate, .. }
+            if target.declaration_span.start == text.find("readers;").unwrap() as u32)).expect("original backing");
+        let original = &old.possible_backings[0];
+        let actions = cfg.holder_edges.iter().filter(|edge| matches!(&cfg.points[edge.from.0].kind, CfgPointKind::Backing { target, transfer: RuntimeBackingTransfer::Move { .. }, .. } if target.declaration_span.start == text.find("readers;").unwrap() as u32))
+            .flat_map(|edge| &edge.actions).collect::<Vec<_>>();
+        assert_eq!(actions.iter().filter(|action| matches!(action,
+            CallableHolderAction::DropArrayElements { backing, .. } if backing.value == original.value
+        )).count(), 1, "{actions:?}");
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == function.body.span
+            })
+            .expect("scope exit");
+        assert!(cfg.holder_exits.iter().filter(|edge| edge.from == exit.id).flat_map(|edge| &edge.actions).any(|action| matches!(action,
+            CallableHolderAction::DropArrayElements { backing, .. } if backing.value != original.value
+        )));
+    }
+}
+
+#[test]
+fn callable_runtime_array_return_and_parameter_forward_transfer_one_cleanup() {
+    let text = "%%start\n(u8())[](u64) create = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; readers };\nunit((u8())[]) consume = fn(items) { items; };\nunit(u64) inspect = fn(count) { (u8())[] forwarded = create(count); consume(forwarded); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let functions = items
+            .iter()
+            .map(|item| match item {
+                ScalarItem::Function(function) => function,
+                _ => panic!("function"),
+            })
+            .collect::<Vec<_>>();
+        assert!(functions[0]
+            .reference_cfg
+            .holder_exits
+            .iter()
+            .flat_map(|edge| &edge.actions)
+            .all(|action| !matches!(action, CallableHolderAction::DropArrayElements { .. })));
+        assert!(functions[2]
+            .reference_cfg
+            .holder_exits
+            .iter()
+            .flat_map(|edge| &edge.actions)
+            .all(|action| !matches!(action, CallableHolderAction::DropArrayElements { .. })));
+        let walks = functions[1]
+            .reference_cfg
+            .holder_exits
+            .iter()
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::DropArrayElements { backing, .. } => Some(backing),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(walks.len(), 1);
+        let returned = functions[0]
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. }))
+            .expect("returned backing");
+        assert!(returned.possible_backings.iter().any(|backing|
+            matches!(&walks[0].value.position, RuntimeValuePosition::CallOutput { lineage, .. } if **lineage == backing.value)
+                && backing.length == walks[0].length));
+    }
+}
+
+#[test]
+fn callable_fixed_widening_keeps_independent_backing_cleanup_and_shared_cells() {
+    let text = "%%start\nunit() inspect = fn { (u8())[2] fixed = [fn { 1 }, fn { 2 }]; (u8())[] copied = fixed; fixed[0]; copied[1]; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        let cfg = &function.reference_cfg;
+        let copy = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Backing {
+                        transfer: RuntimeBackingTransfer::CopyFixed { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("fixed copy");
+        let source = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Backing { target, transfer: RuntimeBackingTransfer::CreateFixed, .. }
+            if target.declaration_span.start == text.find("fixed =").unwrap() as u32)).expect("fixed source");
+        assert_ne!(
+            source.possible_backings[0].value,
+            copy.possible_backings[0].value
+        );
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == function.body.span
+            })
+            .expect("exit");
+        let cleanup = cfg
+            .holder_exits
+            .iter()
+            .filter(|edge| edge.from == exit.id)
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::DropArrayElements { backing, .. } => Some(backing),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(cleanup[0].value, copy.possible_backings[0].value);
+        assert!(cfg.holder_edges.iter().filter(|edge| edge.from == copy.id)
+            .flat_map(|edge| &edge.actions).any(|action| matches!(action,
+                CallableHolderAction::RetainArrayElements { source, backing, .. }
+                    if source.value == cfg.points.iter().find(|point| matches!(point.kind, CfgPointKind::Backing { transfer: RuntimeBackingTransfer::CreateFixed, .. })).expect("fixed").possible_backings[0].value
+                        && backing.value == copy.possible_backings[0].value)));
+        assert!(cleanup[0].callable_family[0]
+            .partitions
+            .iter()
+            .any(
+                |partition| partition.representatives.iter().any(|representative| {
+                    representative.cell.alternatives.iter().any(|case| {
+                        matches!(case, CallableCellCaseFact::Initialized { environment_origin, .. }
+                if environment_origin.literal.range.start == text.find("fn { 1 }").unwrap() as u32)
+                    })
+                })
+            ));
+    }
+}
+
+#[test]
+fn callable_array_branch_and_loop_exit_walks_correlated_per_slot_cases_once() {
+    let text = "%%start\nunit(u64, bool) inspect = fn(count, skip) { (u8())[count] readers; if (skip) { u8 untouched = 0; untouched; } else { u64 index = 0; while (index < count) { u8 captured = 1; readers[index] = fn { captured }; index = index + 1; } }; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        let cfg = &function.reference_cfg;
+        let root = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == function.body.span
+            })
+            .expect("root exit");
+        assert!(cfg
+            .holder_edges
+            .iter()
+            .filter(
+                |edge| matches!(cfg.points[edge.from.0].kind, CfgPointKind::ScopeExit)
+                    && edge.from != root.id
+            )
+            .flat_map(|edge| &edge.actions)
+            .all(|action| !matches!(action, CallableHolderAction::DropArrayElements { .. })));
+        let walks = cfg
+            .holder_exits
+            .iter()
+            .filter(|exit| exit.from == root.id)
+            .flat_map(|exit| &exit.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::DropArrayElements { backing, .. } => Some(backing),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!walks.is_empty());
+        assert!(walks
+            .iter()
+            .any(|backing| backing.callable_family[0]
+                .partitions
+                .iter()
+                .any(|partition| partition
+                    .remainder
+                    .alternatives
+                    .contains(&CallableCellCaseFact::Uninitialized))));
+        assert!(walks.iter().any(|backing| backing.callable_family[0].partitions.iter().any(|partition| partition.remainder.alternatives.iter().any(|case| matches!(case,
+            CallableCellCaseFact::Initialized { environment_origin, instance: CallableEnvironmentInstanceClassFact::FreshPerCell, backing: value, owner, .. }
+                if environment_origin.literal.range.start == text.find("fn { captured }").unwrap() as u32
+                    && value == &backing.value && owner == &backing.owner)))));
+        for backing in walks {
+            assert_eq!(backing.callable_family.len(), 1);
+            assert!(backing.callable_family[0]
+                .partitions
+                .iter()
+                .all(|partition| !partition.remainder.alternatives.is_empty()));
+        }
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .holder_exits,
+            cfg.holder_exits
+        );
+    }
+}
+
+#[test]
+fn callable_array_aggregate_output_keeps_one_projected_cleanup() {
+    let text = "%%start\nstruct Bundle { (u8())[] elements; }\nBundle(u64) create = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; Bundle packed = { .elements = readers; }; packed };\nunit(u64) inspect = fn(count) { Bundle received = create(count); received.elements[0]; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let create = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "create" => Some(function),
+                _ => None,
+            })
+            .expect("create");
+        assert!(create
+            .reference_cfg
+            .holder_exits
+            .iter()
+            .flat_map(|edge| &edge.actions)
+            .all(|action| !matches!(action, CallableHolderAction::DropArrayElements { .. })));
+        let inspect = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let cfg = &inspect.reference_cfg;
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == inspect.body.span
+            })
+            .expect("exit");
+        let walks = cfg
+            .holder_exits
+            .iter()
+            .filter(|edge| edge.from == exit.id)
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::DropArrayElements { backing, .. } => Some(backing),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(walks.len(), 1);
+        assert!(walks[0].callable_family[0].partitions.iter().any(|partition| partition.representatives.iter().any(|representative|
+            representative.cell.alternatives.iter().any(|case| matches!(case, CallableCellCaseFact::Initialized { backing: value, owner, .. }
+                if value == &walks[0].value && owner == &walks[0].owner)))));
+    }
+}
+
+#[test]
+fn callable_array_nested_aggregate_output_keeps_projected_path() {
+    let text = "%%start\nstruct Inner { (u8())[] data; }\nstruct Outer { Inner nested; }\nOuter(u64) create = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; Inner inner_value = { .data = readers; }; Outer outer_value = { .nested = inner_value; }; outer_value };\nunit(u64) inspect = fn(count) { Outer received = create(count); received; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let inspect = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let cfg = &inspect.reference_cfg;
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == inspect.body.span
+            })
+            .expect("exit");
+        assert!(cfg.holder_exits.iter().filter(|edge| edge.from == exit.id)
+            .flat_map(|edge| &edge.actions).any(|action| matches!(action,
+                CallableHolderAction::DropArrayElements { backing, .. } if backing.callable_family.len() == 1)));
+        assert!(cfg
+            .backing_output_contracts
+            .iter()
+            .any(|contract| contract.output == 0 && contract.projections.len() == 2));
+    }
+}
+
+#[test]
+fn callable_array_two_fields_two_outputs_keep_distinct_cleanup_contracts() {
+    let text = "%%start\nstruct Pair { (u8())[] left; (u8())[] right; }\n(Pair, Pair)(u64) create = fn(count) { (u8())[count] a; a[0] = fn { 1 }; (u8())[count] b; b[0] = fn { 2 }; (u8())[count] c; c[0] = fn { 3 }; (u8())[count] d; d[0] = fn { 4 }; Pair first_value = { .left = a; .right = b; }; Pair second_value = { .left = c; .right = d; }; first_value, second_value };\nunit(u64) inspect = fn(count) { Pair first_result, Pair second_result = create(count); first_result; second_result; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let inspect = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let cfg = &inspect.reference_cfg;
+        let contracts = cfg
+            .backing_output_contracts
+            .iter()
+            .filter(|contract| {
+                contract.declaration_span.start == text.find("create =").unwrap() as u32
+                    && !contract.projections.is_empty()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contracts.len(), 4);
+        assert_eq!(
+            contracts
+                .iter()
+                .filter(|contract| contract.output == 0)
+                .count(),
+            2
+        );
+        assert_eq!(
+            contracts
+                .iter()
+                .filter(|contract| contract.output == 1)
+                .count(),
+            2
+        );
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == inspect.body.span
+            })
+            .expect("exit");
+        let walks = cfg
+            .holder_exits
+            .iter()
+            .filter(|edge| edge.from == exit.id)
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::DropArrayElements { backing, .. } => Some(backing),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(walks.len(), 4);
+        for (index, left) in walks.iter().enumerate() {
+            assert!(walks
+                .iter()
+                .skip(index + 1)
+                .all(|right| left.value != right.value));
+            assert!(!left.callable_family.is_empty());
+        }
+        assert!(cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+            .all(|point| point.possible_backings.is_empty()));
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .holder_exits,
+            cfg.holder_exits
+        );
+    }
+}
+
+#[test]
+fn callable_array_returned_field_overwrite_cleans_only_replaced_projection() {
+    let text = "%%start\nstruct Pair { (u8())[] left; (u8())[] right; }\nPair(u64) create = fn(count) { (u8())[count] a; a[0] = fn { 1 }; (u8())[count] b; b[0] = fn { 2 }; Pair packed = { .left = a; .right = b; }; packed };\nunit(u64) inspect = fn(count) { Pair received = create(count); (u8())[count] replacement; replacement[0] = fn { 3 }; received.left = replacement; received.right; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let inspect = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let cfg = &inspect.reference_cfg;
+        let replaced = cfg.holder_edges.iter().filter(|edge| matches!(&cfg.points[edge.from.0].kind, CfgPointKind::Assign { target, .. } if target.projections.iter().any(|projection| matches!(projection, ReferencePlaceProjection::Field(_)))))
+            .flat_map(|edge| &edge.actions).filter_map(|action| match action {
+                CallableHolderAction::DropArrayElements { backing, .. } => Some(backing), _ => None
+            }).collect::<Vec<_>>();
+        assert_eq!(replaced.len(), 1);
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == inspect.body.span
+            })
+            .expect("exit");
+        let remaining = cfg
+            .holder_exits
+            .iter()
+            .filter(|edge| edge.from == exit.id)
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::DropArrayElements { backing, .. } => Some(backing),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining
+            .iter()
+            .all(|backing| backing.value != replaced[0].value));
+        assert!(remaining.iter().any(|backing| backing.callable_family[0].partitions.iter().flat_map(|partition| &partition.representatives)
+            .flat_map(|representative| &representative.cell.alternatives).any(|case| matches!(case,
+                CallableCellCaseFact::Initialized { environment_origin, .. }
+                    if environment_origin.literal.range.start == text.find("fn { 2 }").unwrap() as u32))));
+    }
+}
+
+#[test]
+fn callable_array_aggregate_output_forwarded_through_second_call_keeps_cleanup() {
+    let text = "%%start\nstruct Boxed { (u8())[] data; }\nBoxed(u64) create = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; Boxed packed = { .data = readers; }; packed };\nBoxed(u64) forward = fn(count) { Boxed value = create(count); value };\nunit(u64) inspect = fn(count) { Boxed received = forward(count); received; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let inspect = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let cfg = &inspect.reference_cfg;
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == inspect.body.span
+            })
+            .expect("exit");
+        assert_eq!(
+            cfg.holder_exits
+                .iter()
+                .filter(|edge| edge.from == exit.id)
+                .flat_map(|edge| &edge.actions)
+                .filter(|action| matches!(action, CallableHolderAction::DropArrayElements { .. }))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn callable_array_aggregate_parameter_forward_preserves_projected_owner() {
+    let text = "%%start\nstruct Boxed { (u8())[] data; }\nBoxed(Boxed) forward = fn(input) { input };\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; Boxed original = { .data = readers; }; Boxed received = forward(original); received; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let inspect = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let cfg = &inspect.reference_cfg;
+        assert!(cfg.backing_output_contracts.iter().any(|contract| {
+            contract.declaration_span.start == text.find("forward =").unwrap() as u32
+                && !contract.projections.is_empty()
+                && contract
+                    .sources
+                    .contains(&RuntimeOutputBackingSource::Parameter(0))
+        }));
+        let forward = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "forward" => Some(function),
+                _ => None,
+            })
+            .expect("forward");
+        let input = forward
+            .reference_cfg
+            .projected_backing_input_paths
+            .iter()
+            .flatten()
+            .find(|input| input.position == 0 && input.projections.len() == 1)
+            .expect("projected parameter input");
+        let call = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Call { output: 0, .. }))
+            .expect("call");
+        let argument = call
+            .backing_argument_paths
+            .iter()
+            .flatten()
+            .find(|fact| fact.position == 0 && fact.projections == input.projections)
+            .expect("projected call argument");
+        assert_eq!(input.backing, argument.backing);
+        let returned = call
+            .possible_projected_backings
+            .iter()
+            .find(|fact| fact.place.projections == input.projections)
+            .expect("projected output");
+        assert_eq!(returned.backing.value, argument.backing.value);
+        assert_eq!(returned.backing.length, argument.backing.length);
+        assert_eq!(
+            returned.backing.callable_family.len(),
+            argument.backing.callable_family.len()
+        );
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(
+                &serde_json::to_string(&forward.reference_cfg).unwrap()
+            )
+            .unwrap()
+            .projected_backing_input_paths,
+            forward.reference_cfg.projected_backing_input_paths
+        );
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == inspect.body.span
+            })
+            .expect("exit");
+        let cleanups = cfg
+            .holder_exits
+            .iter()
+            .filter(|edge| edge.from == exit.id)
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::DropArrayElements { backing, .. } => Some(backing),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cleanups.len(), 1);
+        assert!(matches!(
+            cleanups[0].value.position,
+            RuntimeValuePosition::Local
+        ));
+    }
+}
+
+#[test]
+fn returned_two_environment_capture_drops_outer_cell_owner_once() {
+    let text = "%%start\nstruct copy Captured { u8(u8) write; u8(u64) read; }\nCaptured(u64) make = fn(count) { u8[count] slots; slots[0] = 6; Captured result = { .write = fn(value) { slots[0] = value; slots[0] }; .read = fn(index) { slots[index] }; }; result };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let make = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("make");
+        let cfg = &make.reference_cfg;
+        let scope = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == make.body.span
+            })
+            .expect("body exit");
+        let actions = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == scope.id)
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::DropCaptureCellOwner {
+                    binding,
+                    cell,
+                    backing,
+                    ..
+                } => Some((binding, cell, backing)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actions.len(), 1);
+        assert!(cfg.holder_edges.iter().filter(|edge| edge.from == scope.id)
+            .flat_map(|edge| &edge.actions).all(|action| !matches!(action,
+                CallableHolderAction::DropArrayElements { backing, .. } if backing.value == actions[0].2.value)));
+        assert_eq!(
+            actions[0].0.declaration_span.start,
+            text.find("slots;").unwrap() as u32
+        );
+        assert_eq!(actions[0].1.range, actions[0].0.declaration_span);
+        assert_eq!(
+            actions[0].2.value.creation_span.start,
+            text.find("slots;").unwrap() as u32
+        );
+        assert!(matches!(
+            actions[0].2.length,
+            RuntimeArrayLengthFact::Evaluated { .. }
+        ));
+        assert!(matches!(
+            actions[0].2.owner.kind,
+            ReferenceBindingKind::Captured { .. }
+        ));
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .holder_edges,
+            cfg.holder_edges
+        );
+    }
+}
+
+#[test]
+fn conditional_capture_cell_owner_drops_on_skip_and_taken_exits() {
+    let text = "%%start\nunit(bool, u64) inspect = fn(enabled, count) { u8[count] slots; if (enabled) { u8() read = fn { slots[0] }; read(); }; slots[0]; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let cfg = &function.reference_cfg;
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == function.body.span
+            })
+            .expect("exit");
+        let alternatives = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == exit.id)
+            .map(|edge| {
+                edge.actions
+                    .iter()
+                    .filter(|action| {
+                        matches!(action, CallableHolderAction::DropCaptureCellOwner { .. })
+                    })
+                    .count()
+            })
+            .chain(
+                cfg.holder_exits
+                    .iter()
+                    .filter(|edge| edge.from == exit.id)
+                    .map(|edge| {
+                        edge.actions
+                            .iter()
+                            .filter(|action| {
+                                matches!(action, CallableHolderAction::DropCaptureCellOwner { .. })
+                            })
+                            .count()
+                    }),
+            )
+            .collect::<Vec<_>>();
+        assert!(!alternatives.is_empty());
+        assert!(
+            alternatives.iter().all(|count| *count == 1),
+            "{alternatives:?}"
+        );
+    }
+}
+
+#[test]
+fn loop_capture_cell_owner_drops_once_at_outer_scope_exit() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { u8[count] slots; u64 index = 0; while (index < count) { u8() read = fn { slots[0] }; read(); index = index + 1; } slots[0]; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let cfg = &function.reference_cfg;
+        let body = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == function.body.span
+            })
+            .expect("body exit");
+        assert!(cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == body.id)
+            .map(|edge| &edge.actions)
+            .chain(
+                cfg.holder_exits
+                    .iter()
+                    .filter(|edge| edge.from == body.id)
+                    .map(|edge| &edge.actions)
+            )
+            .all(|actions| actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    CallableHolderAction::DropCaptureCellOwner { .. }
+                ))
+                .count()
+                <= 1));
+        assert!(cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == body.id)
+            .map(|edge| &edge.actions)
+            .chain(
+                cfg.holder_exits
+                    .iter()
+                    .filter(|edge| edge.from == body.id)
+                    .map(|edge| &edge.actions)
+            )
+            .any(|actions| actions.iter().any(|action| matches!(
+                action,
+                CallableHolderAction::DropCaptureCellOwner { .. }
+            ))));
+        assert!(cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from != body.id)
+            .flat_map(|edge| &edge.actions)
+            .all(|action| !matches!(action, CallableHolderAction::DropCaptureCellOwner { .. })));
+    }
+}
+
+#[test]
+fn borrowed_and_global_capture_cells_have_no_outer_owned_drop() {
+    let text = "%%start\nu8[2] global = [1, 2];\nunit() inspect = fn { u8 local = 3; *u8 borrowed = &local; u8() read = fn { global[0]; *borrowed }; read(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        for cfg in [&function.reference_cfg] {
+            assert!(cfg
+                .holder_edges
+                .iter()
+                .flat_map(|edge| &edge.actions)
+                .chain(cfg.holder_exits.iter().flat_map(|exit| &exit.actions))
+                .all(|action| !matches!(
+                    action,
+                    CallableHolderAction::DropCaptureCellOwner { .. }
+                )));
+        }
+    }
+}
+
+#[test]
+fn fixed_local_capture_cell_has_one_terminal_owner_drop() {
+    let text = "%%start\nunit() inspect = fn { u8[2] slots = [1, 2]; u8() read = fn { slots[0] }; read(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let cfg = &function.reference_cfg;
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == function.body.span
+            })
+            .expect("exit");
+        let owners = cfg
+            .holder_exits
+            .iter()
+            .filter(|edge| edge.from == exit.id)
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::DropCaptureCellOwner { backing, .. } => Some(backing),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].kind, RuntimeBackingKind::FixedValue);
+        assert!(matches!(
+            owners[0].length,
+            RuntimeArrayLengthFact::Fixed { value: 2, .. }
+        ));
+    }
+}
+
+#[test]
+fn moved_capture_binding_has_no_outer_owner_exit_drop() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { u8[count] slots; u8() read = fn { slots[0] }; read(); u8[] moved = slots; moved[0]; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let cfg = &function.reference_cfg;
+        assert!(cfg
+            .holder_edges
+            .iter()
+            .flat_map(|edge| &edge.actions)
+            .chain(cfg.holder_exits.iter().flat_map(|exit| &exit.actions))
+            .all(|action| !matches!(action, CallableHolderAction::DropCaptureCellOwner { .. })));
+    }
+}
+
+#[test]
+fn captured_runtime_array_replacement_updates_shared_cell_once() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader(u64) make = fn(count) { (u8())[count] slots; slots[0] = fn { 1 }; Reader result = { .read = fn { slots[0]; 1 }; }; (u8())[count] replacement; replacement[0] = fn { 2 }; slots = replacement; result };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("make");
+        let cfg = &function.reference_cfg;
+        let write = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Backing { target, .. }
+            if target.declaration_span.start == text.find("slots;").unwrap() as u32
+                && point.source_span.range.start == text.find("slots = replacement").unwrap() as u32))
+            .expect("captured cell backing write");
+        let actions = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == write.id)
+            .flat_map(|edge| &edge.actions)
+            .collect::<Vec<_>>();
+        let replacements = actions
+            .iter()
+            .filter_map(|action| match action {
+                CallableHolderAction::ReplaceCaptureCellValue {
+                    binding,
+                    cell,
+                    previous,
+                    incoming,
+                    ..
+                } => Some((binding, cell, previous, incoming)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replacements.len(), 1);
+        let (binding, cell, old, new) = replacements[0];
+        assert_eq!(cell.range, binding.declaration_span);
+        assert_eq!(
+            old.value.creation_span.start,
+            text.find("slots;").unwrap() as u32
+        );
+        assert_eq!(
+            new.value.creation_span.start,
+            text.find("replacement;").unwrap() as u32
+        );
+        assert_ne!(old.value, new.value);
+        assert_ne!(old.length, new.length);
+        assert!(matches!(
+            old.length,
+            RuntimeArrayLengthFact::Evaluated { .. }
+        ));
+        assert!(matches!(
+            new.length,
+            RuntimeArrayLengthFact::Evaluated { .. }
+        ));
+        assert_eq!(old.callable_family.len(), 1);
+        assert_eq!(new.callable_family.len(), 1);
+        assert!(actions
+            .iter()
+            .all(|action| !matches!(action, CallableHolderAction::DropArrayElements { .. })));
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == function.body.span
+            })
+            .expect("body exit");
+        let owner = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == exit.id)
+            .flat_map(|edge| &edge.actions)
+            .find_map(|action| match action {
+                CallableHolderAction::DropCaptureCellOwner { backing, .. } => Some(backing),
+                _ => None,
+            })
+            .expect("final cell owner");
+        assert_eq!(owner.value, new.value);
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .holder_edges,
+            cfg.holder_edges
+        );
+    }
+}
+
+#[test]
+fn two_returned_environments_observe_one_replaced_capture_cell() {
+    let text = "%%start\nstruct copy Captured { u8(u8) write; u8(u64) read; }\nCaptured(u64) make = fn(count) { u8[count] slots; slots[0] = 6; Captured result = { .write = fn(value) { slots[0] = value; slots[0] }; .read = fn(index) { slots[index] }; }; u8[count] replacement; replacement[0] = 9; slots = replacement; result };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("make");
+        let cfg = &function.reference_cfg;
+        let write = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Backing { target, .. }
+            if target.declaration_span.start == text.find("slots;").unwrap() as u32
+                && point.source_span.range.start == text.find("slots = replacement").unwrap() as u32)).expect("cell write");
+        let replacements = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == write.id)
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::ReplaceCaptureCellValue {
+                    binding, incoming, ..
+                } => Some((binding, incoming)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replacements.len(), 1);
+        let capture_environments = cfg
+            .environments
+            .iter()
+            .filter(|environment| {
+                environment
+                    .inputs
+                    .iter()
+                    .any(|input| input.binding == *replacements[0].0)
+            })
+            .count();
+        assert_eq!(capture_environments, 2);
+        let returned = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("return");
+        assert_eq!(
+            returned
+                .possible_backings
+                .iter()
+                .filter(|backing| backing.value == replacements[0].1.value)
+                .count(),
+            1
+        );
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == function.body.span
+            })
+            .expect("exit");
+        assert_eq!(
+            cfg.holder_edges
+                .iter()
+                .filter(|edge| edge.from == exit.id)
+                .flat_map(|edge| &edge.actions)
+                .filter(|action| matches!(
+                    action,
+                    CallableHolderAction::DropCaptureCellOwner { .. }
+                ))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn conditional_captured_cell_replacement_preserves_skip_and_taken_backings() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader(u64, bool) make = fn(count, enabled) { u8[count] slots; Reader result = { .read = fn { slots[0] }; }; if (enabled) { u8[count] replacement; replacement[0] = 7; slots = replacement; } result };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("make");
+        let cfg = &function.reference_cfg;
+        let writes = cfg
+            .holder_edges
+            .iter()
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::ReplaceCaptureCellValue {
+                    previous, incoming, ..
+                } => Some((previous, incoming)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 1);
+        assert_ne!(writes[0].0.value, writes[0].1.value);
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == function.body.span
+            })
+            .expect("exit");
+        let owner_values = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == exit.id)
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::DropCaptureCellOwner { backing, .. } => Some(&backing.value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(owner_values.contains(&&writes[0].0.value));
+        assert!(owner_values.contains(&&writes[0].1.value));
+    }
+}
+
+#[test]
+fn loop_captured_cell_replacement_keeps_connected_actions() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader(u64) make = fn(count) { u8[count] slots; Reader result = { .read = fn { slots[0] }; }; u64 index = 0; while (index < count) { u8[count] replacement; replacement[0] = 7; slots = replacement; index = index + 1; } result };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("make");
+        let cfg = &function.reference_cfg;
+        let replacement = text.find("slots = replacement").unwrap() as u32;
+        let write = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::Backing { .. })
+                    && point.source_span.range.start == replacement
+            })
+            .expect("loop write");
+        assert!(cfg.holder_edges.iter().any(|edge| edge.from == write.id
+            && edge.actions.iter().any(|action| matches!(
+                action,
+                CallableHolderAction::ReplaceCaptureCellValue { .. }
+            ))));
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == function.body.span
+            })
+            .expect("body exit");
+        assert!(cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == exit.id)
+            .all(|edge| edge
+                .actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    CallableHolderAction::DropCaptureCellOwner { .. }
+                ))
+                .count()
+                == 1));
+    }
+}
+
+#[test]
+fn captured_cell_replacement_rejects_live_loan_at_write_span() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nunit(u64) inspect = fn(count) { u8[count] slots; *u8 borrowed = &slots[0]; Reader watcher = { .read = fn { slots[0] }; }; u8[count] replacement; slots = replacement; borrowed; watcher.read(); };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let write = text.find("slots = replacement").unwrap() as u32;
+    let loan = text.find("&slots[0]").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let error = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span.range == ByteSpan::new(write, write + 5)
+            })
+            .unwrap_or_else(|| panic!("expected conflicting write: {diagnostics:?}"));
+        assert!(error
+            .labels
+            .iter()
+            .skip(1)
+            .any(|label| label.span.range == ByteSpan::new(loan, loan + 9)));
+    }
+}
+
+#[test]
+fn captured_callable_array_replacement_rejects_selected_old_slot_loan_at_write_span() {
+    let text = "%%start\nstruct copy Reader { u8(u64) read; }\nunit(u64) inspect = fn(count) { (u8())[count] items; u8 first = 3; items[0] = fn { first }; * (u8()) borrowed = &items[0]; Reader watcher = { .read = fn(index) { u8() picked = items[index]; picked() }; }; (u8())[3] incoming; incoming[0] = fn { first }; incoming[1] = fn { first }; incoming[2] = fn { first }; items = incoming; borrowed; watcher.read(2); };\n%%end";
+    let write = text.find("items = incoming").unwrap() as u32;
+    let loan = text.find("&items[0]").unwrap() as u32;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let conflict = diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range == ByteSpan::new(write, write + 5)
+                })
+                .unwrap_or_else(|| panic!("expected old selected slot conflict: {diagnostics:?}"));
+            assert!(conflict
+                .labels
+                .iter()
+                .skip(1)
+                .any(|label| label.span.range == ByteSpan::new(loan, loan + 9)));
+        }
+    }
+}
+
+#[test]
+fn captured_callable_array_replacement_rejects_selected_incoming_slot_loan_at_write_span() {
+    let text = "%%start\nstruct copy Reader { u8(u64) read; }\nunit(u64) inspect = fn(count) { (u8())[count] items; u8 first = 3; items[0] = fn { first }; Reader watcher = { .read = fn(index) { u8() picked = items[index]; picked() }; }; (u8())[3] incoming; incoming[0] = fn { first }; incoming[1] = fn { first }; incoming[2] = fn { first }; * (u8()) borrowed = &incoming[2]; items = incoming; borrowed; watcher.read(2); };\n%%end";
+    let write = text.find("items = incoming").unwrap() as u32;
+    let loan = text.find("&incoming[2]").unwrap() as u32;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let conflict = diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.code == "B0003"
+                        && diagnostic.labels[0].span.range == ByteSpan::new(write + 8, write + 16)
+                })
+                .unwrap_or_else(|| {
+                    panic!("expected incoming selected slot conflict: {diagnostics:?}")
+                });
+            assert!(conflict
+                .labels
+                .iter()
+                .skip(1)
+                .any(|label| label.span.range == ByteSpan::new(loan, loan + 12)));
+        }
+    }
+}
+
+#[test]
+fn callable_array_nested_parameter_forward_preserves_independent_siblings() {
+    let text = "%%start\nstruct Inner { (u8())[] data; }\nstruct Outer { Inner nested; (u8())[] sibling; }\nOuter(Outer) forward = fn(input) { input };\nunit(u64) inspect = fn(count) { (u8())[count] first; first[0] = fn { 1 }; (u8())[count] second; second[0] = fn { 2 }; Inner inside = { .data = first; }; Outer original = { .nested = inside; .sibling = second; }; Outer received = forward(original); received; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let forward = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "forward" => Some(function),
+                _ => None,
+            })
+            .expect("forward");
+        let inputs = &forward.reference_cfg.projected_backing_input_paths;
+        assert!(inputs.iter().any(|path| path.len() == 2
+            && path.iter().any(|input| input.projections.len() == 1)
+            && path.iter().any(|input| input.projections.len() == 2)));
+        let contracts = forward
+            .reference_cfg
+            .backing_output_contracts
+            .iter()
+            .filter(|contract| {
+                contract.declaration_span == forward.name_span && !contract.projections.is_empty()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contracts.len(), 2);
+        assert!(contracts
+            .iter()
+            .all(|contract| contract.sources == vec![RuntimeOutputBackingSource::Parameter(0)]));
+        let inspect = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let cfg = &inspect.reference_cfg;
+        let call = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Call { output: 0, .. }))
+            .expect("call");
+        assert_eq!(call.possible_projected_backings.len(), 2);
+        for projected in &call.possible_projected_backings {
+            let argument = call
+                .backing_argument_paths
+                .iter()
+                .flatten()
+                .find(|input| input.projections == projected.place.projections)
+                .expect("matching field");
+            assert_eq!(projected.backing.value, argument.backing.value);
+            assert_eq!(projected.backing.length, argument.backing.length);
+        }
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == inspect.body.span
+            })
+            .expect("exit");
+        let cleaned = cfg
+            .holder_exits
+            .iter()
+            .filter(|edge| edge.from == exit.id)
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::DropArrayElements { backing, .. } => Some(&backing.value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cleaned.len(), 2);
+        assert_ne!(cleaned[0], cleaned[1]);
+    }
+}
+
+#[test]
+fn callable_array_two_aggregate_parameters_forward_to_distinct_outputs() {
+    let text = "%%start\nstruct Boxed { (u8())[] data; }\n(Boxed, Boxed)(Boxed, Boxed) forward = fn(first, second) { first, second };\nunit(u64) inspect = fn(count) { (u8())[count] a; a[0] = fn { 1 }; (u8())[count] b; b[0] = fn { 2 }; Boxed left = { .data = a; }; Boxed right = { .data = b; }; Boxed result_left, Boxed result_right = forward(left, right); result_left; result_right; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let forward = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "forward" => Some(function),
+                _ => None,
+            })
+            .expect("forward");
+        let contracts = forward
+            .reference_cfg
+            .backing_output_contracts
+            .iter()
+            .filter(|contract| {
+                contract.declaration_span == forward.name_span && !contract.projections.is_empty()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contracts.len(), 2);
+        for output in 0..2 {
+            let contract = contracts
+                .iter()
+                .find(|contract| contract.output == output)
+                .expect("output contract");
+            assert_eq!(
+                contract.sources,
+                vec![RuntimeOutputBackingSource::Parameter(output)]
+            );
+        }
+        let inspect = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let cfg = &inspect.reference_cfg;
+        let outputs = cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].possible_projected_backings.len(), 1);
+        assert_eq!(outputs[1].possible_projected_backings.len(), 1);
+        assert_ne!(
+            outputs[0].possible_projected_backings[0].backing.value,
+            outputs[1].possible_projected_backings[0].backing.value
+        );
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == inspect.body.span
+            })
+            .expect("exit");
+        assert_eq!(
+            cfg.holder_exits
+                .iter()
+                .filter(|edge| edge.from == exit.id)
+                .flat_map(|edge| &edge.actions)
+                .filter(|action| matches!(action, CallableHolderAction::DropArrayElements { .. }))
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn callable_array_forwarded_parameter_field_overwrite_preserves_sibling() {
+    let text = "%%start\nstruct Pair { (u8())[] left; (u8())[] right; }\nPair(Pair) forward = fn(input) { input };\nunit(u64) inspect = fn(count) { (u8())[count] a; a[0] = fn { 1 }; (u8())[count] b; b[0] = fn { 2 }; Pair original = { .left = a; .right = b; }; Pair received = forward(original); (u8())[count] replacement; replacement[0] = fn { 3 }; received.left = replacement; received.right; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let inspect = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let cfg = &inspect.reference_cfg;
+        let old = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| {
+                matches!(&cfg.points[edge.from.0].kind,
+            CfgPointKind::Assign { target, .. } if !target.projections.is_empty())
+            })
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::DropArrayElements { backing, .. } => Some(backing),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(old.len(), 1);
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == inspect.body.span
+            })
+            .expect("exit");
+        let remaining = cfg
+            .holder_exits
+            .iter()
+            .filter(|edge| edge.from == exit.id)
+            .flat_map(|edge| &edge.actions)
+            .filter_map(|action| match action {
+                CallableHolderAction::DropArrayElements { backing, .. } => Some(backing),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining
+            .iter()
+            .all(|backing| backing.value != old[0].value));
+    }
+}
+
+#[test]
+fn runtime_callable_array_unknown_second_index_preserves_guarded_old_cell() {
+    let text = "%%start\nunit((u8())[], u64, u64) overwrite = fn(items, first, second) { first; second; items[first] = fn { 1 }; items[second] = fn { 2 }; items; };\nunit(u64, u64, u64) inspect = fn(count, first, second) { (u8())[count] readers; overwrite(readers, first, second); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(overwrite) = &items[0] else {
+            panic!("overwrite")
+        };
+        let cfg = &overwrite.reference_cfg;
+        let writes = cfg
+            .assignment_points
+            .iter()
+            .filter(|entry| entry.role == ScalarAssignmentPointRole::Assign)
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 2);
+        let actions = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == writes[1].point)
+            .flat_map(|edge| &edge.actions)
+            .collect::<Vec<_>>();
+        let first = text.find("fn { 1 }").unwrap() as u32;
+        assert!(actions.iter().any(|action| matches!(action,
+            CallableHolderAction::DropSelected {
+                old: CallableCellCaseFact::Initialized { environment_origin, .. }, guard, ..
+            } if environment_origin.literal.range.start == first
+                && guard.iter().any(|relation| relation.relation == CallableArrayIndexRelation::Equal
+                    && matches!((&relation.left, &relation.right),
+                        (CallableIndexKeyFact::LivePlace(_), CallableIndexKeyFact::LivePlace(_))))
+        )), "equal branch: {actions:?}");
+        assert!(actions.iter().any(|action| matches!(action,
+            CallableHolderAction::SkipUninitializedSelected { guard, .. }
+                if guard.iter().any(|relation| relation.relation == CallableArrayIndexRelation::Distinct
+                    && matches!((&relation.left, &relation.right),
+                        (CallableIndexKeyFact::LivePlace(_), CallableIndexKeyFact::LivePlace(_))))
+        )), "distinct branch: {actions:?}");
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .holder_edges,
+            cfg.holder_edges
+        );
+    }
+}
+
+#[test]
+fn runtime_callable_array_reassigned_constant_index_preserves_distinct_old_cell() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; u64 index = 0; index; readers[index] = fn { 1 }; index = 1; readers[index] = fn { 2 }; readers; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(inspect) = &items[0] else {
+            panic!("inspect")
+        };
+        let cfg = &inspect.reference_cfg;
+        let writes = cfg.assignment_points.iter().filter(|entry| entry.role == ScalarAssignmentPointRole::Assign
+            && matches!(&cfg.points[entry.point.0].kind, CfgPointKind::Assign { target, .. } if target.projections.iter().any(|projection| matches!(projection, ReferencePlaceProjection::Index(_)))))
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 2);
+        let actions = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == writes[1].point)
+            .flat_map(|edge| &edge.actions)
+            .collect::<Vec<_>>();
+        assert!(!actions.iter().any(|action| matches!(action,
+            CallableHolderAction::DropSelected { old: CallableCellCaseFact::Initialized { environment_origin, .. }, .. }
+                if environment_origin.literal.range.start == text.find("fn { 1 }").unwrap() as u32
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            CallableHolderAction::SkipUninitializedSelected { .. }
+        )));
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .holder_edges,
+            cfg.holder_edges
+        );
+    }
+}
+
+#[test]
+fn runtime_callable_array_selected_copy_retains_source_holder() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; u64 index = 0; index; u8() kept = fn { 7 }; readers[index] = kept; kept(); readers; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(inspect) = &items[0] else {
+            panic!("inspect")
+        };
+        let cfg = &inspect.reference_cfg;
+        let write = cfg.assignment_points.iter().find(|entry| entry.role == ScalarAssignmentPointRole::Assign
+            && matches!(&cfg.points[entry.point.0].kind, CfgPointKind::Assign { target, .. } if !target.projections.is_empty()))
+            .expect("selected copy");
+        let actions = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == write.point)
+            .flat_map(|edge| &edge.actions)
+            .collect::<Vec<_>>();
+        assert!(actions.iter().any(|action| matches!(action,
+            CallableHolderAction::RetainSelected { from: CallableHolderPlace::Binding(binding), to, span, .. }
+                if binding.declaration_span.start == text.find("kept =").unwrap() as u32
+                    && to.index_point.0 < cfg.points.len()
+                    && span.source == cfg.points[write.point.0].source_span.source
+        )), "retained selected input: {actions:?}");
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            CallableHolderAction::SkipUninitializedSelected { .. }
+        )));
+    }
+}
+
+#[test]
+fn runtime_callable_array_move_rejects_stale_owner_with_source_spans() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[count] readers; readers[0] = fn { 1 }; (u8())[] moved = readers; readers[0]; moved; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (diagnostics, source) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        let stale = text.rfind("readers[0]").expect("stale read") as u32;
+        let moved = text.find("= readers; readers[0]").expect("move") as u32 + 2;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Primary
+                        && &label.span.source == source
+                        && label.span.range.start == stale)
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Secondary
+                        && &label.span.source == source
+                        && label.span.range.start == moved)),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn runtime_callable_array_family_imports_through_literal_call() {
+    let text = "%%start\nunit(u64) inspect = fn(count) { (u8())[]((u8())[]) forward = fn(items) { items }; (u8())[count] readers; readers[0] = fn { 1 }; (u8())[] returned = forward(readers); returned; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(inspect) = &items[0] else {
+            panic!("inspect")
+        };
+        let call = inspect
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Call { output: 0, .. })
+                    && point.source_span.range.start
+                        == text.find("forward(readers)").unwrap() as u32
+            })
+            .expect("literal call");
+        let argument = &call.backing_argument_paths[0][0].backing;
+        assert!(matches!(
+            argument.length,
+            RuntimeArrayLengthFact::Evaluated { .. }
+        ));
+        assert_eq!(argument.callable_family[0].elements.len(), 1);
+        let input = inspect
+            .reference_cfg
+            .literal_cfgs
+            .iter()
+            .flat_map(|literal| &literal.reference_cfg.backing_input_paths)
+            .flatten()
+            .find(|fact| fact.value == argument.value)
+            .expect("literal input");
+        assert_eq!(input.length, argument.length);
+        assert_eq!(input.callable_family, argument.callable_family);
+    }
+}
+
+#[test]
+fn runtime_callable_array_family_imports_through_callable_field() {
+    let text = "%%start\nstruct Dispatch { (u8())[]((u8())[], u64) run; }\nunit(u64) inspect = fn(count) { Dispatch runner = { .run = fn(items, unrelated) { unrelated; items }; }; (u8())[count] readers; readers[0] = fn { 1 }; readers[1] = fn { 2 }; (u8())[] returned = runner.run(readers, 51); returned; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let inspect = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                _ => None,
+            })
+            .expect("inspect");
+        let call = inspect
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Call { output: 0, .. })
+                    && point.source_span.range.start
+                        == text.find("runner.run(readers, 51)").unwrap() as u32
+            })
+            .expect("field call");
+        let argument = &call.backing_argument_paths[0][0].backing;
+        assert!(
+            matches!(&argument.length, RuntimeArrayLengthFact::Evaluated { expression: ScalarExpression::Name { name, .. }, .. } if name == "count")
+        );
+        assert_eq!(argument.callable_family[0].elements.len(), 2);
+        assert_ne!(
+            argument.callable_family[0].elements[0].environment,
+            argument.callable_family[0].elements[1].environment
+        );
+        assert!(inspect
+            .reference_cfg
+            .literal_cfgs
+            .iter()
+            .flat_map(|literal| &literal.reference_cfg.backing_input_paths)
+            .flatten()
+            .any(|fact| fact.value == argument.value
+                && fact.length == argument.length
+                && fact.callable_family == argument.callable_family));
+    }
+}
+
+#[test]
+fn runtime_callable_array_branch_families_keep_reaching_alternatives() {
+    let text = "%%start\nunit((u8())[]) consume = fn(items) { items; };\nunit(u64) inspect = fn(count) { (u8())[count] readers; bool choice = true; if (choice) { readers[0] = fn { 1 }; } else { readers[0] = fn { 2 }; }; consume(readers); };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(consume) = &items[0] else {
+            panic!("consume")
+        };
+        let ScalarItem::Function(inspect) = &items[1] else {
+            panic!("inspect")
+        };
+        let call = inspect
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Call { output: 0, .. })
+                    && point.source_span.range.start
+                        == text.find("consume(readers)").unwrap() as u32
+            })
+            .expect("branch call");
+        let alternatives = call
+            .backing_argument_paths
+            .iter()
+            .flat_map(|path| path.iter())
+            .map(|argument| &argument.backing)
+            .collect::<Vec<_>>();
+        assert_eq!(alternatives.len(), 2);
+        assert!(alternatives
+            .iter()
+            .all(|fact| fact.callable_family[0].elements.len() == 1
+                && matches!(fact.length, RuntimeArrayLengthFact::Evaluated { .. })));
+        assert_ne!(
+            alternatives[0].callable_family[0].elements[0].environment,
+            alternatives[1].callable_family[0].elements[0].environment
+        );
+        for fact in &alternatives {
+            let partition = &fact.callable_family[0].partitions[0];
+            assert_eq!(partition.representatives.len(), 2);
+            assert!(partition.representatives.iter().any(|representative| {
+                matches!(representative.key, CallableIndexKeyFact::Constant(_))
+            }));
+            for representative in &partition.representatives {
+                let cases = &representative.cell.alternatives;
+                assert_eq!(cases.len(), 1);
+                assert!(
+                    matches!(&cases[0], CallableCellCaseFact::Initialized { environment_origin, backing, owner, .. }
+                    if environment_origin == &fact.callable_family[0].elements[0].environment
+                        && backing == &fact.value && owner == &fact.owner)
+                );
+            }
+        }
+        assert!(alternatives.iter().all(|fact| consume
+            .reference_cfg
+            .backing_input_paths
+            .iter()
+            .flatten()
+            .any(|input| input.value == fact.value
+                && input.length == fact.length
+                && input.callable_family == fact.callable_family)));
+    }
+}
+
+#[test]
+fn runtime_callable_array_family_preserves_captured_loan_input() {
+    let text = "%%start\nunit((u8())[]) consume = fn(items) { items; };\nunit(u64) inspect = fn(count) { u8 value = 1; *u8 loan = &value; (u8())[count] readers; readers[0] = fn { *loan }; consume(readers); };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(inspect) = &items[1] else {
+            panic!("inspect")
+        };
+        let call = inspect
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Call { output: 0, .. })
+                    && point.source_span.range.start
+                        == text.find("consume(readers)").unwrap() as u32
+            })
+            .expect("call");
+        let element = &call.backing_argument_paths[0][0].backing.callable_family[0].elements[0];
+        assert!(!element.loans.is_empty(), "{element:?}");
+        let cell = &call.backing_argument_paths[0][0].backing.callable_family[0].partitions[0]
+            .representatives[0]
+            .cell
+            .alternatives[0];
+        assert!(
+            matches!(cell, CallableCellCaseFact::Initialized { environment_origin, loans, backing, owner, capture_paths, .. }
+            if environment_origin == &element.environment && loans == &element.loans
+                && backing == &call.backing_argument_paths[0][0].backing.value
+                && owner == &call.backing_argument_paths[0][0].backing.owner
+                && capture_paths == &inspect.reference_cfg.environments[environment_origin.index].capture_paths)
+        );
+        assert!(element.aliases.iter().any(|alias| matches!(alias, CallableHolderPlace::Projection(place) if place.binding == call.backing_argument_paths[0][0].backing.owner)));
+    }
+}
+
+#[test]
+fn runtime_callable_array_family_rejects_escaping_element_loan() {
+    let text = "%%start\n(u8())[](u64) make = fn(count) { u8 value = 1; *u8 loan = &value; (u8())[count] readers; readers[0] = fn { *loan }; readers };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (diagnostics, source) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        let escaped = text.rfind("readers }").expect("returned array") as u32;
+        let borrowed = text.find("&value").expect("loan origin") as u32;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Primary
+                        && &label.span.source == source
+                        && label.span.range.start == escaped)
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == super::super::DiagnosticLabelKind::Secondary
+                        && &label.span.source == source
+                        && label.span.range.start == borrowed)),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn noncallable_runtime_array_loop_writes_do_not_produce_callable_projections() {
+    let text = "%%start\nu8[](u64) make = fn(count) { u8[count] bytes; u64 index = 0; bool writing = true; while (writing) { if (index < count) { bytes[index] = 6; index = index + 1; } else { writing = false; }; if (index < count) { bytes[index] = 7; }; } bytes };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(make) = &items[0] else {
+            panic!("make function")
+        };
+        assert!(make
+            .reference_cfg
+            .points
+            .iter()
+            .any(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. })));
+        assert!(
+            make.reference_cfg
+                .points
+                .iter()
+                .all(|point| point.possible_projected_environments.is_empty()),
+            "noncallable array created callable projections"
+        );
+    }
+}
+
+#[test]
+fn runtime_array_length_tracks_evaluated_allocation_through_parameter_and_return() {
+    let text = "%%start\nu8[](u64, u64) make = fn(count, unrelated) { u8[count] bytes; unrelated; bytes };\nu8[](u8[], u64) relay = fn(items, unrelated) { unrelated; items };\nunit() inspect = fn { u8[] created = make(2, 99); u8[] saved = relay(created, 77); saved[0]; };\ninspect();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(make) = &items[0] else {
+            panic!("make")
+        };
+        let ScalarBlockItem::LocalBinding(bytes) = &make.body.items[0] else {
+            panic!("bytes")
+        };
+        let fact = make
+            .reference_cfg
+            .points
+            .iter()
+            .flat_map(|point| &point.possible_backings)
+            .find(|fact| fact.owner.declaration_span == bytes.name_span)
+            .expect("allocation backing");
+        let RuntimeArrayLengthFact::Evaluated {
+            expression,
+            occurrence,
+            point,
+            ..
+        } = &fact.length
+        else {
+            panic!("evaluated length")
+        };
+        assert!(
+            matches!(expression, ScalarExpression::Name { name, .. } if name == "count"),
+            "{expression:?}"
+        );
+        assert_eq!(
+            occurrence.range,
+            expression_span(
+                bytes.receivers[0]
+                    .allocation_length
+                    .as_ref()
+                    .expect("array length")
+            )
+        );
+        assert_eq!(make.reference_cfg.points[point.0].source_span, *occurrence);
+        let ScalarItem::Function(relay) = &items[1] else {
+            panic!("relay")
+        };
+        assert!(relay
+            .reference_cfg
+            .backing_input_paths
+            .iter()
+            .flatten()
+            .any(
+                |fact| fact.owner.declaration_span == relay.parameter_spans[0]
+                    && fact.length
+                        == fact_length_for_allocation(&make.reference_cfg, bytes.name_span)
+            ));
+        let ScalarItem::Function(inspect) = &items[2] else {
+            panic!("inspect")
+        };
+        let ScalarBlockItem::LocalBinding(saved) = &inspect.body.items[1] else {
+            panic!("saved")
+        };
+        assert!(inspect
+            .reference_cfg
+            .points
+            .iter()
+            .flat_map(|point| &point.possible_backings)
+            .any(|backing| backing.owner.declaration_span == saved.name_span
+                && backing.length == fact.length));
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(&inspect.reference_cfg).unwrap()).unwrap();
+        assert_eq!(restored.points, inspect.reference_cfg.points);
+    }
+}
+
+fn fact_length_for_allocation(
+    cfg: &ScalarReferenceCfg,
+    declaration_span: ByteSpan,
+) -> RuntimeArrayLengthFact {
+    cfg.points
+        .iter()
+        .flat_map(|point| &point.possible_backings)
+        .find(|fact| fact.owner.declaration_span == declaration_span)
+        .expect("allocation fact")
+        .length
+        .clone()
+}
+
+#[test]
+fn fixed_callable_array_elements_keep_distinct_holders_through_copy_and_scope_exit() {
+    let text = "%%start\nunit() observe = fn { u8 first = 1; u8 second = 2; u8()[2] readers = [fn { first }, fn { second }]; u8()[2] copied = readers; readers[0]; copied[1]; };\nobserve();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("observe function")
+        };
+        let cfg = &function.reference_cfg;
+        let ScalarBlockItem::LocalBinding(readers) = &function.body.items[2] else {
+            panic!("readers")
+        };
+        let ScalarBlockItem::LocalBinding(copied) = &function.body.items[3] else {
+            panic!("copied")
+        };
+        let seeded = cfg
+            .binding_points
+            .iter()
+            .filter(|point| {
+                point.occurrence == *readers.occurrence
+                    && matches!(point.role, ScalarBindingPointRole::ArrayElement(_))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            seeded
+                .iter()
+                .map(|event| event.role.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ScalarBindingPointRole::ArrayElement(0),
+                ScalarBindingPointRole::ArrayElement(1)
+            ]
+        );
+        let mut holders = Vec::new();
+        for point in &seeded {
+            let CfgPointKind::BindArrayElement { target, .. } = &cfg.points[point.point.0].kind
+            else {
+                panic!("element holder point")
+            };
+            assert_eq!(target.source, source());
+            assert_eq!(target.binding.declaration_span, readers.name_span);
+            assert!(
+                matches!(&target.projections[..], [ReferencePlaceProjection::Index(ScalarExpression::Integer { value, .. })] if value == &((match point.role { ScalarBindingPointRole::ArrayElement(index) => index, _ => unreachable!() }) as u64).into())
+            );
+            let action = cfg.holder_edges.iter().filter(|edge| edge.from == point.point).flat_map(|edge| &edge.actions).find(|action| matches!(action, CallableHolderAction::Move { to: CallableHolderPlace::Projection(place), .. } if place == target)).expect("moved element holder");
+            let CallableHolderAction::Move { environment, .. } = action else {
+                unreachable!()
+            };
+            holders.push((environment.clone(), target.clone()));
+        }
+        assert_ne!(holders[0].0, holders[1].0);
+        let first_read = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ReadPlace { .. })
+                    && point.source_span.range.start == text.find("readers[0];").unwrap() as u32
+            })
+            .expect("first element read");
+        assert!(first_read.possible_environments.contains(&holders[0].0));
+        assert!(!first_read.possible_environments.contains(&holders[1].0));
+        let copy = cfg
+            .binding_points
+            .iter()
+            .find(|point| {
+                point.occurrence == *copied.occurrence
+                    && point.role == ScalarBindingPointRole::CopyCallableFields
+            })
+            .expect("whole array copy");
+        for (environment, source) in &holders {
+            assert!(cfg.holder_edges.iter().filter(|edge| edge.from == copy.point).flat_map(|edge| &edge.actions).any(|action| matches!(action, CallableHolderAction::Retain { environment: known, from: CallableHolderPlace::Projection(from), to: CallableHolderPlace::Projection(to), .. } if known == environment && from == source && to.binding.declaration_span == copied.name_span && to.projections == source.projections)));
+        }
+        let scope_exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == function.body.span
+            })
+            .expect("scope exit");
+        for (environment, source) in &holders {
+            assert!(cfg.holder_exits.iter().filter(|exit| exit.from == scope_exit.id).flat_map(|exit| &exit.actions).any(|action| matches!(action, CallableHolderAction::Drop { environment: known, holder: CallableHolderPlace::Projection(place), .. } if known == environment && place == source)));
+            assert!(cfg.holder_exits.iter().filter(|exit| exit.from == scope_exit.id).flat_map(|exit| &exit.actions).any(|action| matches!(action, CallableHolderAction::Drop { environment: known, holder: CallableHolderPlace::Projection(place), .. } if known == environment && place.binding.declaration_span == copied.name_span && place.projections == source.projections)));
+        }
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.binding_points, cfg.binding_points);
+        assert_eq!(restored.holder_edges, cfg.holder_edges);
+        assert_eq!(restored.holder_exits, cfg.holder_exits);
+    }
+}
+
+#[test]
+fn top_level_callable_array_literal_and_copy_retain_element_identity() {
+    let text = "%%start\nu8 first = 1;\nu8 second = 2;\nu8()[2] readers = [fn { first }, fn { second }];\nu8()[2] copied = readers;\nreaders[0]; copied[1];\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Binding(readers) = &items[2] else {
+            panic!("array literal")
+        };
+        let ScalarItem::Binding(copied) = &items[3] else {
+            panic!("whole array copy")
+        };
+        let points = cfg
+            .binding_points
+            .iter()
+            .filter(|event| {
+                event.occurrence == *readers.occurrence
+                    && matches!(event.role, ScalarBindingPointRole::ArrayElement(_))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(points.len(), 2);
+        assert!(points.iter().all(|event| matches!(&cfg.top_level.points[event.point.0].execution, ScalarTopLevelPointExecution::Connected { occurrence: ScalarTopLevelOccurrence::Binding(known), .. } if known == readers.occurrence.as_ref())));
+        let copy = cfg
+            .binding_points
+            .iter()
+            .find(|event| {
+                event.occurrence == *copied.occurrence
+                    && event.role == ScalarBindingPointRole::CopyCallableFields
+            })
+            .expect("copy point");
+        let edges = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == copy.point)
+            .collect::<Vec<_>>();
+        assert!(
+            edges
+                .iter()
+                .flat_map(|edge| &edge.actions)
+                .filter(|action| matches!(
+                    action,
+                    CallableHolderAction::Retain {
+                        from: CallableHolderPlace::Projection(_),
+                        to: CallableHolderPlace::Projection(_),
+                        ..
+                    }
+                ))
+                .count()
+                >= 2
+        );
+        assert_eq!(
+            serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap())
+                .unwrap()
+                .binding_points,
+            cfg.binding_points
+        );
+    }
+}
+
+#[test]
+fn fixed_callable_array_aliases_keep_distinct_places_for_one_environment() {
+    let text = "%%start\nunit() inspect = fn { u8 captured = 5; u8() common = fn { captured }; u8()[2] readers = [common, common]; u8()[2] copied = readers; readers[0]; copied[1]; };\ninspect();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        let ScalarBlockItem::LocalBinding(readers) = &function.body.items[2] else {
+            panic!("readers")
+        };
+        let cfg = &function.reference_cfg;
+        let points = cfg
+            .binding_points
+            .iter()
+            .filter(|event| {
+                event.occurrence == *readers.occurrence
+                    && matches!(event.role, ScalarBindingPointRole::ArrayElement(_))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(points.len(), 2);
+        let holders = points
+            .iter()
+            .map(|point| {
+                cfg.holder_edges
+                    .iter()
+                    .filter(|edge| edge.from == point.point)
+                    .flat_map(|edge| &edge.actions)
+                    .find_map(|action| match action {
+                        CallableHolderAction::Retain {
+                            environment,
+                            to: CallableHolderPlace::Projection(place),
+                            ..
+                        } => Some((environment, place)),
+                        _ => None,
+                    })
+                    .expect("aliased element holder")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(holders[0].0, holders[1].0);
+        assert_ne!(holders[0].1.projections, holders[1].1.projections);
+        let exit = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::ScopeExit)
+                    && point.source_span.range == function.body.span
+            })
+            .expect("scope exit");
+        assert!(cfg.holder_exits.iter().filter(|fact| fact.from == exit.id).flat_map(|fact| &fact.actions).filter(|action| matches!(action, CallableHolderAction::Drop { environment, holder: CallableHolderPlace::Projection(place), .. } if environment == holders[0].0 && (place.binding.declaration_span == readers.name_span || place.binding.declaration_span == match &function.body.items[3] { ScalarBlockItem::LocalBinding(copied) => copied.name_span, _ => unreachable!() }))).count() >= 4);
+    }
+}
+
+#[test]
+fn whole_callable_array_assignment_replaces_each_element_holder() {
+    let text = "%%start\nunit() inspect = fn { u8 first = 1; u8 second = 2; u8()[2] readers = [fn { first }, fn { second }]; u8()[2] copied = readers; readers = copied; readers[0]; copied[1]; };\ninspect();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("inspect")
+        };
+        let ScalarBlockItem::Assignment(assignment) = &function.body.items[4] else {
+            panic!("whole assignment")
+        };
+        let cfg = &function.reference_cfg;
+        let copy = cfg
+            .assignment_points
+            .iter()
+            .find(|point| {
+                point.occurrence == *assignment.occurrence
+                    && point.role == ScalarAssignmentPointRole::CopyCallableFields
+            })
+            .expect("array replacement copy");
+        let actions = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == copy.point)
+            .flat_map(|edge| &edge.actions)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    CallableHolderAction::Drop {
+                        holder: CallableHolderPlace::Projection(_),
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    CallableHolderAction::Retain {
+                        from: CallableHolderPlace::Projection(_),
+                        to: CallableHolderPlace::Projection(_),
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn top_level_nested_struct_assignment_reports_scalar_leaf_requirement() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nstruct copy Holder { Reader nested; }\nReader first = { .read = fn { 1 }; };\nReader second = { .read = fn { 2 }; };\nHolder owner = { .nested = first; };\nowner.nested = second;\nReader saved = owner.nested;\nsaved.read();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let start = text.find("owner.nested = second").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.message == "assignment place requires a scalar leaf type"
+                && diagnostic.labels[0].span
+                    == SourceSpan::new(source(), ByteSpan::new(start, start + 13))));
+    }
+}
+
+#[test]
+fn top_level_connected_and_supplemental_points_have_source_qualified_execution() {
+    let text = "%%start\ni32() maker = fn { 1 };\ni32() delayed = fn { maker() };\ni32 first = maker();\nfirst = maker();\nmaker();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(cfg.top_level.points.len(), cfg.points.len());
+        assert_eq!(
+            cfg.top_level
+                .points
+                .iter()
+                .map(|event| event.point.0)
+                .collect::<Vec<_>>(),
+            (0..cfg.points.len()).collect::<Vec<_>>()
+        );
+        for event in &cfg.top_level.points {
+            match &event.execution {
+                ScalarTopLevelPointExecution::Connected {
+                    occurrence,
+                    outgoing,
+                } => {
+                    assert_eq!(*outgoing, cfg.points[event.point.0].successors);
+                    for successor in outgoing {
+                        assert!(cfg
+                            .holder_edges
+                            .iter()
+                            .any(|edge| edge.from == event.point && edge.to == *successor));
+                    }
+                    if let ScalarTopLevelOccurrence::Call(call) = occurrence {
+                        assert!(cfg
+                            .call_points
+                            .iter()
+                            .any(|record| record.occurrence == *call
+                                && record
+                                    .projections
+                                    .iter()
+                                    .any(|projection| projection.point == event.point)));
+                        assert_eq!(call.source_span.source, source());
+                    }
+                }
+                ScalarTopLevelPointExecution::SupplementalAnalysisOnly => {
+                    assert!(cfg.points[event.point.0].successors.is_empty());
+                    assert!(cfg
+                        .holder_edges
+                        .iter()
+                        .all(|edge| edge.from != event.point && edge.to != event.point));
+                    assert!(cfg.holder_exits.iter().all(|exit| exit.from != event.point));
+                }
+            }
+        }
+        let ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) = &items[3] else {
+            panic!("expected ordinary assignment");
+        };
+        assert!(cfg
+            .top_level
+            .assignments
+            .iter()
+            .any(|record| record.occurrence == *assignment.occurrence
+                && record.execution
+                    == ScalarTopLevelAssignmentExecution::EmittedWithoutHolderAction));
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.top_level, cfg.top_level);
+    }
+}
+
+#[test]
+fn project_module_initializer_holder_edges_follow_connected_occurrences() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nu8[2] bytes = [4, 5];\nReader original = { .read = fn { bytes[0] }; };\nReader copied = original;\ncopied = original;\ncopied.read();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (cfg, diagnostics) in [
+        (&single.program.top_level_reference_cfg, &single.diagnostics),
+        (
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let copies = cfg
+            .binding_points
+            .iter()
+            .filter(|point| point.role == ScalarBindingPointRole::CopyCallableFields)
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 1);
+        let overwrites = cfg
+            .assignment_points
+            .iter()
+            .filter(|point| point.role == ScalarAssignmentPointRole::CopyCallableFields)
+            .collect::<Vec<_>>();
+        assert_eq!(overwrites.len(), 1);
+        for point in [copies[0].point, overwrites[0].point] {
+            let record = &cfg.top_level.points[point.0];
+            assert_eq!(record.point, point);
+            let ScalarTopLevelPointExecution::Connected { outgoing, .. } = &record.execution else {
+                panic!("callable copy must be connected");
+            };
+            assert!(outgoing.iter().all(|to| cfg
+                .holder_edges
+                .iter()
+                .any(|edge| edge.from == point && edge.to == *to)));
+        }
+        assert!(cfg.holder_edges.iter().any(|edge| !edge.actions.is_empty()));
+        assert!(cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| !edge.actions.is_empty())
+            .all(|edge| {
+                matches!(
+                    cfg.top_level.points[edge.from.0].execution,
+                    ScalarTopLevelPointExecution::Connected { .. }
+                )
+            }));
+    }
+}
+
+#[test]
+fn independent_module_initializers_keep_distinct_connected_sources() {
+    let first = module_source("src/one.w");
+    let second = module_source("src/two.w");
+    let text = "%%start\nu8 value = 1;\nvalue = 2;\n%%end";
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![
+            ScalarModule::new(
+                first.clone(),
+                module_from_text(first.clone(), text).items,
+                Vec::new(),
+            ),
+            ScalarModule::new(
+                second.clone(),
+                module_from_text(second.clone(), text).items,
+                Vec::new(),
+            ),
+        ],
+        vec![second.clone(), first.clone()],
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for module in &project.project.modules {
+        let cfg = &module.top_level_reference_cfg;
+        assert_eq!(cfg.top_level.points.len(), cfg.points.len());
+        assert!(cfg.top_level.assignments.iter().any(|assignment| {
+            assignment.occurrence.source_span.source == module.source
+                && assignment.execution
+                    == ScalarTopLevelAssignmentExecution::EmittedWithoutHolderAction
+        }));
+        assert!(cfg
+            .top_level
+            .points
+            .iter()
+            .all(|event| match &event.execution {
+                ScalarTopLevelPointExecution::Connected { occurrence, .. } => match occurrence {
+                    ScalarTopLevelOccurrence::Entry(source) => source == &module.source,
+                    ScalarTopLevelOccurrence::Binding(binding) =>
+                        binding.source_span.source == module.source,
+                    ScalarTopLevelOccurrence::Assignment(assignment) =>
+                        assignment.source_span.source == module.source,
+                    ScalarTopLevelOccurrence::Call(call) =>
+                        call.source_span.source == module.source,
+                    ScalarTopLevelOccurrence::Expression(span) => span.source == module.source,
+                },
+                ScalarTopLevelPointExecution::SupplementalAnalysisOnly => true,
+            }));
+    }
+}
+
+#[test]
+fn top_level_multi_checked_outputs_keep_ordered_call_and_binding_projections() {
+    let text = "%%start\n(*u8, *u8)() pair = fn { u8 left = 1; u8 right = 2; &left, &right };\n*u8 first, *u8 second = pair();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Binding(binding) = &items[1] else {
+            panic!("checked binding")
+        };
+        let call = cfg
+            .call_points
+            .iter()
+            .find(|call| call.occurrence.source_span.range == expression_span(&binding.value))
+            .expect("evaluated checked call");
+        assert_eq!(
+            call.projections
+                .iter()
+                .map(|projection| projection.output)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let receivers = cfg
+            .binding_points
+            .iter()
+            .filter(|event| event.occurrence == *binding.occurrence)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receivers
+                .iter()
+                .map(|event| event.output)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(receivers.iter().all(|event| matches!(
+            cfg.top_level.points[event.point.0].execution,
+            ScalarTopLevelPointExecution::Connected { .. }
+        )));
+    }
+}
+
+#[test]
+fn nested_module_initializer_call_is_connected_to_its_canonical_occurrence() {
+    let text = "%%start\ni32() maker = fn { 1 };\ni32 result = maker() + 1;\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Binding(binding) = &items[1] else {
+            panic!("module binding")
+        };
+        let ScalarExpression::Binary { left: call, .. } = &binding.value else {
+            panic!("nested call")
+        };
+        let ScalarExpression::Call { occurrence, .. } = call.as_ref() else {
+            panic!("evaluated call")
+        };
+        let fact = cfg
+            .call_points
+            .iter()
+            .find(|fact| fact.occurrence == **occurrence)
+            .expect("connected nested call");
+        assert!(
+            matches!(&cfg.top_level.points[fact.evaluated_point.0].execution,
+            ScalarTopLevelPointExecution::Connected { occurrence: ScalarTopLevelOccurrence::Call(recorded), .. }
+            if recorded == occurrence.as_ref())
+        );
+    }
+}
+
+#[test]
+fn nested_literal_analysis_stays_out_of_module_runtime_edges() {
+    let text = "%%start\nunit() delayed = fn { unit() inner = fn { 1; }; inner(); };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (cfg, diagnostics) in [
+        (&single.program.top_level_reference_cfg, &single.diagnostics),
+        (
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let supplemental = cfg
+            .top_level
+            .points
+            .iter()
+            .filter(|event| {
+                event.execution == ScalarTopLevelPointExecution::SupplementalAnalysisOnly
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cfg.top_level.points.len(), cfg.points.len());
+        for event in supplemental {
+            assert_eq!(cfg.points[event.point.0].source_span.source, source());
+            assert!(cfg.points[event.point.0].successors.is_empty());
+            assert!(cfg
+                .holder_edges
+                .iter()
+                .all(|edge| edge.from != event.point && edge.to != event.point));
+            assert!(cfg.holder_exits.iter().all(|exit| exit.from != event.point));
+        }
+    }
+}
+
+#[test]
+fn module_callable_field_overwrite_has_connected_holder_action() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader value = { .read = fn { 1 }; };\nvalue.read = fn { 2 };\nvalue.read();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) = &items[1] else {
+            panic!("module field write")
+        };
+        let write = cfg
+            .assignment_points
+            .iter()
+            .find(|event| {
+                event.occurrence == *assignment.occurrence
+                    && event.target == 0
+                    && event.role == ScalarAssignmentPointRole::Assign
+            })
+            .expect("connected field write");
+        let CfgPointKind::Assign {
+            target, rhs_point, ..
+        } = &cfg.points[write.point.0].kind
+        else {
+            panic!("projected field assignment")
+        };
+        assert_eq!(target.projections.len(), 1);
+        assert_eq!(target.source, source());
+        assert!(matches!(
+            cfg.points[rhs_point.0].kind,
+            CfgPointKind::Capture { .. }
+        ));
+        let record = &cfg.top_level.points[write.point.0];
+        let ScalarTopLevelPointExecution::Connected {
+            occurrence: ScalarTopLevelOccurrence::Assignment(occurrence),
+            outgoing,
+        } = &record.execution
+        else {
+            panic!("connected assignment event")
+        };
+        assert_eq!(*occurrence, *assignment.occurrence);
+        assert!(!outgoing.is_empty());
+        assert!(cfg.points[..=write.point.0]
+            .windows(2)
+            .all(|pair| pair[0].successors.contains(&pair[1].id)));
+        assert!(cfg.holder_edges.iter().any(|edge| edge.from == write.point
+            && outgoing.contains(&edge.to)
+            && edge
+                .actions
+                .iter()
+                .any(|action| matches!(action, CallableHolderAction::Drop {
+                holder: CallableHolderPlace::Projection(place), ..
+            } if place.binding == target.binding && place.projections == target.projections))
+            && edge.actions.iter().any(|action| matches!(action,
+                CallableHolderAction::Move { to: CallableHolderPlace::Projection(place), .. }
+                | CallableHolderAction::Retain { to: CallableHolderPlace::Projection(place), .. }
+                if place == target))));
+        assert!(cfg.top_level.assignments.iter().any(|entry| {
+            entry.occurrence == *assignment.occurrence
+                && entry.execution
+                    == ScalarTopLevelAssignmentExecution::Connected {
+                        points: vec![write.point],
+                    }
+        }));
+        let supplemental = cfg
+            .top_level
+            .points
+            .iter()
+            .filter(|event| {
+                event.execution == ScalarTopLevelPointExecution::SupplementalAnalysisOnly
+            })
+            .collect::<Vec<_>>();
+        assert!(!supplemental.is_empty(), "supplemental analysis point");
+        assert!(supplemental.iter().any(|event| matches!(
+            cfg.points[event.point.0].kind,
+            CfgPointKind::Capture { .. }
+        ) && cfg.points[event.point.0].source_span.range
+            == expression_span(&assignment.values[0])));
+        assert!(supplemental
+            .iter()
+            .all(|event| event.point.0 > write.point.0));
+        assert!(supplemental.iter().all(|event| {
+            cfg.points[event.point.0].successors.is_empty()
+                && cfg
+                    .holder_edges
+                    .iter()
+                    .all(|edge| edge.from != event.point && edge.to != event.point)
+                && cfg.holder_exits.iter().all(|exit| exit.from != event.point)
+        }));
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.top_level, cfg.top_level);
+        assert_eq!(restored.assignment_points, cfg.assignment_points);
+    }
+}
+
+#[test]
+fn module_callable_field_overwrite_keeps_distinct_project_sources() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader value = { .read = fn { 1 }; };\nvalue.read = fn { 2 };\nvalue.read();\n%%end";
+    let sources = [module_source("src/one.w"), module_source("src/two.w")];
+    let project = validate_scalar_project(ScalarProject::new(
+        sources
+            .iter()
+            .map(|source| {
+                ScalarModule::from_program(module_from_text(source.clone(), text), Vec::new())
+            })
+            .collect(),
+        sources.to_vec(),
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for module in &project.project.modules {
+        let ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) = &module.items[1]
+        else {
+            panic!("module overwrite")
+        };
+        let cfg = &module.top_level_reference_cfg;
+        let fact = cfg
+            .assignment_points
+            .iter()
+            .find(|event| {
+                event.occurrence == *assignment.occurrence
+                    && event.role == ScalarAssignmentPointRole::Assign
+            })
+            .expect("module overwrite event");
+        assert_eq!(fact.occurrence.source_span.source, module.source);
+        assert_eq!(cfg.points[fact.point.0].source_span.source, module.source);
+        let CfgPointKind::Assign { target, .. } = &cfg.points[fact.point.0].kind else {
+            panic!("field assign")
+        };
+        assert_eq!(target.binding.source, module.source);
+        assert!(cfg.holder_edges.iter().any(|edge| edge.from == fact.point && edge.actions.iter().any(|action| {
+            matches!(action, CallableHolderAction::Drop { span, .. } if span.source == module.source)
+        })));
+    }
+}
+
+#[test]
+fn independent_callable_field_calls_in_branch_and_loop_resolve_in_both_validators() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader(u64) make = fn(count) { u8[count] bytes; bytes[0] = 4; Reader result = { .read = fn { bytes[0] }; }; result };\nunit() run = fn { Reader kept = make(2); Reader another = make(3); kept.read(); another.read(); if (true) { Reader branch = make(4); branch.read(); }; if (false) { Reader skipped = make(6); skipped.read(); }; u64 index = 0; while (index < 2) { Reader iterated = make(5); iterated.read(); index = index + 1; } };\nrun();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(
+            diagnostics.is_empty(),
+            "items: {items:?}; diagnostics: {diagnostics:?}"
+        );
+        let run = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .expect("run function");
+        let kept = text.find("kept =").unwrap() as u32;
+        let another = text.find("another =").unwrap() as u32;
+        assert!(run.reference_cfg.holder_edges.iter().any(|edge| {
+            edge.after.iter().any(|relation| relation.holders.iter().any(|holder| matches!(holder,
+                CallableHolderPlace::Projection(place) if place.binding.declaration_span.start == kept)))
+                && edge.after.iter().any(|relation| relation.holders.iter().any(|holder| matches!(holder,
+                    CallableHolderPlace::Projection(place) if place.binding.declaration_span.start == another)))
+        }), "holder edges: {:?}", run.reference_cfg.holder_edges);
+        assert!(run.reference_cfg.holder_edges.iter().any(|edge| {
+            edge.to.0 <= edge.from.0 && edge.actions.iter().any(|action| matches!(action,
+                CallableHolderAction::Drop { holder: CallableHolderPlace::Projection(place), .. }
+                    if place.binding.declaration_span.start == text.find("iterated =").unwrap() as u32))
+        }), "loop holder edges: {:?}", run.reference_cfg.holder_edges);
+        let branch = run
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::Branch { .. })
+                    && point.source_span.range.start == text.find("true").unwrap() as u32
+            })
+            .expect("branch");
+        let branch_edges = run
+            .reference_cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| edge.from == branch.id)
+            .collect::<Vec<_>>();
+        assert_eq!(branch_edges.len(), 2);
+        assert!(branch_edges
+            .iter()
+            .all(|edge| edge
+                .after
+                .iter()
+                .all(|relation| relation.holders.iter().all(
+                    |holder| !matches!(holder, CallableHolderPlace::Projection(place)
+                if place.binding.declaration_span.start == text.find("branch =").unwrap() as u32)
+                ))));
+        assert!(run.reference_cfg.holder_edges.iter().any(|edge| edge.actions.iter().any(|action|
+            matches!(action, CallableHolderAction::Drop { holder: CallableHolderPlace::Projection(place), .. }
+                if place.binding.declaration_span.start == text.find("branch =").unwrap() as u32))));
+        let skipped_branch = run
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::Branch { .. })
+                    && point.source_span.range.start == text.find("false").unwrap() as u32
+            })
+            .expect("skipped branch");
+        assert_eq!(
+            run.reference_cfg
+                .holder_edges
+                .iter()
+                .filter(|edge| edge.from == skipped_branch.id)
+                .count(),
+            2
+        );
+        assert!(run.reference_cfg.holder_edges.iter().any(|edge| edge.actions.iter().any(|action|
+            matches!(action, CallableHolderAction::Drop { holder: CallableHolderPlace::Projection(place), .. }
+                if place.binding.declaration_span.start == text.find("skipped =").unwrap() as u32))));
+    }
+}
+
+#[test]
+fn copied_callable_holder_preserves_source_and_overwrite_drops_only_destination() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader() make = fn { u8[2] bytes = [4, 5]; Reader result = { .read = fn { bytes[0] }; }; result };\nunit() run = fn { Reader kept = make(); Reader copied = kept; kept.read(); copied.read(); copied = make(); kept.read(); copied.read(); };\nrun();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let run = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .expect("run function");
+        let kept = text.find("kept =").unwrap() as u32;
+        let copied = text.find("copied =").unwrap() as u32;
+        let shared = run
+            .reference_cfg
+            .holder_edges
+            .iter()
+            .find(|edge| {
+                edge.actions.iter().any(|action| {
+                    matches!(action,
+                CallableHolderAction::Retain {
+                    from: CallableHolderPlace::Projection(place),
+                    to: CallableHolderPlace::Projection(other), ..
+                } if place.binding.declaration_span.start == kept
+                    && other.binding.declaration_span.start == copied)
+                })
+            })
+            .expect("copy retains projected callable holder");
+        assert!(
+            shared.after.iter().any(|relation| {
+                relation.holders.iter().any(|holder| {
+                    matches!(holder, CallableHolderPlace::Projection(place)
+                if place.binding.declaration_span.start == kept)
+                }) && relation.holders.iter().any(|holder| {
+                    matches!(holder, CallableHolderPlace::Projection(place)
+                    if place.binding.declaration_span.start == copied)
+                })
+            }),
+            "{:?}",
+            shared.after
+        );
+        let overwrite = text.find("copied = make()").unwrap() as u32;
+        assert!(run.reference_cfg.holder_edges.iter().any(|edge| {
+            edge.actions.iter().any(|action| matches!(action, CallableHolderAction::Drop {
+                holder: CallableHolderPlace::Projection(place), span, ..
+            } if place.binding.declaration_span.start == copied && span.range.start == overwrite))
+                && edge.after.iter().any(|relation| relation.holders.iter().any(|holder|
+                    matches!(holder, CallableHolderPlace::Projection(place) if place.binding.declaration_span.start == kept)))
+        }), "holder edges: {:?}", run.reference_cfg.holder_edges);
+    }
+}
+
+#[test]
+fn repeated_maker_site_keeps_distinct_live_field_holders_after_loop_join() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader() make = fn { u8[2] bytes = [4, 5]; Reader result = { .read = fn { bytes[0] }; }; result };\nunit() run = fn { Reader first = make(); Reader second = first; u64 index = 0; while (index < 2) { Reader next = make(); if (index == 0) { first = next; } else { second = next; }; index = index + 1; } first.read(); second.read(); };\nrun();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let run = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .expect("run function");
+        let first = text.find("first =").unwrap() as u32;
+        let second = text.find("second =").unwrap() as u32;
+        assert!(
+            run.reference_cfg.holder_edges.iter().any(|edge| {
+                matches!(
+                    run.reference_cfg.points[edge.from.0].kind,
+                    CfgPointKind::Join
+                ) && run.reference_cfg.points[edge.from.0]
+                    .source_span
+                    .range
+                    .start
+                    == text.find("while (").unwrap() as u32
+                    && edge.after.iter().any(|relation| {
+                        relation.holders.iter().any(|holder| {
+                            matches!(holder, CallableHolderPlace::Projection(place)
+                    if place.binding.declaration_span.start == first)
+                        })
+                    })
+                    && edge.after.iter().any(|relation| {
+                        relation.holders.iter().any(|holder| {
+                            matches!(holder, CallableHolderPlace::Projection(place)
+                    if place.binding.declaration_span.start == second)
+                        })
+                    })
+                    && !edge.after.iter().any(|relation| {
+                        relation.holders.iter().any(|holder| {
+                            matches!(holder, CallableHolderPlace::Projection(place)
+                    if place.binding.declaration_span.start == first)
+                        }) && relation.holders.iter().any(|holder| {
+                            matches!(holder, CallableHolderPlace::Projection(place)
+                    if place.binding.declaration_span.start == second)
+                        })
+                    })
+            }),
+            "holder edges: {:?}",
+            run.reference_cfg.holder_edges
+        );
+        assert!(run.reference_cfg.holder_edges.len() < 1000);
+    }
+}
+
+#[test]
+fn nested_arithmetic_cfg_fits_the_build_thread_stack() {
+    let text = "%%start\ni32(i32) nested = fn(input) { i32 value = input; if (value > 0) { if (value > 1) { if (value > 2) { while (value > 3) { if (value > 4) { if (value > 5) { value = value * 2; }; }; value = value - 1; } }; }; }; value };\n%%end";
+    let thread = std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(move || {
+            let parsed = parse_source(source(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let validation = derive_scalar_program(&parsed.result);
+            assert!(
+                validation.diagnostics.is_empty(),
+                "{:?}",
+                validation.diagnostics
+            );
+        })
+        .expect("validation thread");
+    thread.join().expect("nested scalar validation");
+}
+
+#[test]
+fn nested_literal_capture_cfg_uses_outer_binding_identity_in_both_validators() {
+    let text = "%%start\n(i32(i32))(i32) make = fn(amount) {\n    i32(i32) add = fn(value) { value + amount };\n    add\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("outer callable");
+        let capture = function
+            .reference_cfg
+            .points
+            .iter()
+            .find_map(|point| match &point.kind {
+                CfgPointKind::Capture { captures, .. } => Some(captures),
+                _ => None,
+            })
+            .expect("literal capture point");
+        assert_eq!(capture.len(), 1);
+        assert_eq!(capture[0].binding.source, source());
+        assert_eq!(capture[0].binding.function_span, function.span);
+        assert_eq!(
+            capture[0].binding.declaration_span,
+            function.parameter_spans[0]
+        );
+        assert_eq!(
+            capture[0].use_span.range.start,
+            text.rfind("amount").unwrap() as u32
+        );
+    }
+}
+
+#[test]
+fn nested_literal_calls_resolve_lexical_direct_and_field_targets_in_both_validators() {
+    let text = "%%start\nstruct copy Transformer { i32(i32) transform; }\n(i32(i32))(Transformer) make = fn(record) {\n    i32(i32) plus = fn(value) { value + 1 };\n    i32(i32) work = fn(value) { record.transform(plus(value)) };\n    work\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for module in [
+        ScalarModule::from_program(single.program.clone(), Vec::new()),
+        project.project.modules[0].clone(),
+    ] {
+        let (sites, _) =
+            resolve_module_call_sites(&source(), &module.items, std::slice::from_ref(&module))
+                .expect("resolved nested calls");
+        assert_eq!(sites.len(), 2);
+        let direct_start = text.find("plus(value)").unwrap() as u32;
+        let direct = sites
+            .iter()
+            .find(|site| site.source_span.range.start == direct_start)
+            .expect("nested direct call");
+        assert_eq!(
+            direct.source_span,
+            SourceSpan::new(source(), ByteSpan::new(direct_start, direct_start + 11))
+        );
+        let ResolvedCallTarget::LocalCallable(local) = &direct.target else {
+            panic!("direct target: {:?}", direct.target)
+        };
+        let plus_start = text.find("plus =").unwrap() as u32;
+        assert_eq!(
+            local.declaration_span,
+            ByteSpan::new(plus_start, plus_start + 4)
+        );
+        assert_eq!(local.source, source());
+        let field_start = text.find("record.transform(plus(value))").unwrap() as u32;
+        let field_call = sites
+            .iter()
+            .find(|site| site.source_span.range.start == field_start)
+            .expect("nested field call");
+        assert_eq!(
+            field_call.source_span,
+            SourceSpan::new(source(), ByteSpan::new(field_start, field_start + 29))
+        );
+        let ResolvedCallTarget::CallableField {
+            receiver_place,
+            field,
+        } = &field_call.target
+        else {
+            panic!("field target: {:?}", field_call.target)
+        };
+        assert_eq!(field, &module.structs[0].fields[0].id);
+        let function = module
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("outer function");
+        assert_eq!(receiver_place.binding.source, source());
+        assert_eq!(receiver_place.binding.function_span, function.span);
+        assert_eq!(receiver_place.function_span, function.span);
+        assert_eq!(
+            receiver_place.binding.declaration_span,
+            function.parameter_spans[0]
+        );
+    }
+}
+
+#[test]
+fn nested_literal_call_uses_lexical_callable_parameter_identity() {
+    let text = "%%start\ni32((i32(i32))) apply = fn(prior) {\n    i32((i32(i32))) nested = fn(operation) { operation(4) };\n    nested(prior)\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for module in [
+        ScalarModule::from_program(single.program.clone(), Vec::new()),
+        project.project.modules[0].clone(),
+    ] {
+        let (sites, _) =
+            resolve_module_call_sites(&source(), &module.items, std::slice::from_ref(&module))
+                .expect("nested calls");
+        let call_start = text.find("operation(4)").unwrap() as u32;
+        let call = sites
+            .iter()
+            .find(|site| site.source_span.range.start == call_start)
+            .expect("nested parameter call");
+        assert_eq!(
+            call.source_span,
+            SourceSpan::new(source(), ByteSpan::new(call_start, call_start + 12))
+        );
+        let ResolvedCallTarget::LocalCallable(binding) = &call.target else {
+            panic!("nested local callable")
+        };
+        let declaration = text.rfind("fn(operation)").unwrap() as u32 + 3;
+        let literal = text.rfind("fn(operation)").unwrap() as u32;
+        assert_eq!(
+            binding.declaration_span,
+            ByteSpan::new(declaration, declaration + 9)
+        );
+        assert_eq!(binding.function_span.start, literal);
+        assert_eq!(binding.source, source());
+    }
+}
+
+#[test]
+fn deeply_nested_literal_call_keeps_outer_field_binding_source() {
+    let text = "%%start\nstruct copy Transformer { i32(i32) transform; }\n(i32(i32))(Transformer) make = fn(record) {\n    i32(i32) middle = fn(value) {\n        i32(i32) inner = fn(item) { record.transform(item) };\n        inner(value)\n    };\n    middle\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for module in [
+        ScalarModule::from_program(single.program.clone(), Vec::new()),
+        project.project.modules[0].clone(),
+    ] {
+        let (sites, _) =
+            resolve_module_call_sites(&source(), &module.items, std::slice::from_ref(&module))
+                .expect("nested sites");
+        assert_eq!(sites.len(), 2);
+        let start = text.find("record.transform(item)").unwrap() as u32;
+        let site = sites
+            .iter()
+            .find(|site| site.source_span.range.start == start)
+            .expect("inner field call");
+        assert_eq!(
+            site.source_span,
+            SourceSpan::new(source(), ByteSpan::new(start, start + 22))
+        );
+        let ResolvedCallTarget::CallableField {
+            receiver_place,
+            field,
+        } = &site.target
+        else {
+            panic!("typed field target")
+        };
+        let function = module
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("outer function");
+        assert_eq!(
+            receiver_place.binding.declaration_span,
+            function.parameter_spans[0]
+        );
+        assert_eq!(receiver_place.binding.source, source());
+        assert_eq!(receiver_place.function_span, function.span);
+        assert_eq!(field, &module.structs[0].fields[0].id);
+        let middle = function
+            .reference_cfg
+            .literal_cfgs
+            .first()
+            .expect("middle CFG");
+        let inner = middle
+            .reference_cfg
+            .literal_cfgs
+            .first()
+            .expect("inner CFG");
+        assert_eq!(inner.literal.source, source());
+        assert!(inner.reference_cfg.points.iter().any(|point| point.source_span == site.source_span && matches!(&point.kind, CfgPointKind::Call { target: ResolvedCallTarget::CallableField { field: resolved, .. }, .. } if resolved == field)));
+    }
+}
+
+#[test]
+fn literal_cfg_retains_captured_borrowed_output_in_both_validators() {
+    let text = "%%start\ni32(i32) apply = fn(value) {\n    *i32 borrowed = &value;\n    *i32() inner = fn() { borrowed };\n    inner;\n    value\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("outer function");
+        let literal = outer
+            .reference_cfg
+            .literal_cfgs
+            .first()
+            .expect("literal cfg");
+        let stored = serde_json::to_value(&outer.reference_cfg).expect("serialize reference CFG");
+        let restored: ScalarReferenceCfg =
+            serde_json::from_value(stored).expect("restore reference CFG");
+        assert_eq!(restored.literal_cfgs[0].literal, literal.literal);
+        let start = text.find("fn() { borrowed }").unwrap() as u32;
+        assert_eq!(
+            literal.literal,
+            SourceSpan::new(source(), ByteSpan::new(start, start + 17))
+        );
+        let capture = &literal.captures[0];
+        let captured = &literal
+            .reference_cfg
+            .inputs
+            .iter()
+            .find(|input| input.binding == capture.binding)
+            .expect("captured input")
+            .origins;
+        assert_eq!(captured.len(), 1);
+        let output = literal
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("literal output");
+        assert_eq!(
+            output.possible_origins.as_ref().expect("borrowed output"),
+            captured
+        );
+        assert_eq!(
+            output.source_span.range.start,
+            text.find("borrowed };").unwrap() as u32
+        );
+        for origin in captured {
+            assert!(
+                matches!(&literal.reference_cfg.facts[origin.0], ReferenceOrigin::Fresh { loan, .. } if loan.creation_span.start == text.find("&value").unwrap() as u32)
+            );
+        }
+    }
+}
+
+#[test]
+fn literal_cfg_records_resolved_inner_call_in_both_validators() {
+    let text = "%%start\ni32(i32) apply = fn(value) {\n    i32(i32) helper = fn(item) { item + 1 };\n    i32(i32) inner = fn(item) { helper(item) };\n    i32 result = inner(value);\n    result\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("outer function");
+        let literal = outer
+            .reference_cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| {
+                literal.literal.range.start
+                    == text.find("fn(item) { helper(item) }").unwrap() as u32
+            })
+            .expect("inner literal cfg");
+        let start = text.find("helper(item)").unwrap() as u32;
+        let call = literal
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                point.source_span.range.start == start
+                    && matches!(point.kind, CfgPointKind::Call { .. })
+            })
+            .expect("inner call point");
+        assert_eq!(
+            call.source_span,
+            SourceSpan::new(source(), ByteSpan::new(start, start + 12))
+        );
+        let CfgPointKind::Call {
+            target: ResolvedCallTarget::LocalCallable(binding),
+            ..
+        } = &call.kind
+        else {
+            panic!("source-qualified callable")
+        };
+        let name_start = text.find("helper =").unwrap() as u32;
+        assert_eq!(
+            binding.declaration_span,
+            ByteSpan::new(name_start, name_start + 6)
+        );
+        assert_eq!(binding.source, source());
+    }
+}
+
+#[test]
+fn literal_cfg_keeps_each_joined_captured_reference_origin() {
+    let text = "%%start\ni32(bool) apply = fn(choice) {\n    i32 first = 1;\n    i32 second = 2;\n    *i32 selected = &first;\n    if (choice) { selected = &first; } else { selected = &second; };\n    *i32() read = fn() { selected };\n    read;\n    first + second\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("outer function");
+        let literal = outer
+            .reference_cfg
+            .literal_cfgs
+            .first()
+            .expect("literal cfg");
+        let captured = &literal
+            .reference_cfg
+            .inputs
+            .iter()
+            .find(|input| input.binding == literal.captures[0].binding)
+            .expect("captured input")
+            .origins;
+        assert_eq!(captured.len(), 2);
+        let output = literal
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("literal output");
+        assert_eq!(output.possible_origins.as_ref().expect("origins"), captured);
+    }
+}
+
+#[test]
+fn literal_cfg_checked_parameter_output_is_borrowed_from_its_parameter() {
+    let text = "%%start\ni32() apply = fn() {\n    *i32(*i32) identity = fn(value) { value };\n    identity;\n    0\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let literal = outer
+            .reference_cfg
+            .literal_cfgs
+            .first()
+            .expect("literal cfg");
+        let output = literal
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("literal output");
+        let origins = output.possible_origins.as_ref().expect("checked output");
+        assert_eq!(origins.len(), 1);
+        assert!(
+            matches!(&literal.reference_cfg.facts[origins.iter().next().unwrap().0], ReferenceOrigin::BorrowedFrom { parameter: 0, loan } if loan.origin_place.binding.function_span == literal.literal.range)
+        );
+    }
+}
+
+#[test]
+fn literal_cfg_preserves_distinct_borrowed_outputs() {
+    let text = "%%start\ni32() apply = fn() {\n    (*i32, *i32)(*i32, *i32) pair = fn(first, second) { first, second };\n    pair;\n    0\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("function");
+        let cfg = &function
+            .reference_cfg
+            .literal_cfgs
+            .first()
+            .expect("literal")
+            .reference_cfg;
+        let outputs = cfg
+            .points
+            .iter()
+            .filter_map(|point| match point.kind {
+                CfgPointKind::ReturnOutput { output, .. } => Some((
+                    output,
+                    point.possible_origins.as_ref().expect("checked output"),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 2);
+        for (index, (output, origins)) in outputs.into_iter().enumerate() {
+            assert_eq!(output, index);
+            assert_eq!(origins.len(), 1);
+            assert!(
+                matches!(&cfg.facts[origins.iter().next().unwrap().0], ReferenceOrigin::BorrowedFrom { parameter, .. } if *parameter == index)
+            );
+        }
+    }
+}
+
+#[test]
+fn nested_literal_output_refreshes_named_borrowed_call_in_both_validators() {
+    let text = "%%start\n*i32(*i32) forward = fn(input) { if (input == null) { input } else { null } };\nunit() outer = fn { *i32(*i32) inner = fn(input) { forward(input) }; inner; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let literal = outer
+            .reference_cfg
+            .literal_cfgs
+            .first()
+            .expect("inner literal");
+        let call_start = text.find("forward(input)").unwrap() as u32;
+        let output = literal
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("checked output");
+        assert_eq!(
+            output.source_span,
+            SourceSpan::new(source(), ByteSpan::new(call_start, call_start + 14))
+        );
+        let origins = output.possible_origins.as_ref().expect("converged origin");
+        assert_eq!(origins.len(), 2);
+        assert!(origins.iter().any(|origin| matches!(&literal.reference_cfg.facts[origin.0], ReferenceOrigin::Null { span } if *span == ByteSpan::new(call_start, call_start + 14))));
+    }
+}
+
+#[test]
+fn nested_literal_refreshes_joined_captured_call_origins_in_both_validators() {
+    let text = "%%start\n*i32(*i32) choose = fn(input) { if (input == null) { input } else { null } };\nunit() outer = fn { i32 owner = 2; *i32 checked = choose(&owner); *i32() inner = fn() { checked }; inner; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let literal = outer
+            .reference_cfg
+            .literal_cfgs
+            .first()
+            .expect("nested literal");
+        let capture = &literal.captures[0];
+        let declaration = text.find("checked =").unwrap() as u32;
+        assert_eq!(
+            capture.binding.declaration_span,
+            ByteSpan::new(declaration, declaration + 7)
+        );
+        let input = literal
+            .reference_cfg
+            .inputs
+            .iter()
+            .find(|input| input.binding == capture.binding)
+            .expect("checked capture input");
+        assert_eq!(input.origins.len(), 2);
+        let output = literal
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("checked output");
+        assert_eq!(
+            output.possible_origins.as_ref().expect("joined origins"),
+            &input.origins
+        );
+        let read = text.find("checked }; inner").unwrap() as u32;
+        assert_eq!(
+            output.source_span,
+            SourceSpan::new(source(), ByteSpan::new(read, read + 7))
+        );
+        let call = text.find("choose(&owner)").unwrap() as u32;
+        assert!(input.origins.iter().any(|origin| matches!(&literal.reference_cfg.facts[origin.0], ReferenceOrigin::Null { span } if *span == ByteSpan::new(call, call + 14))));
+        assert!(input.origins.iter().any(|origin| matches!(&literal.reference_cfg.facts[origin.0], ReferenceOrigin::Fresh { loan, .. } if loan.creation_span == ByteSpan::new(call + 7, call + 13))));
+    }
+}
+
+#[test]
+fn nested_literal_refresh_drops_precontract_borrowed_capture() {
+    let text = "%%start\n*i32(*i32) empty = fn(input) { if (input == null) { null } else { null } };\nunit() outer = fn { i32 owner = 3; *i32 checked = empty(&owner); *i32() inner = fn() { checked }; inner; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let literal = outer.reference_cfg.literal_cfgs.first().expect("inner");
+        let capture = &literal.captures[0];
+        let input = literal
+            .reference_cfg
+            .inputs
+            .iter()
+            .find(|input| input.binding == capture.binding)
+            .expect("input");
+        let output = literal
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("output");
+        assert_eq!(input.origins.len(), 1);
+        assert_eq!(
+            output.possible_origins.as_ref().expect("origin"),
+            &input.origins
+        );
+        let call = text.find("empty(&owner)").unwrap() as u32;
+        assert!(
+            matches!(&literal.reference_cfg.facts[input.origins.iter().next().unwrap().0], ReferenceOrigin::Null { span } if *span == ByteSpan::new(call, call + 13))
+        );
+    }
+}
+
+#[test]
+fn nested_literal_field_call_output_retains_joined_checked_origins() {
+    let text = "%%start\nstruct copy Holder { *i32(*i32) action; }\nunit() outer = fn { Holder box = { .action = fn(value) { if (value == null) { value } else { null } }; }; *i32(*i32) inner = fn(input) { box.action(input) }; inner; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let inner = outer
+            .reference_cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| {
+                literal.literal.range.start
+                    == text.find("fn(input) { box.action(input) }").unwrap() as u32
+            })
+            .expect("inner literal");
+        let call_start = text.find("box.action(input)").unwrap() as u32;
+        let output = inner
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("checked output");
+        assert_eq!(
+            output.source_span,
+            SourceSpan::new(source(), ByteSpan::new(call_start, call_start + 17))
+        );
+        let origins = output.possible_origins.as_ref().expect("resolved origins");
+        assert_eq!(origins.len(), 2);
+        assert!(origins.iter().any(|origin| matches!(&inner.reference_cfg.facts[origin.0], ReferenceOrigin::Null { span } if *span == ByteSpan::new(call_start, call_start + 17))));
+    }
+}
+
+#[test]
+fn callable_field_result_uses_returned_callable_environment() {
+    let text = "%%start\nstruct copy Holder { (i32())() make; }\nunit() outer = fn { Holder box = { .make = fn() { i32 amount = 3; i32() produced = fn() { amount }; produced }; }; i32() result = box.make(); result; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let call_start = text.find("box.make()").unwrap() as u32;
+        let result = outer
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                point.source_span.range.start == call_start
+                    && matches!(point.kind, CfgPointKind::Call { .. })
+            })
+            .expect("field call");
+        assert_eq!(
+            result.source_span,
+            SourceSpan::new(source(), ByteSpan::new(call_start, call_start + 10))
+        );
+        let returned = text.find("fn() { amount }").unwrap() as u32;
+        let callee = text.find("fn() { i32 amount").unwrap() as u32;
+        assert_eq!(result.possible_environments.len(), 1);
+        let environment = result.possible_environments.iter().next().unwrap();
+        assert_eq!(environment.literal.source, source());
+        assert_eq!(environment.literal.range.start, returned);
+        assert_ne!(environment.literal.range.start, callee);
+        let fact = &outer.reference_cfg.environments[environment.index];
+        assert!(
+            fact.owners
+                .iter()
+                .any(|binding| binding.declaration_span.start
+                    == text.find("amount =").unwrap() as u32)
+        );
+    }
+}
+
+#[test]
+fn callable_field_result_preserves_returned_owner_and_loan_sets() {
+    let text = "%%start\nstruct copy Holder { (*i32())() make; }\nunit() outer = fn { Holder box = { .make = fn() { i32 owner = 3; *i32 address = &owner; *i32() produced = fn() { owner; address }; produced }; }; *i32() result = box.make(); result; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let call = outer
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                point.source_span.range.start == text.find("box.make()").unwrap() as u32
+                    && matches!(point.kind, CfgPointKind::Call { .. })
+            })
+            .expect("call");
+        let environment = call
+            .possible_environments
+            .iter()
+            .next()
+            .expect("returned environment");
+        assert_eq!(call.possible_environments.len(), 1);
+        assert_eq!(
+            environment.literal.range.start,
+            text.find("fn() { owner; address }").unwrap() as u32
+        );
+        let fact = &outer.reference_cfg.environments[environment.index];
+        let owner = text.find("owner =").unwrap() as u32;
+        let address = text.find("address =").unwrap() as u32;
+        assert!(fact
+            .owners
+            .iter()
+            .any(|binding| binding.declaration_span == ByteSpan::new(owner, owner + 5)));
+        assert!(fact
+            .owners
+            .iter()
+            .any(|binding| binding.declaration_span == ByteSpan::new(address, address + 7)));
+        assert_eq!(fact.loans.len(), 1);
+        let loan = fact.loans.iter().next().unwrap();
+        let reference = text.find("&owner").unwrap() as u32;
+        assert!(
+            matches!(&outer.reference_cfg.facts[loan.origin.0], ReferenceOrigin::Fresh { loan, .. } if loan.creation_span == ByteSpan::new(reference, reference + 6))
+        );
+    }
+}
+
+#[test]
+fn live_captured_reference_blocks_owner_move_with_original_loan_span() {
+    let text = "%%start\nstruct Payload { i32 value; }\nunit() outer = fn { Payload owner = { .value = 1; }; *Payload address = &owner; unit() observe = fn() { address; }; Payload moved = owner; observe(); moved.value; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let move_start = text.find("= owner; observe").unwrap() as u32 + 2;
+        let loan_start = text.find("&owner").unwrap() as u32;
+        let conflict = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span
+                        == SourceSpan::new(source(), ByteSpan::new(move_start, move_start + 5))
+            })
+            .expect("move while captured loan is live");
+        assert!(conflict.labels.iter().skip(1).any(|label| label.span
+            == SourceSpan::new(source(), ByteSpan::new(loan_start, loan_start + 6))));
+    }
+}
+
+#[test]
+fn live_captured_reference_blocks_release_with_original_loan_span() {
+    let text = "%%start\nunit(u64) outer = fn(length) { u8[length] bytes; *u8 address = &bytes[0]; unit() observe = fn() { address; }; unsafe { core.free(&bytes); }; observe(); };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let release = text.find("core.free(&bytes)").unwrap() as u32;
+    let loan = text.find("&bytes[0]").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let conflict = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span
+                        == SourceSpan::new(source(), ByteSpan::new(release, release + 17))
+            })
+            .expect("live captured loan release");
+        assert!(conflict
+            .labels
+            .iter()
+            .skip(1)
+            .any(|label| label.span == SourceSpan::new(source(), ByteSpan::new(loan, loan + 9))));
+    }
+}
+
+#[test]
+fn captured_mutable_loan_blocks_shared_access_and_shared_capture_allows_shared_access() {
+    let bad = "%%start\nunit() outer = fn { i32 owner = 1; *!i32 address = &!owner; unit() observe = fn() { address; }; *i32 shared = &owner; observe(); shared; };\n%%end";
+    let parsed = parse_source(source(), bad.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let access = bad.find("&owner; observe").unwrap() as u32;
+    let loan = bad.find("&!owner").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let conflict = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span
+                        == SourceSpan::new(source(), ByteSpan::new(access, access + 6))
+            })
+            .expect("mutable capture rejects shared borrow");
+        assert!(conflict
+            .labels
+            .iter()
+            .skip(1)
+            .any(|label| label.span == SourceSpan::new(source(), ByteSpan::new(loan, loan + 7))));
+    }
+
+    let good = "%%start\nunit() outer = fn { i32 owner = 1; *i32 address = &owner; unit() observe = fn() { address; }; *i32 shared = &owner; observe(); shared; };\n%%end";
+    let parsed = parse_source(source(), good.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+}
+
+#[test]
+fn copied_callable_field_keeps_captured_loan_live_across_owner_move() {
+    let text = "%%start\nstruct Payload { i32 value; }\nstruct copy Holder { unit() action; }\nunit() outer = fn { Payload owner = { .value = 1; }; *Payload address = &owner; Holder box = { .action = fn() { address; }; }; Holder copy = box; Payload moved = owner; copy.action(); moved.value; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let operation = text.find("= owner; copy").unwrap() as u32 + 2;
+    let origin = text.find("&owner").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let conflict = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span
+                        == SourceSpan::new(source(), ByteSpan::new(operation, operation + 5))
+            })
+            .unwrap_or_else(|| panic!("copied field keeps captured loan live: {diagnostics:?}"));
+        assert!(conflict.labels.iter().skip(1).any(
+            |label| label.span == SourceSpan::new(source(), ByteSpan::new(origin, origin + 6))
+        ));
+    }
+}
+
+#[test]
+fn replaced_callable_ends_captured_loan_before_owner_move() {
+    let text = "%%start\nstruct Payload { i32 value; }\nunit() outer = fn { Payload owner = { .value = 1; }; *Payload address = &owner; unit() observe = fn() { address; }; observe = fn() { i32 dummy = 0; dummy; }; Payload moved = owner; moved.value; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+}
+
+#[test]
+fn joined_callable_field_alternatives_keep_each_captured_loan_live() {
+    let text = "%%start\nstruct Payload { i32 value; }\nstruct copy Holder { unit() action; }\nunit(bool) outer = fn(flag) { Payload first = { .value = 1; }; Payload second = { .value = 2; }; *Payload left = &first; *Payload right = &second; Holder box = { .action = fn() { left; }; }; if (flag) { box.action = fn() { right; }; } else { box.action = fn() { left; }; }; Payload moved = second; box.action(); moved.value; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let operation = text.find("= second; box").unwrap() as u32 + 2;
+    let origin = text.find("&second").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let conflict = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span
+                        == SourceSpan::new(source(), ByteSpan::new(operation, operation + 6))
+            })
+            .unwrap_or_else(|| panic!("joined callable field: {diagnostics:?}"));
+        assert!(conflict.labels.iter().skip(1).any(
+            |label| label.span == SourceSpan::new(source(), ByteSpan::new(origin, origin + 7))
+        ));
+    }
+}
+
+#[test]
+fn local_runtime_backing_and_copy_widening_have_distinct_owned_value_identities() {
+    let text = "%%start\nunit(u64) alloc = fn(count) { u8[count] bytes; bytes[0] = 1; bytes[0]; };\nunit() widen = fn { u8[2] fixed = [4, 5]; u8[] copied = fixed; u8 original = fixed[0]; copied[0]; original; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        for name in ["alloc", "widen"] {
+            let function = items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) if function.name == name => Some(function),
+                    _ => None,
+                })
+                .expect("named function");
+            let backing = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::Backing { .. }))
+                .collect::<Vec<_>>();
+            if name == "alloc" {
+                assert_eq!(backing.len(), 1);
+                assert_eq!(backing[0].possible_backings.len(), 1);
+                assert_eq!(
+                    backing[0].possible_backings[0].kind,
+                    RuntimeBackingKind::OwnedAllocation
+                );
+                assert_eq!(
+                    backing[0].possible_backings[0].owner.declaration_span,
+                    backing[0].source_span.range
+                );
+            } else {
+                assert_eq!(backing.len(), 2);
+                let fixed = &backing[0].possible_backings[0];
+                let copied = &backing[1].possible_backings[0];
+                assert_eq!(fixed.kind, RuntimeBackingKind::FixedValue);
+                assert_eq!(copied.kind, RuntimeBackingKind::OwnedAllocation);
+                assert_ne!(fixed.value, copied.value);
+                assert_ne!(fixed.owner, copied.owner);
+                assert_eq!(copied.origin.range, backing[1].source_span.range);
+            }
+            let json =
+                serde_json::to_string(&function.reference_cfg).expect("serialize ownership facts");
+            let restored: ScalarReferenceCfg =
+                serde_json::from_str(&json).expect("deserialize ownership facts");
+            assert_eq!(
+                restored
+                    .points
+                    .iter()
+                    .filter(|point| matches!(point.kind, CfgPointKind::Backing { .. }))
+                    .count(),
+                backing.len()
+            );
+        }
+    }
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+}
+
+#[test]
+fn moving_fixed_array_into_runtime_binding_preserves_value_identity_and_rejects_second_move() {
+    let valid = "%%start\nunit() move_once = fn { u8 left = 6; u8 right = 7; (*!u8)[2] items = [&!left, &!right]; (*!u8)[] moved = items; moved; };\n%%end";
+    let parsed = parse_source(source(), valid.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("function");
+        let points = function
+            .reference_cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::Backing { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(points.len(), 2);
+        assert_eq!(
+            points[0].possible_backings[0].value,
+            points[1].possible_backings[0].value
+        );
+        assert_ne!(
+            points[0].possible_backings[0].owner,
+            points[1].possible_backings[0].owner
+        );
+        assert_eq!(
+            points[1].possible_backings[0].kind,
+            RuntimeBackingKind::OwnedAllocation
+        );
+    }
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+
+    let invalid = "%%start\nunit() move_twice = fn { u8 left = 6; u8 right = 7; (*!u8)[2] items = [&!left, &!right]; (*!u8)[] first = items; (*!u8)[] second = items; first; second; };\n%%end";
+    let parsed = parse_source(source(), invalid.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let first = invalid.find("= items;").unwrap() as u32 + 2;
+    let second = invalid.rfind("= items;").unwrap() as u32 + 2;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let conflict = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span
+                        == SourceSpan::new(source(), ByteSpan::new(second, second + 5))
+            })
+            .expect("second move B0003");
+        assert!(conflict
+            .labels
+            .iter()
+            .skip(1)
+            .any(|label| label.span == SourceSpan::new(source(), ByteSpan::new(first, first + 5))));
+    }
+}
+
+#[test]
+fn struct_elements_resolve_before_move_only_fixed_array_widening() {
+    let text = "%%start\nstruct Payload { u8 value; }\nunit() widen = fn { Payload[2] items = [{ .value = 6; }, { .value = 7; }]; Payload[] moved = items; *Payload reader = &moved[0]; reader; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("function");
+        let facts = function
+            .reference_cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::Backing { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(
+            facts[0].possible_backings[0].value,
+            facts[1].possible_backings[0].value
+        );
+        assert_eq!(
+            facts[1].possible_backings[0].kind,
+            RuntimeBackingKind::OwnedAllocation
+        );
+    }
+}
+
+#[test]
+fn runtime_backing_assignment_copies_fixed_and_transfers_runtime_owner() {
+    let text = "%%start\nunit() copy_assignment = fn { u8[2] fixed = [1, 2]; u8[] target = fixed; target = fixed; fixed[0]; target[0]; };\nunit() move_assignment = fn { u8 left = 1; (*!u8)[1] items = [&!left]; (*!u8)[] first = items; (*!u8)[] second = first; (*!u8)[] third = second; third; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        for (name, is_copy) in [("copy_assignment", true), ("move_assignment", false)] {
+            let function = items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) if function.name == name => Some(function),
+                    _ => None,
+                })
+                .expect("function");
+            let points = function
+                .reference_cfg
+                .points
+                .iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::Backing { .. }))
+                .collect::<Vec<_>>();
+            if is_copy {
+                assert_eq!(points.len(), 3);
+                assert_ne!(
+                    points[1].possible_backings[0].value,
+                    points[2].possible_backings[0].value
+                );
+                assert_eq!(
+                    points[1].possible_backings[0].owner,
+                    points[2].possible_backings[0].owner
+                );
+                assert_eq!(
+                    points[2].possible_backings[0].kind,
+                    RuntimeBackingKind::OwnedAllocation
+                );
+            } else {
+                assert_eq!(points.len(), 4);
+                for point in points.iter().skip(1) {
+                    assert_eq!(
+                        point.possible_backings[0].value,
+                        points[0].possible_backings[0].value
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn joined_runtime_backings_keep_correlated_source_and_owner_alternatives() {
+    let text = "%%start\nunit(bool) choose = fn(flag) { u8[2] left = [1, 2]; u8[2] right = [3, 4]; u8[] selected = left; if (flag) { selected = left; } else { selected = right; }; selected[0]; left[0]; right[0]; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("function");
+        let join = function
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::Join)
+                    && point
+                        .possible_backings
+                        .iter()
+                        .filter(|fact| fact.kind == RuntimeBackingKind::OwnedAllocation)
+                        .count()
+                        >= 2
+            })
+            .expect("join of owner alternatives");
+        let owners = join
+            .possible_backings
+            .iter()
+            .filter(|fact| fact.kind == RuntimeBackingKind::OwnedAllocation)
+            .collect::<Vec<_>>();
+        assert_eq!(owners.len(), 2);
+        assert_eq!(owners[0].owner, owners[1].owner);
+        assert_ne!(owners[0].value, owners[1].value);
+        assert_ne!(owners[0].origin, owners[1].origin);
+        assert!(owners.iter().all(|fact| fact.value.source == source()));
+    }
+}
+
+#[test]
+fn direct_call_copies_fixed_arguments_into_correlated_parameter_owners() {
+    let text = "%%start\nunit(u8[], u8[]) receive = fn(first, second) { u8[] kept = first; kept[0]; second[0]; };\nunit() invoke = fn { u8[2] left = [1, 2]; u8[2] right = [3, 4]; receive(left, right); left[0]; right[0]; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let receiver = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "receive" => Some(function),
+                _ => None,
+            })
+            .expect("receiver");
+        let caller = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("caller");
+        let call = caller
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    &point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::ModuleCallable { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("resolved call");
+        assert_eq!(call.backing_argument_paths.len(), 1);
+        let path = &call.backing_argument_paths[0];
+        assert_eq!(path.len(), 2);
+        assert_eq!((path[0].position, path[1].position), (0, 1));
+        assert_ne!(path[0].backing.value, path[1].backing.value);
+        for argument in path {
+            assert_eq!(
+                argument.backing.owner,
+                receiver.reference_cfg.backing_parameters[argument.position]
+            );
+            assert_eq!(argument.backing.value.source, source());
+            assert!(
+                matches!(argument.backing.value.position, RuntimeValuePosition::Argument { index, .. } if index == argument.position)
+            );
+        }
+        assert_eq!(
+            receiver.reference_cfg.backing_input_paths,
+            vec![path
+                .iter()
+                .map(|argument| argument.backing.clone())
+                .collect::<Vec<_>>()]
+        );
+        let entry = &receiver.reference_cfg.points[0];
+        assert_eq!(entry.possible_backings.len(), 2);
+        assert_eq!(entry.possible_backings[0].value, path[0].backing.value);
+        let moved = receiver.reference_cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Backing { target, .. } if target.declaration_span == receiver.body.items.iter().find_map(|item| match item { ScalarBlockItem::LocalBinding(binding) => Some(binding.name_span), _ => None }).expect("kept"))).expect("callee transfer");
+        assert_eq!(moved.possible_backings[0].value, path[0].backing.value);
+    }
+}
+
+#[test]
+fn runtime_call_moves_preserve_value_identity_and_report_second_move_spans() {
+    let valid = "%%start\nunit((*!u8)[], u8[]) receive = fn(first, second) { first; second; };\nunit() invoke = fn { u8 owner = 3; (*!u8)[1] fixed = [&!owner]; u8[1] copyable = [4]; receive(fixed, copyable); copyable[0]; };\n%%end";
+    let parsed = parse_source(source(), valid.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let caller = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("caller");
+        let fixed = caller.reference_cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Backing { target, .. } if target.declaration_span.start == valid.find("fixed =").unwrap() as u32)).expect("fixed backing");
+        let call = caller
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    &point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::ModuleCallable { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("call");
+        let path = &call.backing_argument_paths[0];
+        assert_eq!(path[0].backing.value, fixed.possible_backings[0].value);
+        assert!(matches!(
+            path[1].backing.value.position,
+            RuntimeValuePosition::Argument { index: 1, .. }
+        ));
+    }
+
+    let bad = "%%start\nunit((*!u8)[]) take = fn(value) { value; };\nunit() invoke = fn { u8 owner = 1; (*!u8)[1] fixed = [&!owner]; take(fixed); take(fixed); };\n%%end";
+    let parsed = parse_source(source(), bad.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let first = bad.find("take(fixed)").unwrap() as u32 + 5;
+    let second = bad.rfind("take(fixed)").unwrap() as u32 + 5;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let conflict = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span
+                        == SourceSpan::new(source(), ByteSpan::new(second, second + 5))
+            })
+            .expect("second argument move");
+        assert!(conflict
+            .labels
+            .iter()
+            .skip(1)
+            .any(|label| label.span == SourceSpan::new(source(), ByteSpan::new(first, first + 5))));
+    }
+}
+
+#[test]
+fn local_callable_parameter_retains_actual_call_backing_in_capture_cell() {
+    let text = "%%start\nunit() outer = fn { u8[2] fixed = [4, 5]; unit(u8[]) local = fn(values) { unit() observe = fn { values[0]; }; observe(); }; local(fixed); fixed[0]; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let call = outer
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::LocalCallable(_),
+                        ..
+                    }
+                )
+            })
+            .expect("local call");
+        let owner = &call.backing_argument_paths[0][0].backing;
+        let local = outer
+            .reference_cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| literal.literal.range == owner.owner.function_span)
+            .expect("local literal");
+        assert_eq!(
+            local.reference_cfg.backing_input_paths[0],
+            vec![owner.clone()]
+        );
+        let observe = local
+            .reference_cfg
+            .environments
+            .iter()
+            .find(|environment| {
+                environment
+                    .inputs
+                    .iter()
+                    .any(|input| input.binding == owner.owner)
+            })
+            .expect("captured parameter");
+        assert!(observe.backings.iter().any(|fact| fact.value == owner.value
+            && matches!(fact.owner.kind, ReferenceBindingKind::Captured { .. })
+            && fact.owner.source == owner.owner.source));
+    }
+}
+
+#[test]
+fn imported_runtime_parameters_keep_declaring_source_and_caller_creation() {
+    let library_source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/library.w".into(),
+        "r1".into(),
+    );
+    let library = parse_source(
+        library_source.clone(),
+        "%%start\nunit(u8[], u8[]) receive = fn(first, second) { first[0]; second[0]; };\n%%end"
+            .to_owned(),
+        &[],
+    );
+    let main = parse_source(
+        source(),
+        "%%start\nlibrary = namespace package \"src/library.w\";\nunit() invoke = fn { u8[1] left = [1]; u8[1] right = [2]; library.receive(left, right); left[0]; right[0]; };\n%%end".to_owned(),
+        &[],
+    );
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    assert!(main.diagnostics.is_empty(), "{:?}", main.diagnostics);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![
+            ScalarModule::from_program(
+                derive_scalar_program(&main.result).program,
+                vec![ScalarNamespaceBinding {
+                    binding: "library".into(),
+                    target: library_source.clone(),
+                    span: ByteSpan::new(0, 0),
+                }],
+            ),
+            ScalarModule::from_program(derive_scalar_program(&library.result).program, Vec::new()),
+        ],
+        vec![source(), library_source.clone()],
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    let caller = project.project.modules[0]
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ScalarItem::Function(function) => Some(function),
+            _ => None,
+        })
+        .expect("caller");
+    let callee = project.project.modules[1]
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ScalarItem::Function(function) => Some(function),
+            _ => None,
+        })
+        .expect("callee");
+    let call = caller
+        .reference_cfg
+        .points
+        .iter()
+        .find(|point| {
+            matches!(
+                point.kind,
+                CfgPointKind::Call {
+                    target: ResolvedCallTarget::ModuleCallable { .. },
+                    ..
+                }
+            )
+        })
+        .expect("imported call");
+    let path = &call.backing_argument_paths[0];
+    assert_eq!(path.len(), 2);
+    for (position, argument) in path.iter().enumerate() {
+        assert_eq!(argument.position, position);
+        assert_eq!(argument.backing.value.source, source());
+        assert_eq!(argument.backing.owner.source, library_source);
+        assert_eq!(
+            argument.backing.owner,
+            callee.reference_cfg.backing_parameters[position]
+        );
+    }
+    assert_eq!(
+        callee.reference_cfg.backing_input_paths[0],
+        path.iter()
+            .map(|argument| argument.backing.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn runtime_allocation_call_transfers_existing_identity_once() {
+    let text = "%%start\nunit(u8[]) take = fn(value) { u8[] kept = value; kept[0]; };\nunit() invoke = fn { u8[2] values; take(values); };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let caller = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("caller");
+        let callee = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "take" => Some(function),
+                _ => None,
+            })
+            .expect("callee");
+        let allocation = caller
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Backing {
+                        transfer: RuntimeBackingTransfer::Allocate,
+                        ..
+                    }
+                )
+            })
+            .expect("allocation");
+        let call = caller
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::ModuleCallable { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("call");
+        let transferred = &call.backing_argument_paths[0][0].backing;
+        assert_eq!(transferred.value, allocation.possible_backings[0].value);
+        assert_eq!(
+            transferred.owner,
+            callee.reference_cfg.backing_parameters[0]
+        );
+        let kept = callee
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Backing {
+                        transfer: RuntimeBackingTransfer::Move { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("callee move");
+        assert_eq!(kept.possible_backings[0].value, transferred.value);
+    }
+    let bad = text.replace("take(values);", "take(values); take(values);");
+    let parsed = parse_source(source(), bad.clone(), &[]);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let first = bad.find("take(values)").unwrap() as u32 + 5;
+    let second = bad.rfind("take(values)").unwrap() as u32 + 5;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let conflict = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span
+                        == SourceSpan::new(source(), ByteSpan::new(second, second + 6))
+            })
+            .expect("second move");
+        assert!(conflict
+            .labels
+            .iter()
+            .skip(1)
+            .any(|label| label.span == SourceSpan::new(source(), ByteSpan::new(first, first + 6))));
+    }
+}
+
+#[test]
+fn named_runtime_output_transfers_fresh_and_forwarded_backings_in_both_validators() {
+    let text = "%%start\nu8[](u64) fresh = fn(count) { u8[count] local; local };\nu8[](u8[]) relay = fn(value) { value };\nunit() invoke = fn { u8[2] fixed = [3, 4]; u8[] forwarded = relay(fixed); u8 original = fixed[0]; u8[] allocated = fresh(2); forwarded[0]; allocated[0]; original; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let caller = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("caller");
+        let calls = caller
+            .reference_cfg
+            .points
+            .iter()
+            .filter(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::ModuleCallable { .. },
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let forwarded = calls[0]
+            .possible_backings
+            .iter()
+            .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+            .expect("forwarded call output");
+        assert_eq!(
+            forwarded.value,
+            calls[0].backing_argument_paths[0][0].backing.value
+        );
+        let fresh = calls[1]
+            .possible_backings
+            .iter()
+            .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+            .expect("fresh call output");
+        assert_ne!(fresh.value, forwarded.value);
+        assert!(matches!(
+            fresh.value.position,
+            RuntimeValuePosition::CallOutput { output: 0, .. }
+        ));
+        assert_eq!(fresh.origin.source, source());
+        for (index, call) in calls.iter().enumerate() {
+            let next = caller
+                .reference_cfg
+                .points
+                .iter()
+                .skip(call.id.0 + 1)
+                .find(|point| {
+                    matches!(
+                        point.kind,
+                        CfgPointKind::Backing {
+                            transfer: RuntimeBackingTransfer::Move { .. },
+                            ..
+                        }
+                    )
+                })
+                .expect("bound result");
+            let origin = if index == 0 { forwarded } else { fresh };
+            assert_eq!(next.possible_backings[0].value, origin.value);
+            assert_ne!(next.possible_backings[0].owner, origin.owner);
+        }
+    }
+}
+
+#[test]
+fn named_multi_output_backings_keep_distinct_output_positions() {
+    let text = "%%start\n(u8[], u8[])(u64, u8[]) pair = fn(count, input) { u8[count] made; input, made };\nunit() invoke = fn { u8[2] fixed = [1, 2]; u8[] left, u8[] right = pair(2, fixed); fixed[0]; left[0]; right[0]; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let caller = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("caller");
+        let calls = caller
+            .reference_cfg
+            .points
+            .iter()
+            .filter(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::ModuleCallable { .. },
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].backing_argument_paths[0][0].position, 1);
+        let output = |point: &ReferenceFlowPoint| {
+            point
+                .possible_backings
+                .iter()
+                .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+                .expect("output fact")
+                .clone()
+        };
+        assert_eq!(
+            output(calls[0]).value,
+            calls[0].backing_argument_paths[0][0].backing.value
+        );
+        assert_ne!(output(calls[0]).value, output(calls[1]).value);
+        assert!(matches!(
+            output(calls[1]).value.position,
+            RuntimeValuePosition::CallOutput { output: 1, .. }
+        ));
+        for (index, point) in calls.iter().enumerate() {
+            assert_eq!(
+                output(point).owner.kind,
+                ReferenceBindingKind::CallOutput {
+                    point: point.id,
+                    output: index
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn fixed_return_widening_creates_independent_call_output_and_keeps_source_usable() {
+    let text = "%%start\nu8[]() copy_out = fn { u8[2] fixed = [4, 5]; u8[] result = fixed; fixed[0]; result };\nunit() invoke = fn { u8[] received = copy_out(); received[0]; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let callee = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "copy_out" => Some(function),
+                _ => None,
+            })
+            .expect("callee");
+        let caller = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("caller");
+        let facts = callee
+            .reference_cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::Backing { .. }))
+            .collect::<Vec<_>>();
+        assert_ne!(
+            facts[0].possible_backings[0].value,
+            facts[1].possible_backings[0].value
+        );
+        let call = caller
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+            .expect("call");
+        let returned = call
+            .possible_backings
+            .iter()
+            .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+            .expect("returned");
+        assert_ne!(returned.value, facts[0].possible_backings[0].value);
+        assert_eq!(returned.origin, facts[1].possible_backings[0].origin);
+    }
+}
+
+#[test]
+fn joined_runtime_return_preserves_both_origin_owner_pairs_at_call() {
+    let text = "%%start\nu8[](bool) select = fn(flag) { u8[1] left = [1]; u8[2] right = [2, 3]; if (flag) { u8[] value = left; value } else { u8[] value = right; value } };\nunit() invoke = fn { u8[] selected = select(true); selected[0]; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let caller = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("caller");
+        let call = caller
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+            .expect("call");
+        let candidates = call
+            .possible_backings
+            .iter()
+            .filter(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 2);
+        assert_ne!(candidates[0].value, candidates[1].value);
+        assert_eq!(candidates[0].owner, candidates[1].owner);
+        assert_ne!(candidates[0].origin, candidates[1].origin);
+    }
+}
+
+#[test]
+fn imported_runtime_output_keeps_callee_origin_and_caller_output_identity() {
+    let library_source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/library.w".into(),
+        "r1".into(),
+    );
+    let library = parse_source(
+        library_source.clone(),
+        "%%start\nu8[](u64) create = fn(count) { u8[count] bytes; bytes };\nu8[](u8[]) relay = fn(value) { value };\n%%end".to_owned(),
+        &[],
+    );
+    let main = parse_source(source(), "%%start\nlibrary = namespace package \"src/library.w\";\nunit() invoke = fn { u8[2] fixed = [4, 5]; u8[] forwarded = library.relay(fixed); fixed[0]; forwarded[0]; u8[] result = library.create(2); result[0]; };\n%%end".to_owned(), &[]);
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    assert!(main.diagnostics.is_empty(), "{:?}", main.diagnostics);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![
+            ScalarModule::from_program(
+                derive_scalar_program(&main.result).program,
+                vec![ScalarNamespaceBinding {
+                    binding: "library".into(),
+                    target: library_source.clone(),
+                    span: ByteSpan::new(0, 0),
+                }],
+            ),
+            ScalarModule::from_program(derive_scalar_program(&library.result).program, Vec::new()),
+        ],
+        vec![source(), library_source.clone()],
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    let caller = project.project.modules[0]
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ScalarItem::Function(function) => Some(function),
+            _ => None,
+        })
+        .expect("caller");
+    let call = caller
+        .reference_cfg
+        .points
+        .iter()
+        .find(|point| {
+            matches!(
+                point.kind,
+                CfgPointKind::Call {
+                    expression: ScalarExpression::Call { ref name, .. },
+                    target: ResolvedCallTarget::ModuleCallable { .. },
+                    ..
+                } if name == "create"
+            )
+        })
+        .expect("call");
+    let returned = call
+        .possible_backings
+        .iter()
+        .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+        .expect("return fact");
+    assert_eq!(returned.value.source, source());
+    assert_eq!(returned.owner.source, source());
+    assert_eq!(returned.origin.source, library_source);
+    assert!(
+        matches!(&returned.value.position, RuntimeValuePosition::CallOutput { target_source, output: 0, .. } if target_source == &library_source)
+    );
+    let forwarded_call = caller.reference_cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Call { expression: ScalarExpression::Call { name, .. }, .. } if name == "relay")).expect("imported relay call");
+    let forwarded = forwarded_call
+        .possible_backings
+        .iter()
+        .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+        .expect("forwarded output");
+    assert_eq!(
+        forwarded.value,
+        forwarded_call.backing_argument_paths[0][0].backing.value
+    );
+    assert_eq!(forwarded.value.source, source());
+    assert_eq!(forwarded.owner.source, source());
+}
+
+#[test]
+fn moved_returned_backing_invalidates_prior_caller_owner_with_exact_spans() {
+    let text = "%%start\nu8[](u8[]) relay = fn(value) { value };\nunit() invoke = fn { u8[2] fixed = [1, 2]; u8[] first = relay(fixed); u8[] second = relay(first); first[0]; second[0]; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let transfer_start = text.find("relay(first)").unwrap() as u32 + 6;
+    let invalid_start = text.find("first[0]").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let error = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span
+                        == SourceSpan::new(
+                            source(),
+                            ByteSpan::new(invalid_start, invalid_start + 8),
+                        )
+            })
+            .expect("stale owner");
+        assert!(error.labels.iter().skip(1).any(|label| label.span
+            == SourceSpan::new(source(), ByteSpan::new(transfer_start, transfer_start + 5))));
+    }
+}
+
+#[test]
+fn direct_fixed_output_widens_with_call_output_identity() {
+    let text = "%%start\nu8[]() copy_out = fn { u8[2] fixed = [4, 5]; fixed[0]; fixed };\nunit() invoke = fn { u8[] received = copy_out(); received[0]; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let callee = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "copy_out" => Some(function),
+                _ => None,
+            })
+            .expect("callee");
+        let fixed = callee
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Backing {
+                        transfer: RuntimeBackingTransfer::CreateFixed,
+                        ..
+                    }
+                )
+            })
+            .expect("fixed");
+        let returned = callee
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. }))
+            .expect("return");
+        assert_ne!(
+            returned.possible_backings[0].value,
+            fixed.possible_backings[0].value
+        );
+        assert!(matches!(
+            returned.kind,
+            CfgPointKind::ReturnOutput {
+                backing_action: RuntimeReturnBackingAction::CopyFixed { .. },
+                ..
+            }
+        ));
+        let caller = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("caller");
+        let call = caller
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+            .expect("call");
+        let fact = call
+            .possible_backings
+            .iter()
+            .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+            .expect("copied output");
+        assert!(
+            matches!(&fact.value.position, RuntimeValuePosition::CallOutput { action: RuntimeOutputBackingAction::CopyFixed, lineage, .. } if lineage.as_ref() == &returned.possible_backings[0].value)
+        );
+        assert_eq!(fact.kind, RuntimeBackingKind::OwnedAllocation);
+        assert_eq!(
+            fact.origin.range,
+            ByteSpan::new(
+                text.rfind("fixed }").unwrap() as u32,
+                text.rfind("fixed }").unwrap() as u32 + 5
+            )
+        );
+    }
+}
+
+#[test]
+fn nested_runtime_call_forwards_inner_output_identity_through_parameter() {
+    let text = "%%start\nu8[]() create = fn { u8[2] values = [1, 2]; u8[] owned = values; owned };\nu8[](u8[]) forward = fn(input) { input };\nunit() invoke = fn { u8[] result = forward(create()); result[0]; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let caller = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("caller");
+        let calls = caller
+            .reference_cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let inner = calls[0]
+            .possible_backings
+            .iter()
+            .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+            .expect("inner");
+        let outer = calls[1]
+            .possible_backings
+            .iter()
+            .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+            .expect("outer");
+        assert_eq!(inner.value, outer.value);
+        assert_ne!(inner.owner, outer.owner);
+        assert_eq!(outer.value.source, source());
+    }
+}
+
+#[test]
+fn move_only_fixed_output_transfers_once_into_caller_binding() {
+    let text = "%%start\nstruct Payload { u8 value; }\nPayload[]() make = fn { Payload[1] fixed = [{ .value = 5; }]; fixed };\nunit() invoke = fn { Payload[] received = make(); received; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let callee = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("callee");
+        let caller = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("caller");
+        let origin = callee
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Backing {
+                        transfer: RuntimeBackingTransfer::CreateFixed,
+                        ..
+                    }
+                )
+            })
+            .expect("fixed source");
+        let returned = callee
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. }))
+            .expect("return");
+        assert_eq!(
+            returned.possible_backings[0].value,
+            origin.possible_backings[0].value
+        );
+        assert!(matches!(
+            returned.kind,
+            CfgPointKind::ReturnOutput {
+                backing_action: RuntimeReturnBackingAction::MoveFixed { .. },
+                ..
+            }
+        ));
+        let call = caller
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+            .expect("call");
+        let output = call
+            .possible_backings
+            .iter()
+            .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+            .expect("output");
+        assert!(
+            matches!(&output.value.position, RuntimeValuePosition::CallOutput { action: RuntimeOutputBackingAction::MoveFixed, lineage, .. } if lineage.as_ref() == &origin.possible_backings[0].value)
+        );
+        assert_eq!(output.origin, origin.possible_backings[0].origin);
+        let binding = caller
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Backing {
+                        transfer: RuntimeBackingTransfer::Move { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("caller binding");
+        assert_eq!(binding.possible_backings[0].value, output.value);
+    }
+}
+
+#[test]
+fn missing_forwarded_parameter_owner_reports_call_span_even_with_fresh_alternative() {
+    let text = "%%start\nu8[](u8[], bool) choose = fn(input, flag) { if (flag) { input } else { u8[1] fixed = [1]; u8[] owned = fixed; owned } };\nunit() invoke = fn { u8[2] fixed = [1, 2]; u8[] owned = fixed; u8[] output = choose(owned, true); output[0]; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for mut module in [
+        ScalarModule::from_program(single.program, Vec::new()),
+        project.project.modules[0].clone(),
+    ] {
+        let caller = module
+            .items
+            .iter_mut()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("caller");
+        let backing = caller
+            .reference_cfg
+            .initial_points
+            .iter_mut()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Backing {
+                        transfer: RuntimeBackingTransfer::CopyFixed { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("source-backed owned argument");
+        let CfgPointKind::Backing {
+            target, transfer, ..
+        } = &mut backing.kind
+        else {
+            unreachable!()
+        };
+        let mut absent = target.clone();
+        absent.kind = ReferenceBindingKind::CallOutput {
+            point: CfgPointId(999),
+            output: 0,
+        };
+        *transfer = RuntimeBackingTransfer::Move { source: absent };
+        let errors = super::reference::resolve_reference_output_contracts(
+            std::slice::from_mut(&mut module),
+            &mut super::reference::test_observations::ReferenceValidationTestTrace::new(),
+        );
+        let call_start = text.find("choose(owned, true)").unwrap() as u32;
+        assert!(errors.iter().any(|error| matches!(error, ReferenceAnalysisError::MissingContext { source_span, reason: ReferenceAnalysisErrorReason::MissingResolvedBinding } if source_span.range == ByteSpan::new(call_start, call_start + 19))), "{errors:?}");
+    }
+}
+
+#[test]
+fn top_level_runtime_calls_are_source_ordered_and_keep_copy_identity_in_both_validators() {
+    let text = "%%start\nu8[](u8[]) relay = fn(value) { value };\nu8[2] fixed = [4, 5];\nu8[] result = relay(fixed);\nu8 original = fixed[0];\nresult[0];\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for cfg in [
+        &single.program.top_level_reference_cfg,
+        &project.project.modules[0].top_level_reference_cfg,
+    ] {
+        let call_start = text.find("relay(fixed)").unwrap() as u32;
+        let call = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::Call { .. })
+                    && point.source_span.range.start == call_start
+            })
+            .expect("reachable call");
+        assert_eq!(
+            call.source_span,
+            SourceSpan::new(source(), ByteSpan::new(call_start, call_start + 12))
+        );
+        assert_eq!(call.backing_argument_paths[0][0].position, 0);
+        let output = call
+            .possible_backings
+            .iter()
+            .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+            .expect("output");
+        assert_ne!(
+            output.value,
+            cfg.points
+                .iter()
+                .find(|point| matches!(
+                    point.kind,
+                    CfgPointKind::Backing {
+                        transfer: RuntimeBackingTransfer::CreateFixed,
+                        ..
+                    }
+                ))
+                .expect("fixed")
+                .possible_backings[0]
+                .value
+        );
+        assert!(cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Backing { transfer: RuntimeBackingTransfer::Move { source }, .. } if *source == output.owner)));
+    }
+}
+
+#[test]
+fn top_level_multi_output_assignment_transports_forwarded_and_fresh_owners() {
+    let text = "%%start\n(u8[], u8[])(u8[], u64) pair = fn(input, count) { u8[count] fresh; input, fresh };\nu8[2] fixed = [4, 5];\nu8[] first, u8[] second = pair(fixed, 2);\nfirst, second = pair(fixed, 3);\nfixed[0]; first[0]; second[0];\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for cfg in [
+        &single.program.top_level_reference_cfg,
+        &project.project.modules[0].top_level_reference_cfg,
+    ] {
+        let calls = cfg
+            .points
+            .iter()
+            .filter(|point| {
+                matches!(
+                    &point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::ModuleCallable { .. },
+                        ..
+                    }
+                ) && !point.backing_argument_paths.is_empty()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        for call in &calls {
+            let first = call
+                .possible_backings
+                .iter()
+                .find(|fact| {
+                    matches!(
+                        fact.owner.kind,
+                        ReferenceBindingKind::CallOutput { output: 0, .. }
+                    )
+                })
+                .expect("forwarded output");
+            assert_eq!(first.value, call.backing_argument_paths[0][0].backing.value);
+            let output_one = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Call { output: 1, .. } if point.source_span == call.source_span)).expect("second output");
+            let fresh = output_one
+                .possible_backings
+                .iter()
+                .find(|fact| {
+                    matches!(
+                        fact.owner.kind,
+                        ReferenceBindingKind::CallOutput { output: 1, .. }
+                    )
+                })
+                .expect("fresh output");
+            assert_ne!(first.value, fresh.value);
+        }
+    }
+}
+
+#[test]
+fn top_level_move_only_widening_reports_second_move_in_both_validators() {
+    let text = "%%start\nstruct Payload { u8 value; }\nPayload[1] fixed = [{ .value = 7; }];\nPayload[] first = fixed;\nPayload[] second = fixed;\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let first = text.find("first = fixed").unwrap() as u32 + 8;
+    let second = text.find("second = fixed").unwrap() as u32 + 9;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let error = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span
+                        == SourceSpan::new(source(), ByteSpan::new(second, second + 5))
+            })
+            .expect("second move");
+        assert!(error
+            .labels
+            .iter()
+            .skip(1)
+            .any(|label| label.span == SourceSpan::new(source(), ByteSpan::new(first, first + 5))));
+    }
+}
+
+#[test]
+fn imported_top_level_call_retains_callee_origin_and_caller_owner() {
+    let library_source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/library.w".into(),
+        "r1".into(),
+    );
+    let library = parse_source(
+        library_source.clone(),
+        "%%start\nu8[](u64) create = fn(count) { u8[count] data; data };\n%%end".to_owned(),
+        &[],
+    );
+    let text = "%%start\nlibrary = namespace package \"src/library.w\";\nu8[] result = library.create(2);\nresult[0];\n%%end";
+    let main = parse_source(source(), text.to_owned(), &[]);
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    assert!(main.diagnostics.is_empty(), "{:?}", main.diagnostics);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![
+            ScalarModule::from_program(
+                derive_scalar_program(&main.result).program,
+                vec![ScalarNamespaceBinding {
+                    binding: "library".into(),
+                    target: library_source.clone(),
+                    span: ByteSpan::new(0, 0),
+                }],
+            ),
+            ScalarModule::from_program(derive_scalar_program(&library.result).program, Vec::new()),
+        ],
+        vec![source(), library_source.clone()],
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    let cfg = &project.project.modules[0].top_level_reference_cfg;
+    let call_start = text.find("library.create(2)").unwrap() as u32;
+    let call = cfg
+        .points
+        .iter()
+        .find(|point| {
+            matches!(point.kind, CfgPointKind::Call { .. })
+                && point.source_span.range.start == call_start
+        })
+        .expect("module call");
+    let output = call
+        .possible_backings
+        .iter()
+        .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+        .expect("owned output");
+    assert_eq!(
+        call.source_span,
+        SourceSpan::new(source(), ByteSpan::new(call_start, call_start + 17))
+    );
+    assert_eq!(output.value.source, source());
+    assert_eq!(output.owner.source, source());
+    assert_eq!(output.origin.source, library_source);
+    assert!(cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Backing { transfer: RuntimeBackingTransfer::Move { source }, .. } if source == &output.owner)));
+}
+
+#[test]
+fn top_level_executable_calls_transfer_in_source_order() {
+    let text = "%%start\nstruct Payload { u8 value; }\nunit(Payload[]) consume = fn(value) { value; };\nPayload[1] fixed = [{ .value = 7; }];\nconsume(fixed);\nconsume(fixed);\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let first = text.find("consume(fixed)").unwrap() as u32;
+    let second = text.rfind("consume(fixed)").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let error = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span.range == ByteSpan::new(second + 8, second + 13)
+            })
+            .expect("second call moves unavailable owner");
+        assert!(error
+            .labels
+            .iter()
+            .skip(1)
+            .any(|label| label.span
+                == SourceSpan::new(source(), ByteSpan::new(first + 8, first + 13))));
+    }
+    for cfg in [
+        &single.program.top_level_reference_cfg,
+        &project.project.modules[0].top_level_reference_cfg,
+    ] {
+        let calls = cfg
+            .points
+            .iter()
+            .filter(|point| {
+                matches!(point.kind, CfgPointKind::Call { .. })
+                    && (point.source_span.range.start == first
+                        || point.source_span.range.start == second)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].successors.iter().any(|id| id.0 <= calls[1].id.0));
+    }
+}
+
+#[test]
+fn top_level_multi_output_preserves_joined_forwarded_and_fresh_alternatives() {
+    let text = "%%start\n(u8[], u8[])(u8[], bool) pair = fn(input, flag) { u8[1] fixed = [7]; u8[] selected = fixed; u8[1] second_fixed = [8]; u8[] second = second_fixed; if (flag) { selected = input; }; selected, second };\nu8[2] given = [4, 5];\nu8[] first, u8[] second = pair(given, true);\ngiven[0]; first[0]; second[0];\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for cfg in [
+        &single.program.top_level_reference_cfg,
+        &project.project.modules[0].top_level_reference_cfg,
+    ] {
+        let call = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Call { output: 0, .. }))
+            .expect("first output");
+        let first = call
+            .possible_backings
+            .iter()
+            .filter(|fact| {
+                matches!(
+                    fact.owner.kind,
+                    ReferenceBindingKind::CallOutput { output: 0, .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(first.len(), 2);
+        assert!(first
+            .iter()
+            .any(|fact| fact.value == call.backing_argument_paths[0][0].backing.value));
+        assert!(first
+            .iter()
+            .any(|fact| fact.value != call.backing_argument_paths[0][0].backing.value));
+        let second = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Call { output: 1, .. }))
+            .expect("second output");
+        assert_eq!(
+            second
+                .possible_backings
+                .iter()
+                .filter(|fact| matches!(
+                    fact.owner.kind,
+                    ReferenceBindingKind::CallOutput { output: 1, .. }
+                ))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn top_level_single_assignment_rebinds_call_output_with_new_copy_identity() {
+    let text = "%%start\nu8[](u8[]) relay = fn(value) { value };\nu8[2] fixed = [4, 5];\nu8[] saved = relay(fixed);\nsaved = relay(fixed);\nfixed[0]; saved[0];\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for cfg in [
+        &single.program.top_level_reference_cfg,
+        &project.project.modules[0].top_level_reference_cfg,
+    ] {
+        let calls = cfg
+            .points
+            .iter()
+            .filter(|point| {
+                matches!(point.kind, CfgPointKind::Call { .. })
+                    && !point.backing_argument_paths.is_empty()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let first = calls[0]
+            .possible_backings
+            .iter()
+            .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+            .expect("initial output");
+        let second = calls[1]
+            .possible_backings
+            .iter()
+            .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+            .expect("assigned output");
+        assert_ne!(first.value, second.value);
+        let assigned = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Backing { transfer: RuntimeBackingTransfer::Move { source }, .. } if source == &second.owner)).expect("assignment transport");
+        assert_eq!(assigned.possible_backings[0].value, second.value);
+        assert!(cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Assign { rhs_point, .. } if *rhs_point == calls[1].id)));
+    }
+}
+
+#[test]
+fn top_level_mixed_multi_output_binds_runtime_result_at_second_position() {
+    let text = "%%start\n(i32, u8[])(u64) make = fn(count) { u8[count] bytes; 1, bytes };\ni32 status, u8[] result = make(2);\nstatus; result[0];\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for cfg in [
+        &single.program.top_level_reference_cfg,
+        &project.project.modules[0].top_level_reference_cfg,
+    ] {
+        let calls = cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let second = calls[1]
+            .possible_backings
+            .iter()
+            .find(|fact| {
+                matches!(
+                    fact.owner.kind,
+                    ReferenceBindingKind::CallOutput { output: 1, .. }
+                )
+            })
+            .expect("second output owner");
+        assert!(cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Backing { transfer: RuntimeBackingTransfer::Move { source }, .. } if source == &second.owner)));
+        for name in ["status", "result"] {
+            let span = text
+                .find(&format!(
+                    "{name}{}",
+                    if name == "status" { "," } else { " =" }
+                ))
+                .unwrap() as u32;
+            assert!(cfg
+                .points
+                .iter()
+                .any(|point| matches!(point.kind, CfgPointKind::Bind { .. })
+                    && point.source_span.range == ByteSpan::new(span, span + name.len() as u32)));
+        }
+    }
+}
+
+#[test]
+fn callable_field_fresh_array_output_has_independent_call_owner_in_both_validators() {
+    let text = "%%start\nstruct Container { u8[](u64) make; }\nContainer holder = { .make = fn(count) { u8[count] bytes; bytes }; };\nu8[] result = holder.make(3);\nresult[0];\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (cfg, diagnostics, identity) in [
+        (
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+            &single.program.source,
+        ),
+        (
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+            &project.project.modules[0].source,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let start = text.find("holder.make(3)").unwrap() as u32;
+        let call = cfg
+            .points
+            .iter()
+            .find(|point| {
+                point.source_span.range.start == start
+                    && matches!(
+                        point.kind,
+                        CfgPointKind::Call {
+                            target: ResolvedCallTarget::CallableField { .. },
+                            ..
+                        }
+                    )
+            })
+            .expect("field call");
+        assert_eq!(
+            call.source_span,
+            SourceSpan::new(identity.clone(), ByteSpan::new(start, start + 14))
+        );
+        assert_eq!(call.possible_callee_environments.len(), 1);
+        let output = call
+            .possible_backings
+            .iter()
+            .find(|fact| {
+                matches!(
+                    fact.owner.kind,
+                    ReferenceBindingKind::CallOutput { output: 0, .. }
+                )
+            })
+            .expect("fresh output");
+        assert_eq!(output.owner.source, *identity);
+        assert_eq!(output.origin.source, *identity);
+        assert_ne!(
+            output.owner.declaration_span,
+            call.possible_callee_environments
+                .iter()
+                .next()
+                .unwrap()
+                .literal
+                .range
+        );
+        assert!(cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Backing { transfer: RuntimeBackingTransfer::Move { source }, .. } if source == &output.owner)));
+    }
+}
+
+#[test]
+fn callable_field_forwarded_array_preserves_copy_and_move_argument_identity() {
+    for (structure, fixed, source_is_live, copied) in [
+        (
+            "struct copy Element { u8 value; }",
+            "Element[1] fixed = [{ .value = 7; }];",
+            true,
+            true,
+        ),
+        (
+            "struct Element { u8 value; }",
+            "Element[1] fixed = [{ .value = 7; }];",
+            false,
+            false,
+        ),
+    ] {
+        let text = format!("%%start\n{structure}\nstruct Container {{ Element[](Element[]) forward; }}\nContainer holder = {{ .forward = fn(input) {{ input }}; }};\n{fixed}\nElement[] result = holder.forward(fixed);\n{}\nresult[0];\n%%end", if source_is_live { "fixed[0];" } else { "" });
+        let (single, project) = both_reference_functions(&text);
+        for (cfg, diagnostics, identity) in [
+            (
+                &single.program.top_level_reference_cfg,
+                &single.diagnostics,
+                &single.program.source,
+            ),
+            (
+                &project.project.modules[0].top_level_reference_cfg,
+                &project.diagnostics,
+                &project.project.modules[0].source,
+            ),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let start = text.find("holder.forward(fixed)").unwrap() as u32;
+            let call = cfg
+                .points
+                .iter()
+                .find(|point| {
+                    point.source_span.range.start == start
+                        && matches!(
+                            point.kind,
+                            CfgPointKind::Call {
+                                target: ResolvedCallTarget::CallableField { .. },
+                                ..
+                            }
+                        )
+                })
+                .expect("field call");
+            assert_eq!(
+                call.source_span,
+                SourceSpan::new(identity.clone(), ByteSpan::new(start, start + 21))
+            );
+            let argument = &call.backing_argument_paths[0][0].backing;
+            let output = call
+                .possible_backings
+                .iter()
+                .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+                .expect("forwarded output");
+            assert_eq!(output.value, argument.value);
+            let fixed_fact = cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(
+                        point.kind,
+                        CfgPointKind::Backing {
+                            transfer: RuntimeBackingTransfer::CreateFixed,
+                            ..
+                        }
+                    )
+                })
+                .expect("fixed backing")
+                .possible_backings
+                .first()
+                .expect("fixed fact");
+            assert_eq!(output.value == fixed_fact.value, !copied);
+            assert_ne!(output.owner, argument.owner);
+        }
+    }
+}
+
+#[test]
+fn callable_field_joined_multi_output_keeps_forwarded_and_created_alternatives() {
+    let text = "%%start\nstruct Container { (u8[], u8[])(u8[], bool) choose; }\nunit(bool) invoke = fn(switch) { Container holder = { .choose = fn(input, option) { u8[1] fixed = [7]; u8[] fresh = fixed; option; input, fresh }; }; if (switch) { holder.choose = fn(input, option) { u8[1] fixed = [8]; u8[] first = fixed; u8[1] next = [9]; u8[] second = next; option; input; first, second }; }; u8[2] given = [4, 5]; u8[] first, u8[] second = holder.choose(given, true); given[0]; first[0]; second[0]; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let cfg = &items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => {
+                    Some(&function.reference_cfg)
+                }
+                _ => None,
+            })
+            .expect("invoke");
+        let start = text.find("holder.choose(given, true)").unwrap() as u32;
+        let calls = cfg
+            .points
+            .iter()
+            .filter(|point| {
+                point.source_span.range.start == start
+                    && matches!(
+                        point.kind,
+                        CfgPointKind::Call {
+                            target: ResolvedCallTarget::CallableField { .. },
+                            ..
+                        }
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let forwarded = &calls[0].backing_argument_paths[0][0].backing.value;
+        let first = calls[0]
+            .possible_backings
+            .iter()
+            .filter(|fact| {
+                matches!(
+                    fact.owner.kind,
+                    ReferenceBindingKind::CallOutput { output: 0, .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().any(|fact| &fact.value == forwarded));
+        assert!(first.iter().any(|fact| &fact.value != forwarded));
+        let second = calls[1]
+            .possible_backings
+            .iter()
+            .filter(|fact| {
+                matches!(
+                    fact.owner.kind,
+                    ReferenceBindingKind::CallOutput { output: 1, .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(second.len(), 2);
+        assert!(first.iter().all(|fact| fact.value != second[0].value));
+    }
+}
+
+#[test]
+fn imported_callable_field_keeps_field_source_and_literal_output_lineage() {
+    let library_source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/library.w".into(),
+        "r1".into(),
+    );
+    let library = parse_source(
+        library_source.clone(),
+        "%%start\nstruct Container { u8[](u64) make; }\n%%end".to_owned(),
+        &[],
+    );
+    let text = "%%start\nlibrary = namespace package \"src/library.w\";\nlibrary.Container holder = { .make = fn(count) { u8[count] bytes; bytes }; };\nu8[] result = holder.make(2);\nresult[0];\n%%end";
+    let main = parse_source(source(), text.to_owned(), &[]);
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    assert!(main.diagnostics.is_empty(), "{:?}", main.diagnostics);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![
+            ScalarModule::from_program(
+                derive_scalar_program(&main.result).program,
+                vec![ScalarNamespaceBinding {
+                    binding: "library".into(),
+                    target: library_source.clone(),
+                    span: ByteSpan::new(0, 0),
+                }],
+            ),
+            ScalarModule::from_program(derive_scalar_program(&library.result).program, Vec::new()),
+        ],
+        vec![source(), library_source.clone()],
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    let cfg = &project.project.modules[0].top_level_reference_cfg;
+    let start = text.find("holder.make(2)").unwrap() as u32;
+    let call = cfg
+        .points
+        .iter()
+        .find(|point| {
+            point.source_span.range.start == start
+                && matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::CallableField { .. },
+                        ..
+                    }
+                )
+        })
+        .expect("imported field call");
+    let CfgPointKind::Call {
+        target: ResolvedCallTarget::CallableField { field, .. },
+        ..
+    } = &call.kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.structure.source, library_source);
+    let output = call
+        .possible_backings
+        .iter()
+        .find(|fact| matches!(fact.owner.kind, ReferenceBindingKind::CallOutput { .. }))
+        .expect("call output");
+    assert_eq!(output.owner.source, source());
+    assert_eq!(output.origin.source, source());
+    let RuntimeValuePosition::CallOutput {
+        target_source,
+        target_declaration,
+        ..
+    } = &output.value.position
+    else {
+        panic!("callee lineage")
+    };
+    assert_eq!(target_source, &source());
+    assert_eq!(
+        *target_declaration,
+        call.possible_callee_environments
+            .iter()
+            .next()
+            .unwrap()
+            .literal
+            .range
+    );
+}
+
+#[test]
+fn callable_field_missing_forwarded_owner_reports_exact_call_span_with_fresh_alternative() {
+    let text = "%%start\nstruct Container { u8[](u8[]) choose; }\nunit(bool) invoke = fn(switch) { Container holder = { .choose = fn(input) { input }; }; if (switch) { holder.choose = fn(input) { u8[1] fixed = [9]; u8[] fresh = fixed; input; fresh }; }; u8[2] fixed = [4, 5]; u8[] owned = fixed; u8[] result = holder.choose(owned); result[0]; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for mut module in [
+        ScalarModule::from_program(single.program, Vec::new()),
+        project.project.modules[0].clone(),
+    ] {
+        let function = module
+            .items
+            .iter_mut()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("invoke");
+        let backing = function
+            .reference_cfg
+            .initial_points
+            .iter_mut()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Backing {
+                        transfer: RuntimeBackingTransfer::CopyFixed { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("copied argument owner");
+        let CfgPointKind::Backing {
+            target, transfer, ..
+        } = &mut backing.kind
+        else {
+            unreachable!()
+        };
+        let mut absent = target.clone();
+        absent.kind = ReferenceBindingKind::CallOutput {
+            point: CfgPointId(999),
+            output: 0,
+        };
+        *transfer = RuntimeBackingTransfer::Move { source: absent };
+        let errors = super::reference::resolve_reference_output_contracts(
+            std::slice::from_mut(&mut module),
+            &mut super::reference::test_observations::ReferenceValidationTestTrace::new(),
+        );
+        let start = text.find("holder.choose(owned)").unwrap() as u32;
+        assert!(errors.iter().any(|error| matches!(error, ReferenceAnalysisError::MissingContext { source_span, reason: ReferenceAnalysisErrorReason::MissingResolvedBinding } if source_span == &SourceSpan::new(module.source.clone(), ByteSpan::new(start, start + 20)))), "{errors:?}");
+    }
+}
+
+#[test]
+fn captured_runtime_owner_uses_shared_cell_and_survives_return_in_both_validators() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader(u64) make = fn(count) { u8[count] bytes; Reader result = { .read = fn { bytes[0] }; }; result };\nReader kept = make(2);\nReader copied = kept;\nkept.read(); copied.read();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("make");
+        let cfg = &function.reference_cfg;
+        let captured = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Capture { captures, .. } if captures.iter().any(|capture| capture.name == "bytes"))).expect("array capture");
+        let CfgPointKind::Capture { environment, .. } = &captured.kind else {
+            unreachable!()
+        };
+        let fact = &cfg.environments[environment.index];
+        assert_eq!(fact.inputs.len(), 1);
+        assert_eq!(fact.inputs[0].backings.len(), 1);
+        assert_eq!(fact.backings, fact.inputs[0].backings);
+        assert_eq!(fact.capture_paths.len(), 1);
+        assert_eq!(fact.capture_paths[0][0].backings, fact.inputs[0].backings);
+        assert!(matches!(
+            fact.backings[0].owner.kind,
+            ReferenceBindingKind::Captured { .. }
+        ));
+        let binding = &fact.inputs[0].binding;
+        let created = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Backing { target, transfer: RuntimeBackingTransfer::Allocate, .. } if target == binding)).expect("allocation");
+        assert_eq!(fact.backings[0].value, created.possible_backings[0].value);
+        assert_eq!(
+            fact.backings[0].origin.source,
+            function.reference_cfg.points[0].source_span.source
+        );
+        let literal = cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| literal.literal == environment.literal)
+            .expect("literal");
+        assert_eq!(
+            literal.reference_cfg.inputs[0].backings,
+            fact.inputs[0].backings
+        );
+        assert_eq!(
+            literal.reference_cfg.capture_input_paths,
+            fact.capture_paths
+        );
+        assert!(cfg.points.iter().any(|point| matches!(
+            &point.kind,
+            CfgPointKind::ReturnOutput { .. }
+        ) && point
+            .possible_environments
+            .contains(environment)
+            && point
+                .possible_backings
+                .iter()
+                .any(|backing| backing.value == fact.backings[0].value
+                    && backing.owner == fact.backings[0].owner)));
+        let json = serde_json::to_string(cfg).expect("serialize capture CFG");
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&json).expect("deserialize capture CFG");
+        assert_eq!(restored.environments[environment.index], *fact);
+        assert_eq!(
+            restored
+                .literal_cfgs
+                .iter()
+                .find(|literal| literal.literal == environment.literal)
+                .unwrap()
+                .reference_cfg
+                .capture_input_paths,
+            fact.capture_paths
+        );
+    }
+}
+
+#[test]
+fn returned_struct_field_imports_source_qualified_capture_at_caller() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader(u64) make = fn(count) { u8[count] bytes; Reader result = { .read = fn { bytes[0] }; }; result };\nReader kept = make(2);\nReader copied = kept;\nkept.read(); copied.read();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, top, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let producer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("maker");
+        let captured = producer
+            .reference_cfg
+            .environments
+            .iter()
+            .find(|environment| !environment.backings.is_empty())
+            .expect("captured owner");
+        let output = producer
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("maker output");
+        assert!(producer
+            .reference_cfg
+            .holder_edges
+            .iter()
+            .any(|edge| edge.from == output.id
+                && edge.actions.iter().any(|action| matches!(action,
+                CallableHolderAction::ReturnTransfer {
+                    from: CallableHolderPlace::Projection(place),
+                    to: CallableHolderPlace::OutputProjection { output: 0, projections }, ..
+                } if place.binding.declaration_span.start == text.find("result =").unwrap() as u32
+                    && projections == &place.projections))));
+        let calls = top
+            .points
+            .iter()
+            .filter(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::CallableField { .. },
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let ids = calls
+            .iter()
+            .map(|call| {
+                assert_eq!(call.possible_callee_environments.len(), 1);
+                let id = call.possible_callee_environments.iter().next().unwrap();
+                let environment = &top.environments[id.index];
+                assert_eq!(environment.literal, captured.literal);
+                assert_eq!(environment.backings, captured.backings);
+                id.clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids[0], ids[1]);
+    }
+}
+
+#[test]
+fn independent_returned_struct_calls_have_distinct_capture_environments() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader(u64) make = fn(count) { u8[count] bytes; Reader result = { .read = fn { bytes[0] }; }; result };\nReader first = make(2); Reader second = make(3); first.read(); second.read();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (top, diagnostics) in [
+        (&single.program.top_level_reference_cfg, &single.diagnostics),
+        (
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let calls = top
+            .points
+            .iter()
+            .filter(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::CallableField { .. },
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let first = calls[0]
+            .possible_callee_environments
+            .iter()
+            .next()
+            .expect("first environment");
+        let second = calls[1]
+            .possible_callee_environments
+            .iter()
+            .next()
+            .expect("second environment");
+        assert_ne!(first, second);
+        assert_eq!(first.literal, second.literal);
+        assert_ne!(
+            top.environments[first.index].instance,
+            top.environments[second.index].instance
+        );
+    }
+}
+
+#[test]
+fn imported_maker_preserves_library_capture_and_caller_field_identity() {
+    let library_source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/library.w".into(),
+        "r1".into(),
+    );
+    let library = parse_source(library_source.clone(), "%%start\nstruct copy Reader { u8() read; }\nReader(u64) make = fn(count) { u8[count] bytes; Reader result = { .read = fn { bytes[0] }; }; result };\n%%end".to_owned(), &[]);
+    let main = parse_source(source(), "%%start\nlibrary = namespace package \"src/library.w\";\nlibrary.Reader holder = library.make(2);\nholder.read();\n%%end".to_owned(), &[]);
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    assert!(main.diagnostics.is_empty(), "{:?}", main.diagnostics);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![
+            ScalarModule::from_program(
+                derive_scalar_program(&main.result).program,
+                vec![ScalarNamespaceBinding {
+                    binding: "library".into(),
+                    target: library_source.clone(),
+                    span: ByteSpan::new(0, 0),
+                }],
+            ),
+            ScalarModule::from_program(derive_scalar_program(&library.result).program, Vec::new()),
+        ],
+        vec![source(), library_source.clone()],
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    let top = &project.project.modules[0].top_level_reference_cfg;
+    let call = top
+        .points
+        .iter()
+        .find(|point| {
+            matches!(
+                point.kind,
+                CfgPointKind::Call {
+                    target: ResolvedCallTarget::CallableField { .. },
+                    ..
+                }
+            )
+        })
+        .expect("returned field call");
+    let environment = call
+        .possible_callee_environments
+        .iter()
+        .next()
+        .expect("imported environment");
+    assert_eq!(environment.literal.source, library_source);
+    assert_eq!(
+        top.environments[environment.index].backings[0].value.source,
+        library_source
+    );
+    assert_eq!(
+        top.environments[environment.index].inputs[0].binding.source,
+        library_source
+    );
+}
+
+#[test]
+fn named_callable_return_imports_owned_capture_into_caller() {
+    let text = "%%start\n(u8())(u64) make = fn(count) { u8[count] bytes; fn { bytes[0] } };\nu8() reader = make(2); reader();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (top, diagnostics) in [
+        (&single.program.top_level_reference_cfg, &single.diagnostics),
+        (
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let caller = top
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::LocalCallable(_),
+                        ..
+                    }
+                )
+            })
+            .expect("reader call");
+        let environment = caller
+            .possible_callee_environments
+            .iter()
+            .next()
+            .expect("captured callable");
+        assert_eq!(top.environments[environment.index].backings.len(), 1);
+        assert_eq!(top.environments[environment.index].capture_paths.len(), 1);
+        assert!(matches!(
+            top.environments[environment.index].instance,
+            CallableEnvironmentInstance::CallOutput { .. }
+        ));
+    }
+}
+
+#[test]
+fn direct_local_maker_return_imports_captured_runtime_owner() {
+    let text = "%%start\nunit() outer = fn { (u8())(u64) maker = fn(count) { u8[count] bytes; fn { bytes[0] } }; u8() reader = maker(2); reader(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let cfg = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => {
+                    Some(&function.reference_cfg)
+                }
+                _ => None,
+            })
+            .expect("outer");
+        let calls = cfg
+            .points
+            .iter()
+            .filter(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::LocalCallable(_),
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let output = &calls[0].possible_environments;
+        assert_eq!(output.len(), 1);
+        assert_eq!(calls[1].possible_callee_environments, *output);
+        assert_eq!(
+            cfg.environments[output.iter().next().unwrap().index]
+                .backings
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn joined_returned_fields_keep_separate_captured_owner_alternatives() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader(bool) make = fn(flag) { u8[1] left = [4]; u8[] first = left; u8[1] right = [9]; u8[] second = right; Reader result = { .read = fn { first[0] }; }; if (flag) { result.read = fn { second[0] }; }; result };\nReader holder = make(true); holder.read();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (top, diagnostics) in [
+        (&single.program.top_level_reference_cfg, &single.diagnostics),
+        (
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let field = top
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::CallableField { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("field call");
+        assert_eq!(field.possible_callee_environments.len(), 2);
+        let facts = field
+            .possible_callee_environments
+            .iter()
+            .map(|id| &top.environments[id.index].backings[0])
+            .collect::<Vec<_>>();
+        assert_ne!(facts[0].value, facts[1].value);
+        assert_ne!(facts[0].owner, facts[1].owner);
+        assert!(facts
+            .iter()
+            .all(|fact| matches!(fact.owner.kind, ReferenceBindingKind::Captured { .. })));
+    }
+}
+
+#[test]
+fn interprocedural_borrowed_reference_capture_bounded_use_in_both_validators() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader(*u8) wrap = fn(input) { Reader result = { .read = fn { *input }; }; result };\nunit() caller = fn { u8[2] fixed = [4, 5]; Reader live = wrap(&fixed[0]); live.read(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let caller = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "caller" => Some(function),
+                _ => None,
+            })
+            .expect("caller");
+        let live = text.find("live =").unwrap() as u32;
+        assert!(
+            caller
+                .reference_cfg
+                .holder_edges
+                .iter()
+                .any(|edge| edge.after.iter().any(|relation| {
+                    relation.holders.iter().any(|holder| {
+                        matches!(holder, CallableHolderPlace::Projection(place)
+                if place.binding.declaration_span.start == live)
+                    }) && relation
+                        .capture_paths
+                        .iter()
+                        .flatten()
+                        .any(|input| !input.origins.is_empty())
+                })),
+            "borrowed holder relations: {:?}",
+            caller.reference_cfg.holder_edges.len()
+        );
+        assert!(caller.reference_cfg.holder_exits.iter().any(|exit| exit.actions.iter().any(|action|
+            matches!(action, CallableHolderAction::Drop { holder: CallableHolderPlace::Projection(place), .. }
+                if place.binding.declaration_span.start == live))));
+    }
+}
+
+#[test]
+fn interprocedural_borrowed_reference_capture_escape_rejected_at_exact_spans() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader(*u8) wrap = fn(input) { Reader result = { .read = fn { *input }; }; result };\nReader() escape = fn { u8[2] fixed = [4, 5]; wrap(&fixed[0]) };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    let returned = text.find("wrap(&fixed[0])").unwrap() as u32;
+    let borrowed = text.find("&fixed[0]) };").unwrap() as u32;
+    for (diagnostics, identity) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "captured reference outlives its referent"
+                    && diagnostic.labels.iter().any(|label| {
+                        label.kind == DiagnosticLabelKind::Primary
+                            && label.span.source == *identity
+                            && label.span.range == ByteSpan::new(returned, returned + 15)
+                    })
+                    && diagnostic.labels.iter().any(|label| {
+                        label.kind == DiagnosticLabelKind::Secondary
+                            && label.span.source == *identity
+                            && label.span.range == ByteSpan::new(borrowed, borrowed + 9)
+                    })
+            })
+            .unwrap_or_else(|| panic!("{diagnostics:?}"));
+        assert_eq!(&diagnostic.labels[0].span.source, identity);
+    }
+}
+
+#[test]
+fn cross_module_borrowed_reference_capture_bounded_use_in_both_validators() {
+    let library_source = module_source("src/library.w");
+    let library = module_from_text(
+        library_source.clone(),
+        "%%start\nstruct copy Reader { u8() read; }\nReader(*u8) wrap = fn(input) { Reader result = { .read = fn { *input }; }; result };\n%%end",
+    );
+    let main_source = module_source("src/main.w");
+    let main = module_from_text(
+        main_source.clone(),
+        "%%start\nlib = namespace app \"src/library.w\";\nunit() caller = fn { u8[2] fixed = [4, 5]; lib.Reader live = lib.wrap(&fixed[0]); live.read(); };\n%%end",
+    );
+    let namespace_span = match &main.items[0] {
+        ScalarItem::Namespace(namespace) => namespace.span,
+        _ => panic!("namespace"),
+    };
+    let result = validate_scalar_project(ScalarProject::new(
+        vec![
+            ScalarModule::from_program(
+                main,
+                vec![ScalarNamespaceBinding {
+                    binding: "lib".to_owned(),
+                    target: library_source.clone(),
+                    span: namespace_span,
+                }],
+            ),
+            ScalarModule::from_program(library, Vec::new()),
+        ],
+        vec![main_source, library_source.clone()],
+    ));
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
+#[test]
+fn returned_struct_field_rejects_expired_captured_reference_at_exact_spans() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader() make = fn { u8[2] fixed = [4, 5]; *u8 borrowed = &fixed[0]; Reader result = { .read = fn { *borrowed }; }; result };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    let returned = text.rfind("result }").unwrap() as u32;
+    let borrowed = text.find("&fixed[0]").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == DiagnosticLabelKind::Primary
+                        && label.span
+                            == SourceSpan::new(source(), ByteSpan::new(returned, returned + 6)))
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == DiagnosticLabelKind::Secondary
+                        && label.span
+                            == SourceSpan::new(source(), ByteSpan::new(borrowed, borrowed + 9)))),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn captured_move_only_fixed_argument_retains_value_identity_in_shared_cell() {
+    let text = "%%start\nstruct Payload { u8 value; }\nstruct copy Reader { u8() read; }\nReader(Payload[]) make = fn(bytes) { Reader result = { .read = fn { *Payload address = &bytes[0]; address; 7 }; }; result };\nunit() invoke = fn { Payload[1] fixed = [{ .value = 7; }]; Reader holder = make(fixed); holder.read(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let cfg = &items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => {
+                    Some(&function.reference_cfg)
+                }
+                _ => None,
+            })
+            .expect("invoke");
+        let fixed_fact = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Backing {
+                        transfer: RuntimeBackingTransfer::CreateFixed,
+                        ..
+                    }
+                )
+            })
+            .expect("fixed source")
+            .possible_backings
+            .first()
+            .expect("backing");
+        let call = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::ModuleCallable { .. },
+                        ..
+                    }
+                ) && !point.backing_argument_paths.is_empty()
+            })
+            .expect("maker call");
+        assert_eq!(
+            call.backing_argument_paths[0][0].backing.value,
+            fixed_fact.value
+        );
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("maker");
+        let capture = function
+            .reference_cfg
+            .points
+            .iter()
+            .find_map(|point| match &point.kind {
+                CfgPointKind::Capture {
+                    environment,
+                    captures,
+                    ..
+                } if captures.iter().any(|capture| capture.name == "bytes") => Some(environment),
+                _ => None,
+            })
+            .expect("capture");
+        let fact = &function.reference_cfg.environments[capture.index];
+        assert_eq!(fact.capture_paths.len(), 1);
+        assert_eq!(fact.capture_paths[0][0].backings.len(), 1);
+        assert_eq!(fact.capture_paths[0][0].backings[0].value, fixed_fact.value);
+        assert!(matches!(
+            fact.capture_paths[0][0].backings[0].owner.kind,
+            ReferenceBindingKind::Captured { .. }
+        ));
+    }
+}
+
+#[test]
+fn captured_move_only_fixed_local_preserves_original_allocation_identity() {
+    let text = "%%start\nstruct Payload { u8 value; }\nunit() outer = fn { Payload[1] fixed = [{ .value = 7; }]; u8() getter = fn { *Payload address = &fixed[0]; address; 7 }; getter(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let cfg = &function.reference_cfg;
+        let fixed = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Backing {
+                        transfer: RuntimeBackingTransfer::CreateFixed,
+                        ..
+                    }
+                )
+            })
+            .expect("fixed");
+        let capture = cfg
+            .points
+            .iter()
+            .find_map(|point| match &point.kind {
+                CfgPointKind::Capture {
+                    captures,
+                    environment,
+                    ..
+                } if captures.iter().any(|capture| capture.name == "fixed") => Some(environment),
+                _ => None,
+            })
+            .expect("fixed capture");
+        let backing = &cfg.environments[capture.index].capture_paths[0][0].backings[0];
+        assert_eq!(backing.value, fixed.possible_backings[0].value);
+        assert_eq!(backing.kind, RuntimeBackingKind::FixedValue);
+        assert!(matches!(
+            backing.owner.kind,
+            ReferenceBindingKind::Captured { .. }
+        ));
+    }
+}
+
+#[test]
+fn captured_runtime_allocation_rejects_early_release() {
+    let text = "%%start\nunit(u64) outer = fn(count) { u8[count] bytes; u8() reader = fn { bytes[0] }; unsafe { core.free(&bytes); }; reader(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    let released = text.find("core.free(&bytes)").unwrap() as u32;
+    let created = text.find("bytes;").unwrap() as u32;
+    for (diagnostics, identity) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == DiagnosticLabelKind::Primary
+                        && label.span.source == *identity
+                        && label.span.range.start >= released
+                        && label.span.range.start < released + 17)
+                    && diagnostic
+                        .labels
+                        .iter()
+                        .any(|label| label.kind == DiagnosticLabelKind::Secondary
+                            && label.span.source == *identity
+                            && label.span.range.start <= created)),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn outer_assignment_replaces_captured_cell_value_for_copied_closures() {
+    let text = "%%start\nunit() outer = fn { u8[1] initial = [4]; u8[] bytes = initial; u8() first = fn { bytes[0] }; u8() second = first; u8[1] other = [9]; u8[] next = other; bytes = next; first(); second(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let cfg = &function.reference_cfg;
+        let capture = cfg
+            .points
+            .iter()
+            .find_map(|point| match &point.kind {
+                CfgPointKind::Capture {
+                    captures,
+                    environment,
+                    ..
+                } if captures.iter().any(|capture| capture.name == "bytes") => Some(environment),
+                _ => None,
+            })
+            .expect("capture");
+        let original = &cfg.environments[capture.index].inputs[0].backings[0];
+        let assign = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Backing { target, .. } if target == &cfg.environments[capture.index].inputs[0].binding) && point.source_span.range.start == text.find("bytes = next").unwrap() as u32).expect("write into captured cell");
+        assert_ne!(assign.possible_backings[0].value, original.value);
+        assert_eq!(assign.possible_backings[0].owner, original.owner);
+        let calls = cfg
+            .points
+            .iter()
+            .filter(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::LocalCallable(_),
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert!(calls
+            .iter()
+            .all(|point| point.possible_callee_environments.contains(capture)));
+        assert!(calls.iter().all(|point| point
+            .possible_backings
+            .iter()
+            .any(|fact| fact.value == assign.possible_backings[0].value
+                && fact.owner == original.owner)));
+        let write = cfg
+            .holder_edges
+            .iter()
+            .find(|edge| cfg.points[edge.from.0].id == assign.id)
+            .expect("captured backing write edge");
+        assert!(
+            write.after.iter().any(|relation| {
+                relation.holders.iter().any(|holder| {
+                    matches!(holder, CallableHolderPlace::Binding(binding)
+                if binding.declaration_span.start == text.find("first =").unwrap() as u32)
+                }) && relation.holders.iter().any(|holder| {
+                    matches!(holder, CallableHolderPlace::Binding(binding)
+                    if binding.declaration_span.start == text.find("second =").unwrap() as u32)
+                }) && relation
+                    .capture_paths
+                    .iter()
+                    .flatten()
+                    .flat_map(|input| &input.backings)
+                    .any(|backing| backing.value == assign.possible_backings[0].value)
+            }),
+            "write relations: {:?}",
+            write.after
+        );
+    }
+}
+
+#[test]
+fn captured_owner_rejects_second_move_with_source_backed_diagnostic() {
+    let text = "%%start\nunit() outer = fn { u8[1] fixed = [4]; u8[] bytes = fixed; u8() reader = fn { bytes[0] }; u8[] moved = bytes; u8[] again = bytes; moved[0]; again[0]; reader(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    let start = text.find("again = bytes").unwrap() as u32 + 8;
+    let first = text.find("moved = bytes").unwrap() as u32 + 8;
+    for (diagnostics, identity) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.kind
+                        == DiagnosticLabelKind::Primary
+                        && label.span
+                            == SourceSpan::new(identity.clone(), ByteSpan::new(start, start + 5)))
+                    && diagnostic
+                        .labels
+                        .iter()
+                        .any(|label| label.kind == DiagnosticLabelKind::Secondary
+                            && label.span.source == *identity
+                            && label.span.range.start == first)),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn capture_join_keeps_distinct_owner_value_pairs_in_both_validators() {
+    let text = "%%start\nunit(bool) outer = fn(flag) { u8[1] left = [4]; u8[] bytes = left; if (flag) { u8[1] right = [9]; bytes = right; }; u8() reader = fn { bytes[0] }; reader(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let capture = function
+            .reference_cfg
+            .points
+            .iter()
+            .find_map(|point| match &point.kind {
+                CfgPointKind::Capture {
+                    captures,
+                    environment,
+                    ..
+                } if captures.iter().any(|capture| capture.name == "bytes") => Some(environment),
+                _ => None,
+            })
+            .expect("capture");
+        let fact = &function.reference_cfg.environments[capture.index];
+        assert_eq!(fact.capture_paths.len(), 2);
+        let paths = fact
+            .capture_paths
+            .iter()
+            .map(|path| &path[0].backings[0])
+            .collect::<Vec<_>>();
+        assert_ne!(paths[0].value, paths[1].value);
+        assert_eq!(paths[0].owner, paths[1].owner);
+        assert!(paths
+            .iter()
+            .all(|path| matches!(path.owner.kind, ReferenceBindingKind::Captured { .. })));
+        assert_eq!(fact.inputs[0].backings.len(), 2);
+        let literal = function
+            .reference_cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| literal.literal == capture.literal)
+            .expect("literal");
+        assert_eq!(literal.reference_cfg.capture_input_paths.len(), 2);
+    }
+}
+
+#[test]
+fn captured_aggregate_runtime_field_retains_projected_owner() {
+    let text = "%%start\nstruct Bag { u8[] bytes; }\nunit() outer = fn { u8[1] fixed = [4]; u8[] owned = fixed; Bag container = { .bytes = owned; }; u8() reader = fn { container.bytes[0] }; reader(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let cfg = &items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => {
+                    Some(&function.reference_cfg)
+                }
+                _ => None,
+            })
+            .expect("outer");
+        let capture = cfg
+            .points
+            .iter()
+            .find_map(|point| match &point.kind {
+                CfgPointKind::Capture {
+                    captures,
+                    environment,
+                    ..
+                } if captures.iter().any(|capture| capture.name == "container") => {
+                    Some(environment)
+                }
+                _ => None,
+            })
+            .expect("capture");
+        let path = &cfg.environments[capture.index].capture_paths[0][0];
+        assert_eq!(path.projected_backings.len(), 1);
+        let projected = &path.projected_backings[0];
+        assert_eq!(projected.place.binding, path.binding);
+        assert_eq!(
+            projected.backing,
+            cfg.environments[capture.index].backings[0]
+        );
+        assert!(matches!(
+            projected.backing.owner.kind,
+            ReferenceBindingKind::Captured { .. }
+        ));
+        let literal = cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| literal.literal == capture.literal)
+            .expect("literal");
+        assert_eq!(
+            literal.reference_cfg.capture_input_paths[0][0].projected_backings,
+            path.projected_backings
+        );
+    }
+}
+
+#[test]
+fn moved_aggregate_runtime_field_retains_single_capture_owner() {
+    let text = "%%start\nstruct Bag { u8[] bytes; }\nunit() outer = fn { u8[1] fixed = [4]; u8[] owned = fixed; Bag original = { .bytes = owned; }; Bag moved = original; u8() reader = fn { moved.bytes[0] }; reader(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let cfg = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => {
+                    Some(&function.reference_cfg)
+                }
+                _ => None,
+            })
+            .expect("outer");
+        let created = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::BackingPlace { .. }))
+            .expect("projected backing");
+        let capture = cfg
+            .points
+            .iter()
+            .find_map(|point| match &point.kind {
+                CfgPointKind::Capture {
+                    captures,
+                    environment,
+                    ..
+                } if captures.iter().any(|capture| capture.name == "moved") => Some(environment),
+                _ => None,
+            })
+            .expect("moved capture");
+        let fact = &cfg.environments[capture.index];
+        assert_eq!(fact.capture_paths[0][0].projected_backings.len(), 1);
+        assert_eq!(
+            fact.capture_paths[0][0].projected_backings[0].backing.value,
+            created.possible_backings[0].value
+        );
+        assert_eq!(fact.backings.len(), 1);
+    }
+}
+
+#[test]
+fn nested_field_call_preserves_branch_joined_callee_and_checked_origins() {
+    let text = "%%start\nstruct copy Holder { *i32(*i32) action; }\nunit() outer = fn { Holder box = { .action = fn(input) { input }; }; if (true) { box.action = fn(input) { if (input == null) { input } else { null } }; } else { box.action = fn(input) { input }; }; *i32(*i32) inner = fn(input) { box.action(input) }; inner; };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let inner_start = text.find("fn(input) { box.action(input) }").unwrap() as u32;
+        let inner = outer
+            .reference_cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| literal.literal.range.start == inner_start)
+            .expect("inner");
+        let box_input = inner
+            .reference_cfg
+            .inputs
+            .iter()
+            .find(|input| input.binding == inner.captures[0].binding)
+            .expect("box capture");
+        let projected = box_input
+            .projected
+            .iter()
+            .find(|value| !value.environments.is_empty())
+            .expect("field environments");
+        assert_eq!(projected.environments.len(), 2);
+        let call_start = text.find("box.action(input)").unwrap() as u32;
+        let call = inner
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                point.source_span.range.start == call_start
+                    && matches!(point.kind, CfgPointKind::Call { .. })
+            })
+            .expect("field call");
+        assert_eq!(
+            call.source_span,
+            SourceSpan::new(source(), ByteSpan::new(call_start, call_start + 17))
+        );
+        let output = inner
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("output");
+        let origins = output
+            .possible_origins
+            .as_ref()
+            .expect("checked alternatives");
+        assert_eq!(origins.len(), 2);
+        assert!(origins.iter().any(|origin| matches!(&inner.reference_cfg.facts[origin.0], ReferenceOrigin::Null { span } if *span == ByteSpan::new(call_start, call_start + 17))));
+    }
+}
+
+#[test]
+fn branch_returned_callable_field_keeps_producer_alternatives() {
+    let text = "%%start\nstruct copy Holder { u8() action; }\nHolder(bool) choose = fn(flag) { u8 first = 1; u8 second = 2; if (flag) { Holder left = { .action = fn { first }; }; left } else { Holder right = { .action = fn { second }; }; right } };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "choose" => Some(function),
+                _ => None,
+            })
+            .expect("choose");
+        let cfg = &function.reference_cfg;
+        let output = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("output");
+        assert_eq!(output.possible_projected_environments.len(), 2);
+        assert_eq!(
+            output
+                .possible_projected_environments
+                .iter()
+                .flat_map(|projection| &projection.environments)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2
+        );
+        assert_eq!(
+            cfg.holder_edges
+                .iter()
+                .flat_map(|edge| &edge.actions)
+                .filter(|action| matches!(
+                    action,
+                    CallableHolderAction::ReturnTransfer {
+                        to: CallableHolderPlace::OutputProjection { output: 0, .. },
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.points, cfg.points);
+        assert_eq!(restored.holder_edges, cfg.holder_edges);
+    }
+}
+
+#[test]
+fn branch_returned_callable_outputs_keep_their_own_producers() {
+    let text = "%%start\nstruct copy Holder { u8() action; }\n((u8()), Holder)(bool) choose = fn(flag) { u8 first = 1; u8 second = 2; if (flag) { u8() direct = fn { first }; Holder box = { .action = fn { second }; }; direct, box } else { u8() direct = fn { second }; Holder box = { .action = fn { first }; }; direct, box } };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let cfg = &items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "choose" => Some(function),
+                _ => None,
+            })
+            .expect("choose")
+            .reference_cfg;
+        let outputs = cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].possible_environments.len(), 2);
+        assert_eq!(
+            outputs[1]
+                .possible_projected_environments
+                .iter()
+                .flat_map(|projection| &projection.environments)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2
+        );
+        assert!(outputs[0].possible_projected_environments.is_empty());
+        assert_eq!(
+            cfg.holder_edges
+                .iter()
+                .flat_map(|edge| &edge.actions)
+                .filter_map(|action| match action {
+                    CallableHolderAction::ReturnTransfer {
+                        environment,
+                        to: CallableHolderPlace::Output(0),
+                        ..
+                    } => Some(environment),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2
+        );
+        assert_eq!(
+            cfg.holder_edges
+                .iter()
+                .flat_map(|edge| &edge.actions)
+                .filter_map(|action| match action {
+                    CallableHolderAction::ReturnTransfer {
+                        environment,
+                        to: CallableHolderPlace::OutputProjection { output: 1, .. },
+                        ..
+                    } => Some(environment),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.points, cfg.points);
+        assert_eq!(restored.holder_edges, cfg.holder_edges);
+    }
+}
+
+#[test]
+fn loop_returned_callable_field_has_finite_joined_producers() {
+    let text = "%%start\nstruct copy Holder { u8() action; }\nHolder(bool) choose = fn(flag) { u8 first = 1; u8 second = 2; Holder box = { .action = fn { first }; }; u8 step = 0; while (step < 2) { if (flag) { box.action = fn { second }; } else { box.action = fn { first }; }; step = step + 1; } box };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let cfg = &items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "choose" => Some(function),
+                _ => None,
+            })
+            .expect("choose")
+            .reference_cfg;
+        let output = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("output");
+        assert_eq!(
+            output
+                .possible_projected_environments
+                .iter()
+                .flat_map(|projection| &projection.environments)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+    }
+}
+
+#[test]
+fn branch_returned_callable_field_rejects_invalid_loan_at_output() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader(bool) make = fn(flag) { u8[2] fixed = [4, 5]; *u8 borrowed = &fixed[0]; if (flag) { Reader result = { .read = fn { *borrowed }; }; result } else { Reader other = { .read = fn { fixed[1] }; }; other } };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let result = derive_scalar_program(&parsed.result);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic
+                    .labels
+                    .iter()
+                    .any(|label| label.span.range.start == text.find("&fixed[0]").unwrap() as u32)),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn module_literal_cfg_carries_checked_initializer_and_alias_assignment_in_both_validators() {
+    for text in [
+        "%%start\nstruct copy Holder { *i32() take; }\ni32 amount = 41;\n*i32 address = &amount;\nHolder container = { .take = fn() { address }; };\ncontainer;\n%%end",
+        "%%start\nstruct copy Holder { *i32() take; }\ni32 amount = 41;\n*i32 address = &amount;\n*i32 alias = address;\nHolder container = { .take = fn() { alias }; };\ncontainer;\n%%end",
+        "%%start\nstruct copy Holder { *i32() take; }\ni32 amount = 41;\ni32 previous = 2;\n*i32 address = &amount;\n*i32 alias = &previous;\nalias = address;\nHolder container = { .take = fn() { alias }; };\ncontainer;\n%%end",
+    ] {
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program(&parsed.result);
+        let project = validate_scalar_project(ScalarProject::new(vec![ScalarModule::from_program(single.program.clone(), Vec::new())], vec![source()]));
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for cfg in [&single.program.top_level_reference_cfg, &project.project.modules[0].top_level_reference_cfg] {
+            let name = if text.contains("fn() { alias }") { "alias" } else { "address" };
+            let start = text.find(&format!("fn() {{ {name} }}")).unwrap() as u32;
+            let literal = cfg.literal_cfgs.first().expect("top-level literal CFG");
+            assert_eq!(literal.literal, SourceSpan::new(source(), ByteSpan::new(start, start + 9 + name.len() as u32)));
+            let captured = &literal.captures[0];
+            let declaration = text.find(&format!("{name} =")).unwrap() as u32;
+            assert_eq!(captured.binding.declaration_span, ByteSpan::new(declaration, declaration + name.len() as u32));
+            assert_eq!(captured.binding.source, source());
+            let input = literal.reference_cfg.inputs.iter().find(|input| input.binding == captured.binding).expect("captured binding input");
+            assert_eq!(input.origins.len(), 1);
+            let output = literal.reference_cfg.points.iter().find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. })).expect("literal output");
+            assert_eq!(output.possible_origins.as_ref().expect("borrowed origin"), &input.origins);
+            let read = text.find(&format!("{name} }};")).unwrap() as u32;
+            assert_eq!(output.source_span, SourceSpan::new(source(), ByteSpan::new(read, read + name.len() as u32)));
+            let loan = text.find("&amount").unwrap() as u32;
+            assert!(matches!(&literal.reference_cfg.facts[input.origins.iter().next().unwrap().0], ReferenceOrigin::Fresh { loan: origin, .. } if origin.creation_span == ByteSpan::new(loan, loan + 7)));
+        }
+    }
+}
+
+#[test]
+fn module_literal_cfg_preserves_two_captured_checked_outputs() {
+    let text = "%%start\nstruct copy Holder { (*i32, *i32)() take; }\ni32 first = 1;\ni32 second = 2;\n*i32 left = &first;\n*i32 right = &second;\nHolder container = { .take = fn() { left, right }; };\ncontainer;\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for cfg in [
+        &single.program.top_level_reference_cfg,
+        &project.project.modules[0].top_level_reference_cfg,
+    ] {
+        let literal = cfg.literal_cfgs.first().expect("module literal CFG");
+        for (index, name) in ["left", "right"].into_iter().enumerate() {
+            let capture = literal
+                .captures
+                .iter()
+                .find(|capture| capture.name == name)
+                .expect("source-qualified capture");
+            let declaration = text.find(&format!("{name} =")).unwrap() as u32;
+            assert_eq!(
+                capture.binding.declaration_span,
+                ByteSpan::new(declaration, declaration + name.len() as u32)
+            );
+            let input = literal
+                .reference_cfg
+                .inputs
+                .iter()
+                .find(|input| input.binding == capture.binding)
+                .expect("capture input");
+            let output = literal.reference_cfg.points.iter().find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output, .. } if output == index)).expect("indexed output");
+            assert_eq!(
+                output.possible_origins.as_ref().expect("borrowed origins"),
+                &input.origins
+            );
+            let read = text
+                .find(if index == 0 {
+                    "left, right"
+                } else {
+                    "right };"
+                })
+                .unwrap() as u32;
+            assert_eq!(
+                output.source_span,
+                SourceSpan::new(source(), ByteSpan::new(read, read + name.len() as u32))
+            );
+        }
+        let outputs = literal
+            .reference_cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. }))
+            .collect::<Vec<_>>();
+        assert_ne!(outputs[0].possible_origins, outputs[1].possible_origins);
+    }
+}
+
+#[test]
+fn copied_callable_keeps_one_environment_in_both_validators() {
+    let text = "%%start\n(i32(i32))(i32) make = fn(amount) {\n    i32(i32) first = fn(value) { value + amount };\n    i32(i32) second = first;\n    second\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let cfg = &items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(&function.reference_cfg),
+                _ => None,
+            })
+            .expect("function");
+        let capture = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Capture { .. }))
+            .expect("capture");
+        let CfgPointKind::Capture {
+            environment,
+            captures,
+            ..
+        } = &capture.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(environment.literal.source, source());
+        assert_eq!(cfg.environments[environment.index].literal.source, source());
+        assert!(cfg.environments[environment.index]
+            .owners
+            .contains(&captures[0].binding));
+        let reads = cfg
+            .points
+            .iter()
+            .filter(|point| {
+                matches!(point.kind, CfgPointKind::Read { .. })
+                    && point.possible_environments.contains(environment)
+            })
+            .count();
+        assert!(reads >= 2, "copy and use must retain the environment");
+    }
+}
+
+#[test]
+fn captured_reference_retains_origin_and_loan_in_both_validators() {
+    let text = "%%start\ni32(i32) apply = fn(value) {\n    *i32 reference = &value;\n    i32() read = fn() { *reference };\n    i32() copy = read;\n    copy()\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let cfg = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(&function.reference_cfg),
+                _ => None,
+            })
+            .expect("function");
+        let capture = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Capture { .. }))
+            .expect("capture");
+        let CfgPointKind::Capture {
+            ref environment, ..
+        } = capture.kind
+        else {
+            unreachable!()
+        };
+        let fact = &cfg.environments[environment.index];
+        assert_eq!(fact.origins.len(), 1);
+        assert_eq!(
+            fact.loans,
+            BTreeSet::from([CallableLoanId {
+                origin: *fact.origins.iter().next().expect("origin")
+            }])
+        );
+        assert_eq!(fact.owners.len(), 1);
+        assert!(cfg
+            .points
+            .iter()
+            .any(|point| matches!(point.kind, CfgPointKind::Read { .. })
+                && point.possible_environments.contains(environment)));
+    }
+}
+
+#[test]
+fn returned_callable_keeps_owned_capture_environment_in_both_validators() {
+    let text = "%%start\n(i32(i32))(i32) make = fn(amount) {\n    i32(i32) original = fn(value) { value + amount };\n    i32(i32) copy = original;\n    copy\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let cfg = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(&function.reference_cfg),
+                _ => None,
+            })
+            .expect("function");
+        let capture = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Capture { .. }))
+            .expect("capture");
+        let CfgPointKind::Capture {
+            ref environment, ..
+        } = capture.kind
+        else {
+            unreachable!()
+        };
+        let output = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("output");
+        assert_eq!(
+            output.possible_environments,
+            BTreeSet::from([environment.clone()])
+        );
+        let transferred = cfg
+            .holder_edges
+            .iter()
+            .find(|edge| edge.from == output.id)
+            .expect("return output edge");
+        assert!(transferred.actions.iter().any(|action| matches!(action,
+            CallableHolderAction::ReturnTransfer {
+                from: CallableHolderPlace::Binding(binding),
+                to: CallableHolderPlace::Output(0), environment: known, span,
+            } if binding.declaration_span.start == text.find("copy =").unwrap() as u32
+                && known == environment && span.range == output.source_span.range)));
+        assert!(transferred
+            .after
+            .iter()
+            .any(|relation| relation.environment == *environment
+                && relation.holders.contains(&CallableHolderPlace::Output(0))));
+        assert!(transferred
+            .after
+            .iter()
+            .any(|relation| relation.environment == *environment
+                && relation.holders.iter().any(
+                    |holder| matches!(holder, CallableHolderPlace::Binding(binding)
+                if binding.declaration_span.start == text.find("original =").unwrap() as u32)
+                )));
+        assert!(transferred.actions.iter().all(|action| !matches!(action,
+            CallableHolderAction::ReturnTransfer { from: CallableHolderPlace::Binding(binding), .. }
+                if binding.declaration_span.start == text.find("original =").unwrap() as u32)));
+    }
+}
+
+#[test]
+fn returned_callable_rejects_short_lived_captured_reference_with_loan_label() {
+    let text = "%%start\n(i32())(i32) make = fn(value) {\n    *i32 borrowed = &value;\n    i32() read = fn() { *borrowed };\n    read\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let diagnostic = diagnostics
+            .iter()
+            .find(|item| item.code == "B0003")
+            .expect("escape diagnostic");
+        let returned = text.rfind("read\n").unwrap() as u32;
+        assert_eq!(
+            diagnostic.labels[0].span,
+            SourceSpan::new(source(), ByteSpan::new(returned, returned + 4))
+        );
+        let address = text.find("&value").unwrap() as u32;
+        assert!(diagnostic
+            .labels
+            .iter()
+            .any(|label| label.kind == DiagnosticLabelKind::Secondary
+                && label.span == SourceSpan::new(source(), ByteSpan::new(address, address + 6))));
+    }
+}
+
+#[test]
+fn callable_field_assignment_preserves_join_alternatives_in_both_validators() {
+    let text = "%%start\nstruct copy Holder { i32(i32) operation; }\ni32(i32) apply = fn(amount) {\n    Holder container = { .operation = fn(value) { value + amount }; };\n    if (amount > 0) {\n        container.operation = fn(value) { value + amount };\n    } else {\n        container.operation = fn(value) { amount + value };\n    };\n    i32(i32) copied = container.operation;\n    copied(1)\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let cfg = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(&function.reference_cfg),
+                _ => None,
+            })
+            .expect("function");
+        let read = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    &point.kind,
+                    CfgPointKind::ReadPlace {
+                        place: ScalarPlace::Field { .. },
+                        ..
+                    }
+                ) && point.source_span.range.start
+                    == text.find("container.operation;\n    copied").unwrap() as u32
+            })
+            .expect("field read");
+        assert_eq!(read.possible_environments.len(), 2);
+        for environment in &read.possible_environments {
+            assert_eq!(cfg.environments[environment.index].literal.source, source());
+            assert!(!cfg.environments[environment.index].owners.is_empty());
+        }
+    }
+}
+
+#[test]
+fn contextual_literal_signature_and_typed_capture_cell_survive_both_validators() {
+    let text = "%%start\n(i32(i32))(i32) make = fn(amount) {\n    i32(i32) add = fn(value) { value + amount };\n    add\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    for (items, signatures) in [
+        (
+            &single.program.items,
+            single.program.resolved_literals.borrow(),
+        ),
+        (
+            &project.project.modules[0].items,
+            project.project.modules[0].resolved_literals.borrow(),
+        ),
+    ] {
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("outer function");
+        let point = function
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Capture { .. }))
+            .expect("capture");
+        let CfgPointKind::Capture {
+            literal,
+            signature,
+            captures,
+            ..
+        } = &point.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            signatures
+                .iter()
+                .find(|entry| entry.literal == SourceSpan::new(source(), *literal))
+                .expect("typed literal")
+                .signature,
+            *signature
+        );
+        assert!(
+            matches!(signature, ScalarType::Callable { parameters, outputs } if parameters.as_slice() == [ScalarType::I32] && outputs.outputs[0].ty == ScalarType::I32)
+        );
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].ty, ScalarType::I32);
+        assert_eq!(captures[0].place_type, ScalarType::I32);
+        assert_eq!(captures[0].binding.source, source());
+        assert_eq!(
+            captures[0].binding.declaration_span,
+            function.parameter_spans[0]
+        );
+        assert_eq!(
+            captures[0].use_span.range.start,
+            text.rfind("amount").unwrap() as u32
+        );
+    }
+}
+
+#[test]
+fn captured_struct_field_keeps_resolved_field_identity_in_both_validators() {
+    let text = "%%start\nstruct copy Packet { i32 member; }\n(i32(i32))(Packet) make = fn(boxed) {\n    i32(i32) add = fn(value) { boxed.member + value };\n    add\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let single = derive_scalar_program(&parsed.result);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        vec![source()],
+    ));
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    for (items, structs) in [
+        (&single.program.items, &single.program.structs),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].structs,
+        ),
+    ] {
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("outer function");
+        let captures = function
+            .reference_cfg
+            .points
+            .iter()
+            .find_map(|point| match &point.kind {
+                CfgPointKind::Capture { captures, .. } => Some(captures),
+                _ => None,
+            })
+            .expect("capture point");
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].ty, ScalarType::Struct(structs[0].id.clone()));
+        assert_eq!(captures[0].place_type, ScalarType::I32);
+        assert!(
+            matches!(&captures[0].place, ScalarPlace::Field { field: ScalarFieldReference::Resolved(id), .. } if id == &structs[0].fields[0].id)
+        );
+        assert_eq!(
+            captures[0].binding.declaration_span,
+            function.parameter_spans[0]
+        );
+        assert_eq!(
+            captures[0].use_span.range.start,
+            text.find("boxed.member").unwrap() as u32
+        );
+    }
+}
+
+#[test]
+fn callable_value_layout_is_two_target_pointers() {
+    let callable = ScalarType::Callable {
+        outputs: ScalarOutputSequence {
+            outputs: vec![ScalarOutput {
+                ty: ScalarType::I32,
+                span: ByteSpan::new(0, 0),
+            }],
+            span: ByteSpan::new(0, 0),
+        },
+        parameters: vec![ScalarType::I32],
+    };
+    for (target, size) in [
+        (ScalarTargetLayout::WASM32, 8),
+        (ScalarTargetLayout::NATIVE64, 16),
+    ] {
+        assert_eq!(
+            layout_for_type(&callable, target).unwrap(),
+            ScalarLayout {
+                size,
+                alignment: target.pointer_alignment
+            }
+        );
+    }
+    let text = "%%start\nstruct Holder { u8 tag; i32(i32) action; }\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for (target, size) in [
+        (ScalarTargetLayout::WASM32, 12),
+        (ScalarTargetLayout::NATIVE64, 24),
+    ] {
+        let validated = derive_scalar_program_with_layout(&parsed.result, target);
+        assert!(
+            validated.diagnostics.is_empty(),
+            "{:?}",
+            validated.diagnostics
+        );
+        let structure = &validated.program.structs[0];
+        assert_eq!(structure.fields[1].offset, Some(target.pointer_size));
+        assert_eq!(
+            structure.fields[1].layout.as_ref().unwrap().size,
+            target.pointer_size * 2
+        );
+        assert_eq!(structure.layout.as_ref().unwrap().size, size);
+    }
+}
+
+#[test]
+fn lexical_captures_keep_each_final_use_and_original_binding_source() {
+    let text = "%%start\n(i32(i32))(i32) make = fn(amount) {\n    i32(i32) add = fn(value) { amount + amount + value };\n    add\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let program = derive_scalar_program(&parsed.result).program;
+    let function = program
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ScalarItem::Function(function) => Some(function),
+            _ => None,
+        })
+        .expect("outer callable");
+    let ScalarBlockItem::LocalBinding(binding) = &function.body.items[0] else {
+        panic!("nested literal binding");
+    };
+    let imported = SourceIdentity::new(
+        "other-project".into(),
+        "other-package".into(),
+        "src/other.w".into(),
+        "r2".into(),
+    );
+    let outer_id = ReferenceBindingId {
+        source: imported.clone(),
+        function_span: function.span,
+        declaration_span: function.parameter_spans[0],
+        block_span: function.body.span,
+        kind: ReferenceBindingKind::Declared,
+    };
+    let captures = closure::captures(
+        &source(),
+        &binding.value,
+        &BTreeMap::from([("amount".to_owned(), outer_id.clone())]),
+        &HashMap::from([(outer_id.clone(), ScalarType::I32)]),
+        &program.structs,
+    );
+    let offsets = text
+        .match_indices("amount")
+        .map(|(offset, _)| offset as u32)
+        .collect::<Vec<_>>();
+    assert_eq!(captures.len(), 2);
+    for (capture, offset) in captures.iter().zip(offsets.into_iter().skip(1)) {
+        assert_eq!(capture.binding, outer_id);
+        assert_eq!(capture.use_span.source, source());
+        assert_eq!(capture.use_span.range.start, offset);
+        assert!(matches!(&capture.place, ScalarPlace::Name { name, .. } if name == "amount"));
+    }
+}
+
+#[test]
+fn lexical_captures_preserve_member_projections_and_nested_shadowing() {
+    let text = "%%start\nstruct copy Packet { i32 member; }\n(i32(i32))(Packet) make = fn(boxed) {\n    i32(i32) add = fn(value) {\n        i32(i32) deep = fn(boxed) { boxed.member + value };\n        deep(1) + boxed.member + boxed.member\n    };\n    add\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let program = derive_scalar_program(&parsed.result).program;
+    let function = program
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ScalarItem::Function(function) => Some(function),
+            _ => None,
+        })
+        .expect("outer callable");
+    let ScalarBlockItem::LocalBinding(binding) = &function.body.items[0] else {
+        panic!("nested literal binding");
+    };
+    let outer_id = ReferenceBindingId {
+        source: source(),
+        function_span: function.span,
+        declaration_span: function.parameter_spans[0],
+        block_span: function.body.span,
+        kind: ReferenceBindingKind::Declared,
+    };
+    let captures = closure::captures(
+        &source(),
+        &binding.value,
+        &BTreeMap::from([("boxed".to_owned(), outer_id.clone())]),
+        &HashMap::from([(
+            outer_id.clone(),
+            match &function.signature {
+                ScalarType::Callable { parameters, .. } => parameters[0].clone(),
+                _ => panic!("callable"),
+            },
+        )]),
+        &program.structs,
+    );
+    assert_eq!(captures.len(), 2);
+    let offsets = text
+        .match_indices("boxed.member")
+        .map(|(offset, _)| offset as u32)
+        .collect::<Vec<_>>();
+    for (capture, offset) in captures.iter().zip(offsets.into_iter().skip(1)) {
+        assert_eq!(capture.binding, outer_id);
+        assert_eq!(capture.use_span.range.start, offset);
+        assert!(
+            matches!(&capture.place, ScalarPlace::Field { field: ScalarFieldReference::Resolved(id), .. } if id == &program.structs[0].fields[0].id)
+        );
+    }
+}
+
+#[test]
+fn lexical_local_shadow_stops_capturing_the_outer_binding() {
+    let text = "%%start\n(i32(i32))(i32) make = fn(amount) {\n    i32(i32) add = fn(value) {\n        i32 amount = 1;\n        amount + value\n    };\n    add\n};\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let program = derive_scalar_program(&parsed.result).program;
+    let function = program
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ScalarItem::Function(function) => Some(function),
+            _ => None,
+        })
+        .expect("outer callable");
+    let ScalarBlockItem::LocalBinding(binding) = &function.body.items[0] else {
+        panic!("nested literal binding");
+    };
+    let outer_id = ReferenceBindingId {
+        source: source(),
+        function_span: function.span,
+        declaration_span: function.parameter_spans[0],
+        block_span: function.body.span,
+        kind: ReferenceBindingKind::Declared,
+    };
+    assert!(closure::captures(
+        &source(),
+        &binding.value,
+        &BTreeMap::from([("amount".to_owned(), outer_id.clone())]),
+        &HashMap::from([(outer_id, ScalarType::I32)]),
+        &program.structs,
+    )
+    .is_empty());
+}
+
+#[test]
+fn function_literal_context_checks_parameters_and_return_in_single_and_project() {
+    for (body, expected_code, marker) in [
+        ("value + 1", None, "fn(value)"),
+        ("value + true", Some("B0003"), "value + true"),
+        ("missing", Some("B0001"), "missing"),
+    ] {
+        let text = format!("%%start\ni32(i32) transform = fn(value) {{ {body} }};\n%%end");
+        let parsed = parse_source(source(), text.clone(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program(&parsed.result);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if let Some(code) = expected_code {
+                assert!(
+                    diagnostics.iter().any(|diagnostic| diagnostic.code == code
+                        && diagnostic.labels[0].span.range.start
+                            == text.find(marker).unwrap() as u32),
+                    "{diagnostics:?}"
+                );
+            } else {
+                assert!(
+                    !diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == "B0001"
+                            || diagnostic.code == "B0003"
+                            || diagnostic.code == "B0004"),
+                    "{diagnostics:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn function_literal_checks_each_output_in_single_and_project() {
+    for (final_values, expected_code, error_offset) in [
+        ("value, true", None, None),
+        ("value, value", Some("B0003"), Some(7)),
+        ("value, true, false", Some("B0004"), None),
+    ] {
+        let text =
+            format!("%%start\n(i32, bool)(i32) pair = fn(value) {{ {final_values} }};\n%%end");
+        let parsed = parse_source(source(), text.clone(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program(&parsed.result);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if let Some(code) = expected_code {
+                assert!(
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic.code == code
+                            && error_offset.is_none_or(|offset| {
+                                diagnostic.labels[0].span.range.start
+                                    == (text.find(final_values).unwrap() + offset) as u32
+                            })
+                    }),
+                    "{diagnostics:?}"
+                );
+            } else {
+                assert!(
+                    !diagnostics.iter().any(|diagnostic| matches!(
+                        diagnostic.code.as_str(),
+                        "B0001" | "B0003" | "B0004"
+                    )),
+                    "{diagnostics:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -514,10 +11772,16 @@ fn missing_aggregate_policy_table_reports_spanned_invariant() {
         &validated.program.source,
         &mut function,
         &HashSet::new(),
+        &BTreeMap::new(),
         &[],
         &[],
         &[],
         &HashMap::new(),
+        &[],
+        &assignment::SourceValueTypeFacts {
+            assignments: Vec::new(),
+            expressions: Vec::new(),
+        },
     );
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert_eq!(
@@ -991,17 +12255,224 @@ fn copyable_checked_dereference_remains_a_read_in_both_validators() {
 }
 
 #[test]
-fn indexed_dereference_of_fixed_array_is_rejected_by_current_grammar() {
+fn d3_indexed_deref_ast_fixed_array_mutable_root_is_canonical_composition() {
     let text = "%%start\nstruct Payload { i32 value; }\nPayload(Payload[2], u64) take = fn(values, index) { *!(Payload[2]) writer = &!values; (*writer)[index] };\n%%end";
     let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let node = parsed
+        .result
+        .root
+        .descendants()
+        .find(|node| node.kind() == SyntaxKind::IndexedPlace)
+        .unwrap();
+    let place = derive_place(&node, &source());
+    let ScalarPlace::Index {
+        base,
+        index,
+        index_span,
+        span,
+    } = place
+    else {
+        panic!("indexed place")
+    };
+    let start = text.find("(*writer)[index]").unwrap() as u32;
+    assert_eq!(span, ByteSpan::new(start, start + 16));
+    assert_eq!(index_span, ByteSpan::new(start + 10, start + 15));
+    assert!(matches!(*index, ScalarExpression::Name { ref name, .. } if name == "index"));
     assert!(
-        parsed
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "S0001"),
-        "{:?}",
-        parsed.diagnostics
+        matches!(*base, ScalarPlace::Dereference { ref pointer, span }
+        if span == ByteSpan::new(start + 1, start + 8)
+            && matches!(**pointer, ScalarExpression::Name { ref name, .. } if name == "writer"))
     );
+}
+
+#[test]
+fn d3_indexed_deref_ast_fixed_runtime_pointer_and_index_structure() {
+    for array in ["u8[4]", "u8[]"] {
+        let text = format!("%%start\r\nu8(*({array}), u64) inspect = fn(bytes, index) {{\r\n\t(*fetch(bytes))[\r\n\t# INTENT:  exact payload  \r\n\tindex + 1\r\n\t]\r\n}};\r\n%%end");
+        let parsed = parse_source(source(), text.clone(), &["INTENT".into()]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.result.reconstruct(), text);
+        assert_eq!(parsed.result.comments[0].raw_payload, "  exact payload  ");
+        let node = parsed
+            .result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::IndexedPlace)
+            .unwrap();
+        let place = derive_place(&node, &parsed.result.source);
+        let ScalarPlace::Index {
+            base,
+            index,
+            index_span,
+            span,
+        } = &place
+        else {
+            panic!("indexed place")
+        };
+        let start = text.find("(*fetch(bytes))").unwrap() as u32;
+        let end = text.find("\t]").unwrap() as u32 + 2;
+        assert_eq!(*span, ByteSpan::new(start, end));
+        let index_start = text.find("index + 1").unwrap() as u32;
+        assert_eq!(*index_span, ByteSpan::new(index_start, index_start + 12));
+        let ScalarExpression::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } = &**index
+        else {
+            panic!("index expression")
+        };
+        assert_eq!(*operator, BinaryOperator::Add);
+        assert!(matches!(**left, ScalarExpression::Name { ref name, .. } if name == "index"));
+        assert!(
+            matches!(**right, ScalarExpression::Integer { ref value, .. } if *value == BigInt::from(1))
+        );
+        let ScalarPlace::Dereference { pointer, span } = &**base else {
+            panic!("dereference root")
+        };
+        assert_eq!(*span, ByteSpan::new(start + 1, start + 14));
+        let ScalarExpression::Call {
+            name,
+            arguments,
+            occurrence,
+            span,
+            ..
+        } = &**pointer
+        else {
+            panic!("pointer call")
+        };
+        assert_eq!(name, "fetch");
+        assert_eq!(arguments.len(), 1);
+        assert!(matches!(arguments[0], ScalarExpression::Name { ref name, .. } if name == "bytes"));
+        assert_eq!(*span, ByteSpan::new(start + 2, start + 14));
+        assert_eq!(occurrence.source_span, SourceSpan::new(source(), *span));
+        let read = derive_expression(&node, &parsed.result.source);
+        let ScalarExpression::IndexedRead {
+            occurrence,
+            place: read_place,
+            ..
+        } = read
+        else {
+            panic!("indexed read")
+        };
+        assert_eq!(read_place, place);
+        assert_eq!(
+            occurrence.source_span,
+            SourceSpan::new(source(), wosy_syntax::byte_span(&node))
+        );
+        let snapshot = parsed.result.canonical_cst().snapshot();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored =
+            wosy_syntax::CanonicalCstRoot::from_snapshot(serde_json::from_str(&json).unwrap());
+        assert_eq!(restored.source, source());
+        let restored_node = restored
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::IndexedPlace)
+            .unwrap();
+        assert_eq!(derive_place(&restored_node, &restored.source), place);
+    }
+}
+
+#[test]
+fn d3_indexed_deref_ast_nested_field_and_index_compositions() {
+    let text = "%%start\n(*matrix)[row][column]; (*frame).bytes[index]; (*(*frames)[row]).bytes[column];\n%%end";
+    let parsed = parse_source(source(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let places = parsed
+        .result
+        .root
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::IndexedPlace)
+        .map(|node| derive_place(&node, &source()))
+        .collect::<Vec<_>>();
+    let ScalarPlace::Index {
+        base,
+        index_span,
+        span,
+        ..
+    } = &places[0]
+    else {
+        panic!("outer index")
+    };
+    assert_eq!(*span, ByteSpan::new(8, 30));
+    assert_eq!(*index_span, ByteSpan::new(23, 29));
+    let ScalarPlace::Index {
+        base,
+        index_span,
+        span,
+        ..
+    } = &**base
+    else {
+        panic!("inner index")
+    };
+    assert_eq!(*span, ByteSpan::new(8, 22));
+    assert_eq!(*index_span, ByteSpan::new(18, 21));
+    assert!(matches!(**base, ScalarPlace::Dereference { .. }));
+    for place in &places[1..3] {
+        let ScalarPlace::Index { base, .. } = place else {
+            panic!("field index")
+        };
+        let ScalarPlace::Field { base, field, .. } = &**base else {
+            panic!("field")
+        };
+        assert!(matches!(field, ScalarFieldReference::Unresolved { name, .. } if name == "bytes"));
+        assert!(matches!(**base, ScalarPlace::Dereference { .. }));
+    }
+    let ScalarPlace::Index { base, .. } = &places[2] else {
+        panic!("outer field index")
+    };
+    let ScalarPlace::Field { base, .. } = &**base else {
+        panic!("field")
+    };
+    let ScalarPlace::Dereference { pointer, .. } = &**base else {
+        panic!("dereference")
+    };
+    assert!(matches!(
+        **pointer,
+        ScalarExpression::IndexedRead {
+            place: ScalarPlace::Index { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn d3_indexed_deref_ast_malformed_recovery_keeps_surviving_places() {
+    let text = "%%start\n(*bytes)[before];\n(*bytes)[];\n(*bytes)[after];\n%%end";
+    let parsed = parse_source(source(), text.into(), &[]);
+    assert!(parsed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "S0001"));
+    assert_eq!(parsed.result.reconstruct(), text);
+    let places = parsed
+        .result
+        .root
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::IndexedPlace)
+        .map(|node| derive_place(&node, &source()))
+        .collect::<Vec<_>>();
+    assert_eq!(places.len(), 2);
+    for (place, name) in places.iter().zip(["before", "after"]) {
+        let ScalarPlace::Index {
+            base,
+            index,
+            index_span,
+            ..
+        } = place
+        else {
+            panic!("index")
+        };
+        assert!(matches!(**base, ScalarPlace::Dereference { .. }));
+        assert!(
+            matches!(**index, ScalarExpression::Name { name: ref index_name, .. } if index_name == name)
+        );
+        let start = text.find(name).unwrap() as u32;
+        assert_eq!(*index_span, ByteSpan::new(start, start + name.len() as u32));
+    }
 }
 
 #[test]
@@ -1273,10 +12744,16 @@ fn absent_resolved_assignment_output_is_a_spanned_invariant_error() {
         &validated.program.source,
         &mut function,
         &HashSet::new(),
+        &BTreeMap::new(),
         &[],
         &validated.program.structs,
         &validated.program.enums,
         &HashMap::new(),
+        &[],
+        &assignment::SourceValueTypeFacts {
+            assignments: Vec::new(),
+            expressions: Vec::new(),
+        },
     );
     assert_eq!(errors.len(), 1);
     assert_eq!(
@@ -1360,6 +12837,3135 @@ fn both_reference_functions(text: &str) -> (ScalarValidation, ScalarProjectValid
         vec![source],
     ));
     (single, project)
+}
+
+fn assignment_witness_validation(
+    text: &str,
+    layout: ScalarTargetLayout,
+    project: bool,
+) -> (Vec<ScalarItem>, Vec<crate::Diagnostic>) {
+    let source = source();
+    let parsed = parse_source(source.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let validation = derive_scalar_program_with_layout(&parsed.result, layout);
+    if project {
+        let validation = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(validation.program, Vec::new())],
+            vec![source],
+        ));
+        assert_eq!(validation.project.modules[0].target_layout, layout);
+        (
+            validation.project.modules[0].items.clone(),
+            validation.diagnostics,
+        )
+    } else {
+        assert_eq!(validation.program.target_layout, layout);
+        (validation.program.items, validation.diagnostics)
+    }
+}
+
+fn numeric_prepared_phase_order(layout: ScalarTargetLayout, project: bool) {
+    let text = "%%start\nu32() f = fn { u32 left = 1; u32 right = 2; left, right = right, left; u32 old = (left = 9); old + left + right };\n%%end";
+    let (items, diagnostics) = assignment_witness_validation(text, layout, project);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let ScalarItem::Function(function) = &items[0] else {
+        panic!("function")
+    };
+    let cfg = &function.reference_cfg;
+    let tables = &cfg.evaluated_values;
+    assert_eq!(tables.assignment_evaluations.len(), 2);
+    for evaluation in &tables.assignment_evaluations {
+        assert_eq!(evaluation.destinations.len(), evaluation.writes.len());
+        assert_eq!(evaluation.previous.len(), evaluation.writes.len());
+        for rhs in &evaluation.rhs {
+            for destination in &evaluation.destinations {
+                assert!(rhs.value.point.0 < destination.point.0);
+            }
+        }
+        for destination in &evaluation.destinations {
+            for snapshot in &evaluation.previous {
+                assert!(destination.point.0 < snapshot.point.0);
+            }
+        }
+        for snapshot in &evaluation.previous {
+            for write in &evaluation.writes {
+                assert!(snapshot.point.0 < write.point.0);
+            }
+            assert!(matches!(
+                cfg.initial_points[snapshot.point.0].kind,
+                CfgPointKind::AssignmentSnapshot { .. }
+            ));
+        }
+    }
+    let received = tables
+        .assignment_evaluations
+        .iter()
+        .find(|evaluation| !evaluation.results.is_empty())
+        .expect("received old value");
+    assert_eq!(received.results.len(), 1);
+    assert!(received.writes[0].point.0 < received.results[0].value.point.0);
+    assert_eq!(received.results[0].snapshot, received.previous[0].point);
+}
+
+fn saved_reference_pointer(layout: ScalarTargetLayout, project: bool) {
+    let text = "%%start\nu32() f = fn { u32 left = 1; u32 right = 2; *!u32 target = &!left; *!u32 replacement = &!right; u32 old = (*(target = replacement) = 9); old + left + *target };\n%%end";
+    let (items, diagnostics) = assignment_witness_validation(text, layout, project);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let ScalarItem::Function(function) = &items[0] else {
+        panic!("function")
+    };
+    let tables = &function.reference_cfg.evaluated_values;
+    assert_eq!(tables.assignment_evaluations.len(), 2);
+    let outer = tables
+        .assignment_evaluations
+        .iter()
+        .find(|evaluation| {
+            matches!(
+                evaluation.destinations[0].storage,
+                EvaluatedDestinationStorage::Through { .. }
+            )
+        })
+        .expect("outer destination");
+    let EvaluatedDestinationStorage::Through { pointer, cases } = &outer.destinations[0].storage
+    else {
+        unreachable!()
+    };
+    let inner = tables
+        .assignment_evaluations
+        .iter()
+        .find(|evaluation| {
+            evaluation
+                .results
+                .iter()
+                .any(|result| result.value == *pointer)
+        })
+        .expect("saved reference producer");
+    assert_eq!(inner.results.len(), 1);
+    assert_eq!(outer.results.len(), 1);
+    assert!(inner.results[0].value.point.0 < outer.destinations[0].point.0);
+    assert!(!cases.is_empty());
+    assert!(tables
+        .values
+        .iter()
+        .find(|value| value.id == *pointer)
+        .expect("pointer fact")
+        .cases
+        .iter()
+        .all(|case| matches!(case.payload, EvaluatedPayloadFact::Checked { .. })));
+}
+
+#[test]
+fn numeric_assignment_result_scalar_program_and_project_prepared_phase_order() {
+    numeric_prepared_phase_order(ScalarTargetLayout::WASM32, false);
+    numeric_prepared_phase_order(ScalarTargetLayout::WASM32, true);
+}
+
+#[test]
+fn compositional_assignment_result_scalar_program_and_project_saved_reference_pointer() {
+    saved_reference_pointer(ScalarTargetLayout::WASM32, false);
+    saved_reference_pointer(ScalarTargetLayout::WASM32, true);
+}
+
+#[test]
+fn numeric_assignment_result_prepared_phase_order_scalar_program_native64() {
+    numeric_prepared_phase_order(ScalarTargetLayout::NATIVE64, false);
+}
+#[test]
+fn numeric_assignment_result_prepared_phase_order_scalar_program_wasm32() {
+    numeric_prepared_phase_order(ScalarTargetLayout::WASM32, false);
+}
+#[test]
+fn numeric_assignment_result_prepared_phase_order_scalar_project_native64() {
+    numeric_prepared_phase_order(ScalarTargetLayout::NATIVE64, true);
+}
+#[test]
+fn numeric_assignment_result_prepared_phase_order_scalar_project_wasm32() {
+    numeric_prepared_phase_order(ScalarTargetLayout::WASM32, true);
+}
+
+#[test]
+fn compositional_assignment_result_saved_reference_pointer_scalar_program_native64() {
+    saved_reference_pointer(ScalarTargetLayout::NATIVE64, false);
+}
+#[test]
+fn compositional_assignment_result_saved_reference_pointer_scalar_program_wasm32() {
+    saved_reference_pointer(ScalarTargetLayout::WASM32, false);
+}
+#[test]
+fn compositional_assignment_result_saved_reference_pointer_scalar_project_native64() {
+    saved_reference_pointer(ScalarTargetLayout::NATIVE64, true);
+}
+#[test]
+fn compositional_assignment_result_saved_reference_pointer_scalar_project_wasm32() {
+    saved_reference_pointer(ScalarTargetLayout::WASM32, true);
+}
+
+#[test]
+fn global_callable_call_paths_track_each_overwrite_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 3 }; };\nu8 first = global_field.action();\nglobal_field.action = fn { 4 };\nu8 second = global_field.action();\nfirst; second;\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (cfg, diagnostics) in [
+        (&single.program.top_level_reference_cfg, &single.diagnostics),
+        (
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let calls = cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::Call { output: 0, .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let paths = calls.iter().map(|point| point.global_callable_call_paths.iter().flat_map(|state| state.iter()).filter(|path| matches!(&path.holder, CallableHolderPlace::Projection(place) if place.binding.declaration_span.start == text.find("global_field =").unwrap() as u32)).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(
+            paths[0].len(),
+            1,
+            "{:?}",
+            calls[0].global_callable_call_paths
+        );
+        assert_eq!(
+            paths[1].len(),
+            1,
+            "{:?}",
+            calls[1].global_callable_call_paths
+        );
+        assert!(matches!(
+            paths[0][0].initialization,
+            GlobalCallableInitializationFact::Initialized
+        ));
+        assert!(matches!(
+            paths[1][0].initialization,
+            GlobalCallableInitializationFact::Initialized
+        ));
+        assert_ne!(paths[0][0].relations, paths[1][0].relations);
+        for (point, expected) in calls.iter().zip(paths) {
+            assert_eq!(
+                expected[0].callee,
+                match &point.kind {
+                    CfgPointKind::Call { target, .. } => target.clone(),
+                    _ => unreachable!(),
+                }
+            );
+        }
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        for call in calls {
+            assert_eq!(
+                call.global_callable_call_paths,
+                restored.points[call.id.0].global_callable_call_paths
+            );
+        }
+    }
+}
+
+#[test]
+fn global_callable_call_paths_keep_branch_globals_correlated_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch first = { .action = fn { 1 }; };\nDispatch second = { .action = fn { 2 }; };\nbool choice = true;\nif (choice) { first.action = fn { 3 }; second.action = fn { 4 }; } else { first.action = fn { 5 }; second.action = fn { 6 }; };\nu8 result = first.action();\nresult;\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (cfg, diagnostics) in [
+        (&single.program.top_level_reference_cfg, &single.diagnostics),
+        (
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let call = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Call { output: 0, .. }))
+            .unwrap();
+        let paths = &call.global_callable_call_paths;
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        for path in paths {
+            let fields = path.iter().filter(|fact| matches!(&fact.holder, CallableHolderPlace::Projection(place) if place.projections.iter().any(|projection| matches!(projection, ReferencePlaceProjection::Field(_))))).collect::<Vec<_>>();
+            assert_eq!(fields.len(), 2, "{path:?}");
+            assert!(fields
+                .iter()
+                .all(|fact| fact.initialization == GlobalCallableInitializationFact::Initialized));
+        }
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(
+            paths,
+            &restored.points[call.id.0].global_callable_call_paths
+        );
+    }
+}
+
+#[test]
+fn function_global_call_paths_require_callsite_input_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 3 }; };\nu8() invoke = fn { global_field.action() };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let call = function
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+            .unwrap();
+        let path = call.global_callable_call_paths.iter().flat_map(|state| state.iter()).find(|path| matches!(&path.holder, CallableHolderPlace::Projection(place) if place.binding.declaration_span.start == text.find("global_field =").unwrap() as u32)).unwrap();
+        assert_eq!(
+            path.initialization,
+            GlobalCallableInitializationFact::AwaitingCallsiteInput
+        );
+        assert_eq!(path.relations.len(), 0);
+        assert_eq!(
+            path.callee,
+            match &call.kind {
+                CfgPointKind::Call { target, .. } => target.clone(),
+                _ => unreachable!(),
+            }
+        );
+    }
+}
+
+#[test]
+fn global_callable_function_inputs_follow_each_top_level_callsite_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 3 }; };\nunit() invoke = fn { global_field.action(); };\ninvoke();\nglobal_field.action = fn { 4 };\ninvoke();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let paths = &function.reference_cfg.global_callable_input_paths;
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        let holders = paths.iter().map(|path| path.holders.iter().find(|fact| matches!(&fact.holder, CallableHolderPlace::Projection(place) if place.binding.declaration_span.start == text.find("global_field =").unwrap() as u32)).unwrap()).collect::<Vec<_>>();
+        assert!(holders
+            .iter()
+            .all(|fact| fact.initialization == GlobalCallableInitializationFact::Initialized));
+        assert_ne!(holders[0].relations, holders[1].relations);
+        assert_ne!(paths[0].call, paths[1].call);
+        for holder in &holders {
+            assert!(
+                holder.relations.iter().all(|relation| {
+                    function
+                        .reference_cfg
+                        .environments
+                        .get(relation.environment.index)
+                        .is_some_and(|environment| {
+                            environment.literal == relation.environment.literal
+                        })
+                }),
+                "incoming global environment requires source-qualified rebasing"
+            );
+        }
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(&function.reference_cfg).unwrap()).unwrap();
+        assert_eq!(paths, &restored.global_callable_input_paths);
+    }
+}
+
+#[test]
+fn global_callable_function_write_publishes_source_qualified_effect_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 3 }; };\nunit() replace = fn { global_field.action = fn { 4 }; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics, source) in [
+        (
+            &single.program.items,
+            &single.diagnostics,
+            &single.program.source,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.diagnostics,
+            &project.project.modules[0].source,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "replace" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let effects = function
+            .reference_cfg
+            .points
+            .iter()
+            .flat_map(|point| &point.global_callable_output_effects)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            effects.len(),
+            1,
+            "{effects:?}; points: {:?}",
+            function
+                .reference_cfg
+                .points
+                .iter()
+                .map(|point| &point.kind)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(&effects[0].target.binding.source, source);
+        assert_eq!(
+            effects[0].target.binding.declaration_span.start,
+            text.find("global_field =").unwrap() as u32
+        );
+        assert_eq!(&effects[0].span.source, source);
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(&function.reference_cfg).unwrap()).unwrap();
+        assert_eq!(
+            effects[0],
+            restored
+                .points
+                .iter()
+                .flat_map(|point| &point.global_callable_output_effects)
+                .next()
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn global_callable_copied_inside_function_seeds_connected_retain_and_drop_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 3 }; };\nunit() invoke = fn { Dispatch copy = global_field; copy.action(); };\ninvoke();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    let global_decl = text.find("global_field =").unwrap() as u32;
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let cfg = &function.reference_cfg;
+        assert_eq!(
+            cfg.global_callable_input_paths.len(),
+            1,
+            "{:?}",
+            cfg.global_callable_input_paths
+        );
+        let input = &cfg.global_callable_input_paths[0];
+        let seeded_fact = input
+            .holders
+            .iter()
+            .find(|fact| {
+                fact.initialization == GlobalCallableInitializationFact::Initialized
+                    && !fact.relations.is_empty()
+            })
+            .unwrap_or_else(|| panic!("seeded initialized global holder: {input:?}"));
+        assert!(
+            input.holders.iter().any(|fact| matches!(
+                fact.initialization,
+                GlobalCallableInitializationFact::Initialized
+            )),
+            "{input:?}"
+        );
+        let seeded_holder = seeded_fact.holder.clone();
+        let seeded_binding = match &seeded_holder {
+            CallableHolderPlace::Binding(binding) => binding.clone(),
+            CallableHolderPlace::Projection(place) => place.binding.clone(),
+            holder => panic!("unexpected seeded global holder {holder:?}"),
+        };
+        assert_eq!(seeded_binding.declaration_span.start, global_decl);
+        assert!(
+            !seeded_fact.relations.is_empty(),
+            "seeded global requires holder relations: {input:?}"
+        );
+        for relation in &seeded_fact.relations {
+            assert!(
+                cfg.environments
+                    .get(relation.environment.index)
+                    .is_some_and(|fact| fact.literal == relation.environment.literal),
+                "seeded relation requires source-qualified environment: {relation:?}"
+            );
+            assert!(
+                relation
+                    .holders
+                    .iter()
+                    .any(|holder| holder == &seeded_holder),
+                "seeded relation must hold the global place: {relation:?}"
+            );
+        }
+        let actions = cfg
+            .holder_edges
+            .iter()
+            .flat_map(|edge| &edge.actions)
+            .chain(cfg.holder_exits.iter().flat_map(|exit| &exit.actions))
+            .collect::<Vec<_>>();
+        let retains = actions
+            .iter()
+            .filter_map(|action| match action {
+                CallableHolderAction::Retain { from, to, .. } => Some((from, to)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            retains.iter().any(|(from, _)| *from == &seeded_holder),
+            "copy of the global requires a connected Retain from the seeded holder: {actions:?}"
+        );
+        let copied = retains
+            .iter()
+            .find(|(from, _)| *from == &seeded_holder)
+            .map(|(_, to)| (*to).clone())
+            .unwrap();
+        let copied_binding = match &copied {
+            CallableHolderPlace::Binding(binding) => binding.clone(),
+            CallableHolderPlace::Projection(place) => place.binding.clone(),
+            holder => panic!("unexpected copied holder {holder:?}"),
+        };
+        assert_ne!(copied_binding, seeded_binding);
+        assert!(
+            actions.iter().any(|action| matches!(action, CallableHolderAction::Drop { holder, .. } if holder == &copied)),
+            "each copy requires an exact terminal Drop: {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(action, CallableHolderAction::Drop { holder, .. } if holder == &seeded_holder)),
+            "the global holder stays an external root across callee exit: {actions:?}"
+        );
+        assert!(
+            cfg.holder_exits
+                .iter()
+                .any(|exit| exit.after.iter().any(|relation| relation
+                    .holders
+                    .iter()
+                    .any(|holder| holder == &seeded_holder))),
+            "the global holder remains reachable after callee scope exit: {:?}",
+            cfg.holder_exits
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                CallableHolderAction::DropCaptureCellOwner { binding, .. }
+                | CallableHolderAction::DropCapturedValueCellOwner { binding, .. }
+                if binding == &seeded_binding
+            )),
+            "no counted Global capture cell becomes a promoted owner: {actions:?}"
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(cfg.holder_edges, restored.holder_edges);
+        assert_eq!(cfg.holder_exits, restored.holder_exits);
+        assert_eq!(
+            cfg.global_callable_input_paths,
+            restored.global_callable_input_paths
+        );
+    }
+}
+
+#[test]
+fn global_callable_call_before_init_reports_primary_and_origin_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nunit() invoke = fn { Dispatch copy = global_field; copy; };\ninvoke();\nDispatch global_field = { .action = fn { 3 }; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    let read_start = text.match_indices("global_field").next().unwrap().0 as u32;
+    let decl_start = text.find("global_field =").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "B0003")
+            .unwrap_or_else(|| panic!("call-before-init diagnostic: {diagnostics:?}"));
+        assert_eq!(diagnostic.labels[0].kind, DiagnosticLabelKind::Primary);
+        assert_eq!(
+            diagnostic.labels[0].span.range,
+            ByteSpan::new(read_start, read_start + "global_field".len() as u32),
+            "{diagnostic:?}"
+        );
+        let origin = diagnostic
+            .labels
+            .iter()
+            .find(|label| label.kind == DiagnosticLabelKind::Secondary)
+            .unwrap_or_else(|| panic!("origin span: {diagnostic:?}"));
+        assert_eq!(
+            origin.span.range,
+            ByteSpan::new(decl_start, decl_start + "global_field".len() as u32),
+            "{diagnostic:?}"
+        );
+    }
+}
+
+#[test]
+fn global_callable_overwrite_keeps_each_callsite_input_distinct_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 3 }; };\nunit() invoke = fn { global_field.action(); };\ninvoke();\nglobal_field.action = fn { 4 };\ninvoke();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let paths = &function.reference_cfg.global_callable_input_paths;
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert_ne!(paths[0].call, paths[1].call);
+        let holders = paths
+            .iter()
+            .map(|path| {
+                path.holders
+                    .iter()
+                    .find(|fact| {
+                        matches!(&fact.holder, CallableHolderPlace::Projection(place) if place.binding.declaration_span.start == text.find("global_field =").unwrap() as u32)
+                    })
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(holders
+            .iter()
+            .all(|fact| fact.initialization == GlobalCallableInitializationFact::Initialized));
+        assert_ne!(holders[0].relations, holders[1].relations);
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(&function.reference_cfg).unwrap()).unwrap();
+        assert_eq!(paths, &restored.global_callable_input_paths);
+    }
+}
+
+#[test]
+fn global_callable_transitive_call_seeds_callee_entry_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 3 }; };\nunit() inner = fn { global_field.action(); };\nunit() outer = fn { inner(); };\nouter();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for name in ["inner", "outer"] {
+            let function = items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) if function.name == name => Some(function),
+                    _ => None,
+                })
+                .unwrap();
+            let paths = &function.reference_cfg.global_callable_input_paths;
+            assert_eq!(paths.len(), 1, "{name}: {paths:?}");
+            let holder = paths[0]
+                .holders
+                .iter()
+                .find(|fact| {
+                    matches!(&fact.holder, CallableHolderPlace::Projection(place) if place.binding.declaration_span.start == text.find("global_field =").unwrap() as u32)
+                })
+                .unwrap();
+            assert_eq!(
+                holder.initialization,
+                GlobalCallableInitializationFact::Initialized,
+                "{name}: {holder:?}"
+            );
+            assert!(!holder.relations.is_empty(), "{name}: {holder:?}");
+            let restored: ScalarReferenceCfg =
+                serde_json::from_str(&serde_json::to_string(&function.reference_cfg).unwrap())
+                    .unwrap();
+            assert_eq!(paths, &restored.global_callable_input_paths);
+        }
+    }
+}
+
+#[test]
+fn global_callable_overlapping_module_names_stay_source_qualified_in_both_validators() {
+    let child_source = module_source("src/child.w");
+    let child_text = "%%start\nstruct Dispatch { u8() action; }\nDispatch own = { .action = fn { 8 }; };\nu8() read = fn { own.action() };\n%%end";
+    let child = module_from_text(child_source.clone(), child_text);
+    let main_source = module_source("src/main.w");
+    let main_text = "%%start\nchild = namespace app \"src/child.w\";\nstruct Dispatch { u8() action; }\nDispatch own = { .action = fn { 7 }; };\nu8 result = child.read() + own.action();\n%%end";
+    let main = module_from_text(main_source.clone(), main_text);
+    let namespace_span = match &main.items[0] {
+        ScalarItem::Namespace(namespace) => namespace.span,
+        _ => panic!("namespace item"),
+    };
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![
+            ScalarModule::from_program(
+                main,
+                vec![ScalarNamespaceBinding {
+                    binding: "child".to_owned(),
+                    target: child_source.clone(),
+                    span: namespace_span,
+                }],
+            ),
+            ScalarModule::from_program(child, Vec::new()),
+        ],
+        Vec::new(),
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    let child_module = project
+        .project
+        .modules
+        .iter()
+        .find(|module| module.source == child_source)
+        .unwrap();
+    let reader = child_module
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == "read" => Some(function),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        reader.reference_cfg.global_callable_input_paths.len(),
+        1,
+        "{:?}",
+        reader.reference_cfg.global_callable_input_paths
+    );
+    let incoming = &reader.reference_cfg.global_callable_input_paths[0];
+    assert_eq!(incoming.call.source, main_source);
+    let mut sources = incoming
+        .holders
+        .iter()
+        .map(|fact| match &fact.holder {
+            CallableHolderPlace::Binding(binding) => binding.source.clone(),
+            CallableHolderPlace::Projection(place) => place.binding.source.clone(),
+            holder => panic!("unexpected holder {holder:?}"),
+        })
+        .collect::<Vec<_>>();
+    sources.dedup();
+    assert_eq!(sources, vec![main_source.clone()], "{incoming:?}");
+    for holder in &incoming.holders {
+        for relation in &holder.relations {
+            assert!(
+                reader
+                    .reference_cfg
+                    .environments
+                    .get(relation.environment.index)
+                    .is_some_and(|fact| fact.literal == relation.environment.literal),
+                "overlapping names require source-qualified environments: {relation:?}"
+            );
+        }
+    }
+    let restored: ScalarReferenceCfg =
+        serde_json::from_str(&serde_json::to_string(&reader.reference_cfg).unwrap()).unwrap();
+    assert_eq!(incoming, &restored.global_callable_input_paths[0]);
+}
+
+fn cut3_global_literal_start(
+    text: &str,
+    literal: &str,
+    cfg: &ScalarReferenceCfg,
+    paths: &[GlobalCallableCallPathFact],
+) -> CallableEnvironmentId {
+    let holder = paths
+        .iter()
+        .find(|fact| {
+            matches!(&fact.holder, CallableHolderPlace::Projection(place) if place.binding.declaration_span.start == text.find("global_field =").unwrap_or_else(|| text.find("first =").unwrap()) as u32)
+        })
+        .unwrap_or_else(|| panic!("global holder in {paths:?}"));
+    assert_eq!(
+        holder.initialization,
+        GlobalCallableInitializationFact::Initialized,
+        "{holder:?}"
+    );
+    let environment = holder.relations[0].environment.clone();
+    let fact = cfg.environments.get(environment.index).unwrap();
+    assert_eq!(fact.literal, environment.literal);
+    assert_eq!(
+        environment.literal.range.start,
+        text.find(literal).unwrap() as u32,
+        "{environment:?}"
+    );
+    environment
+}
+
+#[test]
+fn cut3_call_occurrence_key_correlates_whole_input_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 3 }; };\nunit() invoke = fn { global_field.action(); };\ninvoke();\nglobal_field.action = fn { 4 };\ninvoke();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, top_cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let cfg = &function.reference_cfg;
+        assert_eq!(
+            cfg.global_callable_input_paths.len(),
+            2,
+            "{:?}",
+            cfg.global_callable_input_paths
+        );
+        assert_ne!(
+            cfg.global_callable_input_paths[0].occurrence,
+            cfg.global_callable_input_paths[1].occurrence
+        );
+        for input in &cfg.global_callable_input_paths {
+            assert_eq!(input.occurrence.span, input.call);
+            assert_eq!(input.occurrence.callee, input.target);
+            assert_eq!(input.occurrence.output, 0);
+            assert!(matches!(
+                input.occurrence.caller_cfg,
+                ProducerCfgOwnerId::Module(_)
+            ));
+            assert!(
+                !input.holders.is_empty(),
+                "correlated whole input alternative"
+            );
+            let point = &top_cfg.points[input.occurrence.point.0];
+            assert!(
+                matches!(&point.kind, CfgPointKind::Call { .. }),
+                "{:?}",
+                point.kind
+            );
+            assert_eq!(point.source_span, input.call);
+        }
+        assert!(
+            !cfg.global_call_exit_facts.is_empty(),
+            "callee exit facts carry entry-path keys"
+        );
+        for fact in &cfg.global_call_exit_facts {
+            assert!(
+                cfg.global_callable_input_paths
+                    .iter()
+                    .any(|input| input.occurrence == fact.entry),
+                "{fact:?}"
+            );
+        }
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(
+            cfg.global_callable_input_paths,
+            restored.global_callable_input_paths
+        );
+        assert_eq!(cfg.global_call_exit_facts, restored.global_call_exit_facts);
+    }
+}
+
+#[test]
+fn cut3_two_calls_before_after_overwrite_with_copied_old_holder_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 3 }; };\nunit() rotate = fn { Dispatch saved = global_field; global_field.action = fn { 4 }; u8 old = saved.action(); u8 current = global_field.action(); old; current; };\nrotate();\nu8 after = global_field.action();\nafter;\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, top_cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "rotate" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let cfg = &function.reference_cfg;
+        assert!(!cfg.global_call_exit_facts.is_empty(), "exit facts");
+        let fact = cfg
+            .global_call_exit_facts
+            .iter()
+            .find(|fact| !fact.kills.is_empty())
+            .expect("overwrite kill");
+        assert_eq!(fact.kills.len(), 1, "{fact:?}");
+        assert!(!fact.installs.is_empty(), "{fact:?}");
+        assert_eq!(
+            fact.writes.len(),
+            1,
+            "per-write effect stays a member of its path: {fact:?}"
+        );
+        assert!(
+            fact.actions
+                .iter()
+                .any(|action| matches!(action, CallableHolderAction::Drop { .. })),
+            "connected drop travels with the exit: {fact:?}"
+        );
+        // The global write's old holder drop and new holder install move
+        // together as connected actions of the per-write path member.
+        let write_actions = fact
+            .writes
+            .iter()
+            .flat_map(|write| write.actions.iter())
+            .collect::<Vec<_>>();
+        assert!(
+            write_actions
+                .iter()
+                .any(|action| matches!(action, CallableHolderAction::Drop { .. })),
+            "old holder drop in write actions: {fact:?}"
+        );
+        assert!(
+            write_actions
+                .iter()
+                .any(|action| matches!(action, CallableHolderAction::Move { .. })),
+            "new holder install in write actions: {fact:?}"
+        );
+        // The copied old holder stays connected through a Retain on the
+        // callee edges while its ScopeExit drop retires the local copy once.
+        assert!(
+            cfg.holder_edges
+                .iter()
+                .flat_map(|edge| edge.actions.iter())
+                .any(|action| matches!(action, CallableHolderAction::Retain { .. })),
+            "copied old holder retain on callee edges"
+        );
+        // Applied only at the originating caller occurrence successor: the
+        // trailing call observes the new generation, the leading call the old.
+        let calls = top_cfg
+            .points
+            .iter()
+            .filter(|point| matches!(&point.kind, CfgPointKind::Call { output: 0, .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        let first_paths = calls[0]
+            .global_callable_call_paths
+            .iter()
+            .flat_map(|paths| paths.iter())
+            .collect::<Vec<_>>();
+        let second_paths = calls[1]
+            .global_callable_call_paths
+            .iter()
+            .flat_map(|paths| paths.iter())
+            .collect::<Vec<_>>();
+        assert_ne!(first_paths, second_paths, "rotation applied at successor");
+        cut3_global_literal_start(
+            text,
+            "fn { 3 }",
+            top_cfg,
+            &first_paths
+                .iter()
+                .map(|fact| (*fact).clone())
+                .collect::<Vec<_>>(),
+        );
+        cut3_global_literal_start(
+            text,
+            "fn { 4 }",
+            top_cfg,
+            &second_paths
+                .iter()
+                .map(|fact| (*fact).clone())
+                .collect::<Vec<_>>(),
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(cfg.global_call_exit_facts, restored.global_call_exit_facts);
+    }
+}
+
+#[test]
+fn cut3_branch_exit_alternatives_propagate_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch first = { .action = fn { 1 }; };\nbool choice = true;\nunit() pick = fn { if (choice) { first.action = fn { 3 }; } else { first.action = fn { 5 }; } };\npick();\nu8 r = first.action();\nr;\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, top_cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "pick" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let cfg = &function.reference_cfg;
+        assert!(!cfg.global_call_exit_facts.is_empty(), "exit facts");
+        // Both branch writes stay per-write members of their paths.
+        let mut write_spans = cfg
+            .global_call_exit_facts
+            .iter()
+            .flat_map(|fact| fact.writes.iter())
+            .map(|write| write.span.range)
+            .collect::<Vec<_>>();
+        write_spans.sort_by_key(|span| (span.start, span.end));
+        write_spans.dedup();
+        assert_eq!(write_spans.len(), 2, "{write_spans:?}");
+        // Both installed generations reach the caller successor as distinct
+        // alternatives rather than one merged summary.
+        let mut literals = cfg
+            .global_call_exit_facts
+            .iter()
+            .flat_map(|fact| fact.installs.iter())
+            .map(|install| install.environment.literal.range.start)
+            .collect::<Vec<_>>();
+        literals.sort();
+        literals.dedup();
+        assert_eq!(
+            literals,
+            vec![
+                text.find("fn { 3 }").unwrap() as u32,
+                text.find("fn { 5 }").unwrap() as u32
+            ],
+            "{literals:?}"
+        );
+        let call = top_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Call { output: 0, .. })
+                    && point.source_span.range.start == text.find("first.action()").unwrap() as u32
+            })
+            .expect("trailing call");
+        assert_eq!(
+            call.global_callable_call_paths.len(),
+            2,
+            "{:?}",
+            call.global_callable_call_paths
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(cfg.global_call_exit_facts, restored.global_call_exit_facts);
+    }
+}
+
+#[test]
+fn cut3_transitive_exit_pushes_into_parent_continuation_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 3 }; };\nunit() inner = fn { global_field.action = fn { 4 }; };\nunit() outer = fn { inner(); };\nouter();\nu8 r = global_field.action();\nr;\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, top_cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let find = |name: &str| {
+            items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) if function.name == name => Some(function),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let inner = find("inner");
+        let outer = find("outer");
+        assert!(
+            inner
+                .reference_cfg
+                .global_call_exit_facts
+                .iter()
+                .any(|fact| !fact.installs.is_empty()),
+            "inner publishes its write: {:?}",
+            inner.reference_cfg.global_call_exit_facts
+        );
+        // The nested call pushes its result into the parent continuation
+        // before the parent exits.
+        let parent_installs = outer
+            .reference_cfg
+            .global_call_exit_facts
+            .iter()
+            .flat_map(|fact| fact.installs.iter())
+            .collect::<Vec<_>>();
+        assert!(
+            parent_installs
+                .iter()
+                .any(|install| install.environment.literal.range.start
+                    == text.find("fn { 4 }").unwrap() as u32),
+            "parent continuation carries the transitive install: {parent_installs:?}"
+        );
+        let call = top_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Call { output: 0, .. })
+                    && point.source_span.range.start
+                        == text.find("global_field.action()").unwrap() as u32
+            })
+            .expect("trailing call");
+        let paths = call
+            .global_callable_call_paths
+            .iter()
+            .flat_map(|paths| paths.iter())
+            .collect::<Vec<_>>();
+        cut3_global_literal_start(
+            text,
+            "fn { 4 }",
+            top_cfg,
+            &paths.iter().map(|fact| (*fact).clone()).collect::<Vec<_>>(),
+        );
+        for cfg in [&inner.reference_cfg, &outer.reference_cfg] {
+            let restored: ScalarReferenceCfg =
+                serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+            assert_eq!(cfg.global_call_exit_facts, restored.global_call_exit_facts);
+        }
+    }
+}
+
+#[test]
+fn cut3_recursive_same_site_two_invocations_reuse_summary_in_both_validators() {
+    let text = "%%start\nu64 total = 3;\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 3 }; };\nunit(u64) visit = fn(depth) { if (depth < total) { global_field.action = fn { 4 }; visit(depth + 1); }; };\nvisit(0);\nu8 r = global_field.action();\nr;\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, top_cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "visit" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let cfg = &function.reference_cfg;
+        // The recursive occurrence analyzes once: top-level plus one
+        // recursive entry, no abstract ID per dynamic invocation.
+        let recursive = cfg
+            .global_callable_input_paths
+            .iter()
+            .filter(|input| {
+                matches!(
+                    input.occurrence.caller_cfg,
+                    ProducerCfgOwnerId::Function { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recursive.len(), 1, "{:?}", cfg.global_callable_input_paths);
+        assert!(!cfg.global_call_exit_facts.is_empty(), "exit facts");
+        // Equal-pair summary reuse: exits from equal canonical entries share
+        // one identical post state and install set; distinct entries keep
+        // their own actual states without per-invocation divergence.
+        // Equal-pair summary reuse: the recursive occurrence exhibits
+        // exactly the top-level occurrence's summary multiset (same exit
+        // points, kill/install/post shapes) instead of diverging per
+        // dynamic invocation with new abstract IDs.
+        let mut by_entry: Vec<(
+            GlobalCallOccurrenceKey,
+            Vec<(CfgPointId, usize, usize, usize)>,
+        )> = Vec::new();
+        for fact in &cfg.global_call_exit_facts {
+            let shape = (
+                fact.exit_point,
+                fact.kills.len(),
+                fact.installs.len(),
+                fact.post_holders.len(),
+            );
+            if let Some(known) = by_entry.iter_mut().find(|known| known.0 == fact.entry) {
+                if !known.1.contains(&shape) {
+                    known.1.push(shape);
+                }
+            } else {
+                by_entry.push((fact.entry.clone(), vec![shape]));
+            }
+        }
+        assert_eq!(by_entry.len(), 2, "{by_entry:?}");
+        assert_eq!(by_entry[0].1.len(), by_entry[1].1.len(), "{by_entry:?}");
+        for shape in &by_entry[0].1 {
+            assert!(
+                by_entry[1].1.contains(shape),
+                "recursive site reuses the summary shape: {by_entry:?}"
+            );
+        }
+        let call = top_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Call { output: 0, .. })
+                    && point.source_span.range.start
+                        == text.find("global_field.action()").unwrap() as u32
+            })
+            .expect("trailing call");
+        let paths = call
+            .global_callable_call_paths
+            .iter()
+            .flat_map(|paths| paths.iter())
+            .collect::<Vec<_>>();
+        // The recursive write's new generation reaches the trailing caller:
+        // some alternative names the installed literal.
+        let literals = paths
+            .iter()
+            .flat_map(|fact| fact.relations.iter())
+            .map(|relation| relation.environment.literal.range.start)
+            .collect::<Vec<_>>();
+        assert!(
+            literals.contains(&(text.find("fn { 4 }").unwrap() as u32)),
+            "recursive install reaches caller: {literals:?}"
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(cfg.global_call_exit_facts, restored.global_call_exit_facts);
+    }
+}
+
+#[test]
+fn cut3_overlapping_module_exit_keeps_actual_states_in_both_validators() {
+    let child_source = module_source("src/child.w");
+    let child_text = "%%start\nstruct Dispatch { u8() action; }\nDispatch own = { .action = fn { 8 }; };\nunit() bump = fn { own.action = fn { 9 }; };\n%%end";
+    let child = module_from_text(child_source.clone(), child_text);
+    let main_source = module_source("src/main.w");
+    let main_text = "%%start\nchild = namespace app \"src/child.w\";\nstruct Dispatch { u8() action; }\nDispatch own = { .action = fn { 7 }; };\nchild.bump();\nu8 r = own.action();\nr;\n%%end";
+    let main = module_from_text(main_source.clone(), main_text);
+    let namespace_span = match &main.items[0] {
+        ScalarItem::Namespace(namespace) => namespace.span,
+        _ => panic!("namespace item"),
+    };
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![
+            ScalarModule::from_program(
+                main,
+                vec![ScalarNamespaceBinding {
+                    binding: "child".to_owned(),
+                    target: child_source.clone(),
+                    span: namespace_span,
+                }],
+            ),
+            ScalarModule::from_program(child, Vec::new()),
+        ],
+        Vec::new(),
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    let child_module = project
+        .project
+        .modules
+        .iter()
+        .find(|module| module.source == child_source)
+        .unwrap();
+    let bump = child_module
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == "bump" => Some(function),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        bump.reference_cfg
+            .global_call_exit_facts
+            .iter()
+            .any(|fact| fact.installs.iter().any(|install| install
+                .environment
+                .literal
+                .range
+                .start
+                == child_text.find("fn { 9 }").unwrap() as u32
+                && install.environment.literal.source == child_source)),
+        "cross-module mutation keeps its actual validated state: inputs={:?} exits={:?}",
+        bump.reference_cfg.global_callable_input_paths,
+        bump.reference_cfg.global_call_exit_facts
+    );
+    // The caller's own overlapping global is untouched by the foreign write.
+    let main_module = project
+        .project
+        .modules
+        .iter()
+        .find(|module| module.source == main_source)
+        .unwrap();
+    let call = main_module
+        .top_level_reference_cfg
+        .points
+        .iter()
+        .find(|point| {
+            matches!(&point.kind, CfgPointKind::Call { output: 0, .. })
+                && point.source_span.range.start == main_text.find("own.action()").unwrap() as u32
+        })
+        .expect("trailing call");
+    for paths in &call.global_callable_call_paths {
+        for fact in paths {
+            if matches!(&fact.holder, CallableHolderPlace::Projection(place) if place.binding.source == main_source)
+            {
+                assert_eq!(
+                    fact.relations[0].environment.literal.range.start,
+                    main_text.find("fn { 7 }").unwrap() as u32,
+                    "{fact:?}"
+                );
+            }
+            for relation in &fact.relations {
+                let holder_source = match &fact.holder {
+                    CallableHolderPlace::Binding(binding) => &binding.source,
+                    CallableHolderPlace::Projection(place) => &place.binding.source,
+                    _ => continue,
+                };
+                assert_eq!(
+                    &relation.environment.literal.source, holder_source,
+                    "installs stay source-qualified: {relation:?}"
+                );
+            }
+        }
+    }
+    let restored: ScalarReferenceCfg =
+        serde_json::from_str(&serde_json::to_string(&bump.reference_cfg).unwrap()).unwrap();
+    assert_eq!(
+        bump.reference_cfg.global_call_exit_facts,
+        restored.global_call_exit_facts
+    );
+}
+
+#[test]
+fn cut3_wrong_loan_origin_reports_b0003_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 3 }; };\nunit(*u8) plant = fn(ref) { global_field.action = fn { *ref }; };\nunit() run = fn { u8 local = 7; plant(&local); };\nrun();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B0003"
+                && diagnostic.message
+                    == "missing or ambiguous source-qualified global callable environment producer"
+            }),
+            "wrong loan origin diagnostic: {diagnostics:?}"
+        );
+    }
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "plant" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        // No synthetic rescue: the escaping install never publishes.
+        assert!(
+            function
+                .reference_cfg
+                .global_call_exit_facts
+                .iter()
+                .flat_map(|fact| fact.installs.iter())
+                .count()
+                == 0,
+            "escaping install must not publish: {:?}",
+            function.reference_cfg.global_call_exit_facts
+        );
+    }
+}
+
+#[test]
+fn cut3_caller_continuation_and_final_main_holder_exact_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nDispatch global_field = { .action = fn { 3 }; };\nunit() replace = fn { global_field.action = fn { 4 }; };\nreplace();\nDispatch kept = global_field;\nu8 r = kept.action();\nr;\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, top_cfg, diagnostics, terminal_owners) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+            &single.program.terminal_owners,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+            &project.project.modules[0].terminal_owners,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "replace" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            function
+                .reference_cfg
+                .global_call_exit_facts
+                .iter()
+                .any(|fact| !fact.installs.is_empty()),
+            "replace publishes its install"
+        );
+        // Exact caller continuation: the post-call copy retains the new
+        // generation rather than the overwritten one.
+        let copy_edge = top_cfg
+            .holder_edges
+            .iter()
+            .find(|edge| {
+                edge.actions.iter().any(|action| {
+                    matches!(action, CallableHolderAction::Retain { from, .. }
+                        if matches!(from, CallableHolderPlace::Projection(place) if place.binding.declaration_span.start == text.find("global_field =").unwrap() as u32))
+                })
+            })
+            .expect("caller continuation retain");
+        let retained_env = copy_edge
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                CallableHolderAction::Retain { environment, .. } => Some(environment.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            retained_env.literal.range.start,
+            text.find("fn { 4 }").unwrap() as u32,
+            "{retained_env:?}"
+        );
+        // Final main holder: the terminal owner derives from the finally
+        // reachable initialized flow and names the installed slot.
+        let owner = terminal_owners
+            .iter()
+            .find(|owner| owner.global_name == "global_field")
+            .expect("terminal owner");
+        assert_eq!(
+            owner.environment.literal.range.start,
+            text.find("fn { 4 }").unwrap() as u32,
+            "{owner:?}"
+        );
+        assert!(
+            matches!(&owner.holder, CallableHolderPlace::Projection(place) if place.binding.declaration_span.start == text.find("global_field =").unwrap() as u32),
+            "{owner:?}"
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(top_cfg).unwrap()).unwrap();
+        assert_eq!(top_cfg.holder_edges, restored.holder_edges);
+        assert_eq!(top_cfg.holder_exits, restored.holder_exits);
+    }
+}
+
+#[test]
+fn cut3_call_before_init_preserves_uninitialized_exit_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nunit() invoke = fn { Dispatch copy = global_field; copy; };\ninvoke();\nDispatch global_field = { .action = fn { 3 }; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"),
+            "call-before-init diagnostic: {diagnostics:?}"
+        );
+    }
+    for (items, top_cfg) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+        ),
+    ] {
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        // The uninitialized alternative survives into the exit facts instead
+        // of being replaced by a synthetic initialized state.
+        assert!(
+            function
+                .reference_cfg
+                .global_callable_input_paths
+                .iter()
+                .flat_map(|input| input.holders.iter())
+                .any(|holder| matches!(
+                    holder.initialization,
+                    GlobalCallableInitializationFact::Uninitialized
+                )),
+            "uninitialized alternative preserved: {:?}",
+            function.reference_cfg.global_callable_input_paths
+        );
+        assert!(
+            function
+                .reference_cfg
+                .global_call_exit_facts
+                .iter()
+                .flat_map(|fact| fact.post_holders.iter())
+                .any(|holder| matches!(
+                    holder.initialization,
+                    GlobalCallableInitializationFact::Uninitialized
+                )),
+            "uninitialized exit preserved: {:?}",
+            function.reference_cfg.global_call_exit_facts
+        );
+        // The caller keeps no installed generation for the uninitialized global.
+        assert!(
+            top_cfg.holder_edges.iter().flat_map(|edge| edge.actions.iter()).all(|action| !matches!(action, CallableHolderAction::Retain { from, .. } if matches!(from, CallableHolderPlace::Projection(place) if place.binding.declaration_span.start == text.find("global_field =").unwrap() as u32))),
+            "no install without initialization"
+        );
+    }
+}
+
+#[test]
+fn cut3_may_alias_ambiguous_write_reports_b0003_in_both_validators() {
+    // Boundary: a top-level global array write validates, but the same write
+    // inside a callee fails at the transfer layer (missing callee-side array
+    // backing) before exit publication. Either way the ambiguous effect never
+    // publishes a conflicting install; the MayAlias exit checks stay wired
+    // for array backings once callee-side seeding covers them.
+    let direct = "%%start\n(u8())[4] slots = [fn { 1 }, fn { 1 }, fn { 1 }, fn { 1 }];\nslots[0] = fn { 2 };\n%%end";
+    let (single, project) = both_reference_functions(direct);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+    let text = "%%start\n(u8())[4] slots = [fn { 1 }, fn { 1 }, fn { 1 }, fn { 1 }];\nunit(u64) poke = fn(index) { index; slots[index] = fn { 2 }; };\nu64 a = 0;\npoke(a);\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"),
+            "ambiguous global array write diagnostic: {diagnostics:?}"
+        );
+    }
+    for items in [&single.program.items, &project.project.modules[0].items] {
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "poke" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        // Ambiguous effects never publish conflicting installs.
+        let installs = function
+            .reference_cfg
+            .global_call_exit_facts
+            .iter()
+            .flat_map(|fact| fact.installs.iter())
+            .collect::<Vec<_>>();
+        let mut literals = installs
+            .iter()
+            .map(|install| install.environment.literal.range.start)
+            .collect::<Vec<_>>();
+        literals.sort();
+        literals.dedup();
+        assert!(
+            literals.len() <= 1,
+            "no conflicting installs under MayAlias: {literals:?}"
+        );
+    }
+}
+
+fn collector_twin_text() -> &'static str {
+    "%%start\nstruct Counter { i32(i32) advance; }\nstruct copy Captured { u8(u8) write; u8(u64) read; }\nCounter(i32) make_counter = fn(start) { i32 total = start; Counter made = { .advance = fn(delta) { total = total + delta; total }; }; total = total + 2; made };\nCaptured(u64) make_captured = fn(count) { u8[count] slots; slots[0] = 6; slots[1] = 7; Captured result = { .write = fn(value) { slots[0] = value; slots[0] }; .read = fn(index) { slots[index] }; }; u64 longer = count + 1; u8[longer] next; next[0] = 4; next[1] = 5; next[2] = 6; slots = next; result };\nunit() run = fn { Counter held = make_counter(40); i32 first = held.advance(1); i32 second = held.advance(3); Captured kept = make_captured(2); Captured copied = kept; u8 before = kept.read(0); u8 written = kept.write(9); u8 shared = copied.read(0); u64 length = 2; u8[length] replacement; replacement[0] = 5; replacement[1] = 8; kept.read = fn(index) { replacement[index] }; u8 old_after_overwrite = copied.read(0); u8 new_after_overwrite = kept.read(1); Captured separate = make_captured(2); u8 second_write = separate.write(4); u8 second_read = separate.read(0); u8 expanded_read = separate.read(2); if (first != 43 || second != 46 || before != 4 || written != 9 || shared != 9 || old_after_overwrite != 9 || new_after_overwrite != 8 || second_write != 4 || second_read != 4 || expanded_read != 6) { core.system_panic(); }; };\nrun();\n%%end"
+}
+
+#[test]
+fn collector_scalar_cell_value_drop_covers_holder_free_scalars_in_both_validators() {
+    let text = "%%start\nstruct Counter { i32(i32) advance; }\nCounter(i32) make_counter = fn(start) { i32 total = start; Counter made = { .advance = fn(delta) { total = total + delta; total }; }; total = total + 2; made };\nunit() run = fn { Counter held = make_counter(40); held.advance(1); };\nrun();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make_counter" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let actions = function
+            .reference_cfg
+            .holder_edges
+            .iter()
+            .flat_map(|edge| &edge.actions)
+            .chain(
+                function
+                    .reference_cfg
+                    .holder_exits
+                    .iter()
+                    .flat_map(|exit| &exit.actions),
+            )
+            .collect::<Vec<_>>();
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                CallableHolderAction::DropCapturedValueCellOwner { binding, .. }
+                if binding.declaration_span.start == text.find("total = start").unwrap() as u32
+            )),
+            "holder-free scalar capture cell carries a connected value-cell drop: {actions:?}"
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(&function.reference_cfg).unwrap()).unwrap();
+        assert_eq!(
+            restored.holder_edges, function.reference_cfg.holder_edges,
+            "cell action serializes without text encoding"
+        );
+    }
+}
+
+#[test]
+fn collector_holder_carrying_captures_keep_no_value_cell_drop_in_both_validators() {
+    let text = "%%start\nstruct Dispatch { u8() action; }\nunit() run = fn { Dispatch owned = { .action = fn { 3 }; }; Dispatch copy = owned; copy.action(); };\nrun();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let actions = function
+            .reference_cfg
+            .holder_edges
+            .iter()
+            .flat_map(|edge| &edge.actions)
+            .chain(
+                function
+                    .reference_cfg
+                    .holder_exits
+                    .iter()
+                    .flat_map(|exit| &exit.actions),
+            )
+            .collect::<Vec<_>>();
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                CallableHolderAction::DropCapturedValueCellOwner { .. }
+            )),
+            "holder-carrying captures keep the previous behavior (no value-cell drop): {actions:?}"
+        );
+    }
+}
+
+#[test]
+fn collector_receipt_pair_counts_uncounted_escaping_envs_in_both_validators() {
+    let text = collector_twin_text();
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let cfg = &function.reference_cfg;
+        let pair_edges = |literal: u32| {
+            cfg.holder_edges
+                .iter()
+                .filter(|edge| {
+                    edge.actions.iter().any(|action| {
+                        matches!(action, CallableHolderAction::Retain { environment, .. } if environment.literal.range.start == literal)
+                    }) && edge.actions.iter().any(|action| {
+                        matches!(action, CallableHolderAction::Drop { environment, .. } if environment.literal.range.start == literal)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        // Uncopied escaping generations carry exactly one connected pair.
+        let advance = text.find("fn(delta)").unwrap() as u32;
+        assert_eq!(
+            pair_edges(advance).len(),
+            1,
+            "advance receipt carries one Retain+Drop pair: {:?}",
+            cfg.holder_edges
+                .iter()
+                .flat_map(|edge| &edge.actions)
+                .collect::<Vec<_>>()
+        );
+        // Already-counted generations (copied) gain no pair.
+        let write = text.find("fn(value)").unwrap() as u32;
+        let write_pairs = pair_edges(write);
+        assert!(
+            write_pairs.len() <= 1,
+            "copied generations gain no duplicate pair: {write_pairs:?}"
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(cfg.holder_edges, restored.holder_edges);
+    }
+}
+
+#[test]
+fn collector_holder_books_balance_per_env_in_both_validators() {
+    let text = collector_twin_text();
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for item in items {
+            let ScalarItem::Function(function) = item else {
+                continue;
+            };
+            let cfg = &function.reference_cfg;
+            for (index, _) in cfg.environments.iter().enumerate() {
+                let mut retains = 0;
+                let mut drops = 0;
+                let mut other = false;
+                for action in cfg
+                    .holder_edges
+                    .iter()
+                    .flat_map(|edge| &edge.actions)
+                    .chain(cfg.holder_exits.iter().flat_map(|exit| &exit.actions))
+                {
+                    let mine = match action {
+                        CallableHolderAction::Retain { environment, .. }
+                        | CallableHolderAction::Drop { environment, .. } => {
+                            environment.index == index
+                        }
+                        _ => false,
+                    };
+                    if !mine {
+                        continue;
+                    }
+                    match action {
+                        CallableHolderAction::Retain { .. } => retains += 1,
+                        CallableHolderAction::Drop { .. } => drops += 1,
+                        _ => other = true,
+                    }
+                }
+                if retains == 0 && drops == 0 {
+                    continue;
+                }
+                assert!(
+                    !other,
+                    "only Retain/Drop counted here for {} env{index}",
+                    function.name
+                );
+                assert!(
+                    drops >= retains,
+                    "every take has its release for {} env{index}: R={retains} D={drops}",
+                    function.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn collector_dropless_shape_needs_no_drop_in_both_validators() {
+    // Boundary: a pure non-escaping closure owns no reachable allocations,
+    // so scalar correctly records no Drop/Retain for its env and the LLVM
+    // skip stays valid there. This pins the skip's legitimate side.
+    let text = "%%start\nunit() run = fn { u8(u8) twice = fn(value) { value + value }; u8 y = twice(21); y; };\nrun();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let actions = function
+            .reference_cfg
+            .holder_edges
+            .iter()
+            .flat_map(|edge| &edge.actions)
+            .chain(
+                function
+                    .reference_cfg
+                    .holder_exits
+                    .iter()
+                    .flat_map(|exit| &exit.actions),
+            )
+            .collect::<Vec<_>>();
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                CallableHolderAction::Retain { .. } | CallableHolderAction::Drop { .. }
+            )),
+            "dropless shape carries no retain/drop: {actions:?}"
+        );
+    }
+}
+
+#[test]
+fn collector_install_pair_counts_assign_installed_owning_envs_in_both_validators() {
+    let text = collector_twin_text();
+    let overwrite = text.find("fn(index) { replacement").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let cfg = &function.reference_cfg;
+        // The Assign-installed overwrite generation carries exactly one
+        // connected install pair on a downstream Bind edge: the Retain and
+        // the Drop share one edge whose holder is the installed field.
+        let pair_edges = cfg
+            .holder_edges
+            .iter()
+            .filter(|edge| {
+                edge.actions.iter().any(|action| {
+                    matches!(action, CallableHolderAction::Retain { environment, .. } if environment.literal.range.start == overwrite)
+                }) && edge.actions.iter().any(|action| {
+                    matches!(action, CallableHolderAction::Drop { environment, .. } if environment.literal.range.start == overwrite)
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pair_edges.len(),
+            1,
+            "overwrite install carries one Retain+Drop pair: {:?}",
+            cfg.holder_edges
+                .iter()
+                .flat_map(|edge| &edge.actions)
+                .collect::<Vec<_>>()
+        );
+        let pair = &pair_edges[0];
+        let from = &cfg.points[pair.from.0];
+        assert!(
+            matches!(&from.kind, CfgPointKind::Bind { .. }),
+            "install pair hosts on a downstream Bind edge: {from:?}"
+        );
+        for action in &pair.actions {
+            match action {
+                CallableHolderAction::Retain {
+                    environment,
+                    from,
+                    to,
+                    ..
+                } if environment.literal.range.start == overwrite => {
+                    assert_eq!(from, to, "install pair is balance-neutral: {action:?}");
+                }
+                CallableHolderAction::Drop { environment, .. }
+                    if environment.literal.range.start == overwrite => {}
+                _ => {}
+            }
+        }
+        // The overwritten cell retires through two owner releases on the
+        // terminal exit: the creator ownership plus the installing
+        // environment's ownership, which no environment dispose visits.
+        let replacement = text.find("replacement;").unwrap() as u32;
+        let mut owner_releases = 0;
+        for exit in &cfg.holder_exits {
+            owner_releases += exit
+                .actions
+                .iter()
+                .filter(|action| {
+                    matches!(action,
+                        CallableHolderAction::DropCaptureCellOwner { binding, .. }
+                        if binding.declaration_span.start == replacement)
+                })
+                .count();
+        }
+        assert_eq!(
+            owner_releases,
+            2,
+            "overwritten cell carries both owner releases: {:?}",
+            cfg.holder_exits
+                .iter()
+                .flat_map(|exit| &exit.actions)
+                .collect::<Vec<_>>()
+        );
+        // Maker-side cells keep their single release: the maker exit drop
+        // plus the holder-dispose chain already balance them.
+        let maker = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make_captured" => {
+                    Some(function)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let slots = text.find("slots;").unwrap() as u32;
+        let mut maker_releases = 0;
+        for action in maker
+            .reference_cfg
+            .holder_edges
+            .iter()
+            .flat_map(|edge| &edge.actions)
+            .chain(
+                maker
+                    .reference_cfg
+                    .holder_exits
+                    .iter()
+                    .flat_map(|exit| &exit.actions),
+            )
+        {
+            if matches!(action,
+                CallableHolderAction::DropCaptureCellOwner { binding, .. }
+                if binding.declaration_span.start == slots)
+            {
+                maker_releases += 1;
+            }
+        }
+        assert_eq!(
+            maker_releases,
+            1,
+            "maker cell keeps its single release: {:?}",
+            maker
+                .reference_cfg
+                .holder_edges
+                .iter()
+                .flat_map(|edge| &edge.actions)
+                .collect::<Vec<_>>()
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(cfg.holder_edges, restored.holder_edges);
+        assert_eq!(cfg.holder_exits, restored.holder_exits);
+    }
+}
+
+#[test]
+fn collector_pure_install_keeps_proven_skip_in_both_validators() {
+    // Boundary: an Assign-installed literal that captures nothing owns no
+    // reachable allocations, so scalar publishes no install pair for its
+    // env and the LLVM skip stays valid there.
+    let text = "%%start\nstruct copy Captured { u8(u8) write; u8(u64) read; }\nCaptured(u64) make = fn(count) { u8[count] slots; slots[0] = 6; Captured result = { .write = fn(value) { slots[0] = value; slots[0] }; .read = fn(index) { slots[index] }; }; result };\nunit() run = fn { Captured first = make(2); first.read = fn(position) { position; 8 }; if (first.read(0) != 8) { core.system_panic(); }; };\nrun();\n%%end";
+    let pure = text.find("fn(position)").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .unwrap();
+        let cfg = &function.reference_cfg;
+        // The install Move itself is connected, but no counted-domain
+        // entry (field Retain or selected-action coverage) may reference
+        // the pure generation.
+        let counted_entries = cfg
+            .holder_edges
+            .iter()
+            .flat_map(|edge| &edge.actions)
+            .chain(cfg.holder_exits.iter().flat_map(|exit| &exit.actions))
+            .filter(|action| {
+                matches!(action,
+                    CallableHolderAction::Retain { environment, .. }
+                    | CallableHolderAction::MoveSelected { environment, .. }
+                    | CallableHolderAction::RetainSelected { environment, .. }
+                    if environment.literal.range.start == pure)
+                    || matches!(action,
+                        CallableHolderAction::RetainCheckedSelected {
+                            old: CallableCellCaseFact::Initialized {
+                                environment_origin,
+                                ..
+                            },
+                            ..
+                        } if environment_origin.literal.range.start == pure)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            counted_entries.is_empty(),
+            "pure install carries no counted-domain entry: {counted_entries:?}"
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(cfg.holder_edges, restored.holder_edges);
+    }
+}
+
+#[test]
+fn collector_unhosted_owning_install_reports_b0003_in_both_validators() {
+    // Boundary: an Assign-installed literal that owns reachable
+    // allocations but has no downstream Bind host for its install pair is
+    // unrepresentable: scalar reports B0003 instead of leaking silently.
+    let text = "%%start\nstruct copy Captured { u8(u8) write; u8(u64) read; }\nCaptured(u64) make = fn(count) { u8[count] slots; slots[0] = 6; Captured result = { .write = fn(value) { slots[0] = value; slots[0] }; .read = fn(index) { slots[index] }; }; result };\nunit() run = fn { Captured kept = make(2); u8[2] replacement; replacement[0] = 5; replacement[1] = 8; kept.read = fn(index) { replacement[index] }; kept.read(1); };\nrun();\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "B0003"),
+            "unhosted owning install reports B0003: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn cyclic_callable_capture_shapes_in_both_validators() {
+    for (text, array) in [
+        ("%%start\n(unit())() make = fn { unit() inner = fn { 1; }; inner = fn { inner(); }; inner };\nunit() run = fn { unit() first = make(); unit() copied = first; unit() second = make(); copied; second; };\n%%end", false),
+        ("%%start\n(unit())() make = fn { (unit())[1] slots; unit() inner = fn { unit() picked = slots[0]; picked(); }; slots[0] = inner; inner };\nunit() run = fn { unit() first = make(); unit() copied = first; unit() second = make(); copied; second; };\n%%end", true),
+    ] {
+        let (single, project) = both_reference_functions(text);
+        assert!(single.diagnostics.is_empty(), "single {text}: {:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "project {text}: {:?}", project.diagnostics);
+        for items in [&single.program.items, &project.project.modules[0].items] {
+            let function = items.iter().find_map(|item| match item { ScalarItem::Function(function) if function.name == "make" => Some(function), _ => None }).unwrap();
+            let cfg = &function.reference_cfg;
+            let capture = cfg.points.iter().find_map(|point| match &point.kind { CfgPointKind::Capture { captures, environment, .. } if captures.len() == 1 => Some((captures, environment)), _ => None }).expect("cyclic capture");
+            assert_eq!(capture.0.len(), 1);
+            assert_eq!(capture.0[0].binding.source, cfg.points[0].source_span.source);
+            assert_eq!(capture.0[0].binding.declaration_span.start, text.find(if array { "slots;" } else { "inner = fn" }).unwrap() as u32);
+            assert!(matches!(&capture.0[0].ty, ScalarType::RuntimeArray { element, .. } if array && matches!(element.as_ref(), ScalarType::Callable { .. })) || matches!(&capture.0[0].ty, ScalarType::Callable { .. }) && !array);
+            let actions = cfg.holder_edges.iter().flat_map(|edge| &edge.actions).chain(cfg.holder_exits.iter().flat_map(|exit| &exit.actions)).collect::<Vec<_>>();
+            assert!(actions.iter().any(|action| matches!(action, CallableHolderAction::DropCapturedValueCellOwner { binding, .. } if !array && binding.declaration_span == capture.0[0].binding.declaration_span) || matches!(action, CallableHolderAction::DropCaptureCellOwner { binding, .. } if array && binding.declaration_span == capture.0[0].binding.declaration_span)), "{actions:?}");
+            assert!(actions.iter().any(|action| matches!(action, CallableHolderAction::ReturnTransfer { environment, to: CallableHolderPlace::Output(0), .. } if environment == capture.1)));
+            if array {
+                assert!(actions.iter().any(|action| matches!(action, CallableHolderAction::SkipUninitializedSelected { .. })));
+                assert!(actions.iter().any(|action| matches!(action, CallableHolderAction::RetainSelected { environment, .. } if environment == capture.1)));
+            } else {
+                assert!(actions.iter().any(|action| matches!(action, CallableHolderAction::Move { environment, to: CallableHolderPlace::Binding(binding), .. } if environment == capture.1 && binding.declaration_span == capture.0[0].binding.declaration_span)));
+            }
+            let run = items.iter().find_map(|item| match item { ScalarItem::Function(function) if function.name == "run" => Some(function), _ => None }).unwrap();
+            assert_eq!(run.reference_cfg.points.iter().filter(|point| matches!(point.kind, CfgPointKind::Call { .. })).count(), 2);
+            assert!(run.reference_cfg.holder_edges.iter().flat_map(|edge| &edge.actions).any(|action| matches!(action, CallableHolderAction::Retain { .. })));
+            assert_eq!(serde_json::from_str::<ScalarReferenceCfg>(&serde_json::to_string(cfg).unwrap()).unwrap().holder_edges, cfg.holder_edges);
+        }
+    }
+}
+
+#[test]
+fn returned_captured_array_field_overwrite_rebases_multiple_environments_in_both_validators() {
+    let text = "%%start\nstruct copy Captured { u8(u8) write; u8(u64) read; }\nCaptured(u64) make_counter = fn(count) { u8[count] slots; slots[0] = 6; slots[1] = 7; Captured made = { .write = fn(value) { slots[0] = value; slots[0] }; .read = fn(index) { slots[index] }; }; made };\nunit() run = fn { Captured kept = make_counter(2); Captured copy = kept; u8 first = kept.read(0); u8 wrote = kept.write(9); kept.read = fn(index) { index; 5 }; u8 second = copy.read(0); u8 other = kept.read(1); first; wrote; second; other; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let run = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .expect("run");
+        assert!(run.reference_cfg.environments.len() >= 3);
+        for literal in &run.reference_cfg.literal_cfgs {
+            let cfg = &literal.reference_cfg;
+            for point in &cfg.points {
+                for environment in &point.possible_environments {
+                    assert_eq!(
+                        cfg.environments[environment.index].literal,
+                        environment.literal
+                    );
+                }
+            }
+            for environment in &cfg.environments {
+                for input in &environment.inputs {
+                    for captured in &input.environments {
+                        assert_eq!(cfg.environments[captured.index].literal, captured.literal);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn imported_environments_preserve_nested_literal_slots_in_both_validators() {
+    let text = "%%start\nstruct copy Holder { u8() read; }\nHolder() make = fn { u8[2] bytes = [3, 4]; Holder value = { .read = fn { bytes[0] }; }; value };\nunit() run = fn { Holder kept = make(); kept.read = fn { u8() nested = fn { 5 }; nested() }; kept.read(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let run = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .expect("run");
+        let outer = run
+            .reference_cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| {
+                literal.literal.range.start == text.find("fn { u8() nested").unwrap() as u32
+            })
+            .expect("overwritten field literal");
+        let cfg = &outer.reference_cfg;
+        assert!(cfg.environments.len() >= 3);
+        let nested = cfg
+            .points
+            .iter()
+            .find_map(|point| match &point.kind {
+                CfgPointKind::Capture { environment, .. } => Some(environment),
+                _ => None,
+            })
+            .expect("nested literal capture");
+        assert_eq!(nested.index, 1);
+        assert_eq!(cfg.environments[nested.index].literal, nested.literal);
+        for imported in &cfg.environment_imports {
+            let destination = &cfg.environments[imported.destination.index];
+            assert_eq!(destination.literal, imported.destination.literal);
+            assert_eq!(destination.instance, imported.destination_instance);
+        }
+        assert!(cfg.environments.iter().skip(2).any(|environment| {
+            matches!(
+                environment.instance,
+                CallableEnvironmentInstance::CallOutput { .. }
+            )
+        }));
+    }
+}
+
+#[test]
+fn call_import_selection_uses_concrete_callable_overload() {
+    let text = "%%start\nmake = overload {\n    (u8())(u8) => fn(value) { u8() inner = fn { value }; inner };\n    (u16())(u16) => fn(value) { u16() inner = fn { value }; inner };\n};\nunit() run = fn { u8 small = 1; u8() left = make(small); u16 wide = 2; u16() right = make(wide); left(); right(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let run = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .expect("run");
+        let selected = run
+            .reference_cfg
+            .points
+            .iter()
+            .filter_map(|point| match &point.kind {
+                CfgPointKind::Call {
+                    target:
+                        ResolvedCallTarget::ModuleCallable {
+                            concrete: ConcreteCallSelection::Overload(arm),
+                            ..
+                        },
+                    ..
+                } => Some((arm.arm_index, &point.call_import_paths)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(selected.len(), 2);
+        for (arm, paths) in selected {
+            assert!(paths.iter().flatten().any(|result| matches!(
+                &result.source.table.owner,
+                ProducerCfgOwnerId::Function {
+                    body: ProducerFunctionBodyId::Overload(index),
+                    ..
+                } if *index == arm
+            )));
+        }
+    }
+}
+
+#[test]
+fn call_import_table_reuses_entry_and_separates_qualified_equal_literals() {
+    let text = "%%start\n(unit())() make = fn { unit() inner = fn { 1; }; inner };\nunit() run = fn { unit() first = make(); unit() second = make(); first; second; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics, source) in [
+        (
+            &single.program.items,
+            &single.diagnostics,
+            &single.program.source,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.diagnostics,
+            &project.project.modules[0].source,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let make = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("make");
+        let mut contracts = Vec::new();
+        super::reference::collect_function_output_contracts(
+            source,
+            make,
+            make.name_span,
+            super::reference::ReferenceCallableBody::Declaration,
+            &mut contracts,
+        )
+        .unwrap();
+        let result = &contracts[0].environments[0];
+        let instance = CallableEnvironmentInstance::CallOutput {
+            call: SourceSpan::new(source.clone(), make.name_span),
+            output: 0,
+            function_span: make.span,
+        };
+        let mut cfg = ScalarReferenceCfg::new(ProducerCfgOwnerId::Module(source.clone()));
+        let first = super::reference::import_result_environment(
+            &mut cfg,
+            result,
+            &result.id,
+            &instance,
+            &mut BTreeSet::new(),
+            &instance_call_span(&instance),
+        )
+        .unwrap();
+        let repeated = super::reference::import_result_environment(
+            &mut cfg,
+            result,
+            &result.id,
+            &instance,
+            &mut BTreeSet::new(),
+            &instance_call_span(&instance),
+        )
+        .unwrap();
+        assert_eq!(first, repeated);
+        assert_eq!(
+            cfg.environment_imports
+                .iter()
+                .filter(|fact| fact.destination == first)
+                .count(),
+            1
+        );
+        let mut other = result.clone();
+        other.producer.table.owner = ProducerCfgOwnerId::Module(source.clone());
+        let distinct = super::reference::import_result_environment(
+            &mut cfg,
+            &other,
+            &other.id,
+            &instance,
+            &mut BTreeSet::new(),
+            &instance_call_span(&instance),
+        )
+        .unwrap();
+        assert_ne!(first.index, distinct.index);
+        assert_eq!(first.literal, distinct.literal);
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(restored.environment_imports, cfg.environment_imports);
+        cfg.environment_imports[0].destination.index = cfg.environments.len();
+        assert!(
+            matches!(super::reference::import_result_environment(&mut cfg, result, &result.id, &instance, &mut BTreeSet::new(), &instance_call_span(&instance)), Err(ReferenceAnalysisError::MissingContext { source_span, reason: ReferenceAnalysisErrorReason::MissingGlobalCallableProducer }) if source_span == instance_call_span(&instance))
+        );
+        let mut invalid = result.id.clone();
+        invalid.index = usize::MAX;
+        assert!(
+            matches!(super::reference::import_result_environment(&mut cfg, result, &invalid, &instance, &mut BTreeSet::new(), &instance_call_span(&instance)), Err(ReferenceAnalysisError::MissingContext { source_span, reason: ReferenceAnalysisErrorReason::MissingGlobalCallableProducer }) if source_span == instance_call_span(&instance))
+        );
+    }
+}
+
+#[test]
+fn call_import_paths_keep_return_alternatives_and_projected_field_outputs() {
+    for text in [
+        "%%start\n(u8())(bool) choose = fn(flag) { if (flag) { fn { 1 } } else { fn { 2 } } };\nunit() run = fn { u8() read = choose(true); read(); };\n%%end",
+        "%%start\nstruct copy Reader { u8() read; }\nReader() make = fn { Reader result = { .read = fn { 1 }; }; result };\nunit() run = fn { Reader kept = make(); kept.read(); };\n%%end",
+        "%%start\nstruct copy Factory { (u8())() make; }\nunit() run = fn { Factory machine = { .make = fn { u8() inner = fn { 1 }; inner }; }; u8() read = machine.make(); read(); };\n%%end",
+    ] {
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            let run = items.iter().find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            }).expect("run");
+            let cfg = &run.reference_cfg;
+            let call = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Call { target: ResolvedCallTarget::ModuleCallable { .. } | ResolvedCallTarget::CallableField { .. }, .. })).expect("resolved call");
+            let selections = call.call_import_paths.iter().flatten().collect::<Vec<_>>();
+            assert!(!selections.is_empty(), "{text}: {call:?}");
+            for selected in &selections {
+                assert_eq!(selected.call, call.id);
+                let CfgPointKind::Call { target, output, .. } = &call.kind else { unreachable!() };
+                assert_eq!(&selected.target, target);
+                assert_eq!(&selected.output, output);
+                assert_eq!(selected.source.output, *output);
+                assert!(cfg.environment_imports.iter().any(|entry| {
+                    entry.table == selected.source.table
+                        && entry.source_index == selected.source.alternative.source_index
+                        && entry.source_instance == selected.source.alternative.source_instance
+                        && entry.destination == selected.destination
+                }));
+            }
+            if text.contains("choose") {
+                assert_eq!(selections.len(), 2, "{selections:?}");
+                assert!(call.call_import_paths.iter().any(|path| path.len() == 2));
+                assert_ne!(selections[0].source.alternative.source_index, selections[1].source.alternative.source_index);
+            } else if text.contains("Reader") {
+                assert!(selections.iter().any(|selected| !selected.projection.is_empty()));
+            } else {
+                assert!(matches!(&call.kind, CfgPointKind::Call { target: ResolvedCallTarget::CallableField { .. }, .. }));
+            }
+            let restored: ScalarReferenceCfg = serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+            assert_eq!(restored.environment_imports, cfg.environment_imports);
+            assert_eq!(restored.points[call.id.0].call_import_paths, call.call_import_paths);
+        }
+    }
+}
+
+fn instance_call_span(instance: &CallableEnvironmentInstance) -> SourceSpan {
+    let CallableEnvironmentInstance::CallOutput { call, .. } = instance else {
+        unreachable!()
+    };
+    call.clone()
+}
+
+#[test]
+fn producer_table_ids_are_stable_across_collection_and_serialization() {
+    let text = "%%start\n(unit())() make = fn { (unit())() local = fn { unit() inner = fn { 1; }; inner }; local() };\nunit() run = fn { unit() first = make(); unit() second = make(); first; second; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics, source) in [
+        (
+            &single.program.items,
+            &single.diagnostics,
+            &single.program.source,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.diagnostics,
+            &project.project.modules[0].source,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let make = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("make function");
+        assert!(make.reference_cfg.points.iter().any(|point| {
+            matches!(
+                point.kind,
+                CfgPointKind::Call {
+                    target: ResolvedCallTarget::LocalCallable(_),
+                    ..
+                }
+            ) && point.call_import_paths.iter().flatten().any(|selected| {
+                selected.call == point.id
+                    && selected.source.table.owner
+                        == make.reference_cfg.literal_cfgs[0]
+                            .reference_cfg
+                            .producer_owner
+                    && make
+                        .reference_cfg
+                        .environment_imports
+                        .iter()
+                        .any(|entry| entry.destination == selected.destination)
+            })
+        }));
+        let mut first = Vec::new();
+        super::reference::collect_function_output_contracts(
+            source,
+            make,
+            make.name_span,
+            super::reference::ReferenceCallableBody::Declaration,
+            &mut first,
+        )
+        .expect("first collection");
+        let mut second = Vec::new();
+        super::reference::collect_function_output_contracts(
+            source,
+            make,
+            make.name_span,
+            super::reference::ReferenceCallableBody::Declaration,
+            &mut second,
+        )
+        .expect("repeated collection");
+        let ids = first
+            .iter()
+            .flat_map(|contract| &contract.environments)
+            .map(|result| result.producer.clone())
+            .collect::<Vec<_>>();
+        assert!(!ids.is_empty());
+        assert_eq!(
+            ids,
+            second
+                .iter()
+                .flat_map(|contract| &contract.environments)
+                .map(|result| result.producer.clone())
+                .collect::<Vec<_>>()
+        );
+        for contract in &first {
+            for result in &contract.environments {
+                let restored: super::reference::LiteralResultEnvironment =
+                    serde_json::from_str(&serde_json::to_string(result).unwrap()).unwrap();
+                assert_eq!(restored, *result);
+            }
+        }
+        for id in ids {
+            assert_eq!(id.table.owner, make.reference_cfg.producer_owner);
+            assert_eq!(id.output, 0);
+            assert!(matches!(
+                make.reference_cfg.points[id.return_point.0].kind,
+                CfgPointKind::ReturnOutput { output: 0, .. }
+            ));
+            assert_eq!(
+                make.reference_cfg.environments[id.alternative.source_index].instance,
+                id.alternative.source_instance
+            );
+            let json = serde_json::to_string(&id).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ProducerReturnSelectionFact>(&json).unwrap(),
+                id
+            );
+        }
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(&make.reference_cfg).unwrap()).unwrap();
+        assert_eq!(restored.producer_owner, make.reference_cfg.producer_owner);
+        let run = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "run" => Some(function),
+                _ => None,
+            })
+            .expect("run function");
+        assert_eq!(
+            run.reference_cfg
+                .points
+                .iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+                .count(),
+            2
+        );
+    }
+    for modules in [
+        vec![ScalarModule::from_program(
+            single.program.clone(),
+            Vec::new(),
+        )],
+        project.project.modules.clone(),
+    ] {
+        let first = super::reference::collect_project_literal_output_contracts(&modules)
+            .expect("literal collection");
+        let second = super::reference::collect_project_literal_output_contracts(&modules)
+            .expect("repeated literal collection");
+        let ids = first
+            .iter()
+            .flat_map(|contract| {
+                contract
+                    .environments
+                    .iter()
+                    .chain(contract.projected.iter().map(|(_, result)| result))
+            })
+            .map(|result| result.producer.clone())
+            .collect::<Vec<_>>();
+        assert!(!ids.is_empty());
+        assert_eq!(
+            ids,
+            second
+                .iter()
+                .flat_map(|contract| contract
+                    .environments
+                    .iter()
+                    .chain(contract.projected.iter().map(|(_, result)| result)))
+                .map(|result| result.producer.clone())
+                .collect::<Vec<_>>()
+        );
+        for id in ids {
+            assert!(matches!(id.table.owner, ProducerCfgOwnerId::Literal { .. }));
+            assert_eq!(
+                serde_json::from_str::<ProducerReturnSelectionFact>(
+                    &serde_json::to_string(&id).unwrap()
+                )
+                .unwrap(),
+                id
+            );
+        }
+    }
+}
+
+#[test]
+fn producer_table_collection_rejects_invalid_source_index() {
+    let text = "%%start\n(unit())() make = fn { unit() inner = fn { 1; }; inner };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics, source) in [
+        (
+            &single.program.items,
+            &single.diagnostics,
+            &single.program.source,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.diagnostics,
+            &project.project.modules[0].source,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let mut function = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function.clone()),
+                _ => None,
+            })
+            .expect("make function");
+        let invalid_index = function.reference_cfg.environments.len();
+        let point = function
+            .reference_cfg
+            .points
+            .iter_mut()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. }))
+            .expect("return output");
+        let existing = point
+            .possible_environments
+            .iter()
+            .next()
+            .expect("environment")
+            .clone();
+        point.possible_environments.clear();
+        point.possible_environments.insert(CallableEnvironmentId {
+            index: invalid_index,
+            literal: existing.literal,
+        });
+        let expected_span = point.source_span.clone();
+        let mut contracts = Vec::new();
+        let error = super::reference::collect_function_output_contracts(
+            source,
+            &function,
+            function.name_span,
+            super::reference::ReferenceCallableBody::Declaration,
+            &mut contracts,
+        )
+        .expect_err("invalid producer");
+        assert!(
+            matches!(error, ReferenceAnalysisError::MissingContext { source_span, reason: ReferenceAnalysisErrorReason::MissingGlobalCallableProducer } if source_span == expected_span)
+        );
+    }
+}
+
+#[test]
+fn producer_table_owner_distinguishes_overload_arms() {
+    let text = "%%start\nmake = overload { u8(u8) => fn(value) { value }; u8(u64) => fn(value) { 2 }; };\nu8() run = fn { u8 input = 1; u8 left = make(input); u64 wide = 2; u8 right = make(wide); left; right };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let make = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("overload");
+        assert_eq!(make.overload_arms.len(), 2);
+        for (index, arm) in make.overload_arms.iter().enumerate() {
+            assert!(
+                matches!(&arm.reference_cfg.producer_owner, ProducerCfgOwnerId::Function { body: ProducerFunctionBodyId::Overload(known), .. } if *known == index)
+            );
+            assert_eq!(
+                serde_json::from_str::<ScalarReferenceCfg>(
+                    &serde_json::to_string(&arm.reference_cfg).unwrap()
+                )
+                .unwrap()
+                .producer_owner,
+                arm.reference_cfg.producer_owner
+            );
+        }
+    }
+}
+
+fn reference_function<'a>(items: &'a [ScalarItem], name: &str) -> &'a ScalarFunction {
+    items
+        .iter()
+        .find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == name => Some(function),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("function {name}"))
+}
+
+fn capture_facts_for<'a>(
+    cfg: &'a ScalarReferenceCfg,
+    text: &str,
+    names: &[&str],
+) -> Vec<&'a CaptureInputPathFact> {
+    let capture = cfg
+        .points
+        .iter()
+        .find_map(|point| match &point.kind {
+            CfgPointKind::Capture { captures, .. }
+                if names
+                    .iter()
+                    .all(|name| captures.iter().any(|capture| capture.name == **name)) =>
+            {
+                Some(point.id)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("capture for {names:?} in {text}"));
+    cfg.capture_input_path_facts
+        .iter()
+        .filter(|fact| fact.capture == capture)
+        .collect()
+}
+
+fn callable_holder<'a>(
+    text: &str,
+    fact: &'a CaptureInputPathFact,
+    binding: &str,
+) -> &'a ConnectedCaptureHolderFact {
+    let start = text
+        .find(binding)
+        .unwrap_or_else(|| panic!("binding {binding}")) as u32;
+    let input = fact
+        .inputs
+        .iter()
+        .find(|input| input.binding.declaration_span.start == start)
+        .unwrap_or_else(|| panic!("input {binding} in {fact:?}"));
+    let CaptureInputOriginFact::Callable { holders } = &input.origin else {
+        panic!("callable input {binding} in {fact:?}");
+    };
+    assert_eq!(holders.len(), 1, "{fact:?}");
+    &holders[0]
+}
+
+#[test]
+fn parent_capture_path_validates_direct_capture_child_in_both_validators() {
+    let text = "%%start\nunit() run = fn { u8() inner = fn { 1 }; u8() twin = inner; u8() outer = fn { inner(); twin() }; outer(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let run = reference_function(items, "run");
+        let cfg = &run.reference_cfg;
+        let facts = capture_facts_for(cfg, text, &["inner", "twin"]);
+        assert_eq!(facts.len(), 1, "{:?}", cfg.capture_input_path_facts);
+        let fact = facts[0];
+        assert_eq!(fact.owner, cfg.producer_owner);
+        assert_eq!(fact.inputs.len(), 2);
+        assert!(validate_capture_input_path_fact(cfg, fact).is_ok());
+        let inner = callable_holder(text, fact, "inner = fn");
+        let twin = callable_holder(text, fact, "twin = inner");
+        assert_eq!(inner.environment, twin.environment);
+        let HolderProducerRef::Forward {
+            action: inner_action,
+            previous: inner_previous,
+            ..
+        } = &inner.producer
+        else {
+            panic!("inner chain {:?}", inner.producer);
+        };
+        assert!(
+            matches!(inner_action, CallableHolderAction::Move { .. }),
+            "{inner_action:?}"
+        );
+        assert!(
+            matches!(
+                inner_previous.as_ref(),
+                HolderProducerRef::CaptureCreation { .. }
+            ),
+            "{:?}",
+            inner_previous
+        );
+        let HolderProducerRef::Forward {
+            action: twin_action,
+            previous: twin_previous,
+            ..
+        } = &twin.producer
+        else {
+            panic!("twin chain {:?}", twin.producer);
+        };
+        assert!(
+            matches!(twin_action, CallableHolderAction::Retain { .. }),
+            "{twin_action:?}"
+        );
+        assert!(
+            matches!(twin_previous.as_ref(), HolderProducerRef::Forward { .. }),
+            "{:?}",
+            twin_previous
+        );
+        let literal = cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| literal.capture_point == fact.capture)
+            .expect("outer literal");
+        assert_eq!(
+            literal.reference_cfg.capture_input_path_facts.len(),
+            facts.len(),
+            "{:?}",
+            literal.reference_cfg.capture_input_path_facts
+        );
+        let entry = literal
+            .reference_cfg
+            .holder_edges
+            .iter()
+            .find(|edge| edge.from == CfgPointId(0))
+            .expect("child entry edge");
+        for holder in [inner, twin] {
+            assert!(
+                entry.after.iter().any(|relation| {
+                    relation.environment == holder.environment
+                        && relation.holders.contains(&holder.holder)
+                }),
+                "{entry:?}"
+            );
+        }
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(
+            restored.capture_input_path_facts,
+            cfg.capture_input_path_facts
+        );
+    }
+}
+
+#[test]
+fn parent_capture_path_validates_call_bind_capture_child_in_both_validators() {
+    let text = "%%start\n(u8())() make = fn { u8() inner = fn { 1 }; inner };\nunit() run = fn { u8() first = make(); u8() probe = fn { first() }; probe(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let run = reference_function(items, "run");
+        let cfg = &run.reference_cfg;
+        let facts = capture_facts_for(cfg, text, &["first"]);
+        assert_eq!(facts.len(), 1, "{:?}", cfg.capture_input_path_facts);
+        let fact = facts[0];
+        assert_eq!(fact.inputs.len(), 1);
+        assert!(validate_capture_input_path_fact(cfg, fact).is_ok());
+        let first = callable_holder(text, fact, "first = make");
+        let HolderProducerRef::Forward { previous, .. } = &first.producer else {
+            panic!("first chain {:?}", first.producer);
+        };
+        let HolderProducerRef::CallCreation {
+            point, selection, ..
+        } = previous.as_ref()
+        else {
+            panic!("call root {previous:?}");
+        };
+        let CfgPointKind::Call { target, output, .. } = &cfg.points[point.0].kind else {
+            panic!("creation point {:?}", cfg.points[point.0].kind);
+        };
+        assert!(matches!(target, ResolvedCallTarget::ModuleCallable { .. }));
+        assert_eq!(selection.call, *point);
+        assert_eq!(&selection.target, target);
+        assert_eq!(&selection.output, output);
+        assert_eq!(selection.destination, first.environment);
+        let call = cfg.points.iter().find(|known| known.id == *point).unwrap();
+        assert!(call
+            .call_import_paths
+            .iter()
+            .flatten()
+            .any(|selected| selected == selection));
+        assert!(cfg.environment_imports.iter().any(|entry| {
+            entry.table == selection.source.table
+                && entry.source_index == selection.source.alternative.source_index
+                && entry.source_instance == selection.source.alternative.source_instance
+                && entry.destination == first.environment
+        }));
+        let literal = cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| literal.capture_point == fact.capture)
+            .expect("probe literal");
+        assert_eq!(
+            literal.reference_cfg.capture_input_path_facts.len(),
+            facts.len()
+        );
+        let entry = literal
+            .reference_cfg
+            .holder_edges
+            .iter()
+            .find(|edge| edge.from == CfgPointId(0))
+            .expect("child entry edge");
+        assert!(
+            entry.after.iter().any(|relation| {
+                relation.environment == first.environment
+                    && relation.holders.contains(&first.holder)
+            }),
+            "{entry:?}"
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(
+            restored.capture_input_path_facts,
+            cfg.capture_input_path_facts
+        );
+    }
+}
+
+#[test]
+fn parent_capture_path_validates_installed_read_child_in_both_validators() {
+    let text = "%%start\nunit(u64) run = fn(count) { (u8())[count] slots; slots[0] = fn { 1 }; u8() picked = slots[0]; u8() probe = fn { picked() }; picked(); probe(); slots; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let run = reference_function(items, "run");
+        let cfg = &run.reference_cfg;
+        let facts = capture_facts_for(cfg, text, &["picked"]);
+        assert_eq!(facts.len(), 1, "{:?}", cfg.capture_input_path_facts);
+        let fact = facts[0];
+        assert_eq!(fact.inputs.len(), 1);
+        assert!(validate_capture_input_path_fact(cfg, fact).is_ok());
+        let picked = callable_holder(text, fact, "picked = slots");
+        let HolderProducerRef::Forward {
+            action: forward_action,
+            previous,
+            ..
+        } = &picked.producer
+        else {
+            panic!("picked chain {:?}", picked.producer);
+        };
+        assert!(
+            matches!(forward_action, CallableHolderAction::Move { .. }),
+            "{forward_action:?}"
+        );
+        let HolderProducerRef::InstalledRead {
+            point: read,
+            action,
+            ..
+        } = previous.as_ref()
+        else {
+            panic!("installed root {previous:?}");
+        };
+        let CallableHolderAction::RetainCheckedSelected { old, to, .. } = action else {
+            panic!("installed action {action:?}");
+        };
+        assert!(matches!(old, CallableCellCaseFact::Initialized { .. }));
+        assert_eq!(to, &CallableHolderPlace::Temporary(*read));
+        let literal = cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| literal.capture_point == fact.capture)
+            .expect("probe literal");
+        assert_eq!(
+            literal.reference_cfg.capture_input_path_facts.len(),
+            facts.len()
+        );
+        let entry = literal
+            .reference_cfg
+            .holder_edges
+            .iter()
+            .find(|edge| edge.from == CfgPointId(0))
+            .expect("child entry edge");
+        assert!(
+            entry.after.iter().any(|relation| {
+                relation.environment == picked.environment
+                    && relation.holders.contains(&picked.holder)
+            }),
+            "{entry:?}"
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(
+            restored.capture_input_path_facts,
+            cfg.capture_input_path_facts
+        );
+    }
+}
+
+#[test]
+fn parent_capture_path_keeps_branch_joint_inputs_and_scalar_value_in_both_validators() {
+    let text = "%%start\n(u8())() make_a = fn { u8() inner = fn { 1 }; inner };\n(u8())() make_b = fn { u8() inner = fn { 2 }; inner };\nunit(bool) run = fn(flag) { u8() target = if (flag) { make_a() } else { make_b() }; u8 tag = 7; tag; u8() probe = fn { target(); tag }; probe(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let run = reference_function(items, "run");
+        let cfg = &run.reference_cfg;
+        let facts = capture_facts_for(cfg, text, &["target", "tag"]);
+        assert_eq!(facts.len(), 2, "{:?}", cfg.capture_input_path_facts);
+        let make_a = reference_function(items, "make_a");
+        let make_b = reference_function(items, "make_b");
+        let mut makers = Vec::new();
+        for fact in &facts {
+            assert_eq!(fact.inputs.len(), 2);
+            assert!(validate_capture_input_path_fact(cfg, fact).is_ok());
+            let target = callable_holder(text, fact, "target = if");
+            let HolderProducerRef::Forward { previous, .. } = &target.producer else {
+                panic!("target chain {:?}", target.producer);
+            };
+            let HolderProducerRef::CallCreation { selection, .. } = previous.as_ref() else {
+                panic!("call root {previous:?}");
+            };
+            let ProducerCfgOwnerId::Function { declaration, .. } = &selection.source.table.owner
+            else {
+                panic!("source owner {:?}", selection.source.table.owner);
+            };
+            assert!(
+                declaration == &make_a.name_span || declaration == &make_b.name_span,
+                "{selection:?}"
+            );
+            makers.push(declaration.clone());
+            let tag_start = text.find("tag = 7").unwrap() as u32;
+            let tag = fact
+                .inputs
+                .iter()
+                .find(|input| input.binding.declaration_span.start == tag_start)
+                .unwrap_or_else(|| panic!("tag input in {fact:?}"));
+            assert!(
+                matches!(tag.origin, CaptureInputOriginFact::Value),
+                "{tag:?}"
+            );
+        }
+        assert_ne!(makers[0], makers[1]);
+        let literal = cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| literal.capture_point == facts[0].capture)
+            .expect("probe literal");
+        assert_eq!(
+            literal.reference_cfg.capture_input_path_facts.len(),
+            facts.len(),
+            "{:?}",
+            literal.reference_cfg.capture_input_path_facts
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(
+            restored.capture_input_path_facts,
+            cfg.capture_input_path_facts
+        );
+    }
+}
+
+#[test]
+fn corrupt_parent_producer_action_reports_source_qualified_b0003_in_both_validators() {
+    let text = "%%start\n(u8())() make = fn { u8() inner = fn { 1 }; inner };\nunit() run = fn { u8() first = make(); u8() probe = fn { first() }; probe(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let run = reference_function(items, "run");
+        let cfg = &run.reference_cfg;
+        let facts = capture_facts_for(cfg, text, &["first"]);
+        assert_eq!(facts.len(), 1);
+        let fact = facts[0].clone();
+        assert!(validate_capture_input_path_fact(cfg, &fact).is_ok());
+        let input = fact
+            .inputs
+            .iter()
+            .find(|input| matches!(&input.origin, CaptureInputOriginFact::Callable { .. }))
+            .expect("callable input");
+        let CaptureInputOriginFact::Callable { holders } = &input.origin else {
+            unreachable!()
+        };
+        let HolderProducerRef::Forward {
+            point: forward_point,
+            action: forward_action,
+            previous,
+            ..
+        } = &holders[0].producer
+        else {
+            panic!("chain {:?}", holders[0].producer);
+        };
+        let HolderProducerRef::CallCreation {
+            point: call,
+            selection,
+            ..
+        } = previous.as_ref()
+        else {
+            panic!("root {previous:?}");
+        };
+        let check = |cfg: &ScalarReferenceCfg| {
+            let error = validate_capture_input_path_fact(cfg, &fact)
+                .expect_err("corrupt producer must fail");
+            assert!(
+                matches!(
+                    error,
+                    ReferenceAnalysisError::MissingContext {
+                        reason: ReferenceAnalysisErrorReason::MissingGlobalCallableProducer,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(error.source_span(), &fact.capture_span);
+        };
+        let mut cleared_imports = cfg.clone();
+        cleared_imports.points[call.0].call_import_paths.clear();
+        check(&cleared_imports);
+        let mut dropped_entry = cfg.clone();
+        dropped_entry.environment_imports.retain(|entry| {
+            !(entry.table == selection.source.table
+                && entry.source_index == selection.source.alternative.source_index
+                && entry.source_instance == selection.source.alternative.source_instance
+                && entry.destination == holders[0].environment)
+        });
+        assert!(
+            dropped_entry.environment_imports.len() < cfg.environment_imports.len(),
+            "entry present"
+        );
+        check(&dropped_entry);
+        let mut tampered_edge = cfg.clone();
+        let edge = tampered_edge
+            .holder_edges
+            .iter_mut()
+            .find(|edge| edge.from == *forward_point && edge.actions.contains(forward_action))
+            .expect("forward edge");
+        edge.actions.retain(|action| action != forward_action);
+        check(&tampered_edge);
+    }
+}
+
+#[test]
+fn parent_capture_path_facts_roundtrip_json_in_both_validators() {
+    for text in [
+        "%%start\n(u8())() make = fn { u8() inner = fn { 1 }; inner };\nunit() run = fn { u8() first = make(); u8() probe = fn { first() }; probe(); };\n%%end",
+        "%%start\n(u8())() make_a = fn { u8() inner = fn { 1 }; inner };\n(u8())() make_b = fn { u8() inner = fn { 2 }; inner };\nunit(bool) run = fn(flag) { u8() target = if (flag) { make_a() } else { make_b() }; u8 tag = 7; tag; u8() probe = fn { target(); tag }; probe(); };\n%%end",
+    ] {
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            for item in items.iter() {
+                let ScalarItem::Function(function) = item else {
+                    continue;
+                };
+                for cfg in std::iter::once(&function.reference_cfg).chain(
+                    function
+                        .reference_cfg
+                        .literal_cfgs
+                        .iter()
+                        .map(|literal| literal.reference_cfg.as_ref()),
+                ) {
+                    for fact in &cfg.capture_input_path_facts {
+                        let json = serde_json::to_string(fact).unwrap();
+                        assert_eq!(
+                            serde_json::from_str::<CaptureInputPathFact>(&json).unwrap(),
+                            *fact,
+                            "{text}"
+                        );
+                        for input in &fact.inputs {
+                            if let CaptureInputOriginFact::Callable { holders } = &input.origin {
+                                for holder in holders {
+                                    let json = serde_json::to_string(&holder.producer).unwrap();
+                                    assert_eq!(
+                                        serde_json::from_str::<HolderProducerRef>(&json).unwrap(),
+                                        holder.producer,
+                                        "{text}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let restored: ScalarReferenceCfg =
+                        serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+                    assert_eq!(
+                        restored.capture_input_path_facts,
+                        cfg.capture_input_path_facts,
+                        "{text}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn captured_environment_invalid_transfers_retain_b0003_source_spans() {
+    let cases = [
+        (
+            "%%start\nstruct copy Reader { u8() read; }\nReader(*u8) wrap = fn(input) { Reader result = { .read = fn { *input }; }; result };\nReader() escape = fn { u8[2] fixed = [4, 5]; wrap(&fixed[0]) };\n%%end",
+            "wrap(&fixed[0])",
+            0,
+            15,
+            "&fixed[0]",
+            0,
+            9,
+        ),
+        (
+            "%%start\nunit() outer = fn { u8[1] fixed = [4]; u8[] bytes = fixed; u8() reader = fn { bytes[0] }; u8[] moved = bytes; u8[] again = bytes; moved[0]; again[0]; reader(); };\n%%end",
+            "again = bytes",
+            8,
+            5,
+            "moved = bytes",
+            8,
+            5,
+        ),
+        (
+            "%%start\nunit(u64) outer = fn(length) { u8[length] bytes; *u8 address = &bytes[0]; unit() observe = fn() { address; }; unsafe { core.free(&bytes); }; observe(); };\n%%end",
+            "core.free(&bytes)",
+            0,
+            17,
+            "&bytes[0]",
+            0,
+            9,
+        ),
+    ];
+    for (text, primary, primary_offset, primary_length, origin, origin_offset, origin_length) in
+        cases
+    {
+        let (single, project) = both_reference_functions(text);
+        let primary_start = text.find(primary).unwrap() as u32 + primary_offset;
+        let origin_start = text.find(origin).unwrap() as u32 + origin_offset;
+        for (diagnostics, identity) in [
+            (&single.diagnostics, &single.program.source),
+            (&project.diagnostics, &project.project.modules[0].source),
+        ] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003"
+                        && diagnostic.labels.iter().any(|label| {
+                            label.kind == DiagnosticLabelKind::Primary
+                                && label.span
+                                    == SourceSpan::new(
+                                        identity.clone(),
+                                        ByteSpan::new(
+                                            primary_start,
+                                            primary_start + primary_length,
+                                        ),
+                                    )
+                        })
+                        && diagnostic.labels.iter().any(|label| {
+                            label.kind == DiagnosticLabelKind::Secondary
+                                && label.span
+                                    == SourceSpan::new(
+                                        identity.clone(),
+                                        ByteSpan::new(origin_start, origin_start + origin_length),
+                                    )
+                        })
+                }),
+                "{diagnostics:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2491,6 +17097,104 @@ fn callable_struct_field_free_has_source_identity_in_both_validators() {
 }
 
 #[test]
+fn top_level_callable_field_calls_keep_typed_source_targets_in_both_validators() {
+    let text = "%%start\nstruct Holder { i32(i32) apply; }\ni32(i32) inc = fn(value) { value + 1 };\nHolder container = { .apply = inc; };\ni32 result = container.apply(41);\nresult;\nHolder local = { .apply = fn(value) { value + 2 }; };\ni32 next = local.apply(40);\nnext;\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (cfg, structs, diagnostics, source) in [
+        (
+            &single.program.top_level_reference_cfg,
+            &single.program.structs,
+            &single.diagnostics,
+            &single.program.source,
+        ),
+        (
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.project.modules[0].structs,
+            &project.diagnostics,
+            &project.project.modules[0].source,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let calls = cfg
+            .points
+            .iter()
+            .filter_map(|point| match &point.kind {
+                CfgPointKind::Call {
+                    target:
+                        ResolvedCallTarget::CallableField {
+                            receiver_place,
+                            field,
+                        },
+                    ..
+                } => Some((point, receiver_place, field)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        for (index, (point, receiver, field)) in calls.iter().enumerate() {
+            let call = if index == 0 {
+                "container.apply(41)"
+            } else {
+                "local.apply(40)"
+            };
+            let start = text.find(call).unwrap() as u32;
+            assert_eq!(
+                point.source_span,
+                SourceSpan::new(
+                    (*source).clone(),
+                    ByteSpan::new(start, start + call.len() as u32)
+                )
+            );
+            assert_eq!(field, &&structs[0].fields[0].id);
+            assert_eq!(receiver.source, *source);
+            assert_eq!(
+                receiver.declaration_span.start,
+                text.find(if index == 0 { "container =" } else { "local =" })
+                    .unwrap() as u32
+            );
+        }
+    }
+}
+
+#[test]
+fn top_level_contextual_literal_records_captured_binding_and_exact_span() {
+    let text = "%%start\nstruct Holder { i32(i32) action; }\ni32 amount = 2;\nHolder container = { .action = fn(value) { value + amount }; };\ni32 result = container.action(40);\nresult;\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (cfg, diagnostics, source) in [
+        (
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+            &single.program.source,
+        ),
+        (
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+            &project.project.modules[0].source,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let captures = cfg
+            .points
+            .iter()
+            .find_map(|point| match &point.kind {
+                CfgPointKind::Capture { captures, .. } => Some(captures),
+                _ => None,
+            })
+            .expect("top-level capture fact");
+        assert_eq!(captures.len(), 1);
+        let start = text.find("amount }; }").unwrap() as u32;
+        assert_eq!(
+            captures[0].use_span,
+            SourceSpan::new(source.clone(), ByteSpan::new(start, start + 6))
+        );
+        assert_eq!(
+            captures[0].binding.declaration_span.start,
+            text.find("amount =").unwrap() as u32
+        );
+    }
+}
+
+#[test]
 fn callable_struct_field_reports_unknown_noncallable_and_argument_errors_in_both_validators() {
     for (text, code, marker) in [
             (
@@ -3359,7 +18063,18 @@ fn straight_line_reference_cfg_has_source_backed_fresh_forward_reborrow_and_null
             assert!(matches!(cfg.points[0].kind, CfgPointKind::Entry));
         }
         let fresh = functions[0];
-        let address = fresh.reference_cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Borrow { loan, .. } if loan.creation_span.start == text.find("&value").unwrap() as u32)).expect("fresh borrow");
+        let address = fresh
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Borrow { .. })
+                    && evaluated_borrow::accepted_loan(&fresh.reference_cfg, point.id)
+                        .creation_span
+                        .start
+                        == text.find("&value").unwrap() as u32
+            })
+            .expect("fresh borrow");
         let ReferenceOrigin::Fresh { allocation, loan } = sole_fact(fresh, address) else {
             panic!("fresh fact")
         };
@@ -3411,7 +18126,18 @@ fn straight_line_reference_cfg_has_source_backed_fresh_forward_reborrow_and_null
         );
 
         let reborrow = functions[2];
-        let child = reborrow.reference_cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Borrow { loan, .. } if loan.creation_span.start == text.find("&!(*parent)").unwrap() as u32)).expect("child loan");
+        let child = reborrow
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Borrow { .. })
+                    && evaluated_borrow::accepted_loan(&reborrow.reference_cfg, point.id)
+                        .creation_span
+                        .start
+                        == text.find("&!(*parent)").unwrap() as u32
+            })
+            .expect("child loan");
         let ReferenceOrigin::BorrowedFrom { parameter: 0, loan } = sole_fact(reborrow, child)
         else {
             panic!("reborrow origin")
@@ -3454,7 +18180,18 @@ fn straight_line_reference_cfg_has_source_backed_fresh_forward_reborrow_and_null
         );
 
         let nested = functions[4];
-        let local = nested.reference_cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Borrow { loan, .. } if loan.creation_span.start == text.find("&local").unwrap() as u32)).expect("nested loan");
+        let local = nested
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Borrow { .. })
+                    && evaluated_borrow::accepted_loan(&nested.reference_cfg, point.id)
+                        .creation_span
+                        .start
+                        == text.find("&local").unwrap() as u32
+            })
+            .expect("nested loan");
         let ReferenceOrigin::Fresh { allocation, loan } = sole_fact(nested, local) else {
             panic!("nested fresh")
         };
@@ -3529,10 +18266,16 @@ fn assignment_reads_rhs_before_write_and_shadowed_binding_is_diagnosed() {
             source,
             &mut function,
             &HashSet::new(),
+            &BTreeMap::new(),
             &[],
             &[],
             &[],
-            &HashMap::new()
+            &HashMap::new(),
+            &[],
+            &assignment::SourceValueTypeFacts {
+                assignments: Vec::new(),
+                expressions: Vec::new(),
+            }
         )
         .is_empty());
         let reads = function
@@ -3583,30 +18326,7 @@ fn unresolved_name_and_deliberately_empty_internal_origin_are_explicit() {
     let ScalarItem::Function(function) = &result.program.items[0] else {
         panic!("function")
     };
-    let mut builder = ReferenceFlowBuilder {
-        source: result.program.source.clone(),
-        function_span: function.span,
-        names: BTreeMap::new(),
-        module_names: HashSet::new(),
-        call_sites: Vec::new(),
-        origins: HashMap::new(),
-        checked: HashSet::new(),
-        binding_types: HashMap::new(),
-        structs: Vec::new(),
-        enums: Vec::new(),
-        generic_parameters: BTreeSet::new(),
-        assignment_outputs: HashMap::new(),
-        dereference_points: HashMap::new(),
-        cfg: ScalarReferenceCfg {
-            facts: Vec::new(),
-            points: Vec::new(),
-            initial_points: Vec::new(),
-            allocations: BTreeSet::new(),
-            specialized_policies: Vec::new(),
-        },
-        next_scope: 0,
-        cursor: None,
-    };
+    let mut builder = ReferenceFlowBuilder::test_builder(&result.program.source, function);
     let binding = ReferenceBindingId {
         source: result.program.source.clone(),
         function_span: function.span,
@@ -3864,7 +18584,17 @@ fn moving_allocation_records_live_loan_before_move_point() {
             unreachable!()
         };
         assert_eq!(&place.binding, owner);
-        let borrow = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Borrow { place, .. } if place.binding == *owner)).expect("live loan");
+        let borrow = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(&point.kind, CfgPointKind::Borrow { .. })
+                    && evaluated_borrow::accepted_loan(cfg, point.id)
+                        .origin_place
+                        .binding
+                        == *owner
+            })
+            .expect("live loan");
         assert!(borrow.id.0 < moved.id.0);
         assert_eq!(
             borrow.source_span.range.start,
@@ -4851,10 +19581,11 @@ fn terminated_final_expression_is_unit_in_program_and_project_blocks() {
     assert_eq!(function.body.terminated_items, vec![false]);
 
     let source = module_source("src/main.w");
+    let invalid_module = module_from_text(source.clone(), "%%start\ni32() f = fn { 1; };\n%%end");
     let invalid_project = validate_scalar_project(ScalarProject::new(
         vec![ScalarModule::new(
             source.clone(),
-            invalid.program.items,
+            invalid_module.items,
             Vec::new(),
         )],
         vec![source.clone()],
@@ -4864,10 +19595,11 @@ fn terminated_final_expression_is_unit_in_program_and_project_blocks() {
         .iter()
         .any(|diagnostic| diagnostic.code == "B0003"));
 
+    let valid_module = module_from_text(source.clone(), "%%start\ni32() f = fn { 1 };\n%%end");
     let valid_project = validate_scalar_project(ScalarProject::new(
         vec![ScalarModule::new(
             source.clone(),
-            valid.program.items,
+            valid_module.items,
             Vec::new(),
         )],
         vec![source],
@@ -5387,7 +20119,9 @@ fn rejects_const_binding_assignments_at_target_span_in_project() {
         _ => panic!("namespace item"),
     };
     let assignment_target = match &main.items[2] {
-        ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) => assignment.target_span,
+        ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) => {
+            assignment.targets[0].target_span
+        }
         _ => panic!("assignment item"),
     };
     let validation = validate_scalar_project(ScalarProject::new(
@@ -6385,6 +21119,58 @@ fn resolves_ordinary_and_generic_overload_arms_in_single_file_and_project() {
 }
 
 #[test]
+fn concrete_overload_arms_record_distinct_nested_callable_signatures() {
+    let text = "%%start\nmake = overload {\n    (u8())(u8) => fn(value) { u8() inner = fn { value }; inner };\n    (u16())(u16) => fn(value) { u16() inner = fn { value }; inner };\n};\nu8() first = make(1);\nu16() second = make(2);\nu8 one = first();\nu16 two = second();\n%%end";
+    let single = validate_text(text);
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    let signatures = single.program.resolved_literals.borrow();
+    assert!(signatures.iter().any(|entry| matches!(&entry.signature, ScalarType::Callable { outputs, parameters } if parameters.is_empty() && outputs.outputs[0].ty == ScalarType::U8)));
+    assert!(signatures.iter().any(|entry| matches!(&entry.signature, ScalarType::Callable { outputs, parameters } if parameters.is_empty() && outputs.outputs[0].ty == ScalarType::U16)));
+
+    let source = module_source("src/main.w");
+    let program = module_from_text(source.clone(), text);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(program, Vec::new())],
+        vec![source.clone()],
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    let signatures = project.project.modules[0].resolved_literals.borrow();
+    assert_eq!(signatures.iter().filter(|entry| entry.literal.source == source && matches!(&entry.signature, ScalarType::Callable { parameters, .. } if parameters.is_empty())).count(), 2);
+}
+
+#[test]
+fn concrete_overload_nested_callable_invalid_output_reports_source_span() {
+    let text = "%%start\nmake = overload {\n    (u8())(u8) => fn(value) { u8() inner = fn { true }; inner };\n};\nu8() selected = make(1);\n%%end";
+    let single = validate_text(text);
+    assert!(
+        single
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.labels[0].span.range.start <= text.find("true").unwrap() as u32
+                && diagnostic.labels[0].span.range.end >= text.find("true").unwrap() as u32 + 4),
+        "{:?}",
+        single.diagnostics
+    );
+    let source = module_source("src/main.w");
+    let program = module_from_text(source.clone(), text);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(program, Vec::new())],
+        vec![source],
+    ));
+    assert!(
+        project
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.labels[0].span.range.start <= text.find("true").unwrap() as u32
+                && diagnostic.labels[0].span.range.end >= text.find("true").unwrap() as u32 + 4),
+        "{:?}",
+        project.diagnostics
+    );
+}
+
+#[test]
 fn resolves_struct_typed_overload_arm_in_single_file_and_project() {
     let text = "%%start\nstruct utf8 {\n\t*?u8 data;\n\tu64 length;\n}\nparse = overload {\n    *u64(utf8) => fn(text) {\n        *u64 result = null;\n        result\n    };\n};\nutf8 input = { .data = null; .length = 0; };\n*u64 parsed = parse(input);\n%%end";
     let single = validate_text(text);
@@ -7103,7 +21889,7 @@ fn module_source(path: &str) -> SourceIdentity {
 }
 
 fn module_from_text(source: SourceIdentity, text: &str) -> ScalarProgram {
-    let parsed = parse_source(source, text.to_owned(), &[]);
+    let parsed = parse_source(source.clone(), text.to_owned(), &[]);
     assert!(
         parsed.diagnostics.is_empty(),
         "syntax diagnostics: {:?}",
@@ -7415,10 +22201,13 @@ fn resolves_qualified_member_read_and_assignment_through_bound_module() {
     let ScalarItem::Executable(ScalarBlockItem::Assignment(assignment)) = &main.items[2] else {
         panic!("qualified member assignment");
     };
-    assert_eq!(assignment.receiver.as_deref(), Some("math"));
-    assert_eq!(assignment.target, "value");
-    assert_eq!(assignment.receiver_span, Some(ByteSpan::new(68, 72)));
-    assert_eq!(assignment.target_span, ByteSpan::new(73, 78));
+    assert_eq!(assignment.targets[0].receiver.as_deref(), Some("math"));
+    assert_eq!(assignment.targets[0].target, "value");
+    assert_eq!(
+        assignment.targets[0].receiver_span,
+        Some(ByteSpan::new(68, 72))
+    );
+    assert_eq!(assignment.targets[0].target_span, ByteSpan::new(73, 78));
     let result = validate_scalar_project(ScalarProject::new(
         vec![
             ScalarModule::new(
@@ -8125,6 +22914,696 @@ fn enforces_unsafe_raw_addresses_and_rejects_invalid_field_receivers() {
 }
 
 #[test]
+fn d3_raw_address_rejects_moved_roots_and_projections_on_both_validators_and_targets() {
+    for (text, place) in [
+        ("%%start\nunit(u8[]) consume = fn(data) { data[0]; };\nunit(u64) run = fn(count) { u8[count] bytes; bytes[0] = 120; consume(bytes); unsafe { &?bytes[0]; }; };\n%%end", "&?bytes[0]"),
+        ("%%start\nstruct Payload { u8 value; }\nstruct Holder { Payload inner; u8 other; }\nunit() run = fn { Holder container = { .inner = { .value = 1; }; .other = 2; }; Payload taken = container.inner; taken.value; unsafe { &?container.inner; }; };\n%%end", "&?container.inner"),
+        ("%%start\nstruct Payload { u8 value; }\nunit() run = fn { Payload item = { .value = 1; }; Payload taken = item; taken.value; unsafe { &?item; }; };\n%%end", "&?item"),
+    ] {
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let parsed = parse_source(source(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+                vec![source()],
+            ));
+            let start = text.find(place).unwrap() as u32;
+            let expected = ByteSpan::new(start, start + place.len() as u32);
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.span.range == expected)),
+                    "{layout:?}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn d3_raw_address_accepts_available_reinitialized_and_independent_places_on_both_validators_and_targets(
+) {
+    let text = "%%start\nstruct Payload { u8 value; }\nstruct Holder { *!u8 inner; u8 other; }\nunit() run = fn { u8 first = 1; u8 second = 2; Holder container = { .inner = &!first; .other = 2; }; *!u8 taken = container.inner; *taken; unsafe { &?container.other; }; container.inner = &!second; unsafe { &?container.inner; }; Payload item = { .value = 4; }; Payload moved = item; moved.value; item = { .value = 5; }; unsafe { &?item; }; };\n%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+}
+
+#[test]
+fn d3_checked_helper_loan_ends_before_runtime_array_move_on_both_validators_and_targets() {
+    let text = "%%start\nu8(*u8) inspect = fn(byte) { *byte };\nu8(u64) run = fn(count) { u8[count] bytes; bytes[0] = 120; u8 seen = inspect(&bytes[0]); bytes[0] = seen; u8[] moved = bytes; moved[0] };\n%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+}
+
+#[test]
+fn d3_checked_field_initializer_keeps_runtime_backing_with_existing_owner() {
+    let text = "%%start\nstruct Frame { *u8 data; }\nu8(u64) run = fn(count) { u8[count] bytes; bytes[0] = 120; Frame view = { .data = &bytes[0]; }; *u8 reader = view.data; u8 seen = *reader; u8[] moved = bytes; seen + moved[0] };\n%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for items in [&single.program.items, &project.project.modules[0].items] {
+            let function = items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) if function.name == "run" => Some(function),
+                    _ => None,
+                })
+                .unwrap();
+            let assign = function.reference_cfg.points.iter().find(|point|
+                matches!(&point.kind, CfgPointKind::Assign { target, .. } if matches!(target.place, ScalarPlace::Field { .. }))).unwrap();
+            assert!(assign
+                .possible_origins
+                .as_ref()
+                .is_some_and(|origins| !origins.is_empty()));
+            assert!(assign.possible_projected_backings.is_empty());
+            let moved = function
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(
+                        &point.kind,
+                        CfgPointKind::Backing {
+                            transfer: RuntimeBackingTransfer::Move { .. },
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            assert_eq!(moved.possible_backings.len(), 1);
+            assert_eq!(
+                moved.possible_backings[0].value.creation_span.start,
+                text.find("bytes;").unwrap() as u32
+            );
+        }
+    }
+}
+
+#[test]
+fn d3_shared_runtime_array_helper_indexes_checked_referent() {
+    let text = "%%start\nu8(*(u8[]), u64) inspect = fn(bytes, index) { (*bytes)[index] };\nu8(u64) run = fn(count) { u8[count] bytes; bytes[0] = 120; inspect(&bytes, 0) };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+}
+
+#[path = "mutable_reference_move_tests.rs"]
+mod mutable_reference_move_tests;
+
+#[path = "projected_checked_return_tests.rs"]
+mod projected_checked_return_tests;
+
+#[path = "reborrow_state_tests.rs"]
+mod reborrow_state_tests;
+
+#[test]
+fn d3_historical_loan_proof_original_field_transport_conflicts() {
+    let identity = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/checked_references.w".into(),
+        "r1".into(),
+    );
+    let text = "%%start
+struct Record {
+    *?u8 bytes;
+    u32 count;
+}
+*u32(*u32) transport = fn(value) { value };
+*!u32(*!u32) transport_mutable = fn(value) { value };
+Record item = { .bytes = null; .count = 2; };
+*u32 shared = &item.count;
+*!u32 mutable = &!item.count;
+*Record record_shared = &item;
+u32 shared_value = *shared;
+u32 mutable_value = *mutable;
+u32 field_value = (*record_shared).count;
+*u32 forwarded = transport(shared);
+*!u32 mutable_forwarded = transport_mutable(mutable);
+u32 forwarded_value = *transport(shared);
+u32 mutable_forwarded_value = *transport_mutable(mutable);
+forwarded;
+mutable_forwarded;
+%%end";
+    let parsed = parse_source(identity.clone(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![identity.clone()],
+        ));
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            for (primary, secondary) in [(ByteSpan::new(244, 256), ByteSpan::new(215, 226))] {
+                assert!(
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic.code == "B0003"
+                            && diagnostic.labels.iter().any(|label| {
+                                label.kind == super::super::DiagnosticLabelKind::Primary
+                                    && label.span.source == identity
+                                    && label.span.range == primary
+                            })
+                            && diagnostic.labels.iter().any(|label| {
+                                label.kind == super::super::DiagnosticLabelKind::Secondary
+                                    && label.span.source == identity
+                                    && label.span.range == secondary
+                            })
+                    }),
+                    "{layout:?}: {diagnostics:?}"
+                );
+            }
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.labels.iter().any(|label| label.kind
+                            == super::super::DiagnosticLabelKind::Primary
+                            && label.span
+                                == SourceSpan::new(identity.clone(), ByteSpan::new(234, 241)))),
+                "{layout:?}: {diagnostics:#?}"
+            );
+        }
+        for cfg in [
+            &single.program.top_level_reference_cfg,
+            &project.project.modules[0].top_level_reference_cfg,
+        ] {
+            let rejected = cfg
+                .borrow_evaluations
+                .iter()
+                .find(|evaluation| {
+                    cfg.points[evaluation.point.0].source_span
+                        == SourceSpan::new(identity.clone(), ByteSpan::new(244, 256))
+                })
+                .unwrap();
+            assert!(rejected.output.is_empty());
+            assert!(rejected
+                .cases
+                .iter()
+                .all(|case| matches!(case, ReferenceBorrowCase::Rejected { .. })));
+            let initializer = cfg.checked_install_evaluations.iter().find(|evaluation| matches!(evaluation.input, ReferenceCheckedInstallInput::Evaluated { value_point } if value_point == rejected.point)).unwrap();
+            assert_eq!(
+                initializer.disposition,
+                ReferenceCheckedInstallDisposition::Uninitialized
+            );
+            assert!(initializer.accepted_origins.is_empty());
+            assert!(cfg.points.iter().filter(|point| matches!(&point.kind, CfgPointKind::Read { binding } if binding == &initializer.target.binding)).all(|point| point.possible_origins.as_ref().is_none_or(BTreeSet::is_empty)));
+        }
+    }
+}
+
+#[test]
+fn d3_historical_loan_proof_isolated_shared_exclusive_conflicts() {
+    for (text, primary_text, secondary_text) in [
+        (
+            "%%start\nstruct Record { u32 count; }\nunit() run = fn {\nRecord item = { .count = 2; };\n*u32 shared = &item.count;\n*!u32 mutable = &!item.count;\nu32 shared_value = *shared;\nu32 mutable_value = *mutable;\nshared_value;\nmutable_value;\n};\nrun();\n%%end",
+            "&!item.count",
+            "&item.count",
+        ),
+        (
+            "%%start\nstruct Record { u32 count; }\nunit() run = fn {\nRecord item = { .count = 2; };\n*!u32 mutable = &!item.count;\n*Record record_shared = &item;\nu32 mutable_value = *mutable;\nu32 field_value = (*record_shared).count;\nmutable_value;\nfield_value;\n};\nrun();\n%%end",
+            "&item",
+            "&!item.count",
+        ),
+    ] {
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let primary_start = text.find(primary_text).unwrap() as u32;
+        let primary_length = primary_text.len() as u32;
+        let secondary_start = text.find(secondary_text).unwrap() as u32;
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+                vec![source()],
+            ));
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003"
+                        && diagnostic.labels.iter().any(|label| {
+                            label.kind == super::super::DiagnosticLabelKind::Primary
+                                && label.span.source == source()
+                                && label.span.range == ByteSpan::new(primary_start, primary_start + primary_length)
+                        })
+                        && diagnostic.labels.iter().any(|label| {
+                            label.kind == super::super::DiagnosticLabelKind::Secondary
+                                && label.span.source == source()
+                                && label.span.range == ByteSpan::new(secondary_start, secondary_start + secondary_text.len() as u32)
+                        })
+                }), "{text}: {layout:?}: {diagnostics:?}");
+            }
+            for items in [&single.program.items, &project.project.modules[0].items] {
+                let cfg = items.iter().find_map(|item| match item { ScalarItem::Function(function) if function.name == "run" => Some(&function.reference_cfg), _ => None }).unwrap();
+                let rejected = cfg.borrow_evaluations.iter().find(|evaluation| cfg.points[evaluation.point.0].source_span.range == ByteSpan::new(primary_start, primary_start + primary_length)).unwrap();
+                assert!(rejected.output.is_empty());
+                assert!(rejected.cases.iter().all(|case| matches!(case, ReferenceBorrowCase::Rejected { .. })));
+                let accepted = cfg.borrow_evaluations.iter().find(|evaluation| cfg.points[evaluation.point.0].source_span.range == ByteSpan::new(secondary_start, secondary_start + secondary_text.len() as u32)).unwrap();
+                assert_eq!(accepted.output.len(), 1);
+                assert!(cfg.checked_install_evaluations.iter().any(|evaluation| matches!(evaluation.input, ReferenceCheckedInstallInput::Evaluated { value_point } if value_point == accepted.point) && evaluation.disposition == ReferenceCheckedInstallDisposition::Written && evaluation.accepted_origins == accepted.output));
+                assert!(cfg.checked_install_evaluations.iter().any(|evaluation| matches!(evaluation.input, ReferenceCheckedInstallInput::Evaluated { value_point } if value_point == rejected.point) && evaluation.disposition == ReferenceCheckedInstallDisposition::Uninitialized && evaluation.accepted_origins.is_empty()));
+            }
+        }
+    }
+}
+
+#[test]
+fn d3_historical_loan_proof_mutable_transport_use_after_move() {
+    let text = "%%start\n*!u32(*!u32) transport_mutable = fn(value) { value };\nunit() run = fn {\nu32 item = 2;\n*!u32 mutable = &!item;\n*!u32 forwarded = transport_mutable(mutable);\nu32 invalid_value = *mutable;\nu32 forwarded_value = *forwarded;\ninvalid_value;\nforwarded_value;\n};\nrun();\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let use_start = text.find("mutable;\n").unwrap() as u32;
+    let move_start = text.find("mutable);").unwrap() as u32;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003"
+                        && diagnostic.labels.iter().any(|label| {
+                            label.kind == super::super::DiagnosticLabelKind::Primary
+                                && label.span.source == source()
+                                && label.span.range == ByteSpan::new(use_start, use_start + 7)
+                        })
+                        && diagnostic.labels.iter().any(|label| {
+                            label.kind == super::super::DiagnosticLabelKind::Secondary
+                                && label.span.source == source()
+                                && label.span.range == ByteSpan::new(move_start, move_start + 7)
+                        })
+                }),
+                "{layout:?}: {diagnostics:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn d3_historical_loan_proof_reordered_field_transport_accepts() {
+    let identity = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/checked_references.w".into(),
+        "r1".into(),
+    );
+    let text = "%%start
+struct Record {
+    *?u8 bytes;
+    u32 count;
+}
+*u32(*u32) transport = fn(value) { value };
+*!u32(*!u32) transport_mutable = fn(value) { value };
+Record item = { .bytes = null; .count = 2; };
+*u32 shared = &item.count;
+*Record record_shared = &item;
+u32 shared_value = *shared;
+u32 field_value = (*record_shared).count;
+*u32 forwarded = transport(shared);
+u32 forwarded_value = *transport(shared);
+forwarded;
+*!u32 mutable = &!item.count;
+u32 mutable_value = *mutable;
+u32 mutable_forwarded_value = *transport_mutable(&!(*mutable));
+*!u32 mutable_forwarded = transport_mutable(mutable);
+mutable_forwarded;
+%%end";
+    let parsed = parse_source(identity.clone(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![identity.clone()],
+        ));
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+}
+
+#[test]
+fn d3_whole_array_loan_helper_then_mutation_and_move() {
+    let text = "%%start\nu8(*(u8[]), u64) inspect = fn(bytes, index) { (*bytes)[index] };\nu8(u64) run = fn(count) { u8[count] bytes; bytes[0] = 120; u8 first = inspect(&bytes, 0); bytes[0] = 121; u8 second = inspect(&bytes, 0); u8[] moved = bytes; first + second + moved[0] };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for items in [&single.program.items, &project.project.modules[0].items] {
+            let inspect = items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) if function.name == "inspect" => Some(function),
+                    _ => None,
+                })
+                .unwrap();
+            let ScalarType::Callable { parameters, .. } = &inspect.signature else {
+                panic!("helper signature")
+            };
+            assert!(
+                matches!(&parameters[0], ScalarType::CheckedReference { inner, .. } if matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. } if element.as_ref() == &ScalarType::U8))
+            );
+            let read = inspect
+                .reference_cfg
+                .read_points
+                .iter()
+                .find(|read| !read.indices.is_empty())
+                .unwrap();
+            assert_eq!(read.indices.len(), 1);
+            let index = &read.indices[0];
+            assert_eq!(index.source_span.source, source());
+            assert_eq!(
+                &text[index.source_span.range.start as usize..index.source_span.range.end as usize],
+                "index"
+            );
+            assert_eq!(
+                inspect.reference_cfg.points[index.point.0].source_span,
+                index.source_span
+            );
+            let CfgPointKind::ReadPlace {
+                pointer_point: Some(pointer),
+                candidates,
+                ..
+            } = &inspect.reference_cfg.points[read.point.0].kind
+            else {
+                panic!("projected checked read")
+            };
+            assert!(pointer.0 < index.point.0 && index.point.0 < read.point.0);
+            assert!(candidates.iter().all(|place| place.source == source() && place.projections.iter().any(|projection| matches!(projection, ReferencePlaceProjection::Index(ScalarExpression::Name { name, .. }) if name == "index"))));
+            assert!(!candidates.is_empty());
+            assert!(!inspect
+                .reference_cfg
+                .points
+                .iter()
+                .any(|point| matches!(point.kind, CfgPointKind::MoveThrough { .. })));
+            let run = items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) if function.name == "run" => Some(function),
+                    _ => None,
+                })
+                .unwrap();
+            let moved = run
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(
+                        point.kind,
+                        CfgPointKind::Backing {
+                            transfer: RuntimeBackingTransfer::Move { .. },
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            assert_eq!(moved.possible_backings.len(), 1);
+            let backing = &moved.possible_backings[0];
+            assert_eq!(
+                backing.value.creation_span.start,
+                text.find("bytes;").unwrap() as u32
+            );
+            assert!(
+                matches!(&backing.length, RuntimeArrayLengthFact::Evaluated { expression: ScalarExpression::Name { name, .. }, occurrence, .. } if name == "count" && occurrence.source == source())
+            );
+            let loans = run
+                .reference_cfg
+                .points
+                .iter()
+                .filter_map(|point| match &point.kind {
+                    CfgPointKind::Borrow { .. } => Some(evaluated_borrow::accepted_loan(
+                        &run.reference_cfg,
+                        point.id,
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(loans.len(), 2);
+            assert!(loans
+                .iter()
+                .all(|loan| loan.mode == ScalarReferenceMutability::Shared
+                    && loan.origin_place.binding.declaration_span.start
+                        == backing.value.creation_span.start));
+        }
+    }
+}
+
+#[test]
+fn d3_whole_array_loan_fixed_runtime_and_nested_projection() {
+    for text in [
+        "%%start\nu8(*(u8[2]), u64) inspect = fn(bytes, index) { (*bytes)[index] }; u8[2] data = [1, 2]; u8 seen = inspect(&data, 0);\n%%end",
+        "%%start\nstruct Row { u8[2] bytes; } u8(*Row, u64) inspect = fn(record, index) { (*record).bytes[index] }; Row data = { .bytes = [1, 2]; }; u8 seen = inspect(&data, 0);\n%%end",
+        "%%start\nu8(*(u8[2][2]), u64) inspect = fn(bytes, index) { (*bytes)[index][index] }; u8[2][2] data = [[1, 2], [3, 4]]; u8 seen = inspect(&data, 0);\n%%end",
+    ] {
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(single.program.clone(), Vec::new())], vec![source()],
+            ));
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        }
+    }
+}
+
+#[test]
+fn d3_whole_array_loan_shared_write_and_live_alias_conflicts() {
+    for (case, text) in [
+        "%%start\nunit(*(u8[]), u64) write = fn(bytes, index) { (*bytes)[index] = 1; }; u8(u64) run = fn(count) { u8[count] bytes; write(&bytes, 0); bytes[0] };\n%%end",
+        "%%start\n*u8(*(u8[]), u64) select = fn(bytes, index) { &(*bytes)[index] }; u8(u64) run = fn(count) { u8[count] bytes; *u8 alias = select(&bytes, 0); bytes[0] = 1; *alias };\n%%end",
+        "%%start\n*u8(*(u8[]), u64) select = fn(bytes, index) { &(*bytes)[index] }; u8(u64) run = fn(count) { u8[count] bytes; *u8 alias = select(&bytes, 0); u8[] moved = bytes; *alias + moved[0] };\n%%end",
+        "%%start\nu8(u64) run = fn(count) { u8[count] bytes; *!(u8[]) parent = &!bytes; *u8 child = &(*parent)[0]; (*parent)[0] = 1; *child };\n%%end",
+        "%%start\nu8(*(u8[]), u64) inspect = fn(bytes, index) { (*bytes)[index] }; u8(u64) run = fn(count) { u8[count] bytes; *!(u8[]) writer = &!bytes; u8 seen = inspect(&bytes, 0); seen + (*writer)[0] };\n%%end",
+        "%%start\nstruct View { *u8 first; } *u8(*(u8[]), u64) select = fn(bytes, index) { &(*bytes)[index] }; u8(u64) run = fn(count) { u8[count] bytes; View frame = { .first = select(&bytes, 0); }; bytes[0] = 1; *u8 alias = frame.first; *alias };\n%%end",
+    ].into_iter().enumerate() {
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(single.program.clone(), Vec::new())], vec![source()],
+            ));
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                assert!(!diagnostics.is_empty(), "accepted {text}");
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003" && diagnostic.labels.iter().any(|label| label.span.source == source() && label.span.range.end > label.span.range.start)), "{diagnostics:?}");
+                if case > 0 {
+                    assert!(diagnostics.iter().any(|diagnostic| diagnostic.message == "read or move of unavailable place" && diagnostic.labels.iter().any(|label| label.kind == crate::DiagnosticLabelKind::Secondary)), "{diagnostics:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn d3_whole_array_loan_returned_alias_ends_after_last_read() {
+    for text in [
+        "%%start\n*u8(*(u8[]), u64) select = fn(bytes, index) { &(*bytes)[index] }; u8(u64) run = fn(count) { u8[count] bytes; *u8 alias = select(&bytes, 0); u8 seen = *alias; bytes[0] = 1; u8[] moved = bytes; seen + moved[0] };\n%%end",
+        "%%start\nstruct View { *u8 first; } *u8(*(u8[]), u64) select = fn(bytes, index) { &(*bytes)[index] }; u8(u64) run = fn(count) { u8[count] bytes; View frame = { .first = select(&bytes, 0); }; *u8 alias = frame.first; u8 seen = *alias; bytes[0] = 1; u8[] moved = bytes; seen + moved[0] };\n%%end",
+    ] {
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())], vec![source()],
+        ));
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+    }
+}
+
+#[test]
+fn d3_whole_array_loan_mutable_reborrow_branches_and_pointer_occurrence() {
+    for text in [
+        "%%start\nunit(*!(u8[]), u64) update = fn(bytes, index) { (*bytes)[index] = 1; }; u8(u64) run = fn(count) { u8[count] bytes; update(&!bytes, 0); update(&!bytes, 0); bytes[0] };\n%%end",
+        "%%start\nu8(*(u8[]), u64) inspect = fn(bytes, index) { (*bytes)[index] }; u8(u64, bool) run = fn(count, choose) { u8[count] bytes; u8 seen = if (choose) { inspect(&bytes, 0) } else { inspect(&bytes, 1) }; bytes[0] = 1; seen + bytes[0] };\n%%end",
+        "%%start\n*(u8[])(*(u8[])) identity = fn(bytes) { bytes }; u8(u64) run = fn(count) { u8[count] data; u64 index = 0; u8 seen = (*identity(&data))[index + 1]; data[0] = 1; seen + data[0] };\n%%end",
+        "%%start\nu8(u64) run = fn(count) { u8[count] bytes; *!(u8[]) parent = &!bytes; *u8 child = &(*parent)[0]; u8 seen = *child; (*parent)[0] = 1; seen + (*parent)[0] };\n%%end",
+    ] {
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(single.program.clone(), Vec::new())], vec![source()],
+            ));
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        }
+    }
+}
+
+#[test]
+fn d3_whole_array_loan_raw_unsafe_and_element_move_restrictions() {
+    for (text, code) in [
+        ("%%start\nstruct Rack { u8[2] bytes; } u8(*?Rack, u64) inspect = fn(data, index) { (*data).bytes[index] };\n%%end", "B0012"),
+        ("%%start\nstruct Item { u8 value; } Item(*(Item[2]), u64) inspect = fn(items, index) { (*items)[index] };\n%%end", "B0003"),
+    ] {
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(single.program.clone(), Vec::new())], vec![source()],
+            ));
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == code), "{diagnostics:?}");
+            }
+        }
+    }
+    let text = "%%start\nstruct Rack { u8[2] bytes; } u8(*?Rack, u64) inspect = fn(data, index) { unsafe { (*data).bytes[index] } };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    }
+}
+
+#[test]
+fn d3_whole_array_loan_private_extent_and_u64_index() {
+    let text = "%%start\nu8(*(u8[]), u64, u64) inspect = fn(bytes, index, length) { if (length > 0) { (*bytes)[index] } else { 0 } }; u8(u64) run = fn(count) { u8[count] data; u8 seen = inspect(&data, 0, 999); u8[] moved = data; seen + moved[0] };\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for items in [&single.program.items, &project.project.modules[0].items] {
+            let run = items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Function(function) if function.name == "run" => Some(function),
+                    _ => None,
+                })
+                .unwrap();
+            let moved = run
+                .reference_cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(
+                        point.kind,
+                        CfgPointKind::Backing {
+                            transfer: RuntimeBackingTransfer::Move { .. },
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            assert!(
+                matches!(&moved.possible_backings[0].length, RuntimeArrayLengthFact::Evaluated { expression: ScalarExpression::Name { name, .. }, .. } if name == "count")
+            );
+        }
+    }
+    let invalid =
+        "%%start\nu8(*(u8[]), u32) inspect = fn(bytes, index) { (*bytes)[index] };\n%%end";
+    let parsed = parse_source(source(), invalid.to_owned(), &[]);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.message == "expression type does not match expected type"
+                })
+                .unwrap();
+            let start = invalid.rfind("index").unwrap() as u32;
+            assert_eq!(
+                diagnostic.labels[0].span,
+                SourceSpan::new(source(), ByteSpan::new(start, start + 5))
+            );
+        }
+    }
+}
+
+#[test]
 fn derives_checked_reference_addresses_with_exact_shared_mutable_and_aggregate_types() {
     let result = validate_text(
             "%%start\nstruct Item {\n\tu8 field;\n}\nu8 value = 1;\nItem record = { .field = 2; };\nu8[4] bytes = [3, 4, 5, 6];\n*u8 shared = &value;\n*!u8 mutable = &!value;\n*u8 field = &record.field;\n*(u8[4]) array = &bytes;\n*!(u8[4]) mutable_array = &!bytes;\n%%end",
@@ -8344,10 +23823,12 @@ fn rejects_checked_reference_mutability_mismatches_and_unsupported_addresses() {
     }));
 
     let callable =
-        validate_text("%%start\nu8() make = fn { 1 };\n*(u8()) reference = &make;\n%%end");
-    assert!(callable.diagnostics.iter().any(|diagnostic| {
-        diagnostic.message == "checked address requires a storage name or direct storage field"
-    }));
+        validate_text("%%start\nunit() take = fn { u8() make = fn { 1 }; *(u8()) reference = &make; reference; };\n%%end");
+    assert!(
+        callable.diagnostics.is_empty(),
+        "{:?}",
+        callable.diagnostics
+    );
 
     let unit = validate_text(
             "%%start\nunit() touch = fn { 1; };\nunit value = touch();\n*unit reference = &value;\n%%end",
@@ -9857,4 +25338,1320 @@ fn validates_scoped_fixed_array_callable_transport_and_preserves_module_collisio
         "{:?}",
         project.diagnostics
     );
+}
+
+#[test]
+fn direct_struct_return_imports_moved_capture_into_caller_field() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nunit() outer = fn { Reader(u8[]) maker = fn(bytes) { Reader result = { .read = fn { bytes[0] }; }; result }; u8[2] fixed = [4, 5]; u8[] moved = fixed; Reader kept = maker(moved); Reader copied = kept; kept.read(); copied.read(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let cfg = &outer.reference_cfg;
+        let maker_start = text.find("fn(bytes)").unwrap() as u32;
+        let maker = cfg
+            .literal_cfgs
+            .iter()
+            .find(|literal| literal.literal.range.start == maker_start)
+            .expect("maker literal");
+        let maker_output = maker
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. }))
+            .expect("maker output");
+        assert_eq!(maker_output.possible_environments.len(), 1);
+        assert_eq!(maker_output.possible_projected_environments.len(), 1);
+        let maker_environment = maker_output.possible_environments.iter().next().unwrap();
+        let maker_fact = &maker.reference_cfg.environments[maker_environment.index];
+        assert_eq!(maker_fact.backings.len(), 1);
+        assert!(matches!(
+            maker_fact.backings[0].owner.kind,
+            ReferenceBindingKind::Captured { .. }
+        ));
+        let call_start = text.find("maker(moved)").unwrap() as u32;
+        let call = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::Call { .. })
+                    && point.source_span.range.start == call_start
+            })
+            .expect("direct maker call");
+        assert_eq!(call.possible_environments.len(), 1);
+        assert_eq!(call.possible_projected_environments.len(), 1);
+        let environment = call.possible_environments.iter().next().unwrap();
+        assert_eq!(environment.literal, maker_environment.literal);
+        let fact = &cfg.environments[environment.index];
+        assert!(matches!(
+            fact.instance,
+            CallableEnvironmentInstance::CallOutput { .. }
+        ));
+        assert_eq!(fact.backings, maker_fact.backings);
+        assert_eq!(fact.inputs.len(), 1);
+        assert_eq!(fact.inputs[0].backings, maker_fact.backings);
+        assert_eq!(fact.capture_paths.len(), 1);
+        let fields = cfg
+            .points
+            .iter()
+            .filter(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::CallableField { .. },
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 2);
+        for field in &fields {
+            assert_eq!(
+                field.possible_callee_environments,
+                call.possible_environments
+            );
+        }
+    }
+}
+
+#[test]
+fn field_struct_return_imports_moved_capture_into_caller_field() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nstruct copy Holder { Reader(u8[]) make; }\nunit() outer = fn { u8[2] fixed = [4, 5]; u8[] moved = fixed; Holder box = { .make = fn(bytes) { Reader result = { .read = fn { bytes[0] }; }; result }; }; Reader kept = box.make(moved); kept.read(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let outer = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "outer" => Some(function),
+                _ => None,
+            })
+            .expect("outer");
+        let cfg = &outer.reference_cfg;
+        let call_start = text.find("box.make(moved)").unwrap() as u32;
+        let call = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(point.kind, CfgPointKind::Call { .. })
+                    && point.source_span.range.start == call_start
+            })
+            .expect("field maker call");
+        assert_eq!(call.possible_environments.len(), 1);
+        assert_eq!(call.possible_projected_environments.len(), 1);
+        let environment = call.possible_environments.iter().next().unwrap();
+        let fact = &cfg.environments[environment.index];
+        assert!(matches!(
+            fact.instance,
+            CallableEnvironmentInstance::CallOutput { .. }
+        ));
+        assert_eq!(fact.backings.len(), 1);
+        assert!(matches!(
+            fact.backings[0].owner.kind,
+            ReferenceBindingKind::Captured { .. }
+        ));
+        assert_eq!(fact.inputs.len(), 1);
+        assert_eq!(fact.inputs[0].backings, fact.backings);
+        let field = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::CallableField { .. },
+                        ..
+                    }
+                ) && point.source_span.range.start == text.find("kept.read()").unwrap() as u32
+            })
+            .expect("returned field call");
+        assert_eq!(
+            field.possible_callee_environments,
+            call.possible_environments
+        );
+    }
+}
+
+#[test]
+fn named_struct_return_moves_capture_and_rejects_stale_owner() {
+    let text = "%%start\nstruct copy Reader { u8() read; }\nReader(u8[]) make = fn(bytes) { Reader result = { .read = fn { bytes[0] }; }; result };\nunit() invoke = fn { u8[2] fixed = [4, 5]; u8[] moved = fixed; Reader kept = make(moved); kept.read(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let maker = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("maker");
+        let maker_fact = maker
+            .reference_cfg
+            .environments
+            .iter()
+            .find(|environment| !environment.backings.is_empty())
+            .expect("captured backing");
+        let invoke = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("invoke");
+        let call = invoke
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::ModuleCallable { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("named maker call");
+        assert_eq!(call.possible_environments.len(), 1);
+        assert_eq!(call.possible_projected_environments.len(), 1);
+        let environment = call.possible_environments.iter().next().unwrap();
+        let fact = &invoke.reference_cfg.environments[environment.index];
+        assert_eq!(fact.backings, maker_fact.backings);
+        assert_eq!(fact.inputs.len(), 1);
+        assert_eq!(fact.inputs[0].backings, maker_fact.backings);
+        assert!(matches!(
+            fact.backings[0].owner.kind,
+            ReferenceBindingKind::Captured { .. }
+        ));
+        let field = invoke
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::CallableField { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("returned field call");
+        assert_eq!(
+            field.possible_callee_environments,
+            call.possible_environments
+        );
+    }
+
+    let stale = "%%start\nstruct copy Reader { u8() read; }\nReader(u8[]) make = fn(bytes) { Reader result = { .read = fn { bytes[0] }; }; result };\nunit() invoke = fn { u8[2] fixed = [4, 5]; u8[] moved = fixed; Reader kept = make(moved); moved[0]; kept.read(); };\n%%end";
+    let (single, project) = both_reference_functions(stale);
+    let transfer = stale.find("make(moved)").unwrap() as u32 + "make(".len() as u32;
+    let invalid = stale.find("moved[0]").unwrap() as u32;
+    for (diagnostics, identity) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        let conflict = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels[0].span
+                        == SourceSpan::new(identity.clone(), ByteSpan::new(invalid, invalid + 8))
+            })
+            .expect("stale moved owner");
+        assert!(conflict.labels.iter().skip(1).any(|label| label.span
+            == SourceSpan::new(identity.clone(), ByteSpan::new(transfer, transfer + 5))));
+    }
+}
+
+#[test]
+fn ordinary_struct_return_transports_callable_field() {
+    let text = "%%start\nstruct Reader { u8() read; }\nReader(u8[]) make = fn(bytes) { Reader result = { .read = fn { bytes[0] }; }; result };\nunit() invoke = fn { u8[2] fixed = [4, 5]; u8[] moved = fixed; Reader kept = make(moved); kept.read(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let maker = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "make" => Some(function),
+                _ => None,
+            })
+            .expect("maker");
+        let maker_output = maker
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. }))
+            .expect("maker output");
+        assert_eq!(maker_output.possible_environments.len(), 1);
+        assert_eq!(maker_output.possible_projected_environments.len(), 1);
+        let invoke = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+                _ => None,
+            })
+            .expect("invoke");
+        let call = invoke
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::ModuleCallable { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("named maker call");
+        assert_eq!(call.possible_environments.len(), 1);
+        assert_eq!(call.possible_projected_environments.len(), 1);
+        let environment = call.possible_environments.iter().next().unwrap();
+        let fact = &invoke.reference_cfg.environments[environment.index];
+        assert_eq!(fact.backings, maker_output.possible_backings);
+        assert!(matches!(
+            fact.backings[0].owner.kind,
+            ReferenceBindingKind::Captured { .. }
+        ));
+        let field = invoke
+            .reference_cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::CallableField { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("returned field call");
+        assert_eq!(
+            field.possible_callee_environments,
+            call.possible_environments
+        );
+    }
+}
+
+#[test]
+fn imported_struct_return_preserves_moved_capture_across_source() {
+    let library_source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/library.w".into(),
+        "r1".into(),
+    );
+    let library = parse_source(
+        library_source.clone(),
+        "%%start\nstruct copy Reader { u8() read; }\nReader(u8[]) make = fn(bytes) { Reader result = { .read = fn { bytes[0] }; }; result };\n%%end".to_owned(),
+        &[],
+    );
+    let main = parse_source(
+        source(),
+        "%%start\nlibrary = namespace package \"src/library.w\";\nunit() invoke = fn { u8[2] fixed = [4, 5]; u8[] moved = fixed; library.Reader kept = library.make(moved); kept.read(); };\n%%end".to_owned(),
+        &[],
+    );
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    assert!(main.diagnostics.is_empty(), "{:?}", main.diagnostics);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![
+            ScalarModule::from_program(
+                derive_scalar_program(&main.result).program,
+                vec![ScalarNamespaceBinding {
+                    binding: "library".into(),
+                    target: library_source.clone(),
+                    span: ByteSpan::new(0, 0),
+                }],
+            ),
+            ScalarModule::from_program(derive_scalar_program(&library.result).program, Vec::new()),
+        ],
+        vec![source(), library_source.clone()],
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    let caller = project.project.modules[0]
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == "invoke" => Some(function),
+            _ => None,
+        })
+        .expect("invoke");
+    let maker = project.project.modules[1]
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == "make" => Some(function),
+            _ => None,
+        })
+        .expect("maker");
+    let maker_fact = maker
+        .reference_cfg
+        .environments
+        .iter()
+        .find(|environment| !environment.backings.is_empty())
+        .expect("captured backing");
+    assert_eq!(maker_fact.literal.source, library_source);
+    assert_eq!(maker_fact.backings[0].value.source, source());
+    assert_eq!(maker_fact.backings[0].owner.source, library_source);
+    assert!(matches!(
+        maker_fact.backings[0].owner.kind,
+        ReferenceBindingKind::Captured { .. }
+    ));
+    let call = caller
+        .reference_cfg
+        .points
+        .iter()
+        .find(|point| {
+            matches!(
+                point.kind,
+                CfgPointKind::Call {
+                    target: ResolvedCallTarget::ModuleCallable { .. },
+                    ..
+                }
+            )
+        })
+        .expect("imported maker call");
+    assert_eq!(call.possible_environments.len(), 1);
+    assert_eq!(call.possible_projected_environments.len(), 1);
+    let environment = call.possible_environments.iter().next().unwrap();
+    assert_eq!(environment.literal.source, library_source);
+    assert_eq!(environment.literal, maker_fact.literal);
+    let fact = &caller.reference_cfg.environments[environment.index];
+    assert_eq!(fact.backings, maker_fact.backings);
+    assert_eq!(fact.backings[0].value.source, source());
+    assert_eq!(fact.backings[0].owner.source, library_source);
+    assert_eq!(fact.inputs[0].binding.source, library_source);
+    assert_eq!(fact.inputs[0].backings, maker_fact.backings);
+    let field = caller
+        .reference_cfg
+        .points
+        .iter()
+        .find(|point| {
+            matches!(
+                point.kind,
+                CfgPointKind::Call {
+                    target: ResolvedCallTarget::CallableField { .. },
+                    ..
+                }
+            )
+        })
+        .expect("returned field call");
+    assert_eq!(
+        field.possible_callee_environments,
+        call.possible_environments
+    );
+}
+
+#[test]
+fn return_cases_publish_direct_capture_transfer_in_both_validators() {
+    let text = "%%start\n(unit())() make = fn { unit() inner = fn { 1; }; inner };\nunit() run = fn { unit() first = make(); unit() second = make(); first; second; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics, source) in [
+        (
+            &single.program.items,
+            &single.diagnostics,
+            &single.program.source,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.diagnostics,
+            &project.project.modules[0].source,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let make = reference_function(items, "make");
+        let cfg = &make.reference_cfg;
+        let output = cfg
+            .points
+            .iter()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 0, .. }))
+            .expect("return output");
+        let cases = cfg
+            .producer_return_cases
+            .iter()
+            .filter(|fact| fact.return_point == output.id && fact.output == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(cases.len(), 1, "{:?}", cfg.producer_return_cases);
+        let case = cases[0];
+        assert_eq!(case.table.owner, cfg.producer_owner);
+        let binding = match &case.holder {
+            CallableHolderPlace::Binding(binding) => binding,
+            holder => panic!("direct holder {holder:?}"),
+        };
+        assert_eq!(
+            binding.declaration_span.start,
+            text.find("inner = fn").unwrap() as u32
+        );
+        let capture = cfg
+            .points
+            .iter()
+            .find_map(|point| match &point.kind {
+                CfgPointKind::Capture { environment, .. } if *environment == case.environment => {
+                    Some(point.id)
+                }
+                _ => None,
+            })
+            .expect("capture root");
+        assert!(
+            matches!(&case.producer, HolderProducerRef::CaptureCreation { point, environment } if *point == capture && *environment == case.environment)
+                || matches!(&case.producer, HolderProducerRef::Forward { .. }),
+            "{:?}",
+            case.producer
+        );
+        let mut root = &case.producer;
+        while let HolderProducerRef::Forward { previous, .. } = root {
+            root = previous;
+        }
+        assert!(
+            matches!(root, HolderProducerRef::CaptureCreation { point, environment } if *point == capture && *environment == case.environment),
+            "{:?}",
+            case.producer
+        );
+        assert!(
+            matches!(&case.transfer, CallableHolderAction::ReturnTransfer { environment, to: CallableHolderPlace::Output(0), .. } if *environment == case.environment)
+        );
+        assert!(
+            super::reference::validate_producer_return_case_fact(cfg, case).is_ok(),
+            "{case:?}"
+        );
+        let mut contracts = Vec::new();
+        super::reference::collect_function_output_contracts(
+            source,
+            make,
+            make.name_span,
+            super::reference::ReferenceCallableBody::Declaration,
+            &mut contracts,
+        )
+        .expect("contracts");
+        let result = &contracts[0].environments[0];
+        assert_eq!(result.producer.table, case.table);
+        assert_eq!(result.producer.return_point, case.return_point);
+        assert_eq!(result.producer.alternative, case.alternative);
+        assert_eq!(case.environment, result.id);
+        let run = reference_function(items, "run");
+        let entries = run
+            .reference_cfg
+            .environment_imports
+            .iter()
+            .filter(|entry| entry.table == case.table)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        for entry in &entries {
+            assert_eq!(entry.source_index, case.alternative.source_index);
+            assert_eq!(entry.source_instance, case.alternative.source_instance);
+        }
+        assert_ne!(entries[0].destination, entries[1].destination);
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.producer_return_cases, cfg.producer_return_cases);
+    }
+}
+
+#[test]
+fn duplicate_output_holder_without_transfer_reports_source_diagnostic_in_both_validators() {
+    let text = "%%start\n((u8()), (u8()))() both = fn { u8() inner = fn { 1 }; inner, inner };\nunit() run = fn { u8() first = both(); u8() second = both(); first(); second(); };\n%%end";
+    let second = text.find("inner, inner").unwrap() as u32 + "inner, ".len() as u32;
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        let mut spans = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "B0003")
+            .map(|diagnostic| {
+                assert_eq!(diagnostic.labels.len(), 1, "{diagnostic:?}");
+                diagnostic.labels[0].span.range
+            })
+            .collect::<Vec<_>>();
+        spans.sort_by_key(|span| (span.start, span.end));
+        spans.dedup();
+        assert_eq!(
+            spans,
+            vec![ByteSpan::new(second, second + "inner".len() as u32)],
+            "{diagnostics:?}"
+        );
+        let both = reference_function(items, "both");
+        let cfg = &both.reference_cfg;
+        let outputs = cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 2, "{:?}", cfg.points);
+        assert_eq!(
+            cfg.producer_return_cases.len(),
+            1,
+            "{:?}",
+            cfg.producer_return_cases
+        );
+        let case = &cfg.producer_return_cases[0];
+        assert_eq!(case.output, 0);
+        assert_eq!(case.table.owner, cfg.producer_owner);
+        assert!(matches!(
+            &case.transfer,
+            CallableHolderAction::ReturnTransfer {
+                to: CallableHolderPlace::Output(0),
+                ..
+            }
+        ));
+        let mut root = &case.producer;
+        while let HolderProducerRef::Forward { previous, .. } = root {
+            root = previous;
+        }
+        assert!(
+            matches!(root, HolderProducerRef::CaptureCreation { .. }),
+            "{:?}",
+            case.producer
+        );
+        assert!(
+            super::reference::validate_producer_return_case_fact(cfg, case).is_ok(),
+            "{case:?}"
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.producer_return_cases, cfg.producer_return_cases);
+    }
+}
+
+#[test]
+fn nested_projected_capture_paths_rebase_in_both_validators() {
+    let text = "%%start\nstruct copy Twin { u8(u8) write; u8(u64) read; }\nTwin(u64) make = fn(count) { (u8())[count] slots; u8 first = 1; slots[0] = fn { first }; u8() kept = slots[0]; Twin result = { .write = fn(value) { first = value; first }; .read = fn(index) { if (index == 0) { kept() } else { kept() } }; }; result };\nTwin() run = fn { Twin one = make(2); one };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let run = reference_function(items, "run");
+        let run_cfg = &run.reference_cfg;
+        assert!(
+            !run_cfg.environment_imports.is_empty(),
+            "{:?}",
+            run_cfg.environments
+        );
+        for entry in &run_cfg.environment_imports {
+            let destination = run_cfg
+                .environments
+                .get(entry.destination.index)
+                .expect("destination environment");
+            assert_eq!(destination.literal, entry.destination.literal);
+            assert_eq!(destination.instance, entry.destination_instance);
+        }
+        for environment in &run_cfg.environments {
+            for input in environment
+                .inputs
+                .iter()
+                .chain(environment.capture_paths.iter().flatten())
+            {
+                for origin in &input.origins {
+                    assert!(origin.0 < run_cfg.facts.len(), "{origin:?}");
+                }
+                for id in input.environments.iter().chain(
+                    input
+                        .projected
+                        .iter()
+                        .flat_map(|projection| projection.environments.iter()),
+                ) {
+                    assert!(
+                        run_cfg
+                            .environments
+                            .get(id.index)
+                            .is_some_and(|fact| fact.literal == id.literal),
+                        "rebased nested id {id:?}"
+                    );
+                }
+                for backing in input.backings.iter().chain(
+                    input
+                        .projected_backings
+                        .iter()
+                        .map(|projected| &projected.backing),
+                ) {
+                    for family in &backing.callable_family {
+                        for element in &family.elements {
+                            assert!(
+                                run_cfg
+                                    .environments
+                                    .get(element.environment.index)
+                                    .is_some_and(|fact| fact.literal == element.environment.literal),
+                                "rebased installed element {:?}",
+                                element.environment
+                            );
+                        }
+                        for partition in &family.partitions {
+                            for representative in &partition.representatives {
+                                for case in &representative.cell.alternatives {
+                                    if let CallableCellCaseFact::Initialized {
+                                        environment_origin,
+                                        capture_paths,
+                                        loans,
+                                        ..
+                                    } = case
+                                    {
+                                        assert!(
+                                            run_cfg
+                                                .environments
+                                                .get(environment_origin.index)
+                                                .is_some_and(|fact| fact.literal
+                                                    == environment_origin.literal),
+                                            "rebased installed origin {environment_origin:?}"
+                                        );
+                                        for loan in loans {
+                                            assert!(loan.origin.0 < run_cfg.facts.len());
+                                        }
+                                        for path in capture_paths {
+                                            for nested in path {
+                                                for id in nested.environments.iter().chain(
+                                                    nested.projected.iter().flat_map(
+                                                        |projection| projection.environments.iter(),
+                                                    ),
+                                                ) {
+                                                    assert!(
+                                                        run_cfg
+                                                            .environments
+                                                            .get(id.index)
+                                                            .is_some_and(
+                                                                |fact| fact.literal == id.literal
+                                                            ),
+                                                        "rebased installed path id {id:?}"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let encoded = serde_json::to_string(run_cfg).unwrap();
+        let restored: ScalarReferenceCfg = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored.environment_imports, run_cfg.environment_imports);
+        assert_eq!(
+            restored.capture_input_path_facts,
+            run_cfg.capture_input_path_facts
+        );
+        assert_eq!(
+            restored.producer_return_cases,
+            run_cfg.producer_return_cases
+        );
+        assert_eq!(serde_json::to_string(&restored).unwrap(), encoded);
+    }
+}
+
+#[test]
+fn repeated_call_imports_keep_source_map_stable_in_both_validators() {
+    let text = "%%start\n(unit())() make = fn { unit() inner = fn { 1; }; inner };\nunit() run = fn { unit() first = make(); unit() second = make(); first; second; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    let (repeat_single, repeat_project) = both_reference_functions(text);
+    for ((items, diagnostics), (repeat_items, repeat_diagnostics)) in [
+        (
+            (&single.program.items, &single.diagnostics),
+            (&repeat_single.program.items, &repeat_single.diagnostics),
+        ),
+        (
+            (&project.project.modules[0].items, &project.diagnostics),
+            (
+                &repeat_project.project.modules[0].items,
+                &repeat_project.diagnostics,
+            ),
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(repeat_diagnostics.is_empty(), "{repeat_diagnostics:?}");
+        let run = reference_function(items, "run");
+        let repeat_run = reference_function(repeat_items, "run");
+        assert_eq!(
+            run.reference_cfg.environment_imports,
+            repeat_run.reference_cfg.environment_imports
+        );
+        assert_eq!(
+            run.reference_cfg.producer_return_cases,
+            repeat_run.reference_cfg.producer_return_cases
+        );
+        assert_eq!(
+            run.reference_cfg.capture_input_path_facts,
+            repeat_run.reference_cfg.capture_input_path_facts
+        );
+        let make = reference_function(items, "make");
+        let case = make
+            .reference_cfg
+            .producer_return_cases
+            .iter()
+            .find(|fact| fact.output == 0)
+            .expect("published case");
+        let entries = run
+            .reference_cfg
+            .environment_imports
+            .iter()
+            .filter(|entry| entry.table == case.table)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        for entry in &entries {
+            assert_eq!(entry.source_index, case.alternative.source_index);
+            assert_eq!(entry.source_instance, case.alternative.source_instance);
+        }
+        assert_ne!(entries[0].destination, entries[1].destination);
+        let encoded = serde_json::to_string(&run.reference_cfg).unwrap();
+        let restored: ScalarReferenceCfg = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            restored.environment_imports,
+            run.reference_cfg.environment_imports
+        );
+        assert_eq!(serde_json::to_string(&restored).unwrap(), encoded);
+    }
+}
+
+#[test]
+fn two_returns_sharing_source_map_once_per_destination_in_both_validators() {
+    let text = "%%start\n((u8()), (u8()))(bool) pick = fn(flag) { u8() inner = fn { 1 }; u8() alias = inner; if (flag) { inner, alias } else { inner, alias } };\nunit() run = fn { u8() first = pick(true); u8() second = pick(false); first(); second(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pick = reference_function(items, "pick");
+        let cfg = &pick.reference_cfg;
+        let outputs = cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 2, "{:?}", cfg.points);
+        let mut cases = cfg.producer_return_cases.clone();
+        cases.sort_by_key(|fact| fact.output);
+        assert_eq!(cases.len(), 2, "{cases:?}");
+        assert_ne!(cases[0].return_point, cases[1].return_point);
+        assert_eq!(cases[0].output, 0);
+        assert_eq!(cases[1].output, 1);
+        assert_eq!(cases[0].table, cases[1].table);
+        assert_eq!(cases[0].table.owner, cfg.producer_owner);
+        assert_eq!(cases[0].alternative, cases[1].alternative);
+        assert_eq!(cases[0].environment, cases[1].environment);
+        assert_ne!(cases[0].holder, cases[1].holder);
+        for (case, output) in cases.iter().zip(&outputs) {
+            assert_eq!(case.return_point, output.id);
+            let mut root = &case.producer;
+            while let HolderProducerRef::Forward { previous, .. } = root {
+                root = previous;
+            }
+            assert!(
+                matches!(root, HolderProducerRef::CaptureCreation { .. }),
+                "{case:?}"
+            );
+            assert!(
+                super::reference::validate_producer_return_case_fact(cfg, case).is_ok(),
+                "{case:?}"
+            );
+        }
+        let run = reference_function(items, "run");
+        let entries = run
+            .reference_cfg
+            .environment_imports
+            .iter()
+            .filter(|entry| entry.table == cases[0].table)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        for entry in &entries {
+            assert_eq!(entry.source_index, cases[0].alternative.source_index);
+            assert_eq!(entry.source_instance, cases[0].alternative.source_instance);
+        }
+        assert_ne!(entries[0].destination, entries[1].destination);
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.producer_return_cases, cfg.producer_return_cases);
+    }
+}
+
+#[test]
+fn return_cases_keep_branch_installed_cells_with_exact_guards_in_both_validators() {
+    let text = "%%start\n(u8())(bool) pick = fn(flag) { (u8())[2] slots; slots[0] = fn { 1 }; slots[1] = fn { 2 }; if (flag) { slots[0] } else { slots[1] } };\nunit() run = fn { u8() read = pick(true); read(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pick = reference_function(items, "pick");
+        let cfg = &pick.reference_cfg;
+        let cases = &cfg.producer_return_cases;
+        assert_eq!(cases.len(), 2, "{cases:?}");
+        assert_eq!(cases[0].return_point, cases[1].return_point);
+        assert_eq!(cases[0].table, cases[1].table);
+        assert_eq!(cases[0].table.owner, cfg.producer_owner);
+        assert_ne!(cases[0].environment, cases[1].environment);
+        for case in cases {
+            let action = match &case.producer {
+                HolderProducerRef::InstalledRead {
+                    action,
+                    environment,
+                    ..
+                } => {
+                    assert_eq!(*environment, case.environment);
+                    action
+                }
+                producer => panic!("branch producer {producer:?}"),
+            };
+            let CallableHolderAction::RetainCheckedSelected {
+                holder, old, guard, ..
+            } = action
+            else {
+                panic!("installed action {action:?}");
+            };
+            let CallableCellCaseFact::Initialized {
+                environment_origin, ..
+            } = old
+            else {
+                panic!("installed old {old:?}");
+            };
+            assert_eq!(*environment_origin, case.environment);
+            assert_eq!(
+                environment_origin.literal.range.start,
+                case.environment.literal.range.start
+            );
+            assert!(!guard.is_empty(), "{case:?}");
+            let Some(ReferencePlaceProjection::Index(ScalarExpression::Integer {
+                value: selected,
+                ..
+            })) = holder.place.projections.last()
+            else {
+                panic!("installed holder {holder:?}");
+            };
+            let aliases = match old {
+                CallableCellCaseFact::Initialized { holder_aliases, .. } => holder_aliases,
+                _ => unreachable!(),
+            };
+            assert!(
+                aliases.iter().any(|alias| match alias {
+                    CallableHolderPlace::Projection(place) => {
+                        matches!(place.projections.last(), Some(ReferencePlaceProjection::Index(ScalarExpression::Integer { value, .. })) if value == selected)
+                    }
+                    _ => false,
+                }),
+                "{case:?}"
+            );
+            assert!(
+                super::reference::validate_producer_return_case_fact(cfg, case).is_ok(),
+                "{case:?}"
+            );
+        }
+        let origins = cases
+            .iter()
+            .map(|case| case.environment.literal.range.start)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            origins,
+            std::collections::BTreeSet::from([
+                text.find("fn { 1 }").unwrap() as u32,
+                text.find("fn { 2 }").unwrap() as u32,
+            ]),
+            "{cases:?}"
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.producer_return_cases, cfg.producer_return_cases);
+    }
+}
+
+#[test]
+fn return_cases_forward_call_bind_chain_to_return_in_both_validators() {
+    let text = "%%start\n(unit())() make = fn { unit() inner = fn { 1; }; inner };\n(unit())() wrap = fn { unit() got = make(); got };\nunit() run = fn { unit() first = wrap(); first(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let wrap = reference_function(items, "wrap");
+        let cfg = &wrap.reference_cfg;
+        assert_eq!(
+            cfg.producer_return_cases.len(),
+            1,
+            "{:?}",
+            cfg.producer_return_cases
+        );
+        let case = &cfg.producer_return_cases[0];
+        assert_eq!(case.table.owner, cfg.producer_owner);
+        let call = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::ModuleCallable { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("forwarded call");
+        let HolderProducerRef::Forward {
+            previous, action, ..
+        } = &case.producer
+        else {
+            panic!("forwarded producer {:?}", case.producer);
+        };
+        assert!(
+            matches!(
+                action,
+                CallableHolderAction::Retain { .. } | CallableHolderAction::Move { .. }
+            ),
+            "{action:?}"
+        );
+        let HolderProducerRef::CallCreation {
+            point, selection, ..
+        } = previous.as_ref()
+        else {
+            panic!("forwarded root {previous:?}");
+        };
+        assert_eq!(*point, call.id);
+        assert_eq!(selection.call, call.id);
+        assert_eq!(selection.destination, case.environment);
+        assert!(matches!(
+            &case.transfer,
+            CallableHolderAction::ReturnTransfer {
+                to: CallableHolderPlace::Output(0),
+                ..
+            }
+        ));
+        assert!(
+            super::reference::validate_producer_return_case_fact(cfg, case).is_ok(),
+            "{case:?}"
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.producer_return_cases, cfg.producer_return_cases);
+    }
+}
+
+#[test]
+fn nested_capture_cycles_rebase_through_source_map_in_both_validators() {
+    let scalar_cycle = "%%start\n(unit())() make = fn { unit() inner = fn { 1; }; inner = fn { inner(); }; inner };\nunit() run = fn { unit() first = make(); unit() copied = first; unit() second = make(); copied; second; };\n%%end";
+    let installed_cycle = "%%start\n(unit())() make = fn { (unit())[1] slots; unit() inner = fn { unit() picked = slots[0]; picked(); }; slots[0] = inner; inner };\nunit() run = fn { unit() first = make(); unit() copied = first; unit() second = make(); copied; second; };\n%%end";
+    for text in [scalar_cycle, installed_cycle] {
+        let (single, project) = both_reference_functions(text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            let make = reference_function(items, "make");
+            let cfg = &make.reference_cfg;
+            assert_eq!(
+                cfg.producer_return_cases.len(),
+                1,
+                "{text}: {:?}",
+                cfg.producer_return_cases
+            );
+            let case = &cfg.producer_return_cases[0];
+            assert_eq!(case.table.owner, cfg.producer_owner);
+            assert_eq!(case.output, 0);
+            assert!(
+                matches!(
+                    &case.transfer,
+                    CallableHolderAction::ReturnTransfer {
+                        to: CallableHolderPlace::Output(0),
+                        ..
+                    }
+                ),
+                "{text}: {:?}",
+                case.transfer
+            );
+            let mut root = &case.producer;
+            while let HolderProducerRef::Forward { previous, .. } = root {
+                root = previous;
+            }
+            assert!(
+                matches!(
+                    root,
+                    HolderProducerRef::CaptureCreation { .. }
+                        | HolderProducerRef::InstalledRead { .. }
+                ),
+                "{text}: {:?}",
+                case.producer
+            );
+            assert!(
+                super::reference::validate_producer_return_case_fact(cfg, case).is_ok(),
+                "{text}: {case:?}"
+            );
+            let run = reference_function(items, "run");
+            let run_cfg = &run.reference_cfg;
+            let entries = run_cfg
+                .environment_imports
+                .iter()
+                .filter(|entry| entry.table == case.table)
+                .collect::<Vec<_>>();
+            assert!(!entries.is_empty(), "{text}: {entries:?}");
+            let mut calls: Vec<(SourceSpan, Vec<(usize, CallableEnvironmentInstance)>)> =
+                Vec::new();
+            for entry in &entries {
+                let destination = run_cfg
+                    .environments
+                    .get(entry.destination.index)
+                    .expect("destination environment");
+                assert_eq!(destination.literal, entry.destination.literal);
+                assert_eq!(destination.instance, entry.destination_instance);
+                for input in destination
+                    .inputs
+                    .iter()
+                    .chain(destination.capture_paths.iter().flatten())
+                {
+                    for id in input.environments.iter().chain(
+                        input
+                            .projected
+                            .iter()
+                            .flat_map(|projection| projection.environments.iter()),
+                    ) {
+                        assert!(
+                            run_cfg
+                                .environments
+                                .get(id.index)
+                                .is_some_and(|fact| fact.literal == id.literal),
+                            "{text}: rebased nested id {id:?}"
+                        );
+                    }
+                }
+                let call = match &entry.destination_instance {
+                    CallableEnvironmentInstance::CallOutput { call, .. } => call.clone(),
+                    instance => panic!("{text}: expected call output instance, found {instance:?}"),
+                };
+                match calls.iter_mut().find(|(known, _)| *known == call) {
+                    Some((_, sources)) => {
+                        sources.push((entry.source_index, entry.source_instance.clone()));
+                    }
+                    None => calls.push((
+                        call,
+                        vec![(entry.source_index, entry.source_instance.clone())],
+                    )),
+                }
+            }
+            assert_eq!(calls.len(), 2, "{text}: {entries:?}");
+            for (_, sources) in &mut calls {
+                sources.sort_by_key(|(index, _)| *index);
+            }
+            assert_eq!(calls[0].1, calls[1].1, "{text}: {entries:?}");
+            assert!(
+                calls[0].1.contains(&(
+                    case.alternative.source_index,
+                    case.alternative.source_instance.clone()
+                )),
+                "{text}: {entries:?}"
+            );
+            let destinations = entries
+                .iter()
+                .map(|entry| entry.destination.clone())
+                .collect::<Vec<_>>();
+            let mut unique = destinations.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(unique.len(), destinations.len(), "{text}: {entries:?}");
+            let encoded = serde_json::to_string(cfg).unwrap();
+            let restored: ScalarReferenceCfg = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(restored.producer_return_cases, cfg.producer_return_cases);
+            assert_eq!(
+                restored.capture_input_path_facts,
+                cfg.capture_input_path_facts
+            );
+            assert_eq!(serde_json::to_string(&restored).unwrap(), encoded);
+            let run_encoded = serde_json::to_string(run_cfg).unwrap();
+            let run_restored: ScalarReferenceCfg = serde_json::from_str(&run_encoded).unwrap();
+            assert_eq!(
+                run_restored.environment_imports,
+                run_cfg.environment_imports
+            );
+            assert_eq!(serde_json::to_string(&run_restored).unwrap(), run_encoded);
+        }
+    }
+}
+
+#[test]
+fn return_case_validation_rejects_invalid_spans_in_both_validators() {
+    let text = "%%start\n(u8())(bool) pick = fn(flag) { (u8())[2] slots; slots[0] = fn { 1 }; slots[1] = fn { 2 }; if (flag) { slots[0] } else { slots[1] } };\nunit() run = fn { u8() read = pick(true); read(); };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics, source) in [
+        (
+            &single.program.items,
+            &single.diagnostics,
+            &single.program.source,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.diagnostics,
+            &project.project.modules[0].source,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pick = reference_function(items, "pick");
+        let cfg = &pick.reference_cfg;
+        assert_eq!(cfg.producer_return_cases.len(), 2);
+        let mut swapped = cfg.producer_return_cases.clone();
+        let transfer = swapped[0].transfer.clone();
+        swapped[0].transfer = swapped[1].transfer.clone();
+        swapped[1].transfer = transfer;
+        for fact in &swapped {
+            let expected = cfg.points[fact.return_point.0].source_span.clone();
+            assert!(
+                matches!(super::reference::validate_producer_return_case_fact(cfg, fact), Err(ReferenceAnalysisError::MissingContext { source_span, reason: ReferenceAnalysisErrorReason::MissingGlobalCallableProducer }) if source_span == expected),
+                "{fact:?}"
+            );
+        }
+        let mut relocated = cfg.producer_return_cases[0].clone();
+        relocated.producer = HolderProducerRef::CaptureCreation {
+            point: relocated.return_point,
+            environment: relocated.environment.clone(),
+        };
+        let expected = cfg.points[relocated.return_point.0].source_span.clone();
+        assert!(
+            matches!(super::reference::validate_producer_return_case_fact(cfg, &relocated), Err(ReferenceAnalysisError::MissingContext { source_span, reason: ReferenceAnalysisErrorReason::MissingGlobalCallableProducer }) if source_span == expected),
+            "{relocated:?}"
+        );
+        let mut missing = cfg.clone();
+        missing.producer_return_cases[0].alternative.source_index = usize::MAX;
+        let removed = &cfg.producer_return_cases[0];
+        let mut function = pick.clone();
+        function.reference_cfg = missing;
+        let mut contracts = Vec::new();
+        let error = super::reference::collect_function_output_contracts(
+            source,
+            &function,
+            function.name_span,
+            super::reference::ReferenceCallableBody::Declaration,
+            &mut contracts,
+        )
+        .expect_err("missing return case");
+        let expected = cfg.points[removed.return_point.0].source_span.clone();
+        assert!(
+            matches!(error, ReferenceAnalysisError::MissingContext { ref source_span, reason: ReferenceAnalysisErrorReason::MissingGlobalCallableProducer } if *source_span == expected),
+            "{error:?}"
+        );
+        let restored: ScalarReferenceCfg =
+            serde_json::from_str(&serde_json::to_string(cfg).unwrap()).unwrap();
+        assert_eq!(restored.producer_return_cases, cfg.producer_return_cases);
+    }
+}
+
+#[test]
+fn module_multi_output_plain_receivers_register_every_output_in_both_validators() {
+    let text = "%%start\npair = overload {\n    generic T;\n    (T, T)(T) => fn(value) { value };\n};\ni64 wide = 41;\ni64 first, i64 second = pair(wide);\nbool selected = first == wide && second == wide;\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, cfg, diagnostics) in [
+        (
+            &single.program.items,
+            &single.program.top_level_reference_cfg,
+            &single.diagnostics,
+        ),
+        (
+            &project.project.modules[0].items,
+            &project.project.modules[0].top_level_reference_cfg,
+            &project.diagnostics,
+        ),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let binding = items
+            .iter()
+            .find_map(|item| match item {
+                ScalarItem::Binding(binding) if binding.receivers.len() == 2 => Some(binding),
+                _ => None,
+            })
+            .expect("two-output binding");
+        assert_eq!(binding.receivers[0].ty, ScalarType::I64);
+        assert_eq!(binding.receivers[1].ty, ScalarType::I64);
+        assert!(
+            cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Bind { binding: id } if id.declaration_span == binding.receivers[1].name_span)),
+            "missing Bind for {}: {:?}",
+            binding.receivers[1].name,
+            cfg.points
+        );
+        for receiver in &binding.receivers {
+            assert!(
+                cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Read { binding: id } if id.declaration_span == receiver.name_span)),
+                "missing Read for {}: {:?}",
+                receiver.name,
+                cfg.points
+            );
+        }
+    }
+}
+
+#[test]
+fn module_callables_resolve_through_every_namespace_alias() {
+    let child_source = module_source("src/child.w");
+    let child = module_from_text(
+        child_source.clone(),
+        "%%start\ni32() read = fn { 7 };\n%%end",
+    );
+    let main_source = module_source("src/main.w");
+    let main_text = "%%start\nchild = namespace app \"src/child.w\";\ni32 first = child.read();\nagain = namespace app \"src/child.w\";\ni32 second = again.read();\n%%end";
+    let main = module_from_text(main_source.clone(), main_text);
+    let mut namespace_bindings = Vec::new();
+    for item in &main.items {
+        if let ScalarItem::Namespace(namespace) = item {
+            namespace_bindings.push(ScalarNamespaceBinding {
+                binding: namespace.binding.clone(),
+                target: child_source.clone(),
+                span: namespace.span,
+            });
+        }
+    }
+    assert_eq!(namespace_bindings.len(), 2);
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![
+            ScalarModule::from_program(main, namespace_bindings),
+            ScalarModule::from_program(child, Vec::new()),
+        ],
+        Vec::new(),
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    let cfg = &project
+        .project
+        .modules
+        .iter()
+        .find(|module| module.source == main_source)
+        .expect("main module")
+        .top_level_reference_cfg;
+    let mut targets = Vec::new();
+    for call in ["child.read()", "again.read()"] {
+        let start = main_text.find(call).unwrap() as u32;
+        let span = ByteSpan::new(start, start + call.len() as u32);
+        let target = cfg
+            .points
+            .iter()
+            .find_map(|point| match &point.kind {
+                CfgPointKind::Call {
+                    output: 0, target, ..
+                } if point.source_span.range == span => Some(target.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("resolved call {call}: {:?}", cfg.points));
+        assert!(
+            matches!(target, ResolvedCallTarget::ModuleCallable { .. }),
+            "{call}: {target:?}"
+        );
+        targets.push(target);
+    }
+    assert_eq!(targets[0], targets[1]);
 }

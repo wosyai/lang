@@ -1,0 +1,89 @@
+shared_stdlib = true
+
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/stdout"
+stderr = "expected/empty"
+exact = true
+
+[[steps]]
+command = ["wosy", "build", "native"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "native"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[steps]]
+command = ["wosy", "build", "branch_native"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "branch_native"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[steps]]
+command = ["wosy", "build", "branch_wasm"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "branch_wasm"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[steps]]
+command = ["wosy", "build", "counted_native"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "counted_native"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[steps]]
+command = ["wosy", "build", "counted_wasm"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "counted_wasm"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[steps]]
+command = ["wosy", "build", "global_native"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "global_native"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[steps]]
+command = ["wosy", "build", "global_wasm"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "global_wasm"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true

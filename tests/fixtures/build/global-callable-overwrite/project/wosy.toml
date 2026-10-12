@@ -1,0 +1,54 @@
+[package]
+name = "global_callable_overwrite"
+default_target = "native"
+
+[comments]
+categories = []
+
+[builders.native]
+command = ["python", "scripts/build-native"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[runners.native]
+command = ["python", "scripts/run-native"]
+args = []
+
+[builders.wasm]
+command = ["python", "scripts/build-wasm"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[runners.wasm]
+command = ["python", "scripts/run-wasm"]
+args = []
+
+[targets.native]
+root = "src/main.w"
+
+[targets.native.artifacts.main]
+artifact = "GlobalCallableOverwriteNative"
+
+[targets.native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.native.profiles.dev]
+main_artifact = "main"
+
+[targets.wasm]
+root = "src/main.w"
+
+[targets.wasm.artifacts.main]
+artifact = "GlobalCallableOverwriteWasm"
+
+[targets.wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.wasm.profiles.dev]
+main_artifact = "main"

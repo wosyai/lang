@@ -52,7 +52,7 @@ if_block_item = { (if_expr | unit_if_expr) ~ !";" ~ !"}" }
 final_output_list = { output_list }
 local_binding = { allocation_binding | receiver_list ~ "=" ~ output_list ~ ";" }
 allocation_binding = { runtime_receiver ~ ";" }
-runtime_receiver = { type_name ~ "[" ~ expression ~ "]" ~ identifier }
+runtime_receiver = { (parenthesized_type | type_name) ~ "[" ~ expression ~ "]" ~ identifier }
 expression = { if_expr | unit_if_expr | unsafe_expr | assignment | logical_or }
 if_expr = { "if" ~ "(" ~ expression ~ ")" ~ block ~ "else" ~ block }
 unit_if_expr = { "if" ~ "(" ~ expression ~ ")" ~ block }
@@ -75,7 +75,8 @@ shift = { additive ~ (shift_operator ~ additive)* }
 additive = { multiplicative ~ (add_operator ~ multiplicative)* }
 multiplicative = { unary ~ (multiply_operator ~ unary)* }
 unary = { unary_operator ~ unary | primary }
-primary = { call | raw_address | checked_address | indexed_place | field_access | dereference | struct_literal | array_literal | boolean | identifier | float | integer | char | string | parenthesized }
+primary = { function_literal | call | raw_address | checked_address | indexed_place | field_access | dereference | struct_literal | array_literal | boolean | identifier | float | integer | char | string | parenthesized }
+function_literal = { "fn" ~ parameters? ~ block }
 parenthesized = { "(" ~ expression ~ ")" }
 struct_literal = { "{" ~ struct_literal_field* ~ "}" }
 struct_literal_field = { "." ~ identifier ~ "=" ~ expression ~ ";" }
@@ -85,7 +86,7 @@ checked_address = { "&" ~ checked_address_mutability? ~ (place_target | parenthe
 checked_address_mutability = { "!" }
 parenthesized_dereference_place = { "(" ~ dereference ~ ")" }
 place_target = { indexed_place | assignment_target }
-indexed_place = { (qualified_member | dereferenced_field | identifier) ~ index_suffix+ }
+indexed_place = { (qualified_member | dereferenced_field | parenthesized_dereference_place | identifier) ~ index_suffix+ }
 index_suffix = { "[" ~ expression ~ "]" }
 dereference = { "*" ~ primary }
 field_access = { qualified_member | dereferenced_field }

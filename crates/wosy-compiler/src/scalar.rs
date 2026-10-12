@@ -214,7 +214,30 @@ pub struct ReferenceBindingId {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum ReferenceBindingKind {
     Declared,
-    CallOutput { point: CfgPointId, output: usize },
+    BorrowedReferent {
+        parameter: usize,
+    },
+    CallOutput {
+        point: CfgPointId,
+        output: usize,
+    },
+    AssignmentPrevious {
+        snapshot: CfgPointId,
+        output: usize,
+    },
+    Captured {
+        environment_start: u32,
+        environment_end: u32,
+    },
+    Projected {
+        field: usize,
+    },
+    ImportedCapture {
+        call_start: u32,
+        call_end: u32,
+        output: usize,
+        producer: Box<ReferenceBindingId>,
+    },
 }
 
 impl Ord for ReferenceBindingId {
@@ -265,6 +288,7 @@ pub enum ReferencePlaceProjection {
 pub struct ReferenceLoanId {
     pub mode: ScalarReferenceMutability,
     pub origin_place: ReferencePlaceId,
+    pub creation_source: SourceIdentity,
     pub creation_span: ByteSpan,
     pub parent: Option<Box<ReferenceLoanId>>,
 }
@@ -303,14 +327,1073 @@ pub struct ReferenceFlowPoint {
     pub source_span: SourceSpan,
     pub scope: ReferenceScopeId,
     pub possible_origins: Option<BTreeSet<ReferenceOriginId>>,
+    pub possible_environments: BTreeSet<CallableEnvironmentId>,
+    pub possible_projected_environments: Vec<CallableProjectedEnvironment>,
+    pub possible_callee_environments: BTreeSet<CallableEnvironmentId>,
+    pub possible_backings: Vec<RuntimeBackingFact>,
+    pub possible_projected_backings: Vec<RuntimeProjectedBackingFact>,
+    pub backing_argument_paths: Vec<Vec<RuntimeCallArgumentFact>>,
+    pub global_callable_call_paths: Vec<Vec<GlobalCallableCallPathFact>>,
+    pub global_callable_output_effects: Vec<GlobalCallableOutputEffectFact>,
+    pub call_import_paths: Vec<Vec<ProducerCallSelectionFact>>,
     pub successors: Vec<CfgPointId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalCallableCallPathFact {
+    pub callee: ResolvedCallTarget,
+    pub holder: CallableHolderPlace,
+    pub initialization: GlobalCallableInitializationFact,
+    pub relations: Vec<CallableHolderRelation>,
+    pub backings: Vec<RuntimeBackingFact>,
+    pub projected_backings: Vec<RuntimeProjectedBackingFact>,
+    pub origins: BTreeSet<ReferenceOriginId>,
+    pub released: bool,
+    pub moved: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum GlobalCallableInitializationFact {
+    Initialized,
+    Uninitialized,
+    AwaitingCallsiteInput,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalCallableOutputEffectFact {
+    pub target: ReferencePlaceId,
+    pub before: Vec<CallableHolderRelation>,
+    pub after: Vec<CallableHolderRelation>,
+    pub actions: Vec<CallableHolderAction>,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalCallOccurrenceKey {
+    pub caller: SourceIdentity,
+    pub caller_cfg: ProducerCfgOwnerId,
+    pub point: CfgPointId,
+    pub span: SourceSpan,
+    pub callee: ResolvedCallTarget,
+    pub output: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalCallableCallExitFact {
+    pub entry: GlobalCallOccurrenceKey,
+    pub exit_point: CfgPointId,
+    pub post_holders: Vec<GlobalCallableCallPathFact>,
+    pub kills: Vec<CallableHolderPlace>,
+    pub installs: Vec<CallableHolderRelation>,
+    pub actions: Vec<CallableHolderAction>,
+    pub writes: Vec<GlobalCallableOutputEffectFact>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalCallExitImportFact {
+    pub callee: ProducerCfgOwnerId,
+    pub source_index: usize,
+    pub source_literal: SourceSpan,
+    pub destination: CallableEnvironmentId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeValueId {
+    pub source: SourceIdentity,
+    pub function_span: ByteSpan,
+    pub creation_span: ByteSpan,
+    pub position: RuntimeValuePosition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RuntimeValuePosition {
+    Local,
+    CapturedCall {
+        call: SourceSpan,
+        output: usize,
+        lineage: Box<RuntimeValueId>,
+    },
+    Parameter {
+        declaration_span: ByteSpan,
+    },
+    Argument {
+        call: ByteSpan,
+        index: usize,
+    },
+    CallOutput {
+        call: ByteSpan,
+        output: usize,
+        target_source: SourceIdentity,
+        target_declaration: ByteSpan,
+        origin: SourceSpan,
+        action: RuntimeOutputBackingAction,
+        lineage: Box<RuntimeValueId>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RuntimeBackingKind {
+    FixedValue,
+    OwnedAllocation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeBackingFact {
+    pub value: RuntimeValueId,
+    pub owner: ReferenceBindingId,
+    pub kind: RuntimeBackingKind,
+    pub origin: SourceSpan,
+    pub length: RuntimeArrayLengthFact,
+    pub callable_family: Vec<CallableArrayFamilyFact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableArrayFamilyFact {
+    pub element: ScalarType,
+    pub elements: Vec<CallableArrayElementFact>,
+    pub index_relations: Vec<CallableArrayIndexRelationFact>,
+    pub unselected: CallableArrayUnselectedFact,
+    pub partitions: Vec<CallableIndexedPartitionFact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableIndexedPartitionFact {
+    pub representatives: Vec<CallableIndexRepresentativeFact>,
+    pub relations: Vec<CallableIndexEqualityFact>,
+    pub remainder: CallableCellDomainFact,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableIndexRepresentativeFact {
+    pub key: CallableIndexKeyFact,
+    pub anchors: Vec<CallableIndexAnchorFact>,
+    pub cell: CallableCellDomainFact,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CallableIndexKeyFact {
+    Constant(BigInt),
+    LivePlace(ReferencePlaceId),
+    Evaluated {
+        point: CfgPointId,
+        occurrence: SourceSpan,
+        function_span: ByteSpan,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CallableIndexAnchorFact {
+    ValuePlace(ReferencePlaceId),
+    ActiveLoan {
+        loan: ReferenceLoanId,
+        backing: RuntimeValueId,
+        owner: ReferenceBindingId,
+        length: RuntimeArrayLengthFact,
+        origin: SourceSpan,
+    },
+    EscapedHolder(CallableHolderPlace),
+    InFlightSelection(CfgPointId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableIndexEqualityFact {
+    pub left: CallableIndexKeyFact,
+    pub right: CallableIndexKeyFact,
+    pub relation: CallableArrayIndexRelation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableCellDomainFact {
+    pub alternatives: Vec<CallableCellCaseFact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CallableCellCaseFact {
+    Uninitialized,
+    Initialized {
+        environment_origin: CallableEnvironmentId,
+        instance: CallableEnvironmentInstanceClassFact,
+        holder_aliases: Vec<CallableHolderPlace>,
+        backing: RuntimeValueId,
+        owner: ReferenceBindingId,
+        capture_paths: Vec<Vec<CallableCaptureInput>>,
+        loans: BTreeSet<CallableLoanId>,
+        moved: bool,
+        origin: SourceSpan,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CallableEnvironmentInstanceClassFact {
+    FreshPerCell,
+    SharedWith(CallableHolderPlace),
+    ImportedMayAlias,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableArrayUnselectedFact {
+    pub selected: Vec<CallableArrayIndexFact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableArrayElementFact {
+    pub place: ReferencePlaceId,
+    pub index: CallableArrayIndexFact,
+    pub environment: CallableEnvironmentId,
+    pub instances: CallableArrayEnvironmentInstances,
+    pub aliases: Vec<CallableHolderPlace>,
+    pub loans: BTreeSet<CallableLoanId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CallableArrayEnvironmentInstances {
+    KnownElement,
+    PerEvaluatedIndex,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CallableArrayIndexFact {
+    Constant(BigInt),
+    Selected {
+        point: CfgPointId,
+        occurrence: SourceSpan,
+        function_span: ByteSpan,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableArrayIndexRelationFact {
+    pub left: CallableArrayIndexFact,
+    pub right: CallableArrayIndexFact,
+    pub relation: CallableArrayIndexRelation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CallableArrayIndexRelation {
+    Equal,
+    Distinct,
+    MayAlias,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RuntimeArrayLengthFact {
+    Fixed {
+        value: u64,
+        origin: SourceSpan,
+    },
+    Evaluated {
+        expression: ScalarExpression,
+        occurrence: SourceSpan,
+        point: CfgPointId,
+        function_span: ByteSpan,
+    },
+    Parameter {
+        binding: ReferenceBindingId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeBackingLengthSite {
+    pub binding: ReferenceBindingId,
+    pub length: RuntimeArrayLengthFact,
+    pub element: ScalarType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableArrayParameterFact {
+    pub binding: ReferenceBindingId,
+    pub element: ScalarType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeProjectedBackingFact {
+    pub place: ReferencePlaceId,
+    pub backing: RuntimeBackingFact,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeCallArgumentFact {
+    pub position: usize,
+    pub projections: Vec<ReferencePlaceProjection>,
+    pub backing: RuntimeBackingFact,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeCallSignature {
+    pub source: SourceIdentity,
+    pub declaration_span: ByteSpan,
+    pub selection: RuntimeCallSelection,
+    pub parameters: Vec<ScalarType>,
+    pub outputs: Vec<ScalarType>,
+    pub generic_parameters: Vec<String>,
+    pub bindings: Vec<ReferenceBindingId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RuntimeCallSelection {
+    Declaration,
+    Overload(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RuntimeOutputBackingSource {
+    Parameter(usize),
+    Created {
+        origin: SourceSpan,
+        action: RuntimeOutputBackingAction,
+        lineage: RuntimeValueId,
+        length: RuntimeArrayLengthFact,
+        callable_family: Vec<CallableArrayFamilyFact>,
+        owner: ReferenceBindingId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RuntimeOutputBackingAction {
+    Allocate,
+    CopyFixed,
+    MoveFixed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RuntimeReturnBackingAction {
+    Transfer,
+    CopyFixed { source: ReferenceBindingId },
+    MoveFixed { source: ReferenceBindingId },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeBackingOutputContract {
+    pub source: SourceIdentity,
+    pub declaration_span: ByteSpan,
+    pub selection: RuntimeCallSelection,
+    pub output: usize,
+    pub projections: Vec<ReferencePlaceProjection>,
+    pub sources: Vec<RuntimeOutputBackingSource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RuntimeBackingTransfer {
+    CreateFixed,
+    Allocate,
+    CopyFixed { source: ReferenceBindingId },
+    Move { source: ReferenceBindingId },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum HolderProducerRef {
+    CaptureCreation {
+        point: CfgPointId,
+        environment: CallableEnvironmentId,
+    },
+    CallCreation {
+        point: CfgPointId,
+        environment: CallableEnvironmentId,
+        selection: ProducerCallSelectionFact,
+    },
+    InstalledRead {
+        point: CfgPointId,
+        environment: CallableEnvironmentId,
+        action: CallableHolderAction,
+    },
+    GlobalCallsiteInput {
+        call: SourceSpan,
+        holder: CallableHolderPlace,
+        environment: CallableEnvironmentId,
+    },
+    Forward {
+        point: CfgPointId,
+        environment: CallableEnvironmentId,
+        action: CallableHolderAction,
+        previous: Box<HolderProducerRef>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectedCaptureHolderFact {
+    pub holder: CallableHolderPlace,
+    pub environment: CallableEnvironmentId,
+    pub producer: HolderProducerRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CaptureInputOriginFact {
+    Value,
+    Callable {
+        holders: Vec<ConnectedCaptureHolderFact>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CaptureInputFact {
+    pub binding: ReferenceBindingId,
+    pub origin: CaptureInputOriginFact,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CaptureInputPathFact {
+    pub capture: CfgPointId,
+    pub capture_span: SourceSpan,
+    pub owner: ProducerCfgOwnerId,
+    pub inputs: Vec<CaptureInputFact>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct ReferenceOriginId(pub usize);
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableEnvironmentId {
+    pub literal: SourceSpan,
+    pub index: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProducerCfgOwnerId {
+    Module(SourceIdentity),
+    Function {
+        source: SourceIdentity,
+        declaration: ByteSpan,
+        body: ProducerFunctionBodyId,
+    },
+    Literal {
+        enclosing: Box<ProducerCfgOwnerId>,
+        capture_point: CfgPointId,
+        literal: SourceSpan,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProducerFunctionBodyId {
+    Declaration,
+    Overload(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProducerOutputAlternativeId {
+    pub source_index: usize,
+    pub source_instance: CallableEnvironmentInstance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProducerTableId {
+    pub owner: ProducerCfgOwnerId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProducerReturnSelectionFact {
+    pub table: ProducerTableId,
+    pub return_point: CfgPointId,
+    pub output: usize,
+    pub alternative: ProducerOutputAlternativeId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProducerReturnCaseFact {
+    pub table: ProducerTableId,
+    pub return_point: CfgPointId,
+    pub output: usize,
+    pub alternative: ProducerOutputAlternativeId,
+    pub holder: CallableHolderPlace,
+    pub environment: CallableEnvironmentId,
+    pub transfer: CallableHolderAction,
+    pub producer: HolderProducerRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentImportFact {
+    pub table: ProducerTableId,
+    pub source_index: usize,
+    pub source_instance: CallableEnvironmentInstance,
+    pub destination_instance: CallableEnvironmentInstance,
+    pub destination: CallableEnvironmentId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProducerCallSelectionFact {
+    pub call: CfgPointId,
+    pub target: ResolvedCallTarget,
+    pub output: usize,
+    pub source: ProducerReturnSelectionFact,
+    pub destination: CallableEnvironmentId,
+    pub projection: Vec<ReferencePlaceProjection>,
+}
+
+impl Ord for CallableEnvironmentId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            &self.literal.source.project,
+            &self.literal.source.package,
+            &self.literal.source.path,
+            &self.literal.source.revision,
+            self.literal.range.start,
+            self.literal.range.end,
+            self.index,
+        )
+            .cmp(&(
+                &other.literal.source.project,
+                &other.literal.source.package,
+                &other.literal.source.path,
+                &other.literal.source.revision,
+                other.literal.range.start,
+                other.literal.range.end,
+                other.index,
+            ))
+    }
+}
+
+impl PartialOrd for CallableEnvironmentId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct CallableLoanId {
+    pub origin: ReferenceOriginId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableEnvironmentFact {
+    pub literal: SourceSpan,
+    pub instance: CallableEnvironmentInstance,
+    pub origins: BTreeSet<ReferenceOriginId>,
+    pub owners: BTreeSet<ReferenceBindingId>,
+    pub loans: BTreeSet<CallableLoanId>,
+    pub backings: Vec<RuntimeBackingFact>,
+    pub inputs: Vec<CallableCaptureInput>,
+    pub capture_paths: Vec<Vec<CallableCaptureInput>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CallableEnvironmentInstance {
+    Capture,
+    CallOutput {
+        call: SourceSpan,
+        output: usize,
+        function_span: ByteSpan,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableCaptureInput {
+    pub binding: ReferenceBindingId,
+    pub origins: BTreeSet<ReferenceOriginId>,
+    pub environments: BTreeSet<CallableEnvironmentId>,
+    pub projected: Vec<CallableProjectedEnvironment>,
+    pub backings: Vec<RuntimeBackingFact>,
+    pub projected_backings: Vec<RuntimeProjectedBackingFact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableProjectedEnvironment {
+    pub place: ReferencePlaceId,
+    pub environments: BTreeSet<CallableEnvironmentId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CallableHolderPlace {
+    Temporary(CfgPointId),
+    Binding(ReferenceBindingId),
+    Projection(ReferencePlaceId),
+    Output(usize),
+    OutputProjection {
+        output: usize,
+        projections: Vec<ReferencePlaceProjection>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableHolderRelation {
+    pub environment: CallableEnvironmentId,
+    pub holders: Vec<CallableHolderPlace>,
+    pub capture_paths: Vec<Vec<CallableCaptureInput>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableArraySelectedHolderFact {
+    pub value: RuntimeValueId,
+    pub owner: ReferenceBindingId,
+    pub length: RuntimeArrayLengthFact,
+    pub index_point: CfgPointId,
+    pub occurrence: SourceSpan,
+    pub place: ReferencePlaceId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CallableHolderAction {
+    SelectElement {
+        target: ReferencePlaceId,
+        index_point: CfgPointId,
+        selected: ReferencePlaceId,
+    },
+    DropSelected {
+        holder: CallableArraySelectedHolderFact,
+        previous: Vec<CallableArrayElementFact>,
+        old: CallableCellCaseFact,
+        guard: Vec<CallableIndexEqualityFact>,
+        span: SourceSpan,
+    },
+    SkipUninitializedSelected {
+        holder: CallableArraySelectedHolderFact,
+        guard: Vec<CallableIndexEqualityFact>,
+        span: SourceSpan,
+    },
+    RetainCheckedSelected {
+        holder: CallableArraySelectedHolderFact,
+        old: CallableCellCaseFact,
+        guard: Vec<CallableIndexEqualityFact>,
+        to: CallableHolderPlace,
+        span: SourceSpan,
+    },
+    RetainSelected {
+        environment: CallableEnvironmentId,
+        from: CallableHolderPlace,
+        to: CallableArraySelectedHolderFact,
+        span: SourceSpan,
+    },
+    MoveSelected {
+        environment: CallableEnvironmentId,
+        from: CallableHolderPlace,
+        to: CallableArraySelectedHolderFact,
+        span: SourceSpan,
+    },
+    Retain {
+        environment: CallableEnvironmentId,
+        from: CallableHolderPlace,
+        to: CallableHolderPlace,
+        span: SourceSpan,
+    },
+    Move {
+        environment: CallableEnvironmentId,
+        from: CallableHolderPlace,
+        to: CallableHolderPlace,
+        span: SourceSpan,
+    },
+    Drop {
+        environment: CallableEnvironmentId,
+        holder: CallableHolderPlace,
+        span: SourceSpan,
+    },
+    DropArrayElements {
+        backing: RuntimeBackingFact,
+        span: SourceSpan,
+    },
+    DropCapturedValueCellOwner {
+        binding: ReferenceBindingId,
+        cell: SourceSpan,
+        ty: ScalarType,
+        span: SourceSpan,
+    },
+    DropCaptureCellOwner {
+        binding: ReferenceBindingId,
+        cell: SourceSpan,
+        backing: RuntimeBackingFact,
+        span: SourceSpan,
+    },
+    ReplaceCaptureCellValue {
+        binding: ReferenceBindingId,
+        cell: SourceSpan,
+        previous: RuntimeBackingFact,
+        incoming: RuntimeBackingFact,
+        span: SourceSpan,
+    },
+    RetainArrayElements {
+        source: RuntimeBackingFact,
+        backing: RuntimeBackingFact,
+        span: SourceSpan,
+    },
+    ReturnTransfer {
+        environment: CallableEnvironmentId,
+        from: CallableHolderPlace,
+        to: CallableHolderPlace,
+        span: SourceSpan,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableHolderEdgeFact {
+    pub from: CfgPointId,
+    pub to: CfgPointId,
+    pub before: Vec<CallableHolderRelation>,
+    pub after: Vec<CallableHolderRelation>,
+    pub actions: Vec<CallableHolderAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableHolderExitFact {
+    pub from: CfgPointId,
+    pub before: Vec<CallableHolderRelation>,
+    pub after: Vec<CallableHolderRelation>,
+    pub actions: Vec<CallableHolderAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableProgramTerminalOwner {
+    pub source: SourceIdentity,
+    pub module_exit: CfgPointId,
+    pub module_relation: CallableHolderRelation,
+    pub action: CallableHolderAction,
+    pub environment: CallableEnvironmentId,
+    pub holder: CallableHolderPlace,
+    pub global: ReferenceBindingId,
+    pub global_name: String,
+    pub ty: ScalarType,
+}
+
+fn program_terminal_owners(
+    source: &SourceIdentity,
+    items: &[ScalarItem],
+    cfg: &ScalarReferenceCfg,
+) -> Vec<CallableProgramTerminalOwner> {
+    // The module terminal owner derives from the finally reachable
+    // initialized flow: a global observed only through uninitialized
+    // alternatives keeps its diagnostic and receives no terminal owner.
+    let mut initialized: HashSet<ReferenceBindingId> = HashSet::new();
+    let mut uninitialized: HashSet<ReferenceBindingId> = HashSet::new();
+    for point in &cfg.points {
+        for paths in &point.global_callable_call_paths {
+            for fact in paths {
+                let binding = match &fact.holder {
+                    CallableHolderPlace::Binding(binding) => binding.clone(),
+                    CallableHolderPlace::Projection(place) => place.binding.clone(),
+                    _ => continue,
+                };
+                match fact.initialization {
+                    GlobalCallableInitializationFact::Initialized => {
+                        initialized.insert(binding);
+                    }
+                    GlobalCallableInitializationFact::Uninitialized => {
+                        uninitialized.insert(binding);
+                    }
+                    GlobalCallableInitializationFact::AwaitingCallsiteInput => {}
+                }
+            }
+        }
+    }
+    let mut owners = Vec::new();
+    for exit in &cfg.holder_exits {
+        if cfg.top_level.points.iter().all(|point| {
+            point.point != exit.from
+                || !matches!(
+                    point.execution,
+                    ScalarTopLevelPointExecution::Connected { .. }
+                )
+        }) {
+            continue;
+        }
+        for relation in &exit.after {
+            for holder in &relation.holders {
+                let binding = match holder {
+                    CallableHolderPlace::Binding(binding) => binding,
+                    CallableHolderPlace::Projection(place) => &place.binding,
+                    _ => continue,
+                };
+                if binding.source != *source
+                    || binding.function_span != ByteSpan::new(0, 0)
+                    || !matches!(binding.kind, ReferenceBindingKind::Declared)
+                {
+                    continue;
+                }
+                if uninitialized.contains(binding) && !initialized.contains(binding) {
+                    continue;
+                }
+                for item in items {
+                    let ScalarItem::Binding(declaration) = item else {
+                        continue;
+                    };
+                    for receiver in &declaration.receivers {
+                        if receiver.name_span != binding.declaration_span {
+                            continue;
+                        }
+                        if !cfg.top_level.bindings.iter().any(|entry| matches!(&entry.execution, ScalarTopLevelBindingExecution::Connected { points } if points.iter().any(|id| matches!(&cfg.points[id.0].kind, CfgPointKind::Bind { binding: known } if known == binding)))) { continue; }
+                        let owner = CallableProgramTerminalOwner {
+                            source: source.clone(),
+                            module_exit: exit.from,
+                            module_relation: relation.clone(),
+                            action: CallableHolderAction::Drop {
+                                environment: relation.environment.clone(),
+                                holder: holder.clone(),
+                                span: cfg.points[exit.from.0].source_span.clone(),
+                            },
+                            environment: relation.environment.clone(),
+                            holder: holder.clone(),
+                            global: binding.clone(),
+                            global_name: receiver.name.clone(),
+                            ty: receiver.ty.clone(),
+                        };
+                        if !owners.contains(&owner) {
+                            owners.push(owner);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    owners
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarLiteralReferenceCfg {
+    pub literal: SourceSpan,
+    pub capture_point: CfgPointId,
+    pub captures: Vec<closure::ClosureCapture>,
+    pub constructor_seed: source_boundary::SourceLiteralConstructorSeed,
+    pub reference_cfg: Box<ScalarReferenceCfg>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct CfgPointId(pub usize);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarWhileOccurrence {
+    pub source_span: SourceSpan,
+    pub output_projection: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarCallOccurrence {
+    pub source_span: SourceSpan,
+    pub output_projection: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarCaptureOccurrence {
+    pub source_span: SourceSpan,
+    pub output_projection: Vec<usize>,
+}
+
+impl ScalarCaptureOccurrence {
+    pub fn for_literal(span: ByteSpan, body: &ScalarBlock) -> Self {
+        Self {
+            source_span: SourceSpan::new(body.occurrence.source_span.source.clone(), span),
+            output_projection: body.occurrence.output_projection.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarCaptureCfgPoint {
+    pub occurrence: ScalarCaptureOccurrence,
+    pub role: ScalarCapturePointRole,
+    pub point: CfgPointId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarReadRole {
+    Dereference,
+    IndexedRead,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarReadOccurrence {
+    pub source_span: SourceSpan,
+    pub output_projection: Vec<usize>,
+    pub role: ScalarReadRole,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarReadCfgPoint {
+    pub occurrence: ScalarReadOccurrence,
+    pub function_span: ByteSpan,
+    pub point: CfgPointId,
+    pub indices: Vec<ScalarIndexCfgPoint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarIndexCfgPoint {
+    pub source_span: SourceSpan,
+    pub point: CfgPointId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarCapturePointRole {
+    Capture,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarCallCfgPoint {
+    pub occurrence: ScalarCallOccurrence,
+    pub evaluated_point: CfgPointId,
+    pub projections: Vec<ScalarCallOutputProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarCallOutputProjection {
+    pub output: usize,
+    pub point: CfgPointId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarBindingOccurrence {
+    pub source_span: SourceSpan,
+    pub output_projection: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarAssignmentOccurrence {
+    pub source_span: SourceSpan,
+    pub output_projection: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarBindingPointRole {
+    Bind,
+    CopyCallableFields,
+    FieldAssign(ScalarStructFieldId),
+    ArrayElement(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarBindingOutputSource {
+    Direct {
+        occurrence: SourceSpan,
+        output_projection: Vec<usize>,
+        output: usize,
+    },
+    Call {
+        occurrence: ScalarCallOccurrence,
+        output: usize,
+    },
+    Conditional {
+        occurrence: SourceSpan,
+        then_block: ScalarBlockOccurrence,
+        output: usize,
+    },
+    Block {
+        occurrence: ScalarBlockOccurrence,
+        output: usize,
+    },
+    Expression {
+        occurrence: SourceSpan,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarBindingCfgPoint {
+    pub occurrence: ScalarBindingOccurrence,
+    pub output: usize,
+    pub role: ScalarBindingPointRole,
+    pub point: CfgPointId,
+    pub source: ScalarBindingOutputSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarAssignmentPointRole {
+    RhsOutput,
+    Destination,
+    PreviousSnapshot,
+    Result,
+    Dispose,
+    SelectElement,
+    Assign,
+    AssignThrough,
+    CopyCallableFields,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarAssignmentCfgPoint {
+    pub occurrence: ScalarAssignmentOccurrence,
+    pub target: usize,
+    pub role: ScalarAssignmentPointRole,
+    pub point: CfgPointId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarTopLevelOccurrence {
+    Entry(SourceIdentity),
+    Binding(ScalarBindingOccurrence),
+    Assignment(ScalarAssignmentOccurrence),
+    Call(ScalarCallOccurrence),
+    Expression(SourceSpan),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarTopLevelPointExecution {
+    Connected {
+        occurrence: ScalarTopLevelOccurrence,
+        outgoing: Vec<CfgPointId>,
+    },
+    SupplementalAnalysisOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarTopLevelPoint {
+    pub point: CfgPointId,
+    pub execution: ScalarTopLevelPointExecution,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarTopLevelAssignmentExecution {
+    Connected { points: Vec<CfgPointId> },
+    EmittedWithoutHolderAction,
+    UnrepresentedHolderAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarTopLevelAssignment {
+    pub occurrence: ScalarAssignmentOccurrence,
+    pub execution: ScalarTopLevelAssignmentExecution,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarTopLevelCorrespondence {
+    pub points: Vec<ScalarTopLevelPoint>,
+    pub bindings: Vec<ScalarTopLevelBinding>,
+    pub assignments: Vec<ScalarTopLevelAssignment>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarTopLevelBinding {
+    pub occurrence: ScalarBindingOccurrence,
+    pub output: usize,
+    pub execution: ScalarTopLevelBindingExecution,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarTopLevelBindingExecution {
+    Connected { points: Vec<CfgPointId> },
+    EmittedWithoutHolderAction,
+    UnrepresentedHolderAction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarWhilePointRole {
+    LoopTest,
+    Branch,
+    BodyScopeExit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarWhileCfgPoint {
+    pub occurrence: ScalarWhileOccurrence,
+    pub role: ScalarWhilePointRole,
+    pub point: CfgPointId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarBlockOccurrence {
+    pub source_span: SourceSpan,
+    pub output_projection: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarBlockScopeExit {
+    pub occurrence: ScalarBlockOccurrence,
+    pub point: CfgPointId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScalarConditionalPointRole {
+    Branch,
+    ThenScopeExit,
+    ElseScopeExit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarConditionalCfgPoint {
+    pub then_block: ScalarBlockOccurrence,
+    pub role: ScalarConditionalPointRole,
+    pub point: CfgPointId,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReferenceScopeId(pub usize);
@@ -390,10 +1473,12 @@ pub enum ResolvedCallTarget {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct ResolvedCallSite {
     source_span: SourceSpan,
+    expression: ScalarExpression,
     target: ResolvedCallTarget,
+    result_type: ScalarType,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -415,6 +1500,64 @@ pub struct InvalidationCandidate {
     pub loan: ReferenceLoanId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct ReferenceRebindAssociationId(pub usize);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceRebindAssociation {
+    pub owner: ProducerCfgOwnerId,
+    pub occurrence: ScalarCallOccurrence,
+    pub address_point: CfgPointId,
+    pub effect_point: CfgPointId,
+    pub call_point: CfgPointId,
+    pub raw_point: CfgPointId,
+    pub length_point: CfgPointId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceAllocationAddressRequest {
+    pub association: ReferenceRebindAssociationId,
+    pub candidate: InvalidationCandidate,
+    pub indices: Vec<ReferenceBorrowIndexInput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceAllocationAddressCase {
+    Accepted {
+        candidate: InvalidationCandidate,
+    },
+    Rejected {
+        diagnostic: ReferenceBorrowDiagnostic,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceAllocationAddressEvaluation {
+    pub owner: ProducerCfgOwnerId,
+    pub point: CfgPointId,
+    pub association: ReferenceRebindAssociationId,
+    pub cases: Vec<ReferenceAllocationAddressCase>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceAllocationAddressValue {
+    pub association: ReferenceRebindAssociationId,
+    pub candidates: Vec<InvalidationCandidate>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceRebindEvaluation {
+    pub owner: ProducerCfgOwnerId,
+    pub effect_point: CfgPointId,
+    pub address_point: CfgPointId,
+    pub raw_point: CfgPointId,
+    pub length_point: CfgPointId,
+    pub candidate: InvalidationCandidate,
+    pub previous_backings: Vec<RuntimeBackingFact>,
+    pub resulting_backings: Vec<RuntimeBackingFact>,
+    pub expired_origins: BTreeSet<ReferenceOriginId>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ReleaseTarget {
     Raw {
@@ -428,17 +1571,202 @@ pub enum ReleaseTarget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceBorrowAccess {
+    DirectStorage,
+    Through {
+        pointer_point: CfgPointId,
+        parent_origin: ReferenceOriginId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceBorrowIndexInput {
+    pub projection: usize,
+    pub value_point: CfgPointId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceBorrowRequest {
+    DirectStorage {
+        place: ReferencePlaceId,
+        loan: ReferenceLoanId,
+        origin: ReferenceOriginId,
+        indices: Vec<ReferenceBorrowIndexInput>,
+    },
+    Through {
+        pointer_point: CfgPointId,
+        place: ScalarPlace,
+        mode: ScalarReferenceMutability,
+        indices: Vec<ReferenceBorrowIndexInput>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceBorrowRejectedInput {
+    DirectStorage,
+    Through { parent_origin: ReferenceOriginId },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceBorrowDiagnostic {
+    Missing {
+        source_span: SourceSpan,
+        reason: ReferenceAnalysisErrorReason,
+    },
+    Conflict {
+        source_span: SourceSpan,
+        origins: Vec<SourceSpan>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceBorrowCase {
+    Accepted {
+        place: ReferencePlaceId,
+        loan: ReferenceLoanId,
+        origin: ReferenceOriginId,
+        access: ReferenceBorrowAccess,
+    },
+    Invalid {
+        parent_origin: ReferenceOriginId,
+        origin: ReferenceOriginId,
+    },
+    Rejected {
+        input: ReferenceBorrowRejectedInput,
+        diagnostic: ReferenceBorrowDiagnostic,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceBorrowInput {
+    DirectStorage,
+    Through {
+        pointer_point: CfgPointId,
+        origins: BTreeSet<ReferenceOriginId>,
+    },
+    MissingProducer {
+        pointer_point: CfgPointId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceBorrowEvaluation {
+    pub owner: ProducerCfgOwnerId,
+    pub point: CfgPointId,
+    pub input: ReferenceBorrowInput,
+    pub cases: Vec<ReferenceBorrowCase>,
+    pub output: BTreeSet<ReferenceOriginId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceCheckedInstallInput {
+    Evaluated {
+        value_point: CfgPointId,
+    },
+    Parameter {
+        binding: ReferenceBindingId,
+        origin: ReferenceOriginId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceCheckedInstall {
+    pub point: CfgPointId,
+    pub input: ReferenceCheckedInstallInput,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceCheckedInstallDisposition {
+    Written,
+    Retained,
+    Uninitialized,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceCheckedInstallEvaluation {
+    pub owner: ProducerCfgOwnerId,
+    pub point: CfgPointId,
+    pub input: ReferenceCheckedInstallInput,
+    pub target: ReferencePlaceId,
+    pub previous_origins: BTreeSet<ReferenceOriginId>,
+    pub accepted_origins: BTreeSet<ReferenceOriginId>,
+    pub disposition: ReferenceCheckedInstallDisposition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CallableFieldSource {
+    Evaluated(EvaluatedValueId),
+    Assignment(ReferenceBindingId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CfgPointKind {
     Entry,
     ScopeEnter,
     ScopeExit,
     Evaluate(ScalarExpression),
+    ValueOutputProjection {
+        production: CfgPointId,
+        output: usize,
+    },
+    AssignmentDestination {
+        storage: EvaluatedDestinationStorage,
+        place: ScalarPlace,
+    },
+    AssignmentSnapshot {
+        destination_point: CfgPointId,
+        holder: ReferenceBindingId,
+        observed: bool,
+    },
+    AssignmentResult {
+        snapshot_point: CfgPointId,
+        output: usize,
+    },
+    AssignmentDispose {
+        snapshot_point: CfgPointId,
+    },
+    Capture {
+        literal: ByteSpan,
+        environment: CallableEnvironmentId,
+        signature: ScalarType,
+        captures: Vec<closure::ClosureCapture>,
+        parameters: Vec<String>,
+        parameter_spans: Vec<ByteSpan>,
+        body: ScalarBlock,
+    },
     Borrow {
-        place: ReferencePlaceId,
-        loan: ReferenceLoanId,
+        request: ReferenceBorrowRequest,
+    },
+    AllocationIdentityAddress {
+        request: ReferenceAllocationAddressRequest,
     },
     Bind {
         binding: ReferenceBindingId,
+    },
+    BindArrayElement {
+        target: ReferencePlaceId,
+        rhs_point: CfgPointId,
+    },
+    Backing {
+        target: ReferenceBindingId,
+        transfer: RuntimeBackingTransfer,
+        materialize: bool,
+    },
+    BackingPlace {
+        target: ReferencePlaceId,
+        transfer: RuntimeBackingTransfer,
+    },
+    CopyCallableFields {
+        source: CallableFieldSource,
+        target: ReferenceBindingId,
+    },
+    CopyProjectedBackings {
+        source: ReferenceBindingId,
+        target: ReferencePlaceId,
+    },
+    SelectArrayElement {
+        target: ReferencePlaceId,
+        index_point: CfgPointId,
     },
     Assign {
         target: ReferencePlaceId,
@@ -516,18 +1844,132 @@ pub enum CfgPointKind {
         output: usize,
         value_point: CfgPointId,
         checked: bool,
+        backing_action: RuntimeReturnBackingAction,
     },
     Return,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarReferenceCfg {
+    pub source_capture_inventory: SourceCaptureInventory,
+    pub name_resolution_context: NameResolutionContext,
+    pub source_null_constructors: Vec<source_boundary::SourceNullConstructor>,
+    pub module_resolver_input: source_boundary::SourceModuleResolverInputState,
+    pub producer_owner: ProducerCfgOwnerId,
+    pub evaluated_values: EvaluatedValueTables,
     pub facts: Vec<ReferenceOrigin>,
+    pub borrow_evaluations: Vec<ReferenceBorrowEvaluation>,
+    pub rebind_associations: Vec<ReferenceRebindAssociation>,
+    pub allocation_address_evaluations: Vec<ReferenceAllocationAddressEvaluation>,
+    pub rebind_evaluations: Vec<ReferenceRebindEvaluation>,
+    pub checked_installs: Vec<ReferenceCheckedInstall>,
+    pub checked_install_evaluations: Vec<ReferenceCheckedInstallEvaluation>,
+    #[serde(with = "evaluated_borrow::checked_storage_serde")]
+    pub checked_bindings: BTreeMap<ReferenceBindingId, ReferencePlaceId>,
+    pub environments: Vec<CallableEnvironmentFact>,
+    pub environment_imports: Vec<EnvironmentImportFact>,
+    pub inputs: Vec<CallableCaptureInput>,
+    pub capture_input_paths: Vec<Vec<CallableCaptureInput>>,
+    pub capture_input_path_facts: Vec<CaptureInputPathFact>,
+    pub producer_return_cases: Vec<ProducerReturnCaseFact>,
+    pub global_callable_input_paths: Vec<GlobalCallableCallInputFact>,
+    pub global_call_exit_facts: Vec<GlobalCallableCallExitFact>,
+    pub global_call_exit_imports: Vec<GlobalCallExitImportFact>,
+    pub nested_call_installs: Vec<CallableHolderPlace>,
+    pub backing_parameters: Vec<ReferenceBindingId>,
+    pub callable_array_parameters: Vec<CallableArrayParameterFact>,
+    pub backing_length_sites: Vec<RuntimeBackingLengthSite>,
+    pub backing_input_paths: Vec<Vec<RuntimeBackingFact>>,
+    pub projected_backing_input_paths: Vec<Vec<RuntimeCallArgumentFact>>,
+    pub call_signatures: Vec<RuntimeCallSignature>,
+    pub backing_output_contracts: Vec<RuntimeBackingOutputContract>,
+    pub literal_cfgs: Vec<ScalarLiteralReferenceCfg>,
     pub points: Vec<ReferenceFlowPoint>,
+    pub while_points: Vec<ScalarWhileCfgPoint>,
+    pub block_scope_exits: Vec<ScalarBlockScopeExit>,
+    pub conditional_points: Vec<ScalarConditionalCfgPoint>,
+    pub call_points: Vec<ScalarCallCfgPoint>,
+    pub capture_points: Vec<ScalarCaptureCfgPoint>,
+    pub read_points: Vec<ScalarReadCfgPoint>,
+    pub binding_points: Vec<ScalarBindingCfgPoint>,
+    pub assignment_points: Vec<ScalarAssignmentCfgPoint>,
+    pub top_level: Box<ScalarTopLevelCorrespondence>,
+    pub holder_edges: Vec<CallableHolderEdgeFact>,
+    pub holder_exits: Vec<CallableHolderExitFact>,
     pub initial_points: Vec<ReferenceFlowPoint>,
     pub allocations: BTreeSet<ReferenceBindingId>,
+    pub reference_parameters: Vec<ReferenceBindingId>,
     #[serde(skip)]
     pub specialized_policies: Vec<SpecializedCopyPolicy>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalCallableCallInputFact {
+    pub call: SourceSpan,
+    pub target: ResolvedCallTarget,
+    pub holders: Vec<GlobalCallableCallPathFact>,
+    pub producer: SourceSpan,
+    pub environment_indices: Vec<CallableEnvironmentId>,
+    pub occurrence: GlobalCallOccurrenceKey,
+}
+
+impl ScalarReferenceCfg {
+    pub fn new(producer_owner: ProducerCfgOwnerId) -> Self {
+        let module_resolver_input = match &producer_owner {
+            ProducerCfgOwnerId::Module(_) => source_boundary::SourceModuleResolverInputState::PendingModuleInvocation,
+            ProducerCfgOwnerId::Function { .. } | ProducerCfgOwnerId::Literal { .. } => source_boundary::SourceModuleResolverInputState::NotApplicable,
+        };
+        Self {
+            module_resolver_input,
+            producer_owner,
+            source_capture_inventory: SourceCaptureInventory::building(),
+            name_resolution_context: NameResolutionContext::Building,
+            source_null_constructors: Vec::new(),
+            evaluated_values: EvaluatedValueTables::new(),
+            facts: Vec::new(),
+            borrow_evaluations: Vec::new(),
+            rebind_associations: Vec::new(),
+            allocation_address_evaluations: Vec::new(),
+            rebind_evaluations: Vec::new(),
+            checked_installs: Vec::new(),
+            checked_install_evaluations: Vec::new(),
+            checked_bindings: BTreeMap::new(),
+            environments: Vec::new(),
+            environment_imports: Vec::new(),
+            inputs: Vec::new(),
+            capture_input_paths: Vec::new(),
+            capture_input_path_facts: Vec::new(),
+            producer_return_cases: Vec::new(),
+            global_callable_input_paths: Vec::new(),
+            global_call_exit_facts: Vec::new(),
+            global_call_exit_imports: Vec::new(),
+            nested_call_installs: Vec::new(),
+            backing_parameters: Vec::new(),
+            callable_array_parameters: Vec::new(),
+            backing_length_sites: Vec::new(),
+            backing_input_paths: Vec::new(),
+            projected_backing_input_paths: Vec::new(),
+            call_signatures: Vec::new(),
+            backing_output_contracts: Vec::new(),
+            literal_cfgs: Vec::new(),
+            points: Vec::new(),
+            while_points: Vec::new(),
+            block_scope_exits: Vec::new(),
+            conditional_points: Vec::new(),
+            call_points: Vec::new(),
+            capture_points: Vec::new(),
+            read_points: Vec::new(),
+            binding_points: Vec::new(),
+            assignment_points: Vec::new(),
+            top_level: Box::default(),
+            holder_edges: Vec::new(),
+            holder_exits: Vec::new(),
+            initial_points: Vec::new(),
+            allocations: BTreeSet::new(),
+            reference_parameters: Vec::new(),
+            specialized_policies: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -540,7 +1982,7 @@ pub struct SpecializedCopyPolicy {
     pub policy: CopyPolicy,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ReferenceAnalysisErrorReason {
     MissingResolvedBinding,
     MissingResolvedCallTarget,
@@ -548,22 +1990,36 @@ pub enum ReferenceAnalysisErrorReason {
     MissingRequiredDereferenceOrigin,
     MoveFromArrayElement,
     MovedPlace,
+    EscapingCapturedReference,
+    MissingGlobalCallableProducer,
+    InvalidAssignmentCorrespondence,
+    InvalidPointerTypeCorrespondence,
 }
 
 impl ReferenceAnalysisErrorReason {
     fn message(self) -> &'static str {
         match self {
             Self::MissingResolvedBinding => "missing resolved binding",
+            Self::InvalidAssignmentCorrespondence => {
+                "invalid connected assignment destination correspondence"
+            }
+            Self::InvalidPointerTypeCorrespondence => {
+                "invalid source-qualified pointer output type correspondence"
+            }
             Self::MissingResolvedCallTarget => "missing resolved call target",
             Self::MissingCheckedReferenceOrigin => "missing checked-reference origin",
             Self::MissingRequiredDereferenceOrigin => "missing required dereference origin",
             Self::MoveFromArrayElement => "array elements cannot be moved individually",
             Self::MovedPlace => "read or move of unavailable place",
+            Self::EscapingCapturedReference => "captured reference outlives its referent",
+            Self::MissingGlobalCallableProducer => {
+                "missing or ambiguous source-qualified global callable environment producer"
+            }
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ReferenceAnalysisError {
     MissingBinding {
         source_span: SourceSpan,
@@ -582,6 +2038,10 @@ pub enum ReferenceAnalysisError {
         source_span: SourceSpan,
         origins: Vec<SourceSpan>,
     },
+    EscapingCapture {
+        source_span: SourceSpan,
+        origins: Vec<SourceSpan>,
+    },
 }
 
 impl ReferenceAnalysisError {
@@ -590,7 +2050,8 @@ impl ReferenceAnalysisError {
             Self::MissingBinding { source_span, .. }
             | Self::MissingOrigin { source_span, .. }
             | Self::MissingContext { source_span, .. }
-            | Self::ConflictingPlace { source_span, .. } => source_span,
+            | Self::ConflictingPlace { source_span, .. }
+            | Self::EscapingCapture { source_span, .. } => source_span,
         }
     }
 
@@ -599,6 +2060,7 @@ impl ReferenceAnalysisError {
             Self::MissingBinding { .. } => ReferenceAnalysisErrorReason::MissingResolvedBinding,
             Self::MissingOrigin { reason, .. } | Self::MissingContext { reason, .. } => *reason,
             Self::ConflictingPlace { .. } => ReferenceAnalysisErrorReason::MovedPlace,
+            Self::EscapingCapture { .. } => ReferenceAnalysisErrorReason::EscapingCapturedReference,
         }
     }
 
@@ -609,7 +2071,21 @@ impl ReferenceAnalysisError {
             span: self.source_span().clone(),
             message: message.clone(),
         }];
-        if let Self::ConflictingPlace { origins, .. } = self {
+        if let Self::MissingOrigin { binding_id, .. } = self {
+            if binding_id.block_span == ByteSpan::new(0, 0) {
+                let origin =
+                    SourceSpan::new(binding_id.source.clone(), binding_id.declaration_span);
+                if !labels.iter().any(|label| label.span == origin) {
+                    labels.push(super::DiagnosticLabel {
+                        kind: super::DiagnosticLabelKind::Secondary,
+                        span: origin,
+                        message: "global declared here".to_owned(),
+                    });
+                }
+            }
+        }
+        if let Self::ConflictingPlace { origins, .. } | Self::EscapingCapture { origins, .. } = self
+        {
             for origin in origins {
                 if !labels.iter().any(|label| label.span == *origin) {
                     labels.push(super::DiagnosticLabel {
@@ -792,6 +2268,8 @@ enum ScalarFieldIdentity {
 
 #[derive(Clone, Debug, PartialEq)]
 enum ScalarExpressionIdentity {
+    Assignment(Vec<ScalarPlaceIdentity>, Vec<ScalarExpressionIdentity>),
+    FunctionLiteral(Vec<String>, ScalarBlockIdentity),
     Name(String),
     Member(String, String),
     Integer(BigInt),
@@ -912,6 +2390,24 @@ fn scalar_place_target_span(place: &ScalarPlace) -> ByteSpan {
 
 fn scalar_expression_identity(expression: &ScalarExpression) -> ScalarExpressionIdentity {
     match expression {
+        ScalarExpression::Assignment(assignment) => ScalarExpressionIdentity::Assignment(
+            assignment
+                .targets
+                .iter()
+                .map(|target| scalar_place_identity(&target.place))
+                .collect(),
+            assignment
+                .values
+                .iter()
+                .map(scalar_expression_identity)
+                .collect(),
+        ),
+        ScalarExpression::FunctionLiteral {
+            parameters, body, ..
+        } => ScalarExpressionIdentity::FunctionLiteral(
+            parameters.clone(),
+            scalar_block_identity(body),
+        ),
         ScalarExpression::Name { name, .. } => ScalarExpressionIdentity::Name(name.clone()),
         ScalarExpression::Member { receiver, name, .. } => {
             ScalarExpressionIdentity::Member(receiver.clone(), name.clone())
@@ -1217,7 +2713,7 @@ fn is_error_type(ty: &ScalarType) -> bool {
     matches!(ty, ScalarType::Error)
 }
 
-fn scalar_type_equal(left: &ScalarType, right: &ScalarType) -> bool {
+pub(crate) fn scalar_type_equal(left: &ScalarType, right: &ScalarType) -> bool {
     if is_error_type(left) || is_error_type(right) {
         return false;
     }
@@ -1468,6 +2964,16 @@ fn resolve_overload_candidate(
     arguments: &[ScalarOverloadArgument],
     expected: Option<&ScalarType>,
 ) -> Result<(ScalarType, ScalarOverloadSelection), &'static str> {
+    let expected = expected.into_iter().cloned().collect::<Vec<_>>();
+    resolve_overload_candidate_outputs(overload, arguments, &expected, arguments.len())
+}
+
+fn resolve_overload_candidate_outputs(
+    overload: &ScalarFunction,
+    arguments: &[ScalarOverloadArgument],
+    expected: &[ScalarType],
+    minimum_arguments: usize,
+) -> Result<(ScalarType, ScalarOverloadSelection), &'static str> {
     let mut matches = Vec::new();
     let mut inconsistent = false;
     let mut output_mismatch = false;
@@ -1480,7 +2986,7 @@ fn resolve_overload_candidate(
         else {
             continue;
         };
-        if parameters.len() != arguments.len() {
+        if parameters.len() < minimum_arguments || parameters.len() > arguments.len() {
             continue;
         }
         let mut substitutions = BTreeMap::new();
@@ -1498,19 +3004,22 @@ fn resolve_overload_candidate(
             }
             continue;
         }
-        if let Some(expected) = expected {
-            let Some(output) = outputs.outputs.first() else {
-                continue;
-            };
-            if !infer_overload_substitutions(
-                &output.ty,
-                expected,
-                &arm.generic_parameters,
-                &mut substitutions,
-            ) {
-                output_mismatch = true;
-                continue;
-            }
+        if (!expected.is_empty() && outputs.outputs.is_empty())
+            || !outputs
+                .outputs
+                .iter()
+                .zip(expected)
+                .all(|(output, expected)| {
+                    infer_overload_substitutions(
+                        &output.ty,
+                        expected,
+                        &arm.generic_parameters,
+                        &mut substitutions,
+                    )
+                })
+        {
+            output_mismatch = true;
+            continue;
         }
         if arm
             .generic_parameters
@@ -1524,12 +3033,12 @@ fn resolve_overload_candidate(
         }
         let callable = substitute_type(&arm.signature, &substitutions);
         if let ScalarType::Callable { outputs, .. } = &callable {
-            if expected.is_some_and(|expected| {
-                outputs
-                    .outputs
-                    .first()
-                    .is_some_and(|output| !scalar_type_equal(&output.ty, expected))
-            }) {
+            if outputs
+                .outputs
+                .iter()
+                .zip(expected)
+                .any(|(output, expected)| !scalar_type_equal(&output.ty, expected))
+            {
                 output_mismatch = true;
                 continue;
             }
@@ -1629,6 +3138,13 @@ pub enum UnaryOperator {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ScalarExpression {
+    Assignment(Box<ScalarAssignment>),
+    FunctionLiteral {
+        parameters: Vec<String>,
+        parameter_spans: Vec<ByteSpan>,
+        body: ScalarBlock,
+        span: ByteSpan,
+    },
     Name {
         name: String,
         span: ByteSpan,
@@ -1682,10 +3198,12 @@ pub enum ScalarExpression {
     Dereference {
         place: ScalarPlace,
         span: ByteSpan,
+        occurrence: Box<ScalarReadOccurrence>,
     },
     IndexedRead {
         place: ScalarPlace,
         span: ByteSpan,
+        occurrence: Box<ScalarReadOccurrence>,
     },
     StructLiteral {
         fields: Vec<ScalarStructLiteralField>,
@@ -1715,6 +3233,7 @@ pub enum ScalarExpression {
         arguments: Vec<ScalarExpression>,
         overload_selection: Option<ScalarOverloadSelection>,
         span: ByteSpan,
+        occurrence: Box<ScalarCallOccurrence>,
     },
     If {
         condition: Box<ScalarExpression>,
@@ -1754,6 +3273,7 @@ pub struct ScalarBlock {
     pub expressions: Vec<ScalarExpression>,
     pub final_output_values: Vec<ScalarOutputValue>,
     pub span: ByteSpan,
+    pub occurrence: Box<ScalarBlockOccurrence>,
     pub unsafe_context: bool,
 }
 
@@ -1767,14 +3287,10 @@ pub enum ScalarBlockItem {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarAssignment {
-    pub receiver: Option<String>,
-    pub target: String,
-    pub receiver_span: Option<ByteSpan>,
-    pub target_span: ByteSpan,
     pub targets: Vec<ScalarAssignmentTarget>,
-    pub value: ScalarExpression,
     pub values: Vec<ScalarExpression>,
     pub span: ByteSpan,
+    pub occurrence: Box<ScalarAssignmentOccurrence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1787,7 +3303,7 @@ pub struct ScalarAssignmentTarget {
     pub place: ScalarPlace,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedAssignmentOutputId {
     pub source: SourceIdentity,
     pub function_span: ByteSpan,
@@ -1817,8 +3333,9 @@ fn record_assignment_outputs(
     assignment: &ScalarAssignment,
     outputs: &ScalarOutputSequence,
 ) {
-    let Some(function_span) = assignment_function_span(items, assignment.span) else {
-        return;
+    let function_span = match assignment_function_span(items, assignment.span) {
+        Some(span) => span,
+        None => ByteSpan::new(0, 0),
     };
     for (output_index, (target, output)) in
         assignment.targets.iter().zip(&outputs.outputs).enumerate()
@@ -1840,6 +3357,7 @@ pub struct ScalarWhile {
     pub condition: ScalarExpression,
     pub body: ScalarBlock,
     pub span: ByteSpan,
+    pub occurrence: ScalarWhileOccurrence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1854,6 +3372,7 @@ pub struct ScalarBinding {
     pub output_origin: ScalarBindingOutputOrigin,
     pub is_allocation: bool,
     pub span: ByteSpan,
+    pub occurrence: Box<ScalarBindingOccurrence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1924,6 +3443,11 @@ pub struct ScalarProgram {
     pub structs: Vec<ScalarStruct>,
     pub enums: Vec<ScalarEnum>,
     pub target_layout: ScalarTargetLayout,
+    pub resolved_literals: RefCell<Vec<closure::ResolvedLiteralSignature>>,
+    pub resolved_assignment_types: RefCell<Vec<ResolvedAssignmentTypeFact>>,
+    pub resolved_expression_outputs: RefCell<Vec<ResolvedExpressionOutputFact>>,
+    pub top_level_reference_cfg: ScalarReferenceCfg,
+    pub terminal_owners: Vec<CallableProgramTerminalOwner>,
     #[serde(skip)]
     pub resolved_assignment_outputs: RefCell<HashMap<ResolvedAssignmentOutputId, ScalarType>>,
 }
@@ -1951,6 +3475,11 @@ pub struct ScalarModule {
     pub structs: Vec<ScalarStruct>,
     pub enums: Vec<ScalarEnum>,
     pub target_layout: ScalarTargetLayout,
+    pub resolved_literals: RefCell<Vec<closure::ResolvedLiteralSignature>>,
+    pub resolved_assignment_types: RefCell<Vec<ResolvedAssignmentTypeFact>>,
+    pub resolved_expression_outputs: RefCell<Vec<ResolvedExpressionOutputFact>>,
+    pub top_level_reference_cfg: ScalarReferenceCfg,
+    pub terminal_owners: Vec<CallableProgramTerminalOwner>,
     #[serde(skip)]
     pub resolved_assignment_outputs: RefCell<HashMap<ResolvedAssignmentOutputId, ScalarType>>,
 }
@@ -1988,7 +3517,7 @@ impl ScalarModule {
             initialization_nodes.push(ScalarInitializationNode { item_index, span });
         }
         Self {
-            source,
+            source: source.clone(),
             items,
             namespace_bindings,
             members,
@@ -1996,6 +3525,13 @@ impl ScalarModule {
             structs: Vec::new(),
             enums: Vec::new(),
             target_layout: ScalarTargetLayout::WASM32,
+            resolved_literals: RefCell::new(Vec::new()),
+            resolved_assignment_types: RefCell::new(Vec::new()),
+            resolved_expression_outputs: RefCell::new(Vec::new()),
+            top_level_reference_cfg: ScalarReferenceCfg::new(ProducerCfgOwnerId::Module(
+                source.clone(),
+            )),
+            terminal_owners: Vec::new(),
             resolved_assignment_outputs: RefCell::new(HashMap::new()),
         }
     }
@@ -2008,6 +3544,11 @@ impl ScalarModule {
         module.structs = program.structs;
         module.enums = program.enums;
         module.target_layout = program.target_layout;
+        module.resolved_literals = program.resolved_literals;
+        module.resolved_assignment_types = program.resolved_assignment_types;
+        module.resolved_expression_outputs = program.resolved_expression_outputs;
+        module.top_level_reference_cfg = program.top_level_reference_cfg;
+        module.terminal_owners = program.terminal_owners;
         module.resolved_assignment_outputs = program.resolved_assignment_outputs;
         module
     }
@@ -2024,6 +3565,7 @@ impl ScalarProject {
         Self {
             modules,
             initialization_order: unique_initialization_order,
+            terminal_owners: Vec::new(),
         }
     }
 }
@@ -2032,6 +3574,7 @@ impl ScalarProject {
 pub struct ScalarProject {
     pub modules: Vec<ScalarModule>,
     pub initialization_order: Vec<SourceIdentity>,
+    pub terminal_owners: Vec<CallableProgramTerminalOwner>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2064,6 +3607,35 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
 pub fn derive_scalar_program_from_cst_with_layout(
     canonical: &CanonicalCstRoot,
     target_layout: ScalarTargetLayout,
+) -> ScalarValidation {
+    #[cfg(test)]
+    let mut trace = reference::test_observations::ReferenceValidationTestTrace::new();
+    derive_scalar_program_from_cst_worker(
+        canonical,
+        target_layout,
+        #[cfg(test)]
+        &mut trace,
+    )
+}
+
+#[cfg(test)]
+fn derive_scalar_program_observed_test(
+    parse: &ParseResult,
+    layout: ScalarTargetLayout,
+) -> (
+    ScalarValidation,
+    reference::test_observations::ReferenceValidationTestTrace,
+) {
+    let mut trace = reference::test_observations::ReferenceValidationTestTrace::new();
+    let validation =
+        derive_scalar_program_from_cst_worker(parse.canonical_cst(), layout, &mut trace);
+    (validation, trace)
+}
+
+fn derive_scalar_program_from_cst_worker(
+    canonical: &CanonicalCstRoot,
+    target_layout: ScalarTargetLayout,
+    #[cfg(test)] trace: &mut reference::test_observations::ReferenceValidationTestTrace,
 ) -> ScalarValidation {
     let mut items = Vec::new();
     let mut diagnostics = string_diagnostics(canonical);
@@ -2112,13 +3684,22 @@ pub fn derive_scalar_program_from_cst_with_layout(
         match node.kind() {
             SyntaxKind::NamespaceDecl => items.push(ScalarItem::Namespace(derive_namespace(&node))),
             SyntaxKind::ExternDecl => items.push(ScalarItem::Extern(derive_extern(&node))),
-            SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node))),
-            SyntaxKind::FunctionDecl if !generic_function => {
-                items.push(ScalarItem::Function(derive_function(&node)))
-            }
-            SyntaxKind::OverloadDecl => items.push(ScalarItem::Function(derive_overload(&node))),
+            SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(
+                &node,
+                &canonical.source,
+            ))),
+            SyntaxKind::FunctionDecl if !generic_function => items.push(ScalarItem::Function(
+                derive_function(&node, &canonical.source),
+            )),
+            SyntaxKind::OverloadDecl => items.push(ScalarItem::Function(derive_overload(
+                &node,
+                &canonical.source,
+            ))),
             SyntaxKind::GenericFunctionDecl => {
-                items.push(ScalarItem::Function(derive_generic_function(&node)));
+                items.push(ScalarItem::Function(derive_generic_function(
+                    &node,
+                    &canonical.source,
+                )));
                 generic_function = true;
             }
             SyntaxKind::Item => {
@@ -2134,21 +3715,22 @@ pub fn derive_scalar_program_from_cst_with_layout(
                         SyntaxKind::ExternDecl => {
                             items.push(ScalarItem::Extern(derive_extern(&item)))
                         }
-                        SyntaxKind::BindingDecl => {
-                            items.push(ScalarItem::Binding(derive_binding(&item)))
-                        }
-                        SyntaxKind::FunctionDecl if !has_generic_function => {
-                            items.push(ScalarItem::Function(derive_function(&item)))
-                        }
-                        SyntaxKind::OverloadDecl => {
-                            items.push(ScalarItem::Function(derive_overload(&item)))
-                        }
-                        SyntaxKind::GenericFunctionDecl => {
-                            items.push(ScalarItem::Function(derive_generic_function(&item)))
-                        }
-                        SyntaxKind::TopLevelItem => {
-                            items.push(ScalarItem::Executable(derive_executable_item(&item)))
-                        }
+                        SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(
+                            &item,
+                            &canonical.source,
+                        ))),
+                        SyntaxKind::FunctionDecl if !has_generic_function => items.push(
+                            ScalarItem::Function(derive_function(&item, &canonical.source)),
+                        ),
+                        SyntaxKind::OverloadDecl => items.push(ScalarItem::Function(
+                            derive_overload(&item, &canonical.source),
+                        )),
+                        SyntaxKind::GenericFunctionDecl => items.push(ScalarItem::Function(
+                            derive_generic_function(&item, &canonical.source),
+                        )),
+                        SyntaxKind::TopLevelItem => items.push(ScalarItem::Executable(
+                            derive_executable_item(&item, &canonical.source),
+                        )),
                         _ => {}
                     }
                 }
@@ -2165,6 +3747,13 @@ pub fn derive_scalar_program_from_cst_with_layout(
         structs,
         enums,
         target_layout,
+        resolved_literals: RefCell::new(Vec::new()),
+        resolved_assignment_types: RefCell::new(Vec::new()),
+        resolved_expression_outputs: RefCell::new(Vec::new()),
+        top_level_reference_cfg: ScalarReferenceCfg::new(ProducerCfgOwnerId::Module(
+            canonical.source.clone(),
+        )),
+        terminal_owners: Vec::new(),
         resolved_assignment_outputs: RefCell::new(HashMap::new()),
     };
     resolve_program_types(&mut program, &mut diagnostics);
@@ -2177,10 +3766,29 @@ pub fn derive_scalar_program_from_cst_with_layout(
     }
     if diagnostics.is_empty() {
         let module = ScalarModule::from_program(program.clone(), Vec::new());
-        let call_sites = resolve_module_call_sites(&program.source, &program.items, &[module]);
+        let modules = [module];
+        let pre = source_boundary::module_resolver_input::freeze(&program.source, &program.items, &modules);
+        let call_sites = resolve_module_call_sites(&program.source, &program.items, &modules);
+        let evidence = source_boundary::module_resolver_input::finish(pre, &call_sites, &modules);
         diagnostics.extend(
             call_sites
-                .map(|sites| record_program_reference_origins(&mut program, &sites))
+                .map(|(sites, captures)| {
+                    let mut construction = program.clone();
+                    construction.top_level_reference_cfg = ScalarReferenceCfg::new(ProducerCfgOwnerId::Module(program.source.clone()));
+                    if let Err(error) = evidence.install(&mut construction.top_level_reference_cfg, &construction.source, &construction.items, &sites, &captures) { return vec![error]; }
+                    let errors = record_program_reference_origins(
+                        &mut construction,
+                        &sites,
+                        &captures,
+                        #[cfg(test)]
+                        trace,
+                    );
+                    if errors.is_empty() {
+                        (program.items, program.top_level_reference_cfg, program.terminal_owners) =
+                            (construction.items, construction.top_level_reference_cfg, construction.terminal_owners);
+                    }
+                    errors
+                })
                 .unwrap_or_else(|error| vec![error])
                 .into_iter()
                 .map(|error| error.diagnostic()),
@@ -2194,6 +3802,8 @@ pub fn derive_scalar_program_from_cst_with_layout(
                 &[module],
                 &program.structs,
                 &program.enums,
+                #[cfg(test)]
+                trace,
             )
             .into_iter()
             .map(|error| error.diagnostic()),
@@ -2206,6 +3816,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
 }
 
 fn record_overload_selections(program: &mut ScalarProgram) {
+    let facts = program.resolved_expression_outputs.borrow().clone();
     let scope = program
         .items
         .iter()
@@ -2232,16 +3843,12 @@ fn record_overload_selections(program: &mut ScalarProgram) {
     for item in &mut program.items {
         match item {
             ScalarItem::Binding(binding) => {
-                let expected = binding
-                    .receivers
-                    .first()
-                    .map(|receiver| &receiver.ty)
-                    .unwrap_or(&binding.declared_type);
                 record_expression_overload_selection(
                     &mut binding.value,
-                    Some(expected),
                     &scope,
                     &overloads,
+                    &facts,
+                    &program.source,
                 );
             }
             ScalarItem::Function(function) => {
@@ -2251,11 +3858,23 @@ fn record_overload_selections(program: &mut ScalarProgram) {
                         body_scope.insert(name.clone(), ty.clone());
                     }
                 }
-                record_block_overload_selections(&mut function.body, &body_scope, &overloads);
+                record_block_overload_selections(
+                    &mut function.body,
+                    &body_scope,
+                    &overloads,
+                    &facts,
+                    &program.source,
+                );
             }
             ScalarItem::Executable(item) => {
                 let mut item_scope = scope.clone();
-                record_block_item_overload_selections(item, &mut item_scope, &overloads);
+                record_block_item_overload_selections(
+                    item,
+                    &mut item_scope,
+                    &overloads,
+                    &facts,
+                    &program.source,
+                );
             }
             ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
         }
@@ -2264,20 +3883,55 @@ fn record_overload_selections(program: &mut ScalarProgram) {
 
 fn record_expression_overload_selection(
     expression: &mut ScalarExpression,
-    expected: Option<&ScalarType>,
     scope: &BTreeMap<String, ScalarType>,
     overloads: &BTreeMap<String, ScalarFunction>,
+    facts: &[ResolvedExpressionOutputFact],
+    source: &SourceIdentity,
 ) {
+    let expected = facts
+        .iter()
+        .find(|fact| fact.source_span == SourceSpan::new(source.clone(), span_of(expression)))
+        .and_then(|fact| fact.outputs.outputs.first())
+        .map(|output| &output.ty);
     match expression {
+        ScalarExpression::Assignment(assignment) => {
+            for target in &mut assignment.targets {
+                record_place_overload_selections(
+                    &mut target.place,
+                    scope,
+                    overloads,
+                    facts,
+                    source,
+                );
+            }
+            for value in &mut assignment.values {
+                record_expression_overload_selection(value, scope, overloads, facts, source);
+            }
+        }
+        ScalarExpression::FunctionLiteral {
+            parameters, body, ..
+        } => {
+            let mut body_scope = scope.clone();
+            if let Some(ScalarType::Callable {
+                parameters: types, ..
+            }) = expected
+            {
+                for (name, ty) in parameters.iter().zip(types) {
+                    body_scope.insert(name.clone(), ty.clone());
+                }
+            }
+            record_block_overload_selections(body, &body_scope, overloads, facts, source);
+        }
         ScalarExpression::Call {
             receiver,
             name,
             arguments,
             overload_selection,
+            span,
             ..
         } => {
             for argument in arguments.iter_mut() {
-                record_expression_overload_selection(argument, None, scope, overloads);
+                record_expression_overload_selection(argument, scope, overloads, facts, source);
             }
             if let (Some(overload), Some(argument_types)) = (
                 overloads.get(
@@ -2287,22 +3941,53 @@ fn record_expression_overload_selection(
                 ),
                 arguments
                     .iter()
-                    .map(|argument| overload_argument_type(argument, scope))
-                    .collect::<Option<Vec<_>>>(),
+                    .map(|argument| {
+                        facts
+                            .iter()
+                            .find(|fact| {
+                                fact.source_span
+                                    == SourceSpan::new(source.clone(), span_of(argument))
+                            })
+                            .map(|fact| {
+                                fact.outputs
+                                    .outputs
+                                    .iter()
+                                    .map(|output| {
+                                        overload_argument_from_actual(argument, &output.ty)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .map(|outputs| outputs.into_iter().flatten().collect::<Vec<_>>()),
             ) {
-                if let Ok((_, selection)) =
-                    resolve_overload_candidate(overload, &argument_types, expected)
-                {
+                let expected = facts
+                    .iter()
+                    .find(|fact| fact.source_span == SourceSpan::new(source.clone(), *span))
+                    .map(|fact| {
+                        fact.outputs
+                            .outputs
+                            .iter()
+                            .map(|output| output.ty.clone())
+                            .collect::<Vec<_>>()
+                    });
+                let Some(expected) = expected else { return };
+                if let Ok((_, selection)) = resolve_overload_candidate_outputs(
+                    overload,
+                    &argument_types,
+                    &expected,
+                    arguments.len(),
+                ) {
                     *overload_selection = Some(selection);
                 }
             }
         }
         ScalarExpression::Binary { left, right, .. } => {
-            record_expression_overload_selection(left, None, scope, overloads);
-            record_expression_overload_selection(right, None, scope, overloads);
+            record_expression_overload_selection(left, scope, overloads, facts, source);
+            record_expression_overload_selection(right, scope, overloads, facts, source);
         }
         ScalarExpression::Unary { operand, .. } => {
-            record_expression_overload_selection(operand, expected, scope, overloads)
+            record_expression_overload_selection(operand, scope, overloads, facts, source)
         }
         ScalarExpression::If {
             condition,
@@ -2310,62 +3995,43 @@ fn record_expression_overload_selection(
             else_branch,
             ..
         } => {
-            record_expression_overload_selection(
-                condition,
-                Some(&ScalarType::Bool),
-                scope,
-                overloads,
-            );
-            record_block_overload_selections(then_branch, scope, overloads);
-            record_block_overload_selections(else_branch, scope, overloads);
+            record_expression_overload_selection(condition, scope, overloads, facts, source);
+            record_block_overload_selections(then_branch, scope, overloads, facts, source);
+            record_block_overload_selections(else_branch, scope, overloads, facts, source);
         }
         ScalarExpression::UnitIf {
             condition,
             then_branch,
             ..
         } => {
-            record_expression_overload_selection(
-                condition,
-                Some(&ScalarType::Bool),
-                scope,
-                overloads,
-            );
-            record_block_overload_selections(then_branch, scope, overloads);
+            record_expression_overload_selection(condition, scope, overloads, facts, source);
+            record_block_overload_selections(then_branch, scope, overloads, facts, source);
         }
-        ScalarExpression::Block(block) => record_block_overload_selections(block, scope, overloads),
+        ScalarExpression::Block(block) => {
+            record_block_overload_selections(block, scope, overloads, facts, source)
+        }
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
-        | ScalarExpression::Dereference { place, .. } => match place {
-            ScalarPlace::Dereference { pointer, .. } => {
-                record_expression_overload_selection(pointer, None, scope, overloads)
-            }
-            ScalarPlace::Field { base, .. } => {
-                if let ScalarPlace::Dereference { pointer, .. } = base.as_mut() {
-                    record_expression_overload_selection(pointer, None, scope, overloads);
-                }
-            }
-            ScalarPlace::Index { base, index, .. } => {
-                record_place_overload_selections(base, scope, overloads);
-                record_expression_overload_selection(
-                    index,
-                    Some(&ScalarType::U64),
-                    scope,
-                    overloads,
-                );
-            }
-            ScalarPlace::Name { .. } => {}
-        },
+        | ScalarExpression::Dereference { place, .. } => {
+            record_place_overload_selections(place, scope, overloads, facts, source)
+        }
         ScalarExpression::IndexedRead { place, .. } => {
-            record_place_overload_selections(place, scope, overloads)
+            record_place_overload_selections(place, scope, overloads, facts, source)
         }
         ScalarExpression::StructLiteral { fields, .. } => {
             for field in fields {
-                record_expression_overload_selection(&mut field.value, None, scope, overloads);
+                record_expression_overload_selection(
+                    &mut field.value,
+                    scope,
+                    overloads,
+                    facts,
+                    source,
+                );
             }
         }
         ScalarExpression::ArrayLiteral { elements, .. } => {
             for element in elements {
-                record_expression_overload_selection(element, None, scope, overloads);
+                record_expression_overload_selection(element, scope, overloads, facts, source);
             }
         }
         ScalarExpression::Name { .. }
@@ -2384,16 +4050,20 @@ fn record_place_overload_selections(
     place: &mut ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,
     overloads: &BTreeMap<String, ScalarFunction>,
+    facts: &[ResolvedExpressionOutputFact],
+    source: &SourceIdentity,
 ) {
     match place {
         ScalarPlace::Name { .. } => {}
         ScalarPlace::Dereference { pointer, .. } => {
-            record_expression_overload_selection(pointer, None, scope, overloads)
+            record_expression_overload_selection(pointer, scope, overloads, facts, source)
         }
-        ScalarPlace::Field { base, .. } => record_place_overload_selections(base, scope, overloads),
+        ScalarPlace::Field { base, .. } => {
+            record_place_overload_selections(base, scope, overloads, facts, source)
+        }
         ScalarPlace::Index { base, index, .. } => {
-            record_place_overload_selections(base, scope, overloads);
-            record_expression_overload_selection(index, Some(&ScalarType::U64), scope, overloads);
+            record_place_overload_selections(base, scope, overloads, facts, source);
+            record_expression_overload_selection(index, scope, overloads, facts, source);
         }
     }
 }
@@ -2402,33 +4072,61 @@ fn record_block_overload_selections(
     block: &mut ScalarBlock,
     scope: &BTreeMap<String, ScalarType>,
     overloads: &BTreeMap<String, ScalarFunction>,
+    facts: &[ResolvedExpressionOutputFact],
+    source: &SourceIdentity,
 ) {
     let mut scope = scope.clone();
     for item in &mut block.items {
-        record_block_item_overload_selections(item, &mut scope, overloads);
+        record_block_item_overload_selections(item, &mut scope, overloads, facts, source);
     }
-    for output in &mut block.final_output_values {
-        record_expression_overload_selection(&mut output.value, None, &scope, overloads);
+    let final_start = block.items.len() - block.final_output_values.len();
+    let mut position = 0;
+    for (output, item) in block
+        .final_output_values
+        .iter_mut()
+        .zip(&block.items[final_start..])
+    {
+        let ScalarBlockItem::Expression(expression) = item else {
+            unreachable!("final expression mirror")
+        };
+        output.value = expression.clone();
+        if let Some(fact) = facts
+            .iter()
+            .find(|fact| fact.source_span == SourceSpan::new(source.clone(), span_of(expression)))
+        {
+            output.position = position;
+            output.ty = match fact.outputs.outputs.first() {
+                Some(output) => output.ty.clone(),
+                None => ScalarType::Unit,
+            };
+            position += fact.outputs.outputs.len();
+        }
     }
+    block.expressions = block
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarBlockItem::Expression(expression) => Some(expression.clone()),
+            _ => None,
+        })
+        .collect();
 }
 
 fn record_block_item_overload_selections(
     item: &mut ScalarBlockItem,
     scope: &mut BTreeMap<String, ScalarType>,
     overloads: &BTreeMap<String, ScalarFunction>,
+    facts: &[ResolvedExpressionOutputFact],
+    source: &SourceIdentity,
 ) {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            let expected = binding
-                .receivers
-                .first()
-                .map(|receiver| &receiver.ty)
-                .unwrap_or(&binding.declared_type);
             record_expression_overload_selection(
                 &mut binding.value,
-                Some(expected),
                 &scope,
                 overloads,
+                facts,
+                source,
             );
             scope.insert(binding.name.clone(), binding.declared_type.clone());
             for receiver in &binding.receivers {
@@ -2436,39 +4134,77 @@ fn record_block_item_overload_selections(
             }
         }
         ScalarBlockItem::Expression(expression) => {
-            record_expression_overload_selection(expression, None, &scope, overloads)
+            record_expression_overload_selection(expression, &scope, overloads, facts, source)
         }
         ScalarBlockItem::Assignment(assignment) => {
-            record_expression_overload_selection(
-                &mut assignment.value,
-                scope.get(&assignment.target),
-                &scope,
-                overloads,
-            );
-            for (value, target) in assignment.values.iter_mut().zip(&assignment.targets) {
-                record_expression_overload_selection(
-                    value,
-                    scope.get(&target.target),
-                    &scope,
+            for target in &mut assignment.targets {
+                record_place_overload_selections(
+                    &mut target.place,
+                    scope,
                     overloads,
+                    facts,
+                    source,
                 );
+            }
+            for value in &mut assignment.values {
+                record_expression_overload_selection(value, &scope, overloads, facts, source);
             }
         }
         ScalarBlockItem::While(while_expression) => {
-            record_block_overload_selections(&mut while_expression.body, &scope, overloads)
+            record_expression_overload_selection(
+                &mut while_expression.condition,
+                scope,
+                overloads,
+                facts,
+                source,
+            );
+            record_block_overload_selections(
+                &mut while_expression.body,
+                &scope,
+                overloads,
+                facts,
+                source,
+            )
         }
     }
 }
 
+pub(crate) mod conditional_output_group;
+mod evaluated_raw_address;
+mod source_boundary;
+pub use source_boundary::*;
+mod source_relation;
+pub use source_relation::*;
+mod common_loan;
+mod owner_lifetime;
+mod selected_source;
+pub use common_loan::*;
+pub use owner_lifetime::*;
+pub use selected_source::local_loan::*;
+pub use selected_source::source_use::*;
+mod evaluated_value;
+pub(crate) use conditional_output_group::{
+    group_conditional_final_outputs, ConditionalOutputGroup,
+};
+mod evaluated_aggregate_member;
 mod resolution;
+mod return_value;
+pub use evaluated_value::*;
+mod assignment;
+pub use assignment::*;
+mod assignment_lifecycle;
+pub use assignment_lifecycle::{
+    AssignmentApplicationRef, FrameVariableRef, FrozenApplicationState, FrozenConsumerRole,
+    FrozenGuardUse, FrozenSelectionOccurrence, RetainedIndexEndpointId, RetainedIndexSourceFact,
+    RetainedIndexSourceRole, SupportedInstanceVariable,
+};
 use resolution::{
     enum_member_in_module, resolve_module_places, resolve_module_types_in_project,
     resolve_program_places, resolve_program_types, resolve_project_struct_layouts,
 };
 mod typecheck;
 use typecheck::{
-    block_item_type_in_module, block_type_in_module, block_type_in_module_expected,
-    call_output_sequence_in_module, declare_module_name, expect_module_type, expression_span,
+    block_item_type_in_module, declare_module_name, expect_module_type, expression_span,
     expression_type_in_module_expected, is_integer_type, is_module_private_name, module_diagnostic,
     operator, unused_binding_spans, validate, validate_extern, validate_identifier_style,
     validate_module_generic_type, validate_module_type, validate_output_receivers_in_module,
@@ -2484,10 +4220,37 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
 }
 
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
+    #[cfg(test)]
+    let mut trace = reference::test_observations::ReferenceValidationTestTrace::new();
+    validate_scalar_project_worker(
+        project,
+        #[cfg(test)]
+        &mut trace,
+    )
+}
+
+#[cfg(test)]
+fn validate_scalar_project_observed_test(
+    project: ScalarProject,
+) -> (
+    ScalarProjectValidation,
+    reference::test_observations::ReferenceValidationTestTrace,
+) {
+    let mut trace = reference::test_observations::ReferenceValidationTestTrace::new();
+    let validation = validate_scalar_project_worker(project, &mut trace);
+    (validation, trace)
+}
+
+fn validate_scalar_project_worker(
+    project: ScalarProject,
+    #[cfg(test)] trace: &mut reference::test_observations::ReferenceValidationTestTrace,
+) -> ScalarProjectValidation {
     let mut project = project;
     let mut diagnostics = Vec::new();
     for module in &project.modules {
         module.resolved_assignment_outputs.borrow_mut().clear();
+        module.resolved_assignment_types.borrow_mut().clear();
+        module.resolved_expression_outputs.borrow_mut().clear();
     }
     let struct_lookup = project.modules.clone();
     for module in &mut project.modules {
@@ -2666,9 +4429,14 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         }
                         continue;
                     }
-                    let actual = expression_type_in_module_expected(
+                    let expected = binding
+                        .receivers
+                        .iter()
+                        .map(|receiver| receiver.ty.clone())
+                        .collect::<Vec<_>>();
+                    let actual_outputs = typecheck::outputs::sequence_in_module(
                         &binding.value,
-                        Some(&binding.declared_type),
+                        &expected,
                         &declarations,
                         &BTreeSet::new(),
                         &BTreeMap::new(),
@@ -2677,6 +4445,10 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         &mut diagnostics,
                         false,
                     );
+                    let actual = match actual_outputs.outputs.first() {
+                        Some(output) => output.ty.clone(),
+                        None => ScalarType::Unit,
+                    };
                     validate_output_receivers_in_module(
                         &binding.value,
                         &binding.receivers,
@@ -2695,194 +4467,65 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                     );
                 }
                 ScalarItem::Function(function) => {
-                    if !function.overload_arms.is_empty() {
-                        continue;
-                    }
-                    let ScalarType::Callable {
-                        outputs,
-                        parameters,
-                    } = &function.signature
-                    else {
-                        continue;
+                    let bodies = if function.overload_arms.is_empty() {
+                        vec![function]
+                    } else {
+                        function
+                            .overload_arms
+                            .iter()
+                            .filter(|arm| {
+                                arm.generic_parameters.is_empty()
+                                    && closure::contains_literal(&arm.body)
+                            })
+                            .collect::<Vec<_>>()
                     };
-                    if function.parameters.len() != parameters.len() {
-                        diagnostics.push(module_diagnostic(
-                            module,
-                            "B0004",
-                            "function parameter arity does not match its type",
-                            function.span,
-                        ));
-                    }
-                    let mut scope = declarations.clone();
-                    let mut visible_names = declaration_names.clone();
-                    let mut folded_names = folded_declarations.clone();
-                    for (index, name) in function.parameters.iter().enumerate() {
-                        validate_identifier_style(
-                            module,
-                            name,
-                            function.parameter_spans[index],
-                            &mut diagnostics,
-                        );
-                        if index < parameters.len()
-                            && declare_module_name(
+                    for function in bodies {
+                        let ScalarType::Callable {
+                            outputs,
+                            parameters,
+                        } = &function.signature
+                        else {
+                            continue;
+                        };
+                        if function.parameters.len() != parameters.len() {
+                            diagnostics.push(module_diagnostic(
+                                module,
+                                "B0004",
+                                "function parameter arity does not match its type",
+                                function.span,
+                            ));
+                        }
+                        let mut scope = declarations.clone();
+                        let mut visible_names = declaration_names.clone();
+                        let mut folded_names = folded_declarations.clone();
+                        for (index, name) in function.parameters.iter().enumerate() {
+                            validate_identifier_style(
                                 module,
                                 name,
-                                function.span,
-                                &mut visible_names,
-                                &mut folded_names,
+                                function.parameter_spans[index],
                                 &mut diagnostics,
-                            )
-                        {
-                            scope.insert(name.clone(), parameters[index].clone());
-                        }
-                    }
-                    if outputs.outputs.len() > 1 && !function.body.final_output_values.is_empty() {
-                        let final_start =
-                            function.body.items.len() - function.body.final_output_values.len();
-                        for item in &function.body.items[..final_start] {
-                            let _ = match item {
-                                ScalarBlockItem::Expression(
-                                    expression @ (ScalarExpression::If { .. }
-                                    | ScalarExpression::UnitIf { .. }),
-                                ) => expression_type_in_module_expected(
-                                    expression,
-                                    Some(&ScalarType::Unit),
-                                    &scope,
-                                    &visible_names,
-                                    &folded_names,
+                            );
+                            if index < parameters.len()
+                                && declare_module_name(
                                     module,
-                                    &project.modules,
-                                    &mut diagnostics,
-                                    false,
-                                ),
-                                _ => block_item_type_in_module(
-                                    item,
-                                    &mut scope,
+                                    name,
+                                    function.span,
                                     &mut visible_names,
                                     &mut folded_names,
-                                    module,
-                                    &project.modules,
                                     &mut diagnostics,
-                                    false,
-                                ),
-                            };
-                        }
-                        if function.body.final_output_values.len() == 1
-                            && matches!(
-                                &function.body.final_output_values[0].value,
-                                ScalarExpression::Call { .. }
-                            )
-                        {
-                            let value = &function.body.final_output_values[0];
-                            if let Some(actual_outputs) = call_output_sequence_in_module(
-                                &value.value,
-                                &scope,
-                                module,
-                                &project.modules,
-                            ) {
-                                expression_type_in_module_expected(
-                                    &value.value,
-                                    actual_outputs.outputs.first().map(|output| &output.ty),
-                                    &scope,
-                                    &visible_names,
-                                    &folded_names,
-                                    module,
-                                    &project.modules,
-                                    &mut diagnostics,
-                                    false,
-                                );
-                                if actual_outputs.outputs.len() != outputs.outputs.len() {
-                                    diagnostics.push(module_diagnostic(
-                                        module,
-                                        "B0004",
-                                        "function output arity does not match its final output list",
-                                        value.span,
-                                    ));
-                                }
-                                for (actual, expected) in
-                                    actual_outputs.outputs.iter().zip(&outputs.outputs)
-                                {
-                                    expect_module_type(
-                                        module,
-                                        &expected.ty,
-                                        &actual.ty,
-                                        value.span,
-                                        &mut diagnostics,
-                                    );
-                                }
-                            }
-                        } else {
-                            if function.body.final_output_values.len() > 1
-                                && function.body.final_output_values.len() != outputs.outputs.len()
+                                )
                             {
-                                diagnostics.push(module_diagnostic(
-                                    module,
-                                    "B0004",
-                                    "function output arity does not match its final output list",
-                                    function.body.span,
-                                ));
-                            }
-                            for (value, output) in function
-                                .body
-                                .final_output_values
-                                .iter()
-                                .zip(&outputs.outputs)
-                            {
-                                let actual = expression_type_in_module_expected(
-                                    &value.value,
-                                    Some(&output.ty),
-                                    &scope,
-                                    &visible_names,
-                                    &folded_names,
-                                    module,
-                                    &project.modules,
-                                    &mut diagnostics,
-                                    false,
-                                );
-                                expect_module_type(
-                                    module,
-                                    &output.ty,
-                                    &actual,
-                                    value.span,
-                                    &mut diagnostics,
-                                );
+                                scope.insert(name.clone(), parameters[index].clone());
                             }
                         }
-                    } else if let Some(output) = outputs.outputs.first() {
-                        let actual = block_type_in_module_expected(
+                        typecheck::outputs::validate_function_in_module(
                             &function.body,
-                            Some(&output.ty),
+                            outputs,
                             &scope,
                             &visible_names,
                             &folded_names,
                             module,
                             &project.modules,
-                            &mut diagnostics,
-                            false,
-                        );
-                        expect_module_type(
-                            module,
-                            &output.ty,
-                            &actual,
-                            function.body.span,
-                            &mut diagnostics,
-                        );
-                    } else {
-                        let actual = block_type_in_module(
-                            &function.body,
-                            &scope,
-                            &visible_names,
-                            &folded_names,
-                            module,
-                            &project.modules,
-                            &mut diagnostics,
-                            false,
-                        );
-                        expect_module_type(
-                            module,
-                            &ScalarType::Unit,
-                            &actual,
-                            function.body.span,
                             &mut diagnostics,
                         );
                     }
@@ -2919,10 +4562,15 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
     if diagnostics.is_empty() {
         let modules = project.modules.clone();
         for module in &mut project.modules {
+            let pre = source_boundary::module_resolver_input::freeze(&module.source, &module.items, &modules);
             let call_sites = resolve_module_call_sites(&module.source, &module.items, &modules);
+            let evidence = source_boundary::module_resolver_input::finish(pre, &call_sites, &modules);
             diagnostics.extend(
                 call_sites
-                    .map(|sites| {
+                    .map(|(sites, captures)| {
+                        let mut items = module.items.clone();
+                        let mut root = ScalarReferenceCfg::new(ProducerCfgOwnerId::Module(module.source.clone()));
+                        if let Err(error) = evidence.install(&mut root, &module.source, &items, &sites, &captures) { return vec![error]; }
                         let structs = modules
                             .iter()
                             .flat_map(|module| module.structs.clone())
@@ -2931,14 +4579,27 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                             .iter()
                             .flat_map(|module| module.enums.clone())
                             .collect::<Vec<_>>();
-                        record_module_reference_origins(
+                        let errors = record_module_reference_origins(
                             &module.source,
-                            &mut module.items,
+                            &mut items,
+                            &mut root,
                             &sites,
+                            &captures,
                             &structs,
                             &enums,
                             &module.resolved_assignment_outputs.borrow(),
-                        )
+                            &module.resolved_literals.borrow(),
+                            &assignment::SourceValueTypeFacts {
+                                assignments: module.resolved_assignment_types.borrow().clone(),
+                                expressions: module.resolved_expression_outputs.borrow().clone(),
+                            },
+                            #[cfg(test)]
+                            trace,
+                        );
+                        if errors.is_empty() {
+                            (module.items, module.top_level_reference_cfg) = (items, root);
+                        }
+                        errors
                     })
                     .unwrap_or_else(|error| vec![error])
                     .into_iter()
@@ -2948,9 +4609,13 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
     }
     if diagnostics.is_empty() {
         diagnostics.extend(
-            resolve_reference_output_contracts(&mut project.modules)
-                .into_iter()
-                .map(|error| error.diagnostic()),
+            resolve_reference_output_contracts(
+                &mut project.modules,
+                #[cfg(test)]
+                trace,
+            )
+            .into_iter()
+            .map(|error| error.diagnostic()),
         );
     }
     if diagnostics.is_empty() {
@@ -2965,11 +4630,38 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
             .collect::<Vec<_>>();
         for module in &mut project.modules {
             diagnostics.extend(
-                record_specialized_copy_policies(&mut module.items, &modules, &structs, &enums)
-                    .into_iter()
-                    .map(|error| error.diagnostic()),
+                record_specialized_copy_policies(
+                    &mut module.items,
+                    &modules,
+                    &structs,
+                    &enums,
+                    #[cfg(test)]
+                    trace,
+                )
+                .into_iter()
+                .map(|error| error.diagnostic()),
             );
         }
+    }
+    if diagnostics.is_empty() {
+        for module in &mut project.modules {
+            module.terminal_owners = program_terminal_owners(
+                &module.source,
+                &module.items,
+                &module.top_level_reference_cfg,
+            );
+        }
+        project.terminal_owners = project
+            .initialization_order
+            .iter()
+            .flat_map(|source| {
+                project
+                    .modules
+                    .iter()
+                    .filter(move |module| &module.source == source)
+                    .flat_map(|module| module.terminal_owners.clone())
+            })
+            .collect();
     }
     ScalarProjectValidation {
         project,
@@ -2980,6 +4672,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
 fn record_project_overload_selections(project: &mut ScalarProject) {
     let modules = project.modules.clone();
     for module in &mut project.modules {
+        let facts = module.resolved_expression_outputs.borrow().clone();
         let scope = module.members.clone();
         let mut overloads = module
             .items
@@ -3013,16 +4706,12 @@ fn record_project_overload_selections(project: &mut ScalarProject) {
         for item in &mut module.items {
             match item {
                 ScalarItem::Binding(binding) => {
-                    let expected = binding
-                        .receivers
-                        .first()
-                        .map(|receiver| &receiver.ty)
-                        .unwrap_or(&binding.declared_type);
                     record_expression_overload_selection(
                         &mut binding.value,
-                        Some(expected),
                         &scope,
                         &overloads,
+                        &facts,
+                        &module.source,
                     );
                 }
                 ScalarItem::Function(function) => {
@@ -3032,11 +4721,23 @@ fn record_project_overload_selections(project: &mut ScalarProject) {
                             body_scope.insert(name.clone(), ty.clone());
                         }
                     }
-                    record_block_overload_selections(&mut function.body, &body_scope, &overloads);
+                    record_block_overload_selections(
+                        &mut function.body,
+                        &body_scope,
+                        &overloads,
+                        &facts,
+                        &module.source,
+                    );
                 }
                 ScalarItem::Executable(item) => {
                     let mut item_scope = scope.clone();
-                    record_block_item_overload_selections(item, &mut item_scope, &overloads);
+                    record_block_item_overload_selections(
+                        item,
+                        &mut item_scope,
+                        &overloads,
+                        &facts,
+                        &module.source,
+                    );
                 }
                 ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
             }
@@ -3120,7 +4821,7 @@ fn derive_extern(node: &CstNode) -> ScalarExtern {
     }
 }
 
-fn derive_binding(node: &CstNode) -> ScalarBinding {
+fn derive_binding(node: &CstNode, source: &SourceIdentity) -> ScalarBinding {
     let receiver_list = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::ReceiverList)
@@ -3133,7 +4834,7 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
             let allocation_length = receiver
                 .children()
                 .find(|child| child.kind() == SyntaxKind::Expression)
-                .map(|child| derive_expression(&child));
+                .map(|child| derive_expression(&child, source));
             let ty = allocation_length.as_ref().map_or_else(
                 || {
                     let ty_node = direct_nodes(&receiver)
@@ -3143,10 +4844,17 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
                     derive_type(&ty_node)
                 },
                 |_| {
-                    let element = direct_token(&receiver, SyntaxKind::TypeName)
-                        .expect("runtime array element type");
+                    let element = receiver
+                        .children()
+                        .find(|child| child.kind() == SyntaxKind::ParenthesizedType)
+                        .map(|child| derive_type(&child))
+                        .unwrap_or_else(|| {
+                            let element = direct_token(&receiver, SyntaxKind::TypeName)
+                                .expect("runtime array element type");
+                            type_from_name(element.text(), token_span(&element))
+                        });
                     ScalarType::RuntimeArray {
-                        element: Box::new(type_from_name(element.text(), token_span(&element))),
+                        element: Box::new(element),
                         span: wosy_syntax::byte_span(&receiver),
                     }
                 },
@@ -3168,7 +4876,7 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         output_list
             .children()
             .filter(|child| child.kind() == SyntaxKind::Expression)
-            .map(|child| derive_expression(&child))
+            .map(|child| derive_expression(&child, source))
             .collect::<Vec<_>>()
     });
     let value = outputs
@@ -3229,6 +4937,10 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         output_origin,
         is_allocation: outputs.is_empty(),
         span: wosy_syntax::byte_span(node),
+        occurrence: Box::new(ScalarBindingOccurrence {
+            source_span: SourceSpan::new(source.clone(), wosy_syntax::byte_span(node)),
+            output_projection: Vec::new(),
+        }),
     }
 }
 
@@ -3416,6 +5128,10 @@ fn layout_for_type(
             size: target_layout.pointer_size,
             alignment: target_layout.pointer_alignment,
         },
+        ScalarType::Callable { .. } => ScalarLayout {
+            size: target_layout.pointer_size * 2,
+            alignment: target_layout.pointer_alignment,
+        },
         ScalarType::Array {
             element,
             length,
@@ -3522,7 +5238,7 @@ fn output_sequence(node: &CstNode) -> ScalarOutputSequence {
     }
 }
 
-fn derive_function(node: &CstNode) -> ScalarFunction {
+fn derive_function(node: &CstNode, source: &SourceIdentity) -> ScalarFunction {
     let children = direct_nodes(node);
     let signature = derive_type(
         children
@@ -3562,7 +5278,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
     let mut body = children
         .iter()
         .find(|child| child.kind() == SyntaxKind::Block)
-        .map(|node| derive_block(node))
+        .map(|node| derive_block(node, source))
         .expect("function block");
     if let ScalarType::Callable { outputs, .. } = &signature {
         expand_conditional_final_outputs(&mut body, &outputs.outputs);
@@ -3581,10 +5297,57 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         generic_parameters: Vec::new(),
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg {
+            source_capture_inventory: SourceCaptureInventory::building(),
+            name_resolution_context: NameResolutionContext::Building,
+            source_null_constructors: Vec::new(),
+            module_resolver_input: source_boundary::SourceModuleResolverInputState::NotApplicable,
+            evaluated_values: EvaluatedValueTables::new(),
+            producer_owner: ProducerCfgOwnerId::Function {
+                source: source.clone(),
+                declaration: token_span(&name),
+                body: ProducerFunctionBodyId::Declaration,
+            },
+            environments: Vec::new(),
+            environment_imports: Vec::new(),
+            inputs: Vec::new(),
+            capture_input_paths: Vec::new(),
+            capture_input_path_facts: Vec::new(),
+            producer_return_cases: Vec::new(),
+            global_callable_input_paths: Vec::new(),
+            global_call_exit_facts: Vec::new(),
+            global_call_exit_imports: Vec::new(),
+            nested_call_installs: Vec::new(),
+            backing_parameters: Vec::new(),
+            callable_array_parameters: Vec::new(),
+            backing_length_sites: Vec::new(),
+            backing_input_paths: Vec::new(),
+            projected_backing_input_paths: Vec::new(),
+            call_signatures: Vec::new(),
+            backing_output_contracts: Vec::new(),
+            literal_cfgs: Vec::new(),
             facts: Vec::new(),
             points: Vec::new(),
+            borrow_evaluations: Vec::new(),
+            rebind_associations: Vec::new(),
+            allocation_address_evaluations: Vec::new(),
+            rebind_evaluations: Vec::new(),
+            checked_installs: Vec::new(),
+            checked_install_evaluations: Vec::new(),
+            checked_bindings: BTreeMap::new(),
+            while_points: Vec::new(),
+            block_scope_exits: Vec::new(),
+            conditional_points: Vec::new(),
+            call_points: Vec::new(),
+            capture_points: Vec::new(),
+            read_points: Vec::new(),
+            binding_points: Vec::new(),
+            assignment_points: Vec::new(),
+            top_level: Box::default(),
+            holder_edges: Vec::new(),
+            holder_exits: Vec::new(),
             initial_points: Vec::new(),
             allocations: BTreeSet::new(),
+            reference_parameters: Vec::new(),
             specialized_policies: Vec::new(),
         },
     }
@@ -3601,7 +5364,7 @@ fn derive_generic_parameters(node: &CstNode) -> Vec<ScalarGenericParameter> {
         .unwrap_or_default()
 }
 
-fn derive_generic_function(node: &CstNode) -> ScalarFunction {
+fn derive_generic_function(node: &CstNode, source: &SourceIdentity) -> ScalarFunction {
     let generic = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::GenericDecl)
@@ -3610,18 +5373,19 @@ fn derive_generic_function(node: &CstNode) -> ScalarFunction {
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::FunctionDecl)
         .expect("generic function declaration");
-    let mut function = derive_function(&function);
+    let mut function = derive_function(&function, source);
     function.generic_parameters = derive_generic_parameters(&generic);
     function.span = wosy_syntax::byte_span(node);
     function
 }
 
-fn derive_overload(node: &CstNode) -> ScalarFunction {
+fn derive_overload(node: &CstNode, source: &SourceIdentity) -> ScalarFunction {
     let name = direct_token(node, SyntaxKind::Identifier).expect("overload name");
     let arms: Vec<ScalarFunction> = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::OverloadArm)
-        .map(|arm| {
+        .enumerate()
+        .map(|(arm_index, arm)| {
             let children = direct_nodes(&arm);
             let signature = derive_type(
                 children
@@ -3662,6 +5426,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                     .iter()
                     .find(|child| child.kind() == SyntaxKind::Block)
                     .expect("overload arm block"),
+                source,
             );
             if let ScalarType::Callable { outputs, .. } = &signature {
                 expand_conditional_final_outputs(&mut body, &outputs.outputs);
@@ -3683,10 +5448,57 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                     .map_or_else(Vec::new, derive_generic_parameters),
                 overload_arms: Vec::new(),
                 reference_cfg: ScalarReferenceCfg {
+                    source_capture_inventory: SourceCaptureInventory::building(),
+                    name_resolution_context: NameResolutionContext::Building,
+                    source_null_constructors: Vec::new(),
+                    module_resolver_input: source_boundary::SourceModuleResolverInputState::NotApplicable,
+                    evaluated_values: EvaluatedValueTables::new(),
+                    producer_owner: ProducerCfgOwnerId::Function {
+                        source: source.clone(),
+                        declaration: token_span(&name),
+                        body: ProducerFunctionBodyId::Overload(arm_index),
+                    },
+                    environments: Vec::new(),
+                    environment_imports: Vec::new(),
+                    inputs: Vec::new(),
+                    capture_input_paths: Vec::new(),
+                    capture_input_path_facts: Vec::new(),
+                    producer_return_cases: Vec::new(),
+                    global_callable_input_paths: Vec::new(),
+                    global_call_exit_facts: Vec::new(),
+                    global_call_exit_imports: Vec::new(),
+                    nested_call_installs: Vec::new(),
+                    backing_parameters: Vec::new(),
+                    callable_array_parameters: Vec::new(),
+                    backing_length_sites: Vec::new(),
+                    backing_input_paths: Vec::new(),
+                    projected_backing_input_paths: Vec::new(),
+                    call_signatures: Vec::new(),
+                    backing_output_contracts: Vec::new(),
+                    literal_cfgs: Vec::new(),
                     facts: Vec::new(),
                     points: Vec::new(),
+                    borrow_evaluations: Vec::new(),
+                    rebind_associations: Vec::new(),
+                    allocation_address_evaluations: Vec::new(),
+                    rebind_evaluations: Vec::new(),
+                    checked_installs: Vec::new(),
+                    checked_install_evaluations: Vec::new(),
+                    checked_bindings: BTreeMap::new(),
+                    while_points: Vec::new(),
+                    block_scope_exits: Vec::new(),
+                    conditional_points: Vec::new(),
+                    call_points: Vec::new(),
+                    capture_points: Vec::new(),
+                    read_points: Vec::new(),
+                    binding_points: Vec::new(),
+                    assignment_points: Vec::new(),
+                    top_level: Box::default(),
+                    holder_edges: Vec::new(),
+                    holder_exits: Vec::new(),
                     initial_points: Vec::new(),
                     allocations: BTreeSet::new(),
+                    reference_parameters: Vec::new(),
                     specialized_policies: Vec::new(),
                 },
             }
@@ -3705,22 +5517,79 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
             expressions: Vec::new(),
             final_output_values: Vec::new(),
             span: wosy_syntax::byte_span(node),
+            occurrence: Box::new(ScalarBlockOccurrence {
+                source_span: SourceSpan::new(source.clone(), wosy_syntax::byte_span(node)),
+                output_projection: Vec::new(),
+            }),
             unsafe_context: false,
         },
         span: wosy_syntax::byte_span(node),
         generic_parameters: Vec::new(),
         overload_arms: arms,
         reference_cfg: ScalarReferenceCfg {
+            source_capture_inventory: SourceCaptureInventory::building(),
+            name_resolution_context: NameResolutionContext::Building,
+            source_null_constructors: Vec::new(),
+            module_resolver_input: source_boundary::SourceModuleResolverInputState::NotApplicable,
+            evaluated_values: EvaluatedValueTables::new(),
+            producer_owner: ProducerCfgOwnerId::Function {
+                source: source.clone(),
+                declaration: token_span(&name),
+                body: ProducerFunctionBodyId::Declaration,
+            },
+            environments: Vec::new(),
+            environment_imports: Vec::new(),
+            inputs: Vec::new(),
+            capture_input_paths: Vec::new(),
+            capture_input_path_facts: Vec::new(),
+            producer_return_cases: Vec::new(),
+            global_callable_input_paths: Vec::new(),
+            global_call_exit_facts: Vec::new(),
+            global_call_exit_imports: Vec::new(),
+            nested_call_installs: Vec::new(),
+            backing_parameters: Vec::new(),
+            callable_array_parameters: Vec::new(),
+            backing_length_sites: Vec::new(),
+            backing_input_paths: Vec::new(),
+            projected_backing_input_paths: Vec::new(),
+            call_signatures: Vec::new(),
+            backing_output_contracts: Vec::new(),
+            literal_cfgs: Vec::new(),
             facts: Vec::new(),
             points: Vec::new(),
+            borrow_evaluations: Vec::new(),
+            rebind_associations: Vec::new(),
+            allocation_address_evaluations: Vec::new(),
+            rebind_evaluations: Vec::new(),
+            checked_installs: Vec::new(),
+            checked_install_evaluations: Vec::new(),
+            checked_bindings: BTreeMap::new(),
+            while_points: Vec::new(),
+            block_scope_exits: Vec::new(),
+            conditional_points: Vec::new(),
+            call_points: Vec::new(),
+            capture_points: Vec::new(),
+            read_points: Vec::new(),
+            binding_points: Vec::new(),
+            assignment_points: Vec::new(),
+            top_level: Box::default(),
+            holder_edges: Vec::new(),
+            holder_exits: Vec::new(),
             initial_points: Vec::new(),
             allocations: BTreeSet::new(),
+            reference_parameters: Vec::new(),
             specialized_policies: Vec::new(),
         },
     }
 }
 
+mod closure;
+mod evaluated_borrow;
+mod loan_relation;
+mod reborrow;
 mod reference;
+pub use reference::name_resolution::{NameResolutionContext, SourceNameDeclarationRef, SourceNameDeclarationSite, SourceNameFunctionDeclaration, SourceNameFunctionRoot, SourceNameGlobalDeclaration, SourceNameModuleItem, SourceNameReadFact, SourceNameResolutionContext, SourceNameResolutionContextRoot, SourceNameResolutionRole, SourceNameResolutionRoot};
+mod reference_producers;
 use reference::{
     expand_conditional_final_outputs, record_module_reference_origins,
     record_program_reference_origins, record_specialized_copy_policies, resolve_module_call_sites,
@@ -3837,8 +5706,16 @@ fn derive_type(node: &CstNode) -> ScalarType {
             type_from_name(token.text(), token_span(&token))
         }
     };
-    for suffix in node
-        .children()
+    let suffixes = if actual == *node {
+        node.children().collect::<Vec<_>>()
+    } else {
+        let base_end = wosy_syntax::byte_span(&actual).end;
+        node.descendants()
+            .filter(|child| wosy_syntax::byte_span(child).start >= base_end)
+            .collect::<Vec<_>>()
+    };
+    for suffix in suffixes
+        .iter()
         .filter(|child| child.kind() == SyntaxKind::FixedArraySuffix)
     {
         let length = suffix
@@ -3864,32 +5741,21 @@ fn derive_type(node: &CstNode) -> ScalarType {
             span: wosy_syntax::byte_span(node),
         };
     }
-    for _ in node
-        .children()
+    let erased_suffixes = suffixes
+        .iter()
         .filter(|child| child.kind() == SyntaxKind::ErasedArraySuffix)
-    {
+        .count()
+        + node
+            .children_with_tokens()
+            .filter(|element| matches!(element, NodeOrToken::Token(token) if token.kind() == SyntaxKind::ErasedArraySuffix))
+            .count();
+    for _ in 0..erased_suffixes {
         ty = ScalarType::RuntimeArray {
             element: Box::new(ty),
             span: wosy_syntax::byte_span(node),
         };
     }
-    if !matches!(ty, ScalarType::Callable { .. }) {
-        let erased_suffixes = node.text().to_string().match_indices("[]").count();
-        for _ in runtime_array_depth(&ty)..erased_suffixes {
-            ty = ScalarType::RuntimeArray {
-                element: Box::new(ty),
-                span: wosy_syntax::byte_span(node),
-            };
-        }
-    }
     ty
-}
-
-fn runtime_array_depth(ty: &ScalarType) -> usize {
-    match ty {
-        ScalarType::RuntimeArray { element, .. } => 1 + runtime_array_depth(element),
-        _ => 0,
-    }
 }
 
 fn derive_callable_array_type(node: &CstNode) -> ScalarType {
@@ -4188,18 +6054,22 @@ fn string_error_span(token: &CstToken, start: usize, length: usize) -> ByteSpan 
     )
 }
 
-fn derive_block(node: &CstNode) -> ScalarBlock {
-    derive_block_with_context(node, false)
+fn derive_block(node: &CstNode, source: &SourceIdentity) -> ScalarBlock {
+    derive_block_with_context(node, false, source)
 }
 
-fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBlock {
+fn derive_block_with_context(
+    node: &CstNode,
+    unsafe_context: bool,
+    source: &SourceIdentity,
+) -> ScalarBlock {
     let block_items = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::BlockItem)
         .collect::<Vec<_>>();
     let mut items = block_items
         .iter()
-        .map(derive_block_item)
+        .map(|item| derive_block_item(item, source))
         .collect::<Vec<_>>();
     let mut final_output_values = direct_nodes(node)
         .into_iter()
@@ -4214,7 +6084,7 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
                 .filter(|child| child.kind() == SyntaxKind::Expression)
                 .enumerate()
                 .map(|(position, child)| {
-                    let value = derive_expression(&child);
+                    let value = derive_expression(&child, source);
                     ScalarOutputValue {
                         position,
                         ty: ScalarType::Error,
@@ -4280,46 +6150,54 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
         expressions,
         final_output_values,
         span: wosy_syntax::byte_span(node),
+        occurrence: Box::new(ScalarBlockOccurrence {
+            source_span: SourceSpan::new(source.clone(), wosy_syntax::byte_span(node)),
+            output_projection: Vec::new(),
+        }),
         unsafe_context,
     }
 }
 
-fn derive_block_item(node: &CstNode) -> ScalarBlockItem {
+fn derive_block_item(node: &CstNode, source: &SourceIdentity) -> ScalarBlockItem {
     let child = direct_nodes(node).into_iter().next().expect("block item");
     match child.kind() {
-        SyntaxKind::LocalBinding => ScalarBlockItem::LocalBinding(derive_binding(&child)),
-        SyntaxKind::While => ScalarBlockItem::While(derive_while(&child)),
+        SyntaxKind::LocalBinding => ScalarBlockItem::LocalBinding(derive_binding(&child, source)),
+        SyntaxKind::While => ScalarBlockItem::While(derive_while(&child, source)),
         SyntaxKind::Expression => {
             let actual = direct_nodes(&child).into_iter().next().expect("expression");
             match actual.kind() {
-                SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&actual)),
-                SyntaxKind::While => ScalarBlockItem::While(derive_while(&actual)),
-                _ => ScalarBlockItem::Expression(derive_expression(&child)),
+                SyntaxKind::Assignment => {
+                    ScalarBlockItem::Assignment(derive_assignment(&actual, source))
+                }
+                SyntaxKind::While => ScalarBlockItem::While(derive_while(&actual, source)),
+                _ => ScalarBlockItem::Expression(derive_expression(&child, source)),
             }
         }
         _ => panic!("block item grammar"),
     }
 }
 
-fn derive_executable_item(node: &CstNode) -> ScalarBlockItem {
+fn derive_executable_item(node: &CstNode, source: &SourceIdentity) -> ScalarBlockItem {
     let child = direct_nodes(node)
         .into_iter()
         .next()
         .expect("executable item");
     match child.kind() {
-        SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&child)),
+        SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&child, source)),
         SyntaxKind::Expression => {
             let actual = direct_nodes(&child).into_iter().next().expect("expression");
             match actual.kind() {
-                SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&actual)),
-                _ => ScalarBlockItem::Expression(derive_expression(&child)),
+                SyntaxKind::Assignment => {
+                    ScalarBlockItem::Assignment(derive_assignment(&actual, source))
+                }
+                _ => ScalarBlockItem::Expression(derive_expression(&child, source)),
             }
         }
         _ => panic!("top-level item grammar"),
     }
 }
 
-fn derive_assignment(node: &CstNode) -> ScalarAssignment {
+fn derive_assignment(node: &CstNode, source: &SourceIdentity) -> ScalarAssignment {
     let targets_node = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::AssignmentTargets)
@@ -4338,7 +6216,7 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
                 })
                 .collect();
             let target = identifiers.last().expect("assignment target name");
-            let place = derive_place(&target_node);
+            let place = derive_place(&target_node, source);
             ScalarAssignmentTarget {
                 receiver: (identifiers.len() == 2).then(|| identifiers[0].text().to_owned()),
                 target: target.text().to_owned(),
@@ -4352,22 +6230,6 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
             }
         })
         .collect::<Vec<_>>();
-    let target_node = direct_nodes(node)
-        .into_iter()
-        .find(|child| child.kind() == SyntaxKind::AssignmentTarget)
-        .or_else(|| {
-            node.descendants()
-                .find(|child| child.kind() == SyntaxKind::AssignmentTarget)
-        })
-        .expect("assignment target node");
-    let identifiers: Vec<CstToken> = target_node
-        .descendants_with_tokens()
-        .filter_map(|element| match element {
-            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => Some(token),
-            _ => None,
-        })
-        .collect();
-    let target = identifiers.last().expect("assignment target name");
     let output_list = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::OutputList)
@@ -4375,51 +6237,83 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
     let values = output_list
         .children()
         .filter(|child| child.kind() == SyntaxKind::Expression)
-        .map(|child| derive_expression(&child))
+        .map(|child| derive_expression(&child, source))
         .collect::<Vec<_>>();
-    let value = values[0].clone();
     ScalarAssignment {
-        receiver: (identifiers.len() == 2).then(|| identifiers[0].text().to_owned()),
-        target: target.text().to_owned(),
-        receiver_span: (identifiers.len() == 2).then(|| token_span(&identifiers[0])),
-        target_span: token_span(&target),
         targets,
-        value,
         values,
         span: wosy_syntax::byte_span(node),
+        occurrence: Box::new(ScalarAssignmentOccurrence {
+            source_span: SourceSpan::new(source.clone(), wosy_syntax::byte_span(node)),
+            output_projection: Vec::new(),
+        }),
     }
 }
 
-fn derive_while(node: &CstNode) -> ScalarWhile {
+fn derive_while(node: &CstNode, source: &SourceIdentity) -> ScalarWhile {
     let children = direct_nodes(node);
     ScalarWhile {
-        condition: derive_expression(&children[0]),
-        body: derive_block(&children[1]),
+        condition: derive_expression(&children[0], source),
+        body: derive_block(&children[1], source),
         span: wosy_syntax::byte_span(node),
+        occurrence: ScalarWhileOccurrence {
+            source_span: SourceSpan::new(source.clone(), wosy_syntax::byte_span(node)),
+            output_projection: Vec::new(),
+        },
     }
 }
 
-fn derive_expression(node: &CstNode) -> ScalarExpression {
+fn derive_expression(node: &CstNode, source: &SourceIdentity) -> ScalarExpression {
     let actual = if node.kind() == SyntaxKind::Expression {
         direct_nodes(node)[0].clone()
     } else {
         node.clone()
     };
     match actual.kind() {
+        SyntaxKind::Assignment => {
+            ScalarExpression::Assignment(Box::new(derive_assignment(&actual, source)))
+        }
+        SyntaxKind::FunctionLiteral => {
+            let parameters = direct_nodes(&actual)
+                .into_iter()
+                .find(|child| child.kind() == SyntaxKind::Parameters);
+            let identifiers = parameters
+                .into_iter()
+                .flat_map(|node| node.children_with_tokens())
+                .filter_map(|element| match element {
+                    NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => {
+                        Some(token)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            ScalarExpression::FunctionLiteral {
+                parameters: identifiers.iter().map(|token| token.text().to_owned()).collect(),
+                parameter_spans: identifiers.iter().map(token_span).collect(),
+                body: derive_block(
+                    &direct_nodes(&actual)
+                        .into_iter()
+                        .find(|child| child.kind() == SyntaxKind::Block)
+                        .expect("function literal block"),
+                    source,
+                ),
+                span: wosy_syntax::byte_span(&actual),
+            }
+        }
         SyntaxKind::IfExpr => {
             let children = direct_nodes(&actual);
             ScalarExpression::If {
-                condition: Box::new(derive_expression(&children[0])),
-                then_branch: derive_block(&children[1]),
-                else_branch: derive_block(&children[2]),
+                condition: Box::new(derive_expression(&children[0], source)),
+                then_branch: derive_block(&children[1], source),
+                else_branch: derive_block(&children[2], source),
                 span: wosy_syntax::byte_span(&actual),
             }
         }
         SyntaxKind::UnitIfExpr => {
             let children = direct_nodes(&actual);
             ScalarExpression::UnitIf {
-                condition: Box::new(derive_expression(&children[0])),
-                then_branch: derive_block(&children[1]),
+                condition: Box::new(derive_expression(&children[0], source)),
+                then_branch: derive_block(&children[1], source),
                 span: wosy_syntax::byte_span(&actual),
             }
         }
@@ -4429,12 +6323,13 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .find(|child| child.kind() == SyntaxKind::Block)
                 .expect("unsafe block"),
             true,
+            source,
         )),
         SyntaxKind::ArrayLiteral => ScalarExpression::ArrayLiteral {
             elements: direct_nodes(&actual)
                 .into_iter()
                 .filter(|child| child.kind() == SyntaxKind::Expression)
-                .map(|child| derive_expression(&child))
+                .map(|child| derive_expression(&child, source))
                 .collect(),
             span: wosy_syntax::byte_span(&actual),
         },
@@ -4447,14 +6342,14 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
         },
         SyntaxKind::Binary => {
             let children = semantic_children(&actual);
-            let mut value = derive_element(&children[0]);
+            let mut value = derive_element(&children[0], source);
             let mut index = 1;
             while index < children.len() {
                 let NodeOrToken::Token(operator_token) = &children[index] else {
                     panic!("binary operator token")
                 };
                 let operator = operator(operator_token.text());
-                let right = derive_element(&children[index + 1]);
+                let right = derive_element(&children[index + 1], source);
                 let span = ByteSpan::new(span_of(&value).start, span_of(&right).end);
                 value = ScalarExpression::Binary {
                     operator,
@@ -4472,7 +6367,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 panic!("unary expression children")
             };
             let NodeOrToken::Token(operator_token) = first else {
-                return derive_element(first);
+                return derive_element(first, source);
             };
             let operator = match operator_token.text() {
                 "!" => UnaryOperator::LogicalNot,
@@ -4480,7 +6375,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 "-" => UnaryOperator::Negate,
                 _ => panic!("unary operator grammar"),
             };
-            let operand = derive_element(children.get(1).expect("unary operand"));
+            let operand = derive_element(children.get(1).expect("unary operand"), source);
             ScalarExpression::Unary {
                 operator,
                 span: ByteSpan::new(
@@ -4531,7 +6426,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             let arguments = direct_nodes(&actual)
                 .iter()
                 .filter(|child| child.kind() == SyntaxKind::Expression)
-                .map(derive_expression)
+                .map(|child| derive_expression(child, source))
                 .collect();
             ScalarExpression::Call {
                 receiver,
@@ -4545,6 +6440,10 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 arguments,
                 overload_selection: None,
                 span: wosy_syntax::byte_span(&actual),
+                occurrence: Box::new(ScalarCallOccurrence {
+                    source_span: SourceSpan::new(source.clone(), wosy_syntax::byte_span(&actual)),
+                    output_projection: Vec::new(),
+                }),
             }
         }
         SyntaxKind::QualifiedMember => {
@@ -4576,20 +6475,35 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .find(|child| child.kind() == SyntaxKind::DereferencedField)
             {
                 ScalarExpression::Dereference {
-                    place: derive_place(&field),
+                    place: derive_place(&field, source),
                     span: wosy_syntax::byte_span(&actual),
+                    occurrence: Box::new(ScalarReadOccurrence {
+                        source_span: SourceSpan::new(source.clone(), wosy_syntax::byte_span(&actual)),
+                        output_projection: Vec::new(),
+                        role: ScalarReadRole::Dereference,
+                    }),
                 }
             } else {
-                derive_element(&semantic_children(&actual)[0])
+                derive_element(&semantic_children(&actual)[0], source)
             }
         }
         SyntaxKind::IndexedPlace => ScalarExpression::IndexedRead {
-            place: derive_place(&actual),
+            place: derive_place(&actual, source),
             span: wosy_syntax::byte_span(&actual),
+            occurrence: Box::new(ScalarReadOccurrence {
+                source_span: SourceSpan::new(source.clone(), wosy_syntax::byte_span(&actual)),
+                output_projection: Vec::new(),
+                role: ScalarReadRole::IndexedRead,
+            }),
         },
         SyntaxKind::Dereference | SyntaxKind::DereferencedField => ScalarExpression::Dereference {
-            place: derive_place(&actual),
+            place: derive_place(&actual, source),
             span: wosy_syntax::byte_span(&actual),
+            occurrence: Box::new(ScalarReadOccurrence {
+                source_span: SourceSpan::new(source.clone(), wosy_syntax::byte_span(&actual)),
+                output_projection: Vec::new(),
+                role: ScalarReadRole::Dereference,
+            }),
         },
         SyntaxKind::CheckedAddress => {
             let target = direct_nodes(&actual)
@@ -4609,7 +6523,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 } else {
                     ScalarReferenceMutability::Shared
                 },
-                place: derive_place(&target),
+                place: derive_place(&target, source),
                 span: wosy_syntax::byte_span(&actual),
             }
         }
@@ -4619,7 +6533,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .find(|child| child.kind() == SyntaxKind::PlaceTarget)
                 .expect("raw address target");
             ScalarExpression::RawAddress {
-                place: derive_place(&target),
+                place: derive_place(&target, source),
                 span: wosy_syntax::byte_span(&actual),
             }
         }
@@ -4632,7 +6546,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                     let value = field
                         .descendants()
                         .find(|child| child.kind() == SyntaxKind::Expression)
-                        .map(|child| derive_expression(&child))
+                        .map(|child| derive_expression(&child, source))
                         .expect("field value");
                     ScalarStructLiteralField {
                         name: name.text().to_owned(),
@@ -4644,32 +6558,34 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .collect(),
             span: wosy_syntax::byte_span(&actual),
         },
-        SyntaxKind::Parenthesized => derive_expression(&direct_nodes(&actual)[0]),
-        SyntaxKind::Expression => derive_element(&semantic_children(&actual)[0]),
+        SyntaxKind::Parenthesized => derive_expression(&direct_nodes(&actual)[0], source),
+        SyntaxKind::Expression => derive_element(&semantic_children(&actual)[0], source),
         _ => {
             let children = semantic_children(&actual);
             children
                 .first()
-                .map(derive_element)
+                .map(|element| derive_element(element, source))
                 .unwrap_or_else(|| panic!("expression grammar {:?}", actual.kind()))
         }
     }
 }
 
-fn derive_place(node: &CstNode) -> ScalarPlace {
+fn derive_place(node: &CstNode, source: &SourceIdentity) -> ScalarPlace {
     match node.kind() {
         SyntaxKind::ParenthesizedDereferencePlace => derive_place(
             &direct_nodes(node)
                 .into_iter()
                 .find(|child| child.kind() == SyntaxKind::Dereference)
                 .expect("parenthesized dereference place"),
+            source,
         ),
-        SyntaxKind::PlaceTarget => {
-            derive_place(&direct_nodes(node).into_iter().next().expect("place target"))
-        }
+        SyntaxKind::PlaceTarget => derive_place(
+            &direct_nodes(node).into_iter().next().expect("place target"),
+            source,
+        ),
         SyntaxKind::AssignmentTarget => {
             if let Some(child) = direct_nodes(node).into_iter().next() {
-                derive_place(&child)
+                derive_place(&child, source)
             } else {
                 let name = direct_token(node, SyntaxKind::Identifier).expect("place name");
                 ScalarPlace::Name {
@@ -4718,7 +6634,7 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                 .find(|child| child.kind() == SyntaxKind::Dereference)
                 .expect("dereference expression");
             ScalarPlace::Field {
-                base: Box::new(derive_place(&dereference)),
+                base: Box::new(derive_place(&dereference, source)),
                 field: ScalarFieldReference::Unresolved {
                     name: field.text().to_owned(),
                     span: token_span(&field),
@@ -4732,6 +6648,7 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                     .into_iter()
                     .next()
                     .expect("dereference pointer"),
+                source,
             )),
             span: wosy_syntax::byte_span(node),
         },
@@ -4740,7 +6657,7 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
             let mut place = children
                 .iter()
                 .find(|child| child.kind() != SyntaxKind::IndexSuffix)
-                .map(derive_place)
+                .map(|child| derive_place(child, source))
                 .unwrap_or_else(|| {
                     let name =
                         direct_token(node, SyntaxKind::Identifier).expect("indexed place name");
@@ -4760,7 +6677,7 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                 let index_span = wosy_syntax::byte_span(&index);
                 place = ScalarPlace::Index {
                     base: Box::new(place),
-                    index: Box::new(derive_expression(&index)),
+                    index: Box::new(derive_expression(&index, source)),
                     span: ByteSpan::new(
                         wosy_syntax::byte_span(node).start,
                         wosy_syntax::byte_span(&suffix).end,
@@ -4805,9 +6722,12 @@ fn direct_token(node: &CstNode, kind: SyntaxKind) -> Option<CstToken> {
         })
 }
 
-fn derive_element(element: &NodeOrToken<CstNode, CstToken>) -> ScalarExpression {
+fn derive_element(
+    element: &NodeOrToken<CstNode, CstToken>,
+    source: &SourceIdentity,
+) -> ScalarExpression {
     match element {
-        NodeOrToken::Node(node) => derive_expression(node),
+        NodeOrToken::Node(node) => derive_expression(node, source),
         NodeOrToken::Token(token) => match token.kind() {
             SyntaxKind::Boolean => ScalarExpression::Boolean {
                 value: token.text() == "true",
@@ -4917,7 +6837,9 @@ fn token_span(token: &CstToken) -> ByteSpan {
 
 fn span_of(expression: &ScalarExpression) -> ByteSpan {
     match expression {
-        ScalarExpression::Name { span, .. }
+        ScalarExpression::Assignment(assignment) => assignment.span,
+        ScalarExpression::FunctionLiteral { span, .. }
+        | ScalarExpression::Name { span, .. }
         | ScalarExpression::Member { span, .. }
         | ScalarExpression::Integer { span, .. }
         | ScalarExpression::Float { span, .. }

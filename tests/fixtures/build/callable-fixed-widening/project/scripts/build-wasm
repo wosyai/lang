@@ -1,0 +1,8 @@
+import subprocess
+import sys
+
+partition, output_dir, manifest, runtime = sys.argv[1:]
+subprocess.run(["clang", "--target=wasm32-wasi", "-c", "-x", "ir", partition, "-o", output_dir + "/main.o"], check=True)
+subprocess.run(["clang", "--target=wasm32-wasi", "-c", "-x", "ir", runtime, "-o", output_dir + "/runtime.o"], check=True)
+subprocess.run(["clang", "--target=wasm32-wasi", "-c", "-x", "ir", "scripts/counting-wasm.ll", "-o", output_dir + "/counting.o"], check=True)
+subprocess.run(["wasm-ld", "--no-entry", "--allow-undefined", "--export=_start", "--wrap=__wosy_core_alloc", "--wrap=__wosy_core_free", "--wrap=__wosy_core_system_panic", output_dir + "/main.o", output_dir + "/runtime.o", output_dir + "/counting.o", "-o", output_dir + "/main"], check=True)

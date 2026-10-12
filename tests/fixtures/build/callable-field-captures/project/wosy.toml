@@ -1,0 +1,167 @@
+[package]
+name = "callable_field_captures"
+default_target = "app"
+
+[dependencies.std]
+path = "stdlib"
+
+[comments]
+categories = []
+
+[builders.wasm]
+command = ["python", "scripts/build-wasm"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[runners.wasm]
+command = ["python", "scripts/run-wasmtime"]
+args = []
+
+[builders.native]
+command = ["python", "scripts/build-native"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[runners.native]
+command = ["python", "scripts/run-native"]
+args = []
+
+[builders.global_native]
+command = ["python", "scripts/build-global-native"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[builders.global_wasm]
+command = ["python", "scripts/build-global-wasm"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[targets.app]
+root = "src/main.w"
+
+[targets.app.artifacts.main]
+artifact = "CallableFieldCaptures"
+
+[targets.app.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.app.profiles.dev]
+main_artifact = "main"
+
+[targets.native]
+root = "src/native.w"
+
+[targets.native.artifacts.main]
+artifact = "CallableFieldCapturesNative"
+
+[targets.native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.native.profiles.dev]
+main_artifact = "main"
+
+[builders.branch_native]
+command = ["python", "scripts/build-branch-native"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[targets.branch_native]
+root = "src/branch.w"
+
+[targets.branch_native.artifacts.main]
+artifact = "BranchCapturesNative"
+
+[targets.branch_native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "branch_native"
+run_runner = "native"
+
+[targets.branch_native.profiles.dev]
+main_artifact = "main"
+
+[builders.branch_wasm]
+command = ["python", "scripts/build-branch-wasm"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[targets.branch_wasm]
+root = "src/branch.w"
+
+[targets.branch_wasm.artifacts.main]
+artifact = "BranchCapturesWasm"
+
+[targets.branch_wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "branch_wasm"
+run_runner = "wasm"
+
+[targets.branch_wasm.profiles.dev]
+main_artifact = "main"
+
+[targets.counted_native]
+root = "src/counted.w"
+
+[targets.counted_native.artifacts.main]
+artifact = "BranchCountedNative"
+
+[targets.counted_native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "branch_native"
+run_runner = "native"
+
+[targets.counted_native.profiles.dev]
+main_artifact = "main"
+
+[targets.counted_wasm]
+root = "src/counted.w"
+
+[targets.counted_wasm.artifacts.main]
+artifact = "BranchCountedWasm"
+
+[targets.counted_wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "branch_wasm"
+run_runner = "wasm"
+
+[targets.counted_wasm.profiles.dev]
+main_artifact = "main"
+
+[targets.global_native]
+root = "src/global.w"
+
+[targets.global_native.artifacts.main]
+artifact = "GlobalCallableFieldNative"
+
+[targets.global_native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "global_native"
+run_runner = "native"
+
+[targets.global_native.profiles.dev]
+main_artifact = "main"
+
+[targets.global_wasm]
+root = "src/global.w"
+
+[targets.global_wasm.artifacts.main]
+artifact = "GlobalCallableFieldWasm"
+
+[targets.global_wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "global_wasm"
+run_runner = "wasm"
+
+[targets.global_wasm.profiles.dev]
+main_artifact = "main"

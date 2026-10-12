@@ -1,0 +1,7 @@
+import json
+import subprocess
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as file:
+    manifest = json.load(file)
+sys.exit(subprocess.run(["wasmtime", "run", manifest["executable"], *sys.argv[sys.argv.index("--") + 1:]]).returncode)

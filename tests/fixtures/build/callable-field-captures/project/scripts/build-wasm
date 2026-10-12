@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+import subprocess
+import sys
+
+partition, output_dir, manifest, runtime = sys.argv[1:]
+object_path = output_dir + "/main.o"
+wrapper_object_path = output_dir + "/start.o"
+runtime_object_path = output_dir + "/runtime.o"
+counting_object_path = output_dir + "/counting.o"
+subprocess.run(
+    ["clang", "--target=wasm32-wasi", "-c", "-x", "ir", partition, "-o", object_path],
+    check=True,
+)
+subprocess.run(
+    [
+        "clang",
+        "--target=wasm32-wasi",
+        "-c",
+        "-x",
+        "ir",
+        "scripts/start.ll",
+        "-o",
+        wrapper_object_path,
+    ],
+    check=True,
+)
+subprocess.run(
+    [
+        "clang",
+        "--target=wasm32-wasi",
+        "-c",
+        "-x",
+        "ir",
+        runtime,
+        "-o",
+        runtime_object_path,
+    ],
+    check=True,
+)
+subprocess.run(
+    ["clang", "--target=wasm32-wasi", "-c", "-x", "ir", "runtime/wasm32.ll", "-o", counting_object_path],
+    check=True,
+)
+subprocess.run(
+    [
+        "wasm-ld",
+        "--no-entry",
+        "--allow-undefined",
+        "--export=_start",
+        "--wrap=__wosy_core_alloc",
+        "--wrap=__wosy_core_free",
+        object_path,
+        wrapper_object_path,
+        runtime_object_path,
+        counting_object_path,
+        "-o",
+        output_dir + "/main",
+    ],
+    check=True,
+)

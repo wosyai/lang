@@ -1,0 +1,21 @@
+[[steps]]
+command = ["wosy", "build", "native"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "native"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[steps]]
+command = ["wosy", "build", "wasm"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "wasm"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true

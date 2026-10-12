@@ -6,6 +6,10 @@ pub(super) fn emit_expression<'ctx, 'module>(
     expression: &ScalarExpression,
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::Assignment(assignment) => emit_assignment(context, state, assignment),
+        ScalarExpression::FunctionLiteral { span, .. } => {
+            closure::emit_literal(context, state, expression, *span, None)
+        }
         ScalarExpression::Name { name, .. } => {
             if name == "null" {
                 return Ok(EmitValue::Basic(
@@ -75,8 +79,17 @@ pub(super) fn emit_expression<'ctx, 'module>(
             }
             Err(format!("unknown LLVM member {receiver}.{name}"))
         }
-        ScalarExpression::Dereference { place, .. } => emit_place_value(context, state, place),
-        ScalarExpression::IndexedRead { place, .. } => emit_place_value(context, state, place),
+        ScalarExpression::Dereference { place, .. }
+        | ScalarExpression::IndexedRead { place, .. } => {
+            if matches!(
+                assignment_place_type(state, place),
+                Some(ScalarType::Callable { .. })
+            ) {
+                memory::emit_callable_read(context, state, expression, place, None)
+            } else {
+                emit_place_value(context, state, place)
+            }
+        }
         ScalarExpression::Integer { value, .. } => Ok(EmitValue::Basic(
             context
                 .i32_type()
@@ -122,11 +135,45 @@ pub(super) fn emit_expression<'ctx, 'module>(
             receiver,
             name,
             span,
+            occurrence,
             type_arguments,
             arguments,
             overload_selection,
             ..
         } => {
+            if let Some(ResolvedCallTarget::CallableField {
+                receiver_place,
+                field,
+            }) = state.resolved_calls.get(&(span.start, span.end)).cloned()
+            {
+                return emit_callable_field(
+                    context,
+                    state,
+                    &receiver_place,
+                    &field,
+                    occurrence,
+                    arguments,
+                    None,
+                );
+            }
+            if receiver.is_none()
+                && matches!(
+                    state.resolved_calls.get(&(span.start, span.end)),
+                    Some(ResolvedCallTarget::LocalCallable(_))
+                )
+            {
+                return emit_local_closure_call(context, state, name, occurrence, arguments, None);
+            }
+            if receiver.as_ref().is_some_and(|receiver| {
+                state
+                    .storage
+                    .get(receiver)
+                    .map(|(_, ty)| ty)
+                    .or_else(|| state.globals.get(receiver).map(|(_, ty)| ty))
+                    .is_some_and(|ty| matches!(ty, ScalarType::Struct(_)))
+            }) {
+                return Err("callable field call lacks a validated CFG target".to_owned());
+            }
             if state.invalidations.contains_key(&(span.start, span.end)) {
                 return emit_core_invalidation(context, state, *span, arguments, None);
             }
@@ -174,6 +221,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                 state,
                 receiver.as_deref(),
                 name,
+                occurrence,
                 type_arguments,
                 arguments,
                 overload_selection.as_ref(),
@@ -255,6 +303,16 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::Assignment(assignment) => {
+            emit_project_assignment(context, state, assignment, module, modules)
+        }
+        ScalarExpression::FunctionLiteral { span, .. } => closure::emit_literal(
+            context,
+            state,
+            expression,
+            *span,
+            Some(ProjectCallScope { module, modules }),
+        ),
         ScalarExpression::Member {
             receiver,
             name,
@@ -289,27 +347,68 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                     .map_err(builder_error)?,
             ))
         }
-        ScalarExpression::Dereference { place, .. } => emit_place_value_in_project(
-            context,
-            state,
-            place,
-            Some(ProjectCallScope { module, modules }),
-        ),
-        ScalarExpression::IndexedRead { place, .. } => emit_place_value_in_project(
-            context,
-            state,
-            place,
-            Some(ProjectCallScope { module, modules }),
-        ),
+        ScalarExpression::Dereference { place, .. }
+        | ScalarExpression::IndexedRead { place, .. } => {
+            let scope = Some(ProjectCallScope { module, modules });
+            if matches!(
+                assignment_place_type(state, place),
+                Some(ScalarType::Callable { .. })
+            ) {
+                memory::emit_callable_read(context, state, expression, place, scope)
+            } else {
+                emit_place_value_in_project(context, state, place, scope)
+            }
+        }
         ScalarExpression::Call {
             receiver,
             name,
             span,
+            occurrence,
             type_arguments,
             arguments,
             overload_selection,
             ..
         } => {
+            if let Some(ResolvedCallTarget::CallableField {
+                receiver_place,
+                field,
+            }) = state.resolved_calls.get(&(span.start, span.end)).cloned()
+            {
+                return emit_callable_field(
+                    context,
+                    state,
+                    &receiver_place,
+                    &field,
+                    occurrence,
+                    arguments,
+                    Some(ProjectCallScope { module, modules }),
+                );
+            }
+            if receiver.is_none()
+                && matches!(
+                    state.resolved_calls.get(&(span.start, span.end)),
+                    Some(ResolvedCallTarget::LocalCallable(_))
+                )
+            {
+                return emit_local_closure_call(
+                    context,
+                    state,
+                    name,
+                    occurrence,
+                    arguments,
+                    Some(ProjectCallScope { module, modules }),
+                );
+            }
+            if receiver.as_ref().is_some_and(|receiver| {
+                state
+                    .storage
+                    .get(receiver)
+                    .map(|(_, ty)| ty)
+                    .or_else(|| state.globals.get(receiver).map(|(_, ty)| ty))
+                    .is_some_and(|ty| matches!(ty, ScalarType::Struct(_)))
+            }) {
+                return Err("callable field call lacks a validated CFG target".to_owned());
+            }
             if state.invalidations.contains_key(&(span.start, span.end)) {
                 return emit_core_invalidation(
                     context,
@@ -404,19 +503,17 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                     modules,
                 );
             }
-            let target = receiver.as_ref().map_or(module, |binding| {
-                module
-                    .namespace_bindings
-                    .iter()
-                    .find(|namespace| namespace.binding == *binding)
-                    .and_then(|namespace| {
-                        modules
-                            .iter()
-                            .find(|candidate| candidate.source == namespace.target)
-                            .copied()
-                    })
-                    .unwrap_or(module)
-            });
+            let target = match receiver.as_deref() {
+                Some(binding)
+                    if module
+                        .namespace_bindings
+                        .iter()
+                        .any(|namespace| namespace.binding == binding) =>
+                {
+                    project_namespace_target(module, modules, binding)?
+                }
+                _ => module,
+            };
             let qualified = receiver
                 .as_deref()
                 .filter(|binding| {
@@ -472,25 +569,37 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                 .or_else(|| state.call_targets.get(&qualified))
                 .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?
                 .clone();
-            let ScalarType::Callable { parameters, .. } = state
-                .signatures
-                .get(&target)
-                .ok_or_else(|| format!("unknown LLVM callable signature {qualified}"))?
-            else {
-                return Err(format!(
-                    "LLVM callable {qualified} has no callable signature"
-                ));
+            let parameters = match state.signatures.get(&target) {
+                Some(ScalarType::Callable { parameters, .. }) => parameters.clone(),
+                _ => {
+                    return Err(format!(
+                        "LLVM callable {qualified} has no callable signature"
+                    ));
+                }
             };
-            let values = arguments
-                .iter()
-                .zip(parameters)
-                .map(|(argument, parameter)| {
-                    emit_project_typed_expression(
-                        context, state, argument, parameter, module, modules,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            emit_call_values(context, state, &target, values)
+            let mut values = Vec::new();
+            let mut lengths = Vec::new();
+            for (argument, parameter) in arguments.iter().zip(&parameters) {
+                values.push(emit_project_typed_expression(
+                    context, state, argument, parameter, module, modules,
+                )?);
+                lengths.extend(super::call_argument_lengths(
+                    context,
+                    state,
+                    &target,
+                    std::slice::from_ref(argument),
+                    std::slice::from_ref(parameter),
+                )?);
+            }
+            let values = super::apply_call_argument_transport(
+                context,
+                state,
+                (span.start, span.end),
+                arguments,
+                &parameters,
+                values,
+            )?;
+            emit_call_values(context, state, &target, occurrence, values, lengths)
         }
         ScalarExpression::Name { name, .. } => emit_expression(
             context,
@@ -610,11 +719,237 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
     }
 }
 
+fn emit_callable_field<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    receiver: &crate::scalar::ReferencePlaceId,
+    field: &crate::scalar::ScalarStructFieldId,
+    occurrence: &crate::scalar::ScalarCallOccurrence,
+    arguments: &[ScalarExpression],
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<EmitValue<'ctx>, String> {
+    let structure = structure(state.structs, field.structure.clone())?;
+    let resolved = structure
+        .fields
+        .get(field.index)
+        .filter(|candidate| candidate.id == *field)
+        .ok_or_else(|| format!("unknown LLVM callable field {}", field.index))?;
+    let ScalarType::Callable {
+        outputs: _,
+        parameters,
+    } = &resolved.ty
+    else {
+        return Err("resolved callable field has a noncallable type".to_owned());
+    };
+    if arguments.len() != parameters.len() {
+        return Err("resolved callable field argument count differs from its type".to_owned());
+    }
+    let signature = resolved.ty.clone();
+    let place = crate::ScalarPlace::Field {
+        base: Box::new(receiver.place.clone()),
+        field: ScalarFieldReference::Resolved(field.clone()),
+        span: receiver.declaration_span,
+    };
+    let pointer = place_pointer(context, state, &place, project)?;
+    let callable = state
+        .builder
+        .build_load(
+            storage_type(context, &signature, state.structs, state.target_layout)?,
+            pointer,
+            "callable_field",
+        )
+        .map_err(builder_error)?
+        .into_struct_value();
+    emit_closure_call(
+        context, state, callable, &signature, occurrence, arguments, project,
+    )
+}
+
+fn emit_local_closure_call<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    name: &str,
+    occurrence: &crate::scalar::ScalarCallOccurrence,
+    arguments: &[ScalarExpression],
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<EmitValue<'ctx>, String> {
+    let (slot, signature) = state
+        .storage
+        .get(name)
+        .cloned()
+        .or_else(|| {
+            state
+                .globals
+                .get(name)
+                .map(|(global, ty)| (global.as_pointer_value(), ty.clone()))
+        })
+        .ok_or_else(|| format!("missing local closure binding {name}"))?;
+    let callable = state
+        .builder
+        .build_load(
+            storage_type(context, &signature, state.structs, state.target_layout)?,
+            slot,
+            "local_closure",
+        )
+        .map_err(builder_error)?
+        .into_struct_value();
+    emit_closure_call(
+        context, state, callable, &signature, occurrence, arguments, project,
+    )
+}
+
+fn emit_closure_call<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    callable: inkwell::values::StructValue<'ctx>,
+    signature: &ScalarType,
+    occurrence: &crate::scalar::ScalarCallOccurrence,
+    arguments: &[ScalarExpression],
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<EmitValue<'ctx>, String> {
+    let ScalarType::Callable {
+        outputs,
+        parameters,
+    } = signature
+    else {
+        return Err("closure call requires a callable signature".to_owned());
+    };
+    if arguments.len() != parameters.len() {
+        return Err("closure argument count differs from its signature".to_owned());
+    }
+    let code = state
+        .builder
+        .build_extract_value(callable, 0, "field_code")
+        .map_err(builder_error)?
+        .into_pointer_value();
+    let environment = state
+        .builder
+        .build_extract_value(callable, 1, "field_environment")
+        .map_err(builder_error)?;
+    let mut values = vec![BasicMetadataValueEnum::from(environment)];
+    let mut emitted = Vec::with_capacity(arguments.len());
+    let mut lengths = Vec::with_capacity(arguments.len());
+    for (argument, parameter) in arguments.iter().zip(parameters) {
+        let value = match project {
+            Some(scope) => emit_project_typed_expression(
+                context,
+                state,
+                argument,
+                parameter,
+                scope.module,
+                scope.modules,
+            )?,
+            None => emit_typed_expression(context, state, argument, parameter)?,
+        };
+        emitted.push(value);
+        lengths.push(if matches!(parameter, ScalarType::RuntimeArray { .. }) {
+            Some(runtime_length_for_source(context, state, argument, 0)?)
+        } else {
+            None
+        });
+    }
+    let span = (
+        occurrence.source_span.range.start,
+        occurrence.source_span.range.end,
+    );
+    let emitted =
+        super::apply_call_argument_transport(context, state, span, arguments, parameters, emitted)?;
+    for (value, length) in emitted.into_iter().zip(lengths) {
+        values.push(BasicMetadataValueEnum::from(take_basic(value)?));
+        if let Some(length) = length {
+            values.push(length.into());
+        }
+    }
+    let mut owner_slots = BTreeMap::new();
+    for (index, output) in outputs.outputs.iter().enumerate() {
+        if matches!(output.ty, ScalarType::CheckedReference { .. }) {
+            let slot = entry_alloca(
+                state,
+                context.bool_type().into(),
+                &format!("field_owner_{index}"),
+            )?;
+            values.push(slot.into());
+            owner_slots.insert(index, slot);
+        }
+    }
+    let mut length_slots = BTreeMap::new();
+    for (index, output) in outputs.outputs.iter().enumerate() {
+        if matches!(output.ty, ScalarType::RuntimeArray { .. }) {
+            let slot = entry_alloca(
+                state,
+                context.i64_type().into(),
+                &format!("closure_return_length_{index}"),
+            )?;
+            values.push(slot.into());
+            length_slots.insert(index, slot);
+        }
+    }
+    let (ordinary, _) = function_type(context, &signature, state.target_layout)?;
+    let mut llvm_parameters = vec![context.ptr_type(AddressSpace::default()).into()];
+    for ty in parameters {
+        llvm_parameters.push(basic_type(context, ty, state.target_layout)?.into());
+        if matches!(ty, ScalarType::RuntimeArray { .. }) {
+            llvm_parameters.push(context.i64_type().into());
+        }
+    }
+    llvm_parameters.extend(
+        owner_slots
+            .keys()
+            .map(|_| BasicMetadataTypeEnum::from(context.ptr_type(AddressSpace::default()))),
+    );
+    llvm_parameters.extend(
+        length_slots
+            .keys()
+            .map(|_| BasicMetadataTypeEnum::from(context.ptr_type(AddressSpace::default()))),
+    );
+    let code_type = match ordinary.get_return_type() {
+        Some(output) => output.fn_type(&llvm_parameters, false),
+        None => context.void_type().fn_type(&llvm_parameters, false),
+    };
+    let call = state
+        .builder
+        .build_indirect_call(code_type, code, &values, "field_call")
+        .map_err(builder_error)?;
+    state.call_owner_flags = owner_slots
+        .into_iter()
+        .map(|(index, slot)| {
+            state
+                .builder
+                .build_load(
+                    context.bool_type(),
+                    slot,
+                    &format!("field_return_owned_{index}"),
+                )
+                .map(|value| (index, value.into_int_value()))
+                .map_err(builder_error)
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    state.call_length_slots = length_slots;
+    let types = outputs
+        .outputs
+        .iter()
+        .map(|output| output.ty.clone())
+        .collect::<Vec<_>>();
+    state.holder_events.evaluated_call(occurrence, &types)?;
+    match (call.try_as_basic_value(), outputs.outputs.as_slice()) {
+        (ValueKind::Basic(value), [output]) if output.ty != ScalarType::Unit => {
+            Ok(EmitValue::Basic(value))
+        }
+        (ValueKind::Basic(value), outputs) if outputs.len() > 1 => Ok(EmitValue::Aggregate {
+            value: value.into_struct_value(),
+            outputs: outputs.iter().map(|output| output.ty.clone()).collect(),
+        }),
+        (ValueKind::Instruction(_), []) | (ValueKind::Instruction(_), [_]) => Ok(EmitValue::Unit),
+        _ => Err("LLVM callable field result shape does not match its signature".to_owned()),
+    }
+}
+
 fn emit_call<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     receiver: Option<&str>,
     name: &str,
+    occurrence: &crate::scalar::ScalarCallOccurrence,
     type_arguments: &[crate::scalar::ScalarTypeArgument],
     arguments: &[ScalarExpression],
     overload_selection: Option<&ScalarOverloadSelection>,
@@ -637,18 +972,32 @@ fn emit_call<'ctx, 'module>(
     let ScalarType::Callable { parameters, .. } = state
         .signatures
         .get(&target)
+        .cloned()
         .ok_or_else(|| format!("unknown LLVM callable signature {qualified}"))?
     else {
         return Err(format!(
             "LLVM callable {qualified} has no callable signature"
         ));
     };
-    let values = arguments
-        .iter()
-        .zip(parameters)
-        .map(|(argument, parameter)| emit_typed_expression(context, state, argument, parameter))
-        .collect::<Result<Vec<_>, _>>()?;
-    emit_call_values(context, state, &target, values)
+    let mut values = Vec::new();
+    let mut lengths = Vec::new();
+    for (argument, parameter) in arguments.iter().zip(&parameters) {
+        values.push(emit_typed_expression(context, state, argument, parameter)?);
+        lengths.extend(super::call_argument_lengths(
+            context,
+            state,
+            &target,
+            std::slice::from_ref(argument),
+            std::slice::from_ref(parameter),
+        )?);
+    }
+    let span = (
+        occurrence.source_span.range.start,
+        occurrence.source_span.range.end,
+    );
+    let values =
+        super::apply_call_argument_transport(context, state, span, arguments, &parameters, values)?;
+    emit_call_values(context, state, &target, occurrence, values, lengths)
 }
 
 fn allocation_root_name(place: &crate::ScalarPlace) -> Result<&str, String> {
@@ -791,6 +1140,15 @@ fn emit_core_invalidation<'ctx, 'module>(
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("missing checked release storage for {name}"))?;
+            if let ScalarType::RuntimeArray { element, .. } = &ty {
+                if super::memory::has_callable_holders(element, state.structs)? {
+                    if multiple {
+                        return Err(format!("checked callable-array core.free requires a unique connected owner at {name}"));
+                    }
+                    super::release_backing_entry(context, state, &name)?;
+                    continue;
+                }
+            }
             if !matches!(ty, ScalarType::RuntimeArray { .. })
                 || state.runtime_array_allocations.get(&name) != Some(&false)
             {
@@ -1957,7 +2315,9 @@ fn emit_call_values<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     name: &str,
+    occurrence: &crate::scalar::ScalarCallOccurrence,
     values: Vec<EmitValue<'ctx>>,
+    lengths: Vec<Option<inkwell::values::IntValue<'ctx>>>,
 ) -> Result<EmitValue<'ctx>, String> {
     let function = *state
         .functions
@@ -1971,23 +2331,41 @@ fn emit_call_values<'ctx, 'module>(
             EmitValue::Aggregate { .. } => Err("aggregate argument is invalid".into()),
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let ScalarType::Callable { parameters, .. } = state
+    let ScalarType::Callable { outputs, .. } = state
         .signatures
         .get(name)
         .ok_or_else(|| format!("unknown LLVM callable signature {name}"))?
     else {
         return Err(format!("LLVM callable {name} has no callable signature"));
     };
-    let owner_outputs = if function.count_params() as usize > parameters.len() {
-        state
-            .dynamic_owner_outputs
-            .get(name)
-            .ok_or_else(|| format!("missing owner signature for {name}"))?
-    } else {
-        &BTreeSet::new()
+    let defined = state.dynamic_owner_outputs.get(name);
+    if defined.is_none()
+        && (lengths.iter().any(Option::is_some)
+            || outputs
+                .outputs
+                .iter()
+                .any(|output| matches!(output.ty, ScalarType::RuntimeArray { .. })))
+    {
+        return Err(format!(
+            "foreign runtime-array call {name} requires a declared length contract"
+        ));
+    }
+    let owner_outputs = match defined {
+        Some(outputs) => outputs.iter().copied().collect::<Vec<_>>(),
+        None => Vec::new(),
     };
+    if defined.is_some() {
+        let mut paired = Vec::new();
+        for (argument, length) in arguments.into_iter().zip(lengths) {
+            paired.push(argument);
+            if let Some(length) = length {
+                paired.push(length.into());
+            }
+        }
+        arguments = paired;
+    }
     let mut owner_slots = BTreeMap::new();
-    for output in owner_outputs {
+    for output in &owner_outputs {
         let slot = entry_alloca(
             state,
             context.bool_type().into(),
@@ -1995,6 +2373,20 @@ fn emit_call_values<'ctx, 'module>(
         )?;
         arguments.push(slot.into());
         owner_slots.insert(*output, slot);
+    }
+    let mut length_slots = BTreeMap::new();
+    if defined.is_some() {
+        for (index, output) in outputs.outputs.iter().enumerate() {
+            if matches!(output.ty, ScalarType::RuntimeArray { .. }) {
+                let slot = entry_alloca(
+                    state,
+                    context.i64_type().into(),
+                    &format!("array_return_length_{index}"),
+                )?;
+                arguments.push(slot.into());
+                length_slots.insert(index, slot);
+            }
+        }
     }
     let call = state
         .builder
@@ -2014,21 +2406,33 @@ fn emit_call_values<'ctx, 'module>(
                 .map_err(builder_error)
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let outputs = match state.signatures.get(name) {
-        Some(ScalarType::Callable { outputs, .. }) => outputs,
+    state.call_length_slots = length_slots;
+    let tys = match state.signatures.get(name) {
+        Some(ScalarType::Callable { outputs, .. }) => outputs
+            .outputs
+            .iter()
+            .map(|output| output.ty.clone())
+            .collect::<Vec<_>>(),
         _ => return Err(format!("unknown LLVM callable signature {name}")),
     };
-    match (call.try_as_basic_value(), outputs.outputs.as_slice()) {
+    state.holder_events.evaluated_call(occurrence, &tys)?;
+    match (call.try_as_basic_value(), tys.as_slice()) {
         (ValueKind::Basic(value), [output]) => {
-            if output.ty == ScalarType::Unit {
+            if *output == ScalarType::Unit {
                 return Err("unit callable produced a value".to_owned());
             }
-            Ok(EmitValue::Basic(value))
+            let result = EmitValue::Basic(value);
+            super::import_call_result_captures(context, state, name, &result, &tys)?;
+            Ok(result)
         }
-        (ValueKind::Basic(value), outputs) if outputs.len() > 1 => Ok(EmitValue::Aggregate {
-            value: value.into_struct_value(),
-            outputs: outputs.iter().map(|output| output.ty.clone()).collect(),
-        }),
+        (ValueKind::Basic(value), outputs) if outputs.len() > 1 => {
+            let result = EmitValue::Aggregate {
+                value: value.into_struct_value(),
+                outputs: outputs.to_vec(),
+            };
+            super::import_call_result_captures(context, state, name, &result, &tys)?;
+            Ok(result)
+        }
         (ValueKind::Instruction(_), []) | (ValueKind::Instruction(_), [_]) => Ok(EmitValue::Unit),
         (ValueKind::Instruction(_), _) => Err("aggregate callable produced no value".to_owned()),
         (ValueKind::Basic(_), []) | (ValueKind::Basic(_), &[_, _, ..]) => {
@@ -2488,6 +2892,12 @@ fn emit_if<'ctx, 'module>(
     then_branch: &ScalarBlock,
     else_branch: &ScalarBlock,
 ) -> Result<EmitValue<'ctx>, String> {
+    let branch = state.holder_events.conditional_point(
+        &then_branch.occurrence,
+        crate::scalar::ScalarConditionalPointRole::Branch,
+    )?;
+    state.holder_events.arm(branch.id, 0)?;
+    state.holder_events.arm(branch.id, 1)?;
     let condition = take_basic(emit_expression(context, state, condition)?)?.into_int_value();
     emit_if_value(
         context,
@@ -2507,6 +2917,12 @@ fn emit_project_if<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    let branch = state.holder_events.conditional_point(
+        &then_branch.occurrence,
+        crate::scalar::ScalarConditionalPointRole::Branch,
+    )?;
+    state.holder_events.arm(branch.id, 0)?;
+    state.holder_events.arm(branch.id, 1)?;
     let condition = take_basic(condition)?.into_int_value();
     emit_if_value(
         context,
@@ -2524,6 +2940,12 @@ fn emit_unit_if<'ctx, 'module>(
     condition: &ScalarExpression,
     then_branch: &ScalarBlock,
 ) -> Result<EmitValue<'ctx>, String> {
+    let branch = state.holder_events.conditional_point(
+        &then_branch.occurrence,
+        crate::scalar::ScalarConditionalPointRole::Branch,
+    )?;
+    state.holder_events.arm(branch.id, 0)?;
+    state.holder_events.arm(branch.id, 1)?;
     let condition = take_basic(emit_expression(context, state, condition)?)?.into_int_value();
     let function = state
         .builder
@@ -2555,6 +2977,12 @@ fn emit_project_unit_if<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    let branch = state.holder_events.conditional_point(
+        &then_branch.occurrence,
+        crate::scalar::ScalarConditionalPointRole::Branch,
+    )?;
+    state.holder_events.arm(branch.id, 0)?;
+    state.holder_events.arm(branch.id, 1)?;
     let condition = take_basic(condition)?.into_int_value();
     let function = state
         .builder
