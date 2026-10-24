@@ -1197,7 +1197,6 @@ fn inferred_multi_output_call_keeps_each_output_type_and_owner() {
                 target_span: target.target_span,
                 output_index,
             };
-            let facts = facts.borrow();
             let ty = facts.get(&key).expect("resolved output fact");
             if output_index == 0 {
                 assert!(matches!(ty, ScalarType::Struct(_)));
@@ -1230,10 +1229,7 @@ fn inferred_multi_output_call_keeps_each_output_type_and_owner() {
     }
     let serialized = serde_json::to_value(&project.project).expect("serialized project");
     let restored: ScalarProject = serde_json::from_value(serialized).expect("restored project");
-    assert!(restored.modules[0]
-        .resolved_assignment_outputs
-        .borrow()
-        .is_empty());
+    assert!(restored.modules[0].resolved_assignment_outputs.is_empty());
     let revalidated = validate_scalar_project(restored);
     assert!(
         revalidated.diagnostics.is_empty(),
@@ -1243,12 +1239,8 @@ fn inferred_multi_output_call_keeps_each_output_type_and_owner() {
     assert_eq!(
         revalidated.project.modules[0]
             .resolved_assignment_outputs
-            .borrow()
             .len(),
-        project.project.modules[0]
-            .resolved_assignment_outputs
-            .borrow()
-            .len()
+        project.project.modules[0].resolved_assignment_outputs.len()
     );
 }
 
@@ -5256,6 +5248,7 @@ fn derives_and_validates_ordered_local_mutation_and_unit_while() {
     ));
     let overloads =
         ScalarOverloadEnvironment::single(&result.program.source, &result.program.items);
+    let mut inference = ScalarInferenceBuilder::new();
     assert_eq!(
         block_type(
             &while_expression.body,
@@ -5266,6 +5259,7 @@ fn derives_and_validates_ordered_local_mutation_and_unit_while() {
             &mut Vec::new(),
             false,
             &overloads,
+            &mut inference,
         ),
         ScalarType::Unit
     );

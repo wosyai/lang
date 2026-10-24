@@ -535,6 +535,7 @@ fn resolve_place(
             resolve_place(base, scope, program, names, unsafe_context, overloads);
             let base_type = match base.as_ref() {
                 ScalarPlace::Dereference { pointer, .. } => {
+                    let mut scratch = ScalarInferenceBuilder::new();
                     match expression_type(
                         pointer,
                         scope,
@@ -544,6 +545,7 @@ fn resolve_place(
                         &mut Vec::new(),
                         unsafe_context,
                         overloads,
+                        &mut scratch,
                     ) {
                         ScalarType::RawPointer(inner)
                         | ScalarType::CheckedReference { inner, .. } => *inner,
@@ -553,7 +555,15 @@ fn resolve_place(
                 ScalarPlace::Name { .. }
                 | ScalarPlace::Field { .. }
                 | ScalarPlace::Index { .. } => {
-                    place_type(base, scope, program, &mut Vec::new(), overloads)
+                    let mut scratch = ScalarInferenceBuilder::new();
+                    place_type(
+                        base,
+                        scope,
+                        program,
+                        &mut Vec::new(),
+                        overloads,
+                        &mut scratch,
+                    )
                 }
             };
             let structure = match base_type {
@@ -1308,26 +1318,38 @@ fn resolve_module_place(
                 overloads,
             );
             let base_type = match base.as_ref() {
-                ScalarPlace::Dereference { pointer, .. } => match expression_type_in_module(
-                    pointer,
-                    scope,
-                    &BTreeSet::new(),
-                    &BTreeMap::new(),
-                    module,
-                    modules,
-                    &mut Vec::new(),
-                    unsafe_context,
-                    overloads,
-                ) {
-                    ScalarType::RawPointer(inner) | ScalarType::CheckedReference { inner, .. } => {
-                        *inner
+                ScalarPlace::Dereference { pointer, .. } => {
+                    let mut scratch = ScalarInferenceBuilder::new();
+                    match expression_type_in_module(
+                        pointer,
+                        scope,
+                        &BTreeSet::new(),
+                        &BTreeMap::new(),
+                        module,
+                        modules,
+                        &mut Vec::new(),
+                        unsafe_context,
+                        overloads,
+                        &mut scratch,
+                    ) {
+                        ScalarType::RawPointer(inner)
+                        | ScalarType::CheckedReference { inner, .. } => *inner,
+                        _ => ScalarType::Error,
                     }
-                    _ => ScalarType::Error,
-                },
+                }
                 ScalarPlace::Name { .. }
                 | ScalarPlace::Field { .. }
                 | ScalarPlace::Index { .. } => {
-                    place_type_in_module(base, scope, module, modules, &mut Vec::new(), overloads)
+                    let mut scratch = ScalarInferenceBuilder::new();
+                    place_type_in_module(
+                        base,
+                        scope,
+                        module,
+                        modules,
+                        &mut Vec::new(),
+                        overloads,
+                        &mut scratch,
+                    )
                 }
             };
             let structure = match base_type {

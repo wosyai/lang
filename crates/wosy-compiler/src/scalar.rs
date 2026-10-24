@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -1788,54 +1789,6 @@ pub struct ScalarAssignmentTarget {
     pub place: ScalarPlace,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ResolvedAssignmentOutputId {
-    pub source: SourceIdentity,
-    pub function_span: ByteSpan,
-    pub target_span: ByteSpan,
-    pub output_index: usize,
-}
-
-fn assignment_function_span(items: &[ScalarItem], assignment_span: ByteSpan) -> Option<ByteSpan> {
-    items.iter().find_map(|item| {
-        let ScalarItem::Function(function) = item else {
-            return None;
-        };
-        std::iter::once(function)
-            .chain(&function.overload_arms)
-            .find(|candidate| {
-                candidate.body.span.start <= assignment_span.start
-                    && assignment_span.end <= candidate.body.span.end
-            })
-            .map(|candidate| candidate.span)
-    })
-}
-
-fn record_assignment_outputs(
-    facts: &RefCell<HashMap<ResolvedAssignmentOutputId, ScalarType>>,
-    source: &SourceIdentity,
-    items: &[ScalarItem],
-    assignment: &ScalarAssignment,
-    outputs: &ScalarOutputSequence,
-) {
-    let Some(function_span) = assignment_function_span(items, assignment.span) else {
-        return;
-    };
-    for (output_index, (target, output)) in
-        assignment.targets.iter().zip(&outputs.outputs).enumerate()
-    {
-        facts.borrow_mut().insert(
-            ResolvedAssignmentOutputId {
-                source: source.clone(),
-                function_span,
-                target_span: target.target_span,
-                output_index,
-            },
-            output.ty.clone(),
-        );
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarWhile {
     pub condition: ScalarExpression,
@@ -1928,7 +1881,7 @@ pub struct ScalarProgram {
     pub target_layout: ScalarTargetLayout,
     pub layouts: ScalarTargetLayouts,
     #[serde(skip)]
-    pub resolved_assignment_outputs: RefCell<HashMap<ResolvedAssignmentOutputId, ScalarType>>,
+    pub resolved_assignment_outputs: ScalarAssignmentTyping,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1957,7 +1910,7 @@ pub struct ScalarModule {
     pub target_layout: ScalarTargetLayout,
     pub layouts: ScalarTargetLayouts,
     #[serde(skip)]
-    pub resolved_assignment_outputs: RefCell<HashMap<ResolvedAssignmentOutputId, ScalarType>>,
+    pub resolved_assignment_outputs: ScalarAssignmentTyping,
 }
 
 impl ScalarModule {
@@ -2002,7 +1955,7 @@ impl ScalarModule {
             enums: Vec::new(),
             target_layout: ScalarTargetLayout::WASM32,
             layouts: ScalarTargetLayouts::new(ScalarTargetLayout::WASM32),
-            resolved_assignment_outputs: RefCell::new(HashMap::new()),
+            resolved_assignment_outputs: ScalarAssignmentTyping::default(),
         }
     }
 
@@ -2172,16 +2125,20 @@ pub fn derive_scalar_program_from_cst_with_layout(
         enums,
         target_layout,
         layouts: ScalarTargetLayouts::new(target_layout),
-        resolved_assignment_outputs: RefCell::new(HashMap::new()),
+        resolved_assignment_outputs: ScalarAssignmentTyping::default(),
     };
     resolve_program_types(&mut program, &mut diagnostics);
     let overloads = ScalarOverloadEnvironment::single(&program.source, &program.items);
     resolve_program_places(&mut program, &overloads);
-    let mut validation_diagnostics = validate(&program, &overloads);
+    let mut inference = ScalarInferenceBuilder::new();
+    let mut validation_diagnostics = validate(&program, &overloads, &mut inference);
     let mut diagnostics = diagnostics;
     diagnostics.append(&mut validation_diagnostics);
     if diagnostics.is_empty() {
         record_overload_selections(&mut program, &overloads);
+        program.resolved_assignment_outputs = inference.freeze();
+    } else {
+        drop(inference);
     }
     drop(overloads);
     if diagnostics.is_empty() {
@@ -2216,6 +2173,9 @@ pub fn derive_scalar_program_from_cst_with_layout(
 
 mod declarations;
 use declarations::ScalarDeclarationEnvironment;
+mod inference;
+use inference::ScalarInferenceBuilder;
+pub use inference::{ResolvedAssignmentOutputId, ScalarAssignmentTyping};
 mod overload;
 use overload::{
     record_overload_selections, record_project_overload_selections, ScalarOverloadEnvironment,
@@ -2251,7 +2211,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
     let mut project = project;
     let mut diagnostics = Vec::new();
     for module in &mut project.modules {
-        module.resolved_assignment_outputs.borrow_mut().clear();
+        module.resolved_assignment_outputs = ScalarAssignmentTyping::default();
         module.layouts = ScalarTargetLayouts::new(module.target_layout);
     }
     let declarations = declarations::resolve_project_types(&mut project.modules);
@@ -2289,7 +2249,9 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         resolve_module_places(module, &struct_lookup, &declarations, ordinal, &overloads);
     }
     drop(declarations);
+    let mut inferences = Vec::with_capacity(project.modules.len());
     for module in &project.modules {
+        let mut inference = ScalarInferenceBuilder::new();
         validate_unit_if_positions_in_module(module, &mut diagnostics);
         for structure in &module.structs {
             for field in &structure.fields {
@@ -2420,6 +2382,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                 &mut diagnostics,
                                 false,
                                 &overloads,
+                                &mut inference,
                             );
                             expect_module_type(
                                 module,
@@ -2442,6 +2405,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         &mut diagnostics,
                         false,
                         &overloads,
+                        &mut inference,
                     );
                     validate_output_receivers_in_module(
                         &binding.value,
@@ -2522,6 +2486,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                     &mut diagnostics,
                                     false,
                                     &overloads,
+                                    &mut inference,
                                 ),
                                 _ => block_item_type_in_module(
                                     item,
@@ -2533,6 +2498,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                     &mut diagnostics,
                                     false,
                                     &overloads,
+                                    &mut inference,
                                 ),
                             };
                         }
@@ -2561,6 +2527,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                     &mut diagnostics,
                                     false,
                                     &overloads,
+                                    &mut inference,
                                 );
                                 if actual_outputs.outputs.len() != outputs.outputs.len() {
                                     diagnostics.push(module_diagnostic(
@@ -2610,6 +2577,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                     &mut diagnostics,
                                     false,
                                     &overloads,
+                                    &mut inference,
                                 );
                                 expect_module_type(
                                     module,
@@ -2632,6 +2600,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                             &mut diagnostics,
                             false,
                             &overloads,
+                            &mut inference,
                         );
                         expect_module_type(
                             module,
@@ -2651,6 +2620,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                             &mut diagnostics,
                             false,
                             &overloads,
+                            &mut inference,
                         );
                         expect_module_type(
                             module,
@@ -2675,6 +2645,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         &mut diagnostics,
                         false,
                         &overloads,
+                        &mut inference,
                     );
                 }
             }
@@ -2687,9 +2658,15 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                 span,
             ));
         }
+        inferences.push(inference);
     }
     if diagnostics.is_empty() {
         record_project_overload_selections(&mut project, &overloads);
+        for (module, inference) in project.modules.iter_mut().zip(inferences) {
+            module.resolved_assignment_outputs = inference.freeze();
+        }
+    } else {
+        drop(inferences);
     }
     drop(overloads);
     if diagnostics.is_empty() {
@@ -2713,7 +2690,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                             &sites,
                             &structs,
                             &enums,
-                            &module.resolved_assignment_outputs.borrow(),
+                            module.resolved_assignment_outputs.as_map(),
                         )
                     })
                     .unwrap_or_else(|error| vec![error])

@@ -10,7 +10,7 @@ pub(super) fn record_program_reference_origins(
         call_sites,
         &program.structs,
         &program.enums,
-        &program.resolved_assignment_outputs.borrow(),
+        program.resolved_assignment_outputs.as_map(),
     );
     if errors.is_empty() {
         let mut modules = vec![ScalarModule::from_program(program.clone(), Vec::new())];
