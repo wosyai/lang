@@ -12,7 +12,7 @@ pub(super) struct ScalarOverloadHeader {
 }
 
 impl ScalarOverloadHeader {
-    pub(super) fn from_function(function: &ScalarFunction) -> Self {
+    fn from_function(function: &ScalarFunction) -> Self {
         #[cfg(test)]
         observations::record_header(function);
         Self {
@@ -49,16 +49,19 @@ struct ScalarOverloadModule {
     source: SourceIdentity,
     scope: BTreeMap<String, ScalarType>,
     declarations: BTreeMap<usize, ScalarOverloadDeclaration>,
+    first_overloads: BTreeMap<String, usize>,
     namespaces: Vec<ScalarOverloadNamespace>,
 }
 
-struct ScalarOverloadEnvironment {
+pub(super) struct ScalarOverloadEnvironment {
     modules: Vec<ScalarOverloadModule>,
     sources: HashMap<SourceIdentity, usize>,
 }
 
 impl ScalarOverloadEnvironment {
-    fn single(source: &SourceIdentity, items: &[ScalarItem]) -> Self {
+    pub(super) fn single(source: &SourceIdentity, items: &[ScalarItem]) -> Self {
+        #[cfg(test)]
+        let _snapshot = observations::SnapshotScope::new();
         #[cfg(test)]
         observations::record_context(1);
         let scope = items
@@ -75,10 +78,12 @@ impl ScalarOverloadEnvironment {
                 }
             })
             .collect();
+        let declarations = overload_declarations(items);
         let module = ScalarOverloadModule {
             source: copy_source(source),
             scope,
-            declarations: overload_declarations(items),
+            first_overloads: first_overloads(&declarations),
+            declarations,
             namespaces: Vec::new(),
         };
         Self {
@@ -87,7 +92,9 @@ impl ScalarOverloadEnvironment {
         }
     }
 
-    fn project(modules: &[ScalarModule]) -> Self {
+    pub(super) fn project(modules: &[ScalarModule]) -> Self {
+        #[cfg(test)]
+        let _snapshot = observations::SnapshotScope::new();
         #[cfg(test)]
         observations::record_context(modules.len());
         let mut sources = HashMap::new();
@@ -95,6 +102,7 @@ impl ScalarOverloadEnvironment {
             .iter()
             .enumerate()
             .map(|(ordinal, module)| {
+                let declarations = overload_declarations(&module.items);
                 let header = ScalarOverloadModule {
                     source: copy_source(&module.source),
                     scope: module
@@ -102,7 +110,8 @@ impl ScalarOverloadEnvironment {
                         .iter()
                         .map(|(name, ty)| (copy_name(name), copy_type(ty)))
                         .collect(),
-                    declarations: overload_declarations(&module.items),
+                    first_overloads: first_overloads(&declarations),
+                    declarations,
                     namespaces: module
                         .namespace_bindings
                         .iter()
@@ -150,6 +159,60 @@ impl ScalarOverloadEnvironment {
     }
 }
 
+impl ScalarOverloadEnvironment {
+    pub(super) fn first(
+        &self,
+        source: &SourceIdentity,
+        name: &str,
+    ) -> Option<&ScalarOverloadHeader> {
+        let module = &self.modules[*self.sources.get(source)?];
+        let position = module.first_overloads.get(name)?;
+        Some(
+            &module
+                .declarations
+                .get(position)
+                .expect("indexed overload header")
+                .header,
+        )
+    }
+
+    pub(super) fn for_call(
+        &self,
+        source: &SourceIdentity,
+        receiver: Option<&str>,
+        name: &str,
+    ) -> Option<&ScalarOverloadHeader> {
+        let module = &self.modules[*self.sources.get(source)?];
+        match receiver {
+            None => self.first(source, name),
+            Some(binding) => {
+                let namespace = module
+                    .namespaces
+                    .iter()
+                    .find(|namespace| namespace.binding == binding)?;
+                let target = &self.modules[*self.sources.get(&namespace.target)?];
+                if target.scope.contains_key(name) {
+                    self.first(&target.source, name)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn first_overloads(
+    declarations: &BTreeMap<usize, ScalarOverloadDeclaration>,
+) -> BTreeMap<String, usize> {
+    let mut first = BTreeMap::new();
+    for (position, declaration) in declarations {
+        first
+            .entry(copy_name(&declaration.name))
+            .or_insert(*position);
+    }
+    first
+}
+
 fn overload_declarations(items: &[ScalarItem]) -> BTreeMap<usize, ScalarOverloadDeclaration> {
     items
         .iter()
@@ -191,10 +254,12 @@ fn lookup_name(name: &str) -> String {
     name.to_owned()
 }
 
-pub(super) fn record_overload_selections(program: &mut ScalarProgram) {
+pub(super) fn record_overload_selections(
+    program: &mut ScalarProgram,
+    environment: &ScalarOverloadEnvironment,
+) {
     #[cfg(test)]
     let _recording = observations::RecordingScope::new();
-    let environment = ScalarOverloadEnvironment::single(&program.source, &program.items);
     let scope = &environment.modules[0].scope;
     let overloads = environment.lookup(0);
     for item in &mut program.items {
@@ -432,10 +497,12 @@ fn record_block_item_overload_selections(
     }
 }
 
-pub(super) fn record_project_overload_selections(project: &mut ScalarProject) {
+pub(super) fn record_project_overload_selections(
+    project: &mut ScalarProject,
+    environment: &ScalarOverloadEnvironment,
+) {
     #[cfg(test)]
     let _recording = observations::RecordingScope::new();
-    let environment = ScalarOverloadEnvironment::project(&project.modules);
     for (ordinal, module) in project.modules.iter_mut().enumerate() {
         let scope = &environment.modules[ordinal].scope;
         let overloads = environment.lookup(ordinal);
@@ -474,7 +541,7 @@ pub(super) fn record_project_overload_selections(project: &mut ScalarProject) {
 }
 
 #[cfg(test)]
-mod observations {
+pub(super) mod observations {
     use super::super::layout::observations as clone_observations;
     use super::*;
 
@@ -493,6 +560,7 @@ mod observations {
     pub(super) struct Counts {
         pub contexts: usize,
         pub modules: usize,
+        pub recorders: usize,
         pub snapshot: Payload,
         pub projections: Payload,
         pub lookups: usize,
@@ -500,11 +568,17 @@ mod observations {
         pub lookup_key_bytes: usize,
         pub selection_writes: usize,
         pub substitution_slots: usize,
+        pub candidate_calls: usize,
         pub program_copies: usize,
         pub module_copies: usize,
         pub struct_copies: usize,
         pub cfg_copies: usize,
         pub copied_context_payload_units: usize,
+        pub construction_program_copies: usize,
+        pub construction_module_copies: usize,
+        pub construction_struct_copies: usize,
+        pub construction_cfg_copies: usize,
+        pub construction_payload_units: usize,
     }
 
     struct State {
@@ -568,13 +642,21 @@ mod observations {
 
     pub(super) struct RecordingScope {
         clones: Option<clone_observations::Scope>,
+        snapshot: bool,
     }
     impl RecordingScope {
         pub(super) fn new() -> Self {
+            Self::start(false)
+        }
+
+        fn start(snapshot: bool) -> Self {
             let active = ACTIVE.with(|active| {
                 if let Some(state) = active.borrow_mut().as_mut() {
                     assert!(!state.recording);
-                    state.recording = true;
+                    state.recording = snapshot;
+                    if !snapshot {
+                        state.counts.recorders += 1;
+                    }
                     true
                 } else {
                     false
@@ -582,6 +664,7 @@ mod observations {
             });
             Self {
                 clones: active.then(clone_observations::Scope::new),
+                snapshot,
             }
         }
     }
@@ -590,6 +673,14 @@ mod observations {
             if let Some(scope) = &self.clones {
                 let copies = scope.counts();
                 record(|counts| {
+                    if self.snapshot {
+                        counts.construction_program_copies += copies.program_copies;
+                        counts.construction_module_copies += copies.module_copies;
+                        counts.construction_struct_copies += copies.struct_copies;
+                        counts.construction_cfg_copies += copies.cfg_copies;
+                        counts.construction_payload_units += copies.copied_payload_units;
+                        return;
+                    }
                     counts.program_copies += copies.program_copies;
                     counts.module_copies += copies.module_copies;
                     counts.struct_copies += copies.struct_copies;
@@ -607,11 +698,25 @@ mod observations {
         }
     }
 
+    pub(super) struct SnapshotScope {
+        _recording: RecordingScope,
+    }
+    impl SnapshotScope {
+        pub(super) fn new() -> Self {
+            Self {
+                _recording: RecordingScope::start(true),
+            }
+        }
+    }
+
     pub(super) fn record_context(modules: usize) {
         record(|counts| {
             counts.contexts += 1;
             counts.modules += modules;
         });
+    }
+    pub(in crate::scalar) fn record_candidate() {
+        record(|counts| counts.candidate_calls += 1);
     }
     pub(super) fn record_header(function: &ScalarFunction) {
         record_payload(|payload| {
@@ -833,6 +938,9 @@ mod tests {
                     }
                 }
             }
+            for name in module.first_overloads.keys() {
+                name_payload(name, &mut payload);
+            }
             for namespace in &module.namespaces {
                 name_payload(&namespace.binding, &mut payload);
                 source_payload(&namespace.target, &mut payload);
@@ -878,6 +986,11 @@ mod tests {
         assert_eq!(counts.struct_copies, 0);
         assert_eq!(counts.cfg_copies, 0);
         assert_eq!(counts.copied_context_payload_units, 0);
+        assert_eq!(counts.construction_program_copies, 0);
+        assert_eq!(counts.construction_module_copies, 0);
+        assert_eq!(counts.construction_struct_copies, 0);
+        assert_eq!(counts.construction_cfg_copies, 0);
+        assert_eq!(counts.construction_payload_units, 0);
     }
 
     fn assert_selections(items: &[ScalarItem], arms: usize, sites: usize, peer: bool) {
@@ -922,9 +1035,8 @@ mod tests {
                 for body in [4, 8, 16] {
                     let mut project = project(modules, arms, body, 4);
                     let scope = observations::Scope::new();
+                    let environment = ScalarOverloadEnvironment::project(&project.modules);
                     {
-                        let _recording = observations::RecordingScope::new();
-                        let environment = ScalarOverloadEnvironment::project(&project.modules);
                         assert_eq!(environment.modules.len(), modules);
                         assert_eq!(environment.sources.len(), modules);
                         let mut ids = HashSet::new();
@@ -968,13 +1080,18 @@ mod tests {
                     baseline = Some(counts.clone());
                     drop(scope);
                     let scope = observations::Scope::new();
-                    record_project_overload_selections(&mut project);
+                    record_project_overload_selections(&mut project, &environment);
                     for module in &project.modules {
                         assert_selections(&module.items, arms, 4, true);
                     }
                     let mut expected = counts;
+                    expected.contexts = 0;
+                    expected.modules = 0;
+                    expected.snapshot = observations::Payload::default();
+                    expected.recorders = 1;
                     expected.selection_writes = modules * 8;
                     expected.substitution_slots = modules * 4;
+                    expected.candidate_calls = modules * 8;
                     assert_eq!(scope.counts(), expected);
                 }
             }
@@ -986,7 +1103,8 @@ mod tests {
         for sites in [4, 8, 16] {
             let mut program = program(4, 4, sites, 0, None);
             let scope = observations::Scope::new();
-            record_overload_selections(&mut program);
+            let environment = ScalarOverloadEnvironment::single(&program.source, &program.items);
+            record_overload_selections(&mut program, &environment);
             assert_selections(&program.items, 4, sites, false);
             let counts = scope.counts();
             assert_eq!(counts.contexts, 1);
@@ -1002,7 +1120,8 @@ mod tests {
             drop(scope);
             let mut project = project(4, 4, 4, sites);
             let scope = observations::Scope::new();
-            record_project_overload_selections(&mut project);
+            let environment = ScalarOverloadEnvironment::project(&project.modules);
+            record_project_overload_selections(&mut project, &environment);
             for module in &project.modules {
                 assert_selections(&module.items, 4, sites, true);
             }
@@ -1053,8 +1172,17 @@ mod tests {
         let modules = vec![first, second, local];
         let scope = observations::Scope::new();
         {
-            let _recording = observations::RecordingScope::new();
             let environment = ScalarOverloadEnvironment::project(&modules);
+            assert!(std::ptr::eq(
+                environment.first(&modules[0].source, "pick").unwrap(),
+                &environment.modules[0].declarations[&0].header
+            ));
+            assert!(std::ptr::eq(
+                environment
+                    .for_call(&modules[2].source, Some("alias"), "pick")
+                    .unwrap(),
+                &environment.modules[0].declarations[&0].header
+            ));
             let first_lookup = environment.lookup(0);
             assert!(std::ptr::eq(
                 first_lookup["pick"],
@@ -1134,7 +1262,8 @@ mod tests {
         let counts = scope.counts();
         assert_eq!(counts.contexts, 1);
         assert_eq!(counts.snapshot.headers, 1);
-        assert!(counts.projections.headers > 0);
+        assert_eq!(counts.projections, observations::Payload::default());
+        assert_eq!(counts.recorders, 1);
         assert_zero_recording_copies(&counts);
         assert!(outside.counts().program_copies > 0);
         drop(scope);
@@ -1154,9 +1283,100 @@ mod tests {
         let counts = scope.counts();
         assert_eq!(counts.contexts, 1);
         assert_eq!(counts.snapshot.headers, 2);
-        assert!(counts.projections.headers > 0);
+        assert_eq!(counts.projections, observations::Payload::default());
+        assert_eq!(counts.recorders, 1);
         assert_zero_recording_copies(&counts);
         assert!(outside.counts().module_copies > 0);
         assert!(outside.counts().cfg_copies > 0);
+    }
+
+    #[test]
+    fn public_callsites_reuse_fixed_headers_and_account_candidate_and_result_growth() {
+        let mut baselines = BTreeMap::new();
+        for body in [4, 8, 16] {
+            let mut previous_single = 0;
+            let mut previous_project = 0;
+            for sites in [4, 8, 16] {
+                let parsed = parse_source(source(0), text(4, body, sites, None), &[]);
+                let scope = observations::Scope::new();
+                let single = derive_scalar_program(&parsed.result);
+                assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+                assert_selections(&single.program.items, 4, sites, false);
+                let counts = scope.counts();
+                assert_eq!(counts.contexts, 1);
+                assert_eq!(counts.recorders, 1);
+                assert_eq!(counts.snapshot.headers, 1);
+                assert_eq!(counts.snapshot.arms, 4);
+                assert_eq!(counts.projections, observations::Payload::default());
+                assert_eq!(counts.selection_writes, sites * 2);
+                assert_eq!(counts.substitution_slots, sites);
+                assert!(counts.candidate_calls > counts.selection_writes);
+                assert!(counts.candidate_calls > previous_single);
+                previous_single = counts.candidate_calls;
+                assert_zero_recording_copies(&counts);
+                if body == 4 {
+                    baselines.insert((false, sites), counts.snapshot);
+                } else {
+                    assert_eq!(&counts.snapshot, &baselines[&(false, sites)]);
+                }
+                drop(scope);
+
+                let inputs = project(2, 4, body, sites);
+                let scope = observations::Scope::new();
+                let validation = validate_scalar_project(inputs);
+                assert!(
+                    validation.diagnostics.is_empty(),
+                    "{:?}",
+                    validation.diagnostics
+                );
+                for module in &validation.project.modules {
+                    assert_selections(&module.items, 4, sites, true);
+                }
+                let counts = scope.counts();
+                assert_eq!(counts.contexts, 1);
+                assert_eq!(counts.recorders, 1);
+                assert_eq!(counts.snapshot.headers, 2);
+                assert_eq!(counts.snapshot.arms, 8);
+                assert_eq!(counts.projections, observations::Payload::default());
+                assert_eq!(counts.selection_writes, sites * 4);
+                assert_eq!(counts.substitution_slots, sites * 2);
+                assert!(counts.candidate_calls > counts.selection_writes);
+                assert!(counts.candidate_calls > previous_project);
+                previous_project = counts.candidate_calls;
+                assert_zero_recording_copies(&counts);
+                if body == 4 {
+                    baselines.insert((true, sites), counts.snapshot);
+                } else {
+                    assert_eq!(&counts.snapshot, &baselines[&(true, sites)]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_overload_index_ignores_earlier_ordinary_functions() {
+        let parsed = parse_source(source(0), "%%start\nu64(u64) pick = fn(value) { value };\npick = overload { bool(bool) => fn(value) { value }; };\n%%end".into(), &[]);
+        assert!(parsed.diagnostics.is_empty());
+        let program = derive_scalar_program(&parsed.result).program;
+        let scope = observations::Scope::new();
+        let environment = ScalarOverloadEnvironment::single(&program.source, &program.items);
+        let header = environment.first(&program.source, "pick").unwrap();
+        assert_eq!(environment.modules[0].first_overloads["pick"], 1);
+        assert!(std::ptr::eq(
+            header,
+            &environment.modules[0].declarations[&1].header
+        ));
+        let (callable, selection) = resolve_overload_candidate(
+            header,
+            &[ScalarOverloadArgument::Typed(ScalarType::Bool)],
+            Some(&ScalarType::Bool),
+        )
+        .unwrap();
+        assert_eq!(selection.arm_index, 0);
+        assert!(
+            matches!(callable, ScalarType::Callable { parameters, .. } if parameters == [ScalarType::Bool])
+        );
+        assert_eq!(scope.counts().snapshot.headers, 1);
+        assert_eq!(scope.counts().projections, observations::Payload::default());
     }
 }

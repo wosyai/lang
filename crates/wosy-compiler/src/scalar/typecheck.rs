@@ -189,6 +189,7 @@ pub(super) fn call_output_sequence_in_module(
     scope: &BTreeMap<String, ScalarType>,
     module: &ScalarModule,
     modules: &[ScalarModule],
+    overloads: &ScalarOverloadEnvironment,
 ) -> Option<ScalarOutputSequence> {
     let ScalarExpression::Call {
         receiver,
@@ -235,21 +236,13 @@ pub(super) fn call_output_sequence_in_module(
         }
     };
     if member_visible {
-        if let Some(overload) = target.items.iter().find_map(|item| match item {
-            ScalarItem::Function(function)
-                if function.name == *name && !function.overload_arms.is_empty() =>
-            {
-                Some(function)
-            }
-            _ => None,
-        }) {
+        if let Some(overload_header) = overloads.first(&target.source, name) {
             let argument_types = arguments
                 .iter()
                 .map(|argument| overload_argument_type(argument, scope))
                 .collect::<Option<Vec<_>>>()?;
-            let overload_header = ScalarOverloadHeader::from_function(overload);
             let ScalarType::Callable { outputs, .. } =
-                resolve_overload_candidate(&overload_header, &argument_types, None)
+                resolve_overload_candidate(overload_header, &argument_types, None)
                     .ok()?
                     .0
             else {
@@ -319,6 +312,7 @@ fn call_output_sequence(
     expression: &ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
+    overloads: &ScalarOverloadEnvironment,
 ) -> Option<ScalarOutputSequence> {
     let ScalarExpression::Call {
         receiver,
@@ -357,27 +351,17 @@ fn call_output_sequence(
     if extern_callable && !type_arguments.is_empty() {
         return None;
     }
-    if let Some(overload) = receiver
+    if let Some(overload_header) = receiver
         .is_none()
-        .then(|| {
-            program.items.iter().find_map(|item| match item {
-                ScalarItem::Function(function)
-                    if function.name == *name && !function.overload_arms.is_empty() =>
-                {
-                    Some(function)
-                }
-                _ => None,
-            })
-        })
+        .then(|| overloads.first(&program.source, name))
         .flatten()
     {
         let argument_types = arguments
             .iter()
             .map(|argument| overload_argument_type(argument, scope))
             .collect::<Option<Vec<_>>>()?;
-        let overload_header = ScalarOverloadHeader::from_function(overload);
         let ScalarType::Callable { outputs, .. } =
-            resolve_overload_candidate(&overload_header, &argument_types, None)
+            resolve_overload_candidate(overload_header, &argument_types, None)
                 .ok()?
                 .0
         else {
@@ -452,8 +436,11 @@ pub(super) fn validate_output_receivers_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) {
-    let Some(outputs) = call_output_sequence_in_module(expression, scope, module, modules) else {
+    let Some(outputs) =
+        call_output_sequence_in_module(expression, scope, module, modules, overloads)
+    else {
         return;
     };
     if receivers.len() > outputs.outputs.len() {
@@ -476,8 +463,9 @@ fn validate_output_receivers(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) {
-    let Some(outputs) = call_output_sequence(expression, scope, program) else {
+    let Some(outputs) = call_output_sequence(expression, scope, program, overloads) else {
         return;
     };
     if receivers.len() > outputs.outputs.len() {
@@ -508,6 +496,7 @@ pub(super) fn block_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut visible_names = visible_names.clone();
@@ -524,6 +513,7 @@ pub(super) fn block_type_in_module(
             modules,
             diagnostics,
             unsafe_context,
+            overloads,
         );
         if index + 1 == block.items.len() && block.terminated_items[index] {
             result = ScalarType::Unit;
@@ -542,6 +532,7 @@ pub(super) fn block_type_in_module_expected(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut visible_names = visible_names.clone();
@@ -563,6 +554,7 @@ pub(super) fn block_type_in_module_expected(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 )
             }
             _ => block_item_type_in_module(
@@ -574,6 +566,7 @@ pub(super) fn block_type_in_module_expected(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             ),
         };
         if index + 1 == block.items.len() && block.terminated_items[index] {
@@ -592,6 +585,7 @@ pub(super) fn block_item_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
@@ -613,6 +607,7 @@ pub(super) fn block_item_type_in_module(
                         modules,
                         diagnostics,
                         unsafe_context,
+                        overloads,
                     );
                     expect_module_type(
                         module,
@@ -646,6 +641,7 @@ pub(super) fn block_item_type_in_module(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             validate_output_receivers_in_module(
                 &binding.value,
@@ -655,6 +651,7 @@ pub(super) fn block_item_type_in_module(
                 module,
                 modules,
                 diagnostics,
+                overloads,
             );
             expect_module_type(
                 module,
@@ -687,6 +684,7 @@ pub(super) fn block_item_type_in_module(
             modules,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
         ScalarBlockItem::Assignment(assignment) => assignment_type_in_module(
             assignment,
@@ -697,6 +695,7 @@ pub(super) fn block_item_type_in_module(
             modules,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
         ScalarBlockItem::While(while_expression) => while_type_in_module(
             while_expression,
@@ -707,6 +706,7 @@ pub(super) fn block_item_type_in_module(
             modules,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
     }
 }
@@ -720,13 +720,16 @@ fn assignment_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     let mut inferred_names = visible_names.clone();
     let mut inferred_folded_names = folded_names.clone();
     let expected = assignment
         .targets
         .iter()
-        .map(|target| assignment_target_type_in_module(target, scope, module, modules, diagnostics))
+        .map(|target| {
+            assignment_target_type_in_module(target, scope, module, modules, diagnostics, overloads)
+        })
         .collect::<Vec<_>>();
     validate_assignment_target_distinctness_in_module(assignment, module, diagnostics);
     let outputs = assignment
@@ -744,8 +747,9 @@ fn assignment_type_in_module(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
-            match call_output_sequence_in_module(value, scope, module, modules) {
+            match call_output_sequence_in_module(value, scope, module, modules, overloads) {
                 Some(outputs) => Some(outputs.outputs),
                 None if matches!(value, ScalarExpression::Call { .. })
                     && is_error_type(&actual) =>
@@ -822,6 +826,7 @@ fn assignment_target_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) -> Option<ScalarType> {
     if let Some(receiver) = &target.receiver {
         if let Some(namespace) = module
@@ -882,6 +887,7 @@ fn assignment_target_type_in_module(
             module,
             modules,
             diagnostics,
+            overloads,
         )),
     }
 }
@@ -923,6 +929,7 @@ fn while_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     let condition = expression_type_in_module(
         &while_expression.condition,
@@ -933,6 +940,7 @@ fn while_type_in_module(
         modules,
         diagnostics,
         unsafe_context,
+        overloads,
     );
     if !is_error_type(&condition) && !scalar_type_equal(&condition, &ScalarType::Bool) {
         diagnostics.push(module_diagnostic(
@@ -951,6 +959,7 @@ fn while_type_in_module(
         modules,
         diagnostics,
         unsafe_context,
+        overloads,
     );
     ScalarType::Unit
 }
@@ -966,6 +975,7 @@ fn type_core_memory_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if matches!(operation, "alloc" | "free" | "invalidate" | "rebind") && !unsafe_context {
         diagnostics.push(module_diagnostic(
@@ -997,6 +1007,7 @@ fn type_core_memory_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 expect_module_type(
                     module,
@@ -1027,6 +1038,7 @@ fn type_core_memory_in_module(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             if !matches!(
                 actual,
@@ -1078,6 +1090,7 @@ fn type_core_memory_in_module(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             if !is_error_type(&actual) && !matches!(actual, ScalarType::CheckedReference { .. }) {
                 diagnostics.push(module_diagnostic(
@@ -1098,6 +1111,7 @@ fn type_core_memory_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 if !is_error_type(&raw_type) && !matches!(raw_type, ScalarType::RawPointer(_)) {
                     diagnostics.push(module_diagnostic(
@@ -1118,6 +1132,7 @@ fn type_core_memory_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 expect_module_type(
                     module,
@@ -1155,6 +1170,7 @@ fn type_core_memory(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if matches!(operation, "alloc" | "free" | "invalidate" | "rebind") && !unsafe_context {
         diagnostics.push(diagnostic(
@@ -1185,6 +1201,7 @@ fn type_core_memory(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 expect_type(
                     program,
@@ -1214,6 +1231,7 @@ fn type_core_memory(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             if !matches!(
                 actual,
@@ -1264,6 +1282,7 @@ fn type_core_memory(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             if !is_error_type(&actual) && !matches!(actual, ScalarType::CheckedReference { .. }) {
                 diagnostics.push(diagnostic(
@@ -1283,6 +1302,7 @@ fn type_core_memory(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 if !is_error_type(&raw_type) && !matches!(raw_type, ScalarType::RawPointer(_)) {
                     diagnostics.push(diagnostic(
@@ -1302,6 +1322,7 @@ fn type_core_memory(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 expect_type(
                     program,
@@ -1341,6 +1362,7 @@ fn type_core_int_conversion_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
         diagnostics.push(module_diagnostic(
@@ -1381,6 +1403,7 @@ fn type_core_int_conversion_in_module(
         modules,
         diagnostics,
         unsafe_context,
+        overloads,
     );
     let source_width = integer_width(&actual);
     let destination_width = integer_width(destination);
@@ -1433,6 +1456,7 @@ fn type_core_bitcast_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
         diagnostics.push(module_diagnostic(
@@ -1472,6 +1496,7 @@ fn type_core_bitcast_in_module(
         modules,
         diagnostics,
         unsafe_context,
+        overloads,
     );
     if is_error_type(&actual) {
         return ScalarType::Error;
@@ -1516,6 +1541,7 @@ fn type_core_pointer_cast_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if !unsafe_context {
         diagnostics.push(module_diagnostic(
@@ -1567,6 +1593,7 @@ fn type_core_pointer_cast_in_module(
         modules,
         diagnostics,
         unsafe_context,
+        overloads,
     );
     if is_error_type(&actual) {
         return ScalarType::Error;
@@ -1643,6 +1670,7 @@ fn type_core_float_conversion_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
         diagnostics.push(module_diagnostic(
@@ -1683,6 +1711,7 @@ fn type_core_float_conversion_in_module(
         modules,
         diagnostics,
         unsafe_context,
+        overloads,
     );
     let source_valid = float_conversion_source_matches(operation, &actual);
     if !is_error_type(&actual) && !source_valid {
@@ -1719,6 +1748,7 @@ fn type_core_float_conversion(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
         diagnostics.push(diagnostic(
@@ -1759,6 +1789,7 @@ fn type_core_float_conversion(
             program,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
         None => expression_type(
             &arguments[0],
@@ -1768,6 +1799,7 @@ fn type_core_float_conversion(
             program,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
     };
     let source_valid = float_conversion_source_matches(operation, &actual);
@@ -1805,6 +1837,7 @@ fn type_core_int_conversion(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
         diagnostics.push(diagnostic(
@@ -1845,6 +1878,7 @@ fn type_core_int_conversion(
             program,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
         None => expression_type(
             &arguments[0],
@@ -1854,6 +1888,7 @@ fn type_core_int_conversion(
             program,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
     };
     let source_width = integer_width(&actual);
@@ -1898,6 +1933,7 @@ fn type_core_bitcast(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
         diagnostics.push(diagnostic(
@@ -1935,6 +1971,7 @@ fn type_core_bitcast(
         program,
         diagnostics,
         unsafe_context,
+        overloads,
     );
     if is_error_type(&actual) {
         return ScalarType::Error;
@@ -1978,6 +2015,7 @@ fn type_core_pointer_cast(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if !unsafe_context {
         diagnostics.push(diagnostic(
@@ -2028,6 +2066,7 @@ fn type_core_pointer_cast(
         program,
         diagnostics,
         unsafe_context,
+        overloads,
     );
     if is_error_type(&actual) {
         return ScalarType::Error;
@@ -2055,6 +2094,7 @@ fn type_core_raw_memory_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if !unsafe_context {
         diagnostics.push(module_diagnostic(
@@ -2115,6 +2155,7 @@ fn type_core_raw_memory_in_module(
         modules,
         diagnostics,
         unsafe_context,
+        overloads,
     );
     let mut valid = true;
     if !is_error_type(&pointer) {
@@ -2152,6 +2193,7 @@ fn type_core_raw_memory_in_module(
             modules,
             diagnostics,
             unsafe_context,
+            overloads,
         );
         expect_module_type(
             module,
@@ -2185,6 +2227,7 @@ fn type_core_raw_memory(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if !unsafe_context {
         diagnostics.push(diagnostic(
@@ -2244,6 +2287,7 @@ fn type_core_raw_memory(
         program,
         diagnostics,
         unsafe_context,
+        overloads,
     );
     let mut valid = true;
     if !is_error_type(&pointer) {
@@ -2280,6 +2324,7 @@ fn type_core_raw_memory(
             program,
             diagnostics,
             unsafe_context,
+            overloads,
         );
         expect_type(
             program,
@@ -2443,6 +2488,7 @@ pub(super) fn expression_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     match expression {
         ScalarExpression::Name { name, span } if name == "null" => {
@@ -2469,6 +2515,7 @@ pub(super) fn expression_type_in_module(
                 module,
                 modules,
                 diagnostics,
+                overloads,
             )))
         }
         ScalarExpression::CheckedAddress {
@@ -2483,6 +2530,7 @@ pub(super) fn expression_type_in_module(
             module,
             modules,
             diagnostics,
+            overloads,
         ),
         ScalarExpression::Dereference { place, span } => checked_dereference_type_in_module(
             place,
@@ -2492,9 +2540,10 @@ pub(super) fn expression_type_in_module(
             modules,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
         ScalarExpression::IndexedRead { place, .. } => {
-            place_type_in_module(place, scope, module, modules, diagnostics)
+            place_type_in_module(place, scope, module, modules, diagnostics, overloads)
         }
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {
@@ -2622,6 +2671,7 @@ pub(super) fn expression_type_in_module(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             match operator {
                 UnaryOperator::LogicalNot => {
@@ -2670,6 +2720,7 @@ pub(super) fn expression_type_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             let left_type = expression_type_in_module(
@@ -2681,6 +2732,7 @@ pub(super) fn expression_type_in_module(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             let right_type = if matches!(
                 operator,
@@ -2701,6 +2753,7 @@ pub(super) fn expression_type_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 )
             } else {
                 expression_type_in_module(
@@ -2712,6 +2765,7 @@ pub(super) fn expression_type_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 )
             };
             if is_error_type(&left_type) || is_error_type(&right_type) {
@@ -2799,6 +2853,7 @@ pub(super) fn expression_type_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 let expected = utf8_type_from_namespace_target(module, modules, *span, diagnostics);
                 expect_module_type(module, &expected, &actual, *span, diagnostics);
@@ -2825,6 +2880,7 @@ pub(super) fn expression_type_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             if receiver.as_deref() == Some("core")
@@ -2842,6 +2898,7 @@ pub(super) fn expression_type_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             if receiver.as_deref() == Some("core")
@@ -2867,6 +2924,7 @@ pub(super) fn expression_type_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             if receiver.as_deref() == Some("core") && name == "bitcast" {
@@ -2882,6 +2940,7 @@ pub(super) fn expression_type_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             if receiver.as_deref() == Some("core") && matches!(name.as_str(), "offset" | "load") {
@@ -2897,6 +2956,7 @@ pub(super) fn expression_type_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             if receiver.as_deref() == Some("core") && name == "pointer_cast" {
@@ -2912,6 +2972,7 @@ pub(super) fn expression_type_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             if let Some(receiver_type) = receiver.as_ref().and_then(|binding| scope.get(binding)) {
@@ -2968,6 +3029,7 @@ pub(super) fn expression_type_in_module(
                             modules,
                             diagnostics,
                             unsafe_context,
+                            overloads,
                         );
                         expect_module_type(
                             module,
@@ -2985,38 +3047,7 @@ pub(super) fn expression_type_in_module(
                     };
                 }
             }
-            let overload = match receiver {
-                None => module.items.iter().find_map(|item| match item {
-                    ScalarItem::Function(function)
-                        if function.name == *name && !function.overload_arms.is_empty() =>
-                    {
-                        Some(function)
-                    }
-                    _ => None,
-                }),
-                Some(binding) => module
-                    .namespace_bindings
-                    .iter()
-                    .find(|namespace| namespace.binding == *binding)
-                    .and_then(|namespace| {
-                        modules
-                            .iter()
-                            .find(|candidate| candidate.source == namespace.target)
-                    })
-                    .and_then(|target| {
-                        target.members.get(name).and_then(|_| {
-                            target.items.iter().find_map(|item| match item {
-                                ScalarItem::Function(function)
-                                    if function.name == *name
-                                        && !function.overload_arms.is_empty() =>
-                                {
-                                    Some(function)
-                                }
-                                _ => None,
-                            })
-                        })
-                    }),
-            };
+            let overload = overloads.for_call(&module.source, receiver.as_deref(), name);
             if overload.is_some() {
                 return expression_type_in_module_expected(
                     expression,
@@ -3028,6 +3059,7 @@ pub(super) fn expression_type_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             let (callable, target, unsafe_callable, extern_callable) = match receiver {
@@ -3181,6 +3213,7 @@ pub(super) fn expression_type_in_module(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 expect_module_type(target, parameter, &actual, *span, diagnostics);
                 error_argument |= is_error_type(&actual);
@@ -3214,6 +3247,7 @@ pub(super) fn expression_type_in_module(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             expect_module_type(
                 module,
@@ -3231,6 +3265,7 @@ pub(super) fn expression_type_in_module(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             let else_type = block_type_in_module(
                 else_branch,
@@ -3241,6 +3276,7 @@ pub(super) fn expression_type_in_module(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             if !is_error_type(&condition_type)
                 && !is_error_type(&then_type)
@@ -3276,6 +3312,7 @@ pub(super) fn expression_type_in_module(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             expect_module_type(
                 module,
@@ -3293,6 +3330,7 @@ pub(super) fn expression_type_in_module(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             ScalarType::Unit
         }
@@ -3305,6 +3343,7 @@ pub(super) fn expression_type_in_module(
             modules,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
     }
 }
@@ -3319,6 +3358,7 @@ pub(super) fn expression_type_in_module_expected(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if expected.is_some_and(is_error_type) {
         return ScalarType::Error;
@@ -3332,37 +3372,7 @@ pub(super) fn expression_type_in_module_expected(
         ..
     } = expression
     {
-        let overload = match receiver {
-            None => module.items.iter().find_map(|item| match item {
-                ScalarItem::Function(function)
-                    if function.name == *name && !function.overload_arms.is_empty() =>
-                {
-                    Some(function)
-                }
-                _ => None,
-            }),
-            Some(binding) => module
-                .namespace_bindings
-                .iter()
-                .find(|namespace| namespace.binding == *binding)
-                .and_then(|namespace| {
-                    modules
-                        .iter()
-                        .find(|candidate| candidate.source == namespace.target)
-                })
-                .and_then(|target| {
-                    target.members.get(name).and_then(|_| {
-                        target.items.iter().find_map(|item| match item {
-                            ScalarItem::Function(function)
-                                if function.name == *name && !function.overload_arms.is_empty() =>
-                            {
-                                Some(function)
-                            }
-                            _ => None,
-                        })
-                    })
-                }),
-        };
+        let overload = overloads.for_call(&module.source, receiver.as_deref(), name);
         if let Some(overload) = overload {
             if let Some(type_argument) = type_arguments.first() {
                 diagnostics.push(module_diagnostic(
@@ -3385,6 +3395,7 @@ pub(super) fn expression_type_in_module_expected(
                         modules,
                         diagnostics,
                         unsafe_context,
+                        overloads,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -3393,15 +3404,14 @@ pub(super) fn expression_type_in_module_expected(
                 .zip(&argument_types)
                 .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
                 .collect::<Vec<_>>();
-            let overload_header = ScalarOverloadHeader::from_function(overload);
-            let callable =
-                match resolve_overload_candidate(&overload_header, &overload_arguments, expected) {
-                    Ok((callable, _)) => callable,
-                    Err(message) => {
-                        diagnostics.push(module_diagnostic(module, "B0004", message, *name_span));
-                        return ScalarType::Error;
-                    }
-                };
+            let callable = match resolve_overload_candidate(overload, &overload_arguments, expected)
+            {
+                Ok((callable, _)) => callable,
+                Err(message) => {
+                    diagnostics.push(module_diagnostic(module, "B0004", message, *name_span));
+                    return ScalarType::Error;
+                }
+            };
             let ScalarType::Callable {
                 outputs,
                 parameters,
@@ -3420,6 +3430,7 @@ pub(super) fn expression_type_in_module_expected(
                     modules,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 expect_module_type(
                     module,
@@ -3474,6 +3485,7 @@ pub(super) fn expression_type_in_module_expected(
             modules,
             diagnostics,
             unsafe_context,
+            overloads,
         );
         if !is_error_type(&condition_type) && !scalar_type_equal(&condition_type, &ScalarType::Bool)
         {
@@ -3494,6 +3506,7 @@ pub(super) fn expression_type_in_module_expected(
             modules,
             diagnostics,
             unsafe_context,
+            overloads,
         );
         let else_type = block_type_in_module_expected(
             else_branch,
@@ -3505,6 +3518,7 @@ pub(super) fn expression_type_in_module_expected(
             modules,
             diagnostics,
             unsafe_context,
+            overloads,
         );
         if !is_error_type(&then_type)
             && !is_error_type(&else_type)
@@ -3585,6 +3599,7 @@ pub(super) fn expression_type_in_module_expected(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             expect_module_type(
                 module,
@@ -3652,6 +3667,7 @@ pub(super) fn expression_type_in_module_expected(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             expect_module_type(module, &declared.ty, &actual, field.span, diagnostics);
         }
@@ -3710,6 +3726,7 @@ pub(super) fn expression_type_in_module_expected(
             modules,
             diagnostics,
             unsafe_context,
+            overloads,
         );
     }
     if let ScalarExpression::Binary {
@@ -3766,6 +3783,7 @@ pub(super) fn expression_type_in_module_expected(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             let left_type = expression_type_in_module_expected(
                 left,
@@ -3777,6 +3795,7 @@ pub(super) fn expression_type_in_module_expected(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             (left_type, right_type)
         } else if comparison && matches!(left.as_ref(), ScalarExpression::Float { .. }) {
@@ -3789,6 +3808,7 @@ pub(super) fn expression_type_in_module_expected(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             let left_type = expression_type_in_module_expected(
                 left,
@@ -3800,6 +3820,7 @@ pub(super) fn expression_type_in_module_expected(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             (left_type, right_type)
         } else if comparison && matches!(right.as_ref(), ScalarExpression::Float { .. }) {
@@ -3812,6 +3833,7 @@ pub(super) fn expression_type_in_module_expected(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             let right_type = expression_type_in_module_expected(
                 right,
@@ -3823,6 +3845,7 @@ pub(super) fn expression_type_in_module_expected(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             (left_type, right_type)
         } else {
@@ -3840,6 +3863,7 @@ pub(super) fn expression_type_in_module_expected(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             let right_type = expression_type_in_module_expected(
                 right,
@@ -3857,6 +3881,7 @@ pub(super) fn expression_type_in_module_expected(
                 modules,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             (left_type, right_type)
         };
@@ -3900,6 +3925,7 @@ pub(super) fn expression_type_in_module_expected(
         modules,
         diagnostics,
         unsafe_context,
+        overloads,
     )
 }
 
@@ -4028,6 +4054,7 @@ fn checked_address_type(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if !is_supported_checked_address_place(place) {
         diagnostics.push(diagnostic(
@@ -4047,6 +4074,7 @@ fn checked_address_type(
             program,
             diagnostics,
             false,
+            overloads,
         ) {
             ScalarType::CheckedReference {
                 mutability: parent_mode,
@@ -4076,7 +4104,7 @@ fn checked_address_type(
             }
         }
     } else {
-        place_type(place, scope, program, diagnostics)
+        place_type(place, scope, program, diagnostics, overloads)
     };
     if !is_addressable_checked_reference_type(&inner) {
         diagnostics.push(diagnostic(
@@ -4101,6 +4129,7 @@ fn checked_address_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if !is_supported_checked_address_place(place) {
         diagnostics.push(module_diagnostic(
@@ -4121,6 +4150,7 @@ fn checked_address_type_in_module(
             modules,
             diagnostics,
             false,
+            overloads,
         ) {
             ScalarType::CheckedReference {
                 mutability: parent_mode,
@@ -4150,7 +4180,7 @@ fn checked_address_type_in_module(
             }
         }
     } else {
-        place_type_in_module(place, scope, module, modules, diagnostics)
+        place_type_in_module(place, scope, module, modules, diagnostics, overloads)
     };
     if !is_addressable_checked_reference_type(&inner) {
         diagnostics.push(module_diagnostic(
@@ -4173,8 +4203,9 @@ fn writable_place_type(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
-    if writable_place_contains_raw_dereference(place, scope, program, diagnostics) {
+    if writable_place_contains_raw_dereference(place, scope, program, diagnostics, overloads) {
         diagnostics.push(diagnostic(
             program,
             "B0003",
@@ -4183,7 +4214,7 @@ fn writable_place_type(
         ));
         return ScalarType::Error;
     }
-    let ty = writable_path_type(place, scope, program, diagnostics);
+    let ty = writable_path_type(place, scope, program, diagnostics, overloads);
     if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
         diagnostics.push(diagnostic(
             program,
@@ -4203,9 +4234,16 @@ fn writable_place_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
-    if writable_place_contains_raw_dereference_in_module(place, scope, module, modules, diagnostics)
-    {
+    if writable_place_contains_raw_dereference_in_module(
+        place,
+        scope,
+        module,
+        modules,
+        diagnostics,
+        overloads,
+    ) {
         diagnostics.push(module_diagnostic(
             module,
             "B0003",
@@ -4214,7 +4252,7 @@ fn writable_place_type_in_module(
         ));
         return ScalarType::Error;
     }
-    let ty = writable_path_type_in_module(place, scope, module, modules, diagnostics);
+    let ty = writable_path_type_in_module(place, scope, module, modules, diagnostics, overloads);
     if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
         diagnostics.push(module_diagnostic(
             module,
@@ -4232,11 +4270,12 @@ fn writable_place_contains_raw_dereference(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) -> bool {
     match place {
         ScalarPlace::Name { .. } => false,
         ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } => {
-            writable_place_contains_raw_dereference(base, scope, program, diagnostics)
+            writable_place_contains_raw_dereference(base, scope, program, diagnostics, overloads)
         }
         ScalarPlace::Dereference { pointer, .. } => matches!(
             expression_type(
@@ -4247,6 +4286,7 @@ fn writable_place_contains_raw_dereference(
                 program,
                 diagnostics,
                 true,
+                overloads,
             ),
             ScalarType::RawPointer(_)
         ),
@@ -4259,6 +4299,7 @@ fn writable_place_contains_raw_dereference_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) -> bool {
     match place {
         ScalarPlace::Name { .. } => false,
@@ -4269,6 +4310,7 @@ fn writable_place_contains_raw_dereference_in_module(
                 module,
                 modules,
                 diagnostics,
+                overloads,
             )
         }
         ScalarPlace::Dereference { pointer, .. } => matches!(
@@ -4281,6 +4323,7 @@ fn writable_place_contains_raw_dereference_in_module(
                 modules,
                 diagnostics,
                 true,
+                overloads,
             ),
             ScalarType::RawPointer(_)
         ),
@@ -4292,9 +4335,10 @@ fn writable_path_type(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     match place {
-        ScalarPlace::Name { .. } => place_type(place, scope, program, diagnostics),
+        ScalarPlace::Name { .. } => place_type(place, scope, program, diagnostics, overloads),
         ScalarPlace::Dereference { pointer, span } => match expression_type(
             pointer,
             scope,
@@ -4303,6 +4347,7 @@ fn writable_path_type(
             program,
             diagnostics,
             false,
+            overloads,
         ) {
             ScalarType::CheckedReference {
                 mutability: ScalarReferenceMutability::Mutable,
@@ -4321,7 +4366,7 @@ fn writable_path_type(
         },
         ScalarPlace::Field { base, field, span } => {
             let ScalarType::Struct(structure) =
-                writable_path_type(base, scope, program, diagnostics)
+                writable_path_type(base, scope, program, diagnostics, overloads)
             else {
                 diagnostics.push(diagnostic(program, "B0003", "value has no field", *span));
                 return ScalarType::Error;
@@ -4348,7 +4393,7 @@ fn writable_path_type(
             span,
             index_span,
         } => {
-            let base_type = writable_path_type(base, scope, program, diagnostics);
+            let base_type = writable_path_type(base, scope, program, diagnostics, overloads);
             let index_type = expression_type_expected(
                 index,
                 &ScalarType::U64,
@@ -4358,6 +4403,7 @@ fn writable_path_type(
                 program,
                 diagnostics,
                 false,
+                overloads,
             );
             expect_type(
                 program,
@@ -4391,10 +4437,11 @@ fn writable_path_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     match place {
         ScalarPlace::Name { .. } => {
-            place_type_in_module(place, scope, module, modules, diagnostics)
+            place_type_in_module(place, scope, module, modules, diagnostics, overloads)
         }
         ScalarPlace::Dereference { pointer, span } => match expression_type_in_module(
             pointer,
@@ -4405,6 +4452,7 @@ fn writable_path_type_in_module(
             modules,
             diagnostics,
             false,
+            overloads,
         ) {
             ScalarType::CheckedReference {
                 mutability: ScalarReferenceMutability::Mutable,
@@ -4423,7 +4471,7 @@ fn writable_path_type_in_module(
         },
         ScalarPlace::Field { base, field, span } => {
             let ScalarType::Struct(structure) =
-                writable_path_type_in_module(base, scope, module, modules, diagnostics)
+                writable_path_type_in_module(base, scope, module, modules, diagnostics, overloads)
             else {
                 diagnostics.push(module_diagnostic(
                     module,
@@ -4465,7 +4513,8 @@ fn writable_path_type_in_module(
             span,
             index_span,
         } => {
-            let base_type = writable_path_type_in_module(base, scope, module, modules, diagnostics);
+            let base_type =
+                writable_path_type_in_module(base, scope, module, modules, diagnostics, overloads);
             let index_type = expression_type_in_module_expected(
                 index,
                 Some(&ScalarType::U64),
@@ -4476,6 +4525,7 @@ fn writable_path_type_in_module(
                 modules,
                 diagnostics,
                 false,
+                overloads,
             );
             expect_module_type(
                 module,
@@ -4508,6 +4558,7 @@ pub(super) fn place_type(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     match place {
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
@@ -4517,7 +4568,7 @@ pub(super) fn place_type(
         ScalarPlace::Field {
             base, field, span, ..
         } => {
-            let base_type = place_type(base, scope, program, diagnostics);
+            let base_type = place_type(base, scope, program, diagnostics, overloads);
             let id = match base_type {
                 ScalarType::Struct(id) => id,
                 ScalarType::RawPointer(inner) => match inner.as_ref() {
@@ -4556,6 +4607,7 @@ pub(super) fn place_type(
             program,
             diagnostics,
             true,
+            overloads,
         ) {
             ScalarType::RawPointer(inner) => *inner,
             _ => {
@@ -4574,7 +4626,7 @@ pub(super) fn place_type(
             span,
             index_span,
         } => {
-            let base_type = place_type(base, scope, program, diagnostics);
+            let base_type = place_type(base, scope, program, diagnostics, overloads);
             let index_type = expression_type_expected(
                 index,
                 &ScalarType::U64,
@@ -4584,6 +4636,7 @@ pub(super) fn place_type(
                 program,
                 diagnostics,
                 false,
+                overloads,
             );
             expect_type(
                 program,
@@ -4617,6 +4670,7 @@ pub(super) fn place_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     match place {
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
@@ -4632,6 +4686,7 @@ pub(super) fn place_type_in_module(
             modules,
             diagnostics,
             true,
+            overloads,
         ) {
             ScalarType::RawPointer(inner) => *inner,
             _ => {
@@ -4647,7 +4702,8 @@ pub(super) fn place_type_in_module(
         ScalarPlace::Field {
             base, field, span, ..
         } => {
-            let base_type = place_type_in_module(base, scope, module, modules, diagnostics);
+            let base_type =
+                place_type_in_module(base, scope, module, modules, diagnostics, overloads);
             let id = match base_type {
                 ScalarType::Struct(id) => id,
                 ScalarType::RawPointer(inner) => match inner.as_ref() {
@@ -4716,7 +4772,8 @@ pub(super) fn place_type_in_module(
             span,
             index_span,
         } => {
-            let base_type = place_type_in_module(base, scope, module, modules, diagnostics);
+            let base_type =
+                place_type_in_module(base, scope, module, modules, diagnostics, overloads);
             let index_type = expression_type_in_module_expected(
                 index,
                 Some(&ScalarType::U64),
@@ -4727,6 +4784,7 @@ pub(super) fn place_type_in_module(
                 modules,
                 diagnostics,
                 false,
+                overloads,
             );
             expect_module_type(
                 module,
@@ -4761,6 +4819,7 @@ fn checked_dereference_target_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     match expression_type(
         pointer,
@@ -4770,6 +4829,7 @@ fn checked_dereference_target_type(
         program,
         diagnostics,
         unsafe_context,
+        overloads,
     ) {
         ScalarType::CheckedReference { inner, .. } => match inner.as_ref() {
             ScalarType::Unit => {
@@ -4811,6 +4871,7 @@ fn checked_dereference_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     match place {
         ScalarPlace::Dereference { pointer, span } => checked_dereference_target_type(
@@ -4820,6 +4881,7 @@ fn checked_dereference_type(
             program,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
         ScalarPlace::Field {
             base,
@@ -4842,6 +4904,7 @@ fn checked_dereference_type(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             let ScalarFieldReference::Resolved(field) = field else {
                 let ScalarFieldReference::Unresolved { span, .. } = field else {
@@ -4918,6 +4981,7 @@ fn checked_dereference_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     let (pointer, dereference_span, field) = match place {
         ScalarPlace::Dereference { pointer, span } => (pointer, *span, None),
@@ -4969,6 +5033,7 @@ fn checked_dereference_type_in_module(
         modules,
         diagnostics,
         unsafe_context,
+        overloads,
     ) {
         ScalarType::CheckedReference { inner, .. } => match inner.as_ref() {
             ScalarType::Unit => {
@@ -5465,7 +5530,10 @@ pub(super) fn operator(value: &str) -> BinaryOperator {
     }
 }
 
-pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
+pub(super) fn validate(
+    program: &ScalarProgram,
+    overloads: &ScalarOverloadEnvironment,
+) -> Vec<super::Diagnostic> {
     let mut diagnostics = Vec::new();
     validate_unit_if_positions(program, &mut diagnostics);
     let mut declarations = BTreeMap::new();
@@ -5612,6 +5680,7 @@ pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                             program,
                             &mut diagnostics,
                             false,
+                            overloads,
                         );
                         expect_type(
                             program,
@@ -5632,6 +5701,7 @@ pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     program,
                     &mut diagnostics,
                     false,
+                    overloads,
                 );
                 validate_output_receivers(
                     &binding.value,
@@ -5640,6 +5710,7 @@ pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     &declarations,
                     program,
                     &mut diagnostics,
+                    overloads,
                 );
                 expect_type(
                     program,
@@ -5700,6 +5771,7 @@ pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                                 program,
                                 &mut diagnostics,
                                 false,
+                                overloads,
                             ),
                             _ => block_item_type(
                                 item,
@@ -5709,6 +5781,7 @@ pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                                 program,
                                 &mut diagnostics,
                                 false,
+                                overloads,
                             ),
                         };
                     }
@@ -5733,7 +5806,7 @@ pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     {
                         let value = &function.body.final_output_values[0];
                         if let Some(actual_outputs) =
-                            call_output_sequence(&value.value, &scope, program)
+                            call_output_sequence(&value.value, &scope, program, overloads)
                         {
                             expression_type_expected(
                                 &value.value,
@@ -5748,6 +5821,7 @@ pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                                 program,
                                 &mut diagnostics,
                                 false,
+                                overloads,
                             );
                             if actual_outputs.outputs.len() != outputs.outputs.len() {
                                 diagnostics.push(diagnostic(
@@ -5795,6 +5869,7 @@ pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                                 program,
                                 &mut diagnostics,
                                 false,
+                                overloads,
                             );
                             expect_type(program, &output.ty, &actual, value.span, &mut diagnostics);
                         }
@@ -5809,6 +5884,7 @@ pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                         program,
                         &mut diagnostics,
                         false,
+                        overloads,
                     );
                     expect_type(
                         program,
@@ -5826,6 +5902,7 @@ pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                         program,
                         &mut diagnostics,
                         false,
+                        overloads,
                     );
                     expect_type(
                         program,
@@ -5855,6 +5932,7 @@ pub(super) fn validate(program: &ScalarProgram) -> Vec<super::Diagnostic> {
                     program,
                     &mut diagnostics,
                     false,
+                    overloads,
                 );
             }
         }
@@ -6155,6 +6233,7 @@ pub(super) fn block_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut visible_names = visible_names.clone();
@@ -6170,6 +6249,7 @@ pub(super) fn block_type(
             program,
             diagnostics,
             unsafe_context,
+            overloads,
         );
         if index + 1 == block.items.len() && block.terminated_items[index] {
             result = ScalarType::Unit;
@@ -6187,6 +6267,7 @@ fn block_type_expected(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut visible_names = visible_names.clone();
@@ -6207,6 +6288,7 @@ fn block_type_expected(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 )
             }
             _ => block_item_type(
@@ -6217,6 +6299,7 @@ fn block_type_expected(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             ),
         };
         if index + 1 == block.items.len() && block.terminated_items[index] {
@@ -6234,6 +6317,7 @@ fn block_item_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
@@ -6259,6 +6343,7 @@ fn block_item_type(
                         program,
                         diagnostics,
                         unsafe_context,
+                        overloads,
                     );
                     expect_type(
                         program,
@@ -6291,6 +6376,7 @@ fn block_item_type(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             validate_output_receivers(
                 &binding.value,
@@ -6299,6 +6385,7 @@ fn block_item_type(
                 scope,
                 program,
                 diagnostics,
+                overloads,
             );
             expect_type(
                 program,
@@ -6330,6 +6417,7 @@ fn block_item_type(
             program,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
         ScalarBlockItem::Assignment(assignment) => assignment_type(
             assignment,
@@ -6339,6 +6427,7 @@ fn block_item_type(
             program,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
         ScalarBlockItem::While(while_expression) => while_type(
             while_expression,
@@ -6348,6 +6437,7 @@ fn block_item_type(
             program,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
     }
 }
@@ -6360,13 +6450,14 @@ fn assignment_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     let mut inferred_names = visible_names.clone();
     let mut inferred_folded_names = folded_names.clone();
     let expected = assignment
         .targets
         .iter()
-        .map(|target| assignment_target_type(target, scope, program, diagnostics))
+        .map(|target| assignment_target_type(target, scope, program, diagnostics, overloads))
         .collect::<Vec<_>>();
     validate_assignment_target_distinctness(assignment, program, diagnostics);
     let outputs = assignment
@@ -6384,6 +6475,7 @@ fn assignment_type(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 ),
                 None => expression_type(
                     value,
@@ -6393,9 +6485,10 @@ fn assignment_type(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 ),
             };
-            match call_output_sequence(value, scope, program) {
+            match call_output_sequence(value, scope, program, overloads) {
                 Some(outputs) => Some(outputs.outputs),
                 None if matches!(value, ScalarExpression::Call { .. })
                     && is_error_type(&actual) =>
@@ -6471,6 +6564,7 @@ fn assignment_target_type(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarOverloadEnvironment,
 ) -> Option<ScalarType> {
     match &target.place {
         ScalarPlace::Name { name, span } => {
@@ -6491,6 +6585,7 @@ fn assignment_target_type(
             scope,
             program,
             diagnostics,
+            overloads,
         )),
     }
 }
@@ -6542,6 +6637,7 @@ fn while_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     let condition = expression_type(
         &while_expression.condition,
@@ -6551,6 +6647,7 @@ fn while_type(
         program,
         diagnostics,
         unsafe_context,
+        overloads,
     );
     if !is_error_type(&condition) && !scalar_type_equal(&condition, &ScalarType::Bool) {
         diagnostics.push(diagnostic(
@@ -6568,6 +6665,7 @@ fn while_type(
         program,
         diagnostics,
         unsafe_context,
+        overloads,
     );
     ScalarType::Unit
 }
@@ -6580,6 +6678,7 @@ pub(super) fn expression_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     match expression {
         ScalarExpression::RawAddress { place, span } => {
@@ -6591,18 +6690,38 @@ pub(super) fn expression_type(
                     *span,
                 ));
             }
-            ScalarType::RawPointer(Box::new(place_type(place, scope, program, diagnostics)))
+            ScalarType::RawPointer(Box::new(place_type(
+                place,
+                scope,
+                program,
+                diagnostics,
+                overloads,
+            )))
         }
         ScalarExpression::CheckedAddress {
             mutability,
             place,
             span,
-        } => checked_address_type(*mutability, place, *span, scope, program, diagnostics),
-        ScalarExpression::Dereference { place, span } => {
-            checked_dereference_type(place, *span, scope, program, diagnostics, unsafe_context)
-        }
+        } => checked_address_type(
+            *mutability,
+            place,
+            *span,
+            scope,
+            program,
+            diagnostics,
+            overloads,
+        ),
+        ScalarExpression::Dereference { place, span } => checked_dereference_type(
+            place,
+            *span,
+            scope,
+            program,
+            diagnostics,
+            unsafe_context,
+            overloads,
+        ),
         ScalarExpression::IndexedRead { place, .. } => {
-            place_type(place, scope, program, diagnostics)
+            place_type(place, scope, program, diagnostics, overloads)
         }
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {
@@ -6708,6 +6827,7 @@ pub(super) fn expression_type(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             match operator {
                 UnaryOperator::LogicalNot => {
@@ -6755,6 +6875,7 @@ pub(super) fn expression_type(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             let left_type = expression_type(
@@ -6765,6 +6886,7 @@ pub(super) fn expression_type(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             let right_type = if comparison {
                 expression_type_expected(
@@ -6776,6 +6898,7 @@ pub(super) fn expression_type(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 )
             } else {
                 expression_type(
@@ -6786,6 +6909,7 @@ pub(super) fn expression_type(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 )
             };
             if is_error_type(&left_type) || is_error_type(&right_type) {
@@ -6867,6 +6991,7 @@ pub(super) fn expression_type(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 expect_type(program, &ScalarType::Error, &actual, *span, diagnostics);
                 return if is_error_type(&actual) {
@@ -6891,6 +7016,7 @@ pub(super) fn expression_type(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             if receiver.as_deref() == Some("core")
@@ -6907,6 +7033,7 @@ pub(super) fn expression_type(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             if receiver.as_deref() == Some("core")
@@ -6931,6 +7058,7 @@ pub(super) fn expression_type(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             if receiver.as_deref() == Some("core") && name == "bitcast" {
@@ -6945,6 +7073,7 @@ pub(super) fn expression_type(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             if receiver.as_deref() == Some("core") && matches!(name.as_str(), "offset" | "load") {
@@ -6959,6 +7088,7 @@ pub(super) fn expression_type(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             if receiver.as_deref() == Some("core") && name == "pointer_cast" {
@@ -6973,6 +7103,7 @@ pub(super) fn expression_type(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
             }
             if let Some(receiver_type) = receiver.as_ref().and_then(|binding| scope.get(binding)) {
@@ -7020,6 +7151,7 @@ pub(super) fn expression_type(
                             program,
                             diagnostics,
                             unsafe_context,
+                            overloads,
                         );
                         expect_type(
                             program,
@@ -7037,16 +7169,11 @@ pub(super) fn expression_type(
                     };
                 }
             }
-            if let Some(overload) = program.items.iter().find_map(|item| match item {
-                ScalarItem::Function(function)
-                    if receiver.is_none()
-                        && function.name == *name
-                        && !function.overload_arms.is_empty() =>
-                {
-                    Some(function)
-                }
-                _ => None,
-            }) {
+            if let Some(overload) = receiver
+                .is_none()
+                .then(|| overloads.first(&program.source, name))
+                .flatten()
+            {
                 let argument_types = arguments
                     .iter()
                     .map(|argument| {
@@ -7058,6 +7185,7 @@ pub(super) fn expression_type(
                             program,
                             diagnostics,
                             unsafe_context,
+                            overloads,
                         )
                     })
                     .collect::<Vec<_>>();
@@ -7066,15 +7194,14 @@ pub(super) fn expression_type(
                     .zip(&argument_types)
                     .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
                     .collect::<Vec<_>>();
-                let overload_header = ScalarOverloadHeader::from_function(overload);
-                let callable =
-                    match resolve_overload_candidate(&overload_header, &overload_arguments, None) {
-                        Ok((callable, _)) => callable,
-                        Err(message) => {
-                            diagnostics.push(diagnostic(program, "B0004", message, *name_span));
-                            return ScalarType::Error;
-                        }
-                    };
+                let callable = match resolve_overload_candidate(overload, &overload_arguments, None)
+                {
+                    Ok((callable, _)) => callable,
+                    Err(message) => {
+                        diagnostics.push(diagnostic(program, "B0004", message, *name_span));
+                        return ScalarType::Error;
+                    }
+                };
                 let ScalarType::Callable {
                     outputs,
                     parameters,
@@ -7092,6 +7219,7 @@ pub(super) fn expression_type(
                         program,
                         diagnostics,
                         unsafe_context,
+                        overloads,
                     );
                     expect_type(
                         program,
@@ -7202,6 +7330,7 @@ pub(super) fn expression_type(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 expect_type(program, &parameter, &actual, *span, diagnostics);
                 error_argument |= is_error_type(&actual);
@@ -7234,6 +7363,7 @@ pub(super) fn expression_type(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             if !is_error_type(&condition_type)
                 && !scalar_type_equal(&condition_type, &ScalarType::Bool)
@@ -7253,6 +7383,7 @@ pub(super) fn expression_type(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             let else_type = block_type(
                 else_branch,
@@ -7262,6 +7393,7 @@ pub(super) fn expression_type(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             if !is_error_type(&condition_type)
                 && !is_error_type(&then_type)
@@ -7296,6 +7428,7 @@ pub(super) fn expression_type(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             expect_type(
                 program,
@@ -7312,6 +7445,7 @@ pub(super) fn expression_type(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             ScalarType::Unit
         }
@@ -7323,6 +7457,7 @@ pub(super) fn expression_type(
             program,
             diagnostics,
             unsafe_context,
+            overloads,
         ),
     }
 }
@@ -7412,6 +7547,7 @@ fn expression_type_expected(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
+    overloads: &ScalarOverloadEnvironment,
 ) -> ScalarType {
     if is_error_type(expected) {
         return ScalarType::Error;
@@ -7425,14 +7561,7 @@ fn expression_type_expected(
         ..
     } = expression
     {
-        if let Some(overload) = program.items.iter().find_map(|item| match item {
-            ScalarItem::Function(function)
-                if function.name == *name && !function.overload_arms.is_empty() =>
-            {
-                Some(function)
-            }
-            _ => None,
-        }) {
+        if let Some(overload) = overloads.first(&program.source, name) {
             if let Some(type_argument) = type_arguments.first() {
                 diagnostics.push(diagnostic(
                     program,
@@ -7453,6 +7582,7 @@ fn expression_type_expected(
                         program,
                         diagnostics,
                         unsafe_context,
+                        overloads,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -7461,18 +7591,14 @@ fn expression_type_expected(
                 .zip(&argument_types)
                 .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
                 .collect::<Vec<_>>();
-            let overload_header = ScalarOverloadHeader::from_function(overload);
-            let callable = match resolve_overload_candidate(
-                &overload_header,
-                &overload_arguments,
-                Some(expected),
-            ) {
-                Ok((callable, _)) => callable,
-                Err(message) => {
-                    diagnostics.push(diagnostic(program, "B0004", message, *name_span));
-                    return ScalarType::Error;
-                }
-            };
+            let callable =
+                match resolve_overload_candidate(overload, &overload_arguments, Some(expected)) {
+                    Ok((callable, _)) => callable,
+                    Err(message) => {
+                        diagnostics.push(diagnostic(program, "B0004", message, *name_span));
+                        return ScalarType::Error;
+                    }
+                };
             let ScalarType::Callable {
                 outputs,
                 parameters,
@@ -7490,6 +7616,7 @@ fn expression_type_expected(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 expect_type(
                     program,
@@ -7536,6 +7663,7 @@ fn expression_type_expected(
             program,
             diagnostics,
             unsafe_context,
+            overloads,
         );
         match operator {
             UnaryOperator::LogicalNot => {
@@ -7575,6 +7703,7 @@ fn expression_type_expected(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             if !is_error_type(&condition_type)
                 && !scalar_type_equal(&condition_type, &ScalarType::Bool)
@@ -7595,6 +7724,7 @@ fn expression_type_expected(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             let else_type = block_type_expected(
                 else_branch,
@@ -7605,6 +7735,7 @@ fn expression_type_expected(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
             if !is_error_type(&then_type)
                 && !is_error_type(&else_type)
@@ -7679,6 +7810,7 @@ fn expression_type_expected(
                 program,
                 diagnostics,
                 unsafe_context,
+                overloads,
             );
         }
         if let ScalarExpression::Binary {
@@ -7731,6 +7863,7 @@ fn expression_type_expected(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 let left_type = expression_type_expected(
                     left,
@@ -7741,6 +7874,7 @@ fn expression_type_expected(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 (left_type, right_type)
             } else if comparison && matches!(left.as_ref(), ScalarExpression::Float { .. }) {
@@ -7752,6 +7886,7 @@ fn expression_type_expected(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 let left_type = expression_type_expected(
                     left,
@@ -7762,6 +7897,7 @@ fn expression_type_expected(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 (left_type, right_type)
             } else if comparison && matches!(right.as_ref(), ScalarExpression::Float { .. }) {
@@ -7773,6 +7909,7 @@ fn expression_type_expected(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 let right_type = expression_type_expected(
                     right,
@@ -7783,6 +7920,7 @@ fn expression_type_expected(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 (left_type, right_type)
             } else {
@@ -7796,6 +7934,7 @@ fn expression_type_expected(
                         program,
                         diagnostics,
                         unsafe_context,
+                        overloads,
                     )
                 } else if comparison {
                     expression_type(
@@ -7806,6 +7945,7 @@ fn expression_type_expected(
                         program,
                         diagnostics,
                         unsafe_context,
+                        overloads,
                     )
                 } else {
                     expression_type_expected(
@@ -7817,6 +7957,7 @@ fn expression_type_expected(
                         program,
                         diagnostics,
                         unsafe_context,
+                        overloads,
                     )
                 };
                 let right_type = expression_type_expected(
@@ -7834,6 +7975,7 @@ fn expression_type_expected(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 (left_type, right_type)
             };
@@ -7903,6 +8045,7 @@ fn expression_type_expected(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 expect_type(
                     program,
@@ -7964,6 +8107,7 @@ fn expression_type_expected(
                     program,
                     diagnostics,
                     unsafe_context,
+                    overloads,
                 );
                 expect_type(program, &declared.ty, &actual, field.span, diagnostics);
             }
@@ -7985,6 +8129,7 @@ fn expression_type_expected(
             program,
             diagnostics,
             unsafe_context,
+            overloads,
         )
     }
 }

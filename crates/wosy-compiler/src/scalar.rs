@@ -1467,6 +1467,8 @@ fn resolve_overload_candidate(
     arguments: &[ScalarOverloadArgument],
     expected: Option<&ScalarType>,
 ) -> Result<(ScalarType, ScalarOverloadSelection), &'static str> {
+    #[cfg(test)]
+    overload::observations::record_candidate();
     let mut matches = Vec::new();
     let mut inconsistent = false;
     let mut output_mismatch = false;
@@ -2173,13 +2175,15 @@ pub fn derive_scalar_program_from_cst_with_layout(
         resolved_assignment_outputs: RefCell::new(HashMap::new()),
     };
     resolve_program_types(&mut program, &mut diagnostics);
-    resolve_program_places(&mut program);
-    let mut validation_diagnostics = validate(&program);
+    let overloads = ScalarOverloadEnvironment::single(&program.source, &program.items);
+    resolve_program_places(&mut program, &overloads);
+    let mut validation_diagnostics = validate(&program, &overloads);
     let mut diagnostics = diagnostics;
     diagnostics.append(&mut validation_diagnostics);
     if diagnostics.is_empty() {
-        record_overload_selections(&mut program);
+        record_overload_selections(&mut program, &overloads);
     }
+    drop(overloads);
     if diagnostics.is_empty() {
         let module = ScalarModule::from_program(program.clone(), Vec::new());
         let call_sites = resolve_module_call_sites(&program.source, &program.items, &[module]);
@@ -2214,7 +2218,8 @@ mod declarations;
 use declarations::ScalarDeclarationEnvironment;
 mod overload;
 use overload::{
-    record_overload_selections, record_project_overload_selections, ScalarOverloadHeader,
+    record_overload_selections, record_project_overload_selections, ScalarOverloadEnvironment,
+    ScalarOverloadHeader,
 };
 pub(crate) mod layout;
 pub use layout::ScalarTargetLayouts;
@@ -2278,9 +2283,10 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                 .copy_policy;
         }
     }
+    let overloads = ScalarOverloadEnvironment::project(&project.modules);
     let struct_lookup = project.modules.clone();
     for (ordinal, module) in project.modules.iter_mut().enumerate() {
-        resolve_module_places(module, &struct_lookup, &declarations, ordinal);
+        resolve_module_places(module, &struct_lookup, &declarations, ordinal, &overloads);
     }
     drop(declarations);
     for module in &project.modules {
@@ -2413,6 +2419,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                 &project.modules,
                                 &mut diagnostics,
                                 false,
+                                &overloads,
                             );
                             expect_module_type(
                                 module,
@@ -2434,6 +2441,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         &project.modules,
                         &mut diagnostics,
                         false,
+                        &overloads,
                     );
                     validate_output_receivers_in_module(
                         &binding.value,
@@ -2443,6 +2451,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         module,
                         &project.modules,
                         &mut diagnostics,
+                        &overloads,
                     );
                     expect_module_type(
                         module,
@@ -2512,6 +2521,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                     &project.modules,
                                     &mut diagnostics,
                                     false,
+                                    &overloads,
                                 ),
                                 _ => block_item_type_in_module(
                                     item,
@@ -2522,6 +2532,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                     &project.modules,
                                     &mut diagnostics,
                                     false,
+                                    &overloads,
                                 ),
                             };
                         }
@@ -2537,6 +2548,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                 &scope,
                                 module,
                                 &project.modules,
+                                &overloads,
                             ) {
                                 expression_type_in_module_expected(
                                     &value.value,
@@ -2548,6 +2560,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                     &project.modules,
                                     &mut diagnostics,
                                     false,
+                                    &overloads,
                                 );
                                 if actual_outputs.outputs.len() != outputs.outputs.len() {
                                     diagnostics.push(module_diagnostic(
@@ -2596,6 +2609,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                     &project.modules,
                                     &mut diagnostics,
                                     false,
+                                    &overloads,
                                 );
                                 expect_module_type(
                                     module,
@@ -2617,6 +2631,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                             &project.modules,
                             &mut diagnostics,
                             false,
+                            &overloads,
                         );
                         expect_module_type(
                             module,
@@ -2635,6 +2650,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                             &project.modules,
                             &mut diagnostics,
                             false,
+                            &overloads,
                         );
                         expect_module_type(
                             module,
@@ -2658,6 +2674,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         &project.modules,
                         &mut diagnostics,
                         false,
+                        &overloads,
                     );
                 }
             }
@@ -2672,8 +2689,9 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         }
     }
     if diagnostics.is_empty() {
-        record_project_overload_selections(&mut project);
+        record_project_overload_selections(&mut project, &overloads);
     }
+    drop(overloads);
     if diagnostics.is_empty() {
         let modules = project.modules.clone();
         for module in &mut project.modules {

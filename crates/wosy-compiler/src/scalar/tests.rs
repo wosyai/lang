@@ -5254,6 +5254,8 @@ fn derives_and_validates_ordered_local_mutation_and_unit_while() {
         while_expression.body.items[0],
         ScalarBlockItem::Assignment(_)
     ));
+    let overloads =
+        ScalarOverloadEnvironment::single(&result.program.source, &result.program.items);
     assert_eq!(
         block_type(
             &while_expression.body,
@@ -5263,6 +5265,7 @@ fn derives_and_validates_ordered_local_mutation_and_unit_while() {
             &result.program,
             &mut Vec::new(),
             false,
+            &overloads,
         ),
         ScalarType::Unit
     );
