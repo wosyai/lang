@@ -727,7 +727,7 @@ pub(super) fn emit_runtime_array_allocation<'ctx, 'module>(
     length: inkwell::values::IntValue<'ctx>,
 ) -> Result<PointerValue<'ctx>, String> {
     declare_core_runtime(context, state.module);
-    let (element_size, alignment) = allocation_layout(element, state.structs, state.target_layout)?;
+    let (element_size, alignment) = allocation_layout(element, state.layouts, state.target_layout)?;
     let size = state
         .builder
         .build_int_mul(

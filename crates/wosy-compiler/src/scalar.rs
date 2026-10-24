@@ -520,7 +520,8 @@ pub enum CfgPointKind {
     Return,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(not(test), derive(Clone))]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarReferenceCfg {
     pub facts: Vec<ReferenceOrigin>,
     pub points: Vec<ReferenceFlowPoint>,
@@ -1120,11 +1121,10 @@ pub struct ScalarStructField {
     pub name_span: ByteSpan,
     pub ty: ScalarType,
     pub declaration_index: usize,
-    pub offset: Option<u64>,
-    pub layout: Option<ScalarLayout>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(not(test), derive(Clone))]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarStruct {
     pub id: ScalarStructId,
     pub name: String,
@@ -1133,7 +1133,6 @@ pub struct ScalarStruct {
     pub copy_policy: CopyPolicy,
     pub copy_modifier_span: Option<ByteSpan>,
     pub span: ByteSpan,
-    pub layout: Option<ScalarLayout>,
 }
 
 fn resolved_struct_field<'a>(
@@ -1917,13 +1916,15 @@ pub enum ScalarItem {
     Executable(ScalarBlockItem),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(not(test), derive(Clone))]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarProgram {
     pub source: SourceIdentity,
     pub items: Vec<ScalarItem>,
     pub structs: Vec<ScalarStruct>,
     pub enums: Vec<ScalarEnum>,
     pub target_layout: ScalarTargetLayout,
+    pub layouts: ScalarTargetLayouts,
     #[serde(skip)]
     pub resolved_assignment_outputs: RefCell<HashMap<ResolvedAssignmentOutputId, ScalarType>>,
 }
@@ -1941,7 +1942,8 @@ pub struct ScalarInitializationNode {
     pub span: ByteSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(not(test), derive(Clone))]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarModule {
     pub source: SourceIdentity,
     pub items: Vec<ScalarItem>,
@@ -1951,6 +1953,7 @@ pub struct ScalarModule {
     pub structs: Vec<ScalarStruct>,
     pub enums: Vec<ScalarEnum>,
     pub target_layout: ScalarTargetLayout,
+    pub layouts: ScalarTargetLayouts,
     #[serde(skip)]
     pub resolved_assignment_outputs: RefCell<HashMap<ResolvedAssignmentOutputId, ScalarType>>,
 }
@@ -1996,6 +1999,7 @@ impl ScalarModule {
             structs: Vec::new(),
             enums: Vec::new(),
             target_layout: ScalarTargetLayout::WASM32,
+            layouts: ScalarTargetLayouts::new(ScalarTargetLayout::WASM32),
             resolved_assignment_outputs: RefCell::new(HashMap::new()),
         }
     }
@@ -2008,6 +2012,7 @@ impl ScalarModule {
         module.structs = program.structs;
         module.enums = program.enums;
         module.target_layout = program.target_layout;
+        module.layouts = program.layouts;
         module.resolved_assignment_outputs = program.resolved_assignment_outputs;
         module
     }
@@ -2088,7 +2093,6 @@ pub fn derive_scalar_program_from_cst_with_layout(
                     source: canonical.source.clone(),
                     index,
                 },
-                target_layout,
             )
         })
         .collect();
@@ -2165,6 +2169,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
         structs,
         enums,
         target_layout,
+        layouts: ScalarTargetLayouts::new(target_layout),
         resolved_assignment_outputs: RefCell::new(HashMap::new()),
     };
     resolve_program_types(&mut program, &mut diagnostics);
@@ -2460,10 +2465,13 @@ fn record_block_item_overload_selections(
     }
 }
 
+pub(crate) mod layout;
+pub use layout::ScalarTargetLayouts;
+use layout::{resolve_program_struct_layouts, resolve_project_struct_layouts};
 mod resolution;
 use resolution::{
     enum_member_in_module, resolve_module_places, resolve_module_types_in_project,
-    resolve_program_places, resolve_program_types, resolve_project_struct_layouts,
+    resolve_program_places, resolve_program_types,
 };
 mod typecheck;
 use typecheck::{
@@ -2486,8 +2494,9 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
     let mut project = project;
     let mut diagnostics = Vec::new();
-    for module in &project.modules {
+    for module in &mut project.modules {
         module.resolved_assignment_outputs.borrow_mut().clear();
+        module.layouts = ScalarTargetLayouts::new(module.target_layout);
     }
     let struct_lookup = project.modules.clone();
     for module in &mut project.modules {
@@ -3232,15 +3241,11 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
     }
 }
 
-fn derive_struct(
-    node: CstNode,
-    id: ScalarStructId,
-    target_layout: ScalarTargetLayout,
-) -> ScalarStruct {
+fn derive_struct(node: CstNode, id: ScalarStructId) -> ScalarStruct {
     let name = direct_token(&node, SyntaxKind::Identifier).expect("struct name");
     let copy_modifier_span =
         direct_token(&node, SyntaxKind::CopyModifier).map(|token| token_span(&token));
-    let mut fields = node
+    let fields = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::StructField)
         .enumerate()
@@ -3254,15 +3259,11 @@ fn derive_struct(
                 },
                 name: field_name.text().to_owned(),
                 name_span: token_span(&field_name),
-                layout: None,
                 ty,
                 declaration_index: index,
-                offset: None,
             }
         })
         .collect::<Vec<_>>();
-    compute_initial_struct_fields_layout(&mut fields, target_layout);
-    let layout = initial_struct_layout(&fields);
     ScalarStruct {
         id,
         name: name.text().to_owned(),
@@ -3271,7 +3272,6 @@ fn derive_struct(
         copy_policy: CopyPolicy::Move,
         copy_modifier_span,
         span: wosy_syntax::byte_span(&node),
-        layout,
     }
 }
 
@@ -3314,60 +3314,6 @@ fn checked_layout_offset(offset: u64, layout: &ScalarLayout) -> Option<(u64, u64
     let field_offset = checked_align_offset(offset, layout.alignment)?;
     let next_offset = field_offset.checked_add(layout.size)?;
     Some((field_offset, next_offset))
-}
-
-fn clear_struct_layout(structure: &mut ScalarStruct) {
-    structure.layout = None;
-    for field in &mut structure.fields {
-        field.layout = None;
-        field.offset = None;
-    }
-}
-
-fn compute_initial_struct_layout(structure: &mut ScalarStruct, target_layout: ScalarTargetLayout) {
-    compute_initial_struct_fields_layout(&mut structure.fields, target_layout);
-    structure.layout = initial_struct_layout(&structure.fields);
-}
-
-fn compute_initial_struct_fields_layout(
-    fields: &mut [ScalarStructField],
-    target_layout: ScalarTargetLayout,
-) {
-    for field in fields.iter_mut() {
-        field.layout = None;
-        field.offset = None;
-    }
-    let mut offset = 0;
-    for index in 0..fields.len() {
-        let Ok(layout) = layout_for_type(&fields[index].ty, target_layout) else {
-            return;
-        };
-        let Some((field_offset, next_offset)) = checked_layout_offset(offset, &layout) else {
-            for field in fields.iter_mut() {
-                field.layout = None;
-                field.offset = None;
-            }
-            return;
-        };
-        fields[index].offset = Some(field_offset);
-        fields[index].layout = Some(layout.clone());
-        offset = next_offset;
-    }
-}
-
-fn initial_struct_layout(fields: &[ScalarStructField]) -> Option<ScalarLayout> {
-    let mut offset = 0;
-    let mut alignment = 1;
-    for field in fields {
-        let layout = field.layout.as_ref()?;
-        alignment = alignment.max(layout.alignment);
-        let (_, next_offset) = checked_layout_offset(offset, layout)?;
-        offset = next_offset;
-    }
-    Some(ScalarLayout {
-        size: checked_align_offset(offset, alignment)?,
-        alignment,
-    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

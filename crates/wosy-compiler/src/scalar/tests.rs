@@ -4480,21 +4480,45 @@ fn derives_pointer_struct_layouts_from_the_target() {
     let native = derive_scalar_program_with_layout(&parsed.result, ScalarTargetLayout::NATIVE64);
 
     assert_eq!(
-        wasm.program.structs[0].layout,
+        wasm.program
+            .layouts
+            .aggregate(&wasm.program.structs[0].id)
+            .unwrap()
+            .layout,
         Some(ScalarLayout {
             size: 8,
             alignment: 4
         })
     );
-    assert_eq!(wasm.program.structs[0].fields[1].offset, Some(4));
     assert_eq!(
-        native.program.structs[0].layout,
+        wasm.program
+            .layouts
+            .field(&wasm.program.structs[0].fields[1].id)
+            .unwrap()
+            .offset,
+        Some(4)
+    );
+    assert_eq!(
+        native
+            .program
+            .layouts
+            .aggregate(&native.program.structs[0].id)
+            .unwrap()
+            .layout,
         Some(ScalarLayout {
             size: 16,
             alignment: 8
         })
     );
-    assert_eq!(native.program.structs[0].fields[1].offset, Some(8));
+    assert_eq!(
+        native
+            .program
+            .layouts
+            .field(&native.program.structs[0].fields[1].id)
+            .unwrap()
+            .offset,
+        Some(8)
+    );
 }
 
 #[test]
@@ -7595,9 +7619,36 @@ fn derives_struct_layout_fields_and_raw_address() {
             "%%start\nstruct WasiIovec {\n\t*?u8 buf;\n\tu32 len;\n}\nunsafe {\n\tWasiIovec item = {\n\t\t.buf = null;\n\t\t.len = 0;\n\t};\n\t*?WasiIovec address = &?item;\n};\n%%end",
         );
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-    assert_eq!(result.program.structs[0].fields[0].offset, Some(0));
-    assert_eq!(result.program.structs[0].fields[1].offset, Some(4));
-    assert_eq!(result.program.structs[0].layout.as_ref().unwrap().size, 8);
+    assert_eq!(
+        result
+            .program
+            .layouts
+            .field(&result.program.structs[0].fields[0].id)
+            .unwrap()
+            .offset,
+        Some(0)
+    );
+    assert_eq!(
+        result
+            .program
+            .layouts
+            .field(&result.program.structs[0].fields[1].id)
+            .unwrap()
+            .offset,
+        Some(4)
+    );
+    assert_eq!(
+        result
+            .program
+            .layouts
+            .aggregate(&result.program.structs[0].id)
+            .unwrap()
+            .layout
+            .as_ref()
+            .unwrap()
+            .size,
+        8
+    );
     assert_eq!(result.program.target_layout, ScalarTargetLayout::WASM32);
     assert_eq!(
         result.program.structs[0].id,
@@ -8400,14 +8451,26 @@ fn validates_structs_through_project_modules() {
         );
     let struct_id = program.structs[0].id.clone();
     let pair_id = program.structs[1].id.clone();
-    let struct_layout = program.structs[0].layout.clone();
+    let struct_layout = program
+        .layouts
+        .aggregate(&program.structs[0].id)
+        .unwrap()
+        .layout
+        .clone();
     let result = validate_scalar_project(ScalarProject::new(
         vec![ScalarModule::from_program(program, Vec::new())],
         vec![source.clone()],
     ));
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     assert_eq!(result.project.modules[0].structs[0].id, struct_id.clone());
-    assert_eq!(result.project.modules[0].structs[0].layout, struct_layout);
+    assert_eq!(
+        result.project.modules[0]
+            .layouts
+            .aggregate(&result.project.modules[0].structs[0].id)
+            .unwrap()
+            .layout,
+        struct_layout
+    );
     let ScalarItem::Extern(extern_decl) = &result.project.modules[0].items[0] else {
         panic!("extern declaration");
     };
@@ -9170,7 +9233,11 @@ fn fixed_array_layout_overflow_is_a_single_diagnostic_not_a_panic() {
             (text.find(length).expect("length") + length.len()) as u32,
         )
     );
-    let huge = &validation.program.structs[0];
+    let huge = validation
+        .program
+        .layouts
+        .aggregate(&validation.program.structs[0].id)
+        .unwrap();
     assert_eq!(huge.layout, None);
     assert_eq!(huge.fields[0].layout, None);
     assert_eq!(huge.fields[0].offset, None);
@@ -9205,7 +9272,11 @@ fn aggregate_layout_addition_overflow_is_a_single_diagnostic_with_absent_layouts
             (text.find(later).expect("later field") + later.len()) as u32,
         )
     );
-    let huge = &validation.program.structs[0];
+    let huge = validation
+        .program
+        .layouts
+        .aggregate(&validation.program.structs[0].id)
+        .unwrap();
     assert_eq!(huge.layout, None);
     assert!(huge.fields.iter().all(|field| field.layout.is_none()));
     assert!(huge.fields.iter().all(|field| field.offset.is_none()));
@@ -9222,7 +9293,10 @@ fn aggregate_layout_addition_overflow_is_a_single_diagnostic_with_absent_layouts
     assert_eq!(project.diagnostics.len(), 1, "{:?}", project.diagnostics);
     assert_eq!(project.diagnostics[0].code, "B0003");
     assert_eq!(project.diagnostics[0].message, "struct layout exceeds u64");
-    let huge = &project.project.modules[0].structs[0];
+    let huge = project.project.modules[0]
+        .layouts
+        .aggregate(&project.project.modules[0].structs[0].id)
+        .unwrap();
     assert_eq!(huge.layout, None);
     assert!(huge.fields.iter().all(|field| field.layout.is_none()));
     assert!(huge.fields.iter().all(|field| field.offset.is_none()));
@@ -9278,6 +9352,7 @@ struct Huge {
         )
     );
     assert!(validation.program.structs.iter().all(|structure| {
+        let structure = validation.program.layouts.aggregate(&structure.id).unwrap();
         structure.layout.is_none()
             && structure
                 .fields
@@ -9353,6 +9428,7 @@ struct Outer {
     assert_eq!(project.diagnostics[0].message, "struct layout exceeds u64");
     assert!(project.project.modules.iter().all(|module| {
         module.structs.iter().all(|structure| {
+            let structure = module.layouts.aggregate(&structure.id).unwrap();
             structure.layout.is_none()
                 && structure
                     .fields
@@ -9392,6 +9468,7 @@ struct Second {
             "recursive by-value struct layout is unsupported"
         );
         assert!(validation.program.structs.iter().all(|structure| {
+            let structure = validation.program.layouts.aggregate(&structure.id).unwrap();
             structure.layout.is_none()
                 && structure
                     .fields
@@ -9432,6 +9509,7 @@ struct Third {
         ByteSpan::new(start, start + first_field.len() as u32)
     );
     assert!(validation.program.structs.iter().all(|structure| {
+        let structure = validation.program.layouts.aggregate(&structure.id).unwrap();
         structure.layout.is_none()
             && structure
                 .fields
@@ -9465,7 +9543,11 @@ struct Node {
         diagnostics[0].labels[0].span.range,
         ByteSpan::new(start, start + field.len() as u32)
     );
-    let node = &validation.program.structs[0];
+    let node = validation
+        .program
+        .layouts
+        .aggregate(&validation.program.structs[0].id)
+        .unwrap();
     assert_eq!(node.layout, None);
     assert!(node
         .fields
@@ -9508,6 +9590,7 @@ struct Huge {
         );
     }
     assert!(validation.program.structs.iter().all(|structure| {
+        let structure = validation.program.layouts.aggregate(&structure.id).unwrap();
         structure.layout.is_none()
             && structure
                 .fields
@@ -9548,6 +9631,7 @@ struct Late {
         );
     }
     for structure in &validation.program.structs[1..] {
+        let structure = validation.program.layouts.aggregate(&structure.id).unwrap();
         assert_eq!(structure.layout, None);
         assert!(structure
             .fields
@@ -9618,6 +9702,8 @@ struct Late {
         &validation.project.modules[0].structs[1],
         &validation.project.modules[1].structs[0],
     ] {
+        let layouts = layout::ScalarLayoutIndex::project(&validation.project.modules);
+        let structure = layouts.aggregate(&structure.id).unwrap();
         assert_eq!(structure.layout, None);
         assert!(structure
             .fields
@@ -9702,6 +9788,7 @@ struct Alpha {
     }
     for module in &validation.project.modules[1..] {
         assert!(module.structs.iter().all(|structure| {
+            let structure = module.layouts.aggregate(&structure.id).unwrap();
             structure.layout.is_none()
                 && structure
                     .fields
@@ -9730,13 +9817,21 @@ fn absent_local_struct_layout_stops_containing_layout_accumulation() {
             (text.find(length).expect("length") + length.len()) as u32,
         )
     );
-    let outer = &validation.program.structs[0];
+    let outer = validation
+        .program
+        .layouts
+        .aggregate(&validation.program.structs[0].id)
+        .unwrap();
     assert_eq!(outer.layout, None);
     assert_eq!(outer.fields[0].layout, None);
     assert_eq!(outer.fields[0].offset, None);
     assert_eq!(outer.fields[1].layout, None);
     assert_eq!(outer.fields[1].offset, None);
-    let huge = &validation.program.structs[1];
+    let huge = validation
+        .program
+        .layouts
+        .aggregate(&validation.program.structs[1].id)
+        .unwrap();
     assert_eq!(huge.layout, None);
     assert_eq!(huge.fields[0].layout, None);
     assert_eq!(huge.fields[0].offset, None);
@@ -9780,13 +9875,19 @@ fn absent_project_struct_layout_propagates_without_a_duplicate_diagnostic() {
             (library_text.find(length).expect("length") + length.len()) as u32,
         )
     );
-    let outer = &project.project.modules[0].structs[0];
+    let outer = project.project.modules[0]
+        .layouts
+        .aggregate(&project.project.modules[0].structs[0].id)
+        .unwrap();
     assert_eq!(outer.layout, None);
     assert_eq!(outer.fields[0].layout, None);
     assert_eq!(outer.fields[0].offset, None);
     assert_eq!(outer.fields[1].layout, None);
     assert_eq!(outer.fields[1].offset, None);
-    let huge = &project.project.modules[1].structs[0];
+    let huge = project.project.modules[1]
+        .layouts
+        .aggregate(&project.project.modules[1].structs[0].id)
+        .unwrap();
     assert_eq!(huge.layout, None);
     assert_eq!(huge.fields[0].layout, None);
     assert_eq!(huge.fields[0].offset, None);

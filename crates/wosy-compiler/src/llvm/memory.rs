@@ -73,14 +73,13 @@ pub(super) fn basic_type<'ctx>(
 pub(super) fn storage_type<'ctx>(
     context: &'ctx Context,
     ty: &ScalarType,
-    structs: &[ScalarStruct],
+    layouts: &crate::scalar::layout::ScalarLayoutIndex<'_>,
     target_layout: ScalarTargetLayout,
 ) -> Result<BasicTypeEnum<'ctx>, String> {
     match ty {
         ScalarType::Struct(id) => {
-            let structure = structs
-                .iter()
-                .find(|structure| structure.id == *id)
+            let structure = layouts
+                .aggregate(id)
                 .ok_or_else(|| format!("unknown LLVM struct {}", id.index))?;
             let layout = structure
                 .layout
@@ -92,7 +91,7 @@ pub(super) fn storage_type<'ctx>(
         }
         ScalarType::Array {
             element, length, ..
-        } => Ok(storage_type(context, element, structs, target_layout)?
+        } => Ok(storage_type(context, element, layouts, target_layout)?
             .array_type(
                 u32::try_from(*length).map_err(|_| "fixed array length exceeds LLVM array size")?,
             )
@@ -103,7 +102,7 @@ pub(super) fn storage_type<'ctx>(
 
 pub(super) fn allocation_layout(
     ty: &ScalarType,
-    structs: &[ScalarStruct],
+    layouts: &crate::scalar::layout::ScalarLayoutIndex<'_>,
     target_layout: ScalarTargetLayout,
 ) -> Result<(u64, u64), String> {
     match ty {
@@ -118,16 +117,15 @@ pub(super) fn allocation_layout(
             Ok((target_layout.pointer_size, target_layout.pointer_alignment))
         }
         ScalarType::Enum(_) => Ok((4, 4)),
-        ScalarType::Struct(id) => structs
-            .iter()
-            .find(|structure| structure.id == *id)
+        ScalarType::Struct(id) => layouts
+            .aggregate(id)
             .and_then(|structure| structure.layout.as_ref())
             .map(|layout| (layout.size, layout.alignment))
             .ok_or_else(|| format!("runtime allocation has no layout for struct {}", id.index)),
         ScalarType::Array {
             element, length, ..
         } => {
-            let (size, alignment) = allocation_layout(element, structs, target_layout)?;
+            let (size, alignment) = allocation_layout(element, layouts, target_layout)?;
             let size = size
                 .checked_mul(*length)
                 .ok_or_else(|| "runtime allocation size overflows u64".to_owned())?;
@@ -256,11 +254,12 @@ pub(super) fn entry_alloca<'ctx, 'module>(
 }
 
 pub(super) fn structure<'a>(
-    structs: &'a [ScalarStruct],
+    structs: &[&'a ScalarStruct],
     id: crate::ScalarStructId,
 ) -> Result<&'a ScalarStruct, String> {
     structs
         .iter()
+        .copied()
         .find(|structure| structure.id == id)
         .ok_or_else(|| format!("unknown LLVM struct {}", id.index))
 }
@@ -348,9 +347,13 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 .ok_or_else(|| format!("unknown LLVM struct field {}", field.index))?;
             let byte_type = context.i8_type();
             let offset = byte_type.const_int(
-                resolved.offset.ok_or_else(|| {
-                    format!("LLVM struct field {} has no valid offset", field.index)
-                })?,
+                state
+                    .layouts
+                    .field(field)
+                    .and_then(|result| result.offset)
+                    .ok_or_else(|| {
+                        format!("LLVM struct field {} has no valid offset", field.index)
+                    })?,
                 false,
             );
             unsafe {
@@ -386,7 +389,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
             })?
             .into_int_value();
             if let ScalarType::RuntimeArray { element, .. } = base_type {
-                let element = storage_type(context, &element, state.structs, state.target_layout)?;
+                let element = storage_type(context, &element, state.layouts, state.target_layout)?;
                 return unsafe {
                     state.builder.build_in_bounds_gep(
                         element,
@@ -397,7 +400,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 }
                 .map_err(builder_error);
             }
-            let array = storage_type(context, &base_type, state.structs, state.target_layout)?;
+            let array = storage_type(context, &base_type, state.layouts, state.target_layout)?;
             unsafe {
                 state.builder.build_in_bounds_gep(
                     array,
@@ -508,7 +511,10 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
         return Err("struct literal requires a resolved struct type".to_owned());
     };
     let structure = structure(state.structs, id.clone())?;
-    let layout = structure
+    let layout = state
+        .layouts
+        .aggregate(id)
+        .ok_or_else(|| format!("unknown LLVM struct {}", id.index))?
         .layout
         .as_ref()
         .ok_or_else(|| format!("LLVM struct {} has no valid layout", id.index))?;
@@ -542,9 +548,13 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
                 context.i8_type(),
                 destination,
                 &[context.i8_type().const_int(
-                    field.offset.ok_or_else(|| {
-                        format!("LLVM struct field {} has no valid offset", field.id.index)
-                    })?,
+                    state
+                        .layouts
+                        .field(&field.id)
+                        .and_then(|result| result.offset)
+                        .ok_or_else(|| {
+                            format!("LLVM struct field {} has no valid offset", field.id.index)
+                        })?,
                     false,
                 )],
                 field.name.as_str(),
@@ -571,9 +581,9 @@ pub(super) fn emit_array_literal<'ctx, 'module>(
     if elements.len() as u64 != *length {
         return Err("array literal element count does not match fixed array length".to_owned());
     }
-    let storage = storage_type(context, expected, state.structs, state.target_layout)?;
+    let storage = storage_type(context, expected, state.layouts, state.target_layout)?;
     let destination = entry_alloca(state, storage, "array_literal")?;
-    let element_storage = storage_type(context, element, state.structs, state.target_layout)?;
+    let element_storage = storage_type(context, element, state.layouts, state.target_layout)?;
     for (index, expression) in elements.iter().enumerate() {
         let pointer = unsafe {
             state.builder.build_in_bounds_gep(
@@ -664,7 +674,7 @@ pub(super) fn emit_utf8_literal<'ctx, 'module>(
     literal.set_initializer(&byte_type.const_array(&bytes));
     let destination = entry_alloca(
         state,
-        storage_type(context, expected, state.structs, state.target_layout)?,
+        storage_type(context, expected, state.layouts, state.target_layout)?,
         "utf8_literal",
     )?;
     let data = unsafe {
@@ -672,8 +682,10 @@ pub(super) fn emit_utf8_literal<'ctx, 'module>(
             byte_type,
             destination,
             &[byte_type.const_int(
-                structure.fields[0]
-                    .offset
+                state
+                    .layouts
+                    .field(&structure.fields[0].id)
+                    .and_then(|result| result.offset)
                     .ok_or_else(|| "std.utf8 data field has no valid offset".to_owned())?,
                 false,
             )],
@@ -698,8 +710,10 @@ pub(super) fn emit_utf8_literal<'ctx, 'module>(
             byte_type,
             destination,
             &[byte_type.const_int(
-                structure.fields[1]
-                    .offset
+                state
+                    .layouts
+                    .field(&structure.fields[1].id)
+                    .and_then(|result| result.offset)
                     .ok_or_else(|| "std.utf8 length field has no valid offset".to_owned())?,
                 false,
             )],
@@ -726,7 +740,7 @@ pub(super) fn store_value<'ctx, 'module>(
 ) -> Result<(), String> {
     if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
         let source = take_basic(value)?.into_pointer_value();
-        let aggregate = storage_type(context, ty, state.structs, state.target_layout)?;
+        let aggregate = storage_type(context, ty, state.layouts, state.target_layout)?;
         let value = state
             .builder
             .build_load(aggregate, source, "struct_value")

@@ -780,7 +780,13 @@ fn rejects_fixed_array_lengths_that_exceed_llvm_array_size() {
         span: ByteSpan::new(0, 1),
     };
     assert_eq!(
-        storage_type(&context, &array, &[], ScalarTargetLayout::NATIVE64).unwrap_err(),
+        storage_type(
+            &context,
+            &array,
+            &crate::scalar::layout::ScalarLayoutIndex::project(&[]),
+            ScalarTargetLayout::NATIVE64
+        )
+        .unwrap_err(),
         "fixed array length exceeds LLVM array size"
     );
 }
@@ -794,7 +800,13 @@ fn accepts_fixed_array_lengths_at_llvm_array_size_limit() {
         length_span: ByteSpan::new(0, 1),
         span: ByteSpan::new(0, 1),
     };
-    assert!(storage_type(&context, &array, &[], ScalarTargetLayout::NATIVE64).is_ok());
+    assert!(storage_type(
+        &context,
+        &array,
+        &crate::scalar::layout::ScalarLayoutIndex::project(&[]),
+        ScalarTargetLayout::NATIVE64
+    )
+    .is_ok());
 }
 
 #[test]
@@ -4206,6 +4218,8 @@ unit(*?Grid) marker_address = fn(pointer) {
         .iter()
         .find(|structure| structure.name == "Grid")
         .expect("Grid layout");
+    let leaf = validation.program.layouts.aggregate(&leaf.id).unwrap();
+    let grid = validation.program.layouts.aggregate(&grid.id).unwrap();
 
     assert_eq!(
         leaf.layout

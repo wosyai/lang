@@ -109,7 +109,7 @@ pub(super) fn emit_automatic_return_result<'ctx, 'module>(
             "return_result_source",
         )
         .map_err(builder_error)?;
-    let aggregate = storage_type(context, aggregate_type, state.structs, state.target_layout)?;
+    let aggregate = storage_type(context, aggregate_type, state.layouts, state.target_layout)?;
     let copied = state
         .builder
         .build_load(aggregate, source, "return_result_value")

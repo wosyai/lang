@@ -117,7 +117,8 @@ struct EmitState<'ctx, 'module> {
     automatic_return_result_owners: BTreeMap<String, ScalarAutomaticReturnResult>,
     globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     all_globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
-    structs: &'module [ScalarStruct],
+    structs: &'module [&'module ScalarStruct],
+    layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
     target_layout: ScalarTargetLayout,
     next_literal: usize,
     next_block: usize,
@@ -271,6 +272,8 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     let module = ManuallyDrop::new(context.create_module(&validation.program.source.path));
     let builder = context.create_builder();
     let target_layout = validation.program.target_layout;
+    let layouts = crate::scalar::layout::ScalarLayoutIndex::program(&validation.program.layouts);
+    let structs = validation.program.structs.iter().collect::<Vec<_>>();
     let mut globals = BTreeMap::new();
     for item in &validation.program.items {
         if let ScalarItem::Binding(binding) = item {
@@ -278,8 +281,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
                 if *ty == ScalarType::Unit {
                     continue;
                 }
-                let llvm_ty =
-                    storage_type(&context, ty, &validation.program.structs, target_layout)?;
+                let llvm_ty = storage_type(&context, ty, &layouts, target_layout)?;
                 let global = module.add_global(llvm_ty, None, name);
                 global.set_linkage(Linkage::Internal);
                 global.set_initializer(&llvm_ty.const_zero());
@@ -457,7 +459,8 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &function.name,
             &validation.program.items,
             &module,
-            &validation.program.structs,
+            &structs,
+            &layouts,
             target_layout,
         )?;
     }
@@ -475,7 +478,8 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             name,
             &validation.program.items,
             &module,
-            &validation.program.structs,
+            &structs,
+            &layouts,
             target_layout,
         )?;
     }
@@ -493,7 +497,8 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             name,
             &validation.program.items,
             &module,
-            &validation.program.structs,
+            &structs,
+            &layouts,
             target_layout,
         )?;
     }
@@ -508,7 +513,8 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         &globals,
         &validation.program.items,
         &module,
-        &validation.program.structs,
+        &structs,
+        &layouts,
         target_layout,
     )?;
     finish_partition(
@@ -543,8 +549,9 @@ pub fn emit_scalar_project_llvm(
         .collect::<Result<Vec<_>, _>>()?;
     let all_structs = modules
         .iter()
-        .flat_map(|module| module.structs.iter().cloned())
+        .flat_map(|module| module.structs.iter())
         .collect::<Vec<_>>();
+    let layouts = crate::scalar::layout::ScalarLayoutIndex::project(&validation.project.modules);
     let module_name = modules
         .first()
         .ok_or_else(|| "project has no reachable modules".to_owned())?
@@ -574,7 +581,7 @@ pub fn emit_scalar_project_llvm(
                         continue;
                     }
                     let name = project_global_name(&source_module.source, name);
-                    let llvm_ty = storage_type(&context, ty, &all_structs, target_layout)?;
+                    let llvm_ty = storage_type(&context, ty, &layouts, target_layout)?;
                     let global = module.add_global(llvm_ty, None, &name);
                     global.set_linkage(Linkage::Internal);
                     global.set_initializer(&llvm_ty.const_zero());
@@ -735,6 +742,7 @@ pub fn emit_scalar_project_llvm(
             &name,
             &module,
             &all_structs,
+            &layouts,
             target_layout,
         )?;
     }
@@ -754,6 +762,7 @@ pub fn emit_scalar_project_llvm(
             name,
             &module,
             &all_structs,
+            &layouts,
             target_layout,
         )?;
     }
@@ -773,6 +782,7 @@ pub fn emit_scalar_project_llvm(
             name,
             &module,
             &all_structs,
+            &layouts,
             target_layout,
         )?;
     }
@@ -788,6 +798,7 @@ pub fn emit_scalar_project_llvm(
         &globals,
         &module,
         &all_structs,
+        &layouts,
         target_layout,
     )?;
     finish_partition(
@@ -1180,7 +1191,7 @@ fn store_binding_outputs<'ctx, 'module>(
         }
         let slot = entry_alloca(
             state,
-            storage_type(context, ty, state.structs, state.target_layout)?,
+            storage_type(context, ty, state.layouts, state.target_layout)?,
             name,
         )?;
         store_value(context, state, slot, ty, value)?;
@@ -1486,7 +1497,8 @@ fn emit_function<'ctx, 'module>(
     name: &str,
     items: &[ScalarItem],
     module: &'module Module<'ctx>,
-    structs: &'module [ScalarStruct],
+    structs: &'module [&'module ScalarStruct],
+    layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
     target_layout: ScalarTargetLayout,
 ) -> Result<(), String> {
     let value = *functions
@@ -1536,6 +1548,7 @@ fn emit_function<'ctx, 'module>(
         globals: globals.clone(),
         all_globals: globals.clone(),
         structs,
+        layouts,
         target_layout,
         next_literal: 0,
         next_block: 0,
@@ -1556,7 +1569,7 @@ fn emit_function<'ctx, 'module>(
                 .ok_or_else(|| "missing function parameter".to_owned())?;
             let slot = builder
                 .build_alloca(
-                    storage_type(context, parameter, structs, target_layout)?,
+                    storage_type(context, parameter, layouts, target_layout)?,
                     &function.parameters[index],
                 )
                 .map_err(builder_error)?;
@@ -1629,7 +1642,8 @@ fn emit_main<'ctx, 'module>(
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     items: &[ScalarItem],
     module: &'module Module<'ctx>,
-    structs: &'module [ScalarStruct],
+    structs: &'module [&'module ScalarStruct],
+    layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
     target_layout: ScalarTargetLayout,
 ) -> Result<(), String> {
     let main = *functions
@@ -1669,6 +1683,7 @@ fn emit_main<'ctx, 'module>(
         globals: globals.clone(),
         all_globals: globals.clone(),
         structs,
+        layouts,
         target_layout,
         next_literal: 0,
         next_block: 0,
@@ -1734,7 +1749,8 @@ fn emit_project_function<'ctx, 'module>(
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     name: &str,
     module: &'module Module<'ctx>,
-    structs: &'module [ScalarStruct],
+    structs: &'module [&'module ScalarStruct],
+    layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
     target_layout: ScalarTargetLayout,
 ) -> Result<(), String> {
     let value = *functions
@@ -1784,6 +1800,7 @@ fn emit_project_function<'ctx, 'module>(
         globals: module_globals(source_module, globals),
         all_globals: globals.clone(),
         structs,
+        layouts,
         target_layout,
         next_literal: 0,
         next_block: 0,
@@ -1804,7 +1821,7 @@ fn emit_project_function<'ctx, 'module>(
                 .ok_or_else(|| "missing function parameter".to_owned())?;
             let slot = builder
                 .build_alloca(
-                    storage_type(context, parameter, structs, target_layout)?,
+                    storage_type(context, parameter, layouts, target_layout)?,
                     &function.parameters[index],
                 )
                 .map_err(builder_error)?;
@@ -1890,7 +1907,8 @@ fn emit_project_main<'ctx, 'module>(
     modules: &[&ScalarModule],
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     module: &'module Module<'ctx>,
-    structs: &'module [ScalarStruct],
+    structs: &'module [&'module ScalarStruct],
+    layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
     target_layout: ScalarTargetLayout,
 ) -> Result<(), String> {
     let main = *functions
@@ -1930,6 +1948,7 @@ fn emit_project_main<'ctx, 'module>(
         globals: BTreeMap::new(),
         all_globals: globals.clone(),
         structs,
+        layouts,
         target_layout,
         next_literal: 0,
         next_block: 0,
@@ -2551,7 +2570,7 @@ fn emit_assignment<'ctx, 'module>(
                     None => {
                         let slot = entry_alloca(
                             state,
-                            storage_type(context, &ty, state.structs, state.target_layout)?,
+                            storage_type(context, &ty, state.layouts, state.target_layout)?,
                             name,
                         )?;
                         state.storage.insert(name.clone(), (slot, ty.clone()));
@@ -2649,7 +2668,7 @@ fn emit_project_assignment<'ctx, 'module>(
                         None => {
                             let slot = entry_alloca(
                                 state,
-                                storage_type(context, &ty, state.structs, state.target_layout)?,
+                                storage_type(context, &ty, state.layouts, state.target_layout)?,
                                 name,
                             )?;
                             state.storage.insert(name.clone(), (slot, ty.clone()));
@@ -3203,7 +3222,7 @@ fn materialize_assignment_values<'ctx, 'module>(
             }
             let temporary = entry_alloca(
                 state,
-                storage_type(context, &ty, state.structs, state.target_layout)?,
+                storage_type(context, &ty, state.layouts, state.target_layout)?,
                 "assignment_value",
             )?;
             store_value(context, state, temporary, &ty, value)?;

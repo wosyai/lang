@@ -31,7 +31,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                     state
                         .builder
                         .build_load(
-                            storage_type(context, &ty, state.structs, state.target_layout)?,
+                            storage_type(context, &ty, state.layouts, state.target_layout)?,
                             slot,
                             name,
                         )
@@ -46,7 +46,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                     state
                         .builder
                         .build_load(
-                            storage_type(context, &ty, state.structs, state.target_layout)?,
+                            storage_type(context, &ty, state.layouts, state.target_layout)?,
                             global.as_pointer_value(),
                             name,
                         )
@@ -282,7 +282,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                 state
                     .builder
                     .build_load(
-                        storage_type(context, &ty, state.structs, state.target_layout)?,
+                        storage_type(context, &ty, state.layouts, state.target_layout)?,
                         global.as_pointer_value(),
                         name,
                     )
@@ -1650,7 +1650,7 @@ fn emit_core_offset_values<'ctx, 'module>(
     count: inkwell::values::IntValue<'ctx>,
     pointee: &ScalarType,
 ) -> Result<EmitValue<'ctx>, String> {
-    let element = storage_type(context, pointee, state.structs, state.target_layout)?;
+    let element = storage_type(context, pointee, state.layouts, state.target_layout)?;
     let base = state
         .builder
         .build_int_to_ptr(
