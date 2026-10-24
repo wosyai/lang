@@ -494,11 +494,11 @@ fn layout_for_type_in_results(
 }
 
 #[cfg(test)]
-mod observations {
+pub(in crate::scalar) mod observations {
     use super::*;
 
     #[derive(Clone, Debug, Default, Eq, PartialEq)]
-    pub(super) struct Counts {
+    pub(in crate::scalar) struct Counts {
         pub contexts: usize,
         pub declarations: usize,
         pub fields: usize,
@@ -519,18 +519,18 @@ mod observations {
         static ACTIVE: RefCell<Option<Counts>> = const { RefCell::new(None) };
     }
 
-    pub(super) struct Scope {
+    pub(in crate::scalar) struct Scope {
         previous: Option<Counts>,
     }
 
     impl Scope {
-        pub(super) fn new() -> Self {
+        pub(in crate::scalar) fn new() -> Self {
             Self {
                 previous: ACTIVE.with(|active| active.replace(Some(Counts::default()))),
             }
         }
 
-        pub(super) fn counts(&self) -> Counts {
+        pub(in crate::scalar) fn counts(&self) -> Counts {
             ACTIVE.with(|active| {
                 active
                     .borrow()

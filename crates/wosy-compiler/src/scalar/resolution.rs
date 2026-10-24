@@ -487,47 +487,35 @@ fn resolve_place(
     }
 }
 
-pub(super) fn resolve_module_types_in_project(module: &mut ScalarModule, modules: &[ScalarModule]) {
-    let context = module.clone();
-    let names = module
-        .structs
-        .iter()
-        .map(|structure| {
-            (
-                structure.name.clone(),
-                ScalarType::Struct(structure.id.clone()),
-            )
-        })
-        .chain(module.enums.iter().map(|enumeration| {
-            (
-                enumeration.name.clone(),
-                ScalarType::Enum(enumeration.id.clone()),
-            )
-        }))
-        .collect::<BTreeMap<_, _>>();
+pub(super) fn resolve_module_types_in_project(
+    module: &mut ScalarModule,
+    declarations: &ScalarDeclarationEnvironment,
+    current_module: usize,
+) {
     for structure in &mut module.structs {
         for field in &mut structure.fields {
-            field.ty = resolve_type_in_project(&field.ty, &names, &context, modules);
+            field.ty = resolve_type_in_project(&field.ty, declarations, current_module);
         }
     }
     for item in &mut module.items {
         match item {
             ScalarItem::Binding(binding) => {
                 binding.declared_type =
-                    resolve_type_in_project(&binding.declared_type, &names, &context, modules);
+                    resolve_type_in_project(&binding.declared_type, declarations, current_module);
                 for receiver in &mut binding.receivers {
-                    receiver.ty = resolve_type_in_project(&receiver.ty, &names, &context, modules);
+                    receiver.ty =
+                        resolve_type_in_project(&receiver.ty, declarations, current_module);
                 }
             }
             ScalarItem::Function(function) => {
                 if function.generic_parameters.is_empty() {
                     function.signature =
-                        resolve_type_in_project(&function.signature, &names, &context, modules);
+                        resolve_type_in_project(&function.signature, declarations, current_module);
                 }
                 for arm in &mut function.overload_arms {
                     if arm.generic_parameters.is_empty() {
                         arm.signature =
-                            resolve_type_in_project(&arm.signature, &names, &context, modules);
+                            resolve_type_in_project(&arm.signature, declarations, current_module);
                     }
                 }
                 if let ScalarType::Callable { outputs, .. } = &function.signature {
@@ -540,16 +528,16 @@ pub(super) fn resolve_module_types_in_project(module: &mut ScalarModule, modules
                         value.ty = output.ty.clone();
                     }
                 }
-                resolve_block_types_project(&mut function.body, &names, &context, modules);
+                resolve_block_types_project(&mut function.body, declarations, current_module);
             }
             ScalarItem::Extern(extern_decl) => {
                 for function in &mut extern_decl.functions {
                     function.signature =
-                        resolve_type_in_project(&function.signature, &names, &context, modules);
+                        resolve_type_in_project(&function.signature, declarations, current_module);
                 }
             }
             ScalarItem::Executable(item) => {
-                resolve_item_types_project(item, &names, &context, modules)
+                resolve_item_types_project(item, declarations, current_module)
             }
             ScalarItem::Namespace(_) => {}
         }
@@ -573,23 +561,22 @@ pub(super) fn resolve_module_types_in_project(module: &mut ScalarModule, modules
 
 fn resolve_item_types_project(
     item: &mut ScalarBlockItem,
-    names: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    declarations: &ScalarDeclarationEnvironment,
+    current_module: usize,
 ) {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
             binding.declared_type =
-                resolve_type_in_project(&binding.declared_type, names, module, modules);
+                resolve_type_in_project(&binding.declared_type, declarations, current_module);
             for receiver in &mut binding.receivers {
-                receiver.ty = resolve_type_in_project(&receiver.ty, names, module, modules);
+                receiver.ty = resolve_type_in_project(&receiver.ty, declarations, current_module);
             }
         }
         ScalarBlockItem::Expression(ScalarExpression::Block(block)) => {
-            resolve_block_types_project(block, names, module, modules)
+            resolve_block_types_project(block, declarations, current_module)
         }
         ScalarBlockItem::While(while_expression) => {
-            resolve_block_types_project(&mut while_expression.body, names, module, modules)
+            resolve_block_types_project(&mut while_expression.body, declarations, current_module)
         }
         ScalarBlockItem::Expression(_) | ScalarBlockItem::Assignment(_) => {}
     }
@@ -597,24 +584,22 @@ fn resolve_item_types_project(
 
 fn resolve_block_types_project(
     block: &mut ScalarBlock,
-    names: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    declarations: &ScalarDeclarationEnvironment,
+    current_module: usize,
 ) {
     for item in &mut block.items {
-        resolve_item_types_project(item, names, module, modules);
+        resolve_item_types_project(item, declarations, current_module);
     }
 }
 
 fn resolve_type_in_project(
     ty: &ScalarType,
-    names: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    declarations: &ScalarDeclarationEnvironment,
+    current_module: usize,
 ) -> ScalarType {
     match ty {
         ScalarType::Named { name, span } => {
-            if let Some(id) = names.get(name) {
+            if let Some(id) = declarations.local_types(current_module).get(name) {
                 return id.clone();
             }
             ScalarType::Named {
@@ -628,52 +613,24 @@ fn resolve_type_in_project(
             member,
             member_span,
             span,
-        } => match module
-            .namespace_bindings
-            .iter()
-            .find(|namespace| namespace.binding == *receiver)
-            .and_then(|namespace| {
-                modules
-                    .iter()
-                    .find(|candidate| candidate.source == namespace.target)
-            })
-            .and_then(|target| {
-                target.structs.iter().find(|structure| {
-                    structure.name == *member && !is_module_private_name(&structure.name)
-                })
-            }) {
-            Some(structure) => ScalarType::Struct(structure.id.clone()),
-            None => module
-                .namespace_bindings
-                .iter()
-                .find(|namespace| namespace.binding == *receiver)
-                .and_then(|namespace| {
-                    modules
-                        .iter()
-                        .find(|candidate| candidate.source == namespace.target)
-                })
-                .and_then(|target| {
-                    target.enums.iter().find(|enumeration| {
-                        enumeration.name == *member && !is_module_private_name(&enumeration.name)
-                    })
-                })
-                .map_or_else(
-                    || ScalarType::Qualified {
-                        receiver: receiver.clone(),
-                        receiver_span: *receiver_span,
-                        member: member.clone(),
-                        member_span: *member_span,
-                        span: *span,
-                    },
-                    |enumeration| ScalarType::Enum(enumeration.id.clone()),
-                ),
+        } => match declarations.qualified_type(current_module, receiver, member) {
+            Some(ty) => ty,
+            None => ScalarType::Qualified {
+                receiver: receiver.clone(),
+                receiver_span: *receiver_span,
+                member: member.clone(),
+                member_span: *member_span,
+                span: *span,
+            },
         },
         ScalarType::RawPointer(inner) => ScalarType::RawPointer(Box::new(resolve_type_in_project(
-            inner, names, module, modules,
+            inner,
+            declarations,
+            current_module,
         ))),
         ScalarType::CheckedReference { mutability, inner } => ScalarType::CheckedReference {
             mutability: *mutability,
-            inner: Box::new(resolve_type_in_project(inner, names, module, modules)),
+            inner: Box::new(resolve_type_in_project(inner, declarations, current_module)),
         },
         ScalarType::Array {
             element,
@@ -681,7 +638,11 @@ fn resolve_type_in_project(
             length_span,
             span,
         } => ScalarType::Array {
-            element: Box::new(resolve_type_in_project(element, names, module, modules)),
+            element: Box::new(resolve_type_in_project(
+                element,
+                declarations,
+                current_module,
+            )),
             length: *length,
             length_span: *length_span,
             span: *span,
@@ -695,7 +656,7 @@ fn resolve_type_in_project(
                     .outputs
                     .iter()
                     .map(|output| ScalarOutput {
-                        ty: resolve_type_in_project(&output.ty, names, module, modules),
+                        ty: resolve_type_in_project(&output.ty, declarations, current_module),
                         span: output.span,
                     })
                     .collect(),
@@ -703,14 +664,19 @@ fn resolve_type_in_project(
             },
             parameters: parameters
                 .iter()
-                .map(|parameter| resolve_type_in_project(parameter, names, module, modules))
+                .map(|parameter| resolve_type_in_project(parameter, declarations, current_module))
                 .collect(),
         },
         value => value.clone(),
     }
 }
 
-pub(super) fn resolve_module_places(module: &mut ScalarModule, modules: &[ScalarModule]) {
+pub(super) fn resolve_module_places(
+    module: &mut ScalarModule,
+    modules: &[ScalarModule],
+    declarations: &ScalarDeclarationEnvironment,
+    current_module: usize,
+) {
     let context = module.clone();
     let names = module
         .structs
@@ -728,7 +694,7 @@ pub(super) fn resolve_module_places(module: &mut ScalarModule, modules: &[Scalar
             )
         }))
         .collect::<BTreeMap<_, _>>();
-    let declarations = module
+    let bindings = module
         .items
         .iter()
         .filter_map(|item| match item {
@@ -746,15 +712,17 @@ pub(super) fn resolve_module_places(module: &mut ScalarModule, modules: &[Scalar
             ScalarItem::Binding(binding) => {
                 resolve_expression_module_places(
                     &mut binding.value,
-                    &declarations,
+                    &bindings,
                     &context,
                     modules,
                     &names,
                     false,
+                    declarations,
+                    current_module,
                 );
             }
             ScalarItem::Function(function) => {
-                let mut scope = declarations.clone();
+                let mut scope = bindings.clone();
                 if let ScalarType::Callable { parameters, .. } = &function.signature {
                     for (name, ty) in function.parameters.iter().zip(parameters) {
                         scope.insert(name.clone(), ty.clone());
@@ -767,11 +735,22 @@ pub(super) fn resolve_module_places(module: &mut ScalarModule, modules: &[Scalar
                     modules,
                     &names,
                     false,
+                    declarations,
+                    current_module,
                 );
             }
             ScalarItem::Executable(item) => {
-                let mut scope = declarations.clone();
-                resolve_item_module_places(item, &mut scope, &context, modules, &names, false);
+                let mut scope = bindings.clone();
+                resolve_item_module_places(
+                    item,
+                    &mut scope,
+                    &context,
+                    modules,
+                    &names,
+                    false,
+                    declarations,
+                    current_module,
+                );
             }
             ScalarItem::Extern(_) | ScalarItem::Namespace(_) => {}
         }
@@ -785,6 +764,8 @@ fn resolve_item_module_places(
     modules: &[ScalarModule],
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
+    declarations: &ScalarDeclarationEnvironment,
+    current_module: usize,
 ) {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
@@ -795,6 +776,8 @@ fn resolve_item_module_places(
                 modules,
                 names,
                 unsafe_context,
+                declarations,
+                current_module,
             );
             scope.insert(binding.name.clone(), binding.declared_type.clone());
         }
@@ -805,6 +788,8 @@ fn resolve_item_module_places(
             modules,
             names,
             unsafe_context,
+            declarations,
+            current_module,
         ),
         ScalarBlockItem::Assignment(assignment) => {
             for target in &mut assignment.targets {
@@ -815,6 +800,8 @@ fn resolve_item_module_places(
                     modules,
                     names,
                     unsafe_context,
+                    declarations,
+                    current_module,
                 );
             }
             resolve_expression_module_places(
@@ -824,6 +811,8 @@ fn resolve_item_module_places(
                 modules,
                 names,
                 unsafe_context,
+                declarations,
+                current_module,
             );
             for value in &mut assignment.values {
                 resolve_expression_module_places(
@@ -833,6 +822,8 @@ fn resolve_item_module_places(
                     modules,
                     names,
                     unsafe_context,
+                    declarations,
+                    current_module,
                 );
             }
         }
@@ -844,6 +835,8 @@ fn resolve_item_module_places(
                 modules,
                 names,
                 unsafe_context,
+                declarations,
+                current_module,
             );
             resolve_block_module_places(
                 &mut while_expression.body,
@@ -852,6 +845,8 @@ fn resolve_item_module_places(
                 modules,
                 names,
                 unsafe_context,
+                declarations,
+                current_module,
             );
         }
     }
@@ -864,10 +859,21 @@ fn resolve_block_module_places(
     modules: &[ScalarModule],
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
+    declarations: &ScalarDeclarationEnvironment,
+    current_module: usize,
 ) {
     let unsafe_context = unsafe_context || block.unsafe_context;
     for item in &mut block.items {
-        resolve_item_module_places(item, scope, module, modules, names, unsafe_context);
+        resolve_item_module_places(
+            item,
+            scope,
+            module,
+            modules,
+            names,
+            unsafe_context,
+            declarations,
+            current_module,
+        );
     }
     for output in &mut block.final_output_values {
         resolve_expression_module_places(
@@ -877,6 +883,8 @@ fn resolve_block_module_places(
             modules,
             names,
             unsafe_context,
+            declarations,
+            current_module,
         );
     }
 }
@@ -888,16 +896,32 @@ fn resolve_expression_module_places(
     modules: &[ScalarModule],
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
+    declarations: &ScalarDeclarationEnvironment,
+    current_module: usize,
 ) {
     match expression {
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
-        | ScalarExpression::Dereference { place, .. } => {
-            resolve_module_place(place, scope, module, modules, names, unsafe_context)
-        }
-        ScalarExpression::IndexedRead { place, .. } => {
-            resolve_module_place(place, scope, module, modules, names, unsafe_context)
-        }
+        | ScalarExpression::Dereference { place, .. } => resolve_module_place(
+            place,
+            scope,
+            module,
+            modules,
+            names,
+            unsafe_context,
+            declarations,
+            current_module,
+        ),
+        ScalarExpression::IndexedRead { place, .. } => resolve_module_place(
+            place,
+            scope,
+            module,
+            modules,
+            names,
+            unsafe_context,
+            declarations,
+            current_module,
+        ),
         ScalarExpression::StructLiteral { fields, .. } => {
             for field in fields {
                 resolve_expression_module_places(
@@ -907,6 +931,8 @@ fn resolve_expression_module_places(
                     modules,
                     names,
                     unsafe_context,
+                    declarations,
+                    current_module,
                 );
             }
         }
@@ -919,12 +945,32 @@ fn resolve_expression_module_places(
                     modules,
                     names,
                     unsafe_context,
+                    declarations,
+                    current_module,
                 );
             }
         }
         ScalarExpression::Binary { left, right, .. } => {
-            resolve_expression_module_places(left, scope, module, modules, names, unsafe_context);
-            resolve_expression_module_places(right, scope, module, modules, names, unsafe_context);
+            resolve_expression_module_places(
+                left,
+                scope,
+                module,
+                modules,
+                names,
+                unsafe_context,
+                declarations,
+                current_module,
+            );
+            resolve_expression_module_places(
+                right,
+                scope,
+                module,
+                modules,
+                names,
+                unsafe_context,
+                declarations,
+                current_module,
+            );
         }
         ScalarExpression::Unary { operand, .. } => {
             resolve_expression_module_places(
@@ -934,6 +980,8 @@ fn resolve_expression_module_places(
                 modules,
                 names,
                 unsafe_context,
+                declarations,
+                current_module,
             );
         }
         ScalarExpression::Call {
@@ -945,7 +993,8 @@ fn resolve_expression_module_places(
         } => {
             if receiver.as_deref() == Some("core") && name == "pointer_cast" {
                 for argument in type_arguments {
-                    argument.ty = resolve_type_in_project(&argument.ty, names, module, modules);
+                    argument.ty =
+                        resolve_type_in_project(&argument.ty, declarations, current_module);
                 }
             }
             for argument in arguments {
@@ -956,6 +1005,8 @@ fn resolve_expression_module_places(
                     modules,
                     names,
                     unsafe_context,
+                    declarations,
+                    current_module,
                 );
             }
         }
@@ -972,6 +1023,8 @@ fn resolve_expression_module_places(
                 modules,
                 names,
                 unsafe_context,
+                declarations,
+                current_module,
             );
             let mut then_scope = scope.clone();
             resolve_block_module_places(
@@ -981,6 +1034,8 @@ fn resolve_expression_module_places(
                 modules,
                 names,
                 unsafe_context,
+                declarations,
+                current_module,
             );
             let mut else_scope = scope.clone();
             resolve_block_module_places(
@@ -990,6 +1045,8 @@ fn resolve_expression_module_places(
                 modules,
                 names,
                 unsafe_context,
+                declarations,
+                current_module,
             );
         }
         ScalarExpression::UnitIf {
@@ -1004,6 +1061,8 @@ fn resolve_expression_module_places(
                 modules,
                 names,
                 unsafe_context,
+                declarations,
+                current_module,
             );
             let mut then_scope = scope.clone();
             resolve_block_module_places(
@@ -1013,11 +1072,22 @@ fn resolve_expression_module_places(
                 modules,
                 names,
                 unsafe_context,
+                declarations,
+                current_module,
             );
         }
         ScalarExpression::Block(block) => {
             let mut scope = scope.clone();
-            resolve_block_module_places(block, &mut scope, module, modules, names, unsafe_context);
+            resolve_block_module_places(
+                block,
+                &mut scope,
+                module,
+                modules,
+                names,
+                unsafe_context,
+                declarations,
+                current_module,
+            );
         }
         ScalarExpression::Member {
             receiver,
@@ -1081,14 +1151,32 @@ fn resolve_module_place(
     modules: &[ScalarModule],
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
+    declarations: &ScalarDeclarationEnvironment,
+    current_module: usize,
 ) {
     match place {
         ScalarPlace::Name { .. } => {}
-        ScalarPlace::Dereference { pointer, .. } => {
-            resolve_expression_module_places(pointer, scope, module, modules, names, unsafe_context)
-        }
+        ScalarPlace::Dereference { pointer, .. } => resolve_expression_module_places(
+            pointer,
+            scope,
+            module,
+            modules,
+            names,
+            unsafe_context,
+            declarations,
+            current_module,
+        ),
         ScalarPlace::Field { base, field, .. } => {
-            resolve_module_place(base, scope, module, modules, names, unsafe_context);
+            resolve_module_place(
+                base,
+                scope,
+                module,
+                modules,
+                names,
+                unsafe_context,
+                declarations,
+                current_module,
+            );
             let base_type = match base.as_ref() {
                 ScalarPlace::Dereference { pointer, .. } => match expression_type_in_module(
                     pointer,
@@ -1135,8 +1223,26 @@ fn resolve_module_place(
             }
         }
         ScalarPlace::Index { base, index, .. } => {
-            resolve_module_place(base, scope, module, modules, names, unsafe_context);
-            resolve_expression_module_places(index, scope, module, modules, names, unsafe_context);
+            resolve_module_place(
+                base,
+                scope,
+                module,
+                modules,
+                names,
+                unsafe_context,
+                declarations,
+                current_module,
+            );
+            resolve_expression_module_places(
+                index,
+                scope,
+                module,
+                modules,
+                names,
+                unsafe_context,
+                declarations,
+                current_module,
+            );
         }
     }
 }

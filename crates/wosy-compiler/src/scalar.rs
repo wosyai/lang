@@ -2465,6 +2465,8 @@ fn record_block_item_overload_selections(
     }
 }
 
+mod declarations;
+use declarations::ScalarDeclarationEnvironment;
 pub(crate) mod layout;
 pub use layout::ScalarTargetLayouts;
 use layout::{resolve_program_struct_layouts, resolve_project_struct_layouts};
@@ -2498,10 +2500,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         module.resolved_assignment_outputs.borrow_mut().clear();
         module.layouts = ScalarTargetLayouts::new(module.target_layout);
     }
-    let struct_lookup = project.modules.clone();
-    for module in &mut project.modules {
-        resolve_module_types_in_project(module, &struct_lookup);
-    }
+    let declarations = declarations::resolve_project_types(&mut project.modules);
     resolve_project_struct_layouts(&mut project, &mut diagnostics);
     let mut structs = project
         .modules
@@ -2531,9 +2530,10 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         }
     }
     let struct_lookup = project.modules.clone();
-    for module in &mut project.modules {
-        resolve_module_places(module, &struct_lookup);
+    for (ordinal, module) in project.modules.iter_mut().enumerate() {
+        resolve_module_places(module, &struct_lookup, &declarations, ordinal);
     }
+    drop(declarations);
     for module in &project.modules {
         validate_unit_if_positions_in_module(module, &mut diagnostics);
         for structure in &module.structs {
