@@ -247,8 +247,9 @@ pub(super) fn call_output_sequence_in_module(
                 .iter()
                 .map(|argument| overload_argument_type(argument, scope))
                 .collect::<Option<Vec<_>>>()?;
+            let overload_header = ScalarOverloadHeader::from_function(overload);
             let ScalarType::Callable { outputs, .. } =
-                resolve_overload_candidate(overload, &argument_types, None)
+                resolve_overload_candidate(&overload_header, &argument_types, None)
                     .ok()?
                     .0
             else {
@@ -374,8 +375,9 @@ fn call_output_sequence(
             .iter()
             .map(|argument| overload_argument_type(argument, scope))
             .collect::<Option<Vec<_>>>()?;
+        let overload_header = ScalarOverloadHeader::from_function(overload);
         let ScalarType::Callable { outputs, .. } =
-            resolve_overload_candidate(overload, &argument_types, None)
+            resolve_overload_candidate(&overload_header, &argument_types, None)
                 .ok()?
                 .0
         else {
@@ -3391,14 +3393,15 @@ pub(super) fn expression_type_in_module_expected(
                 .zip(&argument_types)
                 .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
                 .collect::<Vec<_>>();
-            let callable = match resolve_overload_candidate(overload, &overload_arguments, expected)
-            {
-                Ok((callable, _)) => callable,
-                Err(message) => {
-                    diagnostics.push(module_diagnostic(module, "B0004", message, *name_span));
-                    return ScalarType::Error;
-                }
-            };
+            let overload_header = ScalarOverloadHeader::from_function(overload);
+            let callable =
+                match resolve_overload_candidate(&overload_header, &overload_arguments, expected) {
+                    Ok((callable, _)) => callable,
+                    Err(message) => {
+                        diagnostics.push(module_diagnostic(module, "B0004", message, *name_span));
+                        return ScalarType::Error;
+                    }
+                };
             let ScalarType::Callable {
                 outputs,
                 parameters,
@@ -7063,14 +7066,15 @@ pub(super) fn expression_type(
                     .zip(&argument_types)
                     .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
                     .collect::<Vec<_>>();
-                let callable = match resolve_overload_candidate(overload, &overload_arguments, None)
-                {
-                    Ok((callable, _)) => callable,
-                    Err(message) => {
-                        diagnostics.push(diagnostic(program, "B0004", message, *name_span));
-                        return ScalarType::Error;
-                    }
-                };
+                let overload_header = ScalarOverloadHeader::from_function(overload);
+                let callable =
+                    match resolve_overload_candidate(&overload_header, &overload_arguments, None) {
+                        Ok((callable, _)) => callable,
+                        Err(message) => {
+                            diagnostics.push(diagnostic(program, "B0004", message, *name_span));
+                            return ScalarType::Error;
+                        }
+                    };
                 let ScalarType::Callable {
                     outputs,
                     parameters,
@@ -7457,14 +7461,18 @@ fn expression_type_expected(
                 .zip(&argument_types)
                 .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
                 .collect::<Vec<_>>();
-            let callable =
-                match resolve_overload_candidate(overload, &overload_arguments, Some(expected)) {
-                    Ok((callable, _)) => callable,
-                    Err(message) => {
-                        diagnostics.push(diagnostic(program, "B0004", message, *name_span));
-                        return ScalarType::Error;
-                    }
-                };
+            let overload_header = ScalarOverloadHeader::from_function(overload);
+            let callable = match resolve_overload_candidate(
+                &overload_header,
+                &overload_arguments,
+                Some(expected),
+            ) {
+                Ok((callable, _)) => callable,
+                Err(message) => {
+                    diagnostics.push(diagnostic(program, "B0004", message, *name_span));
+                    return ScalarType::Error;
+                }
+            };
             let ScalarType::Callable {
                 outputs,
                 parameters,
