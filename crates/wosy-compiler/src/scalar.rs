@@ -2149,8 +2149,8 @@ pub fn derive_scalar_declarations_from_cst(
     }
 }
 
-pub fn derive_scalar_program_from_cst_with_layout(
-    canonical: &CanonicalCstRoot,
+fn typecheck_scalar_program(
+    declarations: ScalarSourceDeclarations,
     target_layout: ScalarTargetLayout,
 ) -> ScalarValidation {
     let ScalarSourceDeclarations {
@@ -2159,7 +2159,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
         structs,
         enums,
         mut diagnostics,
-    } = derive_scalar_declarations_from_cst(canonical);
+    } = declarations;
     let mut program = ScalarProgram {
         source,
         items,
@@ -2186,6 +2186,21 @@ pub fn derive_scalar_program_from_cst_with_layout(
     }
     drop(overloads);
     drop(owners);
+    ScalarValidation {
+        program,
+        diagnostics,
+    }
+}
+
+pub fn derive_scalar_program_from_cst_with_layout(
+    canonical: &CanonicalCstRoot,
+    target_layout: ScalarTargetLayout,
+) -> ScalarValidation {
+    let declarations = derive_scalar_declarations_from_cst(canonical);
+    let ScalarValidation {
+        mut program,
+        mut diagnostics,
+    } = typecheck_scalar_program(declarations, target_layout);
     if diagnostics.is_empty() {
         let module = ScalarModule::from_program(program.clone(), Vec::new());
         let call_sites = resolve_module_call_sites(&program.source, &program.items, &[module]);
@@ -4647,3 +4662,6 @@ mod extraction_tests;
 
 #[cfg(test)]
 mod project_static_tests;
+
+#[cfg(test)]
+mod standalone_static_tests;
