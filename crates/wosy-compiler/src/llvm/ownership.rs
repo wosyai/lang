@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) fn fresh_return_outputs(
     function: &ScalarFunction,
+    reference_cfg: &ScalarReferenceCfg,
 ) -> Result<
     (
         BTreeSet<usize>,
@@ -11,7 +12,7 @@ pub(super) fn fresh_return_outputs(
 > {
     let mut result = BTreeSet::new();
     let mut external_outputs = BTreeSet::new();
-    for point in &function.reference_cfg.points {
+    for point in &reference_cfg.points {
         let CfgPointKind::ReturnOutput {
             output,
             checked: true,
@@ -27,7 +28,7 @@ pub(super) fn fresh_return_outputs(
         let mut local = false;
         let mut external = false;
         for origin in origins {
-            match &function.reference_cfg.facts[origin.0] {
+            match &reference_cfg.facts[origin.0] {
                 ReferenceOrigin::Fresh { allocation, .. }
                     if allocation.function_span == function.span
                         && allocation.source == point.source_span.source =>
@@ -64,15 +65,23 @@ pub(super) fn fresh_return_outputs(
             .final_output_values
             .get(*output)
             .ok_or_else(|| format!("missing return output {output}"))?;
-        record_return_branches(function, &final_output.value, *output, &mut branches)?;
+        record_return_branches(
+            function,
+            reference_cfg,
+            &final_output.value,
+            *output,
+            &mut branches,
+        )?;
     }
     result.retain(|output| !mixed.contains(output));
     Ok((result, branches))
 }
 
-pub(super) fn dynamic_return_outputs(function: &ScalarFunction) -> BTreeSet<usize> {
-    function
-        .reference_cfg
+pub(super) fn dynamic_return_outputs(
+    function_span: wosy_syntax::ByteSpan,
+    reference_cfg: &ScalarReferenceCfg,
+) -> BTreeSet<usize> {
+    reference_cfg
         .points
         .iter()
         .filter_map(|point| {
@@ -89,22 +98,25 @@ pub(super) fn dynamic_return_outputs(function: &ScalarFunction) -> BTreeSet<usiz
             };
             let fresh = origins.iter().any(|id| {
                 matches!(
-                    function.reference_cfg.facts[id.0],
+                    reference_cfg.facts[id.0],
                     ReferenceOrigin::Fresh { .. }
                 )
             });
-            let borrowed = origins.iter().any(|id| matches!(function.reference_cfg.facts[id.0], ReferenceOrigin::BorrowedFrom { .. }));
-            let local = origins.iter().any(|id| matches!(&function.reference_cfg.facts[id.0],
-                ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span == function.span && allocation.source == point.source_span.source));
-            let external_fresh = origins.iter().any(|id| matches!(&function.reference_cfg.facts[id.0],
-                ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span != function.span || allocation.source != point.source_span.source));
+            let borrowed = origins.iter().any(|id| matches!(reference_cfg.facts[id.0], ReferenceOrigin::BorrowedFrom { .. }));
+            let local = origins.iter().any(|id| matches!(&reference_cfg.facts[id.0],
+                ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span == function_span && allocation.source == point.source_span.source));
+            let external_fresh = origins.iter().any(|id| matches!(&reference_cfg.facts[id.0],
+                ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span != function_span || allocation.source != point.source_span.source));
             (fresh && (borrowed || (local && external_fresh))).then_some(output)
         })
         .collect()
 }
 
-pub(super) fn dynamic_return_owner(function: &ScalarFunction) -> bool {
-    !dynamic_return_outputs(function).is_empty()
+pub(super) fn dynamic_return_owner(
+    function_span: wosy_syntax::ByteSpan,
+    reference_cfg: &ScalarReferenceCfg,
+) -> bool {
+    !dynamic_return_outputs(function_span, reference_cfg).is_empty()
 }
 
 pub(super) fn joined_return_binding_types(
@@ -130,11 +142,12 @@ pub(super) fn joined_return_binding_types(
 }
 
 pub(super) fn joined_assignment_owners(
-    function: &ScalarFunction,
+    function_span: wosy_syntax::ByteSpan,
+    reference_cfg: &ScalarReferenceCfg,
     bindings: &BTreeMap<String, ScalarType>,
 ) -> Result<BTreeMap<(u32, u32), CheckedAssignmentOwner>, String> {
     let mut assignments = BTreeMap::new();
-    for point in &function.reference_cfg.points {
+    for point in &reference_cfg.points {
         let CfgPointKind::Assign { target, .. } = &point.kind else {
             continue;
         };
@@ -150,10 +163,10 @@ pub(super) fn joined_assignment_owners(
                 point.source_span
             )
         })?;
-        let local = origins.iter().any(|id| matches!(&function.reference_cfg.facts[id.0],
-            ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span == function.span && allocation.source == point.source_span.source));
-        let external = origins.iter().any(|id| matches!(&function.reference_cfg.facts[id.0],
-            ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span != function.span || allocation.source != point.source_span.source));
+        let local = origins.iter().any(|id| matches!(&reference_cfg.facts[id.0],
+            ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span == function_span && allocation.source == point.source_span.source));
+        let external = origins.iter().any(|id| matches!(&reference_cfg.facts[id.0],
+            ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span != function_span || allocation.source != point.source_span.source));
         let owner = match (local, external) {
             (true, false) => CheckedAssignmentOwner::Local,
             (false, true) => CheckedAssignmentOwner::External,
@@ -195,6 +208,7 @@ pub(super) fn initialize_joined_return_bindings<'ctx>(
 
 fn record_return_branches(
     function: &ScalarFunction,
+    reference_cfg: &ScalarReferenceCfg,
     expression: &ScalarExpression,
     output: usize,
     branches: &mut BTreeMap<
@@ -209,8 +223,7 @@ fn record_return_branches(
     } = expression
     else {
         if let ScalarExpression::Name { name, .. } = expression {
-            let point = function
-                .reference_cfg
+            let point = reference_cfg
                 .points
                 .iter()
                 .find(|point| {
@@ -222,18 +235,16 @@ fn record_return_branches(
                 .possible_origins
                 .as_ref()
                 .ok_or_else(|| format!("missing checked return origins for output {output}"))?;
-            let local = origins.iter().any(|id| matches!(&function.reference_cfg.facts[id.0],
+            let local = origins.iter().any(|id| matches!(&reference_cfg.facts[id.0],
                 ReferenceOrigin::Fresh { allocation, .. } if allocation.function_span == function.span && allocation.source == point.source_span.source));
-            let external = origins
-                .iter()
-                .any(|id| match &function.reference_cfg.facts[id.0] {
-                    ReferenceOrigin::BorrowedFrom { .. } => true,
-                    ReferenceOrigin::Fresh { allocation, .. } => {
-                        allocation.function_span != function.span
-                            || allocation.source != point.source_span.source
-                    }
-                    ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
-                });
+            let external = origins.iter().any(|id| match &reference_cfg.facts[id.0] {
+                ReferenceOrigin::BorrowedFrom { .. } => true,
+                ReferenceOrigin::Fresh { allocation, .. } => {
+                    allocation.function_span != function.span
+                        || allocation.source != point.source_span.source
+                }
+                ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
+            });
             if local && external {
                 let selected = branches
                     .entry((function.body.span.start, function.body.span.end))
@@ -252,11 +263,10 @@ fn record_return_branches(
             return Err(format!("return branch has no unique output {output}"));
         };
         if matches!(value.value, ScalarExpression::If { .. }) {
-            record_return_branches(function, &value.value, output, branches)?;
+            record_return_branches(function, reference_cfg, &value.value, output, branches)?;
             continue;
         }
-        let points = function
-            .reference_cfg
+        let points = reference_cfg
             .points
             .iter()
             .filter(|point| {
@@ -294,20 +304,18 @@ fn record_return_branches(
             .as_ref()
             .expect("checked typed point");
         let local = origins.iter().any(|id| matches!(
-            &function.reference_cfg.facts[id.0],
+            &reference_cfg.facts[id.0],
             ReferenceOrigin::Fresh { allocation, .. }
                 if allocation.function_span == function.span && allocation.source == point.source_span.source
         ));
-        let external = origins
-            .iter()
-            .any(|id| match &function.reference_cfg.facts[id.0] {
-                ReferenceOrigin::BorrowedFrom { .. } => true,
-                ReferenceOrigin::Fresh { allocation, .. } => {
-                    allocation.function_span != function.span
-                        || allocation.source != point.source_span.source
-                }
-                ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
-            });
+        let external = origins.iter().any(|id| match &reference_cfg.facts[id.0] {
+            ReferenceOrigin::BorrowedFrom { .. } => true,
+            ReferenceOrigin::Fresh { allocation, .. } => {
+                allocation.function_span != function.span
+                    || allocation.source != point.source_span.source
+            }
+            ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
+        });
         let selected = branches
             .entry((branch.span.start, branch.span.end))
             .or_default();
@@ -330,10 +338,10 @@ fn record_return_branches(
 }
 
 pub(super) fn checked_call_owners(
-    function: &ScalarFunction,
+    reference_cfg: &ScalarReferenceCfg,
 ) -> Result<BTreeMap<(u32, u32, usize), CheckedCallOwner>, String> {
     let mut owners = BTreeMap::new();
-    for point in &function.reference_cfg.points {
+    for point in &reference_cfg.points {
         let CfgPointKind::Call {
             expression: ScalarExpression::Call { span, .. },
             output,
@@ -347,18 +355,16 @@ pub(super) fn checked_call_owners(
         };
         let owned = |id: &crate::scalar::ReferenceOriginId| {
             matches!(
-                &function.reference_cfg.facts[id.0],
+                &reference_cfg.facts[id.0],
                 ReferenceOrigin::Fresh { loan, .. }
                     if matches!(loan.origin_place.binding.kind, ReferenceBindingKind::CallOutput { point: origin, output: call_output } if origin == point.id && call_output == *output)
             )
         };
         let fresh = origins.iter().any(owned);
-        let borrowed = origins
-            .iter()
-            .any(|id| match &function.reference_cfg.facts[id.0] {
-                ReferenceOrigin::Null { .. } => false,
-                _ => !owned(id),
-            });
+        let borrowed = origins.iter().any(|id| match &reference_cfg.facts[id.0] {
+            ReferenceOrigin::Null { .. } => false,
+            _ => !owned(id),
+        });
         let owner = match (fresh, borrowed) {
             (true, true) => CheckedCallOwner::Mixed,
             (true, false) => CheckedCallOwner::Fresh,

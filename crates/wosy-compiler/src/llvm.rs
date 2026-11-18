@@ -19,7 +19,7 @@ use crate::scalar::{
     CfgPointKind, CoreOperationId, InvalidationCandidate, InvalidationInputs, ReferenceBindingKind,
     ReferenceOrigin, ReleaseTarget, ResolvedCallTarget, ScalarAllocationIdentity,
     ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState, ScalarBindingOutputOrigin,
-    ScalarFieldReference, ScalarOutputValue, ScalarOverloadSelection,
+    ScalarFieldReference, ScalarOutputValue, ScalarOverloadSelection, ScalarReferenceCfg,
 };
 use crate::{
     BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarExpression,
@@ -138,9 +138,9 @@ enum CheckedAssignmentOwner {
     Borrowed,
 }
 
-fn mutable_runtime_allocations(function: &ScalarFunction) -> BTreeSet<(u32, u32)> {
+fn mutable_runtime_allocations(reference_cfg: &ScalarReferenceCfg) -> BTreeSet<(u32, u32)> {
     let mut result = BTreeSet::new();
-    for point in &function.reference_cfg.points {
+    for point in &reference_cfg.points {
         match &point.kind {
             CfgPointKind::Assign { target, .. } if target.projections.is_empty() => {
                 result.insert((target.declaration_span.start, target.declaration_span.end));
@@ -163,7 +163,7 @@ fn mutable_runtime_allocations(function: &ScalarFunction) -> BTreeSet<(u32, u32)
 }
 
 fn resolved_invalidations(
-    function: &ScalarFunction,
+    reference_cfg: &ScalarReferenceCfg,
 ) -> Result<
     BTreeMap<
         (u32, u32),
@@ -176,7 +176,7 @@ fn resolved_invalidations(
     String,
 > {
     let mut events = BTreeMap::new();
-    for point in &function.reference_cfg.points {
+    for point in &reference_cfg.points {
         let (operation, candidates, inputs) = match &point.kind {
             CfgPointKind::Invalidate {
                 operation,
@@ -189,7 +189,7 @@ fn resolved_invalidations(
             } => (CoreOperationId::Free, candidates, InvalidationInputs::Free),
             _ => continue,
         };
-        if !function.reference_cfg.points.iter().any(|call| {
+        if !reference_cfg.points.iter().any(|call| {
             call.source_span == point.source_span && matches!(&call.kind,
                 CfgPointKind::Call { target: ResolvedCallTarget::Core(target), .. } if *target == operation)
         }) {
@@ -321,7 +321,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     {
         let value = module.add_function(
             &function.name,
-            definition_function_type(&context, function, target_layout)?,
+            definition_function_type(&context, function, &function.reference_cfg, target_layout)?,
             None,
         );
         for (index, name) in function.parameters.iter().enumerate() {
@@ -345,7 +345,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     for (lookup, function, name) in &specializations {
         let value = module.add_function(
             name,
-            definition_function_type(&context, function, target_layout)?,
+            definition_function_type(&context, function, &function.reference_cfg, target_layout)?,
             None,
         );
         for (index, parameter) in function.parameters.iter().enumerate() {
@@ -369,7 +369,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     for (lookup, function, name) in &overloads {
         let value = module.add_function(
             name,
-            definition_function_type(&context, function, target_layout)?,
+            definition_function_type(&context, function, &function.reference_cfg, target_layout)?,
             None,
         );
         for (index, parameter) in function.parameters.iter().enumerate() {
@@ -425,13 +425,23 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         })
     {
         if let Some(target) = call_targets.get(&function.name) {
-            insert_runtime_array_result_provenance(&mut runtime_array_results, target, function);
-            dynamic_owner_outputs.insert(target.clone(), dynamic_return_outputs(function));
+            insert_function_result_provenance(
+                &mut runtime_array_results,
+                &mut dynamic_owner_outputs,
+                target,
+                function,
+                &function.reference_cfg,
+            );
         }
     }
     for (_, function, name) in specializations.iter().chain(overloads.iter()) {
-        insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
-        dynamic_owner_outputs.insert(name.clone(), dynamic_return_outputs(function));
+        insert_function_result_provenance(
+            &mut runtime_array_results,
+            &mut dynamic_owner_outputs,
+            name,
+            function,
+            &function.reference_cfg,
+        );
     }
     for function in validation
         .program
@@ -456,6 +466,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &dynamic_owner_outputs,
             &globals,
             function,
+            &function.reference_cfg,
             &function.name,
             &validation.program.items,
             &module,
@@ -475,6 +486,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &dynamic_owner_outputs,
             &globals,
             function,
+            &function.reference_cfg,
             name,
             &validation.program.items,
             &module,
@@ -494,6 +506,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &dynamic_owner_outputs,
             &globals,
             function,
+            &function.reference_cfg,
             name,
             &validation.program.items,
             &module,
@@ -595,7 +608,12 @@ pub fn emit_scalar_project_llvm(
                 let name = project_function_name(&source_module.source, &function.name);
                 let value = module.add_function(
                     &name,
-                    definition_function_type(&context, function, target_layout)?,
+                    definition_function_type(
+                        &context,
+                        function,
+                        &function.reference_cfg,
+                        target_layout,
+                    )?,
                     None,
                 );
                 for (index, parameter) in function.parameters.iter().enumerate() {
@@ -655,7 +673,12 @@ pub fn emit_scalar_project_llvm(
         for (lookup, function, name) in specializations {
             let value = module.add_function(
                 &name,
-                definition_function_type(&context, &function, target_layout)?,
+                definition_function_type(
+                    &context,
+                    &function,
+                    &function.reference_cfg,
+                    target_layout,
+                )?,
                 None,
             );
             for (index, parameter) in function.parameters.iter().enumerate() {
@@ -694,7 +717,12 @@ pub fn emit_scalar_project_llvm(
         ) {
             let value = module.add_function(
                 &name,
-                definition_function_type(&context, &function, target_layout)?,
+                definition_function_type(
+                    &context,
+                    &function,
+                    &function.reference_cfg,
+                    target_layout,
+                )?,
                 None,
             );
             for (index, parameter) in function.parameters.iter().enumerate() {
@@ -715,16 +743,31 @@ pub fn emit_scalar_project_llvm(
     let mut runtime_array_results = BTreeMap::new();
     let mut dynamic_owner_outputs = BTreeMap::new();
     for (_, function, name) in &definitions {
-        insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
-        dynamic_owner_outputs.insert(name.clone(), dynamic_return_outputs(function));
+        insert_function_result_provenance(
+            &mut runtime_array_results,
+            &mut dynamic_owner_outputs,
+            name,
+            function,
+            &function.reference_cfg,
+        );
     }
     for (_, function, name) in &project_specializations {
-        insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
-        dynamic_owner_outputs.insert(name.clone(), dynamic_return_outputs(function));
+        insert_function_result_provenance(
+            &mut runtime_array_results,
+            &mut dynamic_owner_outputs,
+            name,
+            function,
+            &function.reference_cfg,
+        );
     }
     for (_, function, name) in &project_overloads {
-        insert_runtime_array_result_provenance(&mut runtime_array_results, name, function);
-        dynamic_owner_outputs.insert(name.clone(), dynamic_return_outputs(function));
+        insert_function_result_provenance(
+            &mut runtime_array_results,
+            &mut dynamic_owner_outputs,
+            name,
+            function,
+            &function.reference_cfg,
+        );
     }
     for (source_module, function, name) in definitions {
         emit_project_function(
@@ -736,6 +779,7 @@ pub fn emit_scalar_project_llvm(
             &runtime_array_results,
             &dynamic_owner_outputs,
             function,
+            &function.reference_cfg,
             source_module,
             &modules,
             &globals,
@@ -756,6 +800,7 @@ pub fn emit_scalar_project_llvm(
             &runtime_array_results,
             &dynamic_owner_outputs,
             function,
+            &function.reference_cfg,
             source_module,
             &modules,
             &globals,
@@ -776,6 +821,7 @@ pub fn emit_scalar_project_llvm(
             &runtime_array_results,
             &dynamic_owner_outputs,
             function,
+            &function.reference_cfg,
             source_module,
             &modules,
             &globals,
@@ -1041,10 +1087,11 @@ fn function_type<'ctx>(
 fn definition_function_type<'ctx>(
     context: &'ctx Context,
     function: &ScalarFunction,
+    reference_cfg: &ScalarReferenceCfg,
     target_layout: ScalarTargetLayout,
 ) -> Result<FunctionType<'ctx>, String> {
     let (ordinary, _) = function_type(context, &function.signature, target_layout)?;
-    if !dynamic_return_owner(function) {
+    if !dynamic_return_owner(function.span, reference_cfg) {
         return Ok(ordinary);
     }
     let ScalarType::Callable {
@@ -1058,7 +1105,7 @@ fn definition_function_type<'ctx>(
         .iter()
         .map(|ty| basic_type(context, ty, target_layout).map(Into::into))
         .collect::<Result<Vec<BasicMetadataTypeEnum>, _>>()?;
-    for _ in dynamic_return_outputs(function) {
+    for _ in dynamic_return_outputs(function.span, reference_cfg) {
         arguments.push(context.ptr_type(AddressSpace::default()).into());
     }
     match outputs.outputs.as_slice() {
@@ -1425,14 +1472,20 @@ fn runtime_array_assignment_provenance(
     }
 }
 
-fn insert_runtime_array_result_provenance(
-    results: &mut BTreeMap<String, RuntimeArrayResultProvenance>,
+fn insert_function_result_provenance(
+    runtime_array_results: &mut BTreeMap<String, RuntimeArrayResultProvenance>,
+    dynamic_owner_outputs: &mut BTreeMap<String, BTreeSet<usize>>,
     name: &str,
     function: &ScalarFunction,
+    reference_cfg: &ScalarReferenceCfg,
 ) {
     if let Some(provenance) = function_runtime_array_result_provenance(function) {
-        results.insert(name.into(), provenance);
+        runtime_array_results.insert(name.into(), provenance);
     }
+    dynamic_owner_outputs.insert(
+        name.into(),
+        dynamic_return_outputs(function.span, reference_cfg),
+    );
 }
 
 mod ownership;
@@ -1493,6 +1546,7 @@ fn emit_function<'ctx, 'module>(
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     function: &ScalarFunction,
+    reference_cfg: &ScalarReferenceCfg,
     name: &str,
     items: &[ScalarItem],
     module: &'module Module<'ctx>,
@@ -1505,9 +1559,11 @@ fn emit_function<'ctx, 'module>(
         .ok_or_else(|| format!("unknown LLVM function {name}"))?;
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
-    let (fresh_return_outputs, branch_return_outputs) = fresh_return_outputs(function)?;
+    let (fresh_return_outputs, branch_return_outputs) =
+        fresh_return_outputs(function, reference_cfg)?;
     let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;
-    let joined_assignment_owners = joined_assignment_owners(function, &joined_bindings)?;
+    let joined_assignment_owners =
+        joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
         builder,
         module,
@@ -1532,7 +1588,7 @@ fn emit_function<'ctx, 'module>(
             _ => return Err("function has no callable signature".to_owned()),
         },
         return_body_span: Some(function.body.span),
-        checked_call_owners: checked_call_owners(function)?,
+        checked_call_owners: checked_call_owners(reference_cfg)?,
         checked_owner_flags: BTreeMap::new(),
         call_owner_flags: BTreeMap::new(),
         return_owner_flags: BTreeMap::new(),
@@ -1541,8 +1597,8 @@ fn emit_function<'ctx, 'module>(
         runtime_array_allocations: BTreeMap::new(),
         runtime_array_lengths: BTreeMap::new(),
         runtime_array_live: BTreeMap::new(),
-        mutable_runtime_allocations: mutable_runtime_allocations(function),
-        invalidations: resolved_invalidations(function)?,
+        mutable_runtime_allocations: mutable_runtime_allocations(reference_cfg),
+        invalidations: resolved_invalidations(reference_cfg)?,
         automatic_return_result_owners: BTreeMap::new(),
         globals: globals.clone(),
         all_globals: globals.clone(),
@@ -1555,7 +1611,10 @@ fn emit_function<'ctx, 'module>(
     initialize_joined_return_bindings(context, &mut state, joined_bindings)?;
     insert_unit_values(&mut state.values, items);
     if let ScalarType::Callable { parameters, .. } = &function.signature {
-        for (position, output) in dynamic_return_outputs(function).into_iter().enumerate() {
+        for (position, output) in dynamic_return_outputs(function.span, reference_cfg)
+            .into_iter()
+            .enumerate()
+        {
             let slot = value
                 .get_nth_param((parameters.len() + position) as u32)
                 .ok_or_else(|| format!("missing mixed-return owner slot {output}"))?
@@ -1743,6 +1802,7 @@ fn emit_project_function<'ctx, 'module>(
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     function: &ScalarFunction,
+    reference_cfg: &ScalarReferenceCfg,
     source_module: &ScalarModule,
     modules: &[&'module ScalarModule],
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
@@ -1757,9 +1817,11 @@ fn emit_project_function<'ctx, 'module>(
         .ok_or_else(|| format!("unknown LLVM function {name}"))?;
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
-    let (fresh_return_outputs, branch_return_outputs) = fresh_return_outputs(function)?;
+    let (fresh_return_outputs, branch_return_outputs) =
+        fresh_return_outputs(function, reference_cfg)?;
     let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;
-    let joined_assignment_owners = joined_assignment_owners(function, &joined_bindings)?;
+    let joined_assignment_owners =
+        joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
         builder,
         module,
@@ -1784,7 +1846,7 @@ fn emit_project_function<'ctx, 'module>(
             _ => return Err("function has no callable signature".to_owned()),
         },
         return_body_span: Some(function.body.span),
-        checked_call_owners: checked_call_owners(function)?,
+        checked_call_owners: checked_call_owners(reference_cfg)?,
         checked_owner_flags: BTreeMap::new(),
         call_owner_flags: BTreeMap::new(),
         return_owner_flags: BTreeMap::new(),
@@ -1793,8 +1855,8 @@ fn emit_project_function<'ctx, 'module>(
         runtime_array_allocations: BTreeMap::new(),
         runtime_array_lengths: BTreeMap::new(),
         runtime_array_live: BTreeMap::new(),
-        mutable_runtime_allocations: mutable_runtime_allocations(function),
-        invalidations: resolved_invalidations(function)?,
+        mutable_runtime_allocations: mutable_runtime_allocations(reference_cfg),
+        invalidations: resolved_invalidations(reference_cfg)?,
         automatic_return_result_owners: BTreeMap::new(),
         globals: module_globals(source_module, globals),
         all_globals: globals.clone(),
@@ -1807,7 +1869,10 @@ fn emit_project_function<'ctx, 'module>(
     initialize_joined_return_bindings(context, &mut state, joined_bindings)?;
     insert_unit_values(&mut state.values, &source_module.items);
     if let ScalarType::Callable { parameters, .. } = &function.signature {
-        for (position, output) in dynamic_return_outputs(function).into_iter().enumerate() {
+        for (position, output) in dynamic_return_outputs(function.span, reference_cfg)
+            .into_iter()
+            .enumerate()
+        {
             let slot = value
                 .get_nth_param((parameters.len() + position) as u32)
                 .ok_or_else(|| format!("missing mixed-return owner slot {output}"))?
