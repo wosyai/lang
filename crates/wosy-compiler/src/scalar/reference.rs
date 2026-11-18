@@ -1,4 +1,7 @@
-use super::control::{AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentSlot};
+use super::control::{
+    AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentReplacement,
+    AssignmentSlot,
+};
 use super::control::{
     BindingOutput, BindingRegion, BlockItem, BlockItemKind, BlockPosition, BlockRegion,
     ConditionalRegion, FinalOutputSlot, ShortCircuitRegion, WhileRegion,
@@ -125,7 +128,6 @@ fn derive_and_converge_program_references(
         call_sites,
         &program.structs,
         &program.enums,
-        program.resolved_assignment_outputs.as_map(),
     );
     if errors.is_empty() {
         errors.extend(resolve_reference_output_contracts(&mut [
@@ -151,7 +153,6 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     pub(super) structs: &'a [ScalarStruct],
     pub(super) enums: &'a [ScalarEnum],
     pub(super) generic_parameters: BTreeSet<String>,
-    pub(super) assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
     pub(super) dereference_points: HashMap<OccurrenceOrdinal, CfgPointId>,
     pub(super) cfg: ScalarReferenceCfg,
     pub(super) next_scope: usize,
@@ -191,7 +192,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
         call_sites: &'a FunctionCallSites,
         structs: &'a [ScalarStruct],
         enums: &'a [ScalarEnum],
-        assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
     ) -> Self {
         Self {
             source: source.clone(),
@@ -209,7 +209,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 .iter()
                 .map(|parameter| parameter.name.clone())
                 .collect(),
-            assignment_outputs,
             dereference_points: HashMap::new(),
             cfg: ScalarReferenceCfg {
                 facts: Vec::new(),
@@ -225,25 +224,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
 
     fn assignment_output_types(
         &self,
-        assignment: &ScalarAssignment,
+        group: &AssignmentGroup,
     ) -> Result<Vec<ScalarType>, ReferenceAnalysisError> {
-        assignment
-            .targets
-            .iter()
-            .enumerate()
-            .map(|(output_index, target)| {
-                let key = ResolvedAssignmentOutputId {
-                    source: self.source.clone(),
-                    function_span: self.function_span,
-                    target_span: target.target_span,
-                    output_index,
-                };
-                self.assignment_outputs.get(&key).cloned().ok_or_else(|| {
-                    self.missing_context(
-                        target.target_span,
-                        ReferenceAnalysisErrorReason::MissingResolvedBinding,
-                    )
-                })
+        group
+            .destinations()
+            .map(|slot| match &slot.replacement {
+                AssignmentReplacement::Resolved(ty) => Ok(ty.clone()),
+                AssignmentReplacement::Missing => Err(self.missing_context(
+                    slot.target_span,
+                    ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                )),
             })
             .collect()
     }
@@ -1984,9 +1974,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     ScalarBlockItem::Assignment(assignment),
                     BlockItemKind::Assignment { group: key },
                 ) => {
-                    let output_types = self.assignment_output_types(assignment)?;
                     let calls = self.call_sites;
                     let group = &calls.assignments[&(key.block, key.item)];
+                    let output_types = self.assignment_output_types(group)?;
                     let mut values = Vec::new();
                     for evaluation in group.rhs_evaluations() {
                         let value = &assignment.values[evaluation.position];
@@ -3793,7 +3783,12 @@ pub(super) fn resolve_program_call_sites(
     program: &ScalarProgram,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
     let modules = [CallResolutionModule::program(program)];
-    resolve_module_call_sites(&program.source, &program.items, &modules)
+    resolve_module_call_sites(
+        &program.source,
+        &program.items,
+        &modules,
+        program.resolved_assignment_outputs.as_map(),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3919,7 +3914,14 @@ pub(super) fn resolve_project_call_sites(modules: &[ScalarModule]) -> ProjectCal
     ProjectCallSiteResults {
         modules: modules
             .iter()
-            .map(|module| resolve_module_call_sites(&module.source, &module.items, &views))
+            .map(|module| {
+                resolve_module_call_sites(
+                    &module.source,
+                    &module.items,
+                    &views,
+                    module.resolved_assignment_outputs.as_map(),
+                )
+            })
             .collect(),
     }
 }
@@ -3930,6 +3932,7 @@ struct ValidatedCallResolver<'a> {
     module_callables: &'a BTreeMap<(Option<String>, String), (SourceIdentity, ByteSpan)>,
     extern_callables: &'a BTreeMap<(String, String), (SourceIdentity, ByteSpan)>,
     modules: &'a [CallResolutionModule<'a>],
+    assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
     sites: Vec<ResolvedCallSite>,
     occurrences: Vec<OccurrenceMetadata>,
     call_occurrences: Vec<CallOccurrence>,
@@ -4461,6 +4464,17 @@ impl ValidatedCallResolver<'_> {
                             position: destination,
                             destination: place,
                             target_span: target.target_span,
+                            replacement: match self.assignment_outputs.get(
+                                &ResolvedAssignmentOutputId {
+                                    source: self.source.clone(),
+                                    function_span: self.function_span,
+                                    target_span: target.target_span,
+                                    output_index: destination,
+                                },
+                            ) {
+                                Some(ty) => AssignmentReplacement::Resolved(ty.clone()),
+                                None => AssignmentReplacement::Missing,
+                            },
                         });
                     }
                     assert!(self
@@ -4561,6 +4575,7 @@ fn resolve_module_call_sites(
     source: &SourceIdentity,
     items: &[ScalarItem],
     modules: &[CallResolutionModule<'_>],
+    assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
     #[cfg(test)]
     stage_observations::record_call_sites();
@@ -4619,6 +4634,7 @@ fn resolve_module_call_sites(
                 &module_callables,
                 &extern_callables,
                 modules,
+                assignment_outputs,
             )?;
             functions.insert(index, calls);
         }
@@ -4630,9 +4646,17 @@ fn resolve_module_call_sites(
 pub(super) fn test_function_call_sites(
     source: &SourceIdentity,
     function: &ScalarFunction,
+    assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
 ) -> FunctionCallSites {
-    resolve_function_call_sites(source, function, &BTreeMap::new(), &BTreeMap::new(), &[])
-        .expect("test callable without call declarations")
+    resolve_function_call_sites(
+        source,
+        function,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &[],
+        assignment_outputs,
+    )
+    .expect("test callable without call declarations")
 }
 
 fn resolve_function_call_sites(
@@ -4641,6 +4665,7 @@ fn resolve_function_call_sites(
     module_callables: &BTreeMap<(Option<String>, String), (SourceIdentity, ByteSpan)>,
     extern_callables: &BTreeMap<(String, String), (SourceIdentity, ByteSpan)>,
     modules: &[CallResolutionModule<'_>],
+    assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
 ) -> Result<FunctionCallSites, ReferenceAnalysisError> {
     let mut arms = Vec::new();
     for arm in &function.overload_arms {
@@ -4650,6 +4675,7 @@ fn resolve_function_call_sites(
             module_callables,
             extern_callables,
             modules,
+            assignment_outputs,
         )?);
     }
     let mut resolver = ValidatedCallResolver {
@@ -4658,6 +4684,7 @@ fn resolve_function_call_sites(
         module_callables,
         extern_callables,
         modules,
+        assignment_outputs,
         sites: Vec::new(),
         occurrences: Vec::new(),
         call_occurrences: Vec::new(),
@@ -4716,16 +4743,9 @@ pub(super) fn record_module_reference_origins(
     call_sites: &ModuleCallSites,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
-    assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
 ) -> Vec<ReferenceAnalysisError> {
-    let (updates, errors) = derive_module_reference_origins(
-        source,
-        items,
-        call_sites,
-        structs,
-        enums,
-        assignment_outputs,
-    );
+    let (updates, errors) =
+        derive_module_reference_origins(source, items, call_sites, structs, enums);
     install_module_reference_results(items, updates);
     errors
 }
@@ -4736,7 +4756,6 @@ fn derive_module_reference_origins(
     call_sites: &ModuleCallSites,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
-    assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
 ) -> (
     Vec<(usize, FunctionReferenceResult)>,
     Vec<ReferenceAnalysisError>,
@@ -4766,7 +4785,6 @@ fn derive_module_reference_origins(
                     &call_sites.functions[&index],
                     structs,
                     enums,
-                    assignment_outputs,
                     &mut errors,
                 ),
             ));
@@ -4887,7 +4905,6 @@ fn derive_project_reference_origins(
                     sites,
                     structs,
                     enums,
-                    module.resolved_assignment_outputs.as_map(),
                 );
                 updates.push((index, results));
                 errors.extend(current_errors);
@@ -5317,7 +5334,6 @@ pub(super) fn record_function_reference_origins(
     call_sites: &FunctionCallSites,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
-    assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
 ) -> Vec<ReferenceAnalysisError> {
     let mut errors = Vec::new();
     let result = derive_function_reference_result(
@@ -5327,7 +5343,6 @@ pub(super) fn record_function_reference_origins(
         call_sites,
         structs,
         enums,
-        assignment_outputs,
         &mut errors,
     );
     result.install(function);
@@ -5341,7 +5356,6 @@ fn derive_function_reference_result(
     call_sites: &FunctionCallSites,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
-    assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
     errors: &mut Vec<ReferenceAnalysisError>,
 ) -> FunctionReferenceResult {
     let entry_errors = errors.len();
@@ -5355,7 +5369,6 @@ fn derive_function_reference_result(
             calls,
             structs,
             enums,
-            assignment_outputs,
             errors,
         ));
     }
@@ -5366,7 +5379,6 @@ fn derive_function_reference_result(
         call_sites,
         structs,
         enums,
-        assignment_outputs,
         errors.len() == entry_errors,
     );
     errors.extend(current_errors);
@@ -5380,19 +5392,11 @@ fn derive_function_reference_cfg(
     call_sites: &FunctionCallSites,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
-    assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
     prior_children_succeeded: bool,
 ) -> (ScalarReferenceCfg, Vec<ReferenceAnalysisError>) {
     let mut errors = Vec::new();
-    let mut builder = ReferenceFlowBuilder::new(
-        source,
-        function,
-        module_names,
-        call_sites,
-        structs,
-        enums,
-        assignment_outputs,
-    );
+    let mut builder =
+        ReferenceFlowBuilder::new(source, function, module_names, call_sites, structs, enums);
     builder.point(
         CfgPointKind::Entry,
         function.span,

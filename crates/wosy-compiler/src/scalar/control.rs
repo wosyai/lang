@@ -1,4 +1,5 @@
 use super::reference::{BlockOrdinal, OccurrenceOrdinal};
+use super::ScalarType;
 use wosy_syntax::ByteSpan;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,11 +14,18 @@ pub(super) struct AssignmentProjection {
     pub(super) output: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum AssignmentReplacement {
+    Resolved(ScalarType),
+    Missing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AssignmentSlot {
     pub(super) position: usize,
     pub(super) destination: OccurrenceOrdinal,
     pub(super) target_span: ByteSpan,
+    pub(super) replacement: AssignmentReplacement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

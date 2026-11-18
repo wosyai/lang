@@ -251,6 +251,10 @@ fn preparation_publishes_stable_callable_owned_expression_place_and_call_ordinal
             vec![(0, OccurrenceOrdinal(14))]
         );
         assert!(group.projected_outputs().next().is_none());
+        assert!(matches!(
+            group.destinations().next().unwrap().replacement,
+            crate::scalar::control::AssignmentReplacement::Missing
+        ));
         assert_eq!(
             group
                 .destinations()

@@ -201,6 +201,7 @@ fn template_index_retains_first_source_even_when_its_module_is_empty() {
         &second.source,
         &second.items,
         &[CallResolutionModule::module(&second)],
+        second.resolved_assignment_outputs.as_map(),
     )
     .unwrap();
     calls
@@ -209,14 +210,8 @@ fn template_index_retains_first_source_even_when_its_module_is_empty() {
         .unwrap()
         .call_occurrences
         .clear();
-    let (mut second_results, errors) = derive_module_reference_origins(
-        &second.source,
-        &second.items,
-        &calls,
-        &[],
-        &[],
-        second.resolved_assignment_outputs.as_map(),
-    );
+    let (mut second_results, errors) =
+        derive_module_reference_origins(&second.source, &second.items, &calls, &[], &[]);
     assert!(!errors.is_empty());
     let views = [
         ModuleReferenceView {

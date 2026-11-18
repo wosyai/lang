@@ -510,7 +510,8 @@ fn missing_aggregate_policy_table_reports_spanned_invariant() {
     };
     let mut function = function.clone();
     let read_span = expression_span(&function.body.expressions[0]);
-    let calls = reference::test_function_call_sites(&validated.program.source, &function);
+    let calls =
+        reference::test_function_call_sites(&validated.program.source, &function, &HashMap::new());
     let errors = record_function_reference_origins(
         &validated.program.source,
         &mut function,
@@ -518,7 +519,6 @@ fn missing_aggregate_policy_table_reports_spanned_invariant() {
         &calls,
         &[],
         &[],
-        &HashMap::new(),
     );
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert_eq!(
@@ -1262,7 +1262,8 @@ fn absent_resolved_assignment_output_is_a_spanned_invariant_error() {
         panic!("assignment")
     };
     let target_span = assignment.targets[0].target_span;
-    let calls = reference::test_function_call_sites(&validated.program.source, &function);
+    let calls =
+        reference::test_function_call_sites(&validated.program.source, &function, &HashMap::new());
     let errors = record_function_reference_origins(
         &validated.program.source,
         &mut function,
@@ -1270,7 +1271,6 @@ fn absent_resolved_assignment_output_is_a_spanned_invariant_error() {
         &calls,
         &validated.program.structs,
         &validated.program.enums,
-        &HashMap::new(),
     );
     assert_eq!(errors.len(), 1);
     assert_eq!(
@@ -3519,15 +3519,14 @@ fn assignment_reads_rhs_before_write_and_shadowed_binding_is_diagnosed() {
             panic!("function")
         };
         let mut function = function.clone();
-        let calls = reference::test_function_call_sites(source, &function);
+        let calls = reference::test_function_call_sites(source, &function, &HashMap::new());
         assert!(record_function_reference_origins(
             source,
             &mut function,
             &HashSet::new(),
             &calls,
             &[],
-            &[],
-            &HashMap::new()
+            &[]
         )
         .is_empty());
         let reads = function
@@ -3579,8 +3578,8 @@ fn unresolved_name_and_deliberately_empty_internal_origin_are_explicit() {
         panic!("function")
     };
     let module_names = HashSet::new();
-    let assignment_outputs = HashMap::new();
-    let calls = reference::test_function_call_sites(&result.program.source, function);
+    let calls =
+        reference::test_function_call_sites(&result.program.source, function, &HashMap::new());
     let ScalarBlockItem::Expression(expression) = &function.body.items[0] else {
         panic!("canonical expression item")
     };
@@ -3597,7 +3596,6 @@ fn unresolved_name_and_deliberately_empty_internal_origin_are_explicit() {
         &calls,
         &[],
         &[],
-        &assignment_outputs,
     );
     let binding = ReferenceBindingId {
         source: result.program.source.clone(),

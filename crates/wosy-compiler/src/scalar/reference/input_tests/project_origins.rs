@@ -151,8 +151,13 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
             .iter()
             .map(CallResolutionModule::module)
             .collect::<Vec<_>>();
-        let sites =
-            resolve_module_call_sites(&modules[0].source, &modules[0].items, &views).unwrap();
+        let sites = resolve_module_call_sites(
+            &modules[0].source,
+            &modules[0].items,
+            &views,
+            modules[0].resolved_assignment_outputs.as_map(),
+        )
+        .unwrap();
         drop(views);
         let original = modules[0].clone();
         assert!(record_module_reference_origins(
@@ -161,7 +166,6 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
             &sites,
             &original.structs,
             &original.enums,
-            original.resolved_assignment_outputs.as_map(),
         )
         .is_empty());
         let ScalarItem::Function(identity) = &mut modules[0].items[0] else {
@@ -173,8 +177,13 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
             .iter()
             .map(CallResolutionModule::module)
             .collect::<Vec<_>>();
-        let expected =
-            resolve_module_call_sites(&modules[0].source, &modules[0].items, &views).unwrap_err();
+        let expected = resolve_module_call_sites(
+            &modules[0].source,
+            &modules[0].items,
+            &views,
+            modules[0].resolved_assignment_outputs.as_map(),
+        )
+        .unwrap_err();
         drop(views);
         let calls = resolve_project_call_sites(&modules);
         let before_analysis = modules.clone();
@@ -337,8 +346,7 @@ fn ordered_project_call_slots_keep_origin_then_lookup_errors_and_partial_attachm
             &mut b.items,
             &b_calls,
             &b.structs,
-            &b.enums,
-            b.resolved_assignment_outputs.as_map()
+            &b.enums
         )
         .is_empty());
         let ScalarItem::Function(assigned) = &modules[0].items[0] else {

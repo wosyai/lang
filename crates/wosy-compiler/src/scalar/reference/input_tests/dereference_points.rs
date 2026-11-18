@@ -45,7 +45,6 @@ fn prepared_equal_span_dereference_places_retain_distinct_query_pointer_points()
             row,
             &program.structs,
             &program.enums,
-            program.resolved_assignment_outputs.as_map(),
         );
         let ScalarType::Callable { parameters, .. } = &function.signature else {
             unreachable!()

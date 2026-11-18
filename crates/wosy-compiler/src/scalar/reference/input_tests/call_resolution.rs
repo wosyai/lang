@@ -262,9 +262,14 @@ fn standalone_call_lookup_borrows_actual_inputs_and_preserves_complete_indirect_
             CallResolutionModule::module(&later),
         ];
         assert_eq!(
-            resolve_module_call_sites(&module.source, &module.items, &views)
-                .unwrap()
-                .functions[&1]
+            resolve_module_call_sites(
+                &module.source,
+                &module.items,
+                &views,
+                module.resolved_assignment_outputs.as_map()
+            )
+            .unwrap()
+            .functions[&1]
                 .sites,
             expected
         );

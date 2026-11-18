@@ -1,5 +1,5 @@
 use super::*;
-use crate::scalar::control::BlockPosition;
+use crate::scalar::control::{AssignmentReplacement, BlockPosition};
 use reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent};
 
 #[test]
@@ -105,6 +105,21 @@ fn preparation_publishes_neutral_assignment_stages_consumed_by_the_existing_quer
                 ));
             }
             let destinations = group.destinations().collect::<Vec<_>>();
+            let expected_types = if inspected == 0 {
+                vec![ScalarType::U8, ScalarType::Bool, ScalarType::U8]
+            } else {
+                vec![ScalarType::U8, ScalarType::U8]
+            };
+            assert_eq!(
+                destinations
+                    .iter()
+                    .map(|slot| slot.replacement.clone())
+                    .collect::<Vec<_>>(),
+                expected_types
+                    .into_iter()
+                    .map(AssignmentReplacement::Resolved)
+                    .collect::<Vec<_>>()
+            );
             let previous = group.previous_observations().collect::<Vec<_>>();
             let installs = group.installs().collect::<Vec<_>>();
             assert_eq!(destinations.len(), assignment.targets.len());

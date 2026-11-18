@@ -59,7 +59,7 @@ fn source() -> SourceIdentity {
 }
 
 #[test]
-fn real_constructor_borrows_all_five_nonempty_inventories_by_identity() {
+fn real_constructor_borrows_nonempty_inventories_and_prepared_call_rows_by_identity() {
     let parsed = parse_source(source(), TEXT.into(), &[]);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let extracted = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
@@ -84,16 +84,11 @@ fn real_constructor_borrows_all_five_nonempty_inventories_by_identity() {
         call_sites,
         &program.structs,
         &program.enums,
-        program.resolved_assignment_outputs.as_map(),
     );
     assert!(std::ptr::eq(builder.module_names, &module_names));
     assert!(std::ptr::eq(builder.call_sites, call_sites));
     assert!(std::ptr::eq(builder.structs, program.structs.as_slice()));
     assert!(std::ptr::eq(builder.enums, program.enums.as_slice()));
-    assert!(std::ptr::eq(
-        builder.assignment_outputs,
-        program.resolved_assignment_outputs.as_map()
-    ));
     assert_eq!(scope.counts(), layout::observations::Counts::default());
 }
 
@@ -129,7 +124,6 @@ fn actual_function_and_arm_consumers_copy_zero_aggregates_and_match_public_cfgs(
                 &call_sites.functions[&index],
                 &program.structs,
                 &program.enums,
-                program.resolved_assignment_outputs.as_map(),
             );
             assert_eq!(scope.counts(), layout::observations::Counts::default());
             drop(scope);
@@ -182,7 +176,6 @@ fn immutable_producer_preserves_preexisting_cfg_and_entire_input_on_both_targets
                     calls,
                     &program.structs,
                     &program.enums,
-                    program.resolved_assignment_outputs.as_map(),
                     true,
                 );
                 assert_eq!(scope.counts(), layout::observations::Counts::default());
@@ -204,7 +197,8 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
         let extracted = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
         let typed = typecheck_scalar_program(extracted, target);
         assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
-        let program = typed.program;
+        let mut program = typed.program;
+        program.resolved_assignment_outputs = ScalarAssignmentTyping::default();
         let calls = resolve_program_call_sites(&program).unwrap();
         let ScalarItem::Function(parent) = &program.items[0] else {
             panic!("overload")
@@ -212,7 +206,6 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
         assert_eq!(parent.overload_arms.len(), 2);
         let before = parent.clone();
         let module_names = HashSet::from(["pick".to_owned()]);
-        let missing_outputs = HashMap::new();
         let expected_errors = parent
             .overload_arms
             .iter()
@@ -240,7 +233,6 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
                 &calls.functions[&0].arms[position],
                 &program.structs,
                 &program.enums,
-                &missing_outputs,
                 true,
             );
             assert_eq!(errors, vec![expected.clone()]);
@@ -256,7 +248,6 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
             &calls.functions[&0],
             &program.structs,
             &program.enums,
-            &missing_outputs,
             false,
         );
         assert!(errors.is_empty(), "{errors:?}");
@@ -269,7 +260,6 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
             &calls.functions[&0],
             &program.structs,
             &program.enums,
-            &missing_outputs,
             true,
         );
         assert!(errors.is_empty(), "{errors:?}");
@@ -287,7 +277,6 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
             &calls.functions[&0],
             &program.structs,
             &program.enums,
-            &missing_outputs,
         );
         assert_eq!(errors, expected_errors);
         assert_eq!(installed.reference_cfg, gated_parent);
