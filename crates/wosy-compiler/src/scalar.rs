@@ -2195,7 +2195,6 @@ use resolution::{
     resolve_program_places, resolve_program_types,
 };
 mod typecheck;
-use typecheck::ScalarProgramTyping;
 use typecheck::{
     block_item_type_in_module, block_type_in_module, block_type_in_module_expected,
     call_output_sequence_in_module, declare_module_name, expect_module_type, expression_span,
@@ -2204,6 +2203,7 @@ use typecheck::{
     validate_module_generic_type, validate_module_type, validate_output_receivers_in_module,
     validate_unit_if_positions_in_module,
 };
+use typecheck::{split_module_typing, ScalarModuleTyping, ScalarProgramTyping};
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
     let mut diagnostics = string_diagnostics(canonical);
     diagnostics.extend(char_diagnostics(canonical));
@@ -2255,11 +2255,12 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         .iter()
         .map(|module| ScalarAssignmentOwners::new(&module.items))
         .collect::<Vec<_>>();
-    let struct_lookup = project.modules.clone();
-    for (ordinal, module) in project.modules.iter_mut().enumerate() {
+    let (modules, mut module_items) = split_module_typing(&mut project.modules);
+    for (ordinal, items) in module_items.iter_mut().enumerate() {
         resolve_module_places(
-            module,
-            &struct_lookup,
+            items,
+            &modules[ordinal],
+            &modules,
             &declarations,
             ordinal,
             &overloads.typing(ordinal),
@@ -2267,12 +2268,13 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         );
     }
     drop(declarations);
-    let mut inferences = Vec::with_capacity(project.modules.len());
-    for (ordinal, module) in project.modules.iter().enumerate() {
+    let mut inferences = Vec::with_capacity(modules.len());
+    for (ordinal, module) in modules.iter().enumerate() {
+        let items: &[ScalarItem] = module_items[ordinal];
         let overloads = overloads.typing(ordinal);
         let mut inference = ScalarInferenceBuilder::new(&owners[ordinal]);
-        validate_unit_if_positions_in_module(module, &mut diagnostics);
-        for structure in &module.structs {
+        validate_unit_if_positions_in_module(items, module.source, &mut diagnostics);
+        for structure in module.structs {
             for field in &structure.fields {
                 validate_module_type(&module.source, &field.ty, field.name_span, &mut diagnostics);
             }
@@ -2280,7 +2282,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         let mut declarations = BTreeMap::new();
         let mut declaration_names = BTreeSet::new();
         let mut folded_declarations = BTreeMap::new();
-        for item in &module.items {
+        for item in items {
             let (name, span, ty) = match item {
                 ScalarItem::Namespace(namespace) => {
                     validate_identifier_style(
@@ -2376,12 +2378,12 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                 }
             }
         }
-        for item in &module.items {
+        for item in items {
             if let ScalarItem::Extern(extern_decl) = item {
                 validate_extern(&module.source, extern_decl, &mut diagnostics);
             }
         }
-        for item in &module.items {
+        for item in items {
             match item {
                 ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
                 ScalarItem::Binding(binding) => {
@@ -2397,7 +2399,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                 &BTreeSet::new(),
                                 &BTreeMap::new(),
                                 module,
-                                &project.modules,
+                                &modules,
                                 &mut diagnostics,
                                 false,
                                 &overloads,
@@ -2420,7 +2422,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         &BTreeSet::new(),
                         &BTreeMap::new(),
                         module,
-                        &project.modules,
+                        &modules,
                         &mut diagnostics,
                         false,
                         &overloads,
@@ -2432,7 +2434,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         binding.span,
                         &declarations,
                         module,
-                        &project.modules,
+                        &modules,
                         &mut diagnostics,
                         &overloads,
                     );
@@ -2501,7 +2503,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                     &visible_names,
                                     &folded_names,
                                     module,
-                                    &project.modules,
+                                    &modules,
                                     &mut diagnostics,
                                     false,
                                     &overloads,
@@ -2513,7 +2515,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                     &mut visible_names,
                                     &mut folded_names,
                                     module,
-                                    &project.modules,
+                                    &modules,
                                     &mut diagnostics,
                                     false,
                                     &overloads,
@@ -2532,7 +2534,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                 &value.value,
                                 &scope,
                                 module,
-                                &project.modules,
+                                &modules,
                                 &overloads,
                             ) {
                                 expression_type_in_module_expected(
@@ -2542,7 +2544,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                     &visible_names,
                                     &folded_names,
                                     module,
-                                    &project.modules,
+                                    &modules,
                                     &mut diagnostics,
                                     false,
                                     &overloads,
@@ -2592,7 +2594,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                     &visible_names,
                                     &folded_names,
                                     module,
-                                    &project.modules,
+                                    &modules,
                                     &mut diagnostics,
                                     false,
                                     &overloads,
@@ -2615,7 +2617,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                             &visible_names,
                             &folded_names,
                             module,
-                            &project.modules,
+                            &modules,
                             &mut diagnostics,
                             false,
                             &overloads,
@@ -2635,7 +2637,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                             &visible_names,
                             &folded_names,
                             module,
-                            &project.modules,
+                            &modules,
                             &mut diagnostics,
                             false,
                             &overloads,
@@ -2660,7 +2662,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                         &mut visible_names,
                         &mut folded_names,
                         module,
-                        &project.modules,
+                        &modules,
                         &mut diagnostics,
                         false,
                         &overloads,
@@ -2669,7 +2671,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                 }
             }
         }
-        for span in unused_binding_spans(&module.items) {
+        for span in unused_binding_spans(items) {
             diagnostics.push(module_diagnostic(
                 module,
                 "B0009",
@@ -2679,6 +2681,8 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         }
         inferences.push(inference);
     }
+    drop(module_items);
+    drop(modules);
     if diagnostics.is_empty() {
         record_project_overload_selections(&mut project, &overloads);
         for (module, inference) in project.modules.iter_mut().zip(inferences) {

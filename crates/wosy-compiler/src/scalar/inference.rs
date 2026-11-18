@@ -478,14 +478,16 @@ mod tests {
         assert!(typecheck::validate(&program, &overloads, &mut scratch).is_empty());
         assert_eq!(program.resolved_assignment_outputs, expected);
         assert_eq!(scratch.freeze(), expected);
-        let module = ScalarModule::from_program(program, Vec::new());
+        let mut module = ScalarModule::from_program(program, Vec::new());
         let overloads = ScalarOverloadEnvironment::project(std::slice::from_ref(&module));
         let overloads = overloads.typing(0);
+        let (modules, items) = split_module_typing(std::slice::from_mut(&mut module));
+        let current = &modules[0];
         let mut scratch = ScalarInferenceBuilder::new(&owners);
-        let ScalarItem::Function(function) = &module.items[1] else {
+        let ScalarItem::Function(function) = &items[0][1] else {
             panic!("function")
         };
-        let scope = module
+        let scope = current
             .members
             .iter()
             .map(|(name, ty)| (name.clone(), ty.clone()))
@@ -503,8 +505,8 @@ mod tests {
             &scope,
             &BTreeSet::new(),
             &BTreeMap::new(),
-            &module,
-            std::slice::from_ref(&module),
+            current,
+            &modules,
             &mut diagnostics,
             false,
             &overloads,
@@ -512,6 +514,8 @@ mod tests {
         );
         assert_eq!(actual, ScalarType::I32);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        drop(items);
+        drop(modules);
         assert_eq!(module.resolved_assignment_outputs, expected);
         assert_eq!(scratch.freeze(), expected);
     }

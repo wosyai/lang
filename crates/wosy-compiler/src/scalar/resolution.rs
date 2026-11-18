@@ -916,14 +916,14 @@ fn resolve_type_in_project(
 }
 
 pub(super) fn resolve_module_places(
-    module: &mut ScalarModule,
-    modules: &[ScalarModule],
+    items: &mut [ScalarItem],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
     overloads: &ScalarTypingView<'_>,
     owners: &ScalarAssignmentOwners,
 ) {
-    let context = module.clone();
     let names = module
         .structs
         .iter()
@@ -940,8 +940,7 @@ pub(super) fn resolve_module_places(
             )
         }))
         .collect::<BTreeMap<_, _>>();
-    let bindings = module
-        .items
+    let bindings = items
         .iter()
         .filter_map(|item| match item {
             ScalarItem::Binding(binding) => {
@@ -953,13 +952,13 @@ pub(super) fn resolve_module_places(
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
-    for item in &mut module.items {
+    for item in items {
         match item {
             ScalarItem::Binding(binding) => {
                 resolve_expression_module_places(
                     &mut binding.value,
                     &bindings,
-                    &context,
+                    module,
                     modules,
                     &names,
                     false,
@@ -979,7 +978,7 @@ pub(super) fn resolve_module_places(
                 resolve_block_module_places(
                     &mut function.body,
                     &mut scope,
-                    &context,
+                    module,
                     modules,
                     &names,
                     false,
@@ -994,7 +993,7 @@ pub(super) fn resolve_module_places(
                 resolve_item_module_places(
                     item,
                     &mut scope,
-                    &context,
+                    module,
                     modules,
                     &names,
                     false,
@@ -1012,8 +1011,8 @@ pub(super) fn resolve_module_places(
 fn resolve_item_module_places(
     item: &mut ScalarBlockItem,
     scope: &mut BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
     declarations: &ScalarDeclarationEnvironment,
@@ -1123,8 +1122,8 @@ fn resolve_item_module_places(
 fn resolve_block_module_places(
     block: &mut ScalarBlock,
     scope: &mut BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
     declarations: &ScalarDeclarationEnvironment,
@@ -1166,8 +1165,8 @@ fn resolve_block_module_places(
 fn resolve_expression_module_places(
     expression: &mut ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
     declarations: &ScalarDeclarationEnvironment,
@@ -1413,8 +1412,8 @@ fn resolve_expression_module_places(
 }
 
 pub(super) fn enum_member_in_module(
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     receiver: &str,
     name: &str,
 ) -> Option<(ScalarEnumId, u32)> {
@@ -1431,7 +1430,7 @@ pub(super) fn enum_member_in_module(
                     .and_then(|binding| {
                         modules
                             .iter()
-                            .find(|candidate| candidate.source == binding.target)
+                            .find(|candidate| candidate.source == &binding.target)
                     })
                     .and_then(|target| {
                         target.enums.iter().find(|enumeration| {
@@ -1451,8 +1450,8 @@ pub(super) fn enum_member_in_module(
 fn resolve_module_place(
     place: &mut ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
     declarations: &ScalarDeclarationEnvironment,

@@ -1,6 +1,8 @@
 use super::*;
 use crate::parse_source;
 
+mod project_context_tests;
+
 fn source() -> SourceIdentity {
     SourceIdentity::new(
         "project".into(),
@@ -534,8 +536,9 @@ fn diagnostic_wrappers_preserve_exact_source_qualified_structure_and_bytes() {
         diagnostic(&typing, "B0003", "example diagnostic", span),
         expected
     );
-    let module = ScalarModule::from_program(program, Vec::new());
-    let actual = module_diagnostic(&module, "B0003", "example diagnostic", span);
+    let mut module = ScalarModule::from_program(program, Vec::new());
+    let (modules, _items) = split_module_typing(std::slice::from_mut(&mut module));
+    let actual = module_diagnostic(&modules[0], "B0003", "example diagnostic", span);
     assert_eq!(actual, expected);
     assert_eq!(
         serde_json::to_vec(&actual).unwrap(),

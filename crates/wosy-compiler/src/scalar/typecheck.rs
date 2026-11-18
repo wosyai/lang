@@ -7,6 +7,36 @@ pub(super) struct ScalarProgramTyping<'a> {
     pub target_layout: ScalarTargetLayout,
 }
 
+pub(super) struct ScalarModuleTyping<'a> {
+    pub source: &'a SourceIdentity,
+    pub members: &'a BTreeMap<String, ScalarType>,
+    pub namespace_bindings: &'a [ScalarNamespaceBinding],
+    pub structs: &'a [ScalarStruct],
+    pub enums: &'a [ScalarEnum],
+    pub target_layout: ScalarTargetLayout,
+}
+
+pub(super) fn split_module_typing(
+    modules: &mut [ScalarModule],
+) -> (Vec<ScalarModuleTyping<'_>>, Vec<&mut [ScalarItem]>) {
+    modules
+        .iter_mut()
+        .map(|module| {
+            (
+                ScalarModuleTyping {
+                    source: &module.source,
+                    members: &module.members,
+                    namespace_bindings: &module.namespace_bindings,
+                    structs: &module.structs,
+                    enums: &module.enums,
+                    target_layout: module.target_layout,
+                },
+                module.items.as_mut_slice(),
+            )
+        })
+        .unzip()
+}
+
 #[cfg(test)]
 mod callable_context_tests;
 #[cfg(test)]
@@ -69,7 +99,7 @@ pub(super) fn validate_module_type(
 }
 
 pub(super) fn validate_module_generic_type(
-    module: &ScalarModule,
+    module: &ScalarModuleTyping<'_>,
     ty: &ScalarType,
     span: ByteSpan,
     generic_parameters: &[ScalarGenericParameter],
@@ -199,8 +229,8 @@ fn contains_fixed_array(ty: &ScalarType) -> bool {
 pub(super) fn call_output_sequence_in_module(
     expression: &ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     overloads: &ScalarTypingView<'_>,
 ) -> Option<ScalarOutputSequence> {
     let ScalarExpression::Call {
@@ -223,7 +253,7 @@ pub(super) fn call_output_sequence_in_module(
             if let Some(namespace) = namespace {
                 let target = modules
                     .iter()
-                    .find(|candidate| candidate.source == namespace.target)?;
+                    .find(|candidate| candidate.source == &namespace.target)?;
                 (
                     target.members.get(name),
                     target,
@@ -269,7 +299,7 @@ pub(super) fn call_output_sequence_in_module(
             {
                 modules
                     .iter()
-                    .find(|candidate| candidate.source == namespace.target)
+                    .find(|candidate| candidate.source == &namespace.target)
                     .is_some_and(|target| overloads.imported(&target.source).has_extern_name(name))
             } else {
                 overloads.extern_member(Some(binding), name).is_some()
@@ -397,8 +427,8 @@ pub(super) fn validate_output_receivers_in_module(
     receivers: &[ScalarOutputReceiver],
     binding_span: ByteSpan,
     scope: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
 ) {
@@ -456,8 +486,8 @@ pub(super) fn block_type_in_module(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -494,8 +524,8 @@ pub(super) fn block_type_in_module_expected(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -550,8 +580,8 @@ pub(super) fn block_item_type_in_module(
     scope: &mut BTreeMap<String, ScalarType>,
     visible_names: &mut BTreeSet<String>,
     folded_names: &mut BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -696,8 +726,8 @@ fn assignment_type_in_module(
     scope: &mut BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -807,8 +837,8 @@ fn assignment_type_in_module(
 fn assignment_target_type_in_module(
     target: &ScalarAssignmentTarget,
     scope: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
@@ -821,7 +851,7 @@ fn assignment_target_type_in_module(
         {
             let Some(target_module) = modules
                 .iter()
-                .find(|candidate| candidate.source == namespace.target)
+                .find(|candidate| candidate.source == &namespace.target)
             else {
                 diagnostics.push(module_diagnostic(
                     module,
@@ -880,7 +910,7 @@ fn assignment_target_type_in_module(
 
 fn validate_assignment_target_distinctness_in_module(
     assignment: &ScalarAssignment,
-    module: &ScalarModule,
+    module: &ScalarModuleTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     for (index, target) in assignment.targets.iter().enumerate() {
@@ -911,8 +941,8 @@ fn while_type_in_module(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -960,8 +990,8 @@ fn type_core_memory_in_module(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -1359,8 +1389,8 @@ fn type_core_int_conversion_in_module(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -1455,8 +1485,8 @@ fn type_core_bitcast_in_module(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -1542,8 +1572,8 @@ fn type_core_pointer_cast_in_module(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -1673,8 +1703,8 @@ fn type_core_float_conversion_in_module(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -2109,8 +2139,8 @@ fn type_core_raw_memory_in_module(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -2509,8 +2539,8 @@ pub(super) fn expression_type_in_module(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -2643,7 +2673,7 @@ pub(super) fn expression_type_in_module(
             };
             let Some(target) = modules
                 .iter()
-                .find(|candidate| candidate.source == namespace.target)
+                .find(|candidate| candidate.source == &namespace.target)
             else {
                 diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
                 return ScalarType::Error;
@@ -3121,7 +3151,7 @@ pub(super) fn expression_type_in_module(
                     if let Some(namespace) = namespace {
                         let Some(target) = modules
                             .iter()
-                            .find(|module| module.source == namespace.target)
+                            .find(|module| module.source == &namespace.target)
                         else {
                             diagnostics.push(module_diagnostic(
                                 module,
@@ -3385,8 +3415,8 @@ pub(super) fn expression_type_in_module_expected(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -3979,8 +4009,8 @@ pub(super) fn expression_type_in_module_expected(
 }
 
 fn utf8_type_from_namespace_target(
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
@@ -3990,7 +4020,7 @@ fn utf8_type_from_namespace_target(
         .filter_map(|binding| {
             modules
                 .iter()
-                .find(|candidate| candidate.source == binding.target)
+                .find(|candidate| candidate.source == &binding.target)
         })
         .flat_map(|target| target.structs.iter())
         .find(|structure| structure.name == "utf8");
@@ -4009,8 +4039,8 @@ fn utf8_type_from_namespace_target(
 }
 
 fn utf8_type_from_context(
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     expected: &ScalarType,
 ) -> Option<ScalarType> {
     let ScalarType::Struct(expected_id) = expected else {
@@ -4023,7 +4053,7 @@ fn utf8_type_from_context(
         .filter_map(|binding| {
             modules
                 .iter()
-                .find(|candidate| candidate.source == binding.target)
+                .find(|candidate| candidate.source == &binding.target)
         })
         .flat_map(|target| target.structs.iter())
         .find(|structure| structure.id == *expected_id && structure.name == "utf8")
@@ -4035,8 +4065,8 @@ fn field_type_in_module(
     name: &str,
     name_span: ByteSpan,
     span: ByteSpan,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
     let structure_id = match receiver {
@@ -4177,8 +4207,8 @@ fn checked_address_type_in_module(
     place: &ScalarPlace,
     span: ByteSpan,
     scope: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
@@ -4300,8 +4330,8 @@ fn writable_place_type_in_module(
     place: &ScalarPlace,
     target_span: ByteSpan,
     scope: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
@@ -4384,8 +4414,8 @@ fn writable_place_contains_raw_dereference(
 fn writable_place_contains_raw_dereference_in_module(
     place: &ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
@@ -4531,8 +4561,8 @@ fn writable_path_type(
 fn writable_path_type_in_module(
     place: &ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
@@ -4789,8 +4819,8 @@ pub(super) fn place_type(
 pub(super) fn place_type_in_module(
     place: &ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
@@ -5121,8 +5151,8 @@ fn checked_dereference_type_in_module(
     place: &ScalarPlace,
     span: ByteSpan,
     scope: &BTreeMap<String, ScalarType>,
-    module: &ScalarModule,
-    modules: &[ScalarModule],
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -5266,7 +5296,7 @@ fn checked_dereference_type_in_module(
 }
 
 pub(super) fn expect_module_type(
-    module: &ScalarModule,
+    module: &ScalarModuleTyping<'_>,
     expected: &ScalarType,
     actual: &ScalarType,
     span: ByteSpan,
@@ -5314,7 +5344,7 @@ fn integer_width(ty: &ScalarType) -> Option<u32> {
 }
 
 fn expect_module_integer(
-    module: &ScalarModule,
+    module: &ScalarModuleTyping<'_>,
     actual: &ScalarType,
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -5330,7 +5360,7 @@ fn expect_module_integer(
 }
 
 pub(super) fn module_diagnostic(
-    module: &ScalarModule,
+    module: &ScalarModuleTyping<'_>,
     code: &str,
     message: &str,
     span: ByteSpan,
@@ -5364,7 +5394,7 @@ fn fold_name(name: &str) -> String {
 }
 
 pub(super) fn declare_module_name(
-    module: &ScalarModule,
+    module: &ScalarModuleTyping<'_>,
     name: &str,
     span: ByteSpan,
     names: &mut BTreeSet<String>,
@@ -5443,7 +5473,7 @@ fn is_declared_identifier_style(name: &str) -> bool {
 }
 
 fn module_collision_diagnostic(
-    module: &ScalarModule,
+    module: &ScalarModuleTyping<'_>,
     span: ByteSpan,
     first_span: ByteSpan,
 ) -> super::Diagnostic {
@@ -5455,14 +5485,14 @@ fn module_collision_diagnostic(
     );
     diagnostic.labels.push(super::DiagnosticLabel {
         kind: super::DiagnosticLabelKind::Secondary,
-        span: SourceSpan::new(module.source.clone(), first_span),
+        span: SourceSpan::new((*module.source).clone(), first_span),
         message: "first conflicting declaration".to_owned(),
     });
     diagnostic
 }
 
 fn unknown_member_diagnostic(
-    importer: &ScalarModule,
+    importer: &ScalarModuleTyping<'_>,
     member_span: ByteSpan,
     target: &SourceIdentity,
 ) -> super::Diagnostic {
@@ -5473,7 +5503,7 @@ fn unknown_member_diagnostic(
         labels: vec![
             super::DiagnosticLabel {
                 kind: super::DiagnosticLabelKind::Primary,
-                span: SourceSpan::new(importer.source.clone(), member_span),
+                span: SourceSpan::new((*importer.source).clone(), member_span),
                 message: "unknown module member".to_owned(),
             },
             super::DiagnosticLabel {
@@ -5495,10 +5525,11 @@ fn validate_unit_if_positions(program: &ScalarProgram, diagnostics: &mut Vec<sup
 }
 
 pub(super) fn validate_unit_if_positions_in_module(
-    module: &ScalarModule,
+    items: &[ScalarItem],
+    source: &SourceIdentity,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    validate_unit_if_positions_in_items(&module.items, &module.source, diagnostics);
+    validate_unit_if_positions_in_items(items, source, diagnostics);
 }
 
 fn validate_unit_if_positions_in_items(
@@ -8391,7 +8422,7 @@ fn field_type(
 }
 
 fn validate_integer_range(
-    module: &ScalarModule,
+    module: &ScalarModuleTyping<'_>,
     value: &BigInt,
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -8407,7 +8438,7 @@ fn validate_integer_range(
 }
 
 fn validate_integer_range_for_type(
-    module: &ScalarModule,
+    module: &ScalarModuleTyping<'_>,
     value: &BigInt,
     span: ByteSpan,
     ty: &ScalarType,

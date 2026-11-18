@@ -100,13 +100,14 @@ fn single_type(
 }
 
 fn module_type(
-    modules: &[ScalarModule],
+    modules: &[ScalarModuleTyping<'_>],
+    items: &[&mut [ScalarItem]],
     ordinal: usize,
     view: &ScalarTypingView<'_>,
     call: &ScalarExpression,
 ) -> (ScalarType, Vec<Diagnostic>) {
     let module = &modules[ordinal];
-    let owners = ScalarAssignmentOwners::new(&module.items);
+    let owners = ScalarAssignmentOwners::new(items[ordinal]);
     let mut inference = ScalarInferenceBuilder::new(&owners);
     let mut diagnostics = Vec::new();
     let ty = expression_type_in_module(
@@ -160,9 +161,10 @@ fn late_extern_member_is_available_to_outputs_and_standalone_but_first_project_b
                 .ty,
             ScalarType::I32
         );
-        let modules = [ScalarModule::from_program(program, Vec::new())];
+        let mut modules = [ScalarModule::from_program(program, Vec::new())];
         let environment = ScalarOverloadEnvironment::project(&modules);
         let view = environment.typing(0);
+        let (modules, items) = split_module_typing(&mut modules);
         assert_eq!(
             call_output_sequence_in_module(
                 &expression,
@@ -177,7 +179,7 @@ fn late_extern_member_is_available_to_outputs_and_standalone_but_first_project_b
             ScalarType::I32
         );
         assert_eq!(
-            module_type(&modules, 0, &view, &expression),
+            module_type(&modules, &items, 0, &view, &expression),
             (
                 ScalarType::Error,
                 vec![expected(
@@ -250,11 +252,12 @@ fn duplicate_extern_markers_keep_standalone_or_project_first_and_qualified_lexic
                 )]
             )
         );
-        let modules = [ScalarModule::from_program(program, Vec::new())];
+        let mut modules = [ScalarModule::from_program(program, Vec::new())];
         let environment = ScalarOverloadEnvironment::project(&modules);
         let view = environment.typing(0);
+        let (modules, items) = split_module_typing(&mut modules);
         assert_eq!(
-            module_type(&modules, 0, &view, &expression),
+            module_type(&modules, &items, 0, &view, &expression),
             (ScalarType::I32, Vec::new())
         );
     }
@@ -300,9 +303,10 @@ fn first_empty_generic_declaration_controls_both_typing_routes() {
         single_type(&program, &view, &scope, &no_arguments),
         (ScalarType::Bool, Vec::new())
     );
-    let modules = [ScalarModule::from_program(program, Vec::new())];
+    let mut modules = [ScalarModule::from_program(program, Vec::new())];
     let environment = ScalarOverloadEnvironment::project(&modules);
     let view = environment.typing(0);
+    let (modules, items) = split_module_typing(&mut modules);
     assert_eq!(
         call_output_sequence_in_module(
             &expression,
@@ -317,7 +321,7 @@ fn first_empty_generic_declaration_controls_both_typing_routes() {
         ScalarType::I32
     );
     assert_eq!(
-        module_type(&modules, 0, &view, &expression),
+        module_type(&modules, &items, 0, &view, &expression),
         (ScalarType::I32, Vec::new())
     );
 }
@@ -350,12 +354,13 @@ fn local_ordinal_and_first_import_source_choose_independent_generic_headers() {
             target: first.source.clone(),
         }],
     );
-    let modules = [first, second];
+    let mut modules = [first, second];
     let environment = ScalarOverloadEnvironment::project(&modules);
     let view = environment.typing(1);
+    let (modules, items) = split_module_typing(&mut modules);
     let local = call(None, "identity", vec![type_argument()]);
     assert_eq!(
-        module_type(&modules, 1, &view, &local),
+        module_type(&modules, &items, 1, &view, &local),
         (ScalarType::I32, Vec::new())
     );
     assert_eq!(
@@ -380,12 +385,12 @@ fn local_ordinal_and_first_import_source_choose_independent_generic_headers() {
         ScalarType::Bool
     );
     assert_eq!(
-        module_type(&modules, 1, &view, &imported),
+        module_type(&modules, &items, 1, &view, &imported),
         (ScalarType::Bool, Vec::new())
     );
     let imported = call(Some("peer"), "identity", Vec::new());
     assert_eq!(
-        module_type(&modules, 1, &view, &imported),
+        module_type(&modules, &items, 1, &view, &imported),
         (ScalarType::Bool, Vec::new())
     );
     let local_missing_argument = call(None, "identity", Vec::new());
@@ -398,7 +403,7 @@ fn local_ordinal_and_first_import_source_choose_independent_generic_headers() {
     )
     .is_none());
     assert_eq!(
-        module_type(&modules, 1, &view, &local_missing_argument),
+        module_type(&modules, &items, 1, &view, &local_missing_argument),
         (
             ScalarType::Error,
             vec![expected(
@@ -452,9 +457,10 @@ fn imported_extern_name_presence_keeps_visibility_gate_and_includes_private_name
                 target: target.source.clone(),
             }],
         );
-        let modules = [target, current];
+        let mut modules = [target, current];
         let environment = ScalarOverloadEnvironment::project(&modules);
         let view = environment.typing(1);
+        let (modules, items) = split_module_typing(&mut modules);
         let expression = call(Some("peer"), "_private", vec![type_argument()]);
         assert!(call_output_sequence_in_module(
             &expression,
@@ -491,7 +497,7 @@ fn imported_extern_name_presence_keeps_visibility_gate_and_includes_private_name
             }
         };
         assert_eq!(
-            module_type(&modules, 1, &view, &expression),
+            module_type(&modules, &items, 1, &view, &expression),
             (ScalarType::Error, vec![diagnostic])
         );
     }
