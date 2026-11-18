@@ -207,6 +207,7 @@ fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarType>) -> Scalar
 pub(super) fn resolve_program_places(
     program: &mut ScalarProgram,
     overloads: &ScalarOverloadEnvironment,
+    owners: &ScalarAssignmentOwners,
 ) {
     let context = program.clone();
     let names = program
@@ -248,6 +249,7 @@ pub(super) fn resolve_program_places(
                     &names,
                     false,
                     overloads,
+                    owners,
                 );
             }
             ScalarItem::Function(function) => {
@@ -264,6 +266,7 @@ pub(super) fn resolve_program_places(
                     &names,
                     false,
                     overloads,
+                    owners,
                 );
             }
             ScalarItem::Executable(item) => {
@@ -274,6 +277,7 @@ pub(super) fn resolve_program_places(
                     &names,
                     false,
                     overloads,
+                    owners,
                 );
             }
             ScalarItem::Extern(_) | ScalarItem::Namespace(_) => {}
@@ -288,6 +292,7 @@ fn resolve_item_places(
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
+    owners: &ScalarAssignmentOwners,
 ) {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
@@ -298,12 +303,19 @@ fn resolve_item_places(
                 names,
                 unsafe_context,
                 overloads,
+                owners,
             );
             scope.insert(binding.name.clone(), binding.declared_type.clone());
         }
-        ScalarBlockItem::Expression(expression) => {
-            resolve_expression_places(expression, scope, program, names, unsafe_context, overloads)
-        }
+        ScalarBlockItem::Expression(expression) => resolve_expression_places(
+            expression,
+            scope,
+            program,
+            names,
+            unsafe_context,
+            overloads,
+            owners,
+        ),
         ScalarBlockItem::Assignment(assignment) => {
             for target in &mut assignment.targets {
                 resolve_place(
@@ -313,6 +325,7 @@ fn resolve_item_places(
                     names,
                     unsafe_context,
                     overloads,
+                    owners,
                 );
             }
             resolve_expression_places(
@@ -322,9 +335,18 @@ fn resolve_item_places(
                 names,
                 unsafe_context,
                 overloads,
+                owners,
             );
             for value in &mut assignment.values {
-                resolve_expression_places(value, scope, program, names, unsafe_context, overloads);
+                resolve_expression_places(
+                    value,
+                    scope,
+                    program,
+                    names,
+                    unsafe_context,
+                    overloads,
+                    owners,
+                );
             }
         }
         ScalarBlockItem::While(while_expression) => {
@@ -335,6 +357,7 @@ fn resolve_item_places(
                 names,
                 unsafe_context,
                 overloads,
+                owners,
             );
             resolve_block_places(
                 &mut while_expression.body,
@@ -343,6 +366,7 @@ fn resolve_item_places(
                 names,
                 unsafe_context,
                 overloads,
+                owners,
             );
         }
     }
@@ -355,10 +379,19 @@ fn resolve_block_places(
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
+    owners: &ScalarAssignmentOwners,
 ) {
     let unsafe_context = unsafe_context || block.unsafe_context;
     for item in &mut block.items {
-        resolve_item_places(item, scope, program, names, unsafe_context, overloads);
+        resolve_item_places(
+            item,
+            scope,
+            program,
+            names,
+            unsafe_context,
+            overloads,
+            owners,
+        );
     }
     for output in &mut block.final_output_values {
         resolve_expression_places(
@@ -368,6 +401,7 @@ fn resolve_block_places(
             names,
             unsafe_context,
             overloads,
+            owners,
         );
     }
 }
@@ -379,16 +413,29 @@ fn resolve_expression_places(
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
+    owners: &ScalarAssignmentOwners,
 ) {
     match expression {
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
-        | ScalarExpression::Dereference { place, .. } => {
-            resolve_place(place, scope, program, names, unsafe_context, overloads)
-        }
-        ScalarExpression::IndexedRead { place, .. } => {
-            resolve_place(place, scope, program, names, unsafe_context, overloads)
-        }
+        | ScalarExpression::Dereference { place, .. } => resolve_place(
+            place,
+            scope,
+            program,
+            names,
+            unsafe_context,
+            overloads,
+            owners,
+        ),
+        ScalarExpression::IndexedRead { place, .. } => resolve_place(
+            place,
+            scope,
+            program,
+            names,
+            unsafe_context,
+            overloads,
+            owners,
+        ),
         ScalarExpression::StructLiteral { fields, .. } => {
             for field in fields {
                 resolve_expression_places(
@@ -398,6 +445,7 @@ fn resolve_expression_places(
                     names,
                     unsafe_context,
                     overloads,
+                    owners,
                 );
             }
         }
@@ -410,15 +458,40 @@ fn resolve_expression_places(
                     names,
                     unsafe_context,
                     overloads,
+                    owners,
                 );
             }
         }
         ScalarExpression::Binary { left, right, .. } => {
-            resolve_expression_places(left, scope, program, names, unsafe_context, overloads);
-            resolve_expression_places(right, scope, program, names, unsafe_context, overloads);
+            resolve_expression_places(
+                left,
+                scope,
+                program,
+                names,
+                unsafe_context,
+                overloads,
+                owners,
+            );
+            resolve_expression_places(
+                right,
+                scope,
+                program,
+                names,
+                unsafe_context,
+                overloads,
+                owners,
+            );
         }
         ScalarExpression::Unary { operand, .. } => {
-            resolve_expression_places(operand, scope, program, names, unsafe_context, overloads);
+            resolve_expression_places(
+                operand,
+                scope,
+                program,
+                names,
+                unsafe_context,
+                overloads,
+                owners,
+            );
         }
         ScalarExpression::Call {
             receiver,
@@ -440,6 +513,7 @@ fn resolve_expression_places(
                     names,
                     unsafe_context,
                     overloads,
+                    owners,
                 );
             }
         }
@@ -449,7 +523,15 @@ fn resolve_expression_places(
             else_branch,
             ..
         } => {
-            resolve_expression_places(condition, scope, program, names, unsafe_context, overloads);
+            resolve_expression_places(
+                condition,
+                scope,
+                program,
+                names,
+                unsafe_context,
+                overloads,
+                owners,
+            );
             let mut then_scope = scope.clone();
             resolve_block_places(
                 then_branch,
@@ -458,6 +540,7 @@ fn resolve_expression_places(
                 names,
                 unsafe_context,
                 overloads,
+                owners,
             );
             let mut else_scope = scope.clone();
             resolve_block_places(
@@ -467,6 +550,7 @@ fn resolve_expression_places(
                 names,
                 unsafe_context,
                 overloads,
+                owners,
             );
         }
         ScalarExpression::UnitIf {
@@ -474,7 +558,15 @@ fn resolve_expression_places(
             then_branch,
             ..
         } => {
-            resolve_expression_places(condition, scope, program, names, unsafe_context, overloads);
+            resolve_expression_places(
+                condition,
+                scope,
+                program,
+                names,
+                unsafe_context,
+                overloads,
+                owners,
+            );
             let mut then_scope = scope.clone();
             resolve_block_places(
                 then_branch,
@@ -483,11 +575,20 @@ fn resolve_expression_places(
                 names,
                 unsafe_context,
                 overloads,
+                owners,
             );
         }
         ScalarExpression::Block(block) => {
             let mut scope = scope.clone();
-            resolve_block_places(block, &mut scope, program, names, unsafe_context, overloads);
+            resolve_block_places(
+                block,
+                &mut scope,
+                program,
+                names,
+                unsafe_context,
+                overloads,
+                owners,
+            );
         }
         ScalarExpression::Member {
             receiver,
@@ -525,17 +626,32 @@ fn resolve_place(
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
+    owners: &ScalarAssignmentOwners,
 ) {
     match place {
         ScalarPlace::Name { .. } => {}
-        ScalarPlace::Dereference { pointer, .. } => {
-            resolve_expression_places(pointer, scope, program, names, unsafe_context, overloads)
-        }
+        ScalarPlace::Dereference { pointer, .. } => resolve_expression_places(
+            pointer,
+            scope,
+            program,
+            names,
+            unsafe_context,
+            overloads,
+            owners,
+        ),
         ScalarPlace::Field { base, field, span } => {
-            resolve_place(base, scope, program, names, unsafe_context, overloads);
+            resolve_place(
+                base,
+                scope,
+                program,
+                names,
+                unsafe_context,
+                overloads,
+                owners,
+            );
             let base_type = match base.as_ref() {
                 ScalarPlace::Dereference { pointer, .. } => {
-                    let mut scratch = ScalarInferenceBuilder::new();
+                    let mut scratch = ScalarInferenceBuilder::new(owners);
                     match expression_type(
                         pointer,
                         scope,
@@ -555,7 +671,7 @@ fn resolve_place(
                 ScalarPlace::Name { .. }
                 | ScalarPlace::Field { .. }
                 | ScalarPlace::Index { .. } => {
-                    let mut scratch = ScalarInferenceBuilder::new();
+                    let mut scratch = ScalarInferenceBuilder::new(owners);
                     place_type(
                         base,
                         scope,
@@ -588,8 +704,24 @@ fn resolve_place(
             }
         }
         ScalarPlace::Index { base, index, .. } => {
-            resolve_place(base, scope, program, names, unsafe_context, overloads);
-            resolve_expression_places(index, scope, program, names, unsafe_context, overloads);
+            resolve_place(
+                base,
+                scope,
+                program,
+                names,
+                unsafe_context,
+                overloads,
+                owners,
+            );
+            resolve_expression_places(
+                index,
+                scope,
+                program,
+                names,
+                unsafe_context,
+                overloads,
+                owners,
+            );
         }
     }
 }
@@ -784,6 +916,7 @@ pub(super) fn resolve_module_places(
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
     overloads: &ScalarOverloadEnvironment,
+    owners: &ScalarAssignmentOwners,
 ) {
     let context = module.clone();
     let names = module
@@ -828,6 +961,7 @@ pub(super) fn resolve_module_places(
                     declarations,
                     current_module,
                     overloads,
+                    owners,
                 );
             }
             ScalarItem::Function(function) => {
@@ -847,6 +981,7 @@ pub(super) fn resolve_module_places(
                     declarations,
                     current_module,
                     overloads,
+                    owners,
                 );
             }
             ScalarItem::Executable(item) => {
@@ -861,6 +996,7 @@ pub(super) fn resolve_module_places(
                     declarations,
                     current_module,
                     overloads,
+                    owners,
                 );
             }
             ScalarItem::Extern(_) | ScalarItem::Namespace(_) => {}
@@ -878,6 +1014,7 @@ fn resolve_item_module_places(
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
     overloads: &ScalarOverloadEnvironment,
+    owners: &ScalarAssignmentOwners,
 ) {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
@@ -891,6 +1028,7 @@ fn resolve_item_module_places(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
             scope.insert(binding.name.clone(), binding.declared_type.clone());
         }
@@ -904,6 +1042,7 @@ fn resolve_item_module_places(
             declarations,
             current_module,
             overloads,
+            owners,
         ),
         ScalarBlockItem::Assignment(assignment) => {
             for target in &mut assignment.targets {
@@ -917,6 +1056,7 @@ fn resolve_item_module_places(
                     declarations,
                     current_module,
                     overloads,
+                    owners,
                 );
             }
             resolve_expression_module_places(
@@ -929,6 +1069,7 @@ fn resolve_item_module_places(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
             for value in &mut assignment.values {
                 resolve_expression_module_places(
@@ -941,6 +1082,7 @@ fn resolve_item_module_places(
                     declarations,
                     current_module,
                     overloads,
+                    owners,
                 );
             }
         }
@@ -955,6 +1097,7 @@ fn resolve_item_module_places(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
             resolve_block_module_places(
                 &mut while_expression.body,
@@ -966,6 +1109,7 @@ fn resolve_item_module_places(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
         }
     }
@@ -981,6 +1125,7 @@ fn resolve_block_module_places(
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
     overloads: &ScalarOverloadEnvironment,
+    owners: &ScalarAssignmentOwners,
 ) {
     let unsafe_context = unsafe_context || block.unsafe_context;
     for item in &mut block.items {
@@ -994,6 +1139,7 @@ fn resolve_block_module_places(
             declarations,
             current_module,
             overloads,
+            owners,
         );
     }
     for output in &mut block.final_output_values {
@@ -1007,6 +1153,7 @@ fn resolve_block_module_places(
             declarations,
             current_module,
             overloads,
+            owners,
         );
     }
 }
@@ -1021,6 +1168,7 @@ fn resolve_expression_module_places(
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
     overloads: &ScalarOverloadEnvironment,
+    owners: &ScalarAssignmentOwners,
 ) {
     match expression {
         ScalarExpression::RawAddress { place, .. }
@@ -1035,6 +1183,7 @@ fn resolve_expression_module_places(
             declarations,
             current_module,
             overloads,
+            owners,
         ),
         ScalarExpression::IndexedRead { place, .. } => resolve_module_place(
             place,
@@ -1046,6 +1195,7 @@ fn resolve_expression_module_places(
             declarations,
             current_module,
             overloads,
+            owners,
         ),
         ScalarExpression::StructLiteral { fields, .. } => {
             for field in fields {
@@ -1059,6 +1209,7 @@ fn resolve_expression_module_places(
                     declarations,
                     current_module,
                     overloads,
+                    owners,
                 );
             }
         }
@@ -1074,6 +1225,7 @@ fn resolve_expression_module_places(
                     declarations,
                     current_module,
                     overloads,
+                    owners,
                 );
             }
         }
@@ -1088,6 +1240,7 @@ fn resolve_expression_module_places(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
             resolve_expression_module_places(
                 right,
@@ -1099,6 +1252,7 @@ fn resolve_expression_module_places(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
         }
         ScalarExpression::Unary { operand, .. } => {
@@ -1112,6 +1266,7 @@ fn resolve_expression_module_places(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
         }
         ScalarExpression::Call {
@@ -1138,6 +1293,7 @@ fn resolve_expression_module_places(
                     declarations,
                     current_module,
                     overloads,
+                    owners,
                 );
             }
         }
@@ -1157,6 +1313,7 @@ fn resolve_expression_module_places(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
             let mut then_scope = scope.clone();
             resolve_block_module_places(
@@ -1169,6 +1326,7 @@ fn resolve_expression_module_places(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
             let mut else_scope = scope.clone();
             resolve_block_module_places(
@@ -1181,6 +1339,7 @@ fn resolve_expression_module_places(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
         }
         ScalarExpression::UnitIf {
@@ -1198,6 +1357,7 @@ fn resolve_expression_module_places(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
             let mut then_scope = scope.clone();
             resolve_block_module_places(
@@ -1210,6 +1370,7 @@ fn resolve_expression_module_places(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
         }
         ScalarExpression::Block(block) => {
@@ -1224,6 +1385,7 @@ fn resolve_expression_module_places(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
         }
         ScalarExpression::Member {
@@ -1291,6 +1453,7 @@ fn resolve_module_place(
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
     overloads: &ScalarOverloadEnvironment,
+    owners: &ScalarAssignmentOwners,
 ) {
     match place {
         ScalarPlace::Name { .. } => {}
@@ -1304,6 +1467,7 @@ fn resolve_module_place(
             declarations,
             current_module,
             overloads,
+            owners,
         ),
         ScalarPlace::Field { base, field, .. } => {
             resolve_module_place(
@@ -1316,10 +1480,11 @@ fn resolve_module_place(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
             let base_type = match base.as_ref() {
                 ScalarPlace::Dereference { pointer, .. } => {
-                    let mut scratch = ScalarInferenceBuilder::new();
+                    let mut scratch = ScalarInferenceBuilder::new(owners);
                     match expression_type_in_module(
                         pointer,
                         scope,
@@ -1340,7 +1505,7 @@ fn resolve_module_place(
                 ScalarPlace::Name { .. }
                 | ScalarPlace::Field { .. }
                 | ScalarPlace::Index { .. } => {
-                    let mut scratch = ScalarInferenceBuilder::new();
+                    let mut scratch = ScalarInferenceBuilder::new(owners);
                     place_type_in_module(
                         base,
                         scope,
@@ -1386,6 +1551,7 @@ fn resolve_module_place(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
             resolve_expression_module_places(
                 index,
@@ -1397,6 +1563,7 @@ fn resolve_module_place(
                 declarations,
                 current_module,
                 overloads,
+                owners,
             );
         }
     }

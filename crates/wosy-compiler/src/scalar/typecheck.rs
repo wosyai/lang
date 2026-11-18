@@ -500,7 +500,7 @@ pub(super) fn block_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut visible_names = visible_names.clone();
@@ -538,7 +538,7 @@ pub(super) fn block_type_in_module_expected(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut visible_names = visible_names.clone();
@@ -594,7 +594,7 @@ pub(super) fn block_item_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
@@ -740,7 +740,7 @@ fn assignment_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let mut inferred_names = visible_names.clone();
     let mut inferred_folded_names = folded_names.clone();
@@ -797,7 +797,7 @@ fn assignment_type_in_module(
             span: assignment.span,
         });
     if let Some(outputs) = outputs {
-        inference.record_assignment_outputs(&module.source, &module.items, assignment, &outputs);
+        inference.record_assignment_outputs(&module.source, assignment, &outputs);
         if assignment.targets.len() > outputs.outputs.len() {
             diagnostics.push(module_diagnostic(
                 module,
@@ -850,7 +850,7 @@ fn assignment_target_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> Option<ScalarType> {
     if let Some(receiver) = &target.receiver {
         if let Some(namespace) = module
@@ -955,7 +955,7 @@ fn while_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let condition = expression_type_in_module(
         &while_expression.condition,
@@ -1004,7 +1004,7 @@ fn type_core_memory_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if matches!(operation, "alloc" | "free" | "invalidate" | "rebind") && !unsafe_context {
         diagnostics.push(module_diagnostic(
@@ -1205,7 +1205,7 @@ fn type_core_memory(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if matches!(operation, "alloc" | "free" | "invalidate" | "rebind") && !unsafe_context {
         diagnostics.push(diagnostic(
@@ -1403,7 +1403,7 @@ fn type_core_int_conversion_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
         diagnostics.push(module_diagnostic(
@@ -1499,7 +1499,7 @@ fn type_core_bitcast_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
         diagnostics.push(module_diagnostic(
@@ -1586,7 +1586,7 @@ fn type_core_pointer_cast_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if !unsafe_context {
         diagnostics.push(module_diagnostic(
@@ -1717,7 +1717,7 @@ fn type_core_float_conversion_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
         diagnostics.push(module_diagnostic(
@@ -1797,7 +1797,7 @@ fn type_core_float_conversion(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
         diagnostics.push(diagnostic(
@@ -1889,7 +1889,7 @@ fn type_core_int_conversion(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
         diagnostics.push(diagnostic(
@@ -1988,7 +1988,7 @@ fn type_core_bitcast(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
         diagnostics.push(diagnostic(
@@ -2072,7 +2072,7 @@ fn type_core_pointer_cast(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if !unsafe_context {
         diagnostics.push(diagnostic(
@@ -2153,7 +2153,7 @@ fn type_core_raw_memory_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if !unsafe_context {
         diagnostics.push(module_diagnostic(
@@ -2289,7 +2289,7 @@ fn type_core_raw_memory(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if !unsafe_context {
         diagnostics.push(diagnostic(
@@ -2553,7 +2553,7 @@ pub(super) fn expression_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
         ScalarExpression::Name { name, span } if name == "null" => {
@@ -3454,7 +3454,7 @@ pub(super) fn expression_type_in_module_expected(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if expected.is_some_and(is_error_type) {
         return ScalarType::Error;
@@ -4168,7 +4168,7 @@ fn checked_address_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if !is_supported_checked_address_place(place) {
         diagnostics.push(diagnostic(
@@ -4245,7 +4245,7 @@ fn checked_address_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if !is_supported_checked_address_place(place) {
         diagnostics.push(module_diagnostic(
@@ -4329,7 +4329,7 @@ fn writable_place_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if writable_place_contains_raw_dereference(
         place,
@@ -4368,7 +4368,7 @@ fn writable_place_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if writable_place_contains_raw_dereference_in_module(
         place,
@@ -4414,7 +4414,7 @@ fn writable_place_contains_raw_dereference(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> bool {
     match place {
         ScalarPlace::Name { .. } => false,
@@ -4452,7 +4452,7 @@ fn writable_place_contains_raw_dereference_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> bool {
     match place {
         ScalarPlace::Name { .. } => false,
@@ -4491,7 +4491,7 @@ fn writable_path_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match place {
         ScalarPlace::Name { .. } => {
@@ -4599,7 +4599,7 @@ fn writable_path_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match place {
         ScalarPlace::Name { .. } => place_type_in_module(
@@ -4742,7 +4742,7 @@ pub(super) fn place_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match place {
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
@@ -4857,7 +4857,7 @@ pub(super) fn place_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match place {
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
@@ -5023,7 +5023,7 @@ fn checked_dereference_target_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression_type(
         pointer,
@@ -5077,7 +5077,7 @@ fn checked_dereference_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match place {
         ScalarPlace::Dereference { pointer, span } => checked_dereference_target_type(
@@ -5190,7 +5190,7 @@ fn checked_dereference_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let (pointer, dereference_span, field) = match place {
         ScalarPlace::Dereference { pointer, span } => (pointer, *span, None),
@@ -5752,7 +5752,7 @@ pub(super) fn operator(value: &str) -> BinaryOperator {
 pub(super) fn validate(
     program: &ScalarProgram,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> Vec<super::Diagnostic> {
     let mut diagnostics = Vec::new();
     validate_unit_if_positions(program, &mut diagnostics);
@@ -6461,7 +6461,7 @@ pub(super) fn block_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut visible_names = visible_names.clone();
@@ -6497,7 +6497,7 @@ fn block_type_expected(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let mut scope = scope.clone();
     let mut visible_names = visible_names.clone();
@@ -6550,7 +6550,7 @@ fn block_item_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
@@ -6689,7 +6689,7 @@ fn assignment_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let mut inferred_names = visible_names.clone();
     let mut inferred_folded_names = folded_names.clone();
@@ -6750,7 +6750,7 @@ fn assignment_type(
             span: assignment.span,
         });
     if let Some(outputs) = outputs {
-        inference.record_assignment_outputs(&program.source, &program.items, assignment, &outputs);
+        inference.record_assignment_outputs(&program.source, assignment, &outputs);
         if assignment.targets.len() > outputs.outputs.len() {
             diagnostics.push(diagnostic(
                 program,
@@ -6802,7 +6802,7 @@ fn assignment_target_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> Option<ScalarType> {
     match &target.place {
         ScalarPlace::Name { name, span } => {
@@ -6877,7 +6877,7 @@ fn while_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let condition = expression_type(
         &while_expression.condition,
@@ -6921,7 +6921,7 @@ pub(super) fn expression_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
         ScalarExpression::RawAddress { place, span } => {
@@ -7816,7 +7816,7 @@ fn expression_type_expected(
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarOverloadEnvironment,
-    inference: &mut ScalarInferenceBuilder,
+    inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if is_error_type(expected) {
         return ScalarType::Error;

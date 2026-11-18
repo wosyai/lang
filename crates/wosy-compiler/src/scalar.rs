@@ -2131,8 +2131,9 @@ pub fn derive_scalar_program_from_cst_with_layout(
     };
     resolve_program_types(&mut program, &mut diagnostics);
     let overloads = ScalarOverloadEnvironment::single(&program.source, &program.items);
-    resolve_program_places(&mut program, &overloads);
-    let mut inference = ScalarInferenceBuilder::new();
+    let owners = ScalarAssignmentOwners::new(&program.items);
+    resolve_program_places(&mut program, &overloads, &owners);
+    let mut inference = ScalarInferenceBuilder::new(&owners);
     let mut validation_diagnostics = validate(&program, &overloads, &mut inference);
     let mut diagnostics = diagnostics;
     diagnostics.append(&mut validation_diagnostics);
@@ -2143,6 +2144,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
         drop(inference);
     }
     drop(overloads);
+    drop(owners);
     if diagnostics.is_empty() {
         let module = ScalarModule::from_program(program.clone(), Vec::new());
         let call_sites = resolve_module_call_sites(&program.source, &program.items, &[module]);
@@ -2176,8 +2178,8 @@ pub fn derive_scalar_program_from_cst_with_layout(
 mod declarations;
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
-use inference::ScalarInferenceBuilder;
 pub use inference::{ResolvedAssignmentOutputId, ScalarAssignmentTyping};
+use inference::{ScalarAssignmentOwners, ScalarInferenceBuilder};
 mod overload;
 use overload::{
     record_overload_selections, record_project_overload_selections, ScalarOverloadEnvironment,
@@ -2246,14 +2248,26 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         }
     }
     let overloads = ScalarOverloadEnvironment::project(&project.modules);
+    let owners = project
+        .modules
+        .iter()
+        .map(|module| ScalarAssignmentOwners::new(&module.items))
+        .collect::<Vec<_>>();
     let struct_lookup = project.modules.clone();
     for (ordinal, module) in project.modules.iter_mut().enumerate() {
-        resolve_module_places(module, &struct_lookup, &declarations, ordinal, &overloads);
+        resolve_module_places(
+            module,
+            &struct_lookup,
+            &declarations,
+            ordinal,
+            &overloads,
+            &owners[ordinal],
+        );
     }
     drop(declarations);
     let mut inferences = Vec::with_capacity(project.modules.len());
-    for module in &project.modules {
-        let mut inference = ScalarInferenceBuilder::new();
+    for (ordinal, module) in project.modules.iter().enumerate() {
+        let mut inference = ScalarInferenceBuilder::new(&owners[ordinal]);
         validate_unit_if_positions_in_module(module, &mut diagnostics);
         for structure in &module.structs {
             for field in &structure.fields {
@@ -2671,6 +2685,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         drop(inferences);
     }
     drop(overloads);
+    drop(owners);
     if diagnostics.is_empty() {
         let modules = project.modules.clone();
         for module in &mut project.modules {
