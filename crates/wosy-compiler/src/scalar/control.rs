@@ -1,21 +1,23 @@
+use std::collections::HashMap;
+
 use super::reference::{BlockOrdinal, OccurrenceOrdinal};
-use super::ScalarType;
+use super::{ScalarItem, ScalarNamespaceBinding, ScalarType};
 use wosy_syntax::{ByteSpan, SourceIdentity};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ModuleInitializationRegion {
-    pub(super) source: SourceIdentity,
-    pub(super) steps: Vec<ModuleInitializationStep>,
+pub(crate) struct ModuleInitializationRegion {
+    pub(crate) source: SourceIdentity,
+    pub(crate) steps: Vec<ModuleInitializationStep>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ModuleInitializationStep {
-    pub(super) item: usize,
-    pub(super) kind: ModuleInitializationStepKind,
+pub(crate) struct ModuleInitializationStep {
+    pub(crate) item: usize,
+    pub(crate) kind: ModuleInitializationStepKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum ModuleInitializationStepKind {
+pub(crate) enum ModuleInitializationStepKind {
     NamespaceDispatch {
         binding: String,
         binding_span: ByteSpan,
@@ -26,9 +28,48 @@ pub(super) enum ModuleInitializationStepKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum NamespaceTarget {
+pub(crate) enum NamespaceTarget {
     Bound(SourceIdentity),
     Unbound,
+}
+
+pub(crate) fn module_initialization_region(
+    source: &SourceIdentity,
+    items: &[ScalarItem],
+    namespace_bindings: &[ScalarNamespaceBinding],
+) -> ModuleInitializationRegion {
+    let mut namespace_targets = HashMap::new();
+    for binding in namespace_bindings {
+        namespace_targets
+            .entry(binding.binding.as_str())
+            .or_insert(&binding.target);
+    }
+    let steps = items
+        .iter()
+        .enumerate()
+        .filter_map(|(item, declaration)| {
+            let kind = match declaration {
+                ScalarItem::Namespace(namespace) => {
+                    ModuleInitializationStepKind::NamespaceDispatch {
+                        binding: namespace.binding.clone(),
+                        binding_span: namespace.binding_span,
+                        target: match namespace_targets.get(namespace.binding.as_str()) {
+                            Some(target) => NamespaceTarget::Bound((*target).clone()),
+                            None => NamespaceTarget::Unbound,
+                        },
+                    }
+                }
+                ScalarItem::Binding(_) => ModuleInitializationStepKind::BindingInitialization,
+                ScalarItem::Executable(_) => ModuleInitializationStepKind::ExecutableItem,
+                ScalarItem::Function(_) | ScalarItem::Extern(_) => return None,
+            };
+            Some(ModuleInitializationStep { item, kind })
+        })
+        .collect();
+    ModuleInitializationRegion {
+        source: source.clone(),
+        steps,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

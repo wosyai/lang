@@ -3478,7 +3478,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
     }
 }
 
-mod control;
+pub(crate) mod control;
 mod reference;
 mod static_calls;
 use reference::expand_conditional_final_outputs;

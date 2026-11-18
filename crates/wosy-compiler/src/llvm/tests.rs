@@ -1627,13 +1627,17 @@ select = overload {
         };
         let arm = &overload.overload_arms[1];
         assert!(!arm.reference_cfg.points.is_empty());
-        let missing = super::emit_project_llvm(&legacy.project, &|module, item, arm, function| {
-            if (module, item, arm) == (0, 1, Some(1)) {
-                build.reference_cfg(module, item, Some(overload.overload_arms.len()))
-            } else {
-                Some(&function.reference_cfg)
-            }
-        })
+        let missing = super::emit_project_llvm(
+            &legacy.project,
+            &|module| prepared.initialization_region(module),
+            &|module, item, arm, function| {
+                if (module, item, arm) == (0, 1, Some(1)) {
+                    build.reference_cfg(module, item, Some(overload.overload_arms.len()))
+                } else {
+                    Some(&function.reference_cfg)
+                }
+            },
+        )
         .unwrap_err();
         assert!(
             missing.starts_with("internal error: missing reference CFG"),
@@ -4461,6 +4465,117 @@ fn initializes_namespaces_recursively_in_source_order_once() {
     );
     assert!(child_store.expect("child initialization") < read_call.expect("read call"));
     assert!(read_call.expect("read call") < observed_store.expect("observed store"));
+}
+
+#[test]
+fn detached_project_llvm_initializes_interleaved_namespace_diamond_once() {
+    let source = |name| {
+        SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            format!("src/{name}.w"),
+            "r1".into(),
+        )
+    };
+    let (root, left, right, shared) = (
+        source("main"),
+        source("left"),
+        source("right"),
+        source("shared"),
+    );
+    let declarations = |source: &SourceIdentity, text: &str, targets: &[&SourceIdentity]| {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        assert_eq!(declarations.namespaces().count(), targets.len());
+        let bindings = declarations
+            .namespaces()
+            .zip(targets)
+            .map(|(namespace, &target)| ScalarNamespaceBinding {
+                binding: namespace.binding.clone(),
+                span: namespace.span,
+                target: target.clone(),
+            })
+            .collect();
+        (declarations, bindings)
+    };
+
+    for target_layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_scalar_project(
+            vec![
+                declarations(&shared, "%%start\ni32 value = 30;\n%%end", &[]),
+                declarations(
+                    &right,
+                    "%%start\ncommon = namespace package \"src/shared.w\";\ni32 value = 40;\n%%end",
+                    &[&shared],
+                ),
+                declarations(
+                    &root,
+                    "%%start\ni32 value = 10;\nleft = namespace package \"src/left.w\";\nvalue = 11;\nright = namespace package \"src/right.w\";\ni32 after = 12;\n%%end",
+                    &[&left, &right],
+                ),
+                declarations(
+                    &left,
+                    "%%start\ni32() read = fn { 20 };\ni32 value = 20;\ncommon = namespace package \"src/shared.w\";\ni32 after = 21;\n%%end",
+                    &[&shared],
+                ),
+            ],
+            vec![root.clone(), left.clone(), shared.clone(), right.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|invalid| panic!("{:?}", invalid.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let detached_ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let legacy = validate_scalar_project(prepared.project().clone());
+        assert_eq!(
+            detached_ir,
+            emit_scalar_project_llvm(&legacy).unwrap().to_text(),
+        );
+
+        let main = detached_ir.split("define i32 @main").nth(1).expect("main");
+        let global_store = |source, name, value| {
+            format!(
+                "store i32 {value}, ptr @{},",
+                project_global_name(source, name),
+            )
+        };
+        let mut next = 0;
+        for store in [
+            global_store(&root, "value", 10),
+            global_store(&left, "value", 20),
+            global_store(&shared, "value", 30),
+            global_store(&left, "after", 21),
+            "store i32 11, ptr %assignment_value,".to_owned(),
+            global_store(&right, "value", 40),
+            global_store(&root, "after", 12),
+        ] {
+            assert_eq!(main.matches(&store).count(), 1, "{store}: {main}");
+            next += main[next..]
+                .find(&store)
+                .unwrap_or_else(|| panic!("{store}: {main}"))
+                + store.len();
+        }
+
+        let missing = super::emit_project_llvm(
+            prepared.project(),
+            &|module| {
+                if module == 0 {
+                    prepared.initialization_region(prepared.project().modules.len())
+                } else {
+                    prepared.initialization_region(module)
+                }
+            },
+            &|module, item, arm, _| build.reference_cfg(module, item, arm),
+        )
+        .unwrap_err();
+        assert_eq!(
+            missing,
+            format!(
+                "internal error: missing module initialization region for {shared:?} (module 0)"
+            ),
+        );
+    }
 }
 
 #[test]

@@ -16,6 +16,10 @@ use inkwell::AddressSpace;
 use inkwell::{FloatPredicate, IntPredicate};
 use serde::{Deserialize, Serialize};
 
+use crate::scalar::control::{
+    module_initialization_region, ModuleInitializationRegion, ModuleInitializationStepKind,
+    NamespaceTarget,
+};
 use crate::scalar::layout::ScalarTargetLayouts;
 use crate::scalar::{
     CfgPointKind, CoreOperationId, InvalidationCandidate, InvalidationInputs, ReferenceBindingKind,
@@ -530,9 +534,19 @@ pub fn emit_scalar_project_llvm(
     if !validation.diagnostics.is_empty() {
         return Err("cannot emit LLVM for an invalid scalar project".into());
     }
-    emit_project_llvm(&validation.project, &|_, _, _, function| {
-        Some(&function.reference_cfg)
-    })
+    let regions = validation
+        .project
+        .modules
+        .iter()
+        .map(|module| {
+            module_initialization_region(&module.source, &module.items, &module.namespace_bindings)
+        })
+        .collect::<Vec<_>>();
+    emit_project_llvm(
+        &validation.project,
+        &|module| regions.get(module),
+        &|_, _, _, function| Some(&function.reference_cfg),
+    )
 }
 
 pub fn emit_scalar_build_project_llvm(
@@ -541,13 +555,17 @@ pub fn emit_scalar_build_project_llvm(
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar project".into());
     }
-    emit_project_llvm(validation.prepared().project(), &|module, item, arm, _| {
-        validation.reference_cfg(module, item, arm)
-    })
+    let prepared = validation.prepared();
+    emit_project_llvm(
+        prepared.project(),
+        &|module| prepared.initialization_region(module),
+        &|module, item, arm, _| validation.reference_cfg(module, item, arm),
+    )
 }
 
 fn emit_project_llvm<'a>(
     project: &'a ScalarProject,
+    initialization_region: &dyn Fn(usize) -> Option<&'a ModuleInitializationRegion>,
     reference_cfg: &dyn Fn(
         usize,
         usize,
@@ -571,6 +589,17 @@ fn emit_project_llvm<'a>(
         .iter()
         .map(|&(_, module)| module)
         .collect::<Vec<_>>();
+    let regions = ordered_modules
+        .iter()
+        .map(|&(ordinal, module)| {
+            initialization_region(ordinal).ok_or_else(|| {
+                format!(
+                    "internal error: missing module initialization region for {:?} (module {ordinal})",
+                    module.source,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let require_cfg = |module_ordinal, item_ordinal, arm_index, function: &'a ScalarFunction| {
         reference_cfg(module_ordinal, item_ordinal, arm_index, function).ok_or_else(|| {
             let source = &project.modules[module_ordinal].source;
@@ -828,6 +857,7 @@ fn emit_project_llvm<'a>(
         &runtime_array_results,
         &dynamic_owner_outputs,
         &modules,
+        &regions,
         &globals,
         &module,
         &all_structs,
@@ -1956,6 +1986,7 @@ fn emit_project_main<'ctx, 'module>(
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     modules: &[&ScalarModule],
+    regions: &[&ModuleInitializationRegion],
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     module: &'module Module<'ctx>,
     structs: &'module [&'module ScalarStruct],
@@ -2004,10 +2035,15 @@ fn emit_project_main<'ctx, 'module>(
         next_literal: 0,
         next_block: 0,
     };
-    let root = modules
-        .first()
-        .ok_or_else(|| "project has no reachable modules".to_owned())?;
-    initialize_project_module(context, &mut state, root, modules, globals, &mut Vec::new())?;
+    initialize_project_module(
+        context,
+        &mut state,
+        0,
+        modules,
+        regions,
+        globals,
+        &mut Vec::new(),
+    )?;
     release_scope_runtime_array_owners(context, &mut state, &BTreeMap::new())?;
     release_automatic_return_result_owners(context, &mut state, &BTreeMap::new())?;
     builder
@@ -2019,11 +2055,15 @@ fn emit_project_main<'ctx, 'module>(
 fn initialize_project_module<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
-    module: &'module ScalarModule,
+    position: usize,
     modules: &[&'module ScalarModule],
+    regions: &[&ModuleInitializationRegion],
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     initialized: &mut Vec<wosy_syntax::SourceIdentity>,
 ) -> Result<(), String> {
+    let module = modules[position];
+    let region = regions[position];
+    assert_eq!(region.source, module.source);
     if initialized.contains(&module.source) {
         return Ok(());
     }
@@ -2049,22 +2089,37 @@ fn initialize_project_module<'ctx, 'module>(
     state.automatic_return_result_owners.clear();
     insert_unit_values(&mut state.values, &module.items);
 
-    for item in &module.items {
-        match item {
-            ScalarItem::Namespace(namespace) => {
-                let binding = module
-                    .namespace_bindings
+    for step in &region.steps {
+        match (&step.kind, &module.items[step.item]) {
+            (
+                ModuleInitializationStepKind::NamespaceDispatch {
+                    binding,
+                    binding_span,
+                    target,
+                },
+                ScalarItem::Namespace(namespace),
+            ) => {
+                assert_eq!(binding, &namespace.binding);
+                assert_eq!(*binding_span, namespace.binding_span);
+                let NamespaceTarget::Bound(target) = target else {
+                    return Err(format!("unknown namespace binding {binding}"));
+                };
+                let position = modules
                     .iter()
-                    .find(|binding| binding.binding == namespace.binding)
-                    .ok_or_else(|| format!("unknown namespace binding {}", namespace.binding))?;
-                let target = modules
-                    .iter()
-                    .find(|candidate| candidate.source == binding.target)
-                    .ok_or_else(|| format!("missing namespace target {}", binding.target.path))?;
-                initialize_project_module(context, state, target, modules, globals, initialized)?;
+                    .position(|candidate| &candidate.source == target)
+                    .ok_or_else(|| format!("missing namespace target {}", target.path))?;
+                initialize_project_module(
+                    context,
+                    state,
+                    position,
+                    modules,
+                    regions,
+                    globals,
+                    initialized,
+                )?;
                 state.globals = module_globals(module, globals);
             }
-            ScalarItem::Binding(binding) => {
+            (ModuleInitializationStepKind::BindingInitialization, ScalarItem::Binding(binding)) => {
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 if binding.is_allocation {
                     let receiver = binding
@@ -2133,10 +2188,13 @@ fn initialize_project_module<'ctx, 'module>(
                     );
                 }
             }
-            ScalarItem::Executable(item) => {
+            (ModuleInitializationStepKind::ExecutableItem, ScalarItem::Executable(item)) => {
                 emit_project_block_item(context, state, item, module, modules)?;
             }
-            ScalarItem::Extern(_) | ScalarItem::Function(_) => {}
+            _ => panic!(
+                "module initialization step disagrees with item {} in {:?}",
+                step.item, module.source,
+            ),
         }
     }
 

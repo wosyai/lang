@@ -58,6 +58,13 @@ impl PreparedScalarProject {
         &self.project
     }
 
+    pub(crate) fn initialization_region(
+        &self,
+        module_ordinal: usize,
+    ) -> Option<&control::ModuleInitializationRegion> {
+        self.calls.initialization_region(module_ordinal)
+    }
+
     fn analyze(&self) -> reference::ProjectReferenceResults {
         reference::analyze_project_references(&self.project.modules, &self.calls)
     }
