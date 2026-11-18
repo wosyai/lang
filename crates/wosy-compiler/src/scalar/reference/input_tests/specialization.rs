@@ -205,10 +205,12 @@ fn template_index_retains_first_source_even_when_its_module_is_empty() {
                 (
                     0,
                     FunctionCallSites {
+                        structure: OccurrenceStructure::empty(),
                         sites: Vec::new(),
                         occurrences: Vec::new(),
                         call_occurrences: Vec::new(),
                         arms: vec![FunctionCallSites {
+                            structure: OccurrenceStructure::empty(),
                             sites: Vec::new(),
                             arms: Vec::new(),
                             occurrences: Vec::new(),
@@ -219,6 +221,7 @@ fn template_index_retains_first_source_even_when_its_module_is_empty() {
                 (
                     1,
                     FunctionCallSites {
+                        structure: OccurrenceStructure::empty(),
                         sites: Vec::new(),
                         arms: Vec::new(),
                         occurrences: Vec::new(),

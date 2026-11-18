@@ -277,17 +277,20 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
             &mut installed,
             &module_names,
             &FunctionCallSites {
+                structure: OccurrenceStructure::empty(),
                 sites: Vec::new(),
                 occurrences: Vec::new(),
                 call_occurrences: Vec::new(),
                 arms: vec![
                     FunctionCallSites {
+                        structure: OccurrenceStructure::empty(),
                         sites: Vec::new(),
                         arms: Vec::new(),
                         occurrences: Vec::new(),
                         call_occurrences: Vec::new(),
                     },
                     FunctionCallSites {
+                        structure: OccurrenceStructure::empty(),
                         sites: Vec::new(),
                         arms: Vec::new(),
                         occurrences: Vec::new(),

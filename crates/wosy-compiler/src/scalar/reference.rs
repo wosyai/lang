@@ -3500,8 +3500,76 @@ impl ModuleCallSites {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct OccurrenceOrdinal(pub(super) usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct BlockOrdinal(pub(super) usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum OccurrenceParent {
+    Expression(OccurrenceOrdinal),
+    Place(OccurrenceOrdinal),
+    Block(BlockOrdinal),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum OccurrenceEdge {
+    CallArgument(usize),
+    BinaryLeft,
+    BinaryRight,
+    UnaryOperand,
+    Condition,
+    ThenBranch,
+    ElseBranch,
+    BlockBody,
+    AggregateField(usize),
+    AggregateElement(usize),
+    ExpressionPlace,
+    PlaceBase,
+    PlaceIndex,
+    DereferencePointer,
+    BindingRoot { item: usize, output: usize },
+    ExpressionItem { item: usize },
+    FinalOutput { item: usize, output: usize },
+    AssignmentRhs { item: usize, output: usize },
+    AssignmentDestination { item: usize, destination: usize },
+    WhileCondition { item: usize },
+    WhileBody { item: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OccurrenceNode {
+    Expression(OccurrenceOrdinal),
+    Place(OccurrenceOrdinal),
+    Block(BlockOrdinal),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct OccurrenceStructure {
+    pub(super) root: BlockOrdinal,
+    pub(super) blocks: Vec<ByteSpan>,
+    pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
+}
+
+impl OccurrenceStructure {
+    fn new(span: ByteSpan) -> Self {
+        Self {
+            root: BlockOrdinal(0),
+            blocks: vec![span],
+            edges: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn empty() -> Self {
+        Self {
+            root: BlockOrdinal(0),
+            blocks: Vec::new(),
+            edges: HashMap::new(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum OccurrenceRole {
@@ -3527,6 +3595,7 @@ pub(super) struct FunctionCallSites {
     pub(super) arms: Vec<FunctionCallSites>,
     pub(super) occurrences: Vec<OccurrenceMetadata>,
     pub(super) call_occurrences: Vec<CallOccurrence>,
+    pub(super) structure: OccurrenceStructure,
 }
 
 pub(super) struct ProjectCallSiteResults {
@@ -3555,12 +3624,24 @@ struct ValidatedCallResolver<'a> {
     sites: Vec<ResolvedCallSite>,
     occurrences: Vec<OccurrenceMetadata>,
     call_occurrences: Vec<CallOccurrence>,
+    structure: OccurrenceStructure,
 }
 
 impl ValidatedCallResolver<'_> {
-    fn record_occurrence(&mut self, role: OccurrenceRole, span: ByteSpan) -> OccurrenceOrdinal {
+    fn record_occurrence(
+        &mut self,
+        role: OccurrenceRole,
+        span: ByteSpan,
+        parent: OccurrenceParent,
+        edge: OccurrenceEdge,
+    ) -> OccurrenceOrdinal {
         let ordinal = OccurrenceOrdinal(self.occurrences.len());
         self.occurrences.push(OccurrenceMetadata { role, span });
+        let node = match role {
+            OccurrenceRole::Expression => OccurrenceNode::Expression(ordinal),
+            OccurrenceRole::Place => OccurrenceNode::Place(ordinal),
+        };
+        assert!(self.structure.edges.insert((parent, edge), node).is_none());
         ordinal
     }
 
@@ -3569,9 +3650,16 @@ impl ValidatedCallResolver<'_> {
         expression: &ScalarExpression,
         names: &BTreeMap<String, ReferenceBindingId>,
         types: &BTreeMap<String, ScalarType>,
+        parent: OccurrenceParent,
+        edge: OccurrenceEdge,
     ) -> Result<(), ReferenceAnalysisError> {
-        let ordinal =
-            self.record_occurrence(OccurrenceRole::Expression, expression_span(expression));
+        let ordinal = self.record_occurrence(
+            OccurrenceRole::Expression,
+            expression_span(expression),
+            parent,
+            edge,
+        );
+        let parent = OccurrenceParent::Expression(ordinal);
         match expression {
             ScalarExpression::Call {
                 receiver,
@@ -3700,46 +3788,88 @@ impl ValidatedCallResolver<'_> {
                     ordinal,
                     site: site_index,
                 });
-                for argument in arguments {
-                    self.expression(argument, names, types)?;
+                for (position, argument) in arguments.iter().enumerate() {
+                    self.expression(
+                        argument,
+                        names,
+                        types,
+                        parent,
+                        OccurrenceEdge::CallArgument(position),
+                    )?;
                 }
             }
             ScalarExpression::Binary { left, right, .. } => {
-                self.expression(left, names, types)?;
-                self.expression(right, names, types)?;
+                self.expression(left, names, types, parent, OccurrenceEdge::BinaryLeft)?;
+                self.expression(right, names, types, parent, OccurrenceEdge::BinaryRight)?;
             }
-            ScalarExpression::Unary { operand, .. } => self.expression(operand, names, types)?,
+            ScalarExpression::Unary { operand, .. } => {
+                self.expression(operand, names, types, parent, OccurrenceEdge::UnaryOperand)?
+            }
             ScalarExpression::If {
                 condition,
                 then_branch,
                 else_branch,
                 ..
             } => {
-                self.expression(condition, names, types)?;
-                self.block(then_branch, names, types)?;
-                self.block(else_branch, names, types)?;
+                self.expression(condition, names, types, parent, OccurrenceEdge::Condition)?;
+                self.block(
+                    then_branch,
+                    names,
+                    types,
+                    parent,
+                    OccurrenceEdge::ThenBranch,
+                )?;
+                self.block(
+                    else_branch,
+                    names,
+                    types,
+                    parent,
+                    OccurrenceEdge::ElseBranch,
+                )?;
             }
             ScalarExpression::UnitIf {
                 condition,
                 then_branch,
                 ..
             } => {
-                self.expression(condition, names, types)?;
-                self.block(then_branch, names, types)?;
+                self.expression(condition, names, types, parent, OccurrenceEdge::Condition)?;
+                self.block(
+                    then_branch,
+                    names,
+                    types,
+                    parent,
+                    OccurrenceEdge::ThenBranch,
+                )?;
             }
-            ScalarExpression::Block(block) => self.block(block, names, types)?,
+            ScalarExpression::Block(block) => {
+                self.block(block, names, types, parent, OccurrenceEdge::BlockBody)?
+            }
             ScalarExpression::RawAddress { place, .. }
             | ScalarExpression::CheckedAddress { place, .. }
             | ScalarExpression::Dereference { place, .. }
-            | ScalarExpression::IndexedRead { place, .. } => self.place(place, names, types)?,
+            | ScalarExpression::IndexedRead { place, .. } => {
+                self.place(place, names, types, parent, OccurrenceEdge::ExpressionPlace)?
+            }
             ScalarExpression::StructLiteral { fields, .. } => {
-                for field in fields {
-                    self.expression(&field.value, names, types)?;
+                for (position, field) in fields.iter().enumerate() {
+                    self.expression(
+                        &field.value,
+                        names,
+                        types,
+                        parent,
+                        OccurrenceEdge::AggregateField(position),
+                    )?;
                 }
             }
             ScalarExpression::ArrayLiteral { elements, .. } => {
-                for element in elements {
-                    self.expression(element, names, types)?;
+                for (position, element) in elements.iter().enumerate() {
+                    self.expression(
+                        element,
+                        names,
+                        types,
+                        parent,
+                        OccurrenceEdge::AggregateElement(position),
+                    )?;
                 }
             }
             _ => {}
@@ -3752,16 +3882,32 @@ impl ValidatedCallResolver<'_> {
         place: &ScalarPlace,
         names: &BTreeMap<String, ReferenceBindingId>,
         types: &BTreeMap<String, ScalarType>,
+        parent: OccurrenceParent,
+        edge: OccurrenceEdge,
     ) -> Result<(), ReferenceAnalysisError> {
-        self.record_occurrence(OccurrenceRole::Place, scalar_place_target_span(place));
+        let ordinal = self.record_occurrence(
+            OccurrenceRole::Place,
+            scalar_place_target_span(place),
+            parent,
+            edge,
+        );
+        let parent = OccurrenceParent::Place(ordinal);
         match place {
             ScalarPlace::Name { .. } => {}
-            ScalarPlace::Field { base, .. } => self.place(base, names, types)?,
-            ScalarPlace::Index { base, index, .. } => {
-                self.place(base, names, types)?;
-                self.expression(index, names, types)?;
+            ScalarPlace::Field { base, .. } => {
+                self.place(base, names, types, parent, OccurrenceEdge::PlaceBase)?
             }
-            ScalarPlace::Dereference { pointer, .. } => self.expression(pointer, names, types)?,
+            ScalarPlace::Index { base, index, .. } => {
+                self.place(base, names, types, parent, OccurrenceEdge::PlaceBase)?;
+                self.expression(index, names, types, parent, OccurrenceEdge::PlaceIndex)?;
+            }
+            ScalarPlace::Dereference { pointer, .. } => self.expression(
+                pointer,
+                names,
+                types,
+                parent,
+                OccurrenceEdge::DereferencePointer,
+            )?,
         }
         Ok(())
     }
@@ -3771,21 +3917,59 @@ impl ValidatedCallResolver<'_> {
         block: &ScalarBlock,
         outer: &BTreeMap<String, ReferenceBindingId>,
         outer_types: &BTreeMap<String, ScalarType>,
+        parent: OccurrenceParent,
+        edge: OccurrenceEdge,
     ) -> Result<(), ReferenceAnalysisError> {
+        let ordinal = BlockOrdinal(self.structure.blocks.len());
+        self.structure.blocks.push(block.span);
+        assert!(self
+            .structure
+            .edges
+            .insert((parent, edge), OccurrenceNode::Block(ordinal))
+            .is_none());
+        self.block_items(block, outer, outer_types, ordinal)
+    }
+
+    fn block_items(
+        &mut self,
+        block: &ScalarBlock,
+        outer: &BTreeMap<String, ReferenceBindingId>,
+        outer_types: &BTreeMap<String, ScalarType>,
+        ordinal: BlockOrdinal,
+    ) -> Result<(), ReferenceAnalysisError> {
+        let parent = OccurrenceParent::Block(ordinal);
         let mut names = outer.clone();
         let mut types = outer_types.clone();
-        for (item, _) in block.items_with_output_roles() {
+        for (item_index, (item, role)) in block.items_with_output_roles().enumerate() {
             match item {
                 ScalarBlockItem::LocalBinding(binding) => {
                     let ScalarBindingOutput::Evaluate(primary) = binding.output_source(0) else {
                         unreachable!("primary binding output evaluates its source")
                     };
-                    self.expression(primary, &names, &types)?;
+                    self.expression(
+                        primary,
+                        &names,
+                        &types,
+                        parent,
+                        OccurrenceEdge::BindingRoot {
+                            item: item_index,
+                            output: 0,
+                        },
+                    )?;
                     for position in 1..binding.output_values.len() {
                         if let ScalarBindingOutput::Evaluate(value) =
                             binding.output_source(position)
                         {
-                            self.expression(value, &names, &types)?;
+                            self.expression(
+                                value,
+                                &names,
+                                &types,
+                                parent,
+                                OccurrenceEdge::BindingRoot {
+                                    item: item_index,
+                                    output: position,
+                                },
+                            )?;
                         }
                     }
                     for receiver in &binding.receivers {
@@ -3803,14 +3987,43 @@ impl ValidatedCallResolver<'_> {
                     }
                 }
                 ScalarBlockItem::Expression(expression) => {
-                    self.expression(expression, &names, &types)?
+                    let edge = match role {
+                        ScalarBlockItemRole::Ordinary => {
+                            OccurrenceEdge::ExpressionItem { item: item_index }
+                        }
+                        ScalarBlockItemRole::FinalOutput { output, .. } => {
+                            OccurrenceEdge::FinalOutput {
+                                item: item_index,
+                                output,
+                            }
+                        }
+                    };
+                    self.expression(expression, &names, &types, parent, edge)?
                 }
                 ScalarBlockItem::Assignment(assignment) => {
-                    for (_, value) in assignment.rhs().evaluations() {
-                        self.expression(value, &names, &types)?;
+                    for (output, value) in assignment.rhs().evaluations() {
+                        self.expression(
+                            value,
+                            &names,
+                            &types,
+                            parent,
+                            OccurrenceEdge::AssignmentRhs {
+                                item: item_index,
+                                output,
+                            },
+                        )?;
                     }
-                    for target in &assignment.targets {
-                        self.place(&target.place, &names, &types)?;
+                    for (destination, target) in assignment.targets.iter().enumerate() {
+                        self.place(
+                            &target.place,
+                            &names,
+                            &types,
+                            parent,
+                            OccurrenceEdge::AssignmentDestination {
+                                item: item_index,
+                                destination,
+                            },
+                        )?;
                     }
                     for target in &assignment.targets {
                         if let ScalarPlace::Name { name, .. } = &target.place {
@@ -3837,8 +4050,20 @@ impl ValidatedCallResolver<'_> {
                     }
                 }
                 ScalarBlockItem::While(while_expression) => {
-                    self.expression(&while_expression.condition, &names, &types)?;
-                    self.block(&while_expression.body, &names, &types)?;
+                    self.expression(
+                        &while_expression.condition,
+                        &names,
+                        &types,
+                        parent,
+                        OccurrenceEdge::WhileCondition { item: item_index },
+                    )?;
+                    self.block(
+                        &while_expression.body,
+                        &names,
+                        &types,
+                        parent,
+                        OccurrenceEdge::WhileBody { item: item_index },
+                    )?;
                 }
             }
         }
@@ -3941,6 +4166,7 @@ fn resolve_function_call_sites(
         sites: Vec::new(),
         occurrences: Vec::new(),
         call_occurrences: Vec::new(),
+        structure: OccurrenceStructure::new(function.body.span),
     };
     let mut parameter_names = BTreeMap::new();
     let mut parameter_types = BTreeMap::new();
@@ -3965,12 +4191,18 @@ fn resolve_function_call_sites(
             },
         );
     }
-    resolver.block(&function.body, &parameter_names, &parameter_types)?;
+    resolver.block_items(
+        &function.body,
+        &parameter_names,
+        &parameter_types,
+        resolver.structure.root,
+    )?;
     Ok(FunctionCallSites {
         sites: resolver.sites,
         arms,
         occurrences: resolver.occurrences,
         call_occurrences: resolver.call_occurrences,
+        structure: resolver.structure,
     })
 }
 

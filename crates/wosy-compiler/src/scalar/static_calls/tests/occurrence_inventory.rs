@@ -1,4 +1,7 @@
 use super::*;
+use reference::{
+    BlockOrdinal, OccurrenceEdge as Edge, OccurrenceNode as Node, OccurrenceParent as Parent,
+};
 use reference::{CallOccurrence, OccurrenceOrdinal, OccurrenceRole};
 
 #[test]
@@ -29,6 +32,127 @@ fn preparation_publishes_stable_callable_owned_expression_place_and_call_ordinal
         assert!(owner.occurrences.is_empty());
         assert_eq!(owner.arms.len(), 2);
         let row = &owner.arms[0];
+        let root = Parent::Block(row.structure.root);
+        assert_eq!(row.structure.root, BlockOrdinal(0));
+        assert_eq!(row.structure.blocks.len(), 3);
+        assert_eq!(row.structure.edges.len(), 22);
+        for (edge, node) in [
+            (
+                Edge::BindingRoot { item: 0, output: 0 },
+                Node::Expression(OccurrenceOrdinal(0)),
+            ),
+            (
+                Edge::ExpressionItem { item: 1 },
+                Node::Expression(OccurrenceOrdinal(3)),
+            ),
+            (
+                Edge::ExpressionItem { item: 2 },
+                Node::Expression(OccurrenceOrdinal(4)),
+            ),
+            (
+                Edge::BindingRoot { item: 3, output: 0 },
+                Node::Expression(OccurrenceOrdinal(5)),
+            ),
+            (
+                Edge::ExpressionItem { item: 4 },
+                Node::Expression(OccurrenceOrdinal(8)),
+            ),
+            (
+                Edge::AssignmentRhs { item: 5, output: 0 },
+                Node::Expression(OccurrenceOrdinal(14)),
+            ),
+            (
+                Edge::AssignmentDestination {
+                    item: 5,
+                    destination: 0,
+                },
+                Node::Place(OccurrenceOrdinal(15)),
+            ),
+            (
+                Edge::ExpressionItem { item: 6 },
+                Node::Expression(OccurrenceOrdinal(19)),
+            ),
+        ] {
+            assert_eq!(row.structure.edges[&(root, edge)], node);
+        }
+        assert!(!row
+            .structure
+            .edges
+            .contains_key(&(root, Edge::BindingRoot { item: 0, output: 1 })));
+        for (parent, edge, node) in [
+            (
+                Parent::Expression(OccurrenceOrdinal(0)),
+                Edge::CallArgument(0),
+                Node::Expression(OccurrenceOrdinal(1)),
+            ),
+            (
+                Parent::Expression(OccurrenceOrdinal(1)),
+                Edge::CallArgument(0),
+                Node::Expression(OccurrenceOrdinal(2)),
+            ),
+            (
+                Parent::Expression(OccurrenceOrdinal(5)),
+                Edge::AggregateElement(0),
+                Node::Expression(OccurrenceOrdinal(6)),
+            ),
+            (
+                Parent::Expression(OccurrenceOrdinal(5)),
+                Edge::AggregateElement(1),
+                Node::Expression(OccurrenceOrdinal(7)),
+            ),
+            (
+                Parent::Expression(OccurrenceOrdinal(8)),
+                Edge::Condition,
+                Node::Expression(OccurrenceOrdinal(9)),
+            ),
+            (
+                Parent::Expression(OccurrenceOrdinal(8)),
+                Edge::ThenBranch,
+                Node::Block(BlockOrdinal(1)),
+            ),
+            (
+                Parent::Expression(OccurrenceOrdinal(8)),
+                Edge::ElseBranch,
+                Node::Block(BlockOrdinal(2)),
+            ),
+            (
+                Parent::Block(BlockOrdinal(1)),
+                Edge::ExpressionItem { item: 0 },
+                Node::Expression(OccurrenceOrdinal(10)),
+            ),
+            (
+                Parent::Expression(OccurrenceOrdinal(10)),
+                Edge::CallArgument(0),
+                Node::Expression(OccurrenceOrdinal(11)),
+            ),
+            (
+                Parent::Block(BlockOrdinal(2)),
+                Edge::ExpressionItem { item: 0 },
+                Node::Expression(OccurrenceOrdinal(12)),
+            ),
+            (
+                Parent::Expression(OccurrenceOrdinal(12)),
+                Edge::CallArgument(0),
+                Node::Expression(OccurrenceOrdinal(13)),
+            ),
+            (
+                Parent::Place(OccurrenceOrdinal(15)),
+                Edge::PlaceBase,
+                Node::Place(OccurrenceOrdinal(16)),
+            ),
+            (
+                Parent::Place(OccurrenceOrdinal(15)),
+                Edge::PlaceIndex,
+                Node::Expression(OccurrenceOrdinal(17)),
+            ),
+            (
+                Parent::Expression(OccurrenceOrdinal(17)),
+                Edge::CallArgument(0),
+                Node::Expression(OccurrenceOrdinal(18)),
+            ),
+        ] {
+            assert_eq!(row.structure.edges[&(parent, edge)], node);
+        }
         assert_eq!(row.occurrences.len(), 20);
         assert_eq!(
             row.call_occurrences,
@@ -75,6 +199,17 @@ fn preparation_publishes_stable_callable_owned_expression_place_and_call_ordinal
             panic!("actual function item ordinal")
         };
         let arm = &function.overload_arms[0];
+        assert_eq!(row.structure.blocks[0], arm.body.span);
+        let ScalarBlockItem::Expression(ScalarExpression::If {
+            then_branch,
+            else_branch,
+            ..
+        }) = &arm.body.items[4]
+        else {
+            panic!("conditional item")
+        };
+        assert_eq!(row.structure.blocks[1], then_branch.span);
+        assert_eq!(row.structure.blocks[2], else_branch.span);
         let ScalarBlockItem::LocalBinding(binding) = &arm.body.items[0] else {
             panic!("projected binding")
         };
@@ -137,6 +272,7 @@ fn preparation_publishes_stable_callable_owned_expression_place_and_call_ordinal
             0,
             row.occurrences.clone(),
             row.call_occurrences.clone(),
+            row.structure.clone(),
         );
         if let Some(expected) = &expected_inventory {
             assert_eq!(&qualified, expected);
@@ -227,6 +363,30 @@ fn preparation_keeps_equal_span_independent_occurrences_and_earlier_legacy_call_
         drop(copies);
         drop(scope);
         let row = prepared.calls.as_ref().unwrap().function(1);
+        let root = Parent::Block(row.structure.root);
+        assert_eq!(row.structure.blocks.len(), 1);
+        assert_eq!(row.structure.edges.len(), 10);
+        assert_eq!(
+            row.structure.edges[&(root, Edge::BindingRoot { item: 0, output: 0 })],
+            Node::Expression(OccurrenceOrdinal(0))
+        );
+        assert_eq!(
+            row.structure.edges[&(root, Edge::BindingRoot { item: 0, output: 1 })],
+            Node::Expression(OccurrenceOrdinal(4))
+        );
+        for (parent, edge, child) in [
+            (0, Edge::BinaryLeft, 1),
+            (0, Edge::BinaryRight, 3),
+            (1, Edge::CallArgument(0), 2),
+            (4, Edge::BinaryLeft, 5),
+            (4, Edge::BinaryRight, 7),
+            (5, Edge::CallArgument(0), 6),
+        ] {
+            assert_eq!(
+                row.structure.edges[&(Parent::Expression(OccurrenceOrdinal(parent)), edge)],
+                Node::Expression(OccurrenceOrdinal(child))
+            );
+        }
         assert_eq!(row.occurrences.len(), 10);
         assert_eq!(row.occurrences[0], row.occurrences[4]);
         assert_eq!(row.occurrences[0].span, root_span);
