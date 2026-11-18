@@ -1,3 +1,4 @@
+use super::control::CheckedCallSignature;
 use super::*;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -71,22 +72,36 @@ impl ScalarAssignmentTyping {
 // Preparation-local address identity. Validation and the structural walk borrow the same
 // AST nodes; intervening ownership moves preserve their Vec buffers, and overload selections
 // update fields in place. Keys are compared only and never dereferenced or published.
-pub(super) struct ModuleAssignmentOutputs(HashMap<*const ScalarAssignment, Vec<ScalarType>>);
+pub(super) struct PreparationOccurrenceTyping {
+    module_assignments: HashMap<*const ScalarAssignment, Vec<ScalarType>>,
+    calls: HashMap<*const ScalarExpression, CheckedCallSignature>,
+}
 
-impl ModuleAssignmentOutputs {
-    pub(super) fn take(&mut self, assignment: &ScalarAssignment) -> std::vec::IntoIter<ScalarType> {
-        self.0
+impl PreparationOccurrenceTyping {
+    pub(super) fn take_assignment(
+        &mut self,
+        assignment: &ScalarAssignment,
+    ) -> std::vec::IntoIter<ScalarType> {
+        self.module_assignments
             .remove(&std::ptr::from_ref(assignment))
             .unwrap_or_default()
             .into_iter()
+    }
+
+    pub(super) fn take_call(
+        &mut self,
+        expression: &ScalarExpression,
+    ) -> Option<CheckedCallSignature> {
+        self.calls.remove(&std::ptr::from_ref(expression))
     }
 }
 
 pub(super) struct ScalarInferenceBuilder<'a> {
     owners: &'a ScalarAssignmentOwners,
     assignments: HashMap<ResolvedAssignmentOutputId, ScalarType>,
-    module_outputs: ModuleAssignmentOutputs,
+    occurrences: PreparationOccurrenceTyping,
     in_module_initialization: bool,
+    suppress_call_signatures: bool,
 }
 
 impl<'a> ScalarInferenceBuilder<'a> {
@@ -94,8 +109,16 @@ impl<'a> ScalarInferenceBuilder<'a> {
         Self {
             owners,
             assignments: HashMap::new(),
-            module_outputs: ModuleAssignmentOutputs::default(),
+            occurrences: PreparationOccurrenceTyping::default(),
             in_module_initialization: false,
+            suppress_call_signatures: true,
+        }
+    }
+
+    pub(super) fn for_validation(owners: &'a ScalarAssignmentOwners) -> Self {
+        Self {
+            suppress_call_signatures: false,
+            ..Self::new(owners)
         }
     }
 
@@ -104,13 +127,45 @@ impl<'a> ScalarInferenceBuilder<'a> {
         self.finish().0
     }
 
-    pub(super) fn finish(self) -> (ScalarAssignmentTyping, ModuleAssignmentOutputs) {
+    pub(super) fn finish(self) -> (ScalarAssignmentTyping, PreparationOccurrenceTyping) {
         (
             ScalarAssignmentTyping {
                 assignments: self.assignments,
             },
-            self.module_outputs,
+            self.occurrences,
         )
+    }
+
+    pub(super) fn without_call_signatures(
+        &mut self,
+        check_arguments: impl FnOnce(&mut Self) -> Vec<ScalarType>,
+    ) -> Vec<ScalarType> {
+        let previous = std::mem::replace(&mut self.suppress_call_signatures, true);
+        let arguments = check_arguments(self);
+        self.suppress_call_signatures = previous;
+        arguments
+    }
+
+    pub(super) fn record_call_signature(
+        &mut self,
+        expression: &ScalarExpression,
+        parameters: &[ScalarType],
+        outputs: &ScalarOutputSequence,
+        overload_arm: Option<usize>,
+    ) {
+        if self.suppress_call_signatures
+            || matches!(expression, ScalarExpression::Call { receiver: Some(receiver), .. } if receiver == "core")
+        {
+            return;
+        }
+        self.occurrences.calls.insert(
+            std::ptr::from_ref(expression),
+            CheckedCallSignature {
+                parameters: parameters.to_vec(),
+                outputs: outputs.clone(),
+                overload_arm,
+            },
+        );
     }
 
     pub(super) fn set_validation_root(&mut self, item: &ScalarItem) {
@@ -125,7 +180,7 @@ impl<'a> ScalarInferenceBuilder<'a> {
         outputs: &ScalarOutputSequence,
     ) {
         if self.in_module_initialization {
-            self.module_outputs.0.insert(
+            self.occurrences.module_assignments.insert(
                 std::ptr::from_ref(assignment),
                 outputs
                     .outputs

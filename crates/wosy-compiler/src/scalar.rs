@@ -2251,13 +2251,13 @@ fn typecheck_scalar_program(
     declarations: ScalarSourceDeclarations,
     target_layout: ScalarTargetLayout,
 ) -> ScalarValidation {
-    typecheck_scalar_program_with_initialization_outputs(declarations, target_layout).0
+    typecheck_scalar_program_with_occurrences(declarations, target_layout).0
 }
 
-fn typecheck_scalar_program_with_initialization_outputs(
+fn typecheck_scalar_program_with_occurrences(
     declarations: ScalarSourceDeclarations,
     target_layout: ScalarTargetLayout,
-) -> (ScalarValidation, ModuleAssignmentOutputs) {
+) -> (ScalarValidation, PreparationOccurrenceTyping) {
     let ScalarSourceDeclarations {
         source,
         items,
@@ -2279,18 +2279,18 @@ fn typecheck_scalar_program_with_initialization_outputs(
     let typing = overloads.typing(0);
     let owners = ScalarAssignmentOwners::new(&program.items);
     resolve_program_places(&mut program, &typing, &owners);
-    let mut inference = ScalarInferenceBuilder::new(&owners);
+    let mut inference = ScalarInferenceBuilder::for_validation(&owners);
     let mut validation_diagnostics = validate(&program, &typing, &mut inference);
     let mut diagnostics = diagnostics;
     diagnostics.append(&mut validation_diagnostics);
-    let module_outputs = if diagnostics.is_empty() {
+    let occurrence_typing = if diagnostics.is_empty() {
         record_overload_selections(&mut program, &overloads);
-        let (callable_outputs, module_outputs) = inference.finish();
+        let (callable_outputs, occurrences) = inference.finish();
         program.resolved_assignment_outputs = callable_outputs;
-        module_outputs
+        occurrences
     } else {
         drop(inference);
-        ModuleAssignmentOutputs::default()
+        PreparationOccurrenceTyping::default()
     };
     drop(overloads);
     drop(owners);
@@ -2299,7 +2299,7 @@ fn typecheck_scalar_program_with_initialization_outputs(
             program,
             diagnostics,
         },
-        module_outputs,
+        occurrence_typing,
     )
 }
 
@@ -2317,7 +2317,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
 mod declarations;
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
-use inference::{ModuleAssignmentOutputs, ScalarAssignmentOwners, ScalarInferenceBuilder};
+use inference::{PreparationOccurrenceTyping, ScalarAssignmentOwners, ScalarInferenceBuilder};
 pub use inference::{ResolvedAssignmentOutputId, ScalarAssignmentTyping};
 mod overload;
 use overload::{
@@ -2353,12 +2353,12 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
 
 #[cfg(test)]
 fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
-    typecheck_scalar_project_with_initialization_outputs(project).0
+    typecheck_scalar_project_with_occurrences(project).0
 }
 
-fn typecheck_scalar_project_with_initialization_outputs(
+fn typecheck_scalar_project_with_occurrences(
     project: ScalarProject,
-) -> (ScalarProjectValidation, Vec<ModuleAssignmentOutputs>) {
+) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
     let mut project = project;
     let mut diagnostics = Vec::new();
     for module in &mut project.modules {
@@ -2417,7 +2417,7 @@ fn typecheck_scalar_project_with_initialization_outputs(
     for (ordinal, module) in modules.iter().enumerate() {
         let items: &[ScalarItem] = module_items[ordinal];
         let overloads = overloads.typing(ordinal);
-        let mut inference = ScalarInferenceBuilder::new(&owners[ordinal]);
+        let mut inference = ScalarInferenceBuilder::for_validation(&owners[ordinal]);
         validate_unit_if_positions_in_module(items, module.source, &mut diagnostics);
         for structure in module.structs {
             for field in &structure.fields {
@@ -2831,16 +2831,16 @@ fn typecheck_scalar_project_with_initialization_outputs(
     }
     drop(module_items);
     drop(modules);
-    let module_outputs = if diagnostics.is_empty() {
+    let occurrence_typing = if diagnostics.is_empty() {
         record_project_overload_selections(&mut project, &overloads);
         project
             .modules
             .iter_mut()
             .zip(inferences)
             .map(|(module, inference)| {
-                let (callable_outputs, module_outputs) = inference.finish();
+                let (callable_outputs, occurrences) = inference.finish();
                 module.resolved_assignment_outputs = callable_outputs;
-                module_outputs
+                occurrences
             })
             .collect()
     } else {
@@ -2854,7 +2854,7 @@ fn typecheck_scalar_project_with_initialization_outputs(
             project,
             diagnostics,
         },
-        module_outputs,
+        occurrence_typing,
     )
 }
 

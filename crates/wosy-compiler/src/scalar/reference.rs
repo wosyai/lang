@@ -3,9 +3,9 @@ use super::control::NamespaceTarget;
 use super::control::{
     module_initialization_region, BindingAllocationLengthSlot, BindingInitialization,
     BindingOutput, BindingOutputs, BindingReceiverSlot, BindingRegion, BlockItem, BlockItemKind,
-    BlockPosition, BlockRegion, ConditionalRegion, FinalOutputSlot, ModuleInitializationDetail,
-    ModuleInitializationRegion, ModuleInitializationStepKind, ModuleInitializationTopology,
-    ShortCircuitRegion, WhileRegion,
+    BlockPosition, BlockRegion, CheckedCallSignature, ConditionalRegion, FinalOutputSlot,
+    ModuleInitializationDetail, ModuleInitializationRegion, ModuleInitializationStepKind,
+    ModuleInitializationTopology, ShortCircuitRegion, WhileRegion,
 };
 use super::control::{
     AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentReplacement,
@@ -3796,22 +3796,24 @@ impl<'a> CallResolutionModule<'a> {
 pub(super) fn resolve_program_call_sites(
     program: &ScalarProgram,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
-    resolve_program_call_sites_impl(program, WalkMode::StructuralOnly)
-}
-
-pub(super) fn resolve_program_call_sites_with_initialization_outputs(
-    program: &ScalarProgram,
-    initialization_outputs: ModuleAssignmentOutputs,
-) -> Result<ModuleCallSites, ReferenceAnalysisError> {
     resolve_program_call_sites_impl(
         program,
-        WalkMode::ModuleInitialization(initialization_outputs),
+        WalkMode::StructuralOnly,
+        PreparationOccurrenceTyping::default(),
     )
+}
+
+pub(super) fn resolve_program_call_sites_with_occurrences(
+    program: &ScalarProgram,
+    occurrence_typing: PreparationOccurrenceTyping,
+) -> Result<ModuleCallSites, ReferenceAnalysisError> {
+    resolve_program_call_sites_impl(program, WalkMode::ModuleInitialization, occurrence_typing)
 }
 
 fn resolve_program_call_sites_impl(
     program: &ScalarProgram,
     initialization_mode: WalkMode<'_>,
+    occurrence_typing: PreparationOccurrenceTyping,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
     let modules = [CallResolutionModule::program(program)];
     resolve_module_call_sites(
@@ -3821,6 +3823,7 @@ fn resolve_program_call_sites_impl(
         &modules,
         program.resolved_assignment_outputs.as_map(),
         initialization_mode,
+        occurrence_typing,
     )
 }
 
@@ -3962,6 +3965,7 @@ pub(super) struct FunctionCallSites {
     pub(super) occurrences: Vec<OccurrenceMetadata>,
     pub(super) call_occurrences: Vec<CallOccurrence>,
     pub(super) allocation_length_calls: Vec<OccurrenceOrdinal>,
+    pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     query_allocation_outputs: HashMap<(BlockOrdinal, usize), BindingOutputs>,
     pub(super) structure: OccurrenceStructure,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
@@ -3991,29 +3995,29 @@ impl ProjectCallSiteResults {
 
 #[cfg(test)]
 pub(super) fn resolve_project_call_sites(modules: &[ScalarModule]) -> ProjectCallSiteResults {
-    resolve_project_call_sites_impl(modules, ModuleInitializationInputs::StructuralOnly)
+    resolve_project_call_sites_impl(modules, OccurrenceTypingInputs::StructuralOnly)
 }
 
-pub(super) fn resolve_project_call_sites_with_initialization_outputs(
+pub(super) fn resolve_project_call_sites_with_occurrences(
     modules: &[ScalarModule],
-    initialization_outputs: Vec<ModuleAssignmentOutputs>,
+    occurrence_typing: Vec<PreparationOccurrenceTyping>,
 ) -> ProjectCallSiteResults {
-    assert_eq!(modules.len(), initialization_outputs.len());
+    assert_eq!(modules.len(), occurrence_typing.len());
     resolve_project_call_sites_impl(
         modules,
-        ModuleInitializationInputs::Typed(initialization_outputs.into_iter()),
+        OccurrenceTypingInputs::Typed(occurrence_typing.into_iter()),
     )
 }
 
-enum ModuleInitializationInputs {
-    Typed(std::vec::IntoIter<ModuleAssignmentOutputs>),
+enum OccurrenceTypingInputs {
+    Typed(std::vec::IntoIter<PreparationOccurrenceTyping>),
     #[cfg(test)]
     StructuralOnly,
 }
 
 fn resolve_project_call_sites_impl(
     modules: &[ScalarModule],
-    mut initialization_inputs: ModuleInitializationInputs,
+    mut occurrence_inputs: OccurrenceTypingInputs,
 ) -> ProjectCallSiteResults {
     let views = modules
         .iter()
@@ -4023,12 +4027,16 @@ fn resolve_project_call_sites_impl(
         modules: modules
             .iter()
             .map(|module| {
-                let initialization_mode = match &mut initialization_inputs {
-                    ModuleInitializationInputs::Typed(outputs) => WalkMode::ModuleInitialization(
-                        outputs.next().expect("one typing table per module"),
+                let (initialization_mode, occurrence_typing) = match &mut occurrence_inputs {
+                    OccurrenceTypingInputs::Typed(occurrences) => (
+                        WalkMode::ModuleInitialization,
+                        occurrences.next().expect("one typing table per module"),
                     ),
                     #[cfg(test)]
-                    ModuleInitializationInputs::StructuralOnly => WalkMode::StructuralOnly,
+                    OccurrenceTypingInputs::StructuralOnly => (
+                        WalkMode::StructuralOnly,
+                        PreparationOccurrenceTyping::default(),
+                    ),
                 };
                 resolve_module_call_sites(
                     &module.source,
@@ -4037,6 +4045,7 @@ fn resolve_project_call_sites_impl(
                     &views,
                     module.resolved_assignment_outputs.as_map(),
                     initialization_mode,
+                    occurrence_typing,
                 )
             })
             .collect(),
@@ -4057,7 +4066,7 @@ struct CallableWalk<'a> {
 
 enum WalkMode<'a> {
     Callable(CallableWalk<'a>),
-    ModuleInitialization(ModuleAssignmentOutputs),
+    ModuleInitialization,
     StructuralOnly,
 }
 
@@ -4067,8 +4076,10 @@ struct WalkScope {
     types: BTreeMap<String, ScalarType>,
 }
 
-struct StructuralWalker<'a> {
+struct StructuralWalker<'a, 'typing> {
     mode: WalkMode<'a>,
+    occurrence_typing: &'typing mut PreparationOccurrenceTyping,
+    checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     structural_calls: Vec<OccurrenceOrdinal>,
     occurrences: Vec<OccurrenceMetadata>,
     structure: OccurrenceStructure,
@@ -4078,10 +4089,16 @@ struct StructuralWalker<'a> {
     short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
 }
 
-impl<'a> StructuralWalker<'a> {
-    fn new(mode: WalkMode<'a>, span: ByteSpan) -> Self {
+impl<'a, 'typing> StructuralWalker<'a, 'typing> {
+    fn new(
+        mode: WalkMode<'a>,
+        span: ByteSpan,
+        occurrence_typing: &'typing mut PreparationOccurrenceTyping,
+    ) -> Self {
         Self {
             mode,
+            occurrence_typing,
+            checked_call_signatures: HashMap::new(),
             structural_calls: Vec::new(),
             occurrences: Vec::new(),
             structure: OccurrenceStructure::new(span),
@@ -4272,7 +4289,7 @@ impl CallableWalk<'_> {
     }
 }
 
-impl StructuralWalker<'_> {
+impl StructuralWalker<'_, '_> {
     fn expression_children(
         &mut self,
         expression: &ScalarExpression,
@@ -4283,11 +4300,14 @@ impl StructuralWalker<'_> {
         let parent = OccurrenceParent::Expression(ordinal);
         match expression {
             ScalarExpression::Call { arguments, .. } => {
+                if let Some(signature) = self.occurrence_typing.take_call(expression) {
+                    self.checked_call_signatures.insert(ordinal, signature);
+                }
                 match &mut self.mode {
                     WalkMode::Callable(callable) => {
                         callable.register_call(ordinal, expression, names, types)?;
                     }
-                    WalkMode::ModuleInitialization(_) | WalkMode::StructuralOnly => {
+                    WalkMode::ModuleInitialization | WalkMode::StructuralOnly => {
                         self.structural_calls.push(ordinal);
                     }
                 }
@@ -4726,7 +4746,9 @@ impl StructuralWalker<'_> {
                     })
                     .collect();
                 let mut module_outputs = match &mut self.mode {
-                    WalkMode::ModuleInitialization(outputs) => outputs.take(assignment),
+                    WalkMode::ModuleInitialization => {
+                        self.occurrence_typing.take_assignment(assignment)
+                    }
                     _ => std::vec::IntoIter::default(),
                 };
                 let mut slots = Vec::new();
@@ -4743,7 +4765,7 @@ impl StructuralWalker<'_> {
                     )?;
                     let replacement = match &self.mode {
                         WalkMode::StructuralOnly => AssignmentReplacement::StructuralOnly,
-                        WalkMode::ModuleInitialization(_) => module_outputs.next().map_or(
+                        WalkMode::ModuleInitialization => module_outputs.next().map_or(
                             AssignmentReplacement::Missing,
                             AssignmentReplacement::Resolved,
                         ),
@@ -4856,6 +4878,7 @@ fn resolve_module_call_sites(
     modules: &[CallResolutionModule<'_>],
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
     initialization_mode: WalkMode<'_>,
+    mut occurrence_typing: PreparationOccurrenceTyping,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
     #[cfg(test)]
     stage_observations::record_call_sites();
@@ -4915,14 +4938,19 @@ fn resolve_module_call_sites(
                 &extern_callables,
                 modules,
                 assignment_outputs,
+                &mut occurrence_typing,
             )?;
             functions.insert(index, calls);
         }
     }
     let mut initialization = module_initialization_region(source, items, namespace_bindings);
-    initialization.detail = ModuleInitializationDetail::Occurrences(Box::new(
-        walk_module_initialization(&initialization, items, initialization_mode),
-    ));
+    initialization.detail =
+        ModuleInitializationDetail::Occurrences(Box::new(walk_module_initialization(
+            &initialization,
+            items,
+            initialization_mode,
+            &mut occurrence_typing,
+        )));
     Ok(ModuleCallSites {
         functions,
         initialization,
@@ -4933,8 +4961,10 @@ fn walk_module_initialization(
     region: &ModuleInitializationRegion,
     items: &[ScalarItem],
     initialization_mode: WalkMode<'_>,
+    occurrence_typing: &mut PreparationOccurrenceTyping,
 ) -> ModuleInitializationTopology {
-    let mut walker = StructuralWalker::new(initialization_mode, ByteSpan::new(0, 0));
+    let mut walker =
+        StructuralWalker::new(initialization_mode, ByteSpan::new(0, 0), occurrence_typing);
     let root = walker.structure.root;
     let mut scope = WalkScope::default();
     let mut block_items = Vec::new();
@@ -4997,6 +5027,7 @@ fn walk_module_initialization(
         structure: walker.structure,
         occurrences: walker.occurrences,
         calls: walker.structural_calls,
+        checked_call_signatures: walker.checked_call_signatures,
         assignments: walker.assignments,
         conditionals: walker.conditionals,
         loops: walker.loops,
@@ -5017,6 +5048,7 @@ pub(super) fn test_function_call_sites(
         &BTreeMap::new(),
         &[],
         assignment_outputs,
+        &mut PreparationOccurrenceTyping::default(),
     )
     .expect("test callable without call declarations")
 }
@@ -5028,6 +5060,7 @@ fn resolve_function_call_sites(
     extern_callables: &BTreeMap<(String, String), (SourceIdentity, ByteSpan)>,
     modules: &[CallResolutionModule<'_>],
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
+    occurrence_typing: &mut PreparationOccurrenceTyping,
 ) -> Result<FunctionCallSites, ReferenceAnalysisError> {
     let mut arms = Vec::new();
     for arm in &function.overload_arms {
@@ -5038,6 +5071,7 @@ fn resolve_function_call_sites(
             extern_callables,
             modules,
             assignment_outputs,
+            occurrence_typing,
         )?);
     }
     let callable = CallableWalk {
@@ -5051,7 +5085,11 @@ fn resolve_function_call_sites(
         call_occurrences: Vec::new(),
         query_allocation_outputs: HashMap::new(),
     };
-    let mut resolver = StructuralWalker::new(WalkMode::Callable(callable), function.body.span);
+    let mut resolver = StructuralWalker::new(
+        WalkMode::Callable(callable),
+        function.body.span,
+        occurrence_typing,
+    );
     let mut parameter_names = BTreeMap::new();
     let mut parameter_types = BTreeMap::new();
     let ScalarType::Callable {
@@ -5125,6 +5163,7 @@ fn resolve_function_call_sites(
         occurrences: resolver.occurrences,
         call_occurrences: callable.call_occurrences,
         allocation_length_calls: resolver.structural_calls,
+        checked_call_signatures: resolver.checked_call_signatures,
         query_allocation_outputs: callable.query_allocation_outputs,
         structure: resolver.structure,
         assignments: resolver.assignments,

@@ -3094,6 +3094,7 @@ pub(super) fn expression_type_in_module(
                         ));
                         return ScalarType::Error;
                     }
+                    let diagnostics_before_arguments = diagnostics.len();
                     let mut error_argument = false;
                     for (argument, parameter) in arguments.iter().zip(parameters) {
                         let actual = expression_type_in_module_expected(
@@ -3121,6 +3122,9 @@ pub(super) fn expression_type_in_module(
                     return if error_argument {
                         ScalarType::Error
                     } else {
+                        if diagnostics.len() == diagnostics_before_arguments {
+                            inference.record_call_signature(expression, parameters, outputs, None);
+                        }
                         scalar_call_result_in_module(outputs)
                     };
                 }
@@ -3247,6 +3251,7 @@ pub(super) fn expression_type_in_module(
                 ));
                 return ScalarType::Error;
             };
+            let diagnostics_before_arguments = diagnostics.len();
             if arguments.len() != parameters.len() {
                 diagnostics.push(module_diagnostic(
                     module,
@@ -3284,6 +3289,9 @@ pub(super) fn expression_type_in_module(
             if error_argument {
                 ScalarType::Error
             } else {
+                if diagnostics.len() == diagnostics_before_arguments {
+                    inference.record_call_signature(expression, parameters, outputs, None);
+                }
                 scalar_call_result_in_module(outputs)
             }
         }
@@ -3445,36 +3453,39 @@ pub(super) fn expression_type_in_module_expected(
                 ));
                 return ScalarType::Error;
             }
-            let argument_types = arguments
-                .iter()
-                .map(|argument| {
-                    expression_type_in_module(
-                        argument,
-                        scope,
-                        visible_names,
-                        folded_names,
-                        module,
-                        modules,
-                        diagnostics,
-                        unsafe_context,
-                        overloads,
-                        inference,
-                    )
-                })
-                .collect::<Vec<_>>();
+            let diagnostics_before_arguments = diagnostics.len();
+            let argument_types = inference.without_call_signatures(|inference| {
+                arguments
+                    .iter()
+                    .map(|argument| {
+                        expression_type_in_module(
+                            argument,
+                            scope,
+                            visible_names,
+                            folded_names,
+                            module,
+                            modules,
+                            diagnostics,
+                            unsafe_context,
+                            overloads,
+                            inference,
+                        )
+                    })
+                    .collect()
+            });
             let overload_arguments = arguments
                 .iter()
                 .zip(&argument_types)
                 .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
                 .collect::<Vec<_>>();
-            let callable = match resolve_overload_candidate(overload, &overload_arguments, expected)
-            {
-                Ok((callable, _)) => callable,
-                Err(message) => {
-                    diagnostics.push(module_diagnostic(module, "B0004", message, *name_span));
-                    return ScalarType::Error;
-                }
-            };
+            let (callable, selection) =
+                match resolve_overload_candidate(overload, &overload_arguments, expected) {
+                    Ok(resolved) => resolved,
+                    Err(message) => {
+                        diagnostics.push(module_diagnostic(module, "B0004", message, *name_span));
+                        return ScalarType::Error;
+                    }
+                };
             let ScalarType::Callable {
                 outputs,
                 parameters,
@@ -3502,6 +3513,14 @@ pub(super) fn expression_type_in_module_expected(
                     &actual,
                     expression_span(argument),
                     diagnostics,
+                );
+            }
+            if diagnostics.len() == diagnostics_before_arguments {
+                inference.record_call_signature(
+                    expression,
+                    &parameters,
+                    &outputs,
+                    Some(selection.arm_index),
                 );
             }
             return scalar_call_result_in_module(&outputs);
@@ -7385,6 +7404,7 @@ pub(super) fn expression_type(
                         ));
                         return ScalarType::Error;
                     }
+                    let diagnostics_before_arguments = diagnostics.len();
                     let mut error_argument = false;
                     for (argument, parameter) in arguments.iter().zip(parameters) {
                         let actual = expression_type_expected(
@@ -7411,6 +7431,9 @@ pub(super) fn expression_type(
                     return if error_argument {
                         ScalarType::Error
                     } else {
+                        if diagnostics.len() == diagnostics_before_arguments {
+                            inference.record_call_signature(expression, parameters, outputs, None);
+                        }
                         scalar_call_result(outputs)
                     };
                 }
@@ -7420,35 +7443,38 @@ pub(super) fn expression_type(
                 .then(|| overloads.first(&program.source, name))
                 .flatten()
             {
-                let argument_types = arguments
-                    .iter()
-                    .map(|argument| {
-                        expression_type(
-                            argument,
-                            scope,
-                            visible_names,
-                            folded_names,
-                            program,
-                            diagnostics,
-                            unsafe_context,
-                            overloads,
-                            inference,
-                        )
-                    })
-                    .collect::<Vec<_>>();
+                let diagnostics_before_arguments = diagnostics.len();
+                let argument_types = inference.without_call_signatures(|inference| {
+                    arguments
+                        .iter()
+                        .map(|argument| {
+                            expression_type(
+                                argument,
+                                scope,
+                                visible_names,
+                                folded_names,
+                                program,
+                                diagnostics,
+                                unsafe_context,
+                                overloads,
+                                inference,
+                            )
+                        })
+                        .collect()
+                });
                 let overload_arguments = arguments
                     .iter()
                     .zip(&argument_types)
                     .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
                     .collect::<Vec<_>>();
-                let callable = match resolve_overload_candidate(overload, &overload_arguments, None)
-                {
-                    Ok((callable, _)) => callable,
-                    Err(message) => {
-                        diagnostics.push(diagnostic(program, "B0004", message, *name_span));
-                        return ScalarType::Error;
-                    }
-                };
+                let (callable, selection) =
+                    match resolve_overload_candidate(overload, &overload_arguments, None) {
+                        Ok(resolved) => resolved,
+                        Err(message) => {
+                            diagnostics.push(diagnostic(program, "B0004", message, *name_span));
+                            return ScalarType::Error;
+                        }
+                    };
                 let ScalarType::Callable {
                     outputs,
                     parameters,
@@ -7475,6 +7501,14 @@ pub(super) fn expression_type(
                         &actual,
                         expression_span(argument),
                         diagnostics,
+                    );
+                }
+                if diagnostics.len() == diagnostics_before_arguments {
+                    inference.record_call_signature(
+                        expression,
+                        &parameters,
+                        &outputs,
+                        Some(selection.arm_index),
                     );
                 }
                 return scalar_call_result(&outputs);
@@ -7529,6 +7563,7 @@ pub(super) fn expression_type(
                 diagnostics.push(diagnostic(program, "B0001", "unknown callable name", *span));
                 return ScalarType::Error;
             };
+            let diagnostics_before_arguments = diagnostics.len();
             if arguments.len() != parameters.len() {
                 diagnostics.push(diagnostic(
                     program,
@@ -7538,10 +7573,10 @@ pub(super) fn expression_type(
                 ));
             }
             let mut error_argument = false;
-            for (argument, parameter) in arguments.iter().zip(parameters) {
+            for (argument, parameter) in arguments.iter().zip(&parameters) {
                 let actual = expression_type_expected(
                     argument,
-                    &parameter,
+                    parameter,
                     scope,
                     visible_names,
                     folded_names,
@@ -7551,7 +7586,7 @@ pub(super) fn expression_type(
                     overloads,
                     inference,
                 );
-                expect_type(program, &parameter, &actual, *span, diagnostics);
+                expect_type(program, parameter, &actual, *span, diagnostics);
                 error_argument |= is_error_type(&actual);
             }
             if unsafe_callable && !unsafe_context {
@@ -7565,6 +7600,9 @@ pub(super) fn expression_type(
             if error_argument {
                 ScalarType::Error
             } else {
+                if diagnostics.len() == diagnostics_before_arguments {
+                    inference.record_call_signature(expression, &parameters, &outputs, None);
+                }
                 scalar_call_result(&outputs)
             }
         }
@@ -7798,30 +7836,33 @@ fn expression_type_expected(
                 ));
                 return ScalarType::Error;
             }
-            let argument_types = arguments
-                .iter()
-                .map(|argument| {
-                    expression_type(
-                        argument,
-                        scope,
-                        visible_names,
-                        folded_names,
-                        program,
-                        diagnostics,
-                        unsafe_context,
-                        overloads,
-                        inference,
-                    )
-                })
-                .collect::<Vec<_>>();
+            let diagnostics_before_arguments = diagnostics.len();
+            let argument_types = inference.without_call_signatures(|inference| {
+                arguments
+                    .iter()
+                    .map(|argument| {
+                        expression_type(
+                            argument,
+                            scope,
+                            visible_names,
+                            folded_names,
+                            program,
+                            diagnostics,
+                            unsafe_context,
+                            overloads,
+                            inference,
+                        )
+                    })
+                    .collect()
+            });
             let overload_arguments = arguments
                 .iter()
                 .zip(&argument_types)
                 .map(|(argument, actual)| overload_argument_from_actual(argument, actual))
                 .collect::<Vec<_>>();
-            let callable =
+            let (callable, selection) =
                 match resolve_overload_candidate(overload, &overload_arguments, Some(expected)) {
-                    Ok((callable, _)) => callable,
+                    Ok(resolved) => resolved,
                     Err(message) => {
                         diagnostics.push(diagnostic(program, "B0004", message, *name_span));
                         return ScalarType::Error;
@@ -7853,6 +7894,14 @@ fn expression_type_expected(
                     &actual,
                     expression_span(argument),
                     diagnostics,
+                );
+            }
+            if diagnostics.len() == diagnostics_before_arguments {
+                inference.record_call_signature(
+                    expression,
+                    &parameters,
+                    &outputs,
+                    Some(selection.arm_index),
                 );
             }
             return scalar_call_result(&outputs);

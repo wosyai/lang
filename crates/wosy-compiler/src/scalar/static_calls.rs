@@ -10,16 +10,14 @@ impl PreparedProgram {
         declarations: ScalarSourceDeclarations,
         target_layout: ScalarTargetLayout,
     ) -> Result<Self, ScalarValidation> {
-        let (validation, initialization_outputs) =
-            typecheck_scalar_program_with_initialization_outputs(declarations, target_layout);
+        let (validation, occurrence_typing) =
+            typecheck_scalar_program_with_occurrences(declarations, target_layout);
         if !validation.diagnostics.is_empty() {
             return Err(validation);
         }
         let program = validation.program;
-        let calls = reference::resolve_program_call_sites_with_initialization_outputs(
-            &program,
-            initialization_outputs,
-        );
+        let calls =
+            reference::resolve_program_call_sites_with_occurrences(&program, occurrence_typing);
         Ok(Self { program, calls })
     }
 
@@ -49,15 +47,14 @@ pub struct PreparedScalarProject {
 
 impl PreparedScalarProject {
     pub(super) fn new(project: ScalarProject) -> Result<Self, ScalarProjectValidation> {
-        let (validation, initialization_outputs) =
-            typecheck_scalar_project_with_initialization_outputs(project);
+        let (validation, occurrence_typing) = typecheck_scalar_project_with_occurrences(project);
         if !validation.diagnostics.is_empty() {
             return Err(validation);
         }
         let project = validation.project;
-        let calls = reference::resolve_project_call_sites_with_initialization_outputs(
+        let calls = reference::resolve_project_call_sites_with_occurrences(
             &project.modules,
-            initialization_outputs,
+            occurrence_typing,
         );
         Ok(Self { project, calls })
     }

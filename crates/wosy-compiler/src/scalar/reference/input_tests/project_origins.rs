@@ -158,6 +158,7 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
             &views,
             modules[0].resolved_assignment_outputs.as_map(),
             WalkMode::StructuralOnly,
+            PreparationOccurrenceTyping::default(),
         )
         .unwrap();
         drop(views);
@@ -186,6 +187,7 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
             &views,
             modules[0].resolved_assignment_outputs.as_map(),
             WalkMode::StructuralOnly,
+            PreparationOccurrenceTyping::default(),
         )
         .unwrap_err();
         drop(views);
@@ -493,6 +495,7 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
                         structure: OccurrenceStructure::new(ByteSpan::new(0, 0)),
                         occurrences: Vec::new(),
                         calls: Vec::new(),
+                        checked_call_signatures: HashMap::new(),
                         assignments: HashMap::new(),
                         conditionals: HashMap::new(),
                         loops: HashMap::new(),

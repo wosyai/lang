@@ -204,6 +204,7 @@ fn template_index_retains_first_source_even_when_its_module_is_empty() {
         &[CallResolutionModule::module(&second)],
         second.resolved_assignment_outputs.as_map(),
         WalkMode::StructuralOnly,
+        PreparationOccurrenceTyping::default(),
     )
     .unwrap();
     calls

@@ -12,6 +12,8 @@ mod neutral_blocks;
 
 mod assignment_slot_types;
 
+mod checked_call_signatures;
+
 fn parsed(text: &str) -> wosy_syntax::ParseResult {
     let identity = SourceIdentity::new(
         "project".into(),

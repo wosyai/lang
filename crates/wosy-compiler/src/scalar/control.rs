@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::reference::{BlockOrdinal, OccurrenceMetadata, OccurrenceOrdinal, OccurrenceStructure};
-use super::{ScalarBinding, ScalarItem, ScalarNamespaceBinding, ScalarType};
+use super::{ScalarBinding, ScalarItem, ScalarNamespaceBinding, ScalarOutputSequence, ScalarType};
 use wosy_syntax::{ByteSpan, SourceIdentity};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -22,10 +22,18 @@ pub(super) struct ModuleInitializationTopology {
     pub(super) structure: OccurrenceStructure,
     pub(super) occurrences: Vec<OccurrenceMetadata>,
     pub(super) calls: Vec<OccurrenceOrdinal>,
+    pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
     pub(super) loops: HashMap<(BlockOrdinal, usize), WhileRegion>,
     pub(super) short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CheckedCallSignature {
+    pub(super) parameters: Vec<ScalarType>,
+    pub(super) outputs: ScalarOutputSequence,
+    pub(super) overload_arm: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
