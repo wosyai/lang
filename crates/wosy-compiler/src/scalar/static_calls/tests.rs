@@ -4,6 +4,8 @@ use reference::stage_observations::{Counts, Scope};
 
 mod occurrence_inventory;
 
+mod neutral_assignments;
+
 fn parsed(text: &str) -> wosy_syntax::ParseResult {
     let identity = SourceIdentity::new(
         "project".into(),

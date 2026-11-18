@@ -241,6 +241,27 @@ fn preparation_publishes_stable_callable_owned_expression_place_and_call_ordinal
                 _ => None,
             })
             .unwrap();
+        let group = &row.assignments[&(row.structure.root, 5)];
+        assert_eq!(group.span, assignment.span);
+        assert_eq!(
+            group
+                .rhs_evaluations()
+                .map(|root| (root.position, root.expression))
+                .collect::<Vec<_>>(),
+            vec![(0, OccurrenceOrdinal(14))]
+        );
+        assert!(group.projected_outputs().next().is_none());
+        assert_eq!(
+            group
+                .destinations()
+                .map(|slot| (slot.position, slot.destination, slot.target_span))
+                .collect::<Vec<_>>(),
+            vec![(0, OccurrenceOrdinal(15), assignment.targets[0].target_span)]
+        );
+        assert_eq!(
+            group.previous_observations().collect::<Vec<_>>(),
+            group.installs().collect::<Vec<_>>()
+        );
         let place = &assignment.targets[0].place;
         let ScalarPlace::Index { base, index, .. } = place else {
             panic!("projected selector")

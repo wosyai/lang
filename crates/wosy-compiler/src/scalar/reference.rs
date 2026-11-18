@@ -1,3 +1,7 @@
+use super::control::{
+    AssignmentContinuation, AssignmentEvaluation, AssignmentGroup, AssignmentProjection,
+    AssignmentSlot,
+};
 use super::*;
 
 #[cfg(test)]
@@ -1934,59 +1938,47 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
                 ScalarBlockItem::Assignment(assignment) => {
                     let output_types = self.assignment_output_types(assignment)?;
-                    let rhs = assignment.rhs();
+                    let calls = self.call_sites;
+                    let group = &calls.assignments[&(ordinal, item_index)];
                     let mut values = Vec::new();
-                    for (output, value) in rhs.evaluations() {
-                        let ordinal = self.expression_ordinal(
-                            parent,
-                            OccurrenceEdge::AssignmentRhs {
-                                item: item_index,
-                                output,
-                            },
-                        );
-                        let result = self.expression(value, scope, ordinal)?;
+                    for evaluation in group.rhs_evaluations() {
+                        let value = &assignment.values[evaluation.position];
+                        let result = self.expression(value, scope, evaluation.expression)?;
                         let rhs_point = self.cursor.expect("evaluated assignment output");
-                        self.move_value(value, scope, ordinal)?;
+                        self.move_value(value, scope, evaluation.expression)?;
                         values.push((result, rhs_point));
                     }
-                    for position in rhs.projected_outputs() {
-                        let producer = values[0].1;
-                        let rhs_point = self.project_call_output(producer, position);
+                    for projection in group.projected_outputs() {
+                        let producer = values[projection.producer.position].1;
+                        let rhs_point = self.project_call_output(producer, projection.output);
                         values.push((ReferenceValue::Uncomputed, rhs_point));
                     }
-                    let destinations = assignment
-                        .targets
-                        .iter()
+                    let destinations = group
+                        .destinations()
                         .zip(&values)
-                        .enumerate()
-                        .map(|(destination, (target, _))| {
-                            let ordinal = self.place_ordinal(
-                                parent,
-                                OccurrenceEdge::AssignmentDestination {
-                                    item: item_index,
-                                    destination,
-                                },
-                            );
-                            self.assignment_destination(target, scope, ordinal)
+                        .map(|(slot, _)| {
+                            self.assignment_destination(
+                                &assignment.targets[slot.position],
+                                scope,
+                                slot.destination,
+                            )
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    let capture = if assignment.targets.len() > 1 {
+                    let capture = if group.previous_observations().len() > 1 {
                         Some(self.point(
                             CfgPointKind::CaptureAssignmentPrevious { writes: Vec::new() },
-                            assignment.span,
+                            group.span,
                             scope,
                             BTreeSet::new(),
                         ))
                     } else {
                         None
                     };
-                    for (position, ((target, (value, rhs_point)), destination)) in assignment
-                        .targets
-                        .iter()
-                        .zip(values)
-                        .zip(destinations)
-                        .enumerate()
+                    for ((slot, (value, rhs_point)), destination) in
+                        group.installs().zip(values).zip(destinations)
                     {
+                        let position = slot.position;
+                        let target = &assignment.targets[position];
                         if let ScalarPlace::Name { name, span } = &target.place {
                             let id = if let Some(id) = self.names.get(name) {
                                 id.clone()
@@ -2148,6 +2140,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             };
                             writes.push(install);
                         }
+                    }
+                    match group.continuation() {
+                        AssignmentContinuation::Unit => {}
                     }
                 }
                 ScalarBlockItem::While(loop_) => {
@@ -3851,6 +3846,7 @@ pub(super) struct FunctionCallSites {
     pub(super) occurrences: Vec<OccurrenceMetadata>,
     pub(super) call_occurrences: Vec<CallOccurrence>,
     pub(super) structure: OccurrenceStructure,
+    pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
 }
 
 pub(super) struct ProjectCallSiteResults {
@@ -3880,6 +3876,7 @@ struct ValidatedCallResolver<'a> {
     occurrences: Vec<OccurrenceMetadata>,
     call_occurrences: Vec<CallOccurrence>,
     structure: OccurrenceStructure,
+    assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
 }
 
 impl ValidatedCallResolver<'_> {
@@ -3908,6 +3905,18 @@ impl ValidatedCallResolver<'_> {
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
     ) -> Result<(), ReferenceAnalysisError> {
+        self.expression_at(expression, names, types, parent, edge)
+            .map(|_| ())
+    }
+
+    fn expression_at(
+        &mut self,
+        expression: &ScalarExpression,
+        names: &BTreeMap<String, ReferenceBindingId>,
+        types: &BTreeMap<String, ScalarType>,
+        parent: OccurrenceParent,
+        edge: OccurrenceEdge,
+    ) -> Result<OccurrenceOrdinal, ReferenceAnalysisError> {
         let ordinal = self.record_occurrence(
             OccurrenceRole::Expression,
             expression_span(expression),
@@ -4129,7 +4138,7 @@ impl ValidatedCallResolver<'_> {
             }
             _ => {}
         }
-        Ok(())
+        Ok(ordinal)
     }
 
     fn place(
@@ -4140,6 +4149,17 @@ impl ValidatedCallResolver<'_> {
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
     ) -> Result<(), ReferenceAnalysisError> {
+        self.place_at(place, names, types, parent, edge).map(|_| ())
+    }
+
+    fn place_at(
+        &mut self,
+        place: &ScalarPlace,
+        names: &BTreeMap<String, ReferenceBindingId>,
+        types: &BTreeMap<String, ScalarType>,
+        parent: OccurrenceParent,
+        edge: OccurrenceEdge,
+    ) -> Result<OccurrenceOrdinal, ReferenceAnalysisError> {
         let ordinal = self.record_occurrence(
             OccurrenceRole::Place,
             scalar_place_target_span(place),
@@ -4164,7 +4184,7 @@ impl ValidatedCallResolver<'_> {
                 OccurrenceEdge::DereferencePointer,
             )?,
         }
-        Ok(())
+        Ok(ordinal)
     }
 
     fn block(
@@ -4256,8 +4276,9 @@ impl ValidatedCallResolver<'_> {
                     self.expression(expression, &names, &types, parent, edge)?
                 }
                 ScalarBlockItem::Assignment(assignment) => {
+                    let mut evaluations = Vec::new();
                     for (output, value) in assignment.rhs().evaluations() {
-                        self.expression(
+                        let expression = self.expression_at(
                             value,
                             &names,
                             &types,
@@ -4267,9 +4288,22 @@ impl ValidatedCallResolver<'_> {
                                 output,
                             },
                         )?;
+                        evaluations.push(AssignmentEvaluation {
+                            position: output,
+                            expression,
+                        });
                     }
+                    let projections = assignment
+                        .rhs()
+                        .projected_outputs()
+                        .map(|output| AssignmentProjection {
+                            producer: evaluations[0],
+                            output,
+                        })
+                        .collect();
+                    let mut slots = Vec::new();
                     for (destination, target) in assignment.targets.iter().enumerate() {
-                        self.place(
+                        let place = self.place_at(
                             &target.place,
                             &names,
                             &types,
@@ -4279,7 +4313,19 @@ impl ValidatedCallResolver<'_> {
                                 destination,
                             },
                         )?;
+                        slots.push(AssignmentSlot {
+                            position: destination,
+                            destination: place,
+                            target_span: target.target_span,
+                        });
                     }
+                    assert!(self
+                        .assignments
+                        .insert(
+                            (ordinal, item_index),
+                            AssignmentGroup::new(assignment.span, evaluations, projections, slots)
+                        )
+                        .is_none());
                     for target in &assignment.targets {
                         if let ScalarPlace::Name { name, .. } = &target.place {
                             if !names.contains_key(name) {
@@ -4431,6 +4477,7 @@ fn resolve_function_call_sites(
         occurrences: Vec::new(),
         call_occurrences: Vec::new(),
         structure: OccurrenceStructure::new(function.body.span),
+        assignments: HashMap::new(),
     };
     let mut parameter_names = BTreeMap::new();
     let mut parameter_types = BTreeMap::new();
@@ -4467,6 +4514,7 @@ fn resolve_function_call_sites(
         occurrences: resolver.occurrences,
         call_occurrences: resolver.call_occurrences,
         structure: resolver.structure,
+        assignments: resolver.assignments,
     })
 }
 
