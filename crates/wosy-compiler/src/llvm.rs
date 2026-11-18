@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 use std::mem::ManuallyDrop;
@@ -15,6 +16,7 @@ use inkwell::AddressSpace;
 use inkwell::{FloatPredicate, IntPredicate};
 use serde::{Deserialize, Serialize};
 
+use crate::scalar::layout::ScalarTargetLayouts;
 use crate::scalar::{
     CfgPointKind, CoreOperationId, InvalidationCandidate, InvalidationInputs, ReferenceBindingKind,
     ReferenceOrigin, ReleaseTarget, ResolvedCallTarget, ScalarAllocationIdentity,
@@ -269,14 +271,68 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     if !validation.diagnostics.is_empty() {
         return Err("cannot emit LLVM for an invalid scalar program".into());
     }
+    let program = &validation.program;
+    emit_single_module_llvm(
+        &program.source,
+        &program.items,
+        &program.structs,
+        &program.layouts,
+        program.target_layout,
+        &|_, _, function| Some(&function.reference_cfg),
+    )
+}
+
+pub fn emit_scalar_build_single_module_llvm(
+    validation: &ScalarBuildValidation<'_>,
+) -> Result<LlvmPartition, String> {
+    if !validation.diagnostics().is_empty() {
+        return Err("cannot emit LLVM for an invalid scalar program".into());
+    }
+    let modules = &validation.prepared().project().modules;
+    let [module] = modules.as_slice() else {
+        return Err(format!(
+            "single-module LLVM emission requires exactly one prepared module, found {}",
+            modules.len()
+        ));
+    };
+    emit_single_module_llvm(
+        &module.source,
+        &module.items,
+        &module.structs,
+        &module.layouts,
+        module.target_layout,
+        &|item, arm, _| validation.reference_cfg(0, item, arm),
+    )
+}
+
+fn emit_single_module_llvm<'a>(
+    source: &wosy_syntax::SourceIdentity,
+    items: &'a [ScalarItem],
+    structs: &[ScalarStruct],
+    layouts: &ScalarTargetLayouts,
+    target_layout: ScalarTargetLayout,
+    reference_cfg: &dyn Fn(
+        usize,
+        Option<usize>,
+        &'a ScalarFunction,
+    ) -> Option<&'a ScalarReferenceCfg>,
+) -> Result<LlvmPartition, String> {
+    let require_cfg = |item_ordinal, arm_index, function: &'a ScalarFunction| {
+        reference_cfg(item_ordinal, arm_index, function).ok_or_else(|| {
+            let span = function.span;
+            format!(
+                "internal error: missing reference CFG for {} in {source:?} at {}..{} (module 0, item {item_ordinal}, arm {arm_index:?})",
+                function.name, span.start, span.end,
+            )
+        })
+    };
     let context = Context::create();
-    let module = ManuallyDrop::new(context.create_module(&validation.program.source.path));
+    let module = ManuallyDrop::new(context.create_module(&source.path));
     let builder = context.create_builder();
-    let target_layout = validation.program.target_layout;
-    let layouts = crate::scalar::layout::ScalarLayoutIndex::program(&validation.program.layouts);
-    let structs = validation.program.structs.iter().collect::<Vec<_>>();
+    let layouts = crate::scalar::layout::ScalarLayoutIndex::program(layouts);
+    let structs = structs.iter().collect::<Vec<_>>();
     let mut globals = BTreeMap::new();
-    for item in &validation.program.items {
+    for item in items {
         if let ScalarItem::Binding(binding) = item {
             for (name, ty) in binding_receivers(binding).iter() {
                 if *ty == ScalarType::Unit {
@@ -290,9 +346,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             }
         }
     }
-    let mut signatures = validation
-        .program
-        .items
+    let mut signatures = items
         .iter()
         .filter_map(|item| match item {
             ScalarItem::Binding(binding) => {
@@ -307,22 +361,18 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     let mut externs = Vec::new();
     let mut functions = BTreeMap::new();
     let mut call_targets = BTreeMap::new();
-    for function in validation
-        .program
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            ScalarItem::Function(function)
-                if function.generic_parameters.is_empty() && function.overload_arms.is_empty() =>
-            {
-                Some(function)
-            }
-            _ => None,
-        })
-    {
+    let mut definitions = Vec::new();
+    for (item_ordinal, item) in items.iter().enumerate() {
+        let ScalarItem::Function(function) = item else {
+            continue;
+        };
+        if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
+            continue;
+        }
+        let cfg = require_cfg(item_ordinal, None, function)?;
         let value = module.add_function(
             &function.name,
-            definition_function_type(&context, function, &function.reference_cfg, target_layout)?,
+            definition_function_type(&context, function, cfg, target_layout)?,
             None,
         );
         for (index, name) in function.parameters.iter().enumerate() {
@@ -332,37 +382,32 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         }
         functions.insert(function.name.clone(), value);
         call_targets.insert(function.name.clone(), function.name.clone());
+        definitions.push((function, cfg, function.name.as_str()));
     }
-    let specializations =
-        generic_specializations(&validation.program.items, |name| name.to_owned())?;
-    for (lookup, LlvmSpecialization { function, name, .. }) in &specializations {
-        let value = module.add_function(
-            name,
-            definition_function_type(&context, function, &function.reference_cfg, target_layout)?,
-            None,
-        );
-        for (index, parameter) in function.parameters.iter().enumerate() {
-            if let Some(argument) = value.get_nth_param(index as u32) {
-                argument.set_name(parameter);
-            }
-        }
-        call_targets.insert(lookup.clone(), name.clone());
-        signatures.insert(name.clone(), function.signature.clone());
-        functions.insert(name.clone(), value);
-    }
+    let ordinary_count = definitions.len();
+    let specializations = generic_specializations(items, str::to_owned)?;
     let overloads = selected_overload_specializations(
-        &validation.program.items,
-        |name| name.to_owned(),
-        selected_overload_selections(&validation.program.items)
-            .into_iter()
-            .filter_map(|(receiver, name, selection)| {
-                receiver.is_none().then_some((name, selection))
-            }),
+        items,
+        str::to_owned,
+        selected_overload_selections(items).into_iter().filter_map(
+            |(receiver, name, selection)| receiver.is_none().then_some((name, selection)),
+        ),
     );
-    for (lookup, LlvmSpecialization { function, name, .. }) in &overloads {
+    for (
+        lookup,
+        LlvmSpecialization {
+            function,
+            name,
+            template,
+            item_ordinal,
+            arm_index,
+        },
+    ) in specializations.iter().chain(&overloads)
+    {
+        let cfg = require_cfg(*item_ordinal, *arm_index, template)?;
         let value = module.add_function(
             name,
-            definition_function_type(&context, function, &function.reference_cfg, target_layout)?,
+            definition_function_type(&context, function, cfg, target_layout)?,
             None,
         );
         for (index, parameter) in function.parameters.iter().enumerate() {
@@ -373,8 +418,9 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         call_targets.insert(lookup.clone(), name.clone());
         signatures.insert(name.clone(), function.signature.clone());
         functions.insert(name.clone(), value);
+        definitions.push((function.as_ref(), cfg, name.as_str()));
     }
-    for item in &validation.program.items {
+    for item in items {
         if let ScalarItem::Extern(extern_decl) = item {
             for function in &extern_decl.functions {
                 let key = format!("{}.{}", extern_decl.binding, function.name);
@@ -384,7 +430,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
                     continue;
                 };
                 let identity = llvm_extern_identity(
-                    &validation.program.source,
+                    source,
                     &extern_decl.binding,
                     import_module,
                     &function.name,
@@ -408,47 +454,31 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     );
     let mut runtime_array_results = BTreeMap::new();
     let mut dynamic_owner_outputs = BTreeMap::new();
-    for function in validation
-        .program
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            ScalarItem::Function(function) => Some(function),
-            _ => None,
-        })
-    {
+    for (item_ordinal, item) in items.iter().enumerate() {
+        let ScalarItem::Function(function) = item else {
+            continue;
+        };
         if let Some(target) = call_targets.get(&function.name) {
+            let cfg = require_cfg(item_ordinal, None, function)?;
             insert_function_result_provenance(
                 &mut runtime_array_results,
                 &mut dynamic_owner_outputs,
                 target,
                 function,
-                &function.reference_cfg,
+                cfg,
             );
         }
     }
-    for (_, LlvmSpecialization { function, name, .. }) in specializations.iter().chain(&overloads) {
+    for &(function, cfg, name) in &definitions[ordinary_count..] {
         insert_function_result_provenance(
             &mut runtime_array_results,
             &mut dynamic_owner_outputs,
             name,
             function,
-            &function.reference_cfg,
+            cfg,
         );
     }
-    for function in validation
-        .program
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            ScalarItem::Function(function)
-                if function.generic_parameters.is_empty() && function.overload_arms.is_empty() =>
-            {
-                Some(function)
-            }
-            _ => None,
-        })
-    {
+    for (function, cfg, name) in definitions {
         emit_function(
             &context,
             &builder,
@@ -459,49 +489,9 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             &dynamic_owner_outputs,
             &globals,
             function,
-            &function.reference_cfg,
-            &function.name,
-            &validation.program.items,
-            &module,
-            &structs,
-            &layouts,
-            target_layout,
-        )?;
-    }
-    for (_, LlvmSpecialization { function, name, .. }) in &specializations {
-        emit_function(
-            &context,
-            &builder,
-            &functions,
-            &call_targets,
-            &signatures,
-            &runtime_array_results,
-            &dynamic_owner_outputs,
-            &globals,
-            function,
-            &function.reference_cfg,
+            cfg,
             name,
-            &validation.program.items,
-            &module,
-            &structs,
-            &layouts,
-            target_layout,
-        )?;
-    }
-    for (_, LlvmSpecialization { function, name, .. }) in &overloads {
-        emit_function(
-            &context,
-            &builder,
-            &functions,
-            &call_targets,
-            &signatures,
-            &runtime_array_results,
-            &dynamic_owner_outputs,
-            &globals,
-            function,
-            &function.reference_cfg,
-            name,
-            &validation.program.items,
+            items,
             &module,
             &structs,
             &layouts,
@@ -517,7 +507,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         &runtime_array_results,
         &dynamic_owner_outputs,
         &globals,
-        &validation.program.items,
+        items,
         &module,
         &structs,
         &layouts,
@@ -525,7 +515,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     )?;
     finish_partition(
         ManuallyDrop::into_inner(module),
-        validation.program.source.path.clone(),
+        source.path.clone(),
         &context,
         &functions,
         &signatures,
@@ -3976,7 +3966,7 @@ fn encoded_llvm_name<'a>(prefix: &str, components: impl IntoIterator<Item = &'a 
 }
 
 struct LlvmSpecialization<'a> {
-    function: ScalarFunction,
+    function: Cow<'a, ScalarFunction>,
     name: String,
     template: &'a ScalarFunction,
     item_ordinal: usize,
@@ -4025,7 +4015,7 @@ fn generic_specializations(
             body.signature = signature;
             body.generic_parameters.clear();
             LlvmSpecialization {
-                function: body,
+                function: Cow::Owned(body),
                 name,
                 template: function,
                 item_ordinal,
@@ -4079,9 +4069,6 @@ fn selected_overload_specializations(
             .iter()
             .map(|parameter| selection.substitutions[&parameter.name].clone())
             .collect::<Vec<_>>();
-        let mut function = arm.clone();
-        function.signature = substitute_generic_signature(&function, &arguments);
-        function.generic_parameters.clear();
         let lookup = selected_overload_lookup_key(&base, &selection);
         let name = generic_specialization_name(
             &encoded_llvm_name(
@@ -4090,13 +4077,22 @@ fn selected_overload_specializations(
             ),
             &arguments,
         );
-        specializations.entry(lookup).or_insert(LlvmSpecialization {
-            function,
-            name,
-            template: arm,
-            item_ordinal,
-            arm_index: Some(selection.arm_index),
-        });
+        specializations
+            .entry(lookup)
+            .or_insert_with(|| LlvmSpecialization {
+                function: if arguments.is_empty() {
+                    Cow::Borrowed(arm)
+                } else {
+                    let mut function = arm.clone();
+                    function.signature = substitute_generic_signature(arm, &arguments);
+                    function.generic_parameters.clear();
+                    Cow::Owned(function)
+                },
+                name,
+                template: arm,
+                item_ordinal,
+                arm_index: Some(selection.arm_index),
+            });
     }
     specializations
 }

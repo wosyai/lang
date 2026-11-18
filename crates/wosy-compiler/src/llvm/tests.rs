@@ -12,10 +12,10 @@ use super::{LlvmFunction, LlvmFunctionAttributes, LlvmPartition, LlvmValueType};
 use crate::scalar::{CfgPointKind, CoreOperationId, ReleaseTarget, ScalarOverloadSelection};
 use crate::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, derive_scalar_program,
-    derive_scalar_program_with_layout, emit_scalar_build_project_llvm, parse_source,
-    prepare_scalar_project, validate_scalar_project, ScalarItem, ScalarModule,
-    ScalarNamespaceBinding, ScalarOutput, ScalarOutputSequence, ScalarPreparationInputs,
-    ScalarProject, ScalarTargetLayout, ScalarType,
+    derive_scalar_program_with_layout, emit_scalar_build_project_llvm,
+    emit_scalar_build_single_module_llvm, parse_source, prepare_scalar_project,
+    validate_scalar_project, ScalarItem, ScalarModule, ScalarNamespaceBinding, ScalarOutput,
+    ScalarOutputSequence, ScalarPreparationInputs, ScalarProject, ScalarTargetLayout, ScalarType,
 };
 use wosy_syntax::{ByteSpan, SourceIdentity};
 
@@ -1651,6 +1651,123 @@ select = overload {
 }
 
 #[test]
+fn detached_single_module_llvm_matches_legacy_on_both_targets() {
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    for (text, ir_witnesses) in [
+        (
+            "%%start
+unit(u64) discard = fn(count) { u8[count] bytes; bytes[0] = 3; unsafe { core.invalidate(&bytes); } };
+*u8(*u8, bool) choose = fn(input, flag) { u8 local = 1; if (flag) { &local } else { input } };
+select = overload {
+    i64(i64) => fn(value) { value };
+    *u8(*u8, bool) => fn(input, flag) { choose(input, flag) };
+};
+u8 outside = 2;
+*u8 outside_ref = &outside;
+bool use_fresh = true;
+*u8 selected = select(outside_ref, use_fresh);
+%%end",
+            [
+                "store i1 false, ptr %bytes_live",
+                "ptr %checked_return_owner_0",
+            ],
+        ),
+        (
+            "%%start
+generic T;
+T(T) identity = fn(value) { value };
+cast = overload {
+    i32(i64) => fn(value) { 1 };
+    generic T;
+    T(T) => fn(value) { value };
+};
+i64 wide = identity<i64>(1);
+i32 narrow = cast(wide);
+bool flag = true;
+bool copied = cast(flag);
+%%end",
+            ["call i64 @wosy_generic__", "call i1 @wosy_generic__"],
+        ),
+    ] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        for target_layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let prepared = prepare_scalar_project(
+                vec![(
+                    derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+                ScalarPreparationInputs { target_layout },
+            )
+            .unwrap_or_else(|invalid| panic!("{:?}", invalid.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+            let legacy = derive_scalar_program_with_layout(&parsed.result, target_layout);
+            assert!(legacy.diagnostics.is_empty(), "{:?}", legacy.diagnostics);
+
+            let detached_ir = emit_scalar_build_single_module_llvm(&build).unwrap().to_text();
+            assert_eq!(detached_ir, emit_scalar_llvm(&legacy).unwrap().to_text());
+            for witness in ir_witnesses {
+                assert!(
+                    detached_ir.contains(witness),
+                    "missing {witness}: {detached_ir}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn detached_single_module_llvm_rejects_non_single_cardinality() {
+    for count in [0, 2] {
+        let sources = (0..count)
+            .map(|index| {
+                SourceIdentity::new(
+                    "project".into(),
+                    "package".into(),
+                    format!("src/module{index}.w"),
+                    "r1".into(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let declarations = sources
+            .iter()
+            .map(|source| {
+                let parsed =
+                    parse_source(source.clone(), "%%start\nu8 value = 1;\n%%end".into(), &[]);
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                (
+                    derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let prepared = prepare_scalar_project(
+            declarations,
+            sources,
+            ScalarPreparationInputs {
+                target_layout: ScalarTargetLayout::NATIVE64,
+            },
+        )
+        .unwrap_or_else(|invalid| panic!("{:?}", invalid.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        assert_eq!(
+            emit_scalar_build_single_module_llvm(&build).unwrap_err(),
+            format!(
+                "single-module LLVM emission requires exactly one prepared module, found {count}"
+            )
+        );
+    }
+}
+
+#[test]
 fn detached_project_llvm_rejects_build_diagnostics() {
     let source = SourceIdentity::new(
         "project".into(),
@@ -1678,6 +1795,10 @@ fn detached_project_llvm_rejects_build_diagnostics() {
         assert_eq!(
             emit_scalar_build_project_llvm(&build).unwrap_err(),
             "cannot emit LLVM for an invalid scalar project"
+        );
+        assert_eq!(
+            emit_scalar_build_single_module_llvm(&build).unwrap_err(),
+            "cannot emit LLVM for an invalid scalar program"
         );
     }
 }
