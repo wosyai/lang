@@ -510,17 +510,12 @@ fn missing_aggregate_policy_table_reports_spanned_invariant() {
     };
     let mut function = function.clone();
     let read_span = expression_span(&function.body.expressions[0]);
+    let calls = reference::test_function_call_sites(&validated.program.source, &function);
     let errors = record_function_reference_origins(
         &validated.program.source,
         &mut function,
         &HashSet::new(),
-        &reference::FunctionCallSites {
-            structure: reference::OccurrenceStructure::empty(),
-            sites: Vec::new(),
-            arms: Vec::new(),
-            occurrences: Vec::new(),
-            call_occurrences: Vec::new(),
-        },
+        &calls,
         &[],
         &[],
         &HashMap::new(),
@@ -1267,17 +1262,12 @@ fn absent_resolved_assignment_output_is_a_spanned_invariant_error() {
         panic!("assignment")
     };
     let target_span = assignment.targets[0].target_span;
+    let calls = reference::test_function_call_sites(&validated.program.source, &function);
     let errors = record_function_reference_origins(
         &validated.program.source,
         &mut function,
         &HashSet::new(),
-        &reference::FunctionCallSites {
-            structure: reference::OccurrenceStructure::empty(),
-            sites: Vec::new(),
-            arms: Vec::new(),
-            occurrences: Vec::new(),
-            call_occurrences: Vec::new(),
-        },
+        &calls,
         &validated.program.structs,
         &validated.program.enums,
         &HashMap::new(),
@@ -3529,17 +3519,12 @@ fn assignment_reads_rhs_before_write_and_shadowed_binding_is_diagnosed() {
             panic!("function")
         };
         let mut function = function.clone();
+        let calls = reference::test_function_call_sites(source, &function);
         assert!(record_function_reference_origins(
             source,
             &mut function,
             &HashSet::new(),
-            &reference::FunctionCallSites {
-                structure: reference::OccurrenceStructure::empty(),
-                sites: Vec::new(),
-                arms: Vec::new(),
-                occurrences: Vec::new(),
-                call_occurrences: Vec::new()
-            },
+            &calls,
             &[],
             &[],
             &HashMap::new()
@@ -3595,11 +3580,21 @@ fn unresolved_name_and_deliberately_empty_internal_origin_are_explicit() {
     };
     let module_names = HashSet::new();
     let assignment_outputs = HashMap::new();
+    let calls = reference::test_function_call_sites(&result.program.source, function);
+    let ScalarBlockItem::Expression(expression) = &function.body.items[0] else {
+        panic!("canonical expression item")
+    };
+    let reference::OccurrenceNode::Expression(ordinal) = calls.structure.edges[&(
+        reference::OccurrenceParent::Block(calls.structure.root),
+        reference::OccurrenceEdge::FinalOutput { item: 0, output: 0 },
+    )] else {
+        panic!("canonical expression ordinal")
+    };
     let mut builder = ReferenceFlowBuilder::new(
         &result.program.source,
         function,
         &module_names,
-        &[],
+        &calls,
         &[],
         &[],
         &assignment_outputs,
@@ -3615,10 +3610,7 @@ fn unresolved_name_and_deliberately_empty_internal_origin_are_explicit() {
     builder.checked.insert(binding.clone());
     builder.origins.insert(binding.clone(), BTreeSet::new());
     let error = builder
-        .expression(
-            &function.body.final_output_values[0].value,
-            ReferenceScopeId(0),
-        )
+        .expression(expression, ReferenceScopeId(0), ordinal)
         .expect_err("missing fact");
     assert!(matches!(&error, ReferenceAnalysisError::MissingOrigin {
             binding_id,
@@ -3631,10 +3623,7 @@ fn unresolved_name_and_deliberately_empty_internal_origin_are_explicit() {
     );
     builder.names.clear();
     let error = builder
-        .expression(
-            &function.body.final_output_values[0].value,
-            ReferenceScopeId(0),
-        )
+        .expression(expression, ReferenceScopeId(0), ordinal)
         .expect_err("missing resolved binding");
     assert!(
         matches!(error, ReferenceAnalysisError::MissingBinding { name, .. } if name == "parent")

@@ -348,7 +348,7 @@ fn preparation_keeps_equal_span_independent_occurrences_and_earlier_legacy_call_
         *span = call_span;
         let scope = Scope::new();
         let copies = layout::observations::Scope::new();
-        let prepared = PreparedProgram::new(declarations, target)
+        let mut prepared = PreparedProgram::new(declarations, target)
             .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
         assert_eq!(
             scope.counts(),
@@ -407,6 +407,7 @@ fn preparation_keeps_equal_span_independent_occurrences_and_earlier_legacy_call_
         );
         assert_eq!(row.sites.len(), 1);
         assert_eq!(row.sites[0].source_span.range, call_span);
+        let sites_before = row.sites.clone();
         let before = prepared.program.clone();
         let scope = Scope::new();
         let results = prepared.analyze().unwrap();
@@ -415,5 +416,50 @@ fn preparation_keeps_equal_span_independent_occurrences_and_earlier_legacy_call_
         let mut installed = before.clone();
         assert!(results.install(&mut installed).is_empty());
         assert_eq!(prepared.program, before);
+        let row = prepared.calls.as_mut().unwrap().function_mut(1);
+        assert_eq!(row.call_occurrences.remove(1).ordinal, OccurrenceOrdinal(5));
+        assert_eq!(
+            row.call_occurrences,
+            vec![CallOccurrence {
+                ordinal: OccurrenceOrdinal(1),
+                site: 0
+            }]
+        );
+        assert_eq!(row.sites, sites_before);
+        let scope = Scope::new();
+        let results = prepared.analyze().unwrap();
+        assert_eq!(scope.counts().call_sites, 0);
+        drop(scope);
+        let mut partial = before.clone();
+        let errors = results.install(&mut partial);
+        assert_eq!(
+            errors,
+            vec![ReferenceAnalysisError::MissingContext {
+                source_span: SourceSpan::new(before.source.clone(), call_span),
+                reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
+            }]
+        );
+        let ScalarItem::Function(probe) = &partial.items[1] else {
+            unreachable!()
+        };
+        let retained = probe
+            .reference_cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].source_span.range, call_span);
+        assert!(probe.reference_cfg.initial_points.is_empty());
+        assert_eq!(prepared.program, before);
+        let finished = prepared.finish();
+        assert_eq!(finished.program, partial);
+        assert_eq!(
+            finished.diagnostics,
+            errors
+                .iter()
+                .map(ReferenceAnalysisError::diagnostic)
+                .collect::<Vec<_>>()
+        );
     }
 }

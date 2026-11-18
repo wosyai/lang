@@ -197,39 +197,22 @@ fn template_index_retains_first_source_even_when_its_module_is_empty() {
     let first = ScalarModule::new(source(), Vec::new(), Vec::new());
     let second = raw_module(source(), GENERIC, ScalarTargetLayout::WASM32);
     let mut first_results = Vec::new();
+    let mut calls = resolve_module_call_sites(
+        &second.source,
+        &second.items,
+        &[CallResolutionModule::module(&second)],
+    )
+    .unwrap();
+    calls
+        .functions
+        .get_mut(&1)
+        .unwrap()
+        .call_occurrences
+        .clear();
     let (mut second_results, errors) = derive_module_reference_origins(
         &second.source,
         &second.items,
-        &ModuleCallSites {
-            functions: BTreeMap::from([
-                (
-                    0,
-                    FunctionCallSites {
-                        structure: OccurrenceStructure::empty(),
-                        sites: Vec::new(),
-                        occurrences: Vec::new(),
-                        call_occurrences: Vec::new(),
-                        arms: vec![FunctionCallSites {
-                            structure: OccurrenceStructure::empty(),
-                            sites: Vec::new(),
-                            arms: Vec::new(),
-                            occurrences: Vec::new(),
-                            call_occurrences: Vec::new(),
-                        }],
-                    },
-                ),
-                (
-                    1,
-                    FunctionCallSites {
-                        structure: OccurrenceStructure::empty(),
-                        sites: Vec::new(),
-                        arms: Vec::new(),
-                        occurrences: Vec::new(),
-                        call_occurrences: Vec::new(),
-                    },
-                ),
-            ]),
-        },
+        &calls,
         &[],
         &[],
         second.resolved_assignment_outputs.as_map(),

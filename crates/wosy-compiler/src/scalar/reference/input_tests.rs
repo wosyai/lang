@@ -69,8 +69,8 @@ fn real_constructor_borrows_all_five_nonempty_inventories_by_identity() {
     let ScalarItem::Function(function) = &program.items[1] else {
         panic!("read")
     };
-    let call_sites = &call_sites.functions[&1].sites;
-    assert!(!call_sites.is_empty());
+    let call_sites = &call_sites.functions[&1];
+    assert!(!call_sites.sites.is_empty());
     assert!(!program.structs.is_empty());
     assert!(!program.enums.is_empty());
     assert!(!program.resolved_assignment_outputs.is_empty());
@@ -85,7 +85,7 @@ fn real_constructor_borrows_all_five_nonempty_inventories_by_identity() {
         program.resolved_assignment_outputs.as_map(),
     );
     assert!(std::ptr::eq(builder.module_names, &module_names));
-    assert!(std::ptr::eq(builder.call_sites, call_sites.as_slice()));
+    assert!(std::ptr::eq(builder.call_sites, call_sites));
     assert!(std::ptr::eq(builder.structs, program.structs.as_slice()));
     assert!(std::ptr::eq(builder.enums, program.enums.as_slice()));
     assert!(std::ptr::eq(
@@ -177,7 +177,7 @@ fn immutable_producer_preserves_preexisting_cfg_and_entire_input_on_both_targets
                     &program.source,
                     callable,
                     &module_names,
-                    &calls.sites,
+                    calls,
                     &program.structs,
                     &program.enums,
                     program.resolved_assignment_outputs.as_map(),
@@ -203,6 +203,7 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
         let typed = typecheck_scalar_program(extracted, target);
         assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
         let program = typed.program;
+        let calls = resolve_program_call_sites(&program).unwrap();
         let ScalarItem::Function(parent) = &program.items[0] else {
             panic!("overload")
         };
@@ -224,12 +225,17 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
             })
             .collect::<Vec<_>>();
         let mut child_cfgs = Vec::new();
-        for (arm, expected) in parent.overload_arms.iter().zip(&expected_errors) {
+        for (position, (arm, expected)) in parent
+            .overload_arms
+            .iter()
+            .zip(&expected_errors)
+            .enumerate()
+        {
             let (cfg, errors) = derive_function_reference_cfg(
                 &program.source,
                 arm,
                 &module_names,
-                &[],
+                &calls.functions[&0].arms[position],
                 &program.structs,
                 &program.enums,
                 &missing_outputs,
@@ -245,7 +251,7 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
             &program.source,
             parent,
             &module_names,
-            &[],
+            &calls.functions[&0],
             &program.structs,
             &program.enums,
             &missing_outputs,
@@ -258,7 +264,7 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
             &program.source,
             parent,
             &module_names,
-            &[],
+            &calls.functions[&0],
             &program.structs,
             &program.enums,
             &missing_outputs,
@@ -276,28 +282,7 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
             &program.source,
             &mut installed,
             &module_names,
-            &FunctionCallSites {
-                structure: OccurrenceStructure::empty(),
-                sites: Vec::new(),
-                occurrences: Vec::new(),
-                call_occurrences: Vec::new(),
-                arms: vec![
-                    FunctionCallSites {
-                        structure: OccurrenceStructure::empty(),
-                        sites: Vec::new(),
-                        arms: Vec::new(),
-                        occurrences: Vec::new(),
-                        call_occurrences: Vec::new(),
-                    },
-                    FunctionCallSites {
-                        structure: OccurrenceStructure::empty(),
-                        sites: Vec::new(),
-                        arms: Vec::new(),
-                        occurrences: Vec::new(),
-                        call_occurrences: Vec::new(),
-                    },
-                ],
-            },
+            &calls.functions[&0],
             &program.structs,
             &program.enums,
             &missing_outputs,
