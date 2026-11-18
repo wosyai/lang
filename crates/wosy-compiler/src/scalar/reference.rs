@@ -1,7 +1,8 @@
 #[cfg(test)]
 use super::control::NamespaceTarget;
 use super::control::{
-    module_initialization_region, BindingOutput, BindingRegion, BlockItem, BlockItemKind,
+    module_initialization_region, BindingAllocationLengthSlot, BindingInitialization,
+    BindingOutput, BindingOutputs, BindingReceiverSlot, BindingRegion, BlockItem, BlockItemKind,
     BlockPosition, BlockRegion, ConditionalRegion, FinalOutputSlot, ModuleInitializationDetail,
     ModuleInitializationRegion, ModuleInitializationStepKind, ModuleInitializationTopology,
     ShortCircuitRegion, WhileRegion,
@@ -1717,10 +1718,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
         scope: ReferenceScopeId,
         declared: &mut Vec<(String, ReferenceBindingId, Option<ReferenceBindingId>)>,
         call_producer: Option<CfgPointId>,
-        region: &BindingRegion,
+        receivers: &[BindingReceiverSlot],
+        secondary: &[BindingOutput],
     ) -> Result<(), ReferenceAnalysisError> {
-        for receiver in &region.receivers()[1..] {
-            match &region.secondary[receiver.position - 1] {
+        for receiver in &receivers[1..] {
+            match &secondary[receiver.position - 1] {
                 BindingOutput::Evaluate {
                     position: source,
                     expression,
@@ -1839,8 +1841,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     BlockItemKind::Binding(binding_region),
                 ) => {
                     let receiver = &binding_region.receivers()[0];
+                    let outputs = match &binding_region.initialization {
+                        BindingInitialization::Outputs(outputs) => outputs,
+                        BindingInitialization::Allocation { .. } => {
+                            &calls.query_allocation_outputs[&(ordinal, item_index)]
+                        }
+                    };
                     let primary = &binding.value;
-                    let primary_ordinal = binding_region.primary;
+                    let primary_ordinal = outputs.primary;
                     let value = if matches!(receiver.ty, ScalarType::RawPointer(_))
                         && matches!(primary, ScalarExpression::Name { name, .. } if name == "null")
                     {
@@ -1906,7 +1914,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 scope,
                                 &mut declared,
                                 call_producer,
-                                binding_region,
+                                binding_region.receivers(),
+                                &outputs.secondary,
                             )?;
                             continue;
                         }
@@ -1941,7 +1950,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         scope,
                         &mut declared,
                         call_producer,
-                        binding_region,
+                        binding_region.receivers(),
+                        &outputs.secondary,
                     )?;
                 }
                 (
@@ -3844,6 +3854,8 @@ pub(super) enum OccurrenceEdge {
     PlaceIndex,
     DereferencePointer,
     BindingRoot { item: usize, output: usize },
+    BindingAllocationLength { item: usize, position: usize },
+    QueryAllocationPlaceholder { item: usize, output: usize },
     ExpressionItem { item: usize },
     FinalOutput { item: usize, output: usize },
     AssignmentRhs { item: usize, output: usize },
@@ -3930,6 +3942,8 @@ pub(super) struct FunctionCallSites {
     pub(super) arms: Vec<FunctionCallSites>,
     pub(super) occurrences: Vec<OccurrenceMetadata>,
     pub(super) call_occurrences: Vec<CallOccurrence>,
+    pub(super) allocation_length_calls: Vec<OccurrenceOrdinal>,
+    query_allocation_outputs: HashMap<(BlockOrdinal, usize), BindingOutputs>,
     pub(super) structure: OccurrenceStructure,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
@@ -3942,6 +3956,11 @@ pub(super) struct ProjectCallSiteResults {
 }
 
 impl ProjectCallSiteResults {
+    #[cfg(test)]
+    pub(super) fn function(&self, module: usize, item: usize) -> &FunctionCallSites {
+        &self.modules[module].as_ref().unwrap().functions[&item]
+    }
+
     pub(super) fn initialization_region(
         &self,
         module_ordinal: usize,
@@ -3981,11 +4000,12 @@ struct CallableWalk<'a> {
     assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
     sites: Vec<ResolvedCallSite>,
     call_occurrences: Vec<CallOccurrence>,
+    query_allocation_outputs: HashMap<(BlockOrdinal, usize), BindingOutputs>,
 }
 
 enum WalkMode<'a> {
     Callable(CallableWalk<'a>),
-    ModuleInitialization(Vec<OccurrenceOrdinal>),
+    StructuralOnly,
 }
 
 #[derive(Default)]
@@ -3996,6 +4016,7 @@ struct WalkScope {
 
 struct StructuralWalker<'a> {
     mode: WalkMode<'a>,
+    structural_calls: Vec<OccurrenceOrdinal>,
     occurrences: Vec<OccurrenceMetadata>,
     structure: OccurrenceStructure,
     assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
@@ -4008,6 +4029,7 @@ impl<'a> StructuralWalker<'a> {
     fn new(mode: WalkMode<'a>, span: ByteSpan) -> Self {
         Self {
             mode,
+            structural_calls: Vec::new(),
             occurrences: Vec::new(),
             structure: OccurrenceStructure::new(span),
             assignments: HashMap::new(),
@@ -4212,7 +4234,7 @@ impl StructuralWalker<'_> {
                     WalkMode::Callable(callable) => {
                         callable.register_call(ordinal, expression, names, types)?;
                     }
-                    WalkMode::ModuleInitialization(calls) => calls.push(ordinal),
+                    WalkMode::StructuralOnly => self.structural_calls.push(ordinal),
                 }
                 for (position, argument) in arguments.iter().enumerate() {
                     self.expression(
@@ -4449,29 +4471,67 @@ impl StructuralWalker<'_> {
         Ok(())
     }
 
-    fn binding_region(
+    fn binding_allocation_lengths(
         &mut self,
         binding: &ScalarBinding,
         position: BlockPosition,
-        block_span: ByteSpan,
-        scope: &mut WalkScope,
-    ) -> Result<BindingRegion, ReferenceAnalysisError> {
+    ) -> Result<BindingInitialization, ReferenceAnalysisError> {
+        let mode = std::mem::replace(&mut self.mode, WalkMode::StructuralOnly);
+        let names = BTreeMap::new();
+        let types = BTreeMap::new();
+        let lengths = binding
+            .receivers
+            .iter()
+            .enumerate()
+            .filter_map(|(receiver, slot)| Some((receiver, slot.allocation_length.as_ref()?)))
+            .map(|(receiver, length)| {
+                let expression = self.expression_at(
+                    length,
+                    &names,
+                    &types,
+                    OccurrenceParent::Block(position.block),
+                    OccurrenceEdge::BindingAllocationLength {
+                        item: position.item,
+                        position: receiver,
+                    },
+                )?;
+                Ok(BindingAllocationLengthSlot {
+                    position: receiver,
+                    expression,
+                    ty: ScalarType::U64,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>();
+        self.mode = mode;
+        Ok(BindingInitialization::Allocation { lengths: lengths? })
+    }
+
+    fn binding_outputs(
+        &mut self,
+        binding: &ScalarBinding,
+        position: BlockPosition,
+        scope: &WalkScope,
+    ) -> Result<BindingOutputs, ReferenceAnalysisError> {
         let parent = OccurrenceParent::Block(position.block);
         let item_index = position.item;
         let WalkScope { names, types } = scope;
+        let edge = |output| {
+            if binding.is_allocation {
+                OccurrenceEdge::QueryAllocationPlaceholder {
+                    item: item_index,
+                    output,
+                }
+            } else {
+                OccurrenceEdge::BindingRoot {
+                    item: item_index,
+                    output,
+                }
+            }
+        };
         let ScalarBindingOutput::Evaluate(primary) = binding.output_source(0) else {
             unreachable!("primary binding output evaluates its source")
         };
-        let primary = self.expression_at(
-            primary,
-            names,
-            types,
-            parent,
-            OccurrenceEdge::BindingRoot {
-                item: item_index,
-                output: 0,
-            },
-        )?;
+        let primary = self.expression_at(primary, names, types, parent, edge(0))?;
         let output_count = match binding.output_origin {
             ScalarBindingOutputOrigin::SingleExpression => binding.receivers.len(),
             ScalarBindingOutputOrigin::IndependentExpressions => binding.output_values.len(),
@@ -4480,16 +4540,8 @@ impl StructuralWalker<'_> {
         for position in 1..output_count {
             let output = match binding.output_source(position) {
                 ScalarBindingOutput::Evaluate(value) => {
-                    let expression = self.expression_at(
-                        value,
-                        names,
-                        types,
-                        parent,
-                        OccurrenceEdge::BindingRoot {
-                            item: item_index,
-                            output: position,
-                        },
-                    )?;
+                    let expression =
+                        self.expression_at(value, names, types, parent, edge(position))?;
                     BindingOutput::Evaluate {
                         position,
                         expression,
@@ -4501,10 +4553,37 @@ impl StructuralWalker<'_> {
             };
             secondary.push(output);
         }
+        Ok(BindingOutputs { primary, secondary })
+    }
+
+    fn binding_region(
+        &mut self,
+        binding: &ScalarBinding,
+        position: BlockPosition,
+        block_span: ByteSpan,
+        scope: &mut WalkScope,
+    ) -> Result<BindingRegion, ReferenceAnalysisError> {
+        let initialization = if binding.is_allocation {
+            if matches!(&self.mode, WalkMode::Callable(_)) {
+                let outputs = self.binding_outputs(binding, position, scope)?;
+                let WalkMode::Callable(callable) = &mut self.mode else {
+                    unreachable!("callable binding output traversal")
+                };
+                assert!(callable
+                    .query_allocation_outputs
+                    .insert((position.block, position.item), outputs)
+                    .is_none());
+            }
+            self.binding_allocation_lengths(binding, position)?
+        } else {
+            BindingInitialization::Outputs(self.binding_outputs(binding, position, scope)?)
+        };
         if let WalkMode::Callable(callable) = &self.mode {
             for receiver in &binding.receivers {
-                types.insert(receiver.name.clone(), receiver.ty.clone());
-                names.insert(
+                scope
+                    .types
+                    .insert(receiver.name.clone(), receiver.ty.clone());
+                scope.names.insert(
                     receiver.name.clone(),
                     ReferenceBindingId {
                         source: callable.source.clone(),
@@ -4516,7 +4595,7 @@ impl StructuralWalker<'_> {
                 );
             }
         }
-        Ok(BindingRegion::new(primary, secondary, binding))
+        Ok(BindingRegion::new(initialization, binding))
     }
 
     fn block_item(
@@ -4601,7 +4680,7 @@ impl StructuralWalker<'_> {
                         },
                     )?;
                     let replacement = match &self.mode {
-                        WalkMode::ModuleInitialization(_) => AssignmentReplacement::StructuralOnly,
+                        WalkMode::StructuralOnly => AssignmentReplacement::StructuralOnly,
                         WalkMode::Callable(callable) => callable
                             .assignment_outputs
                             .get(&ResolvedAssignmentOutputId {
@@ -4787,10 +4866,7 @@ fn walk_module_initialization(
     region: &ModuleInitializationRegion,
     items: &[ScalarItem],
 ) -> ModuleInitializationTopology {
-    let mut walker = StructuralWalker::new(
-        WalkMode::ModuleInitialization(Vec::new()),
-        ByteSpan::new(0, 0),
-    );
+    let mut walker = StructuralWalker::new(WalkMode::StructuralOnly, ByteSpan::new(0, 0));
     let root = walker.structure.root;
     let mut scope = WalkScope::default();
     let mut block_items = Vec::new();
@@ -4849,13 +4925,10 @@ fn walk_module_initialization(
         root_block.span = span;
     }
     root_block.items = block_items;
-    let WalkMode::ModuleInitialization(calls) = walker.mode else {
-        unreachable!("module initialization structural traversal")
-    };
     ModuleInitializationTopology {
         structure: walker.structure,
         occurrences: walker.occurrences,
-        calls,
+        calls: walker.structural_calls,
         assignments: walker.assignments,
         conditionals: walker.conditionals,
         loops: walker.loops,
@@ -4908,6 +4981,7 @@ fn resolve_function_call_sites(
         assignment_outputs,
         sites: Vec::new(),
         call_occurrences: Vec::new(),
+        query_allocation_outputs: HashMap::new(),
     };
     let mut resolver = StructuralWalker::new(WalkMode::Callable(callable), function.body.span);
     let mut parameter_names = BTreeMap::new();
@@ -4982,6 +5056,8 @@ fn resolve_function_call_sites(
         arms,
         occurrences: resolver.occurrences,
         call_occurrences: callable.call_occurrences,
+        allocation_length_calls: resolver.structural_calls,
+        query_allocation_outputs: callable.query_allocation_outputs,
         structure: resolver.structure,
         assignments: resolver.assignments,
         conditionals: resolver.conditionals,

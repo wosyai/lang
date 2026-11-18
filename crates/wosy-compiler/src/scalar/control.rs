@@ -197,18 +197,34 @@ pub(super) struct BindingReceiverSlot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct BindingRegion {
+pub(super) struct BindingAllocationLengthSlot {
+    pub(super) position: usize,
+    pub(super) expression: OccurrenceOrdinal,
+    pub(super) ty: ScalarType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BindingOutputs {
     pub(super) primary: OccurrenceOrdinal,
     pub(super) secondary: Vec<BindingOutput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum BindingInitialization {
+    Outputs(BindingOutputs),
+    Allocation {
+        lengths: Vec<BindingAllocationLengthSlot>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BindingRegion {
+    pub(super) initialization: BindingInitialization,
     receivers: Vec<BindingReceiverSlot>,
 }
 
 impl BindingRegion {
-    pub(super) fn new(
-        primary: OccurrenceOrdinal,
-        secondary: Vec<BindingOutput>,
-        binding: &ScalarBinding,
-    ) -> Self {
+    pub(super) fn new(initialization: BindingInitialization, binding: &ScalarBinding) -> Self {
         let mut receivers = Vec::with_capacity(binding.receivers.len().max(1));
         receivers.push(BindingReceiverSlot {
             position: 0,
@@ -225,8 +241,7 @@ impl BindingRegion {
             },
         ));
         Self {
-            primary,
-            secondary,
+            initialization,
             receivers,
         }
     }

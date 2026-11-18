@@ -658,9 +658,14 @@ fn prepared_module_initialization_publishes_nested_canonical_occurrences() {
         let BlockItemKind::Binding(binding) = &root_items[0].kind else {
             panic!("root binding");
         };
+        let BindingInitialization::Outputs(BindingOutputs { primary, .. }) =
+            &binding.initialization
+        else {
+            panic!("value initializer");
+        };
         assert_eq!(
             structure.edges[&(root, Edge::BindingRoot { item: 3, output: 0 })],
-            Node::Expression(binding.primary)
+            Node::Expression(*primary)
         );
         assert_eq!(binding.receivers()[0].name, "value");
         let ConditionalRegion::Value {
@@ -668,7 +673,7 @@ fn prepared_module_initialization_publishes_nested_canonical_occurrences() {
             then_block,
             else_block,
             ..
-        } = topology.conditionals[&binding.primary]
+        } = topology.conditionals[primary]
         else {
             panic!("initializer conditional");
         };
