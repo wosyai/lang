@@ -276,9 +276,11 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         return Err("cannot emit LLVM for an invalid scalar program".into());
     }
     let program = &validation.program;
+    let initialization_region = module_initialization_region(&program.source, &program.items, &[]);
     emit_single_module_llvm(
         &program.source,
         &program.items,
+        &initialization_region,
         &program.structs,
         &program.layouts,
         program.target_layout,
@@ -292,16 +294,24 @@ pub fn emit_scalar_build_single_module_llvm(
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar program".into());
     }
-    let modules = &validation.prepared().project().modules;
+    let prepared = validation.prepared();
+    let modules = &prepared.project().modules;
     let [module] = modules.as_slice() else {
         return Err(format!(
             "single-module LLVM emission requires exactly one prepared module, found {}",
             modules.len()
         ));
     };
+    let initialization_region = prepared.initialization_region(0).ok_or_else(|| {
+        format!(
+            "internal error: missing module initialization region for {:?} (module 0)",
+            module.source,
+        )
+    })?;
     emit_single_module_llvm(
         &module.source,
         &module.items,
+        initialization_region,
         &module.structs,
         &module.layouts,
         module.target_layout,
@@ -312,6 +322,7 @@ pub fn emit_scalar_build_single_module_llvm(
 fn emit_single_module_llvm<'a>(
     source: &wosy_syntax::SourceIdentity,
     items: &'a [ScalarItem],
+    initialization_region: &ModuleInitializationRegion,
     structs: &[ScalarStruct],
     layouts: &ScalarTargetLayouts,
     target_layout: ScalarTargetLayout,
@@ -512,6 +523,7 @@ fn emit_single_module_llvm<'a>(
         &dynamic_owner_outputs,
         &globals,
         items,
+        initialization_region,
         &module,
         &structs,
         &layouts,
@@ -1716,6 +1728,7 @@ fn emit_main<'ctx, 'module>(
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     items: &[ScalarItem],
+    initialization_region: &ModuleInitializationRegion,
     module: &'module Module<'ctx>,
     structs: &'module [&'module ScalarStruct],
     layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
@@ -1764,9 +1777,9 @@ fn emit_main<'ctx, 'module>(
         next_block: 0,
     };
     insert_unit_values(&mut state.values, items);
-    for item in items {
-        match item {
-            ScalarItem::Binding(binding) => {
+    for step in &initialization_region.steps {
+        match (&step.kind, &items[step.item]) {
+            (ModuleInitializationStepKind::BindingInitialization, ScalarItem::Binding(binding)) => {
                 let value = emit_binding_value(context, &mut state, binding)?;
                 if binding.is_allocation {
                     store_binding_outputs(context, &mut state, binding, value)?;
@@ -1796,10 +1809,14 @@ fn emit_main<'ctx, 'module>(
                     );
                 }
             }
-            ScalarItem::Executable(item) => {
+            (ModuleInitializationStepKind::ExecutableItem, ScalarItem::Executable(item)) => {
                 emit_block_item(context, &mut state, item)?;
             }
-            ScalarItem::Namespace(_) | ScalarItem::Extern(_) | ScalarItem::Function(_) => {}
+            (ModuleInitializationStepKind::NamespaceDispatch { .. }, ScalarItem::Namespace(_)) => {}
+            _ => panic!(
+                "module initialization step disagrees with item {} in {:?}",
+                step.item, initialization_region.source,
+            ),
         }
     }
     release_scope_runtime_array_owners(context, &mut state, &BTreeMap::new())?;

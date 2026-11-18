@@ -1662,27 +1662,46 @@ fn detached_single_module_llvm_matches_legacy_on_both_targets() {
         "src/main.w".into(),
         "r1".into(),
     );
-    for (text, ir_witnesses) in [
-        (
-            "%%start
+    for (target_layout, pointer_width) in [
+        (ScalarTargetLayout::WASM32, "i32"),
+        (ScalarTargetLayout::NATIVE64, "i64"),
+    ] {
+        let dereference = format!("inttoptr {pointer_width}");
+        for (text, ir_witnesses, main_stores) in [
+            (
+                "%%start
+i32 counter = 10;
 unit(u64) discard = fn(count) { u8[count] bytes; bytes[0] = 3; unsafe { core.invalidate(&bytes); } };
 *u8(*u8, bool) choose = fn(input, flag) { u8 local = 1; if (flag) { &local } else { input } };
 select = overload {
     i64(i64) => fn(value) { value };
     *u8(*u8, bool) => fn(input, flag) { choose(input, flag) };
 };
+counter = 11;
+i32 after = 12;
+counter = 13;
 u8 outside = 2;
 *u8 outside_ref = &outside;
+u8 observed = *outside_ref;
 bool use_fresh = true;
 *u8 selected = select(outside_ref, use_fresh);
 %%end",
-            [
-                "store i1 false, ptr %bytes_live",
-                "ptr %checked_return_owner_0",
-            ],
-        ),
-        (
-            "%%start
+                [
+                    "store i1 false, ptr %bytes_live",
+                    "ptr %checked_return_owner_0",
+                    dereference.as_str(),
+                ]
+                .as_slice(),
+                [
+                    "store i32 10, ptr @counter,",
+                    "store i32 11,",
+                    "store i32 12, ptr @after,",
+                    "store i32 13,",
+                ]
+                .as_slice(),
+            ),
+            (
+                "%%start
 generic T;
 T(T) identity = fn(value) { value };
 cast = overload {
@@ -1695,12 +1714,12 @@ i32 narrow = cast(wide);
 bool flag = true;
 bool copied = cast(flag);
 %%end",
-            ["call i64 @wosy_generic__", "call i1 @wosy_generic__"],
-        ),
-    ] {
-        let parsed = parse_source(source.clone(), text.into(), &[]);
-        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        for target_layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+                ["call i64 @wosy_generic__", "call i1 @wosy_generic__"].as_slice(),
+                &[],
+            ),
+        ] {
+            let parsed = parse_source(source.clone(), text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
             let prepared = prepare_scalar_project(
                 vec![(
                     derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
@@ -1722,6 +1741,15 @@ bool copied = cast(flag);
                     detached_ir.contains(witness),
                     "missing {witness}: {detached_ir}"
                 );
+            }
+            let main = detached_ir.split("define i32 @main").nth(1).expect("main");
+            let mut next = 0;
+            for &store in main_stores {
+                assert_eq!(main.matches(store).count(), 1, "{store}: {main}");
+                next += main[next..]
+                    .find(store)
+                    .unwrap_or_else(|| panic!("{store}: {main}"))
+                    + store.len();
             }
         }
     }
