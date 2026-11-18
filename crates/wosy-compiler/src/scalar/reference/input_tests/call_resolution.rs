@@ -265,6 +265,7 @@ fn standalone_call_lookup_borrows_actual_inputs_and_preserves_complete_indirect_
             resolve_module_call_sites(
                 &module.source,
                 &module.items,
+                &module.namespace_bindings,
                 &views,
                 module.resolved_assignment_outputs.as_map()
             )

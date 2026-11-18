@@ -1,6 +1,35 @@
 use super::reference::{BlockOrdinal, OccurrenceOrdinal};
 use super::ScalarType;
-use wosy_syntax::ByteSpan;
+use wosy_syntax::{ByteSpan, SourceIdentity};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ModuleInitializationRegion {
+    pub(super) source: SourceIdentity,
+    pub(super) steps: Vec<ModuleInitializationStep>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ModuleInitializationStep {
+    pub(super) item: usize,
+    pub(super) kind: ModuleInitializationStepKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ModuleInitializationStepKind {
+    NamespaceDispatch {
+        binding: String,
+        binding_span: ByteSpan,
+        target: NamespaceTarget,
+    },
+    BindingInitialization,
+    ExecutableItem,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum NamespaceTarget {
+    Bound(SourceIdentity),
+    Unbound,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct AssignmentEvaluation {

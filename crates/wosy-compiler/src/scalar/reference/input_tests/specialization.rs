@@ -200,6 +200,7 @@ fn template_index_retains_first_source_even_when_its_module_is_empty() {
     let mut calls = resolve_module_call_sites(
         &second.source,
         &second.items,
+        &second.namespace_bindings,
         &[CallResolutionModule::module(&second)],
         second.resolved_assignment_outputs.as_map(),
     )

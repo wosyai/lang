@@ -4,7 +4,8 @@ use super::control::{
 };
 use super::control::{
     BindingOutput, BindingRegion, BlockItem, BlockItemKind, BlockPosition, BlockRegion,
-    ConditionalRegion, FinalOutputSlot, ShortCircuitRegion, WhileRegion,
+    ConditionalRegion, FinalOutputSlot, ModuleInitializationRegion, ModuleInitializationStep,
+    ModuleInitializationStepKind, NamespaceTarget, ShortCircuitRegion, WhileRegion,
 };
 use super::*;
 
@@ -3792,6 +3793,7 @@ pub(super) fn resolve_program_call_sites(
     resolve_module_call_sites(
         &program.source,
         &program.items,
+        &[],
         &modules,
         program.resolved_assignment_outputs.as_map(),
     )
@@ -3800,6 +3802,7 @@ pub(super) fn resolve_program_call_sites(
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct ModuleCallSites {
     functions: BTreeMap<usize, FunctionCallSites>,
+    pub(super) initialization: ModuleInitializationRegion,
 }
 
 #[cfg(test)]
@@ -3954,6 +3957,7 @@ pub(super) fn resolve_project_call_sites(modules: &[ScalarModule]) -> ProjectCal
                 resolve_module_call_sites(
                     &module.source,
                     &module.items,
+                    &module.namespace_bindings,
                     &views,
                     module.resolved_assignment_outputs.as_map(),
                 )
@@ -4610,6 +4614,7 @@ impl ValidatedCallResolver<'_> {
 fn resolve_module_call_sites(
     source: &SourceIdentity,
     items: &[ScalarItem],
+    namespace_bindings: &[ScalarNamespaceBinding],
     modules: &[CallResolutionModule<'_>],
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
@@ -4661,21 +4666,49 @@ fn resolve_module_call_sites(
             }
         }
     }
-    let mut functions = BTreeMap::new();
-    for (index, item) in items.iter().enumerate() {
-        if let ScalarItem::Function(function) = item {
-            let calls = resolve_function_call_sites(
-                source,
-                function,
-                &module_callables,
-                &extern_callables,
-                modules,
-                assignment_outputs,
-            )?;
-            functions.insert(index, calls);
-        }
+    let mut namespace_targets = HashMap::new();
+    for binding in namespace_bindings {
+        namespace_targets
+            .entry(binding.binding.as_str())
+            .or_insert(&binding.target);
     }
-    Ok(ModuleCallSites { functions })
+    let mut functions = BTreeMap::new();
+    let mut steps = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let kind = match item {
+            ScalarItem::Function(function) => {
+                let calls = resolve_function_call_sites(
+                    source,
+                    function,
+                    &module_callables,
+                    &extern_callables,
+                    modules,
+                    assignment_outputs,
+                )?;
+                functions.insert(index, calls);
+                continue;
+            }
+            ScalarItem::Extern(_) => continue,
+            ScalarItem::Namespace(namespace) => ModuleInitializationStepKind::NamespaceDispatch {
+                binding: namespace.binding.clone(),
+                binding_span: namespace.binding_span,
+                target: match namespace_targets.get(namespace.binding.as_str()) {
+                    Some(target) => NamespaceTarget::Bound((*target).clone()),
+                    None => NamespaceTarget::Unbound,
+                },
+            },
+            ScalarItem::Binding(_) => ModuleInitializationStepKind::BindingInitialization,
+            ScalarItem::Executable(_) => ModuleInitializationStepKind::ExecutableItem,
+        };
+        steps.push(ModuleInitializationStep { item: index, kind });
+    }
+    Ok(ModuleCallSites {
+        functions,
+        initialization: ModuleInitializationRegion {
+            source: source.clone(),
+            steps,
+        },
+    })
 }
 
 #[cfg(test)]

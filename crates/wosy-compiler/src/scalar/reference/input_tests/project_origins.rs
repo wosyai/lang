@@ -154,6 +154,7 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
         let sites = resolve_module_call_sites(
             &modules[0].source,
             &modules[0].items,
+            &modules[0].namespace_bindings,
             &views,
             modules[0].resolved_assignment_outputs.as_map(),
         )
@@ -180,6 +181,7 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
         let expected = resolve_module_call_sites(
             &modules[0].source,
             &modules[0].items,
+            &modules[0].namespace_bindings,
             &views,
             modules[0].resolved_assignment_outputs.as_map(),
         )
@@ -480,7 +482,84 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
     assert_eq!(
         calls.modules,
         vec![Ok(ModuleCallSites {
-            functions: BTreeMap::new()
+            functions: BTreeMap::new(),
+            initialization: ModuleInitializationRegion {
+                source: modules[0].source.clone(),
+                steps: Vec::new(),
+            },
         })]
     );
+}
+
+#[test]
+fn standalone_and_project_publish_source_ordered_module_initialization_dispatch() {
+    use ModuleInitializationStepKind as Step;
+
+    let text = "%%start\nchild = namespace package \"child.w\";\nenv = extern wasm \"helper\" { unit() flush; };\ni32 value = 1;\ni32(i32) identity = fn(input) { input };\nvalue;\n%%end";
+    let target = ScalarTargetLayout::WASM32;
+    let mut root = raw_module("root.w", text, target);
+    let child = raw_module("child.w", text, target);
+    let parsed = parse_source(root.source.clone(), text.into(), &[]);
+    let typed = typecheck_scalar_program(
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+        target,
+    );
+    assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+    let standalone = resolve_program_call_sites(&typed.program).unwrap();
+
+    let ScalarItem::Namespace(namespace) = &root.items[0] else {
+        panic!("namespace item")
+    };
+    let binding_span = namespace.binding_span;
+    assert_eq!(
+        &text[binding_span.start as usize..binding_span.end as usize],
+        "child"
+    );
+    root.namespace_bindings.push(ScalarNamespaceBinding {
+        binding: namespace.binding.clone(),
+        span: namespace.span,
+        target: child.source.clone(),
+    });
+    let typed_project = typecheck_scalar_project(project(vec![root, child]));
+    assert!(
+        typed_project.diagnostics.is_empty(),
+        "{:?}",
+        typed_project.diagnostics
+    );
+    let modules = &typed_project.project.modules;
+    let project_calls = resolve_project_call_sites(modules);
+    for (calls, source, target) in [
+        (&standalone, &typed.program.source, NamespaceTarget::Unbound),
+        (
+            project_calls.modules[0].as_ref().unwrap(),
+            &modules[0].source,
+            NamespaceTarget::Bound(modules[1].source.clone()),
+        ),
+        (
+            project_calls.modules[1].as_ref().unwrap(),
+            &modules[1].source,
+            NamespaceTarget::Unbound,
+        ),
+    ] {
+        let region = &calls.initialization;
+        assert_eq!(&region.source, source);
+        assert_eq!(
+            region
+                .steps
+                .iter()
+                .map(|step| step.item)
+                .collect::<Vec<_>>(),
+            [0, 2, 4]
+        );
+        assert_eq!(
+            region.steps[0].kind,
+            Step::NamespaceDispatch {
+                binding: "child".into(),
+                binding_span,
+                target,
+            }
+        );
+        assert_eq!(region.steps[1].kind, Step::BindingInitialization);
+        assert_eq!(region.steps[2].kind, Step::ExecutableItem);
+    }
 }
