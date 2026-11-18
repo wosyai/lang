@@ -2008,6 +2008,31 @@ pub struct ScalarValidation {
     pub diagnostics: Vec<super::Diagnostic>,
 }
 
+pub struct ScalarSourceDeclarations {
+    source: SourceIdentity,
+    items: Vec<ScalarItem>,
+    structs: Vec<ScalarStruct>,
+    enums: Vec<ScalarEnum>,
+    diagnostics: Vec<super::Diagnostic>,
+}
+
+impl ScalarSourceDeclarations {
+    pub fn source(&self) -> &SourceIdentity {
+        &self.source
+    }
+
+    pub fn diagnostics(&self) -> &[super::Diagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn namespaces(&self) -> impl Iterator<Item = &ScalarNamespace> {
+        self.items.iter().filter_map(|item| match item {
+            ScalarItem::Namespace(namespace) => Some(namespace),
+            _ => None,
+        })
+    }
+}
+
 pub fn derive_scalar_program(parse: &ParseResult) -> ScalarValidation {
     derive_scalar_program_with_layout(parse, ScalarTargetLayout::WASM32)
 }
@@ -2023,16 +2048,11 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
     derive_scalar_program_from_cst_with_layout(canonical, ScalarTargetLayout::WASM32)
 }
 
-pub fn derive_scalar_program_from_cst_with_layout(
+pub fn derive_scalar_declarations_from_cst(
     canonical: &CanonicalCstRoot,
-    target_layout: ScalarTargetLayout,
-) -> ScalarValidation {
+) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
-    let mut diagnostics = string_diagnostics(canonical);
-    diagnostics.extend(char_diagnostics(canonical));
-    diagnostics.extend(integer_diagnostics(canonical));
-    diagnostics.extend(float_diagnostics(canonical));
-    diagnostics.extend(fixed_array_length_diagnostics(canonical));
+    let diagnostics = derive_scalar_diagnostics_from_cst(canonical);
     let source_root = canonical
         .root
         .children()
@@ -2120,8 +2140,28 @@ pub fn derive_scalar_program_from_cst_with_layout(
             generic_function = false;
         }
     }
-    let mut program = ScalarProgram {
+    ScalarSourceDeclarations {
         source: canonical.source.clone(),
+        items,
+        structs,
+        enums,
+        diagnostics,
+    }
+}
+
+pub fn derive_scalar_program_from_cst_with_layout(
+    canonical: &CanonicalCstRoot,
+    target_layout: ScalarTargetLayout,
+) -> ScalarValidation {
+    let ScalarSourceDeclarations {
+        source,
+        items,
+        structs,
+        enums,
+        mut diagnostics,
+    } = derive_scalar_declarations_from_cst(canonical);
+    let mut program = ScalarProgram {
+        source,
         items,
         structs,
         enums,
@@ -4590,3 +4630,6 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod extraction_tests;
