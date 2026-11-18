@@ -1813,6 +1813,27 @@ pub struct ScalarBinding {
     pub span: ByteSpan,
 }
 
+enum ScalarBindingOutput<'a> {
+    Evaluate(&'a ScalarExpression),
+    ProjectPrimary { output: usize },
+}
+
+impl ScalarBinding {
+    fn output_source(&self, position: usize) -> ScalarBindingOutput<'_> {
+        if position == 0 {
+            return ScalarBindingOutput::Evaluate(&self.value);
+        }
+        match self.output_origin {
+            ScalarBindingOutputOrigin::IndependentExpressions => {
+                ScalarBindingOutput::Evaluate(&self.output_values[position].value)
+            }
+            ScalarBindingOutputOrigin::SingleExpression => {
+                ScalarBindingOutput::ProjectPrimary { output: position }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarNamespace {
     pub binding: String,

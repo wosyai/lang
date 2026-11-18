@@ -1489,11 +1489,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
         call_producer: Option<CfgPointId>,
     ) -> Result<(), ReferenceAnalysisError> {
         for (position, receiver) in binding.receivers.iter().enumerate().skip(1) {
-            let value = &binding.output_values[position].value;
-            if binding.output_origin == ScalarBindingOutputOrigin::IndependentExpressions {
-                self.expression(value, scope)?;
-            } else if let Some(producer) = call_producer {
-                self.project_call_output(producer, position);
+            match binding.output_source(position) {
+                ScalarBindingOutput::Evaluate(value) => {
+                    self.expression(value, scope)?;
+                }
+                ScalarBindingOutput::ProjectPrimary { output } => {
+                    if let Some(producer) = call_producer {
+                        self.project_call_output(producer, output);
+                    }
+                }
             }
             let id = ReferenceBindingId {
                 source: self.source.clone(),
@@ -1575,28 +1579,31 @@ impl<'a> ReferenceFlowBuilder<'a> {
         for (index, item) in block.items.iter().enumerate() {
             match item {
                 ScalarBlockItem::LocalBinding(binding) => {
+                    let ScalarBindingOutput::Evaluate(primary) = binding.output_source(0) else {
+                        unreachable!("primary binding output evaluates its source")
+                    };
                     let value = if matches!(binding.declared_type, ScalarType::RawPointer(_))
-                        && matches!(&binding.value, ScalarExpression::Name { name, .. } if name == "null")
+                        && matches!(primary, ScalarExpression::Name { name, .. } if name == "null")
                     {
                         self.point(
-                            CfgPointKind::Evaluate(binding.value.clone()),
-                            expression_span(&binding.value),
+                            CfgPointKind::Evaluate(primary.clone()),
+                            expression_span(primary),
                             scope,
                             BTreeSet::new(),
                         );
                         ReferenceValue::Other
                     } else {
-                        self.expression(&binding.value, scope)?
+                        self.expression(primary, scope)?
                     };
                     let call_producer = if binding.output_origin
                         == ScalarBindingOutputOrigin::SingleExpression
-                        && matches!(binding.value, ScalarExpression::Call { .. })
+                        && matches!(primary, ScalarExpression::Call { .. })
                     {
                         Some(self.cursor.expect("evaluated binding call"))
                     } else {
                         None
                     };
-                    self.move_value(&binding.value, scope)?;
+                    self.move_value(primary, scope)?;
                     let id = ReferenceBindingId {
                         source: self.source.clone(),
                         function_span: self.function_span,
@@ -3732,10 +3739,15 @@ impl ValidatedCallResolver<'_> {
         for item in &block.items {
             match item {
                 ScalarBlockItem::LocalBinding(binding) => {
-                    self.expression(&binding.value, &names, &types)?;
-                    if binding.output_origin == ScalarBindingOutputOrigin::IndependentExpressions {
-                        for output in binding.output_values.iter().skip(1) {
-                            self.expression(&output.value, &names, &types)?;
+                    let ScalarBindingOutput::Evaluate(primary) = binding.output_source(0) else {
+                        unreachable!("primary binding output evaluates its source")
+                    };
+                    self.expression(primary, &names, &types)?;
+                    for position in 1..binding.output_values.len() {
+                        if let ScalarBindingOutput::Evaluate(value) =
+                            binding.output_source(position)
+                        {
+                            self.expression(value, &names, &types)?;
                         }
                     }
                     for receiver in &binding.receivers {

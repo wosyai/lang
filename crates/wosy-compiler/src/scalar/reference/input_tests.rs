@@ -12,6 +12,8 @@ mod call_resolution;
 
 mod call_projection;
 
+mod binding_outputs;
+
 mod assignment_destinations;
 
 mod complete_results;
