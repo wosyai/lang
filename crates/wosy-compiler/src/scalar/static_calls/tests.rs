@@ -6,6 +6,8 @@ mod occurrence_inventory;
 
 mod neutral_assignments;
 
+mod neutral_branches;
+
 fn parsed(text: &str) -> wosy_syntax::ParseResult {
     let identity = SourceIdentity::new(
         "project".into(),

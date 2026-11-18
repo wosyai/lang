@@ -2,6 +2,9 @@ use super::control::{
     AssignmentContinuation, AssignmentEvaluation, AssignmentGroup, AssignmentProjection,
     AssignmentSlot,
 };
+use super::control::{
+    BlockPosition, ConditionalRegion, FinalOutputSlot, ShortCircuitRegion, ValueArm, WhileRegion,
+};
 use super::*;
 
 #[cfg(test)]
@@ -582,9 +585,21 @@ impl<'a> ReferenceFlowBuilder<'a> {
         else_branch: Option<&ScalarBlock>,
         span: ByteSpan,
         scope: ReferenceScopeId,
-        parent: OccurrenceParent,
+        region: &ConditionalRegion,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
-        self.expression_child(condition, scope, parent, OccurrenceEdge::Condition)?;
+        let (condition_ordinal, then_block) = match region {
+            ConditionalRegion::Value {
+                condition,
+                then_arm,
+                ..
+            } => (*condition, then_arm.block),
+            ConditionalRegion::Unit {
+                condition,
+                then_block,
+                ..
+            } => (*condition, *then_block),
+        };
+        self.expression(condition, scope, condition_ordinal)?;
         let branch = self.point(
             CfgPointKind::Branch {
                 condition: condition.clone(),
@@ -596,10 +611,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let incoming_names = self.names.clone();
         let incoming_origins = self.origins.clone();
         let incoming_checked = self.checked.clone();
-        let then_value = self.block(
-            then_branch,
-            self.block_ordinal(parent, OccurrenceEdge::ThenBranch),
-        )?;
+        let then_value = self.block(then_branch, then_block)?;
         let then_end = self.cursor.expect("then branch terminal");
         let then_checked = self.checked.clone();
 
@@ -608,10 +620,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
         self.checked = incoming_checked.clone();
         self.cursor = Some(branch);
         let (else_value, else_end) = if let Some(else_branch) = else_branch {
-            let result = self.block(
-                else_branch,
-                self.block_ordinal(parent, OccurrenceEdge::ElseBranch),
-            )?;
+            let ConditionalRegion::Value { else_arm, .. } = region else {
+                unreachable!("value conditional region")
+            };
+            let result = self.block(else_branch, else_arm.block)?;
             (result, self.cursor.expect("else branch terminal"))
         } else {
             (None, branch)
@@ -646,25 +658,42 @@ impl<'a> ReferenceFlowBuilder<'a> {
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
         let span = expression_span(expression);
         let parent = OccurrenceParent::Expression(ordinal);
+        let calls = self.call_sites;
         match expression {
             ScalarExpression::If {
                 condition,
                 then_branch,
                 else_branch,
                 ..
-            } => self.conditional(
-                condition,
-                then_branch,
-                Some(else_branch),
-                span,
-                scope,
-                parent,
-            ),
+            } => {
+                let region = &calls.conditionals[&ordinal];
+                assert!(
+                    matches!(region, ConditionalRegion::Value { .. }),
+                    "expected value conditional at {ordinal:?} in {:?}",
+                    self.source
+                );
+                self.conditional(
+                    condition,
+                    then_branch,
+                    Some(else_branch),
+                    span,
+                    scope,
+                    region,
+                )
+            }
             ScalarExpression::UnitIf {
                 condition,
                 then_branch,
                 ..
-            } => self.conditional(condition, then_branch, None, span, scope, parent),
+            } => {
+                let region = &calls.conditionals[&ordinal];
+                assert!(
+                    matches!(region, ConditionalRegion::Unit { .. }),
+                    "expected unit conditional at {ordinal:?} in {:?}",
+                    self.source
+                );
+                self.conditional(condition, then_branch, None, span, scope, region)
+            }
             ScalarExpression::Block(block) => match self
                 .block(block, self.block_ordinal(parent, OccurrenceEdge::BlockBody))?
             {
@@ -819,9 +848,20 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     Ok(ReferenceValue::Uncomputed)
                 }
             }
-            ScalarExpression::Binary { left, right, .. } => {
-                self.expression_child(left, scope, parent, OccurrenceEdge::BinaryLeft)?;
-                self.expression_child(right, scope, parent, OccurrenceEdge::BinaryRight)?;
+            ScalarExpression::Binary {
+                operator,
+                left,
+                right,
+                ..
+            } => {
+                if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
+                    let region = &calls.short_circuits[&ordinal];
+                    self.expression(left, scope, region.left)?;
+                    self.expression(right, scope, region.right)?;
+                } else {
+                    self.expression_child(left, scope, parent, OccurrenceEdge::BinaryLeft)?;
+                    self.expression_child(right, scope, parent, OccurrenceEdge::BinaryRight)?;
+                }
                 self.point(
                     CfgPointKind::Evaluate(expression.clone()),
                     span,
@@ -2146,6 +2186,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     }
                 }
                 ScalarBlockItem::While(loop_) => {
+                    let region = self.call_sites.loops[&(ordinal, item_index)];
+                    let (body, test) = region.body_to_test();
                     let loop_head = self.point(
                         CfgPointKind::LoopTest {
                             condition: loop_.condition.clone(),
@@ -2154,12 +2196,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         scope,
                         BTreeSet::new(),
                     );
-                    self.expression_child(
-                        &loop_.condition,
-                        scope,
-                        parent,
-                        OccurrenceEdge::WhileCondition { item: item_index },
-                    )?;
+                    self.expression(&loop_.condition, scope, test)?;
                     let branch = self.point(
                         CfgPointKind::Branch {
                             condition: loop_.condition.clone(),
@@ -2171,10 +2208,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let names = self.names.clone();
                     let origins = self.origins.clone();
                     let checked = self.checked.clone();
-                    self.block(
-                        &loop_.body,
-                        self.block_ordinal(parent, OccurrenceEdge::WhileBody { item: item_index }),
-                    )?;
+                    self.block(&loop_.body, body)?;
                     let back = self.cursor.expect("loop body terminal");
                     self.cfg.points[back.0].successors.push(loop_head);
                     self.names = names;
@@ -3847,6 +3881,9 @@ pub(super) struct FunctionCallSites {
     pub(super) call_occurrences: Vec<CallOccurrence>,
     pub(super) structure: OccurrenceStructure,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
+    pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
+    pub(super) loops: HashMap<(BlockOrdinal, usize), WhileRegion>,
+    pub(super) short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
 }
 
 pub(super) struct ProjectCallSiteResults {
@@ -3877,6 +3914,9 @@ struct ValidatedCallResolver<'a> {
     call_occurrences: Vec<CallOccurrence>,
     structure: OccurrenceStructure,
     assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
+    conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
+    loops: HashMap<(BlockOrdinal, usize), WhileRegion>,
+    short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
 }
 
 impl ValidatedCallResolver<'_> {
@@ -4062,9 +4102,33 @@ impl ValidatedCallResolver<'_> {
                     )?;
                 }
             }
-            ScalarExpression::Binary { left, right, .. } => {
-                self.expression(left, names, types, parent, OccurrenceEdge::BinaryLeft)?;
-                self.expression(right, names, types, parent, OccurrenceEdge::BinaryRight)?;
+            ScalarExpression::Binary {
+                operator,
+                left,
+                right,
+                ..
+            } => {
+                let left =
+                    self.expression_at(left, names, types, parent, OccurrenceEdge::BinaryLeft)?;
+                let right =
+                    self.expression_at(right, names, types, parent, OccurrenceEdge::BinaryRight)?;
+                if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
+                    let evaluate_right_when = matches!(operator, BinaryOperator::And);
+                    assert!(self
+                        .short_circuits
+                        .insert(
+                            ordinal,
+                            ShortCircuitRegion {
+                                span: expression_span(expression),
+                                left,
+                                right,
+                                evaluate_right_when,
+                                bypass: !evaluate_right_when,
+                                join: ordinal,
+                            }
+                        )
+                        .is_none());
+                }
             }
             ScalarExpression::Unary { operand, .. } => {
                 self.expression(operand, names, types, parent, OccurrenceEdge::UnaryOperand)?
@@ -4075,38 +4139,65 @@ impl ValidatedCallResolver<'_> {
                 else_branch,
                 ..
             } => {
-                self.expression(condition, names, types, parent, OccurrenceEdge::Condition)?;
-                self.block(
+                let condition =
+                    self.expression_at(condition, names, types, parent, OccurrenceEdge::Condition)?;
+                let then_arm = self.block(
                     then_branch,
                     names,
                     types,
                     parent,
                     OccurrenceEdge::ThenBranch,
                 )?;
-                self.block(
+                let else_arm = self.block(
                     else_branch,
                     names,
                     types,
                     parent,
                     OccurrenceEdge::ElseBranch,
                 )?;
+                assert!(self
+                    .conditionals
+                    .insert(
+                        ordinal,
+                        ConditionalRegion::Value {
+                            span: expression_span(expression),
+                            condition,
+                            then_arm,
+                            else_arm,
+                            resume: ordinal,
+                        }
+                    )
+                    .is_none());
             }
             ScalarExpression::UnitIf {
                 condition,
                 then_branch,
                 ..
             } => {
-                self.expression(condition, names, types, parent, OccurrenceEdge::Condition)?;
-                self.block(
+                let condition =
+                    self.expression_at(condition, names, types, parent, OccurrenceEdge::Condition)?;
+                let then_arm = self.block(
                     then_branch,
                     names,
                     types,
                     parent,
                     OccurrenceEdge::ThenBranch,
                 )?;
+                assert!(self
+                    .conditionals
+                    .insert(
+                        ordinal,
+                        ConditionalRegion::Unit {
+                            span: expression_span(expression),
+                            condition,
+                            then_block: then_arm.block,
+                            fallthrough: ordinal,
+                        }
+                    )
+                    .is_none());
             }
             ScalarExpression::Block(block) => {
-                self.block(block, names, types, parent, OccurrenceEdge::BlockBody)?
+                self.block(block, names, types, parent, OccurrenceEdge::BlockBody)?;
             }
             ScalarExpression::RawAddress { place, .. }
             | ScalarExpression::CheckedAddress { place, .. }
@@ -4194,7 +4285,7 @@ impl ValidatedCallResolver<'_> {
         outer_types: &BTreeMap<String, ScalarType>,
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
-    ) -> Result<(), ReferenceAnalysisError> {
+    ) -> Result<ValueArm, ReferenceAnalysisError> {
         let ordinal = BlockOrdinal(self.structure.blocks.len());
         self.structure.blocks.push(block.span);
         assert!(self
@@ -4202,7 +4293,11 @@ impl ValidatedCallResolver<'_> {
             .edges
             .insert((parent, edge), OccurrenceNode::Block(ordinal))
             .is_none());
-        self.block_items(block, outer, outer_types, ordinal)
+        let outputs = self.block_items(block, outer, outer_types, ordinal)?;
+        Ok(ValueArm {
+            block: ordinal,
+            outputs,
+        })
     }
 
     fn block_items(
@@ -4211,8 +4306,9 @@ impl ValidatedCallResolver<'_> {
         outer: &BTreeMap<String, ReferenceBindingId>,
         outer_types: &BTreeMap<String, ScalarType>,
         ordinal: BlockOrdinal,
-    ) -> Result<(), ReferenceAnalysisError> {
+    ) -> Result<Vec<FinalOutputSlot>, ReferenceAnalysisError> {
         let parent = OccurrenceParent::Block(ordinal);
+        let mut outputs = Vec::new();
         let mut names = outer.clone();
         let mut types = outer_types.clone();
         for (item_index, (item, role)) in block.items_with_output_roles().enumerate() {
@@ -4262,18 +4358,27 @@ impl ValidatedCallResolver<'_> {
                     }
                 }
                 ScalarBlockItem::Expression(expression) => {
-                    let edge = match role {
+                    let edge = match &role {
                         ScalarBlockItemRole::Ordinary => {
                             OccurrenceEdge::ExpressionItem { item: item_index }
                         }
                         ScalarBlockItemRole::FinalOutput { output, .. } => {
                             OccurrenceEdge::FinalOutput {
                                 item: item_index,
-                                output,
+                                output: *output,
                             }
                         }
                     };
-                    self.expression(expression, &names, &types, parent, edge)?
+                    let expression =
+                        self.expression_at(expression, &names, &types, parent, edge)?;
+                    if let ScalarBlockItemRole::FinalOutput { output, metadata } = role {
+                        outputs.push(FinalOutputSlot {
+                            item: item_index,
+                            output,
+                            expression,
+                            span: metadata.span,
+                        });
+                    }
                 }
                 ScalarBlockItem::Assignment(assignment) => {
                     let mut evaluations = Vec::new();
@@ -4351,24 +4456,39 @@ impl ValidatedCallResolver<'_> {
                     }
                 }
                 ScalarBlockItem::While(while_expression) => {
-                    self.expression(
+                    let test = self.expression_at(
                         &while_expression.condition,
                         &names,
                         &types,
                         parent,
                         OccurrenceEdge::WhileCondition { item: item_index },
                     )?;
-                    self.block(
+                    let body = self.block(
                         &while_expression.body,
                         &names,
                         &types,
                         parent,
                         OccurrenceEdge::WhileBody { item: item_index },
                     )?;
+                    assert!(self
+                        .loops
+                        .insert(
+                            (ordinal, item_index),
+                            WhileRegion {
+                                span: while_expression.span,
+                                test,
+                                body: body.block,
+                                on_false: BlockPosition {
+                                    block: ordinal,
+                                    item: item_index + 1
+                                },
+                            }
+                        )
+                        .is_none());
                 }
             }
         }
-        Ok(())
+        Ok(outputs)
     }
 }
 
@@ -4478,6 +4598,9 @@ fn resolve_function_call_sites(
         call_occurrences: Vec::new(),
         structure: OccurrenceStructure::new(function.body.span),
         assignments: HashMap::new(),
+        conditionals: HashMap::new(),
+        loops: HashMap::new(),
+        short_circuits: HashMap::new(),
     };
     let mut parameter_names = BTreeMap::new();
     let mut parameter_types = BTreeMap::new();
@@ -4515,6 +4638,9 @@ fn resolve_function_call_sites(
         call_occurrences: resolver.call_occurrences,
         structure: resolver.structure,
         assignments: resolver.assignments,
+        conditionals: resolver.conditionals,
+        loops: resolver.loops,
+        short_circuits: resolver.short_circuits,
     })
 }
 
