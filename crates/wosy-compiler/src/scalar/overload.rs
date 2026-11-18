@@ -1662,8 +1662,8 @@ mod tests {
         assert_eq!(counts.projections, observations::Payload::default());
         assert_eq!(counts.recorders, 1);
         assert_zero_recording_copies(&counts);
-        assert!(outside.counts().module_copies > 0);
-        assert!(outside.counts().cfg_copies > 0);
+        assert_eq!(outside.counts().module_copies, 0);
+        assert_eq!(outside.counts().cfg_copies, 0);
     }
 
     #[test]

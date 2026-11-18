@@ -422,9 +422,9 @@ mod tests {
         assert_eq!(header_scope.counts().environments, 1);
         assert_eq!(header_scope.counts().modules, 4);
         let copies = copy_scope.counts();
-        assert!(copies.module_copies > 0);
+        assert_eq!(copies.module_copies, 0);
         assert!(copies.struct_copies > 0);
-        assert!(copies.cfg_copies > 0);
+        assert_eq!(copies.cfg_copies, 0);
         for (ordinal, module) in validation.project.modules.iter().enumerate() {
             let target = &validation.project.modules[(ordinal + 1) % 4];
             assert_eq!(

@@ -29,7 +29,7 @@ fn standalone_detached_convergence_propagates_checked_returns_without_integral_c
                 call_sites: 0,
                 reference_origins: 1,
                 output_contracts: 1,
-                copy_specialization: 0
+                copy_specialization: 1
             }
         );
         drop(stages);

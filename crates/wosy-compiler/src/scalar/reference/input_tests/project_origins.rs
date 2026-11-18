@@ -56,7 +56,7 @@ fn actual_project_origin_stage_copies_one_aggregate_inventory_and_preserves_conv
         }
         let scope = layout::observations::Scope::new();
         let stages = stage_observations::Scope::new();
-        let (mut updates, errors) = derive_project_reference_origins(&derived.modules);
+        let (mut updates, errors, _) = derive_project_reference_origins(&derived.modules);
         assert!(errors.is_empty(), "{errors:?}");
         let counts = scope.counts();
         assert_eq!(counts.program_copies, 0);

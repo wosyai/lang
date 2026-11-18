@@ -6,6 +6,8 @@ mod project_origins;
 
 mod output_contracts;
 
+mod specialization;
+
 const TEXT: &str = "%%start\nstruct copy Point { u8 value; }\nenum Marker { ready; }\npick = overload { u8(u8) => fn(input) { u8 next = input; next }; u32(u32) => fn(input) { u32 next = input; next }; };\nu8(Point) read = fn(input) { next = input; pick(next.value) };\n%%end";
 
 fn source() -> SourceIdentity {

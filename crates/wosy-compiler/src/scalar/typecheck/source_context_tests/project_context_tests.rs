@@ -82,9 +82,9 @@ fn splitter_and_project_place_entry_borrow_ordered_actual_storage_across_indepen
                         "{:?}",
                         validation.diagnostics
                     );
-                    assert!(public.counts().module_copies > 0);
+                    assert_eq!(public.counts().module_copies, 0);
                     assert!(public.counts().struct_copies > 0);
-                    assert!(public.counts().cfg_copies > 0);
+                    assert_eq!(public.counts().cfg_copies, 0);
                     drop(public);
                     let mut project = validation.project;
                     for (ordinal, module) in project.modules.iter_mut().enumerate() {

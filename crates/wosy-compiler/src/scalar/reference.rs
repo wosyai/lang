@@ -72,6 +72,29 @@ pub(super) fn record_program_reference_origins(
     program: &mut ScalarProgram,
     call_sites: &[ResolvedCallSite],
 ) -> Vec<ReferenceAnalysisError> {
+    let (mut updates, mut errors) = derive_and_converge_program_references(program, call_sites);
+    if errors.is_empty() {
+        errors.extend(specialize_reference_results(
+            &mut [ModuleReferenceView {
+                source: &program.source,
+                items: &program.items,
+                results: &mut updates,
+            }],
+            &program.structs,
+            &program.enums,
+        ));
+    }
+    install_module_reference_results(&mut program.items, updates);
+    errors
+}
+
+fn derive_and_converge_program_references(
+    program: &ScalarProgram,
+    call_sites: &[ResolvedCallSite],
+) -> (
+    Vec<(usize, FunctionReferenceResult)>,
+    Vec<ReferenceAnalysisError>,
+) {
     let (mut updates, mut errors) = derive_module_reference_origins(
         &program.source,
         &program.items,
@@ -89,8 +112,7 @@ pub(super) fn record_program_reference_origins(
             },
         ]));
     }
-    install_module_reference_results(&mut program.items, updates);
-    errors
+    (updates, errors)
 }
 
 pub(super) struct ReferenceFlowBuilder<'a> {
@@ -3771,7 +3793,34 @@ fn install_module_reference_results(
 pub(super) fn record_project_reference_origins(
     modules: &mut [ScalarModule],
 ) -> Vec<ReferenceAnalysisError> {
-    let (mut updates, mut errors) = derive_project_reference_origins(modules);
+    let (mut updates, mut errors, inventory) = derive_and_converge_project_references(modules);
+    if errors.is_empty() && !modules.is_empty() {
+        let (structs, enums) =
+            inventory.expect("successful module call lookup built aggregate inventory");
+        let mut views = updates
+            .iter_mut()
+            .map(|(index, results)| ModuleReferenceView {
+                source: &modules[*index].source,
+                items: &modules[*index].items,
+                results,
+            })
+            .collect::<Vec<_>>();
+        errors.extend(specialize_reference_results(&mut views, &structs, &enums));
+    }
+    for (index, results) in updates {
+        install_module_reference_results(&mut modules[index].items, results);
+    }
+    errors
+}
+
+fn derive_and_converge_project_references(
+    modules: &[ScalarModule],
+) -> (
+    Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
+    Vec<ReferenceAnalysisError>,
+    Option<(Vec<ScalarStruct>, Vec<ScalarEnum>)>,
+) {
+    let (mut updates, mut errors, inventory) = derive_project_reference_origins(modules);
     if errors.is_empty() {
         let mut views = updates
             .iter_mut()
@@ -3783,10 +3832,7 @@ pub(super) fn record_project_reference_origins(
             .collect::<Vec<_>>();
         errors.extend(resolve_reference_output_contracts(&mut views));
     }
-    for (index, results) in updates {
-        install_module_reference_results(&mut modules[index].items, results);
-    }
-    errors
+    (updates, errors, inventory)
 }
 
 fn derive_project_reference_origins(
@@ -3794,6 +3840,7 @@ fn derive_project_reference_origins(
 ) -> (
     Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
     Vec<ReferenceAnalysisError>,
+    Option<(Vec<ScalarStruct>, Vec<ScalarEnum>)>,
 ) {
     let mut inventory = None;
     let mut updates = Vec::new();
@@ -3827,7 +3874,7 @@ fn derive_project_reference_origins(
             Err(error) => errors.push(error),
         }
     }
-    (updates, errors)
+    (updates, errors, inventory)
 }
 
 struct ModuleReferenceView<'a> {
@@ -4016,43 +4063,103 @@ fn resolve_reference_output_contracts(
     }
 }
 
-pub(super) fn record_specialized_copy_policies(
-    items: &mut [ScalarItem],
-    modules: &[ScalarModule],
+struct ReferenceTemplateIndex<'a> {
+    modules: HashMap<
+        &'a SourceIdentity,
+        HashMap<ByteSpan, (&'a ScalarFunction, &'a FunctionReferenceResult)>,
+    >,
+}
+
+impl<'a> ReferenceTemplateIndex<'a> {
+    fn new(modules: &'a [ModuleReferenceView<'_>]) -> Self {
+        let mut index = HashMap::new();
+        for module in modules {
+            index.entry(module.source).or_insert_with(|| {
+                let mut declarations = HashMap::new();
+                for (ordinal, result) in module.results.iter() {
+                    let ScalarItem::Function(function) = &module.items[*ordinal] else {
+                        unreachable!("function result ordinal")
+                    };
+                    declarations
+                        .entry(function.name_span)
+                        .or_insert((function, result));
+                }
+                declarations
+            });
+        }
+        Self { modules: index }
+    }
+}
+
+struct FunctionPolicyResult {
+    policies: Vec<SpecializedCopyPolicy>,
+    arms: Vec<FunctionPolicyResult>,
+}
+
+impl FunctionPolicyResult {
+    fn apply(self, result: &mut FunctionReferenceResult) {
+        for (update, arm) in self.arms.into_iter().zip(&mut result.arms) {
+            update.apply(arm);
+        }
+        result.cfg.specialized_policies.extend(self.policies);
+    }
+}
+
+fn specialize_reference_results(
+    modules: &mut [ModuleReferenceView<'_>],
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
 ) -> Vec<ReferenceAnalysisError> {
-    #[cfg(test)]
-    stage_observations::record_copy_specialization();
+    let templates = ReferenceTemplateIndex::new(modules);
     let mut errors = Vec::new();
-    for item in items {
-        if let ScalarItem::Function(function) = item {
-            errors.extend(record_function_specialized_copy_policies(
-                function, modules, structs, enums,
-            ));
+    let mut updates = Vec::new();
+    for module in modules.iter() {
+        #[cfg(test)]
+        stage_observations::record_copy_specialization();
+        let mut module_updates = Vec::new();
+        for (ordinal, result) in module.results.iter() {
+            let ScalarItem::Function(function) = &module.items[*ordinal] else {
+                unreachable!("function result ordinal")
+            };
+            let (update, current_errors) = derive_function_specialized_copy_policies(
+                function, result, &templates, structs, enums,
+            );
+            module_updates.push(update);
+            errors.extend(current_errors);
+        }
+        updates.push(module_updates);
+    }
+    drop(templates);
+    for (module, updates) in modules.iter_mut().zip(updates) {
+        for ((_, result), update) in module.results.iter_mut().zip(updates) {
+            update.apply(result);
         }
     }
     errors
 }
 
-fn record_function_specialized_copy_policies(
-    function: &mut ScalarFunction,
-    modules: &[ScalarModule],
+fn derive_function_specialized_copy_policies(
+    function: &ScalarFunction,
+    result: &FunctionReferenceResult,
+    templates: &ReferenceTemplateIndex<'_>,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
-) -> Vec<ReferenceAnalysisError> {
+) -> (FunctionPolicyResult, Vec<ReferenceAnalysisError>) {
     let mut errors = Vec::new();
-    for arm in &mut function.overload_arms {
-        errors.extend(record_function_specialized_copy_policies(
-            arm, modules, structs, enums,
-        ));
+    let mut arms = Vec::new();
+    let mut policies = Vec::new();
+    for (arm, result) in function.overload_arms.iter().zip(&result.arms) {
+        let (update, current_errors) =
+            derive_function_specialized_copy_policies(arm, result, templates, structs, enums);
+        arms.push(update);
+        errors.extend(current_errors);
     }
     let generic_parameters = function
         .generic_parameters
         .iter()
         .map(|parameter| parameter.name.clone())
         .collect::<BTreeSet<_>>();
-    for point in &function.reference_cfg.points {
+    for point in &result.cfg.points {
         let CfgPointKind::Call {
             expression: ScalarExpression::Call { type_arguments, .. },
             output: 0,
@@ -4071,28 +4178,22 @@ fn record_function_specialized_copy_policies(
             source_span: point.source_span.clone(),
             reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
         };
-        let Some(declaration) = modules
-            .iter()
-            .find(|module| module.source == *source)
-            .and_then(|module| {
-                module.items.iter().find_map(|item| match item {
-                    ScalarItem::Function(candidate) if candidate.name_span == *declaration_span => {
-                        Some(candidate)
-                    }
-                    _ => None,
-                })
-            })
+        let Some((declaration, declaration_result)) = templates
+            .modules
+            .get(source)
+            .and_then(|module| module.get(declaration_span))
         else {
             errors.push(error());
             continue;
         };
         let template = match concrete {
-            ConcreteCallSelection::Overload(selection) => {
-                declaration.overload_arms.get(selection.arm_index)
-            }
-            ConcreteCallSelection::Declaration => Some(declaration),
+            ConcreteCallSelection::Overload(selection) => declaration
+                .overload_arms
+                .get(selection.arm_index)
+                .zip(declaration_result.arms.get(selection.arm_index)),
+            ConcreteCallSelection::Declaration => Some((*declaration, *declaration_result)),
         };
-        let Some(template) = template else {
+        let Some((template, template_result)) = template else {
             errors.push(error());
             continue;
         };
@@ -4123,7 +4224,7 @@ fn record_function_specialized_copy_policies(
             continue;
         }
         let mut deferred = BTreeMap::new();
-        for template_point in &template.reference_cfg.points {
+        for template_point in &template_result.cfg.points {
             let ty = match &template_point.kind {
                 CfgPointKind::DeferredMove { ty, .. }
                 | CfgPointKind::DeferredMoveThrough { ty, .. }
@@ -4145,23 +4246,20 @@ fn record_function_specialized_copy_policies(
                 }
                 Ok(policy) => {
                     deferred.insert(template_point.id.0, policy);
-                    function
-                        .reference_cfg
-                        .specialized_policies
-                        .push(SpecializedCopyPolicy {
-                            call_point: point.id,
-                            template_source: source.clone(),
-                            template_function_span: template.span,
-                            template_point: template_point.id,
-                            ty: concrete_ty,
-                            policy,
-                        })
+                    policies.push(SpecializedCopyPolicy {
+                        call_point: point.id,
+                        template_source: source.clone(),
+                        template_function_span: template.span,
+                        template_point: template_point.id,
+                        ty: concrete_ty,
+                        policy,
+                    })
                 }
                 Err(_) => errors.push(error()),
             }
         }
         if !deferred.is_empty() {
-            let mut concrete_cfg = template.reference_cfg.clone();
+            let mut concrete_cfg = template_result.cfg.clone();
             concrete_cfg.points = concrete_cfg.initial_points.clone();
             let transferred = transfer_reference_facts(&mut concrete_cfg, &deferred, &[]);
             errors.extend(transferred.into_iter().map(|error| {
@@ -4172,7 +4270,7 @@ fn record_function_specialized_copy_policies(
             }));
         }
     }
-    errors
+    (FunctionPolicyResult { policies, arms }, errors)
 }
 
 struct FunctionReferenceResult {

@@ -2212,19 +2212,6 @@ pub fn derive_scalar_program_from_cst_with_layout(
                 .map(|error| error.diagnostic()),
         );
     }
-    if diagnostics.is_empty() {
-        let module = ScalarModule::from_program(program.clone(), Vec::new());
-        diagnostics.extend(
-            record_specialized_copy_policies(
-                &mut program.items,
-                &[module],
-                &program.structs,
-                &program.enums,
-            )
-            .into_iter()
-            .map(|error| error.diagnostic()),
-        );
-    }
     ScalarValidation {
         program,
         diagnostics,
@@ -2765,24 +2752,6 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                 .into_iter()
                 .map(|error| error.diagnostic()),
         );
-    }
-    if diagnostics.is_empty() {
-        let modules = project.modules.clone();
-        let structs = modules
-            .iter()
-            .flat_map(|module| module.structs.clone())
-            .collect::<Vec<_>>();
-        let enums = modules
-            .iter()
-            .flat_map(|module| module.enums.clone())
-            .collect::<Vec<_>>();
-        for module in &mut project.modules {
-            diagnostics.extend(
-                record_specialized_copy_policies(&mut module.items, &modules, &structs, &enums)
-                    .into_iter()
-                    .map(|error| error.diagnostic()),
-            );
-        }
     }
     ScalarProjectValidation {
         project,
@@ -3405,8 +3374,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
 
 mod reference;
 use reference::{
-    expand_conditional_final_outputs, record_program_reference_origins,
-    record_specialized_copy_policies, resolve_module_call_sites,
+    expand_conditional_final_outputs, record_program_reference_origins, resolve_module_call_sites,
 };
 fn derive_type(node: &CstNode) -> ScalarType {
     let actual = if matches!(node.kind(), SyntaxKind::TypeSpec | SyntaxKind::Punctuation) {
