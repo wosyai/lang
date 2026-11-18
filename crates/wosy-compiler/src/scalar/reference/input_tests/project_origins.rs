@@ -177,6 +177,19 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
             resolve_module_call_sites(&modules[0].source, &modules[0].items, &views).unwrap_err();
         drop(views);
         let calls = resolve_project_call_sites(&modules);
+        let before_analysis = modules.clone();
+        let complete = analyze_project_references(&modules, calls);
+        assert_eq!(modules, before_analysis);
+        assert_eq!(complete.errors, vec![expected.clone()]);
+        assert_eq!(
+            complete
+                .updates
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        let calls = resolve_project_call_sites(&modules);
         let scope = layout::observations::Scope::new();
         let stages = stage_observations::Scope::new();
         let errors = record_project_reference_origins(&mut modules, calls);
@@ -196,6 +209,9 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
         drop(stages);
         drop(scope);
         assert_eq!(modules[0], untouched);
+        let mut moved = before_analysis;
+        assert_eq!(complete.install(&mut moved), errors);
+        assert_eq!(moved, modules);
         for item in &modules[1].items {
             let ScalarItem::Function(function) = item else {
                 panic!("function")

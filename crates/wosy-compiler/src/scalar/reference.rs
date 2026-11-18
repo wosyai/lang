@@ -72,6 +72,25 @@ pub(super) fn record_program_reference_origins(
     program: &mut ScalarProgram,
     call_sites: &[ResolvedCallSite],
 ) -> Vec<ReferenceAnalysisError> {
+    analyze_program_references(program, call_sites).install(program)
+}
+
+struct ProgramReferenceResults {
+    updates: Vec<(usize, FunctionReferenceResult)>,
+    errors: Vec<ReferenceAnalysisError>,
+}
+
+impl ProgramReferenceResults {
+    fn install(self, program: &mut ScalarProgram) -> Vec<ReferenceAnalysisError> {
+        install_module_reference_results(&mut program.items, self.updates);
+        self.errors
+    }
+}
+
+fn analyze_program_references(
+    program: &ScalarProgram,
+    call_sites: &[ResolvedCallSite],
+) -> ProgramReferenceResults {
     let (mut updates, mut errors) = derive_and_converge_program_references(program, call_sites);
     if errors.is_empty() {
         errors.extend(specialize_reference_results(
@@ -84,8 +103,7 @@ pub(super) fn record_program_reference_origins(
             &program.enums,
         ));
     }
-    install_module_reference_results(&mut program.items, updates);
-    errors
+    ProgramReferenceResults { updates, errors }
 }
 
 fn derive_and_converge_program_references(
@@ -3971,6 +3989,27 @@ pub(super) fn record_project_reference_origins(
     modules: &mut [ScalarModule],
     call_sites: ProjectCallSiteResults,
 ) -> Vec<ReferenceAnalysisError> {
+    analyze_project_references(modules, call_sites).install(modules)
+}
+
+struct ProjectReferenceResults {
+    updates: Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
+    errors: Vec<ReferenceAnalysisError>,
+}
+
+impl ProjectReferenceResults {
+    fn install(self, modules: &mut [ScalarModule]) -> Vec<ReferenceAnalysisError> {
+        for (index, results) in self.updates {
+            install_module_reference_results(&mut modules[index].items, results);
+        }
+        self.errors
+    }
+}
+
+fn analyze_project_references(
+    modules: &[ScalarModule],
+    call_sites: ProjectCallSiteResults,
+) -> ProjectReferenceResults {
     let (mut updates, mut errors, inventory) =
         derive_and_converge_project_references(modules, call_sites);
     if errors.is_empty() && !modules.is_empty() {
@@ -3986,10 +4025,7 @@ pub(super) fn record_project_reference_origins(
             .collect::<Vec<_>>();
         errors.extend(specialize_reference_results(&mut views, &structs, &enums));
     }
-    for (index, results) in updates {
-        install_module_reference_results(&mut modules[index].items, results);
-    }
-    errors
+    ProjectReferenceResults { updates, errors }
 }
 
 fn derive_and_converge_project_references(
