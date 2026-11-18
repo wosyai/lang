@@ -9,10 +9,9 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 use wosy_compiler::{
-    derive_scalar_diagnostics_from_cst, derive_scalar_program_from_cst_with_layout,
-    emit_scalar_llvm_text, emit_scalar_project_llvm, parse_source, publication,
-    serialize_publication, validate_scalar_project, ScalarModule, ScalarNamespaceBinding,
-    ScalarProject, ScalarTargetLayout,
+    analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_llvm,
+    emit_scalar_build_single_module_llvm, parse_source, prepare_scalar_project, publication,
+    serialize_publication, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
 use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest, load_reachable_source_graph,
@@ -269,7 +268,7 @@ fn compile_project(
     let mut pending = vec![(project.package.clone(), root_path.clone())];
     let mut index = 0;
     let mut nodes = Vec::new();
-    let mut canonical = BTreeMap::new();
+    let mut declarations_by_path = BTreeMap::new();
     let mut texts = BTreeMap::new();
 
     while index < pending.len() {
@@ -309,12 +308,11 @@ fn compile_project(
         }
         let snapshot_path = persist_cst(root, &output)?;
         let cst = load_canonical_cst(&snapshot_path)?;
-        let validation = derive_scalar_program_from_cst_with_layout(&cst, target_layout);
+        #[cfg(test)]
+        routing_observations::record(|counts| counts.extractions += 1);
+        let declarations = derive_scalar_declarations_from_cst(&cst);
         let mut namespace_edges = Vec::new();
-        for item in &validation.program.items {
-            let wosy_compiler::ScalarItem::Namespace(namespace) = item else {
-                continue;
-            };
+        for namespace in declarations.namespaces() {
             let module_path = serde_json::from_str::<String>(&namespace.path)
                 .map_err(|error| format!("invalid namespace path: {error}"))?;
             let module_path = PackageRelativePath::new(module_path.into())?;
@@ -368,7 +366,7 @@ fn compile_project(
             content_revision: ContentRevision(revision),
             namespace_edges,
         });
-        canonical.insert((package.clone(), path.clone()), cst);
+        declarations_by_path.insert((package, path), declarations);
         texts.insert(graph_source, text);
     }
 
@@ -387,7 +385,7 @@ fn compile_project(
         render_graph_diagnostics(&error, &texts);
         format_graph_error(error)
     })?;
-    let mut modules = Vec::new();
+    let mut project_declarations = Vec::new();
     let mut source_by_path = BTreeMap::new();
     let mut derivation_diagnostics = Vec::new();
     for node in &graph.nodes {
@@ -398,16 +396,15 @@ fn compile_project(
         );
     }
     for node in &graph.nodes {
-        let cst = canonical
-            .get(&(node.source.package.clone(), node.source.path.clone()))
+        let declarations = declarations_by_path
+            .remove(&(node.source.package.clone(), node.source.path.clone()))
             .ok_or_else(|| {
                 format!(
                     "missing canonical CST for {}",
                     node.source.path.as_path().display()
                 )
             })?;
-        derivation_diagnostics.extend(derive_scalar_diagnostics_from_cst(cst));
-        let validation = derive_scalar_program_from_cst_with_layout(cst, target_layout);
+        derivation_diagnostics.extend_from_slice(declarations.diagnostics());
         let namespace_bindings = node
             .namespace_edges
             .iter()
@@ -424,10 +421,7 @@ fn compile_project(
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        modules.push(ScalarModule::from_program(
-            validation.program,
-            namespace_bindings,
-        ));
+        project_declarations.push((declarations, namespace_bindings));
     }
     render_project_diagnostics(&derivation_diagnostics, &texts);
     if !derivation_diagnostics.is_empty() {
@@ -447,22 +441,34 @@ fn compile_project(
                 .ok_or_else(|| format!("missing module {}", node.source.path.as_path().display()))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let validation = validate_scalar_project(ScalarProject::new(modules, initialization_order));
-    render_project_diagnostics(&validation.diagnostics, &texts);
-    if !validation.diagnostics.is_empty() {
+    #[cfg(test)]
+    routing_observations::record(|counts| counts.preparations += 1);
+    let prepared = prepare_scalar_project(
+        project_declarations,
+        initialization_order,
+        ScalarPreparationInputs { target_layout },
+    )
+    .map_err(|rejected| {
+        render_project_diagnostics(&rejected.diagnostics, &texts);
+        "build rejected by semantic diagnostics".to_owned()
+    })?;
+    #[cfg(test)]
+    routing_observations::record(|counts| counts.builds += 1);
+    let validation = analyze_scalar_build(&prepared);
+    render_project_diagnostics(validation.diagnostics(), &texts);
+    if !validation.diagnostics().is_empty() {
         return Err("build rejected by semantic diagnostics".to_owned());
     }
     let llvm = if graph.nodes.len() == 1 {
-        emit_scalar_llvm_text(&derive_scalar_program_from_cst_with_layout(
-            canonical
-                .get(&(project.package.clone(), root_path.clone()))
-                .ok_or_else(|| "missing canonical CST for project root".to_owned())?,
-            target_layout,
-        ))?
+        #[cfg(test)]
+        routing_observations::record(|counts| counts.single_module_emissions += 1);
+        emit_scalar_build_single_module_llvm(&validation)?
     } else {
-        let partition = emit_scalar_project_llvm(&validation)?;
-        partition.to_text()
-    };
+        #[cfg(test)]
+        routing_observations::record(|counts| counts.project_emissions += 1);
+        emit_scalar_build_project_llvm(&validation)?
+    }
+    .to_text();
     let source_observations = graph
         .nodes
         .iter()
@@ -759,6 +765,56 @@ fn render_diagnostics(
 }
 
 #[cfg(test)]
+mod routing_observations {
+    use super::*;
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) struct Counts {
+        pub(super) extractions: usize,
+        pub(super) preparations: usize,
+        pub(super) builds: usize,
+        pub(super) single_module_emissions: usize,
+        pub(super) project_emissions: usize,
+    }
+
+    thread_local! {
+        static COUNTS: Cell<Option<Counts>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn record(update: impl FnOnce(&mut Counts)) {
+        COUNTS.with(|slot| {
+            if let Some(mut counts) = slot.get() {
+                update(&mut counts);
+                slot.set(Some(counts));
+            }
+        });
+    }
+
+    pub(super) fn observe_compile(
+        project: &ProjectContext,
+        configuration: &ProjectConfiguration,
+    ) -> (Result<(String, Vec<SourceObservation>), String>, Counts) {
+        struct Restore(Option<Counts>);
+
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                COUNTS.set(self.0);
+            }
+        }
+
+        let _restore = Restore(COUNTS.replace(Some(Counts::default())));
+        let result = compile_project(
+            &project.root,
+            project,
+            configuration,
+            ScalarTargetLayout::NATIVE64,
+        );
+        (result, COUNTS.get().expect("active routing observations"))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -780,6 +836,121 @@ mod tests {
             std::process::id(),
             safe_thread_name
         ))
+    }
+
+    fn routing_test_project(
+        name: &str,
+        sources: &[(&str, &str)],
+    ) -> (ProjectContext, ProjectConfiguration) {
+        let root = snapshot_test_path(name).with_extension("");
+        fs::create_dir_all(&root).expect("create routing test project");
+        for (path, text) in sources {
+            fs::write(root.join(path), text).expect("write routing test source");
+        }
+        let project = ProjectContext {
+            root,
+            package: "app".to_owned(),
+            source_root: "main.w".into(),
+            comment_categories: Vec::new(),
+        };
+        let configuration = ProjectConfiguration {
+            default_target: "app".to_owned(),
+            builders: BTreeMap::new(),
+            runners: BTreeMap::new(),
+            targets: BTreeMap::new(),
+            dependencies: BTreeMap::new(),
+            resolved_packages: BTreeMap::new(),
+        };
+        (project, configuration)
+    }
+
+    #[test]
+    fn static_boundary_routes_single_and_multi_module_build_once() {
+        let single = [(
+            "main.w",
+            "%%start\ni32() answer = fn() {\n\t42\n};\n%%end\n",
+        )];
+        let multi = [
+            (
+                "main.w",
+                "%%start\nmath = namespace app \"math.w\";\ni32 value = math.answer();\n%%end\n",
+            ),
+            ("math.w", single[0].1),
+        ];
+        for (name, sources, single_module_emissions, project_emissions) in [
+            ("single", single.as_slice(), 1, 0),
+            ("multi", multi.as_slice(), 0, 1),
+        ] {
+            let (project, configuration) = routing_test_project(name, sources);
+            let (result, counts) = routing_observations::observe_compile(&project, &configuration);
+            let (llvm, observations) = result.expect("compile routing test project");
+            assert_eq!(
+                counts,
+                routing_observations::Counts {
+                    extractions: sources.len(),
+                    preparations: 1,
+                    builds: 1,
+                    single_module_emissions,
+                    project_emissions,
+                },
+                "{name}"
+            );
+
+            if sources.len() == 1 {
+                assert!(llvm.contains("define i32 @answer()"), "{llvm}");
+            } else {
+                assert!(llvm.contains("define i32 @wosy_fn__"), "{llvm}");
+                assert!(llvm.contains("call i32 @wosy_fn__"), "{llvm}");
+            }
+            assert!(llvm.contains("ret i32 42"), "{llvm}");
+
+            let expected = sources
+                .iter()
+                .map(|&(path, text)| SourceObservation {
+                    source: ProjectSourceIdentity::new(
+                        project.root.to_string_lossy().into_owned(),
+                        project.package.clone(),
+                        PackageRelativePath::new(path.into()).expect("test source path"),
+                    ),
+                    content_revision: ContentRevision(blake3::hash(text.as_bytes()).to_string()),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(observations, expected);
+            for observation in &observations {
+                let snapshot = project
+                    .root
+                    .join(".wosy/cst")
+                    .join(format!("{}.json", observation.content_revision.0));
+                assert!(
+                    snapshot.is_file(),
+                    "missing snapshot: {}",
+                    snapshot.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_discovery_uses_only_source_declarations() {
+        let (project, configuration) = routing_test_project(
+            "missing-module",
+            &[(
+                "main.w",
+                "%%start\nmissing = namespace app \"missing.w\";\n%%end\n",
+            )],
+        );
+        let (result, counts) = routing_observations::observe_compile(&project, &configuration);
+        assert_eq!(
+            result.expect_err("reject missing namespace module"),
+            "M0001: missing module app::missing.w"
+        );
+        assert_eq!(
+            counts,
+            routing_observations::Counts {
+                extractions: 1,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
