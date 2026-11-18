@@ -147,7 +147,7 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     pub(super) enums: &'a [ScalarEnum],
     pub(super) generic_parameters: BTreeSet<String>,
     pub(super) assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
-    pub(super) dereference_points: HashMap<ByteSpan, CfgPointId>,
+    pub(super) dereference_points: HashMap<OccurrenceOrdinal, CfgPointId>,
     pub(super) cfg: ScalarReferenceCfg,
     pub(super) next_scope: usize,
     pub(super) cursor: Option<CfgPointId>,
@@ -171,6 +171,11 @@ enum ReferenceAssignmentDestination {
 enum CheckedReadSource {
     Place(OccurrenceOrdinal),
     SyntheticMember,
+}
+
+struct ReferencePlaceRoot<'a> {
+    place: &'a ScalarPlace,
+    ordinal: OccurrenceOrdinal,
 }
 
 impl<'a> ReferenceFlowBuilder<'a> {
@@ -319,6 +324,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
         let ordinal = self.expression_ordinal(parent, edge);
         self.expression(expression, scope, ordinal)
+    }
+
+    fn place_root<'p>(
+        &self,
+        mut place: &'p ScalarPlace,
+        mut ordinal: OccurrenceOrdinal,
+    ) -> ReferencePlaceRoot<'p> {
+        while let ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } = place {
+            ordinal =
+                self.place_ordinal(OccurrenceParent::Place(ordinal), OccurrenceEdge::PlaceBase);
+            place = base;
+        }
+        ReferencePlaceRoot { place, ordinal }
     }
 
     fn intern(&mut self, origin: ReferenceOrigin) -> ReferenceOriginId {
@@ -675,12 +693,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let mut checked_release_address = None;
                 let mut argument_points = Vec::new();
                 for (position, argument) in arguments.iter().enumerate() {
-                    self.expression_child(
-                        argument,
-                        scope,
-                        parent,
-                        OccurrenceEdge::CallArgument(position),
-                    )?;
+                    let ordinal =
+                        self.expression_ordinal(parent, OccurrenceEdge::CallArgument(position));
+                    self.expression(argument, scope, ordinal)?;
                     argument_points.push(self.cursor.expect("evaluated call argument"));
                     if position == 0
                         && target == ResolvedCallTarget::Core(CoreOperationId::Free)
@@ -699,7 +714,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     {
                         address = self.cursor;
                     }
-                    self.move_value(argument, scope)?;
+                    self.move_value(argument, scope, ordinal)?;
                 }
                 if let ResolvedCallTarget::Core(
                     operation @ (CoreOperationId::Invalidate | CoreOperationId::Rebind),
@@ -823,13 +838,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
             ScalarExpression::ArrayLiteral { elements, .. } => {
                 for (position, element) in elements.iter().enumerate() {
-                    self.expression_child(
-                        element,
-                        scope,
-                        parent,
-                        OccurrenceEdge::AggregateElement(position),
-                    )?;
-                    self.move_value(element, scope)?;
+                    let ordinal =
+                        self.expression_ordinal(parent, OccurrenceEdge::AggregateElement(position));
+                    self.expression(element, scope, ordinal)?;
+                    self.move_value(element, scope, ordinal)?;
                 }
                 self.point(
                     CfgPointKind::Evaluate(expression.clone()),
@@ -841,13 +853,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
             ScalarExpression::StructLiteral { fields, .. } => {
                 for (position, field) in fields.iter().enumerate() {
-                    self.expression_child(
-                        &field.value,
-                        scope,
-                        parent,
-                        OccurrenceEdge::AggregateField(position),
-                    )?;
-                    self.move_value(&field.value, scope)?;
+                    let ordinal =
+                        self.expression_ordinal(parent, OccurrenceEdge::AggregateField(position));
+                    self.expression(&field.value, scope, ordinal)?;
+                    self.move_value(&field.value, scope, ordinal)?;
                 }
                 self.point(
                     CfgPointKind::Evaluate(expression.clone()),
@@ -974,25 +983,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
             ScalarExpression::CheckedAddress {
                 mutability, place, ..
             } => {
-                let root = reference_root(place);
                 let place_ordinal = self.place_ordinal(parent, OccurrenceEdge::ExpressionPlace);
-                let parents = match root {
+                let root = self.place_root(place, place_ordinal);
+                let parents = match root.place {
                     ScalarPlace::Dereference { pointer, .. } => {
-                        let mut root_place = place;
-                        let mut root_ordinal = place_ordinal;
-                        while let ScalarPlace::Field { base, .. }
-                        | ScalarPlace::Index { base, .. } = root_place
-                        {
-                            root_ordinal = self.place_ordinal(
-                                OccurrenceParent::Place(root_ordinal),
-                                OccurrenceEdge::PlaceBase,
-                            );
-                            root_place = base;
-                        }
                         let ReferenceValue::Checked(origins) = self.expression_child(
                             pointer,
                             scope,
-                            OccurrenceParent::Place(root_ordinal),
+                            OccurrenceParent::Place(root.ordinal),
                             OccurrenceEdge::DereferencePointer,
                         )?
                         else {
@@ -1042,7 +1040,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         continue;
                     }
                     let (binding, declaration_span, declaration_block, parent_loan) =
-                        match (root, &parent) {
+                        match (root.place, &parent) {
                             (
                                 ScalarPlace::Name {
                                     name,
@@ -1165,7 +1163,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
                     )
                 })?;
-                self.dereference_points.insert(*span, point);
+                self.dereference_points.insert(ordinal, point);
             }
             ScalarPlace::Field { base, .. } => self.place_expressions(
                 base,
@@ -1271,17 +1269,23 @@ impl<'a> ReferenceFlowBuilder<'a> {
             return Ok(ReferenceValue::Other);
         }
         self.read_place_expressions(place, scope, source)?;
-        let pointer_point = match reference_root(place) {
-            ScalarPlace::Dereference { span, .. } => {
-                Some(*self.dereference_points.get(span).ok_or_else(|| {
-                    self.missing_context(
-                        *span,
-                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
-                    )
-                })?)
+        let pointer_point = match source {
+            CheckedReadSource::SyntheticMember => None,
+            CheckedReadSource::Place(ordinal) => {
+                let root = self.place_root(place, ordinal);
+                match root.place {
+                    ScalarPlace::Dereference { span, .. } => {
+                        Some(*self.dereference_points.get(&root.ordinal).ok_or_else(|| {
+                            self.missing_context(
+                                *span,
+                                ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                            )
+                        })?)
+                    }
+                    ScalarPlace::Name { .. } => None,
+                    ScalarPlace::Field { .. } | ScalarPlace::Index { .. } => unreachable!(),
+                }
             }
-            ScalarPlace::Name { .. } => None,
-            ScalarPlace::Field { .. } | ScalarPlace::Index { .. } => unreachable!(),
         };
         let candidates = if pointer_point.is_none() {
             vec![self.assignment_place(place, span)?]
@@ -1419,6 +1423,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         &mut self,
         value: &ScalarExpression,
         scope: ReferenceScopeId,
+        ordinal: OccurrenceOrdinal,
     ) -> Result<(), ReferenceAnalysisError> {
         let (name, place, ty, span) = match value {
             ScalarExpression::Name { name, span } => {
@@ -1529,11 +1534,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
             }
             ScalarExpression::Dereference { place, span } => {
-                let ScalarPlace::Dereference {
-                    pointer,
-                    span: root_span,
-                } = reference_root(place)
-                else {
+                let root = self.place_root(
+                    place,
+                    self.place_ordinal(
+                        OccurrenceParent::Expression(ordinal),
+                        OccurrenceEdge::ExpressionPlace,
+                    ),
+                );
+                let ScalarPlace::Dereference { pointer, .. } = root.place else {
                     return Err(self.missing_context(
                         *span,
                         ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
@@ -1567,12 +1575,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
                     ));
                 };
-                let pointer_point = *self.dereference_points.get(root_span).ok_or_else(|| {
-                    self.missing_context(
-                        *span,
-                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
-                    )
-                })?;
+                let pointer_point =
+                    *self.dereference_points.get(&root.ordinal).ok_or_else(|| {
+                        self.missing_context(
+                            *span,
+                            ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                        )
+                    })?;
                 self.point(
                     if policy == CopyPolicy::Deferred {
                         CfgPointKind::DeferredMoveThrough {
@@ -1743,8 +1752,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
         }
         self.place_expressions(&target.place, scope, ordinal)?;
-        if let ScalarPlace::Dereference { span, .. } = reference_root(&target.place) {
-            let pointer_point = *self.dereference_points.get(span).ok_or_else(|| {
+        let root = self.place_root(&target.place, ordinal);
+        if let ScalarPlace::Dereference { .. } = root.place {
+            let pointer_point = *self.dereference_points.get(&root.ordinal).ok_or_else(|| {
                 self.missing_context(
                     target.target_span,
                     ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
@@ -1776,6 +1786,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let ScalarBindingOutput::Evaluate(primary) = binding.output_source(0) else {
                         unreachable!("primary binding output evaluates its source")
                     };
+                    let primary_ordinal = self.expression_ordinal(
+                        parent,
+                        OccurrenceEdge::BindingRoot {
+                            item: item_index,
+                            output: 0,
+                        },
+                    );
                     let value = if matches!(binding.declared_type, ScalarType::RawPointer(_))
                         && matches!(primary, ScalarExpression::Name { name, .. } if name == "null")
                     {
@@ -1787,15 +1804,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         );
                         ReferenceValue::Other
                     } else {
-                        self.expression_child(
-                            primary,
-                            scope,
-                            parent,
-                            OccurrenceEdge::BindingRoot {
-                                item: item_index,
-                                output: 0,
-                            },
-                        )?
+                        self.expression(primary, scope, primary_ordinal)?
                     };
                     let call_producer = if binding.output_origin
                         == ScalarBindingOutputOrigin::SingleExpression
@@ -1805,7 +1814,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     } else {
                         None
                     };
-                    self.move_value(primary, scope)?;
+                    self.move_value(primary, scope, primary_ordinal)?;
                     let id = ReferenceBindingId {
                         source: self.source.clone(),
                         function_span: self.function_span,
@@ -1908,9 +1917,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             }
                         }
                     };
-                    let value = self.expression_child(expression, scope, parent, edge)?;
+                    let ordinal = self.expression_ordinal(parent, edge);
+                    let value = self.expression(expression, scope, ordinal)?;
                     let value_point = self.cursor.expect("evaluated output expression");
-                    self.move_value(expression, scope)?;
+                    self.move_value(expression, scope, ordinal)?;
                     if let ScalarBlockItemRole::FinalOutput { output, metadata } = role {
                         return_values.push((output, value_point, metadata));
                         if matches!(value, ReferenceValue::Checked(_)) {
@@ -1927,17 +1937,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let rhs = assignment.rhs();
                     let mut values = Vec::new();
                     for (output, value) in rhs.evaluations() {
-                        let result = self.expression_child(
-                            value,
-                            scope,
+                        let ordinal = self.expression_ordinal(
                             parent,
                             OccurrenceEdge::AssignmentRhs {
                                 item: item_index,
                                 output,
                             },
-                        )?;
+                        );
+                        let result = self.expression(value, scope, ordinal)?;
                         let rhs_point = self.cursor.expect("evaluated assignment output");
-                        self.move_value(value, scope)?;
+                        self.move_value(value, scope, ordinal)?;
                         values.push((result, rhs_point));
                     }
                     for position in rhs.projected_outputs() {

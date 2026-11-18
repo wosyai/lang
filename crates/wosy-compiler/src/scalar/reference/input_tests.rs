@@ -20,6 +20,8 @@ mod assignment_outputs;
 
 mod assignment_destinations;
 
+mod dereference_points;
+
 mod complete_results;
 
 fn assert_project_reference_results(
