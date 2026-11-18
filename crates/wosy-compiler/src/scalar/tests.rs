@@ -514,7 +514,10 @@ fn missing_aggregate_policy_table_reports_spanned_invariant() {
         &validated.program.source,
         &mut function,
         &HashSet::new(),
-        &[],
+        &reference::FunctionCallSites {
+            sites: Vec::new(),
+            arms: Vec::new(),
+        },
         &[],
         &[],
         &HashMap::new(),
@@ -1265,7 +1268,10 @@ fn absent_resolved_assignment_output_is_a_spanned_invariant_error() {
         &validated.program.source,
         &mut function,
         &HashSet::new(),
-        &[],
+        &reference::FunctionCallSites {
+            sites: Vec::new(),
+            arms: Vec::new(),
+        },
         &validated.program.structs,
         &validated.program.enums,
         &HashMap::new(),
@@ -3521,7 +3527,10 @@ fn assignment_reads_rhs_before_write_and_shadowed_binding_is_diagnosed() {
             source,
             &mut function,
             &HashSet::new(),
-            &[],
+            &reference::FunctionCallSites {
+                sites: Vec::new(),
+                arms: Vec::new()
+            },
             &[],
             &[],
             &HashMap::new()

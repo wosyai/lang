@@ -469,5 +469,10 @@ fn empty_project_calls_have_zero_slots_and_query_enters_only_convergence() {
 fn actual_empty_module_keeps_its_successful_ordinal_slot() {
     let modules = vec![ScalarModule::new(source(), Vec::new(), Vec::new())];
     let calls = resolve_project_call_sites(&modules);
-    assert_eq!(calls.modules, vec![Ok(Vec::new())]);
+    assert_eq!(
+        calls.modules,
+        vec![Ok(ModuleCallSites {
+            functions: BTreeMap::new()
+        })]
+    );
 }

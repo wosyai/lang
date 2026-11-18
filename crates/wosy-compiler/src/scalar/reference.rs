@@ -70,7 +70,7 @@ pub(in crate::scalar) mod stage_observations {
 
 pub(super) fn record_program_reference_origins(
     program: &mut ScalarProgram,
-    call_sites: &[ResolvedCallSite],
+    call_sites: &ModuleCallSites,
 ) -> Vec<ReferenceAnalysisError> {
     analyze_program_references(program, call_sites).install(program)
 }
@@ -89,7 +89,7 @@ impl ProgramReferenceResults {
 
 fn analyze_program_references(
     program: &ScalarProgram,
-    call_sites: &[ResolvedCallSite],
+    call_sites: &ModuleCallSites,
 ) -> ProgramReferenceResults {
     let (mut updates, mut errors) = derive_and_converge_program_references(program, call_sites);
     if errors.is_empty() {
@@ -108,7 +108,7 @@ fn analyze_program_references(
 
 fn derive_and_converge_program_references(
     program: &ScalarProgram,
-    call_sites: &[ResolvedCallSite],
+    call_sites: &ModuleCallSites,
 ) -> (
     Vec<(usize, FunctionReferenceResult)>,
     Vec<ReferenceAnalysisError>,
@@ -3486,13 +3486,24 @@ impl<'a> CallResolutionModule<'a> {
 
 pub(super) fn resolve_program_call_sites(
     program: &ScalarProgram,
-) -> Result<Vec<ResolvedCallSite>, ReferenceAnalysisError> {
+) -> Result<ModuleCallSites, ReferenceAnalysisError> {
     let modules = [CallResolutionModule::program(program)];
     resolve_module_call_sites(&program.source, &program.items, &modules)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ModuleCallSites {
+    functions: BTreeMap<usize, FunctionCallSites>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct FunctionCallSites {
+    pub(super) sites: Vec<ResolvedCallSite>,
+    pub(super) arms: Vec<FunctionCallSites>,
+}
+
 pub(super) struct ProjectCallSiteResults {
-    modules: Vec<Result<Vec<ResolvedCallSite>, ReferenceAnalysisError>>,
+    modules: Vec<Result<ModuleCallSites, ReferenceAnalysisError>>,
 }
 
 pub(super) fn resolve_project_call_sites(modules: &[ScalarModule]) -> ProjectCallSiteResults {
@@ -3788,7 +3799,7 @@ fn resolve_module_call_sites(
     source: &SourceIdentity,
     items: &[ScalarItem],
     modules: &[CallResolutionModule<'_>],
-) -> Result<Vec<ResolvedCallSite>, ReferenceAnalysisError> {
+) -> Result<ModuleCallSites, ReferenceAnalysisError> {
     #[cfg(test)]
     stage_observations::record_call_sites();
     let current = modules.iter().find(|module| module.source == source);
@@ -3837,20 +3848,20 @@ fn resolve_module_call_sites(
             }
         }
     }
-    let mut sites = Vec::new();
-    for item in items {
+    let mut functions = BTreeMap::new();
+    for (index, item) in items.iter().enumerate() {
         if let ScalarItem::Function(function) = item {
-            resolve_function_call_sites(
+            let calls = resolve_function_call_sites(
                 source,
                 function,
                 &module_callables,
                 &extern_callables,
                 modules,
-                &mut sites,
             )?;
+            functions.insert(index, calls);
         }
     }
-    Ok(sites)
+    Ok(ModuleCallSites { functions })
 }
 
 fn resolve_function_call_sites(
@@ -3859,17 +3870,16 @@ fn resolve_function_call_sites(
     module_callables: &BTreeMap<(Option<String>, String), (SourceIdentity, ByteSpan)>,
     extern_callables: &BTreeMap<(String, String), (SourceIdentity, ByteSpan)>,
     modules: &[CallResolutionModule<'_>],
-    sites: &mut Vec<ResolvedCallSite>,
-) -> Result<(), ReferenceAnalysisError> {
+) -> Result<FunctionCallSites, ReferenceAnalysisError> {
+    let mut arms = Vec::new();
     for arm in &function.overload_arms {
-        resolve_function_call_sites(
+        arms.push(resolve_function_call_sites(
             source,
             arm,
             module_callables,
             extern_callables,
             modules,
-            sites,
-        )?;
+        )?);
     }
     let mut resolver = ValidatedCallResolver {
         source,
@@ -3903,15 +3913,17 @@ fn resolve_function_call_sites(
         );
     }
     resolver.block(&function.body, &parameter_names, &parameter_types)?;
-    sites.extend(resolver.sites);
-    Ok(())
+    Ok(FunctionCallSites {
+        sites: resolver.sites,
+        arms,
+    })
 }
 
 #[cfg(test)]
 pub(super) fn record_module_reference_origins(
     source: &SourceIdentity,
     items: &mut [ScalarItem],
-    call_sites: &[ResolvedCallSite],
+    call_sites: &ModuleCallSites,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
@@ -3931,7 +3943,7 @@ pub(super) fn record_module_reference_origins(
 fn derive_module_reference_origins(
     source: &SourceIdentity,
     items: &[ScalarItem],
-    call_sites: &[ResolvedCallSite],
+    call_sites: &ModuleCallSites,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
@@ -3961,7 +3973,7 @@ fn derive_module_reference_origins(
                     source,
                     function,
                     &module_names,
-                    call_sites,
+                    &call_sites.functions[&index],
                     structs,
                     enums,
                     assignment_outputs,
@@ -4511,7 +4523,7 @@ pub(super) fn record_function_reference_origins(
     source: &SourceIdentity,
     function: &mut ScalarFunction,
     module_names: &HashSet<String>,
-    call_sites: &[ResolvedCallSite],
+    call_sites: &FunctionCallSites,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
@@ -4535,7 +4547,7 @@ fn derive_function_reference_result(
     source: &SourceIdentity,
     function: &ScalarFunction,
     module_names: &HashSet<String>,
-    call_sites: &[ResolvedCallSite],
+    call_sites: &FunctionCallSites,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
@@ -4543,12 +4555,13 @@ fn derive_function_reference_result(
 ) -> FunctionReferenceResult {
     let entry_errors = errors.len();
     let mut arms = Vec::new();
-    for arm in &function.overload_arms {
+    assert_eq!(function.overload_arms.len(), call_sites.arms.len());
+    for (arm, calls) in function.overload_arms.iter().zip(&call_sites.arms) {
         arms.push(derive_function_reference_result(
             source,
             arm,
             module_names,
-            call_sites,
+            calls,
             structs,
             enums,
             assignment_outputs,
@@ -4559,7 +4572,7 @@ fn derive_function_reference_result(
         source,
         function,
         module_names,
-        call_sites,
+        &call_sites.sites,
         structs,
         enums,
         assignment_outputs,

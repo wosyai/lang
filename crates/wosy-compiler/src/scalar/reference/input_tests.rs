@@ -63,6 +63,7 @@ fn real_constructor_borrows_all_five_nonempty_inventories_by_identity() {
     let ScalarItem::Function(function) = &program.items[1] else {
         panic!("read")
     };
+    let call_sites = &call_sites.functions[&1].sites;
     assert!(!call_sites.is_empty());
     assert!(!program.structs.is_empty());
     assert!(!program.enums.is_empty());
@@ -72,7 +73,7 @@ fn real_constructor_borrows_all_five_nonempty_inventories_by_identity() {
         &program.source,
         function,
         &module_names,
-        &call_sites,
+        call_sites,
         &program.structs,
         &program.enums,
         program.resolved_assignment_outputs.as_map(),
@@ -102,7 +103,12 @@ fn actual_function_and_arm_consumers_copy_zero_aggregates_and_match_public_cfgs(
         let public = derive_scalar_program_with_layout(&parsed.result, target);
         assert_eq!(public.diagnostics, typed.diagnostics);
         assert_eq!(program.items.len(), 2);
-        for (item, expected) in program.items.iter_mut().zip(&public.program.items) {
+        for (index, (item, expected)) in program
+            .items
+            .iter_mut()
+            .zip(&public.program.items)
+            .enumerate()
+        {
             let (ScalarItem::Function(function), ScalarItem::Function(expected)) = (item, expected)
             else {
                 panic!("function")
@@ -112,7 +118,7 @@ fn actual_function_and_arm_consumers_copy_zero_aggregates_and_match_public_cfgs(
                 &program.source,
                 function,
                 &module_names,
-                &call_sites,
+                &call_sites.functions[&index],
                 &program.structs,
                 &program.enums,
                 program.resolved_assignment_outputs.as_map(),
@@ -150,11 +156,14 @@ fn immutable_producer_preserves_preexisting_cfg_and_entire_input_on_both_targets
         let before = program.clone();
         let call_sites = resolve_program_call_sites(&program).unwrap();
         let module_names = HashSet::from(["pick".to_owned(), "read".to_owned()]);
-        for item in &program.items {
+        for (index, item) in program.items.iter().enumerate() {
             let ScalarItem::Function(function) = item else {
                 panic!("function")
             };
-            for callable in std::iter::once(function).chain(&function.overload_arms) {
+            let calls = &call_sites.functions[&index];
+            for (callable, calls) in std::iter::once((function, calls))
+                .chain(function.overload_arms.iter().zip(&calls.arms))
+            {
                 assert!(!callable.reference_cfg.points.is_empty());
                 assert!(!callable.reference_cfg.initial_points.is_empty());
                 let scope = layout::observations::Scope::new();
@@ -162,7 +171,7 @@ fn immutable_producer_preserves_preexisting_cfg_and_entire_input_on_both_targets
                     &program.source,
                     callable,
                     &module_names,
-                    &call_sites,
+                    &calls.sites,
                     &program.structs,
                     &program.enums,
                     program.resolved_assignment_outputs.as_map(),
@@ -261,7 +270,19 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
             &program.source,
             &mut installed,
             &module_names,
-            &[],
+            &FunctionCallSites {
+                sites: Vec::new(),
+                arms: vec![
+                    FunctionCallSites {
+                        sites: Vec::new(),
+                        arms: Vec::new(),
+                    },
+                    FunctionCallSites {
+                        sites: Vec::new(),
+                        arms: Vec::new(),
+                    },
+                ],
+            },
             &program.structs,
             &program.enums,
             &missing_outputs,

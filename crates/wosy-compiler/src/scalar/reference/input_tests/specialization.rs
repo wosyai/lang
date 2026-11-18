@@ -200,7 +200,27 @@ fn template_index_retains_first_source_even_when_its_module_is_empty() {
     let (mut second_results, errors) = derive_module_reference_origins(
         &second.source,
         &second.items,
-        &[],
+        &ModuleCallSites {
+            functions: BTreeMap::from([
+                (
+                    0,
+                    FunctionCallSites {
+                        sites: Vec::new(),
+                        arms: vec![FunctionCallSites {
+                            sites: Vec::new(),
+                            arms: Vec::new(),
+                        }],
+                    },
+                ),
+                (
+                    1,
+                    FunctionCallSites {
+                        sites: Vec::new(),
+                        arms: Vec::new(),
+                    },
+                ),
+            ]),
+        },
         &[],
         &[],
         second.resolved_assignment_outputs.as_map(),
