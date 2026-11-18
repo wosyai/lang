@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::reference::{BlockOrdinal, OccurrenceOrdinal};
-use super::{ScalarItem, ScalarNamespaceBinding, ScalarType};
+use super::{ScalarBinding, ScalarItem, ScalarNamespaceBinding, ScalarType};
 use wosy_syntax::{ByteSpan, SourceIdentity};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,9 +169,51 @@ pub(super) enum BindingOutput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BindingReceiverSlot {
+    pub(super) position: usize,
+    pub(super) name: String,
+    pub(super) span: ByteSpan,
+    pub(super) ty: ScalarType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct BindingRegion {
     pub(super) primary: OccurrenceOrdinal,
     pub(super) secondary: Vec<BindingOutput>,
+    receivers: Vec<BindingReceiverSlot>,
+}
+
+impl BindingRegion {
+    pub(super) fn new(
+        primary: OccurrenceOrdinal,
+        secondary: Vec<BindingOutput>,
+        binding: &ScalarBinding,
+    ) -> Self {
+        let mut receivers = Vec::with_capacity(binding.receivers.len().max(1));
+        receivers.push(BindingReceiverSlot {
+            position: 0,
+            name: binding.name.clone(),
+            span: binding.name_span,
+            ty: binding.declared_type.clone(),
+        });
+        receivers.extend(binding.receivers.iter().enumerate().skip(1).map(
+            |(position, receiver)| BindingReceiverSlot {
+                position,
+                name: receiver.name.clone(),
+                span: receiver.name_span,
+                ty: receiver.ty.clone(),
+            },
+        ));
+        Self {
+            primary,
+            secondary,
+            receivers,
+        }
+    }
+
+    pub(super) fn receivers(&self) -> &[BindingReceiverSlot] {
+        &self.receivers
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

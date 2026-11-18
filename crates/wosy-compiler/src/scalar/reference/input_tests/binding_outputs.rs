@@ -124,3 +124,112 @@ fn binding_output_sources_borrow_canonical_roots_and_project_precise_primary_ord
         assert_eq!(program, before);
     }
 }
+
+#[test]
+fn typed_binding_receiver_slots_preserve_mixed_output_order_and_drive_reference_analysis() {
+    let text = "%%start\nstruct Payload { u8 value; }\n(bool, Payload)(Payload) pair = fn(input) { true, input };\nunit(Payload, Payload) probe = fn(left_input, right_input) { Payload left, bool valid = left_input, false; bool done, Payload right = pair(right_input); left; valid; done; right; };\n%%end";
+    for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let typed = typecheck_scalar_program(declarations, target);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let mut program = typed.program;
+        let calls = resolve_program_call_sites(&program).unwrap();
+        let row = calls.function(1);
+        let block = &row.structure.blocks[row.structure.root.0];
+        let payload = &row.boundary.parameters[0].ty;
+        assert!(matches!(payload, ScalarType::Struct(_)));
+        let ScalarItem::Function(probe) = &mut program.items[1] else {
+            panic!("probe")
+        };
+        let mut spans = Vec::new();
+        for (item, expected) in [
+            [("left", payload), ("valid", &ScalarType::Bool)],
+            [("done", &ScalarType::Bool), ("right", payload)],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ScalarBlockItem::LocalBinding(binding) = &probe.body.items[item] else {
+                panic!("local binding")
+            };
+            let BlockItemKind::Binding(region) = &block.items[item].kind else {
+                panic!("binding region")
+            };
+            let slots = region.receivers();
+            assert_eq!(slots.len(), expected.len());
+            for (position, (slot, (name, ty))) in slots.iter().zip(expected).enumerate() {
+                assert_eq!(slot.position, position);
+                assert_eq!(slot.name, name);
+                assert_eq!(&slot.ty, ty);
+                let span = if position == 0 {
+                    binding.name_span
+                } else {
+                    binding.receivers[position].name_span
+                };
+                assert_eq!(slot.span, span);
+                spans.push(span);
+            }
+        }
+
+        let module_names = HashSet::from(["pair".to_owned(), "probe".to_owned()]);
+        let (expected, errors) = derive_function_reference_cfg(
+            &program.source,
+            probe,
+            &module_names,
+            row,
+            &program.structs,
+            &program.enums,
+            true,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let binds = expected
+            .points
+            .iter()
+            .filter_map(|point| match &point.kind {
+                CfgPointKind::Bind { binding } => Some(binding),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(binds.len(), spans.len());
+        for (binding, span) in binds.iter().zip(&spans) {
+            assert_eq!(binding.source, program.source);
+            assert_eq!(binding.function_span, probe.span);
+            assert_eq!(binding.block_span, block.span);
+            assert_eq!(binding.declaration_span, *span);
+        }
+        let moves = expected
+            .points
+            .iter()
+            .filter_map(|point| match &point.kind {
+                CfgPointKind::Move { owner, ty, .. } if spans.contains(&owner.declaration_span) => {
+                    Some((owner.declaration_span, ty))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(moves, [(spans[0], payload), (spans[3], payload)]);
+
+        for item in &mut probe.body.items[..2] {
+            let ScalarBlockItem::LocalBinding(binding) = item else {
+                unreachable!()
+            };
+            binding.name.clear();
+            binding.name_span = ByteSpan::new(0, 0);
+            binding.declared_type = ScalarType::Error;
+            binding.receivers.clear();
+        }
+        let (actual, errors) = derive_function_reference_cfg(
+            &program.source,
+            probe,
+            &module_names,
+            row,
+            &program.structs,
+            &program.enums,
+            true,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(actual, expected);
+    }
+}

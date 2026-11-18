@@ -1715,8 +1715,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
         call_producer: Option<CfgPointId>,
         region: &BindingRegion,
     ) -> Result<(), ReferenceAnalysisError> {
-        for (position, receiver) in binding.receivers.iter().enumerate().skip(1) {
-            match &region.secondary[position - 1] {
+        for receiver in &region.receivers()[1..] {
+            match &region.secondary[receiver.position - 1] {
                 BindingOutput::Evaluate {
                     position: source,
                     expression,
@@ -1732,7 +1732,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             let id = ReferenceBindingId {
                 source: self.source.clone(),
                 function_span: self.function_span,
-                declaration_span: receiver.name_span,
+                declaration_span: receiver.span,
                 block_span: block.span,
                 kind: ReferenceBindingKind::Declared,
             };
@@ -1741,15 +1741,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
             declared.push((receiver.name.clone(), id.clone(), previous));
             if matches!(receiver.ty, ScalarType::CheckedReference { .. }) {
                 self.checked.insert(id.clone());
-                self.uncomputed_point(
-                    CfgPointKind::Bind { binding: id },
-                    receiver.name_span,
-                    scope,
-                );
+                self.uncomputed_point(CfgPointKind::Bind { binding: id }, receiver.span, scope);
             } else {
                 self.point(
                     CfgPointKind::Bind { binding: id },
-                    receiver.name_span,
+                    receiver.span,
                     scope,
                     BTreeSet::new(),
                 );
@@ -1838,9 +1834,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     ScalarBlockItem::LocalBinding(binding),
                     BlockItemKind::Binding(binding_region),
                 ) => {
+                    let receiver = &binding_region.receivers()[0];
                     let primary = &binding.value;
                     let primary_ordinal = binding_region.primary;
-                    let value = if matches!(binding.declared_type, ScalarType::RawPointer(_))
+                    let value = if matches!(receiver.ty, ScalarType::RawPointer(_))
                         && matches!(primary, ScalarExpression::Name { name, .. } if name == "null")
                     {
                         self.point(
@@ -1865,35 +1862,28 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let id = ReferenceBindingId {
                         source: self.source.clone(),
                         function_span: self.function_span,
-                        declaration_span: binding.name_span,
+                        declaration_span: receiver.span,
                         block_span: block.span,
                         kind: ReferenceBindingKind::Declared,
                     };
-                    self.binding_types
-                        .insert(id.clone(), binding.declared_type.clone());
+                    self.binding_types.insert(id.clone(), receiver.ty.clone());
                     if binding.is_allocation {
                         self.cfg.allocations.insert(id.clone());
                     }
                     let origins = match value {
                         ReferenceValue::Checked(origins) => Some(origins),
                         ReferenceValue::Other
-                            if matches!(
-                                binding.declared_type,
-                                ScalarType::CheckedReference { .. }
-                            ) =>
+                            if matches!(receiver.ty, ScalarType::CheckedReference { .. }) =>
                         {
                             return Err(self.missing_origin(
-                                binding.name_span,
+                                receiver.span,
                                 id,
                                 ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
                             ));
                         }
                         ReferenceValue::Other => None,
                         ReferenceValue::Uncomputed
-                            if matches!(
-                                binding.declared_type,
-                                ScalarType::CheckedReference { .. }
-                            ) =>
+                            if matches!(receiver.ty, ScalarType::CheckedReference { .. }) =>
                         {
                             self.checked.insert(id.clone());
                             self.origins.remove(&id);
@@ -1901,11 +1891,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 CfgPointKind::Bind {
                                     binding: id.clone(),
                                 },
-                                binding.name_span,
+                                receiver.span,
                                 scope,
                             );
-                            let old = self.names.insert(binding.name.clone(), id.clone());
-                            declared.push((binding.name.clone(), id, old));
+                            let old = self.names.insert(receiver.name.clone(), id.clone());
+                            declared.push((receiver.name.clone(), id, old));
                             self.additional_receivers(
                                 binding,
                                 block,
@@ -1918,7 +1908,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                         ReferenceValue::Uncomputed => None,
                     };
-                    let old = self.names.insert(binding.name.clone(), id.clone());
+                    let old = self.names.insert(receiver.name.clone(), id.clone());
                     if let Some(origins) = origins {
                         self.checked.insert(id.clone());
                         self.origins.insert(id.clone(), origins.clone());
@@ -1926,7 +1916,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             CfgPointKind::Bind {
                                 binding: id.clone(),
                             },
-                            binding.name_span,
+                            receiver.span,
                             scope,
                             origins,
                         );
@@ -1935,12 +1925,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             CfgPointKind::Bind {
                                 binding: id.clone(),
                             },
-                            binding.name_span,
+                            receiver.span,
                             scope,
                             BTreeSet::new(),
                         );
                     }
-                    declared.push((binding.name.clone(), id, old));
+                    declared.push((receiver.name.clone(), id, old));
                     self.additional_receivers(
                         binding,
                         block,
@@ -4446,7 +4436,7 @@ impl ValidatedCallResolver<'_> {
                             },
                         );
                     }
-                    BlockItemKind::Binding(BindingRegion { primary, secondary })
+                    BlockItemKind::Binding(BindingRegion::new(primary, secondary, binding))
                 }
                 ScalarBlockItem::Expression(expression) => {
                     let edge = match &role {
