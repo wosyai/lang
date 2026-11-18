@@ -1919,6 +1919,8 @@ impl ScalarModule {
         items: Vec<ScalarItem>,
         namespace_bindings: Vec<ScalarNamespaceBinding>,
     ) -> Self {
+        #[cfg(test)]
+        layout::observations::record_module_construction();
         let mut members = BTreeMap::new();
         let mut initialization_nodes = Vec::new();
         for (item_index, item) in items.iter().enumerate() {
@@ -2255,7 +2257,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         validate_unit_if_positions_in_module(module, &mut diagnostics);
         for structure in &module.structs {
             for field in &structure.fields {
-                validate_module_type(module, &field.ty, field.name_span, &mut diagnostics);
+                validate_module_type(&module.source, &field.ty, field.name_span, &mut diagnostics);
             }
         }
         let mut declarations = BTreeMap::new();
@@ -2265,7 +2267,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
             let (name, span, ty) = match item {
                 ScalarItem::Namespace(namespace) => {
                     validate_identifier_style(
-                        module,
+                        &module.source,
                         &namespace.binding,
                         namespace.binding_span,
                         &mut diagnostics,
@@ -2274,7 +2276,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                 }
                 ScalarItem::Extern(extern_decl) => {
                     validate_identifier_style(
-                        module,
+                        &module.source,
                         &extern_decl.binding,
                         extern_decl.binding_span,
                         &mut diagnostics,
@@ -2284,7 +2286,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                 ScalarItem::Binding(binding) => {
                     for receiver in &binding.receivers {
                         validate_identifier_style(
-                            module,
+                            &module.source,
                             &receiver.name,
                             receiver.name_span,
                             &mut diagnostics,
@@ -2294,7 +2296,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                 }
                 ScalarItem::Function(function) => {
                     validate_identifier_style(
-                        module,
+                        &module.source,
                         &function.name,
                         function.name_span,
                         &mut diagnostics,
@@ -2325,7 +2327,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                             for arm in &function.overload_arms {
                                 if arm.generic_parameters.is_empty() {
                                     validate_module_type(
-                                        module,
+                                        &module.source,
                                         &arm.signature,
                                         arm.span,
                                         &mut diagnostics,
@@ -2341,7 +2343,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                                 }
                             }
                         } else if function.generic_parameters.is_empty() {
-                            validate_module_type(module, ty, span, &mut diagnostics);
+                            validate_module_type(&module.source, ty, span, &mut diagnostics);
                         } else {
                             validate_module_generic_type(
                                 module,
@@ -2352,14 +2354,14 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                             );
                         }
                     } else {
-                        validate_module_type(module, ty, span, &mut diagnostics);
+                        validate_module_type(&module.source, ty, span, &mut diagnostics);
                     }
                 }
             }
         }
         for item in &module.items {
             if let ScalarItem::Extern(extern_decl) = item {
-                validate_extern(module, extern_decl, &mut diagnostics);
+                validate_extern(&module.source, extern_decl, &mut diagnostics);
             }
         }
         for item in &module.items {
@@ -2449,7 +2451,7 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
                     let mut folded_names = folded_declarations.clone();
                     for (index, name) in function.parameters.iter().enumerate() {
                         validate_identifier_style(
-                            module,
+                            &module.source,
                             name,
                             function.parameter_spans[index],
                             &mut diagnostics,

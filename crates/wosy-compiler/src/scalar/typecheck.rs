@@ -1,24 +1,27 @@
 use super::*;
 
+#[cfg(test)]
+mod source_context_tests;
+
 pub(super) fn validate_module_type(
-    module: &ScalarModule,
+    source: &SourceIdentity,
     ty: &ScalarType,
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     match ty {
         ScalarType::Named { span, .. } | ScalarType::Qualified { span, .. } => diagnostics.push(
-            module_diagnostic(module, "B0003", "unknown scalar type", *span),
+            source_diagnostic(source, "B0003", "unknown scalar type", *span),
         ),
         ScalarType::Callable {
             outputs,
             parameters,
         } => {
             for output in &outputs.outputs {
-                validate_module_type(module, &output.ty, output.span, diagnostics);
+                validate_module_type(source, &output.ty, output.span, diagnostics);
             }
             for parameter in parameters {
-                validate_module_type(module, parameter, span, diagnostics);
+                validate_module_type(source, parameter, span, diagnostics);
             }
         }
         ScalarType::Unit
@@ -38,18 +41,18 @@ pub(super) fn validate_module_type(
         | ScalarType::Char
         | ScalarType::ArtifactId => {}
         ScalarType::CheckedReference { inner, .. } => {
-            validate_module_type(module, inner, span, diagnostics)
+            validate_module_type(source, inner, span, diagnostics)
         }
         ScalarType::RawPointer(inner)
             if matches!(inner.as_ref(), ScalarType::U8 | ScalarType::Struct(_)) => {}
-        ScalarType::RawPointer(_) => diagnostics.push(module_diagnostic(
-            module,
+        ScalarType::RawPointer(_) => diagnostics.push(source_diagnostic(
+            source,
             "B0003",
             "unsupported raw pointer type",
             span,
         )),
         ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
-            validate_module_type(module, element, span, diagnostics)
+            validate_module_type(source, element, span, diagnostics)
         }
         ScalarType::Struct(_) | ScalarType::Enum(_) => {}
         ScalarType::Error => {}
@@ -97,12 +100,12 @@ pub(super) fn validate_module_generic_type(
                 );
             }
         }
-        _ => validate_module_type(module, ty, span, diagnostics),
+        _ => validate_module_type(&module.source, ty, span, diagnostics),
     }
 }
 
 pub(super) fn validate_extern(
-    module: &ScalarModule,
+    source: &SourceIdentity,
     extern_decl: &ScalarExtern,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
@@ -110,32 +113,32 @@ pub(super) fn validate_extern(
         && matches!(extern_decl.actual_module, ScalarExternModule::Valid(_))
         && !extern_decl.functions.is_empty();
     if !valid_binding {
-        diagnostics.push(module_diagnostic(
-            module,
+        diagnostics.push(source_diagnostic(
+            source,
             "B0003",
             "unsupported extern declaration",
             extern_decl.span,
         ));
     }
     for function in &extern_decl.functions {
-        validate_identifier_style(module, &function.name, function.name_span, diagnostics);
+        validate_identifier_style(source, &function.name, function.name_span, diagnostics);
         validate_module_type(
-            module,
+            source,
             &function.signature,
             function.signature_span,
             diagnostics,
         );
         if contains_fixed_array(&function.signature) {
-            diagnostics.push(module_diagnostic(
-                module,
+            diagnostics.push(source_diagnostic(
+                source,
                 "B0003",
                 "direct FFI arrays are not supported",
                 function.signature_span,
             ));
         }
         if contains_checked_reference(&function.signature) {
-            diagnostics.push(module_diagnostic(
-                module,
+            diagnostics.push(source_diagnostic(
+                source,
                 "B0003",
                 "direct FFI checked references are not supported",
                 function.signature_span,
@@ -596,7 +599,12 @@ pub(super) fn block_item_type_in_module(
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
             for receiver in &binding.receivers {
-                validate_identifier_style(module, &receiver.name, receiver.name_span, diagnostics);
+                validate_identifier_style(
+                    &module.source,
+                    &receiver.name,
+                    receiver.name_span,
+                    diagnostics,
+                );
             }
             if binding.is_allocation {
                 for receiver in &binding.receivers {
@@ -818,7 +826,7 @@ fn assignment_type_in_module(
                     diagnostics,
                 );
             } else if let ScalarPlace::Name { name, span } = &target.place {
-                validate_identifier_style(module, name, *span, diagnostics);
+                validate_identifier_style(&module.source, name, *span, diagnostics);
                 if declare_module_name(
                     module,
                     name,
@@ -5391,13 +5399,22 @@ pub(super) fn module_diagnostic(
     message: &str,
     span: ByteSpan,
 ) -> super::Diagnostic {
+    source_diagnostic(&module.source, code, message, span)
+}
+
+fn source_diagnostic(
+    source: &SourceIdentity,
+    code: &str,
+    message: &str,
+    span: ByteSpan,
+) -> super::Diagnostic {
     super::Diagnostic {
         code: code.to_owned(),
         severity: super::DiagnosticSeverity::Error,
         message: message.to_owned(),
         labels: vec![super::DiagnosticLabel {
             kind: super::DiagnosticLabelKind::Primary,
-            span: SourceSpan::new(module.source.clone(), span),
+            span: SourceSpan::new(source.clone(), span),
             message: message.to_owned(),
         }],
         notes: Vec::new(),
@@ -5441,14 +5458,14 @@ pub(super) fn declare_module_name(
 }
 
 pub(super) fn validate_identifier_style(
-    module: &ScalarModule,
+    source: &SourceIdentity,
     name: &str,
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     if !is_declared_identifier_style(name) {
-        diagnostics.push(module_diagnostic(
-            module,
+        diagnostics.push(source_diagnostic(
+            source,
             "B0003",
             "identifier must use snake_case, PascalCase, or SCREAMING_SNAKE_CASE",
             span,
@@ -5859,9 +5876,7 @@ pub(super) fn validate(
     }
     for item in &program.items {
         if let ScalarItem::Extern(extern_decl) = item {
-            let module =
-                ScalarModule::new(program.source.clone(), program.items.clone(), Vec::new());
-            validate_extern(&module, extern_decl, &mut diagnostics);
+            validate_extern(&program.source, extern_decl, &mut diagnostics);
         }
     }
     let mut scope = declarations.clone();
@@ -8567,17 +8582,7 @@ pub(super) fn diagnostic(
     message: &str,
     span: ByteSpan,
 ) -> super::Diagnostic {
-    super::Diagnostic {
-        code: code.to_owned(),
-        severity: super::DiagnosticSeverity::Error,
-        message: message.to_owned(),
-        labels: vec![super::DiagnosticLabel {
-            kind: super::DiagnosticLabelKind::Primary,
-            span: SourceSpan::new(program.source.clone(), span),
-            message: message.to_owned(),
-        }],
-        notes: Vec::new(),
-    }
+    source_diagnostic(&program.source, code, message, span)
 }
 
 fn declare_program_name(

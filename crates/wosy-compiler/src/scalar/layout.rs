@@ -509,6 +509,7 @@ pub(in crate::scalar) mod observations {
         pub lookups: usize,
         pub lookup_entries: usize,
         pub program_copies: usize,
+        pub module_constructions: usize,
         pub module_copies: usize,
         pub struct_copies: usize,
         pub cfg_copies: usize,
@@ -595,6 +596,9 @@ pub(in crate::scalar) mod observations {
             counts.module_copies += 1;
             counts.copied_payload_units += items;
         });
+    }
+    pub(in crate::scalar) fn record_module_construction() {
+        record(|counts| counts.module_constructions += 1);
     }
     pub(super) fn record_struct_copy(fields: usize) {
         record(|counts| {
@@ -869,18 +873,41 @@ mod tests {
     }
 
     #[test]
+    fn module_constructor_observation_measures_actual_construction() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "main.w".into(),
+            "r1".into(),
+        );
+        let scope = observations::Scope::new();
+        let module = ScalarModule::new(source.clone(), Vec::new(), Vec::new());
+        assert_eq!(module.source, source);
+        assert!(module.items.is_empty());
+        assert_eq!(
+            scope.counts(),
+            observations::Counts {
+                module_constructions: 1,
+                ..observations::Counts::default()
+            }
+        );
+    }
+
+    #[test]
     fn layout_copy_observations_measure_actual_clone_constructors() {
         let program = program(2, 4, 0, ScalarTargetLayout::WASM32);
         let scope = observations::Scope::new();
         let copy = program.clone();
         let counts = scope.counts();
         assert_eq!(counts.program_copies, 1);
+        assert_eq!(counts.module_constructions, 0);
         assert_eq!(counts.struct_copies, 2);
         assert!(counts.cfg_copies > 0);
         assert!(counts.copied_payload_units > 0);
         let module = ScalarModule::from_program(copy, Vec::new());
         let _copy = module.clone();
         assert_eq!(scope.counts().module_copies, 1);
+        assert_eq!(scope.counts().module_constructions, 1);
         assert_eq!(scope.counts().struct_copies, 4);
     }
 
@@ -968,7 +995,13 @@ mod tests {
                     pointer
                 );
             }
-            assert_eq!(scope.counts(), observations::Counts::default());
+            assert_eq!(
+                scope.counts(),
+                observations::Counts {
+                    module_constructions: 1,
+                    ..observations::Counts::default()
+                }
+            );
         }
     }
 
