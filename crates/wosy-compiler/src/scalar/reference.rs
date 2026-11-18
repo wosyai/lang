@@ -3347,6 +3347,23 @@ pub(super) fn resolve_program_call_sites(
     resolve_module_call_sites(&program.source, &program.items, &modules)
 }
 
+pub(super) struct ProjectCallSiteResults {
+    modules: Vec<Result<Vec<ResolvedCallSite>, ReferenceAnalysisError>>,
+}
+
+pub(super) fn resolve_project_call_sites(modules: &[ScalarModule]) -> ProjectCallSiteResults {
+    let views = modules
+        .iter()
+        .map(CallResolutionModule::module)
+        .collect::<Vec<_>>();
+    ProjectCallSiteResults {
+        modules: modules
+            .iter()
+            .map(|module| resolve_module_call_sites(&module.source, &module.items, &views))
+            .collect(),
+    }
+}
+
 struct ValidatedCallResolver<'a> {
     source: &'a SourceIdentity,
     function_span: ByteSpan,
@@ -3826,8 +3843,10 @@ fn install_module_reference_results(
 
 pub(super) fn record_project_reference_origins(
     modules: &mut [ScalarModule],
+    call_sites: ProjectCallSiteResults,
 ) -> Vec<ReferenceAnalysisError> {
-    let (mut updates, mut errors, inventory) = derive_and_converge_project_references(modules);
+    let (mut updates, mut errors, inventory) =
+        derive_and_converge_project_references(modules, call_sites);
     if errors.is_empty() && !modules.is_empty() {
         let (structs, enums) =
             inventory.expect("successful module call lookup built aggregate inventory");
@@ -3849,12 +3868,14 @@ pub(super) fn record_project_reference_origins(
 
 fn derive_and_converge_project_references(
     modules: &[ScalarModule],
+    call_sites: ProjectCallSiteResults,
 ) -> (
     Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
     Vec<ReferenceAnalysisError>,
     Option<(Vec<ScalarStruct>, Vec<ScalarEnum>)>,
 ) {
-    let (mut updates, mut errors, inventory) = derive_project_reference_origins(modules);
+    let (mut updates, mut errors, inventory) =
+        derive_project_reference_origins(modules, call_sites);
     if errors.is_empty() {
         let mut views = updates
             .iter_mut()
@@ -3871,6 +3892,7 @@ fn derive_and_converge_project_references(
 
 fn derive_project_reference_origins(
     modules: &[ScalarModule],
+    call_sites: ProjectCallSiteResults,
 ) -> (
     Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
     Vec<ReferenceAnalysisError>,
@@ -3879,12 +3901,8 @@ fn derive_project_reference_origins(
     let mut inventory = None;
     let mut updates = Vec::new();
     let mut errors = Vec::new();
-    let call_modules = modules
-        .iter()
-        .map(CallResolutionModule::module)
-        .collect::<Vec<_>>();
-    for (index, module) in modules.iter().enumerate() {
-        match resolve_module_call_sites(&module.source, &module.items, &call_modules) {
+    for (index, (module, calls)) in modules.iter().zip(call_sites.modules).enumerate() {
+        match calls {
             Ok(sites) => {
                 let (structs, enums) = inventory.get_or_insert_with(|| {
                     (

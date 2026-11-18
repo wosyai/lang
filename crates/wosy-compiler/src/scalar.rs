@@ -2746,8 +2746,9 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         mut diagnostics,
     } = typecheck_scalar_project(project);
     if diagnostics.is_empty() {
+        let call_sites = reference::resolve_project_call_sites(&project.modules);
         diagnostics.extend(
-            reference::record_project_reference_origins(&mut project.modules)
+            reference::record_project_reference_origins(&mut project.modules, call_sites)
                 .into_iter()
                 .map(|error| error.diagnostic()),
         );
