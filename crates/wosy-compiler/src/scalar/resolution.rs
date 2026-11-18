@@ -209,7 +209,12 @@ pub(super) fn resolve_program_places(
     overloads: &ScalarTypingView<'_>,
     owners: &ScalarAssignmentOwners,
 ) {
-    let context = program.clone();
+    let context = ScalarProgramTyping {
+        source: &program.source,
+        structs: &program.structs,
+        enums: &program.enums,
+        target_layout: program.target_layout,
+    };
     let names = program
         .structs
         .iter()
@@ -288,7 +293,7 @@ pub(super) fn resolve_program_places(
 fn resolve_item_places(
     item: &mut ScalarBlockItem,
     scope: &mut BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -375,7 +380,7 @@ fn resolve_item_places(
 fn resolve_block_places(
     block: &mut ScalarBlock,
     scope: &mut BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -409,7 +414,7 @@ fn resolve_block_places(
 fn resolve_expression_places(
     expression: &mut ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -622,7 +627,7 @@ fn resolve_expression_places(
 fn resolve_place(
     place: &mut ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,

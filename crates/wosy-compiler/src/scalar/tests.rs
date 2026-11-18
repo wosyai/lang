@@ -5251,13 +5251,19 @@ fn derives_and_validates_ordered_local_mutation_and_unit_while() {
     let overloads = overloads.typing(0);
     let owners = ScalarAssignmentOwners::new(&result.program.items);
     let mut inference = ScalarInferenceBuilder::new(&owners);
+    let typing = ScalarProgramTyping {
+        source: &result.program.source,
+        structs: &result.program.structs,
+        enums: &result.program.enums,
+        target_layout: result.program.target_layout,
+    };
     assert_eq!(
         block_type(
             &while_expression.body,
             &BTreeMap::new(),
             &BTreeSet::new(),
             &BTreeMap::new(),
-            &result.program,
+            &typing,
             &mut Vec::new(),
             false,
             &overloads,

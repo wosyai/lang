@@ -2195,6 +2195,7 @@ use resolution::{
     resolve_program_places, resolve_program_types,
 };
 mod typecheck;
+use typecheck::ScalarProgramTyping;
 use typecheck::{
     block_item_type_in_module, block_type_in_module, block_type_in_module_expected,
     call_output_sequence_in_module, declare_module_name, expect_module_type, expression_span,

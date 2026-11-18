@@ -78,12 +78,18 @@ fn single_type(
     let owners = ScalarAssignmentOwners::new(&program.items);
     let mut inference = ScalarInferenceBuilder::new(&owners);
     let mut diagnostics = Vec::new();
+    let typing = ScalarProgramTyping {
+        source: &program.source,
+        structs: &program.structs,
+        enums: &program.enums,
+        target_layout: program.target_layout,
+    };
     let ty = expression_type(
         call,
         scope,
         &BTreeSet::new(),
         &BTreeMap::new(),
-        program,
+        &typing,
         &mut diagnostics,
         false,
         view,
@@ -134,6 +140,12 @@ fn late_extern_member_is_available_to_outputs_and_standalone_but_first_project_b
             first.functions[0].name = "other".into();
         }
         program.items.push(ScalarItem::Extern(late));
+        let typing = ScalarProgramTyping {
+            source: &program.source,
+            structs: &program.structs,
+            enums: &program.enums,
+            target_layout: program.target_layout,
+        };
         let expression = call(Some("env"), "fetch", Vec::new());
         let environment = ScalarOverloadEnvironment::single(&program.source, &program.items);
         let view = environment.typing(0);
@@ -142,7 +154,7 @@ fn late_extern_member_is_available_to_outputs_and_standalone_but_first_project_b
             (ScalarType::I32, Vec::new())
         );
         assert_eq!(
-            call_output_sequence(&expression, &BTreeMap::new(), &program, &view)
+            call_output_sequence(&expression, &BTreeMap::new(), &typing, &view)
                 .unwrap()
                 .outputs[0]
                 .ty,
@@ -203,6 +215,12 @@ fn duplicate_extern_markers_keep_standalone_or_project_first_and_qualified_lexic
             "B0012",
             "unsafe extern call requires an unsafe block",
         );
+        let typing = ScalarProgramTyping {
+            source: &program.source,
+            structs: &program.structs,
+            enums: &program.enums,
+            target_layout: program.target_layout,
+        };
         assert_eq!(
             single_type(&program, &view, &BTreeMap::new(), &expression),
             (ScalarType::I32, vec![unsafe_diagnostic.clone()])
@@ -213,14 +231,14 @@ fn duplicate_extern_markers_keep_standalone_or_project_first_and_qualified_lexic
             (ScalarType::Bool, vec![unsafe_diagnostic])
         );
         assert_eq!(
-            call_output_sequence(&expression, &lexical, &program, &view)
+            call_output_sequence(&expression, &lexical, &typing, &view)
                 .unwrap()
                 .outputs[0]
                 .ty,
             ScalarType::I32
         );
         let generic_call = call(Some("env"), "fetch", vec![type_argument()]);
-        assert!(call_output_sequence(&generic_call, &lexical, &program, &view).is_none());
+        assert!(call_output_sequence(&generic_call, &lexical, &typing, &view).is_none());
         assert_eq!(
             single_type(&program, &view, &lexical, &generic_call),
             (
@@ -256,12 +274,18 @@ fn first_empty_generic_declaration_controls_both_typing_routes() {
     }];
     later.signature = callable(ScalarType::Bool);
     program.items.push(ScalarItem::Function(later));
+    let typing = ScalarProgramTyping {
+        source: &program.source,
+        structs: &program.structs,
+        enums: &program.enums,
+        target_layout: program.target_layout,
+    };
     let environment = ScalarOverloadEnvironment::single(&program.source, &program.items);
     let view = environment.typing(0);
     let scope = BTreeMap::from([("identity".into(), callable(ScalarType::Bool))]);
     let expression = call(None, "identity", vec![type_argument(), type_argument()]);
     assert_eq!(
-        call_output_sequence(&expression, &scope, &program, &view)
+        call_output_sequence(&expression, &scope, &typing, &view)
             .unwrap()
             .outputs[0]
             .ty,

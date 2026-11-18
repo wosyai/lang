@@ -1,5 +1,12 @@
 use super::*;
 
+pub(super) struct ScalarProgramTyping<'a> {
+    pub source: &'a SourceIdentity,
+    pub structs: &'a [ScalarStruct],
+    pub enums: &'a [ScalarEnum],
+    pub target_layout: ScalarTargetLayout,
+}
+
 #[cfg(test)]
 mod callable_context_tests;
 #[cfg(test)]
@@ -291,7 +298,7 @@ pub(super) fn call_output_sequence_in_module(
 fn call_output_sequence(
     expression: &ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     overloads: &ScalarTypingView<'_>,
 ) -> Option<ScalarOutputSequence> {
     let ScalarExpression::Call {
@@ -418,7 +425,7 @@ fn validate_output_receivers(
     receivers: &[ScalarOutputReceiver],
     binding_span: ByteSpan,
     scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
 ) {
@@ -1155,7 +1162,7 @@ fn type_core_memory(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -1747,7 +1754,7 @@ fn type_core_float_conversion(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -1839,7 +1846,7 @@ fn type_core_int_conversion(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -1938,7 +1945,7 @@ fn type_core_bitcast(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -2022,7 +2029,7 @@ fn type_core_pointer_cast(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -2239,7 +2246,7 @@ fn type_core_raw_memory(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -4094,7 +4101,7 @@ fn checked_address_type(
     place: &ScalarPlace,
     span: ByteSpan,
     scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
@@ -4255,7 +4262,7 @@ fn writable_place_type(
     place: &ScalarPlace,
     target_span: ByteSpan,
     scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
@@ -4340,7 +4347,7 @@ fn writable_place_type_in_module(
 fn writable_place_contains_raw_dereference(
     place: &ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
@@ -4417,7 +4424,7 @@ fn writable_place_contains_raw_dereference_in_module(
 fn writable_path_type(
     place: &ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
@@ -4668,7 +4675,7 @@ fn writable_path_type_in_module(
 pub(super) fn place_type(
     place: &ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
@@ -4948,7 +4955,7 @@ fn checked_dereference_target_type(
     pointer: &ScalarExpression,
     span: ByteSpan,
     scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -5002,7 +5009,7 @@ fn checked_dereference_type(
     place: &ScalarPlace,
     span: ByteSpan,
     scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -5403,7 +5410,7 @@ pub(super) fn validate_identifier_style(
 }
 
 fn validate_program_identifier_style(
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     name: &str,
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -5685,11 +5692,19 @@ pub(super) fn validate(
 ) -> Vec<super::Diagnostic> {
     let mut diagnostics = Vec::new();
     validate_unit_if_positions(program, &mut diagnostics);
+    let items = &program.items;
+    let typing = ScalarProgramTyping {
+        source: &program.source,
+        structs: &program.structs,
+        enums: &program.enums,
+        target_layout: program.target_layout,
+    };
+    let program = &typing;
     let mut declarations = BTreeMap::new();
     let mut declaration_names = BTreeSet::new();
     let mut folded_declarations = BTreeMap::new();
     let mut struct_names = BTreeSet::new();
-    for structure in &program.structs {
+    for structure in program.structs {
         if !declare_program_name(
             program,
             &structure.name,
@@ -5714,7 +5729,7 @@ pub(super) fn validate(
             }
         }
     }
-    for item in &program.items {
+    for item in items {
         let (name, span, ty) = match item {
             ScalarItem::Namespace(namespace) => {
                 validate_program_identifier_style(
@@ -5803,13 +5818,13 @@ pub(super) fn validate(
             }
         }
     }
-    for item in &program.items {
+    for item in items {
         if let ScalarItem::Extern(extern_decl) = item {
             validate_extern(&program.source, extern_decl, &mut diagnostics);
         }
     }
     let mut scope = declarations.clone();
-    for item in &program.items {
+    for item in items {
         match item {
             ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
             ScalarItem::Binding(binding) => {
@@ -6093,7 +6108,7 @@ pub(super) fn validate(
             }
         }
     }
-    for span in unused_binding_spans(&program.items) {
+    for span in unused_binding_spans(items) {
         diagnostics.push(diagnostic(
             program,
             "B0009",
@@ -6291,7 +6306,7 @@ pub(super) fn unused_binding_spans(items: &[ScalarItem]) -> Vec<ByteSpan> {
 }
 
 fn validate_type(
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     ty: &ScalarType,
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -6343,7 +6358,7 @@ fn validate_type(
 }
 
 fn validate_generic_type(
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     ty: &ScalarType,
     span: ByteSpan,
     generic_parameters: &[ScalarGenericParameter],
@@ -6386,7 +6401,7 @@ pub(super) fn block_type(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -6422,7 +6437,7 @@ fn block_type_expected(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -6475,7 +6490,7 @@ fn block_item_type(
     scope: &mut BTreeMap<String, ScalarType>,
     visible_names: &mut BTreeSet<String>,
     folded_names: &mut BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -6614,7 +6629,7 @@ fn assignment_type(
     scope: &mut BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -6728,7 +6743,7 @@ fn assignment_type(
 fn assignment_target_type(
     target: &ScalarAssignmentTarget,
     scope: &BTreeMap<String, ScalarType>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
@@ -6760,7 +6775,7 @@ fn assignment_target_type(
 
 fn validate_assignment_target_distinctness(
     assignment: &ScalarAssignment,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     for (index, target) in assignment.targets.iter().enumerate() {
@@ -6802,7 +6817,7 @@ fn while_type(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -6846,7 +6861,7 @@ pub(super) fn expression_type(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -7632,7 +7647,7 @@ pub(super) fn expression_type(
 fn validate_conditional_output_arity(
     block: &ScalarBlock,
     output_count: usize,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     if block.final_output_values.len() == output_count {
@@ -7673,7 +7688,7 @@ fn validate_conditional_output_arity(
 }
 
 fn expect_type(
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     expected: &ScalarType,
     actual: &ScalarType,
     span: ByteSpan,
@@ -7690,7 +7705,7 @@ fn expect_type(
 }
 
 fn expect_integer(
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     actual: &ScalarType,
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -7711,7 +7726,7 @@ fn expression_type_expected(
     scope: &BTreeMap<String, ScalarType>,
     visible_names: &BTreeSet<String>,
     folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
     overloads: &ScalarTypingView<'_>,
@@ -8349,7 +8364,7 @@ fn field_type(
     name: &str,
     name_span: ByteSpan,
     span: ByteSpan,
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) -> ScalarType {
     let Some(receiver) = receiver else {
@@ -8422,7 +8437,7 @@ fn validate_integer_range_for_type(
 }
 
 fn validate_integer_range_program(
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     value: &BigInt,
     span: ByteSpan,
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -8438,7 +8453,7 @@ fn validate_integer_range_program(
 }
 
 fn validate_integer_range_for_type_program(
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     value: &BigInt,
     span: ByteSpan,
     ty: &ScalarType,
@@ -8476,7 +8491,7 @@ fn is_const_binding_name(name: &str) -> bool {
 }
 
 pub(super) fn diagnostic(
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     code: &str,
     message: &str,
     span: ByteSpan,
@@ -8485,7 +8500,7 @@ pub(super) fn diagnostic(
 }
 
 fn declare_program_name(
-    program: &ScalarProgram,
+    program: &ScalarProgramTyping<'_>,
     name: &str,
     span: ByteSpan,
     names: &mut BTreeSet<String>,
@@ -8508,7 +8523,7 @@ fn declare_program_name(
             );
             collision.labels.push(super::DiagnosticLabel {
                 kind: super::DiagnosticLabelKind::Secondary,
-                span: SourceSpan::new(program.source.clone(), *first_span),
+                span: SourceSpan::new((*program.source).clone(), *first_span),
                 message: "first conflicting declaration".to_owned(),
             });
             diagnostics.push(collision);
