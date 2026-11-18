@@ -1576,7 +1576,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let mut declared = Vec::new();
         let mut result = None;
         let mut return_values = Vec::new();
-        for (index, item) in block.items.iter().enumerate() {
+        for (item, role) in block.items_with_output_roles() {
             match item {
                 ScalarBlockItem::LocalBinding(binding) => {
                     let ScalarBindingOutput::Evaluate(primary) = binding.output_source(0) else {
@@ -1688,17 +1688,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let value = self.expression(expression, scope)?;
                     let value_point = self.cursor.expect("evaluated output expression");
                     self.move_value(expression, scope)?;
-                    if index >= block.items.len() - block.final_output_values.len() {
-                        return_values.push(value_point);
+                    if let ScalarBlockItemRole::FinalOutput { output, metadata } = role {
+                        return_values.push((output, value_point, metadata));
                         if matches!(value, ReferenceValue::Checked(_)) {
                             result = Some(value);
                         } else if matches!(value, ReferenceValue::Uncomputed)
-                            && matches!(
-                                block.final_output_values
-                                    [index - (block.items.len() - block.final_output_values.len())]
-                                .ty,
-                                ScalarType::CheckedReference { .. }
-                            )
+                            && matches!(metadata.ty, ScalarType::CheckedReference { .. })
                         {
                             result = Some(value);
                         }
@@ -1941,17 +1936,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
         }
         if scope == ReferenceScopeId(0) {
-            for (output, value_point) in return_values.into_iter().enumerate() {
+            for (output, value_point, metadata) in return_values {
                 self.uncomputed_point(
                     CfgPointKind::ReturnOutput {
                         output,
                         value_point,
-                        checked: matches!(
-                            block.final_output_values[output].ty,
-                            ScalarType::CheckedReference { .. }
-                        ),
+                        checked: matches!(metadata.ty, ScalarType::CheckedReference { .. }),
                     },
-                    block.final_output_values[output].span,
+                    metadata.span,
                     scope,
                 );
             }
@@ -3736,7 +3728,7 @@ impl ValidatedCallResolver<'_> {
     ) -> Result<(), ReferenceAnalysisError> {
         let mut names = outer.clone();
         let mut types = outer_types.clone();
-        for item in &block.items {
+        for (item, _) in block.items_with_output_roles() {
             match item {
                 ScalarBlockItem::LocalBinding(binding) => {
                     let ScalarBindingOutput::Evaluate(primary) = binding.output_source(0) else {

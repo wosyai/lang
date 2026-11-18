@@ -1762,6 +1762,34 @@ pub struct ScalarBlock {
     pub unsafe_context: bool,
 }
 
+enum ScalarBlockItemRole<'a> {
+    Ordinary,
+    FinalOutput {
+        output: usize,
+        metadata: &'a ScalarOutputValue,
+    },
+}
+
+impl ScalarBlock {
+    fn items_with_output_roles(
+        &self,
+    ) -> impl Iterator<Item = (&ScalarBlockItem, ScalarBlockItemRole<'_>)> {
+        let first_output = self.items.len() - self.final_output_values.len();
+        self.items.iter().enumerate().map(move |(index, item)| {
+            let role = if index < first_output {
+                ScalarBlockItemRole::Ordinary
+            } else {
+                let output = index - first_output;
+                ScalarBlockItemRole::FinalOutput {
+                    output,
+                    metadata: &self.final_output_values[output],
+                }
+            };
+            (item, role)
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ScalarBlockItem {
     LocalBinding(ScalarBinding),
