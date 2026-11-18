@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 use std::mem::ManuallyDrop;
 use std::num::NonZeroU32;
@@ -2540,6 +2540,152 @@ enum AssignmentDestination<'ctx> {
     },
 }
 
+struct JoinedAssignmentPrevious<'ctx> {
+    owner_slot: PointerValue<'ctx>,
+    storage: PointerValue<'ctx>,
+    owner: inkwell::values::IntValue<'ctx>,
+    address: inkwell::values::IntValue<'ctx>,
+}
+
+fn capture_joined_assignment_previous<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    target: &crate::scalar::ScalarAssignmentTarget,
+    ty: &ScalarType,
+    destination: &AssignmentDestination<'ctx>,
+) -> Result<Option<JoinedAssignmentPrevious<'ctx>>, String> {
+    if matches!(destination, AssignmentDestination::Unit) {
+        return Ok(None);
+    }
+    let crate::ScalarPlace::Name { name, .. } = &target.place else {
+        return Ok(None);
+    };
+    let Some((owner_slot, _)) = state.joined_return_bindings.get(name).cloned() else {
+        return Ok(None);
+    };
+    if !matches!(ty, ScalarType::CheckedReference { .. }) {
+        return Err(format!(
+            "joined return binding {name} lacks checked-reference type"
+        ));
+    }
+    let AssignmentDestination::Existing(destination) = destination else {
+        unreachable!("joined destination has existing storage")
+    };
+    let owner = state
+        .builder
+        .build_load(context.bool_type(), owner_slot, "joined_previous_owner")
+        .map_err(builder_error)?
+        .into_int_value();
+    let address = state
+        .builder
+        .build_load(
+            basic_type(context, ty, state.target_layout)?,
+            *destination,
+            "joined_previous_address",
+        )
+        .map_err(builder_error)?
+        .into_int_value();
+    Ok(Some(JoinedAssignmentPrevious {
+        owner_slot,
+        storage: *destination,
+        owner,
+        address,
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct JoinedAssignmentSource<'ctx> {
+    owner_slot: PointerValue<'ctx>,
+    storage: PointerValue<'ctx>,
+    owned: inkwell::values::IntValue<'ctx>,
+}
+
+struct AssignmentValue<'ctx> {
+    value: EmitValue<'ctx>,
+    ty: ScalarType,
+    provenance: RuntimeArrayAssignmentProvenance,
+    call_flag: Option<inkwell::values::IntValue<'ctx>>,
+    joined_source: Option<JoinedAssignmentSource<'ctx>>,
+}
+
+fn stage_joined_assignment_owners<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    assignment: &ScalarAssignment,
+    values: &[AssignmentValue<'ctx>],
+    previous: &mut [Option<JoinedAssignmentPrevious<'ctx>>],
+) -> Result<Vec<Option<inkwell::values::IntValue<'ctx>>>, String> {
+    let mut owners = vec![None; previous.len()];
+    let mut transferred = HashMap::new();
+    let mut sources = Vec::new();
+    let mut self_replacements = Vec::new();
+    for (position, ((target, value), previous)) in assignment
+        .targets
+        .iter()
+        .zip(values)
+        .zip(previous.iter())
+        .enumerate()
+    {
+        let (Some(source), Some(previous)) = (value.joined_source, previous) else {
+            continue;
+        };
+        let classification = state
+            .joined_assignment_owners
+            .get(&(target.target_span.start, target.target_span.end))
+            .ok_or_else(|| {
+                format!(
+                    "missing validated assignment owner at {:?}",
+                    target.target_span
+                )
+            })?;
+        if matches!(classification, CheckedAssignmentOwner::Borrowed) {
+            continue;
+        }
+        if source.owner_slot == previous.owner_slot && source.storage == previous.storage {
+            self_replacements.push((position, source));
+            continue;
+        }
+        match transferred.entry((source.owner_slot, source.storage)) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(source.owned);
+                owners[position] = Some(source.owned);
+                sources.push(source);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                owners[position] = Some(context.bool_type().const_zero())
+            }
+        }
+    }
+    for (position, source) in self_replacements {
+        owners[position] = Some(
+            if transferred.contains_key(&(source.owner_slot, source.storage)) {
+                context.bool_type().const_zero()
+            } else {
+                source.owned
+            },
+        );
+    }
+    for previous in previous.iter_mut().flatten() {
+        if let Some(owned) = transferred.get(&(previous.owner_slot, previous.storage)) {
+            let retained = state
+                .builder
+                .build_not(*owned, "joined_owner_not_transferred")
+                .map_err(builder_error)?;
+            previous.owner = state
+                .builder
+                .build_and(previous.owner, retained, "joined_previous_eligible")
+                .map_err(builder_error)?;
+        }
+    }
+    for source in sources {
+        state
+            .builder
+            .build_store(source.owner_slot, context.bool_type().const_zero())
+            .map_err(builder_error)?;
+    }
+    Ok(owners)
+}
+
 fn retain_assignment_destination<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
@@ -2620,15 +2766,35 @@ fn emit_assignment<'ctx, 'module>(
         .targets
         .iter()
         .zip(&values)
-        .map(|(target, (_, ty, _, _))| retain_assignment_destination(context, state, target, ty))
+        .map(|(target, value)| retain_assignment_destination(context, state, target, &value.ty))
         .collect::<Result<Vec<_>, String>>()?;
-    for (position, ((target, (value, ty, provenance, call_flag)), destination)) in assignment
+    let mut previous = assignment
+        .targets
+        .iter()
+        .zip(&values)
+        .zip(&destinations)
+        .map(|((target, value), destination)| {
+            capture_joined_assignment_previous(context, state, target, &value.ty, destination)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let owners =
+        stage_joined_assignment_owners(context, state, assignment, &values, &mut previous)?;
+    for (position, ((((target, staged), destination), previous), joined_owner)) in assignment
         .targets
         .iter()
         .zip(values)
         .zip(destinations)
+        .zip(previous)
+        .zip(owners)
         .enumerate()
     {
+        let AssignmentValue {
+            value,
+            ty,
+            provenance,
+            call_flag,
+            joined_source: _,
+        } = staged;
         let Some(destination) = install_assignment_destination(state, target, &ty, destination)
         else {
             continue;
@@ -2644,10 +2810,11 @@ fn emit_assignment<'ctx, 'module>(
             target,
             expression,
             position,
-            destination,
+            previous,
             &ty,
             value,
             call_flag,
+            joined_owner,
         )?;
         transition_runtime_array_assignment(context, state, target, &ty, &provenance)?;
         store_value(context, state, destination, &ty, value)?;
@@ -2694,7 +2861,8 @@ fn emit_project_assignment<'ctx, 'module>(
         .targets
         .iter()
         .zip(&values)
-        .map(|(target, (_, ty, _, _))| {
+        .map(|(target, value)| {
+            let ty = &value.ty;
             if *ty == ScalarType::Unit {
                 return Ok(AssignmentDestination::Unit);
             }
@@ -2715,13 +2883,33 @@ fn emit_project_assignment<'ctx, 'module>(
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
-    for (position, ((target, (value, ty, provenance, call_flag)), destination)) in assignment
+    let mut previous = assignment
+        .targets
+        .iter()
+        .zip(&values)
+        .zip(&destinations)
+        .map(|((target, value), destination)| {
+            capture_joined_assignment_previous(context, state, target, &value.ty, destination)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let owners =
+        stage_joined_assignment_owners(context, state, assignment, &values, &mut previous)?;
+    for (position, ((((target, staged), destination), previous), joined_owner)) in assignment
         .targets
         .iter()
         .zip(values)
         .zip(destinations)
+        .zip(previous)
+        .zip(owners)
         .enumerate()
     {
+        let AssignmentValue {
+            value,
+            ty,
+            provenance,
+            call_flag,
+            joined_source: _,
+        } = staged;
         let Some(destination) = install_assignment_destination(state, target, &ty, destination)
         else {
             continue;
@@ -2737,10 +2925,11 @@ fn emit_project_assignment<'ctx, 'module>(
             target,
             expression,
             position,
-            destination,
+            previous,
             &ty,
             value,
             call_flag,
+            joined_owner,
         )?;
         transition_runtime_array_assignment(context, state, target, &ty, &provenance)?;
         store_value(context, state, destination, &ty, value)?;
@@ -2754,16 +2943,23 @@ fn transition_joined_checked_assignment<'ctx, 'module>(
     target: &crate::scalar::ScalarAssignmentTarget,
     expression: &ScalarExpression,
     output: usize,
-    destination: PointerValue<'ctx>,
+    previous: Option<JoinedAssignmentPrevious<'ctx>>,
     ty: &ScalarType,
     value: EmitValue<'ctx>,
     call_flag: Option<inkwell::values::IntValue<'ctx>>,
+    joined_owner: Option<inkwell::values::IntValue<'ctx>>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let crate::ScalarPlace::Name { name, .. } = &target.place else {
+    let Some(JoinedAssignmentPrevious {
+        owner_slot,
+        storage: _,
+        owner: previous_owner,
+        address: previous_address,
+    }) = previous
+    else {
         return Ok(value);
     };
-    let Some((owner_slot, _)) = state.joined_return_bindings.get(name).cloned() else {
-        return Ok(value);
+    let crate::ScalarPlace::Name { name, .. } = &target.place else {
+        unreachable!("joined destination is a name")
     };
     let classification = *state
         .joined_assignment_owners
@@ -2781,13 +2977,8 @@ fn transition_joined_checked_assignment<'ctx, 'module>(
     };
     let (value, owned) = match classification {
         CheckedAssignmentOwner::Local => {
-            if let ScalarExpression::Name { name: source, .. } = expression {
-                if let Some((slot, _)) = state.joined_return_bindings.get(source) {
-                    let owned = state
-                        .builder
-                        .build_load(context.bool_type(), *slot, "joined_assignment_owned")
-                        .map_err(builder_error)?
-                        .into_int_value();
+            if let ScalarExpression::Name { .. } = expression {
+                if let Some(owned) = joined_owner {
                     (value, owned)
                 } else {
                     let copied =
@@ -2819,12 +3010,8 @@ fn transition_joined_checked_assignment<'ctx, 'module>(
                         .ok_or_else(|| format!("missing mixed-call owner flag at {span:?}"))?,
                 },
                 ScalarExpression::Name { name: source, .. } => {
-                    if let Some((slot, _)) = state.joined_return_bindings.get(source) {
-                        state
-                            .builder
-                            .build_load(context.bool_type(), *slot, "joined_assignment_owned")
-                            .map_err(builder_error)?
-                            .into_int_value()
+                    if let Some(owned) = joined_owner {
+                        owned
                     } else if let Some(flag) = state.checked_owner_flags.get(source) {
                         *flag
                     } else if state.automatic_return_result_owners.contains_key(source) {
@@ -2845,20 +3032,6 @@ fn transition_joined_checked_assignment<'ctx, 'module>(
         CheckedAssignmentOwner::Borrowed => (value, context.bool_type().const_zero()),
     };
     let address = take_basic(value.clone())?.into_int_value();
-    let previous_owner = state
-        .builder
-        .build_load(context.bool_type(), owner_slot, "joined_previous_owner")
-        .map_err(builder_error)?
-        .into_int_value();
-    let previous_address = state
-        .builder
-        .build_load(
-            basic_type(context, ty, state.target_layout)?,
-            destination,
-            "joined_previous_address",
-        )
-        .map_err(builder_error)?
-        .into_int_value();
     let different = state
         .builder
         .build_int_compare(
@@ -2924,16 +3097,6 @@ fn transition_joined_checked_assignment<'ctx, 'module>(
         .builder
         .build_store(owner_slot, owned)
         .map_err(builder_error)?;
-    if let ScalarExpression::Name { name: source, .. } = expression {
-        if source != name {
-            if let Some((slot, _)) = state.joined_return_bindings.get(source) {
-                state
-                    .builder
-                    .build_store(*slot, context.bool_type().const_zero())
-                    .map_err(builder_error)?;
-            }
-        }
-    }
     Ok(value)
 }
 
@@ -3231,15 +3394,7 @@ fn materialize_assignment_values<'ctx, 'module>(
         &ScalarExpression,
         Option<&ScalarType>,
     ) -> Result<EmitValue<'ctx>, String>,
-) -> Result<
-    Vec<(
-        EmitValue<'ctx>,
-        ScalarType,
-        RuntimeArrayAssignmentProvenance,
-        Option<inkwell::values::IntValue<'ctx>>,
-    )>,
-    String,
-> {
+) -> Result<Vec<AssignmentValue<'ctx>>, String> {
     let mut emit = emit;
     let mut position = 0;
     let mut values = Vec::new();
@@ -3250,6 +3405,29 @@ fn materialize_assignment_values<'ctx, 'module>(
             expression,
             expected.get(position).and_then(Option::as_ref),
         )?;
+        let joined_source = if let ScalarExpression::Name { name, .. } = expression {
+            if let Some((owner_slot, _)) = state.joined_return_bindings.get(name) {
+                let storage = state
+                    .storage
+                    .get(name)
+                    .expect("joined source has lexical storage")
+                    .0;
+                let owned = state
+                    .builder
+                    .build_load(context.bool_type(), *owner_slot, "joined_assignment_owned")
+                    .map_err(builder_error)?
+                    .into_int_value();
+                Some(JoinedAssignmentSource {
+                    owner_slot: *owner_slot,
+                    storage,
+                    owned,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let call_flags = state.call_owner_flags.clone();
         let output_types = match &value {
             EmitValue::Aggregate { outputs, .. } => outputs.clone(),
@@ -3263,7 +3441,13 @@ fn materialize_assignment_values<'ctx, 'module>(
         for (output_position, ty) in output_types.into_iter().enumerate() {
             let value = extract_output(state, value.clone(), output_position)?;
             if ty == ScalarType::Unit {
-                values.push((EmitValue::Unit, ty, provenance.clone(), None));
+                values.push(AssignmentValue {
+                    value: EmitValue::Unit,
+                    ty,
+                    provenance: provenance.clone(),
+                    call_flag: None,
+                    joined_source: None,
+                });
                 position += 1;
                 continue;
             }
@@ -3287,12 +3471,13 @@ fn materialize_assignment_values<'ctx, 'module>(
                         .map_err(builder_error)?,
                 )
             };
-            values.push((
+            values.push(AssignmentValue {
                 value,
                 ty,
-                provenance.clone(),
-                call_flags.get(&output_position).copied(),
-            ));
+                provenance: provenance.clone(),
+                call_flag: call_flags.get(&output_position).copied(),
+                joined_source,
+            });
             position += 1;
         }
     }

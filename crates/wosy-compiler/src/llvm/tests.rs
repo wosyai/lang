@@ -360,6 +360,202 @@ fn joined_local_and_forwarded_checked_assignment_returns_by_runtime_owner() {
 }
 
 #[test]
+fn joined_assignment_previous_values_are_captured_before_group_writes_on_both_targets() {
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let text = "%%start\nstruct copy Point { u8 value; }\n(*Point, *Point)(*Point, bool, bool) choose = fn(input, local, borrowed) { *Point left = null; *Point right = null; u8 marker = 0; *!u8 marker_writer = &!marker; if (local) { Point first = { .value = 11; }; Point second = { .value = 22; }; left, right, *marker_writer = &first, &second, 3; }; if (borrowed) { left, right, *marker_writer = input, input, 4; }; marker_writer; left, right };\n%%end";
+    for (layout, width) in [
+        (ScalarTargetLayout::WASM32, "i32"),
+        (ScalarTargetLayout::NATIVE64, "i64"),
+    ] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for llvm in [
+            emit_scalar_llvm(&single).unwrap().to_text(),
+            emit_scalar_project_llvm(&project).unwrap().to_text(),
+        ] {
+            let lines = llvm.lines().collect::<Vec<_>>();
+            let owners = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.contains("joined_previous_owner") && line.contains(" = load i1,")
+                })
+                .collect::<Vec<_>>();
+            let addresses = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.contains("joined_previous_address")
+                        && line.contains(&format!(" = load {width},"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(owners.len(), 4, "{llvm}");
+            assert_eq!(addresses.len(), 4, "{llvm}");
+            let selectors = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    if !line.contains(&format!(" = load {width}, ptr %marker_writer,")) {
+                        return false;
+                    }
+                    let value = line.split_whitespace().next().unwrap();
+                    lines.iter().any(|candidate| {
+                        candidate.contains(&format!("inttoptr {width} {value} to ptr"))
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(selectors.len(), 2, "{llvm}");
+            for group in 0..2 {
+                let first_capture = owners[2 * group].0;
+                let last_capture = addresses[2 * group + 1].0;
+                let rhs_loads = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, line)| {
+                        *index < first_capture
+                            && line.contains(&format!(" = load {width}, ptr %assignment_value"))
+                    })
+                    .collect::<Vec<_>>();
+                assert!(rhs_loads.len() >= 2, "{llvm}");
+                assert!(rhs_loads[rhs_loads.len() - 1].0 < first_capture, "{llvm}");
+                let (selector_index, selector_line) = selectors[group];
+                let selector_value = selector_line.split_whitespace().next().unwrap();
+                let destination = lines
+                    .iter()
+                    .enumerate()
+                    .find(|(_, line)| {
+                        line.contains(&format!("inttoptr {width} {selector_value} to ptr"))
+                    })
+                    .expect("retained projected destination");
+                assert!(rhs_loads[rhs_loads.len() - 1].0 < selector_index, "{llvm}");
+                assert!(
+                    selector_index < destination.0 && destination.0 < first_capture,
+                    "{llvm}"
+                );
+                assert!(owners[2 * group].0 < addresses[2 * group].0, "{llvm}");
+                assert!(addresses[2 * group].0 < owners[2 * group + 1].0, "{llvm}");
+                assert!(owners[2 * group + 1].0 < last_capture, "{llvm}");
+                let mut prior_write = last_capture;
+                for (position, name) in ["left", "right"].into_iter().enumerate() {
+                    let (owner_index, owner_line) = owners[2 * group + position];
+                    let (address_index, address_line) = addresses[2 * group + position];
+                    assert!(
+                        owner_line.contains(&format!(", ptr %{name}_return_owner,")),
+                        "{llvm}"
+                    );
+                    assert!(address_line.contains(&format!(", ptr %{name},")), "{llvm}");
+                    let owner = owner_line.split_whitespace().next().unwrap();
+                    let address = address_line.split_whitespace().next().unwrap();
+                    let different = lines
+                        .iter()
+                        .enumerate()
+                        .find(|(_, line)| {
+                            line.contains("joined_owner_replaced")
+                                && line.contains(&format!("icmp ne {width} {address},"))
+                        })
+                        .expect("replacement predicate");
+                    let live = lines
+                        .iter()
+                        .enumerate()
+                        .find(|(_, line)| {
+                            line.contains("joined_previous_live")
+                                && line.contains(&format!("icmp ne {width} {address}, 0"))
+                        })
+                        .expect("previous live predicate");
+                    assert!(last_capture < different.0, "{llvm}");
+                    assert!(prior_write < different.0, "{llvm}");
+                    assert!(
+                        address_index < live.0 && owner_index < different.0,
+                        "{llvm}"
+                    );
+                    let different_value = different.1.split_whitespace().next().unwrap();
+                    let live_value = live.1.split_whitespace().next().unwrap();
+                    let owned = lines
+                        .iter()
+                        .enumerate()
+                        .find(|(_, line)| {
+                            line.contains(&format!("and i1 {owner}, {different_value}"))
+                        })
+                        .expect("previous-owned predicate");
+                    let owned_value = owned.1.split_whitespace().next().unwrap();
+                    let release = lines
+                        .iter()
+                        .enumerate()
+                        .find(|(_, line)| {
+                            line.contains(&format!("and i1 {owned_value}, {live_value}"))
+                        })
+                        .expect("release predicate");
+                    let release_value = release.1.split_whitespace().next().unwrap();
+                    let branch = lines
+                        .iter()
+                        .enumerate()
+                        .find(|(_, line)| line.contains(&format!("br i1 {release_value},")))
+                        .expect("conditional release");
+                    assert!(last_capture < branch.0, "{llvm}");
+                    let pointer = lines
+                        .iter()
+                        .enumerate()
+                        .find(|(_, line)| {
+                            line.contains("joined_previous_pointer")
+                                && line.contains(&format!("inttoptr {width} {address} to ptr"))
+                        })
+                        .expect("released previous address");
+                    let pointer_value = pointer.1.split_whitespace().next().unwrap();
+                    let free = lines
+                        .iter()
+                        .enumerate()
+                        .find(|(_, line)| {
+                            line.contains(&format!(
+                                "call void @__wosy_core_free(ptr {pointer_value})"
+                            ))
+                        })
+                        .expect("previous owner free");
+                    assert!(branch.0 < pointer.0 && pointer.0 < free.0, "{llvm}");
+                    let owner_write = lines
+                        .iter()
+                        .enumerate()
+                        .find(|(index, line)| {
+                            *index > branch.0
+                                && line.contains("store i1 ")
+                                && line.contains(&format!(", ptr %{name}_return_owner,"))
+                        })
+                        .expect("ordered owner install");
+                    let value_write = lines
+                        .iter()
+                        .enumerate()
+                        .find(|(index, line)| {
+                            *index > owner_write.0
+                                && line.contains(&format!("store {width} "))
+                                && line.contains(&format!(", ptr %{name},"))
+                        })
+                        .expect("ordered checked-address install");
+                    assert!(
+                        last_capture < owner_write.0 && owner_write.0 < value_write.0,
+                        "{llvm}"
+                    );
+                    prior_write = value_write.0;
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn move_only_checked_aggregate_is_consumed_as_one_sized_value() {
     let source = SourceIdentity::new(
         "project".into(),
@@ -392,6 +588,702 @@ fn move_only_checked_aggregate_is_consumed_as_one_sized_value() {
                 !llvm.contains("call void @__wosy_core_free(ptr %deref"),
                 "{llvm}"
             );
+        }
+    }
+}
+
+#[test]
+fn joined_group_transfer_does_not_release_the_address_transferred_to_left() {
+    fn release_on_owned_distinct_live_path(
+        value: &str,
+        definitions: &BTreeMap<String, String>,
+        previous_owner: &str,
+        different: &str,
+        live: &str,
+        transferred_owner: &str,
+    ) -> bool {
+        if value == previous_owner
+            || value == different
+            || value == live
+            || value == transferred_owner
+            || value == "true"
+        {
+            return true;
+        }
+        if value == "false" {
+            return false;
+        }
+        if let Some(operands) = definitions[value].strip_prefix("xor i1 ") {
+            let (left, right) = operands.split_once(", ").unwrap();
+            return release_on_owned_distinct_live_path(
+                left,
+                definitions,
+                previous_owner,
+                different,
+                live,
+                transferred_owner,
+            ) ^ release_on_owned_distinct_live_path(
+                right,
+                definitions,
+                previous_owner,
+                different,
+                live,
+                transferred_owner,
+            );
+        }
+        let operands = definitions[value]
+            .strip_prefix("and i1 ")
+            .expect("release conjunction");
+        let (left, right) = operands.split_once(", ").unwrap();
+        release_on_owned_distinct_live_path(
+            left,
+            definitions,
+            previous_owner,
+            different,
+            live,
+            transferred_owner,
+        ) && release_on_owned_distinct_live_path(
+            right,
+            definitions,
+            previous_owner,
+            different,
+            live,
+            transferred_owner,
+        )
+    }
+
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let text = "%%start\nstruct copy Point { u8 value; }\n(*Point, *Point)(*Point, bool, bool, bool) choose = fn(input, local, borrowed, transfer) { *Point left = null; *Point right = null; if (local) { Point first = { .value = 11; }; Point second = { .value = 22; }; left, right = &first, &second; }; if (borrowed) { left, right = input, input; }; if (transfer) { left, right = right, input; }; left, right };\nunit() caller = fn { Point outside = { .value = 33; }; *Point first, *Point second = choose(&outside, true, false, true); Point one = *first; Point two = *second; one; two; };\ncaller();\n%%end";
+    let mut unsafe_routes = Vec::new();
+    for (layout, width) in [
+        (ScalarTargetLayout::WASM32, "i32"),
+        (ScalarTargetLayout::NATIVE64, "i64"),
+    ] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (route, llvm) in [
+            (
+                "standalone",
+                emit_scalar_llvm(&single)
+                    .expect("accepted standalone emission")
+                    .to_text(),
+            ),
+            (
+                "project",
+                emit_scalar_project_llvm(&project)
+                    .expect("accepted project emission")
+                    .to_text(),
+            ),
+        ] {
+            let lines = llvm
+                .lines()
+                .skip_while(|line| !line.starts_with(&format!("define {{ {width}, {width} }} @")))
+                .take_while(|line| *line != "}")
+                .collect::<Vec<_>>();
+            assert!(!lines.is_empty(), "{llvm}");
+            let definitions = lines
+                .iter()
+                .filter_map(|line| {
+                    line.split_once(" = ").map(|(name, expression)| {
+                        (
+                            name.split_whitespace().next().unwrap().to_owned(),
+                            expression.to_owned(),
+                        )
+                    })
+                })
+                .collect::<BTreeMap<_, _>>();
+            let (owner_index, owner_line) = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.contains("joined_previous_owner")
+                        && line.contains(" = load i1, ptr %right_return_owner,")
+                })
+                .last()
+                .expect("captured previous right owner");
+            let (address_index, address_line) = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.contains("joined_previous_address")
+                        && line.contains(&format!(" = load {width}, ptr %right,"))
+                })
+                .last()
+                .expect("captured previous right address");
+            let owner = owner_line.split_whitespace().next().unwrap();
+            let address = address_line.split_whitespace().next().unwrap();
+            let (left_write, left_store) = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.contains(&format!("store {width} ")) && line.contains(", ptr %left,")
+                })
+                .last()
+                .expect("transferred right payload installed in left");
+            let replacement_value = left_store
+                .split_once(&format!("store {width} "))
+                .unwrap()
+                .1
+                .split(',')
+                .next()
+                .unwrap();
+            let replacement_slot = definitions[replacement_value]
+                .strip_prefix(&format!("load {width}, ptr "))
+                .unwrap()
+                .split(',')
+                .next()
+                .unwrap();
+            let (rhs_store, rhs_line) = lines
+                .iter()
+                .enumerate()
+                .filter(|(index, line)| {
+                    *index < owner_index
+                        && line.contains(&format!("store {width} "))
+                        && line.contains(&format!(", ptr {replacement_slot},"))
+                })
+                .last()
+                .expect("staged right payload");
+            let right_value = rhs_line
+                .split_once(&format!("store {width} "))
+                .unwrap()
+                .1
+                .split(',')
+                .next()
+                .unwrap();
+            assert!(
+                definitions[right_value].starts_with(&format!("load {width}, ptr %right,")),
+                "{llvm}"
+            );
+            assert!(
+                rhs_store < owner_index && owner_index < address_index,
+                "{llvm}"
+            );
+            assert!(
+                lines[rhs_store + 1..address_index]
+                    .iter()
+                    .all(|line| !(line.contains("store ") && line.contains(", ptr %right,"))),
+                "right address changed before capture: {llvm}"
+            );
+            let (source_owner_read, source_owner_line) = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.contains("joined_assignment_owned")
+                        && line.contains(" = load i1, ptr %right_return_owner,")
+                })
+                .last()
+                .expect("joined RHS owner transfer");
+            let source_owner = source_owner_line.split_whitespace().next().unwrap();
+            let left_owner_write = lines
+                .iter()
+                .position(|line| {
+                    line.contains(&format!("store i1 {source_owner}, ptr %left_return_owner,"))
+                })
+                .expect("left receives right ownership");
+            let source_clear = lines
+                .iter()
+                .enumerate()
+                .filter(|(index, line)| {
+                    *index < left_write && line.contains("store i1 false, ptr %right_return_owner,")
+                })
+                .last()
+                .expect("source owner clear")
+                .0;
+            assert!(
+                source_owner_read < rhs_store && source_owner_read < owner_index,
+                "{llvm}"
+            );
+            assert!(
+                address_index < source_clear
+                    && source_clear < left_owner_write
+                    && left_owner_write < left_write,
+                "{llvm}"
+            );
+            assert!(
+                lines[source_owner_read + 1..owner_index]
+                    .iter()
+                    .all(|line| !(line.contains("store ")
+                        && line.contains(", ptr %right_return_owner,"))),
+                "right owner changed before capture: {llvm}"
+            );
+            let different = lines
+                .iter()
+                .find(|line| {
+                    line.contains("joined_owner_replaced")
+                        && line.contains(&format!("icmp ne {width} {address},"))
+                })
+                .expect("old right versus distinct input comparison");
+            let different_value = different.split_whitespace().next().unwrap();
+            let new_right = different
+                .split_once(&format!("icmp ne {width} {address}, "))
+                .unwrap()
+                .1;
+            let input_slot = definitions[new_right]
+                .strip_prefix(&format!("load {width}, ptr "))
+                .unwrap()
+                .split(',')
+                .next()
+                .unwrap();
+            let input_store = lines
+                .iter()
+                .enumerate()
+                .filter(|(index, line)| {
+                    *index < owner_index
+                        && line.contains(&format!(", ptr {input_slot},"))
+                        && line.contains(&format!("store {width} "))
+                })
+                .last()
+                .expect("staged distinct input")
+                .1;
+            let input_value = input_store
+                .split_once(&format!("store {width} "))
+                .unwrap()
+                .1
+                .split(',')
+                .next()
+                .unwrap();
+            assert!(
+                definitions[input_value].starts_with(&format!("load {width}, ptr %input")),
+                "{llvm}"
+            );
+            let live = lines
+                .iter()
+                .find(|line| {
+                    line.contains("joined_previous_live")
+                        && line.contains(&format!("icmp ne {width} {address}, 0"))
+                })
+                .expect("old right live predicate");
+            let live_value = live.split_whitespace().next().unwrap();
+            let owned = lines
+                .iter()
+                .find(|line| {
+                    line.contains(" = and i1 ") && line.ends_with(&format!(", {different_value}"))
+                })
+                .expect("captured right owner release input");
+            let owned_value = owned.split_whitespace().next().unwrap();
+            let release = lines
+                .iter()
+                .find(|line| line.contains(&format!("and i1 {owned_value}, {live_value}")))
+                .expect("right replacement release predicate");
+            let release_value = release.split_whitespace().next().unwrap();
+            let branch = lines
+                .iter()
+                .position(|line| line.contains(&format!("br i1 {release_value},")))
+                .expect("right release branch");
+            assert!(source_clear < left_write && left_write < branch, "{llvm}");
+            let pointer = lines
+                .iter()
+                .find(|line| {
+                    line.contains("joined_previous_pointer")
+                        && line.contains(&format!("inttoptr {width} {address} to ptr"))
+                })
+                .expect("old right release address");
+            let pointer_value = pointer.split_whitespace().next().unwrap();
+            assert!(
+                lines.iter().any(|line| line
+                    .contains(&format!("call void @__wosy_core_free(ptr {pointer_value})"))),
+                "{llvm}"
+            );
+            let releases_transferred_address = release_on_owned_distinct_live_path(
+                release_value,
+                &definitions,
+                owner,
+                different_value,
+                live_value,
+                source_owner,
+            );
+            println!("{layout:?} {route}: validation=accepted emission=accepted; old_right={address} old_owner={owner}; left_payload={replacement_value}; clear_line={source_clear}; release={release_value}; frees_transferred_right={releases_transferred_address}");
+            println!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                source_owner_line,
+                owner_line,
+                address_line,
+                lines[source_clear],
+                lines[left_owner_write],
+                left_store,
+                release,
+                lines[branch]
+            );
+            if releases_transferred_address {
+                unsafe_routes.push(format!("{layout:?} {route}"));
+            }
+        }
+    }
+    assert!(unsafe_routes.is_empty(), "right replacement frees the owned address transferred to left on local=true, borrowed=false, transfer=true: {unsafe_routes:?}");
+}
+
+#[test]
+fn joined_group_crossed_self_and_ordinary_replacements_preserve_owner_authority() {
+    fn predicate(
+        value: &str,
+        definitions: &BTreeMap<String, String>,
+        inputs: &BTreeMap<String, bool>,
+    ) -> bool {
+        if value == "true" {
+            return true;
+        }
+        if value == "false" {
+            return false;
+        }
+        if let Some(value) = inputs.get(value) {
+            return *value;
+        }
+        let expression = &definitions[value];
+        if let Some(operands) = expression.strip_prefix("xor i1 ") {
+            let (left, right) = operands.split_once(", ").unwrap();
+            return predicate(left, definitions, inputs) ^ predicate(right, definitions, inputs);
+        }
+        let operands = expression
+            .strip_prefix("and i1 ")
+            .expect("joined release conjunction");
+        let (left, right) = operands.split_once(", ").unwrap();
+        predicate(left, definitions, inputs) && predicate(right, definitions, inputs)
+    }
+
+    for (case, group, destination_order, source_names, expected_owner_bits, expected_releases) in [
+        (
+            "crossed",
+            "left, right = right, left;",
+            ["left", "right"],
+            ["right", "left"],
+            [true, true],
+            [false, false],
+        ),
+        (
+            "self_then_transfer",
+            "right, left = right, right;",
+            ["right", "left"],
+            ["right", "right"],
+            [false, true],
+            [false, true],
+        ),
+        (
+            "ordinary",
+            "left, right = input, input;",
+            ["left", "right"],
+            ["input", "input"],
+            [false, false],
+            [true, true],
+        ),
+    ] {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let text = format!("%%start\nstruct copy Point {{ u8 value; }}\n(*Point, *Point)(*Point, bool, bool, bool) choose = fn(input, local, borrowed, replace) {{ *Point left = null; *Point right = null; if (local) {{ Point first = {{ .value = 11; }}; Point second = {{ .value = 22; }}; left, right = &first, &second; }}; if (borrowed) {{ left, right = input, input; }}; if (replace) {{ {group} }}; left, right }};\n%%end");
+        for (layout, width) in [
+            (ScalarTargetLayout::WASM32, "i32"),
+            (ScalarTargetLayout::NATIVE64, "i64"),
+        ] {
+            let parsed = parse_source(source.clone(), text.clone(), &[]);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{case}: {:?}",
+                parsed.diagnostics
+            );
+            let single = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(
+                single.diagnostics.is_empty(),
+                "{case}: {:?}",
+                single.diagnostics
+            );
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(
+                project.diagnostics.is_empty(),
+                "{case}: {:?}",
+                project.diagnostics
+            );
+            for (route, llvm) in [
+                ("standalone", emit_scalar_llvm(&single).unwrap().to_text()),
+                (
+                    "project",
+                    emit_scalar_project_llvm(&project).unwrap().to_text(),
+                ),
+            ] {
+                let lines = llvm
+                    .lines()
+                    .skip_while(|line| {
+                        !line.starts_with(&format!("define {{ {width}, {width} }} @"))
+                    })
+                    .take_while(|line| *line != "}")
+                    .collect::<Vec<_>>();
+                let definitions = lines
+                    .iter()
+                    .filter_map(|line| {
+                        line.split_once(" = ").map(|(name, expression)| {
+                            (
+                                name.split_whitespace().next().unwrap().to_owned(),
+                                expression.to_owned(),
+                            )
+                        })
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let captures = destination_order.map(|name| {
+                    let owner = lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| {
+                            line.contains("joined_previous_owner")
+                                && line.contains(&format!(" = load i1, ptr %{name}_return_owner,"))
+                        })
+                        .last()
+                        .unwrap();
+                    let address = lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| {
+                            line.contains("joined_previous_address")
+                                && line.contains(&format!(" = load {width}, ptr %{name},"))
+                        })
+                        .last()
+                        .unwrap();
+                    (owner, address)
+                });
+                let last_capture = captures.iter().map(|(_, address)| address.0).max().unwrap();
+                let staged_owners = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| {
+                        line.contains("joined_assignment_owned") && line.contains(" = load i1,")
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    staged_owners.len(),
+                    if case == "ordinary" { 0 } else { 2 },
+                    "{case} {route}: {llvm}"
+                );
+                let mut inputs = BTreeMap::new();
+                for (_, line) in &staged_owners {
+                    inputs.insert(line.split_whitespace().next().unwrap().to_owned(), true);
+                }
+                let mut prior_write = last_capture;
+                let mut released = 0;
+                for position in 0..2 {
+                    let name = destination_order[position];
+                    let source_name = source_names[position];
+                    let ((owner_index, owner_line), (address_index, address_line)) =
+                        captures[position];
+                    let owner = owner_line.split_whitespace().next().unwrap();
+                    let address = address_line.split_whitespace().next().unwrap();
+                    inputs.insert(owner.to_owned(), true);
+                    let (write_index, write) = lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| {
+                            line.contains(&format!("store {width} "))
+                                && line.contains(&format!(", ptr %{name},"))
+                        })
+                        .last()
+                        .unwrap();
+                    let payload = write
+                        .split_once(&format!("store {width} "))
+                        .unwrap()
+                        .1
+                        .split(',')
+                        .next()
+                        .unwrap();
+                    let temporary = definitions[payload]
+                        .strip_prefix(&format!("load {width}, ptr "))
+                        .unwrap()
+                        .split(',')
+                        .next()
+                        .unwrap();
+                    let (rhs_index, rhs) = lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, line)| {
+                            *index < owner_index
+                                && line.contains(&format!("store {width} "))
+                                && line.contains(&format!(", ptr {temporary},"))
+                        })
+                        .last()
+                        .unwrap();
+                    let source_payload = rhs
+                        .split_once(&format!("store {width} "))
+                        .unwrap()
+                        .1
+                        .split(',')
+                        .next()
+                        .unwrap();
+                    assert!(
+                        definitions[source_payload]
+                            .starts_with(&format!("load {width}, ptr %{source_name}")),
+                        "{case}: {llvm}"
+                    );
+                    assert!(
+                        rhs_index < owner_index && owner_index < address_index,
+                        "{case}: {llvm}"
+                    );
+                    let owner_writes = lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, line)| {
+                            *index > last_capture
+                                && line.contains("store i1 ")
+                                && line.contains(&format!(", ptr %{name}_return_owner,"))
+                        })
+                        .collect::<Vec<_>>();
+                    let expected_clear =
+                        case == "crossed" || (case == "self_then_transfer" && name == "right");
+                    assert_eq!(
+                        owner_writes.len(),
+                        if expected_clear { 2 } else { 1 },
+                        "{case}: {llvm}"
+                    );
+                    let install = owner_writes.last().unwrap();
+                    let installed_bit = install
+                        .1
+                        .split_once("store i1 ")
+                        .unwrap()
+                        .1
+                        .split(',')
+                        .next()
+                        .unwrap();
+                    assert_eq!(
+                        predicate(installed_bit, &definitions, &inputs),
+                        expected_owner_bits[position],
+                        "{case} owner {name}: {llvm}"
+                    );
+                    if case != "ordinary" {
+                        let staged = staged_owners[position];
+                        assert!(
+                            staged
+                                .1
+                                .contains(&format!(", ptr %{source_name}_return_owner,")),
+                            "{case}: {llvm}"
+                        );
+                        assert!(
+                            staged.0 < rhs_index && staged.0 < owner_index,
+                            "{case}: {llvm}"
+                        );
+                        if expected_owner_bits[position] {
+                            assert_eq!(
+                                installed_bit,
+                                staged.1.split_whitespace().next().unwrap(),
+                                "{case}: {llvm}"
+                            );
+                        }
+                    }
+                    if expected_clear {
+                        assert!(
+                            owner_writes[0].1.contains("store i1 false,"),
+                            "{case}: {llvm}"
+                        );
+                        assert!(
+                            last_capture < owner_writes[0].0 && owner_writes[0].0 < install.0,
+                            "{case}: {llvm}"
+                        );
+                        for other in destination_order {
+                            let first_install = lines
+                                .iter()
+                                .enumerate()
+                                .filter(|(index, line)| {
+                                    *index > last_capture
+                                        && line.contains("store i1 ")
+                                        && line.contains(&format!(", ptr %{other}_return_owner,"))
+                                })
+                                .last()
+                                .unwrap()
+                                .0;
+                            assert!(
+                                owner_writes[0].0 < first_install,
+                                "late source clear in {case}: {llvm}"
+                            );
+                        }
+                    }
+                    assert!(
+                        prior_write < install.0 && install.0 < write_index,
+                        "{case}: {llvm}"
+                    );
+                    prior_write = write_index;
+                    let different = lines
+                        .iter()
+                        .find(|line| {
+                            line.contains("joined_owner_replaced")
+                                && line.contains(&format!("icmp ne {width} {address},"))
+                        })
+                        .unwrap();
+                    let different_value = different.split_whitespace().next().unwrap();
+                    let live = lines
+                        .iter()
+                        .find(|line| {
+                            line.contains("joined_previous_live")
+                                && line.contains(&format!("icmp ne {width} {address}, 0"))
+                        })
+                        .unwrap();
+                    let live_value = live.split_whitespace().next().unwrap();
+                    inputs.insert(
+                        different_value.to_owned(),
+                        !(case == "self_then_transfer" && name == "right"),
+                    );
+                    inputs.insert(live_value.to_owned(), true);
+                    let owned = lines
+                        .iter()
+                        .find(|line| {
+                            line.contains(" = and i1 ")
+                                && line.ends_with(&format!(", {different_value}"))
+                        })
+                        .unwrap();
+                    let owned_value = owned.split_whitespace().next().unwrap();
+                    let release = lines
+                        .iter()
+                        .find(|line| line.contains(&format!("and i1 {owned_value}, {live_value}")))
+                        .unwrap();
+                    let release_value = release.split_whitespace().next().unwrap();
+                    let release_bit = predicate(release_value, &definitions, &inputs);
+                    assert_eq!(
+                        release_bit, expected_releases[position],
+                        "{case} release {name}: {llvm}"
+                    );
+                    released += usize::from(release_bit);
+                    let pointer = lines
+                        .iter()
+                        .find(|line| {
+                            line.contains("joined_previous_pointer")
+                                && line.contains(&format!("inttoptr {width} {address} to ptr"))
+                        })
+                        .unwrap();
+                    let pointer_value = pointer.split_whitespace().next().unwrap();
+                    assert_eq!(
+                        lines
+                            .iter()
+                            .filter(|line| line.contains(&format!(
+                                "call void @__wosy_core_free(ptr {pointer_value})"
+                            )))
+                            .count(),
+                        1,
+                        "{case}: {llvm}"
+                    );
+                }
+                assert_eq!(
+                    released,
+                    expected_releases.into_iter().filter(|value| *value).count()
+                );
+                println!("{case} {layout:?} {route}: staged joined bits={}, eligible old-owner releases={released}; payload/slot/order/clear checks passed", staged_owners.len());
+            }
         }
     }
 }
