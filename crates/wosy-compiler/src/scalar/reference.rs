@@ -68,6 +68,7 @@ pub(in crate::scalar) mod stage_observations {
     }
 }
 
+#[cfg(test)]
 pub(super) fn record_program_reference_origins(
     program: &mut ScalarProgram,
     call_sites: &ModuleCallSites,
@@ -75,19 +76,19 @@ pub(super) fn record_program_reference_origins(
     analyze_program_references(program, call_sites).install(program)
 }
 
-struct ProgramReferenceResults {
+pub(super) struct ProgramReferenceResults {
     updates: Vec<(usize, FunctionReferenceResult)>,
     errors: Vec<ReferenceAnalysisError>,
 }
 
 impl ProgramReferenceResults {
-    fn install(self, program: &mut ScalarProgram) -> Vec<ReferenceAnalysisError> {
+    pub(super) fn install(self, program: &mut ScalarProgram) -> Vec<ReferenceAnalysisError> {
         install_module_reference_results(&mut program.items, self.updates);
         self.errors
     }
 }
 
-fn analyze_program_references(
+pub(super) fn analyze_program_references(
     program: &ScalarProgram,
     call_sites: &ModuleCallSites,
 ) -> ProgramReferenceResults {
@@ -3997,6 +3998,7 @@ fn install_module_reference_results(
     }
 }
 
+#[cfg(test)]
 pub(super) fn record_project_reference_origins(
     modules: &mut [ScalarModule],
     call_sites: &ProjectCallSiteResults,
@@ -4004,13 +4006,13 @@ pub(super) fn record_project_reference_origins(
     analyze_project_references(modules, call_sites).install(modules)
 }
 
-struct ProjectReferenceResults {
+pub(super) struct ProjectReferenceResults {
     updates: Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
     errors: Vec<ReferenceAnalysisError>,
 }
 
 impl ProjectReferenceResults {
-    fn install(self, modules: &mut [ScalarModule]) -> Vec<ReferenceAnalysisError> {
+    pub(super) fn install(self, modules: &mut [ScalarModule]) -> Vec<ReferenceAnalysisError> {
         for (index, results) in self.updates {
             install_module_reference_results(&mut modules[index].items, results);
         }
@@ -4018,7 +4020,7 @@ impl ProjectReferenceResults {
     }
 }
 
-fn analyze_project_references(
+pub(super) fn analyze_project_references(
     modules: &[ScalarModule],
     call_sites: &ProjectCallSiteResults,
 ) -> ProjectReferenceResults {

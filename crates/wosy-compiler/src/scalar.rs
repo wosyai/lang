@@ -2200,23 +2200,9 @@ pub fn derive_scalar_program_from_cst_with_layout(
     target_layout: ScalarTargetLayout,
 ) -> ScalarValidation {
     let declarations = derive_scalar_declarations_from_cst(canonical);
-    let ScalarValidation {
-        mut program,
-        mut diagnostics,
-    } = typecheck_scalar_program(declarations, target_layout);
-    if diagnostics.is_empty() {
-        let call_sites = resolve_program_call_sites(&program);
-        diagnostics.extend(
-            call_sites
-                .map(|sites| record_program_reference_origins(&mut program, &sites))
-                .unwrap_or_else(|error| vec![error])
-                .into_iter()
-                .map(|error| error.diagnostic()),
-        );
-    }
-    ScalarValidation {
-        program,
-        diagnostics,
+    match static_calls::PreparedProgram::new(declarations, target_layout) {
+        Ok(prepared) => prepared.finish(),
+        Err(validation) => validation,
     }
 }
 
@@ -2744,21 +2730,9 @@ fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
 }
 
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
-    let ScalarProjectValidation {
-        mut project,
-        mut diagnostics,
-    } = typecheck_scalar_project(project);
-    if diagnostics.is_empty() {
-        let call_sites = reference::resolve_project_call_sites(&project.modules);
-        diagnostics.extend(
-            reference::record_project_reference_origins(&mut project.modules, &call_sites)
-                .into_iter()
-                .map(|error| error.diagnostic()),
-        );
-    }
-    ScalarProjectValidation {
-        project,
-        diagnostics,
+    match static_calls::PreparedProject::new(project) {
+        Ok(prepared) => prepared.finish(),
+        Err(validation) => validation,
     }
 }
 
@@ -3376,9 +3350,8 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
 }
 
 mod reference;
-use reference::{
-    expand_conditional_final_outputs, record_program_reference_origins, resolve_program_call_sites,
-};
+mod static_calls;
+use reference::expand_conditional_final_outputs;
 fn derive_type(node: &CstNode) -> ScalarType {
     let actual = if matches!(node.kind(), SyntaxKind::TypeSpec | SyntaxKind::Punctuation) {
         node.descendants()
