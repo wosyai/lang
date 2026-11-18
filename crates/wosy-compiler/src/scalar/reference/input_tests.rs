@@ -24,6 +24,8 @@ mod dereference_points;
 
 mod complete_results;
 
+mod callable_boundary;
+
 fn assert_project_reference_results(
     left: &ProjectReferenceResults,
     right: &ProjectReferenceResults,

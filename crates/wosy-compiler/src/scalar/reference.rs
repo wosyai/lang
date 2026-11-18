@@ -204,8 +204,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
             binding_types: HashMap::new(),
             structs,
             enums,
-            generic_parameters: function
-                .generic_parameters
+            generic_parameters: call_sites
+                .boundary
+                .generics
                 .iter()
                 .map(|parameter| parameter.name.clone())
                 .collect(),
@@ -1959,12 +1960,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let value_point = self.cursor.expect("evaluated output expression");
                     self.move_value(expression, scope, ordinal)?;
                     if let BlockItemKind::FinalOutput(slot) = kind {
-                        let metadata = &block.final_output_values[slot.output];
+                        let ty = if scope == ReferenceScopeId(0) {
+                            &calls.boundary.root_outputs[slot.output].ty
+                        } else {
+                            &block.final_output_values[slot.output].ty
+                        };
                         return_values.push(value_point);
                         if matches!(value, ReferenceValue::Checked(_)) {
                             result = Some(value);
                         } else if matches!(value, ReferenceValue::Uncomputed)
-                            && matches!(metadata.ty, ScalarType::CheckedReference { .. })
+                            && matches!(ty, ScalarType::CheckedReference { .. })
                         {
                             result = Some(value);
                         }
@@ -2236,7 +2241,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         if scope == ReferenceScopeId(0) {
             for (slot, value_point) in region.final_outputs().zip(return_values) {
-                let metadata = &block.final_output_values[slot.output];
+                let metadata = &calls.boundary.root_outputs[slot.output];
+                assert_eq!(metadata.output, slot.output);
                 self.uncomputed_point(
                     CfgPointKind::ReturnOutput {
                         output: slot.output,
@@ -3890,7 +3896,37 @@ pub(super) struct CallOccurrence {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(super) struct ParameterSlot {
+    pub(super) ordinal: usize,
+    pub(super) name: String,
+    pub(super) span: ByteSpan,
+    pub(super) ty: ScalarType,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct DeclaredResultSlot {
+    pub(super) ordinal: usize,
+    pub(super) span: ByteSpan,
+    pub(super) ty: ScalarType,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct RootOutputType {
+    pub(super) output: usize,
+    pub(super) ty: ScalarType,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CallableBoundary {
+    pub(super) parameters: Vec<ParameterSlot>,
+    pub(super) results: Vec<DeclaredResultSlot>,
+    pub(super) root_outputs: Vec<RootOutputType>,
+    pub(super) generics: Vec<ScalarGenericParameter>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct FunctionCallSites {
+    pub(super) boundary: CallableBoundary,
     pub(super) sites: Vec<ResolvedCallSite>,
     pub(super) arms: Vec<FunctionCallSites>,
     pub(super) occurrences: Vec<OccurrenceMetadata>,
@@ -4696,22 +4732,56 @@ fn resolve_function_call_sites(
     };
     let mut parameter_names = BTreeMap::new();
     let mut parameter_types = BTreeMap::new();
-    let ScalarType::Callable { parameters, .. } = &function.signature else {
+    let ScalarType::Callable {
+        parameters,
+        outputs,
+    } = &function.signature
+    else {
         unreachable!("validated function signature")
     };
-    for (index, (name, span)) in function
-        .parameters
-        .iter()
-        .zip(&function.parameter_spans)
-        .enumerate()
-    {
-        parameter_types.insert(name.clone(), parameters[index].clone());
+    let boundary = CallableBoundary {
+        parameters: function
+            .parameters
+            .iter()
+            .zip(&function.parameter_spans)
+            .enumerate()
+            .map(|(ordinal, (name, span))| ParameterSlot {
+                ordinal,
+                name: name.clone(),
+                span: *span,
+                ty: parameters[ordinal].clone(),
+            })
+            .collect(),
+        results: outputs
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(ordinal, output)| DeclaredResultSlot {
+                ordinal,
+                span: output.span,
+                ty: output.ty.clone(),
+            })
+            .collect(),
+        root_outputs: function
+            .body
+            .final_output_values
+            .iter()
+            .enumerate()
+            .map(|(output, metadata)| RootOutputType {
+                output,
+                ty: metadata.ty.clone(),
+            })
+            .collect(),
+        generics: function.generic_parameters.clone(),
+    };
+    for slot in &boundary.parameters {
+        parameter_types.insert(slot.name.clone(), slot.ty.clone());
         parameter_names.insert(
-            name.clone(),
+            slot.name.clone(),
             ReferenceBindingId {
                 source: source.clone(),
                 function_span: function.span,
-                declaration_span: *span,
+                declaration_span: slot.span,
                 block_span: function.body.span,
                 kind: ReferenceBindingKind::Declared,
             },
@@ -4724,6 +4794,7 @@ fn resolve_function_call_sites(
         resolver.structure.root,
     )?;
     Ok(FunctionCallSites {
+        boundary,
         sites: resolver.sites,
         arms,
         occurrences: resolver.occurrences,
@@ -5403,84 +5474,84 @@ fn derive_function_reference_cfg(
         ReferenceScopeId(0),
         BTreeSet::new(),
     );
-    for (name, span) in function.parameters.iter().zip(&function.parameter_spans) {
+    for slot in &call_sites.boundary.parameters {
         builder.names.insert(
-            name.clone(),
+            slot.name.clone(),
             ReferenceBindingId {
                 source: source.clone(),
                 function_span: function.span,
-                declaration_span: *span,
+                declaration_span: slot.span,
                 block_span: function.body.span,
                 kind: ReferenceBindingKind::Declared,
             },
         );
     }
-    if let ScalarType::Callable { parameters, .. } = &function.signature {
-        for (index, ((name, span), ty)) in function
-            .parameters
-            .iter()
-            .zip(&function.parameter_spans)
-            .zip(parameters)
-            .enumerate()
-        {
-            builder
-                .binding_types
-                .insert(builder.names[name].clone(), ty.clone());
-            if let ScalarType::CheckedReference { mutability, .. } = ty {
-                let binding = builder.names[name].clone();
-                let loan = ReferenceLoanId {
-                    mode: *mutability,
-                    origin_place: ReferencePlaceId {
-                        source: source.clone(),
-                        function_span: function.span,
-                        declaration_span: *span,
-                        block_span: function.body.span,
-                        binding: binding.clone(),
-                        projections: Vec::new(),
-                        place: ScalarPlace::Name {
-                            name: name.clone(),
-                            span: *span,
-                        },
+    for slot in &call_sites.boundary.parameters {
+        let name = &slot.name;
+        let span = &slot.span;
+        let ty = &slot.ty;
+        builder
+            .binding_types
+            .insert(builder.names[name].clone(), ty.clone());
+        if let ScalarType::CheckedReference { mutability, .. } = ty {
+            let binding = builder.names[name].clone();
+            let loan = ReferenceLoanId {
+                mode: *mutability,
+                origin_place: ReferencePlaceId {
+                    source: source.clone(),
+                    function_span: function.span,
+                    declaration_span: *span,
+                    block_span: function.body.span,
+                    binding: binding.clone(),
+                    projections: Vec::new(),
+                    place: ScalarPlace::Name {
+                        name: name.clone(),
+                        span: *span,
                     },
-                    creation_span: *span,
-                    parent: None,
-                };
-                let id = builder.intern(ReferenceOrigin::BorrowedFrom {
-                    parameter: index,
-                    loan,
-                });
-                builder.checked.insert(binding.clone());
-                builder
-                    .origins
-                    .insert(binding.clone(), BTreeSet::from([id]));
-                builder.point(
-                    CfgPointKind::Bind { binding },
-                    *span,
-                    ReferenceScopeId(0),
-                    BTreeSet::from([id]),
-                );
-            }
+                },
+                creation_span: *span,
+                parent: None,
+            };
+            let id = builder.intern(ReferenceOrigin::BorrowedFrom {
+                parameter: slot.ordinal,
+                loan,
+            });
+            builder.checked.insert(binding.clone());
+            builder
+                .origins
+                .insert(binding.clone(), BTreeSet::from([id]));
+            builder.point(
+                CfgPointKind::Bind { binding },
+                *span,
+                ReferenceScopeId(0),
+                BTreeSet::from([id]),
+            );
         }
     }
     match builder.block(&function.body, call_sites.structure.root) {
         Err(error) => errors.push(error),
         Ok(result) => {
-            if let ScalarType::Callable { outputs, .. } = &function.signature {
-                if matches!(
-                    outputs.outputs.first(),
-                    Some(ScalarOutput {
-                        ty: ScalarType::CheckedReference { .. },
-                        ..
-                    })
-                ) && result.is_none()
-                    && !function.body.final_output_values.is_empty()
-                {
-                    let span = function.body.final_output_values[0].span;
-                    errors.push(builder.missing_context(
-                        span,
-                        ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
-                    ));
-                }
+            if matches!(
+                call_sites.boundary.results.first(),
+                Some(DeclaredResultSlot {
+                    ty: ScalarType::CheckedReference { .. },
+                    ..
+                })
+            ) && result.is_none()
+                && call_sites.structure.blocks[call_sites.structure.root.0]
+                    .final_outputs()
+                    .next()
+                    .is_some()
+            {
+                let span = call_sites.structure.blocks[call_sites.structure.root.0]
+                    .final_outputs()
+                    .next()
+                    .expect("root final output")
+                    .span;
+                errors.push(builder.missing_context(
+                    span,
+                    ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                ));
             }
         }
     }
