@@ -2767,13 +2767,6 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         );
     }
     if diagnostics.is_empty() {
-        diagnostics.extend(
-            resolve_reference_output_contracts(&mut project.modules)
-                .into_iter()
-                .map(|error| error.diagnostic()),
-        );
-    }
-    if diagnostics.is_empty() {
         let modules = project.modules.clone();
         let structs = modules
             .iter()
@@ -3414,7 +3407,6 @@ mod reference;
 use reference::{
     expand_conditional_final_outputs, record_program_reference_origins,
     record_specialized_copy_policies, resolve_module_call_sites,
-    resolve_reference_output_contracts,
 };
 fn derive_type(node: &CstNode) -> ScalarType {
     let actual = if matches!(node.kind(), SyntaxKind::TypeSpec | SyntaxKind::Punctuation) {

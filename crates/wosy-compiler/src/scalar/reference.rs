@@ -72,19 +72,24 @@ pub(super) fn record_program_reference_origins(
     program: &mut ScalarProgram,
     call_sites: &[ResolvedCallSite],
 ) -> Vec<ReferenceAnalysisError> {
-    let mut errors = record_module_reference_origins(
+    let (mut updates, mut errors) = derive_module_reference_origins(
         &program.source,
-        &mut program.items,
+        &program.items,
         call_sites,
         &program.structs,
         &program.enums,
         program.resolved_assignment_outputs.as_map(),
     );
     if errors.is_empty() {
-        let mut modules = vec![ScalarModule::from_program(program.clone(), Vec::new())];
-        errors.extend(resolve_reference_output_contracts(&mut modules));
-        program.items = modules.remove(0).items;
+        errors.extend(resolve_reference_output_contracts(&mut [
+            ModuleReferenceView {
+                source: &program.source,
+                items: &program.items,
+                results: &mut updates,
+            },
+        ]));
     }
+    install_module_reference_results(&mut program.items, updates);
     errors
 }
 
@@ -3685,6 +3690,7 @@ fn resolve_function_call_sites(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn record_module_reference_origins(
     source: &SourceIdentity,
     items: &mut [ScalarItem],
@@ -3765,6 +3771,30 @@ fn install_module_reference_results(
 pub(super) fn record_project_reference_origins(
     modules: &mut [ScalarModule],
 ) -> Vec<ReferenceAnalysisError> {
+    let (mut updates, mut errors) = derive_project_reference_origins(modules);
+    if errors.is_empty() {
+        let mut views = updates
+            .iter_mut()
+            .map(|(index, results)| ModuleReferenceView {
+                source: &modules[*index].source,
+                items: &modules[*index].items,
+                results,
+            })
+            .collect::<Vec<_>>();
+        errors.extend(resolve_reference_output_contracts(&mut views));
+    }
+    for (index, results) in updates {
+        install_module_reference_results(&mut modules[index].items, results);
+    }
+    errors
+}
+
+fn derive_project_reference_origins(
+    modules: &[ScalarModule],
+) -> (
+    Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
+    Vec<ReferenceAnalysisError>,
+) {
     let mut inventory = None;
     let mut updates = Vec::new();
     let mut errors = Vec::new();
@@ -3797,10 +3827,13 @@ pub(super) fn record_project_reference_origins(
             Err(error) => errors.push(error),
         }
     }
-    for (index, results) in updates {
-        install_module_reference_results(&mut modules[index].items, results);
-    }
-    errors
+    (updates, errors)
+}
+
+struct ModuleReferenceView<'a> {
+    source: &'a SourceIdentity,
+    items: &'a [ScalarItem],
+    results: &'a mut [(usize, FunctionReferenceResult)],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3829,14 +3862,14 @@ struct ConcreteReferenceOutputContract {
 }
 
 fn collect_concrete_output_contracts(
-    function: &ScalarFunction,
+    result: &FunctionReferenceResult,
     templates: &[ReferenceOutputContract],
     concrete: &mut Vec<ConcreteReferenceOutputContract>,
 ) {
-    for arm in &function.overload_arms {
+    for arm in &result.arms {
         collect_concrete_output_contracts(arm, templates, concrete);
     }
-    for point in &function.reference_cfg.initial_points {
+    for point in &result.cfg.initial_points {
         let CfgPointKind::Call {
             expression: ScalarExpression::Call { type_arguments, .. },
             output,
@@ -3883,11 +3916,12 @@ fn collect_concrete_output_contracts(
 fn collect_function_output_contracts(
     source: &SourceIdentity,
     function: &ScalarFunction,
+    result: &FunctionReferenceResult,
     declaration_span: ByteSpan,
     body: ReferenceCallableBody,
     contracts: &mut Vec<ReferenceOutputContract>,
 ) {
-    for point in &function.reference_cfg.points {
+    for point in &result.cfg.points {
         let CfgPointKind::ReturnOutput { output, .. } = point.kind else {
             continue;
         };
@@ -3905,7 +3939,7 @@ fn collect_function_output_contracts(
             output,
             origins: origins
                 .iter()
-                .map(|id| function.reference_cfg.facts[id.0].clone())
+                .map(|id| result.cfg.facts[id.0].clone())
                 .collect(),
         });
     }
@@ -3913,6 +3947,7 @@ fn collect_function_output_contracts(
         collect_function_output_contracts(
             source,
             arm,
+            &result.arms[index],
             declaration_span,
             ReferenceCallableBody::Overload(index),
             contracts,
@@ -3921,17 +3956,17 @@ fn collect_function_output_contracts(
 }
 
 fn transfer_function_output_contracts(
-    function: &mut ScalarFunction,
+    result: &mut FunctionReferenceResult,
     contracts: &[ConcreteReferenceOutputContract],
 ) -> Vec<ReferenceAnalysisError> {
     let mut errors = Vec::new();
-    for arm in &mut function.overload_arms {
+    for arm in &mut result.arms {
         errors.extend(transfer_function_output_contracts(arm, contracts));
     }
-    if !function.reference_cfg.initial_points.is_empty() {
-        function.reference_cfg.points = function.reference_cfg.initial_points.clone();
+    if !result.cfg.initial_points.is_empty() {
+        result.cfg.points = result.cfg.initial_points.clone();
         errors.extend(transfer_reference_facts(
-            &mut function.reference_cfg,
+            &mut result.cfg,
             &BTreeMap::new(),
             contracts,
         ));
@@ -3939,8 +3974,8 @@ fn transfer_function_output_contracts(
     errors
 }
 
-pub(super) fn resolve_reference_output_contracts(
-    modules: &mut [ScalarModule],
+fn resolve_reference_output_contracts(
+    modules: &mut [ModuleReferenceView<'_>],
 ) -> Vec<ReferenceAnalysisError> {
     #[cfg(test)]
     stage_observations::record_output_contracts();
@@ -3948,32 +3983,30 @@ pub(super) fn resolve_reference_output_contracts(
     loop {
         let mut concrete = Vec::new();
         for module in modules.iter() {
-            for item in &module.items {
-                if let ScalarItem::Function(function) = item {
-                    collect_concrete_output_contracts(function, &contracts, &mut concrete);
-                }
+            for (_, result) in module.results.iter() {
+                collect_concrete_output_contracts(result, &contracts, &mut concrete);
             }
         }
         let mut errors = Vec::new();
         for module in modules.iter_mut() {
-            for item in &mut module.items {
-                if let ScalarItem::Function(function) = item {
-                    errors.extend(transfer_function_output_contracts(function, &concrete));
-                }
+            for (_, result) in module.results.iter_mut() {
+                errors.extend(transfer_function_output_contracts(result, &concrete));
             }
         }
         let mut next = Vec::new();
         for module in modules.iter() {
-            for item in &module.items {
-                if let ScalarItem::Function(function) = item {
-                    collect_function_output_contracts(
-                        &module.source,
-                        function,
-                        function.name_span,
-                        ReferenceCallableBody::Declaration,
-                        &mut next,
-                    );
-                }
+            for (index, result) in module.results.iter() {
+                let ScalarItem::Function(function) = &module.items[*index] else {
+                    unreachable!("function result ordinal")
+                };
+                collect_function_output_contracts(
+                    module.source,
+                    function,
+                    result,
+                    function.name_span,
+                    ReferenceCallableBody::Declaration,
+                    &mut next,
+                );
             }
         }
         if next == contracts {

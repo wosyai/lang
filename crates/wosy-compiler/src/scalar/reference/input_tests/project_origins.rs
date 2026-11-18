@@ -56,7 +56,7 @@ fn actual_project_origin_stage_copies_one_aggregate_inventory_and_preserves_conv
         }
         let scope = layout::observations::Scope::new();
         let stages = stage_observations::Scope::new();
-        let errors = record_project_reference_origins(&mut derived.modules);
+        let (mut updates, errors) = derive_project_reference_origins(&derived.modules);
         assert!(errors.is_empty(), "{errors:?}");
         let counts = scope.counts();
         assert_eq!(counts.program_copies, 0);
@@ -75,19 +75,38 @@ fn actual_project_origin_stage_copies_one_aggregate_inventory_and_preserves_conv
         );
         drop(stages);
         drop(scope);
+        assert_eq!(derived, before);
         for (module, original) in derived.modules.iter().zip(&before.modules) {
             assert_eq!(module.structs, original.structs);
             assert_eq!(module.enums, original.enums);
             assert_eq!(module.layouts, original.layouts);
-            for item in &module.items {
-                let ScalarItem::Function(function) = item else {
-                    panic!("function")
-                };
-                assert!(!function.reference_cfg.points.is_empty());
-                assert!(!function.reference_cfg.initial_points.is_empty());
+        }
+        for (_, results) in &updates {
+            for (_, result) in results {
+                assert!(!result.cfg.points.is_empty());
+                assert!(!result.cfg.initial_points.is_empty());
             }
         }
-        let errors = resolve_reference_output_contracts(&mut derived.modules);
+        let mut views = updates
+            .iter_mut()
+            .map(|(index, results)| ModuleReferenceView {
+                source: &derived.modules[*index].source,
+                items: &derived.modules[*index].items,
+                results,
+            })
+            .collect::<Vec<_>>();
+        let scope = layout::observations::Scope::new();
+        let stages = stage_observations::Scope::new();
+        let errors = resolve_reference_output_contracts(&mut views);
+        assert_eq!(scope.counts(), layout::observations::Counts::default());
+        assert_eq!(stages.counts().output_contracts, 1);
+        drop(stages);
+        drop(scope);
+        drop(views);
+        assert_eq!(derived, before);
+        for (index, results) in updates {
+            install_module_reference_results(&mut derived.modules[index].items, results);
+        }
         let unavailable = text.rfind("next };").unwrap() as u32;
         let moved = text.find("next; next").unwrap() as u32;
         let expected = derived
