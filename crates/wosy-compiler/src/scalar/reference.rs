@@ -1,14 +1,15 @@
+#[cfg(test)]
+use super::control::NamespaceTarget;
 use super::control::{
     module_initialization_region, BindingOutput, BindingRegion, BlockItem, BlockItemKind,
-    BlockPosition, BlockRegion, ConditionalRegion, FinalOutputSlot, ModuleInitializationRegion,
+    BlockPosition, BlockRegion, ConditionalRegion, FinalOutputSlot, ModuleInitializationDetail,
+    ModuleInitializationRegion, ModuleInitializationStepKind, ModuleInitializationTopology,
     ShortCircuitRegion, WhileRegion,
 };
 use super::control::{
     AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentReplacement,
     AssignmentSlot,
 };
-#[cfg(test)]
-use super::control::{ModuleInitializationStepKind, NamespaceTarget};
 use super::*;
 
 #[cfg(test)]
@@ -238,6 +239,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     slot.target_span,
                     ReferenceAnalysisErrorReason::MissingResolvedBinding,
                 )),
+                AssignmentReplacement::StructuralOnly => {
+                    unreachable!("reference assignments are owned by a callable")
+                }
             })
             .collect()
     }
@@ -3968,7 +3972,7 @@ pub(super) fn resolve_project_call_sites(modules: &[ScalarModule]) -> ProjectCal
     }
 }
 
-struct ValidatedCallResolver<'a> {
+struct CallableWalk<'a> {
     source: &'a SourceIdentity,
     function_span: ByteSpan,
     module_callables: &'a BTreeMap<(Option<String>, String), (SourceIdentity, ByteSpan)>,
@@ -3976,8 +3980,23 @@ struct ValidatedCallResolver<'a> {
     modules: &'a [CallResolutionModule<'a>],
     assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
     sites: Vec<ResolvedCallSite>,
-    occurrences: Vec<OccurrenceMetadata>,
     call_occurrences: Vec<CallOccurrence>,
+}
+
+enum WalkMode<'a> {
+    Callable(CallableWalk<'a>),
+    ModuleInitialization(Vec<OccurrenceOrdinal>),
+}
+
+#[derive(Default)]
+struct WalkScope {
+    names: BTreeMap<String, ReferenceBindingId>,
+    types: BTreeMap<String, ScalarType>,
+}
+
+struct StructuralWalker<'a> {
+    mode: WalkMode<'a>,
+    occurrences: Vec<OccurrenceMetadata>,
     structure: OccurrenceStructure,
     assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
@@ -3985,7 +4004,19 @@ struct ValidatedCallResolver<'a> {
     short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
 }
 
-impl ValidatedCallResolver<'_> {
+impl<'a> StructuralWalker<'a> {
+    fn new(mode: WalkMode<'a>, span: ByteSpan) -> Self {
+        Self {
+            mode,
+            occurrences: Vec::new(),
+            structure: OccurrenceStructure::new(span),
+            assignments: HashMap::new(),
+            conditionals: HashMap::new(),
+            loops: HashMap::new(),
+            short_circuits: HashMap::new(),
+        }
+    }
+
     fn record_occurrence(
         &mut self,
         role: OccurrenceRole,
@@ -4029,135 +4060,160 @@ impl ValidatedCallResolver<'_> {
             parent,
             edge,
         );
-        let parent = OccurrenceParent::Expression(ordinal);
-        match expression {
-            ScalarExpression::Call {
-                receiver,
-                receiver_span,
-                name,
-                arguments,
-                overload_selection,
-                span,
-                ..
-            } => {
-                let target = if receiver.as_deref() == Some("core") {
-                    CoreOperationId::from_name(name).map(ResolvedCallTarget::Core)
-                } else if receiver.is_none() {
-                    names
-                        .get(name)
-                        .cloned()
-                        .map(ResolvedCallTarget::LocalCallable)
-                        .or_else(|| {
-                            self.module_callables.get(&(None, name.clone())).map(
-                                |(source, declaration_span)| ResolvedCallTarget::ModuleCallable {
-                                    source: source.clone(),
-                                    declaration_span: *declaration_span,
-                                    concrete: match overload_selection {
-                                        Some(selection) => {
-                                            ConcreteCallSelection::Overload(selection.clone())
-                                        }
-                                        None => ConcreteCallSelection::Declaration,
-                                    },
-                                },
-                            )
-                        })
-                } else if let Some(receiver_type) =
-                    receiver.as_ref().and_then(|binding| types.get(binding))
-                {
-                    let ScalarType::Struct(id) = receiver_type else {
-                        return Err(ReferenceAnalysisError::MissingContext {
-                            source_span: SourceSpan::new(self.source.clone(), *span),
-                            reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
-                        });
-                    };
-                    let field = self
-                        .modules
-                        .iter()
-                        .find_map(|module| {
-                            module.structs.iter().find(|structure| structure.id == *id)
-                        })
-                        .and_then(|structure| {
-                            resolved_struct_field(
-                                receiver_type,
-                                name,
-                                std::slice::from_ref(structure),
-                            )
-                        })
-                        .expect("validated callable field");
-                    let binding_name = receiver.as_ref().expect("typed field receiver");
-                    let binding = names.get(binding_name).expect("validated receiver binding");
-                    let receiver_span = receiver_span.expect("validated receiver source span");
-                    Some(ResolvedCallTarget::CallableField {
-                        receiver_place: ReferencePlaceId {
-                            source: self.source.clone(),
-                            function_span: self.function_span,
-                            declaration_span: binding.declaration_span,
-                            block_span: binding.block_span,
-                            binding: binding.clone(),
-                            projections: Vec::new(),
-                            place: ScalarPlace::Name {
-                                name: binding_name.clone(),
-                                span: receiver_span,
+        self.expression_children(expression, names, types, ordinal)?;
+        Ok(ordinal)
+    }
+}
+
+impl CallableWalk<'_> {
+    fn register_call(
+        &mut self,
+        ordinal: OccurrenceOrdinal,
+        expression: &ScalarExpression,
+        names: &BTreeMap<String, ReferenceBindingId>,
+        types: &BTreeMap<String, ScalarType>,
+    ) -> Result<(), ReferenceAnalysisError> {
+        let ScalarExpression::Call {
+            receiver,
+            receiver_span,
+            name,
+            overload_selection,
+            span,
+            ..
+        } = expression
+        else {
+            unreachable!("callable registration requires a call occurrence")
+        };
+        let target = if receiver.as_deref() == Some("core") {
+            CoreOperationId::from_name(name).map(ResolvedCallTarget::Core)
+        } else if receiver.is_none() {
+            names
+                .get(name)
+                .cloned()
+                .map(ResolvedCallTarget::LocalCallable)
+                .or_else(|| {
+                    self.module_callables.get(&(None, name.clone())).map(
+                        |(source, declaration_span)| ResolvedCallTarget::ModuleCallable {
+                            source: source.clone(),
+                            declaration_span: *declaration_span,
+                            concrete: match overload_selection {
+                                Some(selection) => {
+                                    ConcreteCallSelection::Overload(selection.clone())
+                                }
+                                None => ConcreteCallSelection::Declaration,
                             },
                         },
-                        field: field.id.clone(),
-                    })
-                } else {
-                    self.module_callables
-                        .get(&(receiver.clone(), name.clone()))
-                        .map(
-                            |(source, declaration_span)| ResolvedCallTarget::ModuleCallable {
-                                source: source.clone(),
-                                declaration_span: *declaration_span,
-                                concrete: match overload_selection {
-                                    Some(selection) => {
-                                        ConcreteCallSelection::Overload(selection.clone())
-                                    }
-                                    None => ConcreteCallSelection::Declaration,
-                                },
-                            },
-                        )
-                        .or_else(|| {
-                            self.extern_callables
-                                .get(&(receiver.clone().expect("qualified call"), name.clone()))
-                                .map(|(source, declaration_span)| {
-                                    ResolvedCallTarget::ExternCallable {
-                                        source: source.clone(),
-                                        declaration_span: *declaration_span,
-                                    }
-                                })
-                        })
-                };
-                let target = target.ok_or_else(|| ReferenceAnalysisError::MissingContext {
+                    )
+                })
+        } else if let Some(receiver_type) = receiver.as_ref().and_then(|binding| types.get(binding))
+        {
+            let ScalarType::Struct(id) = receiver_type else {
+                return Err(ReferenceAnalysisError::MissingContext {
                     source_span: SourceSpan::new(self.source.clone(), *span),
                     reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
-                })?;
-                let site = ResolvedCallSite {
-                    source_span: SourceSpan::new(self.source.clone(), *span),
-                    target,
-                };
-                let site_index = if let Some((index, existing)) = self
-                    .sites
-                    .iter()
-                    .enumerate()
-                    .find(|(_, existing)| existing.source_span == site.source_span)
-                {
-                    if existing.target != site.target {
-                        return Err(ReferenceAnalysisError::MissingContext {
-                            source_span: site.source_span,
-                            reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
-                        });
-                    }
-                    index
-                } else {
-                    let index = self.sites.len();
-                    self.sites.push(site);
-                    index
-                };
-                self.call_occurrences.push(CallOccurrence {
-                    ordinal,
-                    site: site_index,
                 });
+            };
+            let field = self
+                .modules
+                .iter()
+                .find_map(|module| module.structs.iter().find(|structure| structure.id == *id))
+                .and_then(|structure| {
+                    resolved_struct_field(receiver_type, name, std::slice::from_ref(structure))
+                })
+                .expect("validated callable field");
+            let binding_name = receiver.as_ref().expect("typed field receiver");
+            let binding = names.get(binding_name).expect("validated receiver binding");
+            let receiver_span = receiver_span.expect("validated receiver source span");
+            Some(ResolvedCallTarget::CallableField {
+                receiver_place: ReferencePlaceId {
+                    source: self.source.clone(),
+                    function_span: self.function_span,
+                    declaration_span: binding.declaration_span,
+                    block_span: binding.block_span,
+                    binding: binding.clone(),
+                    projections: Vec::new(),
+                    place: ScalarPlace::Name {
+                        name: binding_name.clone(),
+                        span: receiver_span,
+                    },
+                },
+                field: field.id.clone(),
+            })
+        } else {
+            self.module_callables
+                .get(&(receiver.clone(), name.clone()))
+                .map(
+                    |(source, declaration_span)| ResolvedCallTarget::ModuleCallable {
+                        source: source.clone(),
+                        declaration_span: *declaration_span,
+                        concrete: match overload_selection {
+                            Some(selection) => ConcreteCallSelection::Overload(selection.clone()),
+                            None => ConcreteCallSelection::Declaration,
+                        },
+                    },
+                )
+                .or_else(|| {
+                    self.extern_callables
+                        .get(&(receiver.clone().expect("qualified call"), name.clone()))
+                        .map(
+                            |(source, declaration_span)| ResolvedCallTarget::ExternCallable {
+                                source: source.clone(),
+                                declaration_span: *declaration_span,
+                            },
+                        )
+                })
+        };
+        let target = target.ok_or_else(|| ReferenceAnalysisError::MissingContext {
+            source_span: SourceSpan::new(self.source.clone(), *span),
+            reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
+        })?;
+        let site = ResolvedCallSite {
+            source_span: SourceSpan::new(self.source.clone(), *span),
+            target,
+        };
+        let site_index = if let Some((index, existing)) = self
+            .sites
+            .iter()
+            .enumerate()
+            .find(|(_, existing)| existing.source_span == site.source_span)
+        {
+            if existing.target != site.target {
+                return Err(ReferenceAnalysisError::MissingContext {
+                    source_span: site.source_span,
+                    reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
+                });
+            }
+            index
+        } else {
+            let index = self.sites.len();
+            self.sites.push(site);
+            index
+        };
+        self.call_occurrences.push(CallOccurrence {
+            ordinal,
+            site: site_index,
+        });
+        Ok(())
+    }
+}
+
+impl StructuralWalker<'_> {
+    fn expression_children(
+        &mut self,
+        expression: &ScalarExpression,
+        names: &BTreeMap<String, ReferenceBindingId>,
+        types: &BTreeMap<String, ScalarType>,
+        ordinal: OccurrenceOrdinal,
+    ) -> Result<(), ReferenceAnalysisError> {
+        let parent = OccurrenceParent::Expression(ordinal);
+        match expression {
+            ScalarExpression::Call { arguments, .. } => {
+                match &mut self.mode {
+                    WalkMode::Callable(callable) => {
+                        callable.register_call(ordinal, expression, names, types)?;
+                    }
+                    WalkMode::ModuleInitialization(calls) => calls.push(ordinal),
+                }
                 for (position, argument) in arguments.iter().enumerate() {
                     self.expression(
                         argument,
@@ -4295,7 +4351,7 @@ impl ValidatedCallResolver<'_> {
             }
             _ => {}
         }
-        Ok(ordinal)
+        Ok(())
     }
 
     fn place(
@@ -4372,169 +4428,216 @@ impl ValidatedCallResolver<'_> {
         outer_types: &BTreeMap<String, ScalarType>,
         ordinal: BlockOrdinal,
     ) -> Result<(), ReferenceAnalysisError> {
-        let parent = OccurrenceParent::Block(ordinal);
         let mut items = Vec::new();
-        let mut names = outer.clone();
-        let mut types = outer_types.clone();
+        let mut scope = WalkScope {
+            names: outer.clone(),
+            types: outer_types.clone(),
+        };
         for (item_index, (item, role)) in block.items_with_output_roles().enumerate() {
-            let kind = match item {
-                ScalarBlockItem::LocalBinding(binding) => {
-                    let ScalarBindingOutput::Evaluate(primary) = binding.output_source(0) else {
-                        unreachable!("primary binding output evaluates its source")
-                    };
-                    let primary = self.expression_at(
-                        primary,
-                        &names,
-                        &types,
+            items.push(self.block_item(
+                item,
+                role,
+                BlockPosition {
+                    block: ordinal,
+                    item: item_index,
+                },
+                block.span,
+                &mut scope,
+            )?);
+        }
+        self.structure.blocks[ordinal.0] = BlockRegion::new(block.span, items);
+        Ok(())
+    }
+
+    fn binding_region(
+        &mut self,
+        binding: &ScalarBinding,
+        position: BlockPosition,
+        block_span: ByteSpan,
+        scope: &mut WalkScope,
+    ) -> Result<BindingRegion, ReferenceAnalysisError> {
+        let parent = OccurrenceParent::Block(position.block);
+        let item_index = position.item;
+        let WalkScope { names, types } = scope;
+        let ScalarBindingOutput::Evaluate(primary) = binding.output_source(0) else {
+            unreachable!("primary binding output evaluates its source")
+        };
+        let primary = self.expression_at(
+            primary,
+            names,
+            types,
+            parent,
+            OccurrenceEdge::BindingRoot {
+                item: item_index,
+                output: 0,
+            },
+        )?;
+        let output_count = match binding.output_origin {
+            ScalarBindingOutputOrigin::SingleExpression => binding.receivers.len(),
+            ScalarBindingOutputOrigin::IndependentExpressions => binding.output_values.len(),
+        };
+        let mut secondary = Vec::with_capacity(output_count.saturating_sub(1));
+        for position in 1..output_count {
+            let output = match binding.output_source(position) {
+                ScalarBindingOutput::Evaluate(value) => {
+                    let expression = self.expression_at(
+                        value,
+                        names,
+                        types,
                         parent,
                         OccurrenceEdge::BindingRoot {
                             item: item_index,
-                            output: 0,
+                            output: position,
                         },
                     )?;
-                    let output_count = match binding.output_origin {
-                        ScalarBindingOutputOrigin::SingleExpression => binding.receivers.len(),
-                        ScalarBindingOutputOrigin::IndependentExpressions => {
-                            binding.output_values.len()
-                        }
-                    };
-                    let mut secondary = Vec::with_capacity(output_count.saturating_sub(1));
-                    for position in 1..output_count {
-                        let output = match binding.output_source(position) {
-                            ScalarBindingOutput::Evaluate(value) => {
-                                let expression = self.expression_at(
-                                    value,
-                                    &names,
-                                    &types,
-                                    parent,
-                                    OccurrenceEdge::BindingRoot {
-                                        item: item_index,
-                                        output: position,
-                                    },
-                                )?;
-                                BindingOutput::Evaluate {
-                                    position,
-                                    expression,
-                                }
-                            }
-                            ScalarBindingOutput::ProjectPrimary { output } => {
-                                BindingOutput::ProjectPrimary { output }
-                            }
-                        };
-                        secondary.push(output);
-                    }
-                    for receiver in &binding.receivers {
-                        types.insert(receiver.name.clone(), receiver.ty.clone());
-                        names.insert(
-                            receiver.name.clone(),
-                            ReferenceBindingId {
-                                source: self.source.clone(),
-                                function_span: self.function_span,
-                                declaration_span: receiver.name_span,
-                                block_span: block.span,
-                                kind: ReferenceBindingKind::Declared,
-                            },
-                        );
-                    }
-                    BlockItemKind::Binding(BindingRegion::new(primary, secondary, binding))
-                }
-                ScalarBlockItem::Expression(expression) => {
-                    let edge = match &role {
-                        ScalarBlockItemRole::Ordinary => {
-                            OccurrenceEdge::ExpressionItem { item: item_index }
-                        }
-                        ScalarBlockItemRole::FinalOutput { output, .. } => {
-                            OccurrenceEdge::FinalOutput {
-                                item: item_index,
-                                output: *output,
-                            }
-                        }
-                    };
-                    let expression =
-                        self.expression_at(expression, &names, &types, parent, edge)?;
-                    match role {
-                        ScalarBlockItemRole::FinalOutput { output, metadata } => {
-                            BlockItemKind::FinalOutput(FinalOutputSlot {
-                                item: item_index,
-                                output,
-                                expression,
-                                span: metadata.span,
-                            })
-                        }
-                        ScalarBlockItemRole::Ordinary => BlockItemKind::Evaluation { expression },
+                    BindingOutput::Evaluate {
+                        position,
+                        expression,
                     }
                 }
-                ScalarBlockItem::Assignment(assignment) => {
-                    let mut evaluations = Vec::new();
-                    for (output, value) in assignment.rhs().evaluations() {
-                        let expression = self.expression_at(
-                            value,
-                            &names,
-                            &types,
-                            parent,
-                            OccurrenceEdge::AssignmentRhs {
-                                item: item_index,
-                                output,
-                            },
-                        )?;
-                        evaluations.push(AssignmentEvaluation {
-                            position: output,
-                            expression,
-                        });
+                ScalarBindingOutput::ProjectPrimary { output } => {
+                    BindingOutput::ProjectPrimary { output }
+                }
+            };
+            secondary.push(output);
+        }
+        if let WalkMode::Callable(callable) = &self.mode {
+            for receiver in &binding.receivers {
+                types.insert(receiver.name.clone(), receiver.ty.clone());
+                names.insert(
+                    receiver.name.clone(),
+                    ReferenceBindingId {
+                        source: callable.source.clone(),
+                        function_span: callable.function_span,
+                        declaration_span: receiver.name_span,
+                        block_span,
+                        kind: ReferenceBindingKind::Declared,
+                    },
+                );
+            }
+        }
+        Ok(BindingRegion::new(primary, secondary, binding))
+    }
+
+    fn block_item(
+        &mut self,
+        item: &ScalarBlockItem,
+        role: ScalarBlockItemRole<'_>,
+        position: BlockPosition,
+        block_span: ByteSpan,
+        scope: &mut WalkScope,
+    ) -> Result<BlockItem, ReferenceAnalysisError> {
+        let BlockPosition {
+            block: ordinal,
+            item: item_index,
+        } = position;
+        let parent = OccurrenceParent::Block(ordinal);
+        let WalkScope { names, types } = scope;
+        let kind = match item {
+            ScalarBlockItem::LocalBinding(binding) => {
+                BlockItemKind::Binding(self.binding_region(binding, position, block_span, scope)?)
+            }
+            ScalarBlockItem::Expression(expression) => {
+                let edge = match &role {
+                    ScalarBlockItemRole::Ordinary => {
+                        OccurrenceEdge::ExpressionItem { item: item_index }
                     }
-                    let projections = assignment
-                        .rhs()
-                        .projected_outputs()
-                        .map(|output| AssignmentProjection {
-                            producer: evaluations[0],
+                    ScalarBlockItemRole::FinalOutput { output, .. } => {
+                        OccurrenceEdge::FinalOutput {
+                            item: item_index,
+                            output: *output,
+                        }
+                    }
+                };
+                let expression = self.expression_at(expression, names, types, parent, edge)?;
+                match role {
+                    ScalarBlockItemRole::FinalOutput { output, metadata } => {
+                        BlockItemKind::FinalOutput(FinalOutputSlot {
+                            item: item_index,
                             output,
+                            expression,
+                            span: metadata.span,
                         })
-                        .collect();
-                    let mut slots = Vec::new();
-                    for (destination, target) in assignment.targets.iter().enumerate() {
-                        let place = self.place_at(
-                            &target.place,
-                            &names,
-                            &types,
-                            parent,
-                            OccurrenceEdge::AssignmentDestination {
-                                item: item_index,
-                                destination,
-                            },
-                        )?;
-                        slots.push(AssignmentSlot {
-                            position: destination,
-                            destination: place,
-                            target_span: target.target_span,
-                            replacement: match self.assignment_outputs.get(
-                                &ResolvedAssignmentOutputId {
-                                    source: self.source.clone(),
-                                    function_span: self.function_span,
-                                    target_span: target.target_span,
-                                    output_index: destination,
-                                },
-                            ) {
-                                Some(ty) => AssignmentReplacement::Resolved(ty.clone()),
-                                None => AssignmentReplacement::Missing,
-                            },
-                        });
                     }
-                    assert!(self
-                        .assignments
-                        .insert(
-                            (ordinal, item_index),
-                            AssignmentGroup::new(
-                                assignment.span,
-                                evaluations,
-                                projections,
-                                slots,
-                                BlockPosition {
-                                    block: ordinal,
-                                    item: item_index + 1
-                                }
-                            )
-                        )
-                        .is_none());
+                    ScalarBlockItemRole::Ordinary => BlockItemKind::Evaluation { expression },
+                }
+            }
+            ScalarBlockItem::Assignment(assignment) => {
+                let mut evaluations = Vec::new();
+                for (output, value) in assignment.rhs().evaluations() {
+                    let expression = self.expression_at(
+                        value,
+                        names,
+                        types,
+                        parent,
+                        OccurrenceEdge::AssignmentRhs {
+                            item: item_index,
+                            output,
+                        },
+                    )?;
+                    evaluations.push(AssignmentEvaluation {
+                        position: output,
+                        expression,
+                    });
+                }
+                let projections = assignment
+                    .rhs()
+                    .projected_outputs()
+                    .map(|output| AssignmentProjection {
+                        producer: evaluations[0],
+                        output,
+                    })
+                    .collect();
+                let mut slots = Vec::new();
+                for (destination, target) in assignment.targets.iter().enumerate() {
+                    let place = self.place_at(
+                        &target.place,
+                        names,
+                        types,
+                        parent,
+                        OccurrenceEdge::AssignmentDestination {
+                            item: item_index,
+                            destination,
+                        },
+                    )?;
+                    let replacement = match &self.mode {
+                        WalkMode::ModuleInitialization(_) => AssignmentReplacement::StructuralOnly,
+                        WalkMode::Callable(callable) => callable
+                            .assignment_outputs
+                            .get(&ResolvedAssignmentOutputId {
+                                source: callable.source.clone(),
+                                function_span: callable.function_span,
+                                target_span: target.target_span,
+                                output_index: destination,
+                            })
+                            .map_or(AssignmentReplacement::Missing, |ty| {
+                                AssignmentReplacement::Resolved(ty.clone())
+                            }),
+                    };
+                    slots.push(AssignmentSlot {
+                        position: destination,
+                        destination: place,
+                        target_span: target.target_span,
+                        replacement,
+                    });
+                }
+                assert!(self
+                    .assignments
+                    .insert(
+                        (ordinal, item_index),
+                        AssignmentGroup::new(
+                            assignment.span,
+                            evaluations,
+                            projections,
+                            slots,
+                            BlockPosition {
+                                block: ordinal,
+                                item: item_index + 1
+                            },
+                        ),
+                    )
+                    .is_none());
+                if let WalkMode::Callable(callable) = &self.mode {
                     for target in &assignment.targets {
                         if let ScalarPlace::Name { name, .. } = &target.place {
                             if !names.contains_key(name) {
@@ -4548,68 +4651,56 @@ impl ValidatedCallResolver<'_> {
                                 names.insert(
                                     name.clone(),
                                     ReferenceBindingId {
-                                        source: self.source.clone(),
-                                        function_span: self.function_span,
+                                        source: callable.source.clone(),
+                                        function_span: callable.function_span,
                                         declaration_span: target.target_span,
-                                        block_span: block.span,
+                                        block_span,
                                         kind: ReferenceBindingKind::Declared,
                                     },
                                 );
                             }
                         }
                     }
-                    BlockItemKind::Assignment {
-                        group: BlockPosition {
-                            block: ordinal,
-                            item: item_index,
-                        },
-                    }
                 }
-                ScalarBlockItem::While(while_expression) => {
-                    let test = self.expression_at(
-                        &while_expression.condition,
-                        &names,
-                        &types,
-                        parent,
-                        OccurrenceEdge::WhileCondition { item: item_index },
-                    )?;
-                    let body = self.block(
-                        &while_expression.body,
-                        &names,
-                        &types,
-                        parent,
-                        OccurrenceEdge::WhileBody { item: item_index },
-                    )?;
-                    assert!(self
-                        .loops
-                        .insert(
-                            (ordinal, item_index),
-                            WhileRegion {
-                                span: while_expression.span,
-                                test,
-                                body,
-                                on_false: BlockPosition {
-                                    block: ordinal,
-                                    item: item_index + 1
-                                },
-                            }
-                        )
-                        .is_none());
-                    BlockItemKind::While {
-                        region: BlockPosition {
-                            block: ordinal,
-                            item: item_index,
+                BlockItemKind::Assignment { group: position }
+            }
+            ScalarBlockItem::While(while_expression) => {
+                let test = self.expression_at(
+                    &while_expression.condition,
+                    names,
+                    types,
+                    parent,
+                    OccurrenceEdge::WhileCondition { item: item_index },
+                )?;
+                let body = self.block(
+                    &while_expression.body,
+                    names,
+                    types,
+                    parent,
+                    OccurrenceEdge::WhileBody { item: item_index },
+                )?;
+                assert!(self
+                    .loops
+                    .insert(
+                        (ordinal, item_index),
+                        WhileRegion {
+                            span: while_expression.span,
+                            test,
+                            body,
+                            on_false: BlockPosition {
+                                block: ordinal,
+                                item: item_index + 1
+                            },
                         },
-                    }
-                }
-            };
-            items.push(BlockItem {
-                position: item_index,
-                kind,
-            });
-        }
-        self.structure.blocks[ordinal.0] = BlockRegion::new(block.span, items);
-        Ok(())
+                    )
+                    .is_none());
+                BlockItemKind::While { region: position }
+            }
+        };
+        Ok(BlockItem {
+            position: item_index,
+            kind,
+        })
     }
 }
 
@@ -4682,10 +4773,94 @@ fn resolve_module_call_sites(
             functions.insert(index, calls);
         }
     }
+    let mut initialization = module_initialization_region(source, items, namespace_bindings);
+    initialization.detail = ModuleInitializationDetail::Occurrences(Box::new(
+        walk_module_initialization(&initialization, items),
+    ));
     Ok(ModuleCallSites {
         functions,
-        initialization: module_initialization_region(source, items, namespace_bindings),
+        initialization,
     })
+}
+
+fn walk_module_initialization(
+    region: &ModuleInitializationRegion,
+    items: &[ScalarItem],
+) -> ModuleInitializationTopology {
+    let mut walker = StructuralWalker::new(
+        WalkMode::ModuleInitialization(Vec::new()),
+        ByteSpan::new(0, 0),
+    );
+    let root = walker.structure.root;
+    let mut scope = WalkScope::default();
+    let mut block_items = Vec::new();
+    let mut extent: Option<ByteSpan> = None;
+    for step in &region.steps {
+        let position = BlockPosition {
+            block: root,
+            item: step.item,
+        };
+        let span = match (&step.kind, &items[step.item]) {
+            (
+                ModuleInitializationStepKind::NamespaceDispatch { .. },
+                ScalarItem::Namespace(namespace),
+            ) => namespace.span,
+            (ModuleInitializationStepKind::BindingInitialization, ScalarItem::Binding(binding)) => {
+                let binding_region = walker
+                    .binding_region(binding, position, binding.span, &mut scope)
+                    .expect("neutral module binding traversal");
+                block_items.push(BlockItem {
+                    position: position.item,
+                    kind: BlockItemKind::Binding(binding_region),
+                });
+                binding.span
+            }
+            (ModuleInitializationStepKind::ExecutableItem, ScalarItem::Executable(item)) => {
+                let span = match item {
+                    ScalarBlockItem::LocalBinding(binding) => binding.span,
+                    ScalarBlockItem::Expression(expression) => expression_span(expression),
+                    ScalarBlockItem::Assignment(assignment) => assignment.span,
+                    ScalarBlockItem::While(while_expression) => while_expression.span,
+                };
+                block_items.push(
+                    walker
+                        .block_item(
+                            item,
+                            ScalarBlockItemRole::Ordinary,
+                            position,
+                            span,
+                            &mut scope,
+                        )
+                        .expect("neutral module executable traversal"),
+                );
+                span
+            }
+            _ => unreachable!("dispatch derives from this exact item slice"),
+        };
+        extent = Some(match extent {
+            Some(previous) => {
+                ByteSpan::new(previous.start.min(span.start), previous.end.max(span.end))
+            }
+            None => span,
+        });
+    }
+    let root_block = &mut walker.structure.blocks[root.0];
+    if let Some(span) = extent {
+        root_block.span = span;
+    }
+    root_block.items = block_items;
+    let WalkMode::ModuleInitialization(calls) = walker.mode else {
+        unreachable!("module initialization structural traversal")
+    };
+    ModuleInitializationTopology {
+        structure: walker.structure,
+        occurrences: walker.occurrences,
+        calls,
+        assignments: walker.assignments,
+        conditionals: walker.conditionals,
+        loops: walker.loops,
+        short_circuits: walker.short_circuits,
+    }
 }
 
 #[cfg(test)]
@@ -4724,7 +4899,7 @@ fn resolve_function_call_sites(
             assignment_outputs,
         )?);
     }
-    let mut resolver = ValidatedCallResolver {
+    let callable = CallableWalk {
         source,
         function_span: function.span,
         module_callables,
@@ -4732,14 +4907,9 @@ fn resolve_function_call_sites(
         modules,
         assignment_outputs,
         sites: Vec::new(),
-        occurrences: Vec::new(),
         call_occurrences: Vec::new(),
-        structure: OccurrenceStructure::new(function.body.span),
-        assignments: HashMap::new(),
-        conditionals: HashMap::new(),
-        loops: HashMap::new(),
-        short_circuits: HashMap::new(),
     };
+    let mut resolver = StructuralWalker::new(WalkMode::Callable(callable), function.body.span);
     let mut parameter_names = BTreeMap::new();
     let mut parameter_types = BTreeMap::new();
     let ScalarType::Callable {
@@ -4803,12 +4973,15 @@ fn resolve_function_call_sites(
         &parameter_types,
         resolver.structure.root,
     )?;
+    let WalkMode::Callable(callable) = resolver.mode else {
+        unreachable!("callable structural traversal")
+    };
     Ok(FunctionCallSites {
         boundary,
-        sites: resolver.sites,
+        sites: callable.sites,
         arms,
         occurrences: resolver.occurrences,
-        call_occurrences: resolver.call_occurrences,
+        call_occurrences: callable.call_occurrences,
         structure: resolver.structure,
         assignments: resolver.assignments,
         conditionals: resolver.conditionals,

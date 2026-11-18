@@ -1,13 +1,31 @@
 use std::collections::HashMap;
 
-use super::reference::{BlockOrdinal, OccurrenceOrdinal};
+use super::reference::{BlockOrdinal, OccurrenceMetadata, OccurrenceOrdinal, OccurrenceStructure};
 use super::{ScalarBinding, ScalarItem, ScalarNamespaceBinding, ScalarType};
 use wosy_syntax::{ByteSpan, SourceIdentity};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModuleInitializationRegion {
     pub(crate) source: SourceIdentity,
     pub(crate) steps: Vec<ModuleInitializationStep>,
+    pub(super) detail: ModuleInitializationDetail,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum ModuleInitializationDetail {
+    DispatchOnly,
+    Occurrences(Box<ModuleInitializationTopology>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ModuleInitializationTopology {
+    pub(super) structure: OccurrenceStructure,
+    pub(super) occurrences: Vec<OccurrenceMetadata>,
+    pub(super) calls: Vec<OccurrenceOrdinal>,
+    pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
+    pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
+    pub(super) loops: HashMap<(BlockOrdinal, usize), WhileRegion>,
+    pub(super) short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +87,7 @@ pub(crate) fn module_initialization_region(
     ModuleInitializationRegion {
         source: source.clone(),
         steps,
+        detail: ModuleInitializationDetail::DispatchOnly,
     }
 }
 
@@ -88,6 +107,7 @@ pub(super) struct AssignmentProjection {
 pub(super) enum AssignmentReplacement {
     Resolved(ScalarType),
     Missing,
+    StructuralOnly,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

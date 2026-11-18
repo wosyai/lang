@@ -486,6 +486,17 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
             initialization: ModuleInitializationRegion {
                 source: modules[0].source.clone(),
                 steps: Vec::new(),
+                detail: ModuleInitializationDetail::Occurrences(Box::new(
+                    ModuleInitializationTopology {
+                        structure: OccurrenceStructure::new(ByteSpan::new(0, 0)),
+                        occurrences: Vec::new(),
+                        calls: Vec::new(),
+                        assignments: HashMap::new(),
+                        conditionals: HashMap::new(),
+                        loops: HashMap::new(),
+                        short_circuits: HashMap::new(),
+                    }
+                )),
             },
         })]
     );
@@ -561,5 +572,172 @@ fn standalone_and_project_publish_source_ordered_module_initialization_dispatch(
         );
         assert_eq!(region.steps[1].kind, Step::BindingInitialization);
         assert_eq!(region.steps[2].kind, Step::ExecutableItem);
+    }
+}
+
+#[test]
+fn prepared_module_initialization_publishes_nested_canonical_occurrences() {
+    use OccurrenceEdge as Edge;
+    use OccurrenceNode as Node;
+    use OccurrenceParent as Parent;
+
+    let text = "%%start\nfirst = namespace package \"child.w\";\ni32(i32) identity = fn(input) { input };\nsecond = namespace package \"child.w\";\ni32 value = if (true && second.echo(false)) { if (false) { 1 } else { 2 } } else { 3 };\nif (true) { while (false) { value = identity(4); } };\n%%end";
+    let source = |path: &str| {
+        SourceIdentity::new("project".into(), "package".into(), path.into(), "r1".into())
+    };
+    for target_layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let root_source = source("root.w");
+        let child_text = "%%start\nbool(bool) echo = fn(flag) { flag };\n%%end";
+        let child_source = source("child.w");
+        let root = parse_source(root_source.clone(), text.into(), &[]);
+        let child = parse_source(child_source.clone(), child_text.into(), &[]);
+        assert!(root.diagnostics.is_empty(), "{:?}", root.diagnostics);
+        assert!(child.diagnostics.is_empty(), "{:?}", child.diagnostics);
+        let root = derive_scalar_declarations_from_cst(root.result.canonical_cst());
+        let child = derive_scalar_declarations_from_cst(child.result.canonical_cst());
+        let bindings = root
+            .namespaces()
+            .map(|namespace| ScalarNamespaceBinding {
+                binding: namespace.binding.clone(),
+                span: namespace.span,
+                target: child_source.clone(),
+            })
+            .collect();
+        let stages = stage_observations::Scope::new();
+        let prepared = crate::prepare_scalar_project(
+            vec![(root, bindings), (child, Vec::new())],
+            vec![root_source.clone(), child_source.clone()],
+            crate::ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        assert_eq!(
+            stages.counts(),
+            stage_observations::Counts {
+                call_sites: 2,
+                ..Default::default()
+            }
+        );
+        let region = prepared
+            .initialization_region(0)
+            .expect("root initialization");
+        assert_eq!(region.source, root_source);
+        assert_eq!(
+            prepared.initialization_region(1).unwrap().source,
+            child_source
+        );
+        assert_eq!(
+            region
+                .steps
+                .iter()
+                .map(|step| step.item)
+                .collect::<Vec<_>>(),
+            [0, 2, 3, 4]
+        );
+        let ModuleInitializationDetail::Occurrences(topology) = &region.detail else {
+            panic!("prepared initialization topology");
+        };
+        let structure = &topology.structure;
+        let root = Parent::Block(structure.root);
+        let root_items = &structure.blocks[structure.root.0].items;
+        assert_eq!(
+            root_items
+                .iter()
+                .map(|item| item.position)
+                .collect::<Vec<_>>(),
+            [3, 4]
+        );
+        assert!(structure.edges.keys().all(|(parent, edge)| *parent != root
+            || matches!(
+                edge,
+                Edge::BindingRoot { item: 3, output: 0 } | Edge::ExpressionItem { item: 4 }
+            )));
+        let spelling = |ordinal: OccurrenceOrdinal| {
+            let span = topology.occurrences[ordinal.0].span;
+            &text[span.start as usize..span.end as usize]
+        };
+        let BlockItemKind::Binding(binding) = &root_items[0].kind else {
+            panic!("root binding");
+        };
+        assert_eq!(
+            structure.edges[&(root, Edge::BindingRoot { item: 3, output: 0 })],
+            Node::Expression(binding.primary)
+        );
+        assert_eq!(binding.receivers()[0].name, "value");
+        let ConditionalRegion::Value {
+            condition,
+            then_block,
+            else_block,
+            ..
+        } = topology.conditionals[&binding.primary]
+        else {
+            panic!("initializer conditional");
+        };
+        let short = topology.short_circuits[&condition];
+        assert!(short.evaluate_right_when);
+        assert!(!short.bypass);
+        assert_eq!(short.join, condition);
+        assert_eq!(spelling(short.left), "true");
+        assert_eq!(spelling(short.right), "second.echo(false)");
+        let Node::Expression(argument) =
+            structure.edges[&(Parent::Expression(short.right), Edge::CallArgument(0))]
+        else {
+            panic!("qualified call argument");
+        };
+        assert_eq!(spelling(argument), "false");
+        let final_output =
+            |block: BlockOrdinal| *structure.blocks[block.0].final_outputs().next().unwrap();
+        let nested = final_output(then_block);
+        assert_eq!((nested.item, nested.output), (0, 0));
+        assert_eq!(nested.span, topology.occurrences[nested.expression.0].span);
+        let ConditionalRegion::Value {
+            then_block,
+            else_block: nested_else,
+            ..
+        } = topology.conditionals[&nested.expression]
+        else {
+            panic!("nested conditional");
+        };
+        assert_eq!(spelling(final_output(then_block).expression), "1");
+        assert_eq!(spelling(final_output(nested_else).expression), "2");
+        assert_eq!(spelling(final_output(else_block).expression), "3");
+
+        let Node::Expression(executable) =
+            structure.edges[&(root, Edge::ExpressionItem { item: 4 })]
+        else {
+            panic!("root executable");
+        };
+        let ConditionalRegion::Unit { then_block, .. } = topology.conditionals[&executable] else {
+            panic!("executable conditional");
+        };
+        let loop_region = topology.loops[&(then_block, 0)];
+        assert_eq!(
+            loop_region.body_to_test(),
+            (loop_region.body, loop_region.test)
+        );
+        assert_eq!(spelling(loop_region.test), "false");
+        let group = &topology.assignments[&(loop_region.body, 0)];
+        let rhs = group.rhs_evaluations().next().unwrap();
+        let destination = group.destinations().next().unwrap();
+        assert_eq!(spelling(rhs.expression), "identity(4)");
+        assert_eq!(spelling(destination.destination), "value");
+        assert_eq!(
+            topology.occurrences[destination.destination.0].span,
+            destination.target_span
+        );
+        assert!(rhs.expression.0 < destination.destination.0);
+        assert_eq!(
+            destination.replacement,
+            AssignmentReplacement::StructuralOnly
+        );
+        assert_eq!(group.previous_observations().next(), Some(destination));
+        assert_eq!(group.installs().next(), Some(destination));
+        assert_eq!(
+            group.continuation(),
+            BlockPosition {
+                block: loop_region.body,
+                item: 1
+            }
+        );
+        assert_eq!(topology.calls, [short.right, rhs.expression]);
     }
 }
