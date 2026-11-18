@@ -332,6 +332,7 @@ mod tests {
                     }
                     let overloads =
                         ScalarOverloadEnvironment::single(&program.source, &program.items);
+                    let overloads = overloads.typing(0);
                     for _ in 0..2 {
                         let mut builder = ScalarInferenceBuilder::new(&owners);
                         assert!(std::ptr::eq(builder.owners, &owners));
@@ -471,6 +472,7 @@ mod tests {
         let program = result.program;
         let expected = program.resolved_assignment_outputs.clone();
         let overloads = ScalarOverloadEnvironment::single(&program.source, &program.items);
+        let overloads = overloads.typing(0);
         let owners = ScalarAssignmentOwners::new(&program.items);
         let mut scratch = ScalarInferenceBuilder::new(&owners);
         assert!(typecheck::validate(&program, &overloads, &mut scratch).is_empty());
@@ -478,6 +480,7 @@ mod tests {
         assert_eq!(scratch.freeze(), expected);
         let module = ScalarModule::from_program(program, Vec::new());
         let overloads = ScalarOverloadEnvironment::project(std::slice::from_ref(&module));
+        let overloads = overloads.typing(0);
         let mut scratch = ScalarInferenceBuilder::new(&owners);
         let ScalarItem::Function(function) = &module.items[1] else {
             panic!("function")
@@ -520,6 +523,7 @@ mod tests {
         assert!(invalid.program.resolved_assignment_outputs.is_empty());
         let overloads =
             ScalarOverloadEnvironment::single(&invalid.program.source, &invalid.program.items);
+        let overloads = overloads.typing(0);
         let owners = ScalarAssignmentOwners::new(&invalid.program.items);
         let mut provisional = ScalarInferenceBuilder::new(&owners);
         assert!(!typecheck::validate(&invalid.program, &overloads, &mut provisional).is_empty());

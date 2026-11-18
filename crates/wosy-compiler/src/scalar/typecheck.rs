@@ -1,6 +1,8 @@
 use super::*;
 
 #[cfg(test)]
+mod callable_context_tests;
+#[cfg(test)]
 mod source_context_tests;
 
 pub(super) fn validate_module_type(
@@ -192,7 +194,7 @@ pub(super) fn call_output_sequence_in_module(
     scope: &BTreeMap<String, ScalarType>,
     module: &ScalarModule,
     modules: &[ScalarModule],
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
 ) -> Option<ScalarOutputSequence> {
     let ScalarExpression::Call {
         receiver,
@@ -204,8 +206,8 @@ pub(super) fn call_output_sequence_in_module(
     else {
         return None;
     };
-    let (callable, target, member_visible) = match receiver {
-        None => (scope.get(name), module, true),
+    let (callable, target, member_visible, target_view) = match receiver {
+        None => (scope.get(name), module, true, *overloads),
         Some(binding) => {
             let namespace = module
                 .namespace_bindings
@@ -219,21 +221,16 @@ pub(super) fn call_output_sequence_in_module(
                     target.members.get(name),
                     target,
                     target.members.contains_key(name),
+                    overloads.imported(&target.source),
                 )
             } else {
                 (
-                    module.items.iter().find_map(|item| match item {
-                        ScalarItem::Extern(extern_decl) if extern_decl.binding == *binding => {
-                            extern_decl
-                                .functions
-                                .iter()
-                                .find(|function| function.name == *name)
-                                .map(|function| &function.signature)
-                        }
-                        _ => None,
-                    }),
+                    overloads
+                        .extern_member(Some(binding), name)
+                        .map(|member| &member.signature),
                     module,
                     true,
+                    *overloads,
                 )
             }
         }
@@ -266,24 +263,9 @@ pub(super) fn call_output_sequence_in_module(
                 modules
                     .iter()
                     .find(|candidate| candidate.source == namespace.target)
-                    .is_some_and(|target| {
-                        target.items.iter().any(|item| {
-                            matches!(
-                                item,
-                                ScalarItem::Extern(extern_decl)
-                                    if extern_decl.functions.iter().any(|function| function.name == *name)
-                            )
-                        })
-                    })
+                    .is_some_and(|target| overloads.imported(&target.source).has_extern_name(name))
             } else {
-                module.items.iter().any(|item| {
-                    matches!(
-                        item,
-                        ScalarItem::Extern(extern_decl)
-                            if extern_decl.binding == *binding
-                                && extern_decl.functions.iter().any(|function| function.name == *name)
-                    )
-                })
+                overloads.extern_member(Some(binding), name).is_some()
             }
         }
     };
@@ -291,12 +273,7 @@ pub(super) fn call_output_sequence_in_module(
         return None;
     }
     let generic_parameters = if member_visible {
-        target.items.iter().find_map(|item| match item {
-            ScalarItem::Function(function) if function.name == *name => {
-                Some(&function.generic_parameters)
-            }
-            _ => None,
-        })
+        target_view.generics(name)
     } else {
         None
     };
@@ -315,7 +292,7 @@ fn call_output_sequence(
     expression: &ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
 ) -> Option<ScalarOutputSequence> {
     let ScalarExpression::Call {
         receiver,
@@ -330,27 +307,11 @@ fn call_output_sequence(
     let callable = if receiver.is_none() {
         scope.get(name)
     } else {
-        program.items.iter().find_map(|item| match item {
-            ScalarItem::Extern(extern_decl)
-                if receiver.as_deref() == Some(extern_decl.binding.as_str()) =>
-            {
-                extern_decl
-                    .functions
-                    .iter()
-                    .find(|function| function.name == *name)
-                    .map(|function| &function.signature)
-            }
-            _ => None,
-        })
+        overloads
+            .extern_member(receiver.as_deref(), name)
+            .map(|member| &member.signature)
     }?;
-    let extern_callable = program.items.iter().any(|item| {
-        matches!(
-            item,
-            ScalarItem::Extern(extern_decl)
-                if receiver.as_deref() == Some(extern_decl.binding.as_str())
-                    && extern_decl.functions.iter().any(|function| function.name == *name)
-        )
-    });
+    let extern_callable = overloads.extern_member(receiver.as_deref(), name).is_some();
     if extern_callable && !type_arguments.is_empty() {
         return None;
     }
@@ -372,14 +333,7 @@ fn call_output_sequence(
         };
         return Some(outputs);
     }
-    let generic_parameters = receiver.is_none().then(|| {
-        program.items.iter().find_map(|item| match item {
-            ScalarItem::Function(function) if function.name == *name => {
-                Some(&function.generic_parameters)
-            }
-            _ => None,
-        })
-    });
+    let generic_parameters = receiver.is_none().then(|| overloads.generics(name));
     let callable = if let Some(Some(parameters)) = generic_parameters {
         substitute_generic_callable(callable, parameters, type_arguments)?
     } else {
@@ -439,7 +393,7 @@ pub(super) fn validate_output_receivers_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
 ) {
     let Some(outputs) =
         call_output_sequence_in_module(expression, scope, module, modules, overloads)
@@ -466,7 +420,7 @@ fn validate_output_receivers(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
 ) {
     let Some(outputs) = call_output_sequence(expression, scope, program, overloads) else {
         return;
@@ -499,7 +453,7 @@ pub(super) fn block_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let mut scope = scope.clone();
@@ -537,7 +491,7 @@ pub(super) fn block_type_in_module_expected(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let mut scope = scope.clone();
@@ -593,7 +547,7 @@ pub(super) fn block_item_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match item {
@@ -739,7 +693,7 @@ fn assignment_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let mut inferred_names = visible_names.clone();
@@ -849,7 +803,7 @@ fn assignment_target_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> Option<ScalarType> {
     if let Some(receiver) = &target.receiver {
@@ -954,7 +908,7 @@ fn while_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let condition = expression_type_in_module(
@@ -1003,7 +957,7 @@ fn type_core_memory_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if matches!(operation, "alloc" | "free" | "invalidate" | "rebind") && !unsafe_context {
@@ -1204,7 +1158,7 @@ fn type_core_memory(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if matches!(operation, "alloc" | "free" | "invalidate" | "rebind") && !unsafe_context {
@@ -1402,7 +1356,7 @@ fn type_core_int_conversion_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
@@ -1498,7 +1452,7 @@ fn type_core_bitcast_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
@@ -1585,7 +1539,7 @@ fn type_core_pointer_cast_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if !unsafe_context {
@@ -1716,7 +1670,7 @@ fn type_core_float_conversion_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
@@ -1796,7 +1750,7 @@ fn type_core_float_conversion(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
@@ -1888,7 +1842,7 @@ fn type_core_int_conversion(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
@@ -1987,7 +1941,7 @@ fn type_core_bitcast(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if type_arguments.len() != 1 {
@@ -2071,7 +2025,7 @@ fn type_core_pointer_cast(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if !unsafe_context {
@@ -2152,7 +2106,7 @@ fn type_core_raw_memory_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if !unsafe_context {
@@ -2288,7 +2242,7 @@ fn type_core_raw_memory(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if !unsafe_context {
@@ -2552,7 +2506,7 @@ pub(super) fn expression_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
@@ -3150,8 +3104,8 @@ pub(super) fn expression_type_in_module(
                     inference,
                 );
             }
-            let (callable, target, unsafe_callable, extern_callable) = match receiver {
-                None => (scope.get(name), module, false, false),
+            let (callable, target, unsafe_callable, extern_callable, target_view) = match receiver {
+                None => (scope.get(name), module, false, false, *overloads),
                 Some(binding) => {
                     let namespace = module
                         .namespace_bindings
@@ -3182,34 +3136,13 @@ pub(super) fn expression_type_in_module(
                             Some(callable),
                             target,
                             false,
-                            target.items.iter().any(|item| {
-                                matches!(
-                                    item,
-                                    ScalarItem::Extern(extern_decl)
-                                        if extern_decl.functions.iter().any(|function| function.name == *name)
-                                )
-                            }),
+                            overloads.imported(&target.source).has_extern_name(name),
+                            overloads.imported(&target.source),
                         )
                     } else {
-                        let extern_decl = module.items.iter().find_map(|item| match item {
-                            ScalarItem::Extern(extern_decl) if extern_decl.binding == *binding => {
-                                Some(extern_decl)
-                            }
-                            _ => None,
-                        });
-                        let Some(extern_decl) = extern_decl else {
-                            diagnostics.push(module_diagnostic(
-                                module,
-                                "B0001",
-                                "unknown callable name",
-                                *span,
-                            ));
-                            return ScalarType::Error;
-                        };
-                        let Some(function) = extern_decl
-                            .functions
-                            .iter()
-                            .find(|function| function.name == *name)
+                        let Some(function) = overloads
+                            .extern_member(Some(binding), name)
+                            .filter(|member| member.first_declaration)
                         else {
                             diagnostics.push(module_diagnostic(
                                 module,
@@ -3224,6 +3157,7 @@ pub(super) fn expression_type_in_module(
                             module,
                             function.unsafe_marker,
                             true,
+                            *overloads,
                         )
                     }
                 }
@@ -3246,12 +3180,7 @@ pub(super) fn expression_type_in_module(
                 ));
                 return ScalarType::Error;
             }
-            let generic_parameters = target.items.iter().find_map(|item| match item {
-                ScalarItem::Function(function) if function.name == *name => {
-                    Some(&function.generic_parameters)
-                }
-                _ => None,
-            });
+            let generic_parameters = target_view.generics(name);
             let callable = if let Some(generic_parameters) = generic_parameters {
                 let Some(callable) =
                     substitute_generic_callable(&callable, generic_parameters, type_arguments)
@@ -3453,7 +3382,7 @@ pub(super) fn expression_type_in_module_expected(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if expected.is_some_and(is_error_type) {
@@ -4167,7 +4096,7 @@ fn checked_address_type(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if !is_supported_checked_address_place(place) {
@@ -4244,7 +4173,7 @@ fn checked_address_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if !is_supported_checked_address_place(place) {
@@ -4328,7 +4257,7 @@ fn writable_place_type(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if writable_place_contains_raw_dereference(
@@ -4367,7 +4296,7 @@ fn writable_place_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if writable_place_contains_raw_dereference_in_module(
@@ -4413,7 +4342,7 @@ fn writable_place_contains_raw_dereference(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> bool {
     match place {
@@ -4451,7 +4380,7 @@ fn writable_place_contains_raw_dereference_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> bool {
     match place {
@@ -4490,7 +4419,7 @@ fn writable_path_type(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match place {
@@ -4598,7 +4527,7 @@ fn writable_path_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match place {
@@ -4741,7 +4670,7 @@ pub(super) fn place_type(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match place {
@@ -4856,7 +4785,7 @@ pub(super) fn place_type_in_module(
     module: &ScalarModule,
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match place {
@@ -5022,7 +4951,7 @@ fn checked_dereference_target_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression_type(
@@ -5076,7 +5005,7 @@ fn checked_dereference_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match place {
@@ -5189,7 +5118,7 @@ fn checked_dereference_type_in_module(
     modules: &[ScalarModule],
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let (pointer, dereference_span, field) = match place {
@@ -5751,7 +5680,7 @@ pub(super) fn operator(value: &str) -> BinaryOperator {
 
 pub(super) fn validate(
     program: &ScalarProgram,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> Vec<super::Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -6460,7 +6389,7 @@ pub(super) fn block_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let mut scope = scope.clone();
@@ -6496,7 +6425,7 @@ fn block_type_expected(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let mut scope = scope.clone();
@@ -6549,7 +6478,7 @@ fn block_item_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match item {
@@ -6688,7 +6617,7 @@ fn assignment_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let mut inferred_names = visible_names.clone();
@@ -6801,7 +6730,7 @@ fn assignment_target_type(
     scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> Option<ScalarType> {
     match &target.place {
@@ -6876,7 +6805,7 @@ fn while_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let condition = expression_type(
@@ -6920,7 +6849,7 @@ pub(super) fn expression_type(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
@@ -7496,41 +7425,18 @@ pub(super) fn expression_type(
                 .as_ref()
                 .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"));
             let callable = scope.get(&lookup_name).cloned().or_else(|| {
-                program.items.iter().find_map(|item| match item {
-                    ScalarItem::Extern(extern_decl)
-                        if receiver.as_deref() == Some(extern_decl.binding.as_str()) =>
-                    {
-                        extern_decl
-                            .functions
-                            .iter()
-                            .find(|function| function.name == *name)
-                            .map(|function| function.signature.clone())
-                    }
-                    _ => None,
-                })
+                overloads
+                    .extern_member(receiver.as_deref(), name)
+                    .map(|member| member.signature.clone())
             });
-            let unsafe_callable = program.items.iter().any(|item| {
-                matches!(
-                    item,
-                    ScalarItem::Extern(extern_decl)
-                        if receiver.as_deref() == Some(extern_decl.binding.as_str())
-                            && extern_decl.functions.iter().any(|function| {
-                                function.name == *name && function.unsafe_marker
-                            })
-                )
-            });
+            let unsafe_callable = overloads
+                .extern_member(receiver.as_deref(), name)
+                .is_some_and(|member| member.any_unsafe);
             let Some(callable) = callable else {
                 diagnostics.push(diagnostic(program, "B0001", "unknown callable name", *span));
                 return ScalarType::Error;
             };
-            let extern_callable = program.items.iter().any(|item| {
-                matches!(
-                    item,
-                    ScalarItem::Extern(extern_decl)
-                        if receiver.as_deref() == Some(extern_decl.binding.as_str())
-                            && extern_decl.functions.iter().any(|function| function.name == *name)
-                )
-            });
+            let extern_callable = overloads.extern_member(receiver.as_deref(), name).is_some();
             if extern_callable && !type_arguments.is_empty() {
                 diagnostics.push(diagnostic(
                     program,
@@ -7540,14 +7446,7 @@ pub(super) fn expression_type(
                 ));
                 return ScalarType::Error;
             }
-            let generic_parameters = (receiver.is_none()).then(|| {
-                program.items.iter().find_map(|item| match item {
-                    ScalarItem::Function(function) if function.name == *name => {
-                        Some(&function.generic_parameters)
-                    }
-                    _ => None,
-                })
-            });
+            let generic_parameters = (receiver.is_none()).then(|| overloads.generics(name));
             let callable = if let Some(Some(generic_parameters)) = generic_parameters {
                 let Some(callable) =
                     substitute_generic_callable(&callable, generic_parameters, type_arguments)
@@ -7815,7 +7714,7 @@ fn expression_type_expected(
     program: &ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     if is_error_type(expected) {

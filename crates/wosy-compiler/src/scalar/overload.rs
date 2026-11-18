@@ -51,6 +51,141 @@ struct ScalarOverloadModule {
     declarations: BTreeMap<usize, ScalarOverloadDeclaration>,
     first_overloads: BTreeMap<String, usize>,
     namespaces: Vec<ScalarOverloadNamespace>,
+    callables: ScalarCallableHeaders,
+}
+
+struct ScalarCallableHeaders {
+    generics: BTreeMap<String, Vec<ScalarGenericParameter>>,
+    externs: BTreeMap<String, BTreeMap<String, ScalarExternMemberHeader>>,
+    extern_names: BTreeSet<String>,
+}
+
+pub(super) struct ScalarExternMemberHeader {
+    pub signature: ScalarType,
+    pub first_declaration: bool,
+    pub unsafe_marker: bool,
+    pub any_unsafe: bool,
+}
+
+impl ScalarCallableHeaders {
+    fn new(items: &[ScalarItem]) -> Self {
+        let mut generics = BTreeMap::new();
+        let mut externs = BTreeMap::<String, BTreeMap<String, ScalarExternMemberHeader>>::new();
+        let mut extern_names = BTreeSet::new();
+        for item in items {
+            match item {
+                ScalarItem::Function(function) => {
+                    if !generics.contains_key(&function.name) {
+                        generics.insert(
+                            copy_name(&function.name),
+                            function
+                                .generic_parameters
+                                .iter()
+                                .map(|parameter| ScalarGenericParameter {
+                                    name: copy_name(&parameter.name),
+                                    span: parameter.span,
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+                ScalarItem::Extern(declaration) => {
+                    let first_declaration = !externs.contains_key(&declaration.binding);
+                    if first_declaration {
+                        externs.insert(copy_name(&declaration.binding), BTreeMap::new());
+                    }
+                    let members = externs
+                        .get_mut(&declaration.binding)
+                        .expect("indexed extern binding");
+                    for function in &declaration.functions {
+                        if !extern_names.contains(&function.name) {
+                            extern_names.insert(copy_name(&function.name));
+                        }
+                        if let Some(member) = members.get_mut(&function.name) {
+                            member.any_unsafe |= function.unsafe_marker;
+                        } else {
+                            members.insert(
+                                copy_name(&function.name),
+                                ScalarExternMemberHeader {
+                                    signature: copy_type(&function.signature),
+                                    first_declaration,
+                                    unsafe_marker: function.unsafe_marker,
+                                    any_unsafe: function.unsafe_marker,
+                                },
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let headers = Self {
+            generics,
+            externs,
+            extern_names,
+        };
+        #[cfg(test)]
+        observations::record_callables(&headers);
+        headers
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ScalarTypingView<'a> {
+    environment: &'a ScalarOverloadEnvironment,
+    ordinal: usize,
+}
+
+impl ScalarTypingView<'_> {
+    pub(super) fn imported(&self, source: &SourceIdentity) -> Self {
+        Self {
+            environment: self.environment,
+            ordinal: *self
+                .environment
+                .sources
+                .get(source)
+                .expect("typing source in phase environment"),
+        }
+    }
+    pub(super) fn generics(&self, name: &str) -> Option<&[ScalarGenericParameter]> {
+        self.environment.modules[self.ordinal]
+            .callables
+            .generics
+            .get(name)
+            .map(Vec::as_slice)
+    }
+    pub(super) fn extern_member(
+        &self,
+        binding: Option<&str>,
+        name: &str,
+    ) -> Option<&ScalarExternMemberHeader> {
+        self.environment.modules[self.ordinal]
+            .callables
+            .externs
+            .get(binding?)?
+            .get(name)
+    }
+    pub(super) fn has_extern_name(&self, name: &str) -> bool {
+        self.environment.modules[self.ordinal]
+            .callables
+            .extern_names
+            .contains(name)
+    }
+    pub(super) fn first(
+        &self,
+        source: &SourceIdentity,
+        name: &str,
+    ) -> Option<&ScalarOverloadHeader> {
+        self.environment.first(source, name)
+    }
+    pub(super) fn for_call(
+        &self,
+        source: &SourceIdentity,
+        receiver: Option<&str>,
+        name: &str,
+    ) -> Option<&ScalarOverloadHeader> {
+        self.environment.for_call(source, receiver, name)
+    }
 }
 
 pub(super) struct ScalarOverloadEnvironment {
@@ -59,6 +194,12 @@ pub(super) struct ScalarOverloadEnvironment {
 }
 
 impl ScalarOverloadEnvironment {
+    pub(super) fn typing(&self, ordinal: usize) -> ScalarTypingView<'_> {
+        ScalarTypingView {
+            environment: self,
+            ordinal,
+        }
+    }
     pub(super) fn single(source: &SourceIdentity, items: &[ScalarItem]) -> Self {
         #[cfg(test)]
         let _snapshot = observations::SnapshotScope::new();
@@ -80,6 +221,7 @@ impl ScalarOverloadEnvironment {
             .collect();
         let declarations = overload_declarations(items);
         let module = ScalarOverloadModule {
+            callables: ScalarCallableHeaders::new(items),
             source: copy_source(source),
             scope,
             first_overloads: first_overloads(&declarations),
@@ -104,6 +246,7 @@ impl ScalarOverloadEnvironment {
             .map(|(ordinal, module)| {
                 let declarations = overload_declarations(&module.items);
                 let header = ScalarOverloadModule {
+                    callables: ScalarCallableHeaders::new(&module.items),
                     source: copy_source(&module.source),
                     scope: module
                         .members
@@ -547,6 +690,11 @@ pub(super) mod observations {
 
     #[derive(Clone, Debug, Default, Eq, PartialEq)]
     pub(super) struct Payload {
+        pub callable_headers: usize,
+        pub ordinary_parameters: usize,
+        pub extern_bindings: usize,
+        pub extern_members: usize,
+        pub extern_names: usize,
         pub headers: usize,
         pub arms: usize,
         pub generics: usize,
@@ -727,6 +875,15 @@ pub(super) mod observations {
                 .iter()
                 .map(|arm| arm.generic_parameters.len())
                 .sum::<usize>();
+        });
+    }
+    pub(super) fn record_callables(headers: &ScalarCallableHeaders) {
+        record_payload(|payload| {
+            payload.callable_headers += headers.generics.len();
+            payload.ordinary_parameters += headers.generics.values().map(Vec::len).sum::<usize>();
+            payload.extern_bindings += headers.externs.len();
+            payload.extern_members += headers.externs.values().map(BTreeMap::len).sum::<usize>();
+            payload.extern_names += headers.extern_names.len();
         });
     }
     pub(super) fn record_name(bytes: usize) {
@@ -921,6 +1078,27 @@ mod tests {
             source_payload(source, &mut payload);
         }
         for module in &environment.modules {
+            payload.callable_headers += module.callables.generics.len();
+            for (name, parameters) in &module.callables.generics {
+                name_payload(name, &mut payload);
+                payload.ordinary_parameters += parameters.len();
+                for parameter in parameters {
+                    name_payload(&parameter.name, &mut payload);
+                }
+            }
+            payload.extern_bindings += module.callables.externs.len();
+            for (binding, members) in &module.callables.externs {
+                name_payload(binding, &mut payload);
+                payload.extern_members += members.len();
+                for (name, member) in members {
+                    name_payload(name, &mut payload);
+                    type_payload(&member.signature, &mut payload);
+                }
+            }
+            payload.extern_names += module.callables.extern_names.len();
+            for name in &module.callables.extern_names {
+                name_payload(name, &mut payload);
+            }
             source_payload(&module.source, &mut payload);
             for (name, ty) in &module.scope {
                 name_payload(name, &mut payload);
@@ -955,6 +1133,59 @@ mod tests {
         items: &[ScalarItem],
     ) {
         assert_eq!(&header.source, source);
+        let mut generics = BTreeMap::new();
+        let mut externs =
+            BTreeMap::<&str, BTreeMap<&str, (&ScalarExternFunction, bool, bool)>>::new();
+        let mut names = BTreeSet::new();
+        for item in items {
+            match item {
+                ScalarItem::Function(function) => {
+                    generics
+                        .entry(function.name.as_str())
+                        .or_insert(&function.generic_parameters);
+                }
+                ScalarItem::Extern(declaration) => {
+                    let first = !externs.contains_key(declaration.binding.as_str());
+                    let members = externs.entry(declaration.binding.as_str()).or_default();
+                    for function in &declaration.functions {
+                        names.insert(function.name.as_str());
+                        if let Some(member) = members.get_mut(function.name.as_str()) {
+                            member.2 |= function.unsafe_marker;
+                        } else {
+                            members.insert(
+                                function.name.as_str(),
+                                (function, first, function.unsafe_marker),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(header.callables.generics.len(), generics.len());
+        for (name, parameters) in generics {
+            assert_eq!(&header.callables.generics[name], parameters);
+        }
+        assert_eq!(header.callables.externs.len(), externs.len());
+        for (binding, members) in externs {
+            assert_eq!(header.callables.externs[binding].len(), members.len());
+            for (name, (function, first, any_unsafe)) in members {
+                let member = &header.callables.externs[binding][name];
+                assert_eq!(member.signature, function.signature);
+                assert_eq!(member.first_declaration, first);
+                assert_eq!(member.unsafe_marker, function.unsafe_marker);
+                assert_eq!(member.any_unsafe, any_unsafe);
+            }
+        }
+        assert_eq!(
+            header
+                .callables
+                .extern_names
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            names
+        );
         let declarations = items
             .iter()
             .enumerate()
@@ -1025,6 +1256,151 @@ mod tests {
             calls += 1;
         }
         assert_eq!(calls, sites * 2);
+    }
+
+    #[test]
+    fn callable_metadata_preserves_first_empty_generics_and_duplicate_extern_predicates() {
+        let parsed = parse_source(source(0), "%%start\ni32(i32) identity = fn(value) { value };\nenv = extern wasm \"helper\" { i32() fetch; };\n%%end".into(), &[]);
+        assert!(parsed.diagnostics.is_empty());
+        let result = derive_scalar_program(&parsed.result);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let mut items = result.program.items;
+        let ScalarItem::Function(first) = &items[0] else {
+            panic!("function")
+        };
+        let mut generic = first.clone();
+        generic.generic_parameters = vec![
+            ScalarGenericParameter {
+                name: "Z".into(),
+                span: ByteSpan::new(1, 2),
+            },
+            ScalarGenericParameter {
+                name: "A".into(),
+                span: ByteSpan::new(3, 4),
+            },
+        ];
+        let mut ordered = generic.clone();
+        ordered.name = "ordered".into();
+        let expected_parameters = ordered.generic_parameters.clone();
+        items.push(ScalarItem::Function(generic));
+        items.push(ScalarItem::Function(ordered));
+        let ScalarItem::Extern(first) = &items[1] else {
+            panic!("extern")
+        };
+        let mut duplicate = first.clone();
+        duplicate.functions[0].unsafe_marker = true;
+        duplicate.functions[0].signature = ScalarType::Callable {
+            outputs: ScalarOutputSequence {
+                outputs: vec![ScalarOutput {
+                    ty: ScalarType::Bool,
+                    span: ByteSpan::new(5, 6),
+                }],
+                span: ByteSpan::new(5, 6),
+            },
+            parameters: Vec::new(),
+        };
+        let mut missing = first.clone();
+        missing.binding = "empty".into();
+        missing.functions.clear();
+        let mut late = duplicate.clone();
+        late.binding = "empty".into();
+        late.functions[0].name = "_private".into();
+        items.extend([
+            ScalarItem::Extern(duplicate),
+            ScalarItem::Extern(missing),
+            ScalarItem::Extern(late),
+        ]);
+        let scope = observations::Scope::new();
+        let environment = ScalarOverloadEnvironment::single(&source(0), &items);
+        let view = environment.typing(0);
+        assert_eq!(view.generics("identity"), Some([].as_slice()));
+        assert_eq!(
+            view.generics("ordered"),
+            Some(expected_parameters.as_slice())
+        );
+        assert_eq!(view.generics("missing"), None);
+        let fetch = view.extern_member(Some("env"), "fetch").unwrap();
+        assert!(fetch.first_declaration);
+        assert!(!fetch.unsafe_marker);
+        assert!(fetch.any_unsafe);
+        assert!(
+            matches!(&fetch.signature, ScalarType::Callable { outputs, .. } if outputs.outputs[0].ty == ScalarType::I32)
+        );
+        let private = view.extern_member(Some("empty"), "_private").unwrap();
+        assert!(!private.first_declaration);
+        assert!(private.unsafe_marker);
+        assert!(view.has_extern_name("_private"));
+        assert!(view.extern_member(None, "fetch").is_none());
+        assert_module_membership(&environment.modules[0], &source(0), &items);
+        let counts = scope.counts();
+        assert_eq!(counts.contexts, 1);
+        let mut copied_payload = enumerate_payload(&environment);
+        let ScalarItem::Function(overwritten_scope_entry) = &items[0] else {
+            panic!("first scope entry")
+        };
+        name_payload(&overwritten_scope_entry.name, &mut copied_payload);
+        type_payload(&overwritten_scope_entry.signature, &mut copied_payload);
+        assert_eq!(counts.snapshot, copied_payload);
+        assert_eq!(counts.snapshot.callable_headers, 2);
+        assert_eq!(counts.snapshot.ordinary_parameters, 2);
+        assert_eq!(counts.snapshot.extern_bindings, 2);
+        assert_eq!(counts.snapshot.extern_members, 2);
+        assert_eq!(counts.snapshot.extern_names, 2);
+        assert_eq!(counts.projections, observations::Payload::default());
+        assert_zero_recording_copies(&counts);
+    }
+
+    #[test]
+    fn callable_metadata_payload_is_body_independent_and_imports_select_first_complete_source() {
+        let mut baseline = None;
+        for body in [4, 8, 16] {
+            let parsed = parse_source(source(0), format!("%%start\ni32(i32) identity = fn(value) {{ {} value }};\nenv = extern wasm \"helper\" {{ i32() fetch; }};\n%%end", "value; ".repeat(body)), &[]);
+            assert!(parsed.diagnostics.is_empty());
+            let result = derive_scalar_program(&parsed.result);
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            let mut first = ScalarModule::from_program(result.program, Vec::new());
+            let mut second = first.clone();
+            let ScalarItem::Function(function) = &mut first.items[0] else {
+                panic!("first")
+            };
+            function.generic_parameters = vec![ScalarGenericParameter {
+                name: "First".into(),
+                span: ByteSpan::new(1, 2),
+            }];
+            let ScalarItem::Function(function) = &mut second.items[0] else {
+                panic!("second")
+            };
+            function.generic_parameters = vec![ScalarGenericParameter {
+                name: "Second".into(),
+                span: ByteSpan::new(3, 4),
+            }];
+            let modules = [first, second];
+            let scope = observations::Scope::new();
+            let environment = ScalarOverloadEnvironment::project(&modules);
+            let current = environment.typing(1);
+            assert_eq!(current.generics("identity").unwrap()[0].name, "Second");
+            let imported = current.imported(&modules[1].source);
+            assert_eq!(imported.generics("identity").unwrap()[0].name, "First");
+            assert!(std::ptr::eq(
+                imported.generics("identity").unwrap(),
+                environment.typing(0).generics("identity").unwrap()
+            ));
+            for (header, module) in environment.modules.iter().zip(&modules) {
+                assert_module_membership(header, &module.source, &module.items);
+            }
+            let counts = scope.counts();
+            assert_eq!(counts.contexts, 1);
+            assert_eq!(counts.snapshot, enumerate_payload(&environment));
+            assert_eq!(counts.snapshot.callable_headers, 2);
+            assert_eq!(counts.snapshot.ordinary_parameters, 2);
+            assert_eq!(counts.snapshot.extern_members, 2);
+            assert_zero_recording_copies(&counts);
+            if let Some(expected) = &baseline {
+                assert_eq!(&counts.snapshot, expected);
+            } else {
+                baseline = Some(counts.snapshot);
+            }
+        }
     }
 
     #[test]

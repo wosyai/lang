@@ -80,6 +80,7 @@ fn standalone_extern_validation_has_zero_constructions_and_copies_across_indepen
                 );
             }
             let overloads = ScalarOverloadEnvironment::single(&program.source, &program.items);
+            let overloads = overloads.typing(0);
             let owners = ScalarAssignmentOwners::new(&program.items);
             let mut inference = ScalarInferenceBuilder::new(&owners);
             let scope = layout::observations::Scope::new();

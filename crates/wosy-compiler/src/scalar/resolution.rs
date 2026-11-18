@@ -206,7 +206,7 @@ fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarType>) -> Scalar
 
 pub(super) fn resolve_program_places(
     program: &mut ScalarProgram,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     owners: &ScalarAssignmentOwners,
 ) {
     let context = program.clone();
@@ -291,7 +291,7 @@ fn resolve_item_places(
     program: &ScalarProgram,
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     owners: &ScalarAssignmentOwners,
 ) {
     match item {
@@ -378,7 +378,7 @@ fn resolve_block_places(
     program: &ScalarProgram,
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     owners: &ScalarAssignmentOwners,
 ) {
     let unsafe_context = unsafe_context || block.unsafe_context;
@@ -412,7 +412,7 @@ fn resolve_expression_places(
     program: &ScalarProgram,
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     owners: &ScalarAssignmentOwners,
 ) {
     match expression {
@@ -625,7 +625,7 @@ fn resolve_place(
     program: &ScalarProgram,
     names: &BTreeMap<String, ScalarType>,
     unsafe_context: bool,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     owners: &ScalarAssignmentOwners,
 ) {
     match place {
@@ -915,7 +915,7 @@ pub(super) fn resolve_module_places(
     modules: &[ScalarModule],
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     owners: &ScalarAssignmentOwners,
 ) {
     let context = module.clone();
@@ -1013,7 +1013,7 @@ fn resolve_item_module_places(
     unsafe_context: bool,
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     owners: &ScalarAssignmentOwners,
 ) {
     match item {
@@ -1124,7 +1124,7 @@ fn resolve_block_module_places(
     unsafe_context: bool,
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     owners: &ScalarAssignmentOwners,
 ) {
     let unsafe_context = unsafe_context || block.unsafe_context;
@@ -1167,7 +1167,7 @@ fn resolve_expression_module_places(
     unsafe_context: bool,
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     owners: &ScalarAssignmentOwners,
 ) {
     match expression {
@@ -1452,7 +1452,7 @@ fn resolve_module_place(
     unsafe_context: bool,
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
-    overloads: &ScalarOverloadEnvironment,
+    overloads: &ScalarTypingView<'_>,
     owners: &ScalarAssignmentOwners,
 ) {
     match place {

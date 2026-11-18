@@ -5248,6 +5248,7 @@ fn derives_and_validates_ordered_local_mutation_and_unit_while() {
     ));
     let overloads =
         ScalarOverloadEnvironment::single(&result.program.source, &result.program.items);
+    let overloads = overloads.typing(0);
     let owners = ScalarAssignmentOwners::new(&result.program.items);
     let mut inference = ScalarInferenceBuilder::new(&owners);
     assert_eq!(
