@@ -49,6 +49,160 @@ fn assert_query_stages(counts: Counts, valid: bool) {
     );
 }
 
+const OWNERSHIP_INVALID: &str = "%%start\nstruct Payload { u8 value; }\nPayload(Payload) consume = fn(input) { next = input; next; next };\n%%end";
+
+fn prepare_extracted(
+    parsed: &wosy_syntax::ParseResult,
+    target_layout: ScalarTargetLayout,
+) -> crate::PreparedScalarProject {
+    let declarations = derive_scalar_declarations_from_cst(parsed.canonical_cst());
+    let order = vec![declarations.source().clone()];
+    crate::prepare_scalar_project(
+        vec![(declarations, Vec::new())],
+        order,
+        crate::ScalarPreparationInputs { target_layout },
+    )
+    .unwrap_or_else(|error| panic!("{:?}", error.diagnostics))
+}
+
+#[test]
+fn prepare_ownership_invalid_source_without_build_query() {
+    let parsed = parsed(OWNERSHIP_INVALID);
+    for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let scope = Scope::new();
+        let copies = layout::observations::Scope::new();
+        let prepared = prepare_extracted(&parsed, target);
+        assert_eq!(
+            scope.counts(),
+            Counts {
+                call_sites: 1,
+                ..Counts::default()
+            }
+        );
+        assert_eq!(copies.counts().program_copies, 0);
+        assert_eq!(copies.counts().module_copies, 0);
+        assert_eq!(copies.counts().cfg_copies, 0);
+        let project = prepared.project();
+        assert_eq!(
+            project.initialization_order.as_slice(),
+            std::slice::from_ref(&parsed.source)
+        );
+        let module = &project.modules[0];
+        assert_eq!(module.source, parsed.source);
+        assert_eq!(module.target_layout, target);
+        assert_eq!(module.resolved_assignment_outputs.len(), 1);
+    }
+}
+
+#[test]
+fn explicit_build_preserves_current_ownership_diagnostics() {
+    let invalid = "%%start
+struct Payload { u8 value; }
+Payload(Payload) first = fn(input) { next = input; next; next };
+Payload(Payload) second = fn(input) { next = input; next; next };
+%%end";
+    let valid = "%%start
+u8(u8) identity = fn(input) { next = input; next };
+u8(u8) caller = fn(input) { identity(input) };
+%%end";
+    for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        for (text, valid) in [(invalid, false), (valid, true)] {
+            let parsed = parsed(text);
+            let legacy = crate::validate_scalar_project(raw_project(
+                derive_scalar_declarations_from_cst(parsed.canonical_cst()),
+                target,
+            ));
+            assert_eq!(legacy.diagnostics.len(), if valid { 0 } else { 2 });
+            for diagnostic in &legacy.diagnostics {
+                assert_eq!(diagnostic.code, "B0003");
+                assert_eq!(diagnostic.message, "read or move of unavailable place");
+            }
+            let prepared = prepare_extracted(&parsed, target);
+            let before = prepared.project().clone();
+            let builds = [(), ()].map(|()| {
+                let scope = Scope::new();
+                let copies = layout::observations::Scope::new();
+                let build = crate::analyze_scalar_build(&prepared);
+                assert_query_stages(scope.counts(), valid);
+                assert_eq!(copies.counts().program_copies, 0);
+                assert_eq!(copies.counts().module_copies, 0);
+                assert_eq!(copies.counts().cfg_copies, 0);
+                build
+            });
+            for build in builds {
+                assert!(std::ptr::eq(build.prepared(), &prepared));
+                assert_eq!(build.diagnostics(), legacy.diagnostics.as_slice());
+            }
+            assert_eq!(prepared.project(), &before);
+            for item in &prepared.project().modules[0].items {
+                let ScalarItem::Function(function) = item else {
+                    continue;
+                };
+                assert!(function.reference_cfg.facts.is_empty());
+                assert!(function.reference_cfg.points.is_empty());
+                assert!(function.reference_cfg.initial_points.is_empty());
+                assert!(function.reference_cfg.allocations.is_empty());
+                assert!(function.reference_cfg.specialized_policies.is_empty());
+            }
+            if valid {
+                let ScalarItem::Function(caller) = &legacy.project.modules[0].items[1] else {
+                    panic!("caller")
+                };
+                assert!(!caller.reference_cfg.points.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn project_preparation_reports_extraction_diagnostics_in_module_order() {
+    for target_layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let declarations = [
+            ("z.w", "%%start\nchar letter = 'ab';\n%%end"),
+            ("a.w", "%%start\ni32 number = 1__2;\n%%end"),
+        ]
+        .map(|(path, text)| {
+            let source =
+                SourceIdentity::new("project".into(), "package".into(), path.into(), "r1".into());
+            let parsed = parse_source(source, text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+        });
+        let sources = declarations
+            .each_ref()
+            .map(|declarations| declarations.source().clone());
+        let expected: Vec<_> = declarations
+            .iter()
+            .flat_map(|declarations| {
+                assert_eq!(declarations.diagnostics().len(), 1);
+                declarations.diagnostics().iter().cloned()
+            })
+            .collect();
+        let order = vec![sources[1].clone(), sources[0].clone()];
+        let stages = Scope::new();
+        let layouts = layout::observations::Scope::new();
+        let Err(rejected) = crate::prepare_scalar_project(
+            declarations
+                .map(|declarations| (declarations, Vec::new()))
+                .into(),
+            order.clone(),
+            crate::ScalarPreparationInputs { target_layout },
+        ) else {
+            panic!("extraction rejection")
+        };
+        assert_eq!(stages.counts(), Counts::default());
+        assert_eq!(layouts.counts().contexts, 0);
+        assert_eq!(rejected.diagnostics, expected);
+        assert_eq!(rejected.project.initialization_order, order);
+        assert_eq!(rejected.project.modules.len(), sources.len());
+        for (module, source) in rejected.project.modules.iter().zip(sources) {
+            assert_eq!(module.source, source);
+            assert_eq!(module.items.len(), 1);
+            assert_eq!(module.layouts.target, target_layout);
+        }
+    }
+}
+
 #[test]
 fn standalone_preparation_retains_static_inputs_for_repeatable_owned_queries_and_legacy_output() {
     for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
@@ -112,7 +266,8 @@ fn project_preparation_retains_static_inputs_for_repeatable_owned_queries_and_le
             let public_input = raw.clone();
             let scope = Scope::new();
             let copies = layout::observations::Scope::new();
-            let prepared = PreparedProject::new(raw).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let prepared = PreparedScalarProject::new(raw)
+                .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
             assert_eq!(scope.counts(), Counts { call_sites: 1, ..Counts::default() });
             assert_eq!(copies.counts().program_copies, 0);
             assert_eq!(copies.counts().module_copies, 0);
@@ -177,7 +332,7 @@ fn static_rejection_returns_original_validation_with_zero_lookup_or_ownership_en
         );
         let expected = typecheck_scalar_project(raw.clone());
         let scope = Scope::new();
-        let Err(actual) = PreparedProject::new(raw) else {
+        let Err(actual) = PreparedScalarProject::new(raw) else {
             panic!("static project rejection")
         };
         assert_eq!(scope.counts(), Counts::default());

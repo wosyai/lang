@@ -38,12 +38,12 @@ impl PreparedProgram {
     }
 }
 
-pub(super) struct PreparedProject {
+pub struct PreparedScalarProject {
     project: ScalarProject,
     calls: reference::ProjectCallSiteResults,
 }
 
-impl PreparedProject {
+impl PreparedScalarProject {
     pub(super) fn new(project: ScalarProject) -> Result<Self, ScalarProjectValidation> {
         let validation = typecheck_scalar_project(project);
         if !validation.diagnostics.is_empty() {
@@ -52,6 +52,10 @@ impl PreparedProject {
         let project = validation.project;
         let calls = reference::resolve_project_call_sites(&project.modules);
         Ok(Self { project, calls })
+    }
+
+    pub fn project(&self) -> &ScalarProject {
+        &self.project
     }
 
     fn analyze(&self) -> reference::ProjectReferenceResults {
@@ -65,6 +69,36 @@ impl PreparedProject {
             project: self.project,
             diagnostics: errors.into_iter().map(|error| error.diagnostic()).collect(),
         }
+    }
+}
+
+pub struct ScalarBuildValidation<'a> {
+    prepared: &'a PreparedScalarProject,
+    _results: reference::ProjectReferenceResults,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl<'a> ScalarBuildValidation<'a> {
+    pub fn prepared(&self) -> &'a PreparedScalarProject {
+        self.prepared
+    }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+}
+
+pub fn analyze_scalar_build(prepared: &PreparedScalarProject) -> ScalarBuildValidation<'_> {
+    let results = prepared.analyze();
+    let diagnostics = results
+        .errors()
+        .iter()
+        .map(ReferenceAnalysisError::diagnostic)
+        .collect();
+    ScalarBuildValidation {
+        prepared,
+        _results: results,
+        diagnostics,
     }
 }
 

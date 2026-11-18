@@ -2126,6 +2126,10 @@ impl ScalarSourceDeclarations {
     }
 }
 
+pub struct ScalarPreparationInputs {
+    pub target_layout: ScalarTargetLayout,
+}
+
 pub fn derive_scalar_program(parse: &ParseResult) -> ScalarValidation {
     derive_scalar_program_with_layout(parse, ScalarTargetLayout::WASM32)
 }
@@ -2821,8 +2825,41 @@ fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
     }
 }
 
+pub fn prepare_scalar_project(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+) -> Result<PreparedScalarProject, ScalarProjectValidation> {
+    let mut modules = Vec::with_capacity(declarations.len());
+    let mut diagnostics = Vec::new();
+    for (declarations, namespace_bindings) in declarations {
+        let ScalarSourceDeclarations {
+            source,
+            items,
+            structs,
+            enums,
+            diagnostics: extraction_diagnostics,
+        } = declarations;
+        let mut module = ScalarModule::new(source, items, namespace_bindings);
+        module.structs = structs;
+        module.enums = enums;
+        module.target_layout = inputs.target_layout;
+        module.layouts = ScalarTargetLayouts::new(inputs.target_layout);
+        modules.push(module);
+        diagnostics.extend(extraction_diagnostics);
+    }
+    let project = ScalarProject::new(modules, initialization_order);
+    if !diagnostics.is_empty() {
+        return Err(ScalarProjectValidation {
+            project,
+            diagnostics,
+        });
+    }
+    PreparedScalarProject::new(project)
+}
+
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
-    match static_calls::PreparedProject::new(project) {
+    match PreparedScalarProject::new(project) {
         Ok(prepared) => prepared.finish(),
         Err(validation) => validation,
     }
@@ -3445,6 +3482,7 @@ mod control;
 mod reference;
 mod static_calls;
 use reference::expand_conditional_final_outputs;
+pub use static_calls::{analyze_scalar_build, PreparedScalarProject, ScalarBuildValidation};
 fn derive_type(node: &CstNode) -> ScalarType {
     let actual = if matches!(node.kind(), SyntaxKind::TypeSpec | SyntaxKind::Punctuation) {
         node.descendants()

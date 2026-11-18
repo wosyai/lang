@@ -4923,6 +4923,10 @@ pub(super) struct ProjectReferenceResults {
 }
 
 impl ProjectReferenceResults {
+    pub(super) fn errors(&self) -> &[ReferenceAnalysisError] {
+        &self.errors
+    }
+
     pub(super) fn install(self, modules: &mut [ScalarModule]) -> Vec<ReferenceAnalysisError> {
         for (index, results) in self.updates {
             install_module_reference_results(&mut modules[index].items, results);
