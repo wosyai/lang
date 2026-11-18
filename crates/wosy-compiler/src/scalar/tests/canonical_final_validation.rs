@@ -1,6 +1,67 @@
 use super::*;
 
 #[test]
+fn raw_project_preparation_resolves_branch_local_aggregate_types() {
+    let root = source();
+    let dependency = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "types.w".into(),
+        "r1".into(),
+    );
+    let parsed = parse_source(
+        root.clone(),
+        "%%start
+types = namespace package \"types.w\";
+struct Payload { u8 value; }
+u8(bool) choose = fn(flag) {
+    if (flag) {
+        Payload payload = { .value = 42; };
+        payload.value
+    } else {
+        types.Status status = types.Status::ready;
+        if (status == types.Status::ready) { 1 } else { 0 }
+    }
+};
+%%end"
+            .into(),
+        &[],
+    );
+    let imported = parse_source(
+        dependency.clone(),
+        "%%start\nenum Status { ready; waiting; }\n%%end".into(),
+        &[],
+    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    assert!(
+        imported.diagnostics.is_empty(),
+        "{:?}",
+        imported.diagnostics
+    );
+    for target_layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let namespace = declarations.namespaces().next().expect("types namespace");
+        let binding = ScalarNamespaceBinding {
+            binding: namespace.binding.clone(),
+            target: dependency.clone(),
+            span: namespace.span,
+        };
+        prepare_scalar_project(
+            vec![
+                (declarations, vec![binding]),
+                (
+                    derive_scalar_declarations_from_cst(imported.result.canonical_cst()),
+                    Vec::new(),
+                ),
+            ],
+            vec![dependency.clone(), root.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+    }
+}
+
+#[test]
 fn canonical_final_validation_borrows_mixed_forwarded_and_conditional_roots_on_both_routes() {
     let text = "%%start\n(u8, bool)(u8, bool) mixed = fn(value, flag) { value, flag };\n(u8, bool)(u8, bool) forward = fn(value, flag) { mixed(value, flag) };\n(u8, bool)(u8, bool) choose = fn(value, flag) { if (flag) { value, flag } else { value, flag } };\n%%end";
     for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {

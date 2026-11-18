@@ -744,35 +744,13 @@ pub(super) fn resolve_module_types_in_project(
     for item in &mut module.items {
         match item {
             ScalarItem::Binding(binding) => {
-                binding.declared_type =
-                    resolve_type_in_project(&binding.declared_type, declarations, current_module);
-                for receiver in &mut binding.receivers {
-                    receiver.ty =
-                        resolve_type_in_project(&receiver.ty, declarations, current_module);
-                }
+                resolve_binding_types_project(binding, declarations, current_module);
             }
             ScalarItem::Function(function) => {
-                if function.generic_parameters.is_empty() {
-                    function.signature =
-                        resolve_type_in_project(&function.signature, declarations, current_module);
-                }
+                resolve_callable_types_project(function, declarations, current_module);
                 for arm in &mut function.overload_arms {
-                    if arm.generic_parameters.is_empty() {
-                        arm.signature =
-                            resolve_type_in_project(&arm.signature, declarations, current_module);
-                    }
+                    resolve_callable_types_project(arm, declarations, current_module);
                 }
-                if let ScalarType::Callable { outputs, .. } = &function.signature {
-                    for (value, output) in function
-                        .body
-                        .final_output_values
-                        .iter_mut()
-                        .zip(&outputs.outputs)
-                    {
-                        value.ty = output.ty.clone();
-                    }
-                }
-                resolve_block_types_project(&mut function.body, declarations, current_module);
             }
             ScalarItem::Extern(extern_decl) => {
                 for function in &mut extern_decl.functions {
@@ -803,6 +781,46 @@ pub(super) fn resolve_module_types_in_project(
     }
 }
 
+fn resolve_callable_types_project(
+    function: &mut ScalarFunction,
+    declarations: &ScalarDeclarationEnvironment,
+    current_module: usize,
+) {
+    if function.generic_parameters.is_empty() {
+        function.signature =
+            resolve_type_in_project(&function.signature, declarations, current_module);
+    }
+    if let ScalarType::Callable { outputs, .. } = &function.signature {
+        for (value, output) in function
+            .body
+            .final_output_values
+            .iter_mut()
+            .zip(&outputs.outputs)
+        {
+            value.ty = output.ty.clone();
+        }
+    }
+    resolve_block_types_project(&mut function.body, declarations, current_module);
+}
+
+fn resolve_binding_types_project(
+    binding: &mut ScalarBinding,
+    declarations: &ScalarDeclarationEnvironment,
+    current_module: usize,
+) {
+    binding.declared_type =
+        resolve_type_in_project(&binding.declared_type, declarations, current_module);
+    for receiver in &mut binding.receivers {
+        receiver.ty = resolve_type_in_project(&receiver.ty, declarations, current_module);
+    }
+    resolve_expression_types_project(&mut binding.value, declarations, current_module);
+    if binding.output_origin == ScalarBindingOutputOrigin::IndependentExpressions {
+        for output in &mut binding.output_values {
+            resolve_expression_types_project(&mut output.value, declarations, current_module);
+        }
+    }
+}
+
 fn resolve_item_types_project(
     item: &mut ScalarBlockItem,
     declarations: &ScalarDeclarationEnvironment,
@@ -810,19 +828,25 @@ fn resolve_item_types_project(
 ) {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            binding.declared_type =
-                resolve_type_in_project(&binding.declared_type, declarations, current_module);
-            for receiver in &mut binding.receivers {
-                receiver.ty = resolve_type_in_project(&receiver.ty, declarations, current_module);
-            }
+            resolve_binding_types_project(binding, declarations, current_module);
         }
-        ScalarBlockItem::Expression(ScalarExpression::Block(block)) => {
-            resolve_block_types_project(block, declarations, current_module)
+        ScalarBlockItem::Expression(expression) => {
+            resolve_expression_types_project(expression, declarations, current_module);
         }
         ScalarBlockItem::While(while_expression) => {
-            resolve_block_types_project(&mut while_expression.body, declarations, current_module)
+            resolve_expression_types_project(
+                &mut while_expression.condition,
+                declarations,
+                current_module,
+            );
+            resolve_block_types_project(&mut while_expression.body, declarations, current_module);
         }
-        ScalarBlockItem::Expression(_) | ScalarBlockItem::Assignment(_) => {}
+        ScalarBlockItem::Assignment(assignment) => {
+            for value in &mut assignment.values {
+                resolve_expression_types_project(value, declarations, current_module);
+            }
+            resolve_expression_types_project(&mut assignment.value, declarations, current_module);
+        }
     }
 }
 
@@ -833,6 +857,40 @@ fn resolve_block_types_project(
 ) {
     for item in &mut block.items {
         resolve_item_types_project(item, declarations, current_module);
+    }
+    for output in &mut block.final_output_values {
+        resolve_expression_types_project(&mut output.value, declarations, current_module);
+    }
+}
+
+fn resolve_expression_types_project(
+    expression: &mut ScalarExpression,
+    declarations: &ScalarDeclarationEnvironment,
+    current_module: usize,
+) {
+    match expression {
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            resolve_expression_types_project(condition, declarations, current_module);
+            resolve_block_types_project(then_branch, declarations, current_module);
+            resolve_block_types_project(else_branch, declarations, current_module);
+        }
+        ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        } => {
+            resolve_expression_types_project(condition, declarations, current_module);
+            resolve_block_types_project(then_branch, declarations, current_module);
+        }
+        ScalarExpression::Block(block) => {
+            resolve_block_types_project(block, declarations, current_module);
+        }
+        _ => {}
     }
 }
 
