@@ -408,18 +408,23 @@ pub(super) fn function_runtime_array_result_provenance(
     }
 }
 
-pub(super) fn release_runtime_array_owner<'ctx, 'module>(
+pub(super) struct RuntimeArrayRelease<'ctx> {
+    pointer: BasicValueEnum<'ctx>,
+    live: Option<inkwell::values::IntValue<'ctx>>,
+}
+
+pub(super) fn capture_runtime_array_release<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     name: &str,
-) -> Result<(), String> {
+) -> Result<Option<RuntimeArrayRelease<'ctx>>, String> {
     if !state
         .runtime_array_owners
         .get(name)
         .copied()
         .unwrap_or(false)
     {
-        return Ok(());
+        return Ok(None);
     }
     let (slot, ty) = state
         .storage
@@ -447,16 +452,31 @@ pub(super) fn release_runtime_array_owner<'ctx, 'module>(
             )
             .map_err(builder_error)?
     };
+    let live = if let Some(live) = state.runtime_array_live.get(name) {
+        Some(
+            state
+                .builder
+                .build_load(context.bool_type(), *live, "allocation_live")
+                .map_err(builder_error)?
+                .into_int_value(),
+        )
+    } else {
+        None
+    };
+    Ok(Some(RuntimeArrayRelease { pointer, live }))
+}
+
+pub(super) fn consume_runtime_array_release<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    handle: RuntimeArrayRelease<'ctx>,
+) -> Result<(), String> {
+    let RuntimeArrayRelease { pointer, live } = handle;
     let release = state
         .module
         .get_function(CORE_FREE_SYMBOL)
         .ok_or_else(|| "core free runtime declaration is missing".to_owned())?;
-    if let Some(live) = state.runtime_array_live.get(name) {
-        let live = state
-            .builder
-            .build_load(context.bool_type(), *live, "allocation_live")
-            .map_err(builder_error)?
-            .into_int_value();
+    if let Some(live) = live {
         let block = state
             .builder
             .get_insert_block()
@@ -480,14 +500,24 @@ pub(super) fn release_runtime_array_owner<'ctx, 'module>(
             .build_unconditional_branch(next)
             .map_err(builder_error)?;
         state.builder.position_at_end(next);
-        state.runtime_array_owners.insert(name.to_owned(), false);
         return Ok(());
     }
     state
         .builder
         .build_call(release, &[pointer.into()], "runtime_array_release")
         .map_err(builder_error)?;
-    state.runtime_array_owners.insert(name.to_owned(), false);
+    Ok(())
+}
+
+pub(super) fn release_runtime_array_owner<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    name: &str,
+) -> Result<(), String> {
+    if let Some(handle) = capture_runtime_array_release(context, state, name)? {
+        consume_runtime_array_release(context, state, handle)?;
+        state.runtime_array_owners.insert(name.to_owned(), false);
+    }
     Ok(())
 }
 

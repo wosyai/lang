@@ -1987,6 +1987,179 @@ fn transfers_runtime_array_ownership_through_a_returned_aggregate_pointer() {
 }
 
 #[test]
+fn runtime_array_group_captures_previous_releases_before_installs_on_both_routes() {
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    for (case, group, expected_previous, expected_total) in [
+        ("ordinary", "left, right = third, fourth;", 2, 4),
+        ("transfer", "left, right = right, third;", 1, 4),
+        ("crossed", "left, right = right, left;", 0, 4),
+        ("local_live", "left, right = third, fourth;", 2, 4),
+    ] {
+        let text = if case == "local_live" {
+            format!("%%start\nunit() replace = fn {{ u64 length = 1; u8[length] left; u8[length] right; u8[length] third; u8[length] fourth; left; right; {group} left; right; }};\n%%end")
+        } else {
+            format!("%%start\nu64 length = 1;\nu8[length] first;\nu8[length] second;\nu8[length] third;\nu8[length] fourth;\nu8[] left = first;\nu8[] right = second;\n{group}\n%%end")
+        };
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let parsed = parse_source(source.clone(), text.clone(), &[]);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{case}: {:?}",
+                parsed.diagnostics
+            );
+            let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(
+                single.diagnostics.is_empty(),
+                "{case}: {:?}",
+                single.diagnostics
+            );
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(
+                    single.program.clone(),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+            ));
+            assert!(
+                project.diagnostics.is_empty(),
+                "{case}: {:?}",
+                project.diagnostics
+            );
+            for (route, llvm) in [
+                ("standalone", emit_scalar_llvm(&single).unwrap().to_text()),
+                (
+                    "project",
+                    emit_scalar_project_llvm(&project).unwrap().to_text(),
+                ),
+            ] {
+                let lines = llvm.lines().collect::<Vec<_>>();
+                let slots = ["left", "right"].map(|name| {
+                    if case == "local_live" {
+                        format!("%{name}_backing")
+                    } else if route == "standalone" {
+                        format!("@{name}")
+                    } else {
+                        format!("@{}", project_global_name(&source, name))
+                    }
+                });
+                let installs = slots.each_ref().map(|slot| {
+                    lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| {
+                            line.contains("store ptr ") && line.contains(&format!(", ptr {slot},"))
+                        })
+                        .last()
+                        .unwrap_or_else(|| {
+                            panic!("missing {slot} install in {case} {route}: {llvm}")
+                        })
+                        .0
+                });
+                assert!(installs[0] < installs[1], "{case} {route}: {llvm}");
+                let captures = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, line)| {
+                        *index < installs[0]
+                            && line.contains("runtime_array_owner")
+                            && line.contains(" = load ptr,")
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(captures.len(), expected_previous, "{case} {route}: {llvm}");
+                let first_release = lines
+                    .iter()
+                    .position(|line| line.contains("call void @__wosy_core_free"))
+                    .unwrap();
+                if case == "local_live" {
+                    let live = lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, line)| {
+                            *index < installs[0]
+                                && line.contains("allocation_live")
+                                && line.contains(" = load i1,")
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(live.len(), 2, "{case} {route}: {llvm}");
+                    for (index, line) in live {
+                        assert!(index < first_release, "{case} {route}: {llvm}");
+                        let bit = line.split_whitespace().next().unwrap();
+                        assert_eq!(
+                            lines
+                                .iter()
+                                .filter(|line| line
+                                    .contains(&format!("br i1 {bit}, label %release.live")))
+                                .count(),
+                            1,
+                            "{case} {route}: {llvm}"
+                        );
+                    }
+                }
+                for (index, line) in captures {
+                    assert!(index < first_release, "{case} {route}: {llvm}");
+                    let pointer = line.split_whitespace().next().unwrap();
+                    assert_eq!(
+                        lines
+                            .iter()
+                            .filter(|line| line
+                                .contains(&format!("call void @__wosy_core_free(ptr {pointer})")))
+                            .count(),
+                        1,
+                        "{case} {route}: {llvm}"
+                    );
+                }
+                assert_eq!(
+                    llvm.matches("call void @__wosy_core_free").count(),
+                    expected_total,
+                    "{case} {route}: {llvm}"
+                );
+                for slot in &slots {
+                    let remaining = lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, line)| {
+                            *index > installs[1]
+                                && line.contains("runtime_array_owner")
+                                && line.contains(&format!("load ptr, ptr {slot},"))
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        remaining.len(),
+                        1,
+                        "scope owner {slot} in {case} {route}: {llvm}"
+                    );
+                    let pointer = remaining[0].1.split_whitespace().next().unwrap();
+                    assert_eq!(
+                        lines
+                            .iter()
+                            .filter(|line| line
+                                .contains(&format!("call void @__wosy_core_free(ptr {pointer})")))
+                            .count(),
+                        1,
+                        "scope release {slot} in {case} {route}: {llvm}"
+                    );
+                }
+                if case == "transfer" || case == "crossed" {
+                    assert!(
+                        !lines[..installs[0]]
+                            .iter()
+                            .any(|line| line.contains("runtime_array_owner")
+                                && line.contains(&format!("load ptr, ptr {},", slots[1]))),
+                        "transferred right released: {llvm}"
+                    );
+                }
+                println!("{case} {layout:?} {route}: captured previous releases={expected_previous}, total releases={expected_total}");
+            }
+        }
+    }
+}
+
+#[test]
 fn emits_shared_core_allocation_release_and_panic_abi_for_both_targets() {
     let source = SourceIdentity::new(
         "project".into(),

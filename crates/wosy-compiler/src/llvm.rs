@@ -1440,8 +1440,7 @@ use ownership::{
     binding_receivers, checked_call_owners, dynamic_return_outputs, dynamic_return_owner,
     emit_runtime_array_allocation, fresh_return_outputs, function_runtime_array_result_provenance,
     initialize_joined_return_bindings, joined_assignment_owners, joined_return_binding_types,
-    release_runtime_array_owner, release_scope_runtime_array_owners, return_bindings,
-    transfer_runtime_array_return,
+    release_scope_runtime_array_owners, return_bindings, transfer_runtime_array_return,
 };
 fn emit_project_binding_value<'ctx, 'module>(
     context: &'ctx Context,
@@ -2606,6 +2605,98 @@ struct AssignmentValue<'ctx> {
     provenance: RuntimeArrayAssignmentProvenance,
     call_flag: Option<inkwell::values::IntValue<'ctx>>,
     joined_source: Option<JoinedAssignmentSource<'ctx>>,
+    runtime_array_source: Option<PointerValue<'ctx>>,
+}
+
+struct RuntimeArrayAssignment<'ctx> {
+    owns: bool,
+    previous: Option<ownership::RuntimeArrayRelease<'ctx>>,
+}
+
+fn stage_runtime_array_assignments<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    assignment: &ScalarAssignment,
+    values: &[AssignmentValue<'ctx>],
+    destinations: &[AssignmentDestination<'ctx>],
+) -> Result<Vec<Option<RuntimeArrayAssignment<'ctx>>>, String> {
+    let mut owns = values
+        .iter()
+        .map(|value| value.provenance.result.owns())
+        .collect::<Vec<_>>();
+    let mut transferred = std::collections::HashSet::new();
+    let mut sources = Vec::new();
+    let mut self_replacements = Vec::new();
+    for (position, ((target, value), destination)) in assignment
+        .targets
+        .iter()
+        .zip(values)
+        .zip(destinations)
+        .enumerate()
+    {
+        if !matches!(value.ty, ScalarType::RuntimeArray { .. })
+            || !matches!(target.place, crate::ScalarPlace::Name { .. })
+        {
+            continue;
+        }
+        let Some(source) = value.runtime_array_source else {
+            continue;
+        };
+        if matches!(destination, AssignmentDestination::Existing(slot) if *slot == source) {
+            self_replacements.push((position, source));
+        } else {
+            owns[position] = transferred.insert(source);
+            if owns[position] {
+                sources.push((
+                    value
+                        .provenance
+                        .source_name
+                        .as_ref()
+                        .expect("runtime-array lexical source"),
+                    source,
+                ));
+            }
+        }
+    }
+    let mut retains_storage = vec![false; values.len()];
+    for (position, source) in self_replacements {
+        owns[position] = !transferred.contains(&source);
+        retains_storage[position] = true;
+    }
+    let mut staged = Vec::with_capacity(values.len());
+    for (position, ((target, value), destination)) in assignment
+        .targets
+        .iter()
+        .zip(values)
+        .zip(destinations)
+        .enumerate()
+    {
+        let crate::ScalarPlace::Name { name, .. } = &target.place else {
+            staged.push(None);
+            continue;
+        };
+        if !matches!(value.ty, ScalarType::RuntimeArray { .. }) {
+            staged.push(None);
+            continue;
+        }
+        let protected = retains_storage[position]
+            || matches!(destination, AssignmentDestination::Existing(slot) if transferred.contains(slot));
+        let previous = if protected {
+            None
+        } else {
+            ownership::capture_runtime_array_release(context, state, name)?
+        };
+        staged.push(Some(RuntimeArrayAssignment {
+            owns: owns[position],
+            previous,
+        }));
+    }
+    for (name, slot) in sources {
+        if state.storage.get(name).map(|(storage, _)| *storage) == Some(slot) {
+            state.runtime_array_owners.insert(name.clone(), false);
+        }
+    }
+    Ok(staged)
 }
 
 fn stage_joined_assignment_owners<'ctx>(
@@ -2779,21 +2870,26 @@ fn emit_assignment<'ctx, 'module>(
         .collect::<Result<Vec<_>, String>>()?;
     let owners =
         stage_joined_assignment_owners(context, state, assignment, &values, &mut previous)?;
-    for (position, ((((target, staged), destination), previous), joined_owner)) in assignment
-        .targets
-        .iter()
-        .zip(values)
-        .zip(destinations)
-        .zip(previous)
-        .zip(owners)
-        .enumerate()
+    let runtime_arrays =
+        stage_runtime_array_assignments(context, state, assignment, &values, &destinations)?;
+    for (position, (((((target, staged), destination), previous), joined_owner), runtime_array)) in
+        assignment
+            .targets
+            .iter()
+            .zip(values)
+            .zip(destinations)
+            .zip(previous)
+            .zip(owners)
+            .zip(runtime_arrays)
+            .enumerate()
     {
         let AssignmentValue {
             value,
             ty,
-            provenance,
+            provenance: _,
             call_flag,
             joined_source: _,
+            runtime_array_source: _,
         } = staged;
         let Some(destination) = install_assignment_destination(state, target, &ty, destination)
         else {
@@ -2816,7 +2912,7 @@ fn emit_assignment<'ctx, 'module>(
             call_flag,
             joined_owner,
         )?;
-        transition_runtime_array_assignment(context, state, target, &ty, &provenance)?;
+        transition_runtime_array_assignment(context, state, target, runtime_array)?;
         store_value(context, state, destination, &ty, value)?;
     }
     Ok(EmitValue::Unit)
@@ -2894,21 +2990,26 @@ fn emit_project_assignment<'ctx, 'module>(
         .collect::<Result<Vec<_>, String>>()?;
     let owners =
         stage_joined_assignment_owners(context, state, assignment, &values, &mut previous)?;
-    for (position, ((((target, staged), destination), previous), joined_owner)) in assignment
-        .targets
-        .iter()
-        .zip(values)
-        .zip(destinations)
-        .zip(previous)
-        .zip(owners)
-        .enumerate()
+    let runtime_arrays =
+        stage_runtime_array_assignments(context, state, assignment, &values, &destinations)?;
+    for (position, (((((target, staged), destination), previous), joined_owner), runtime_array)) in
+        assignment
+            .targets
+            .iter()
+            .zip(values)
+            .zip(destinations)
+            .zip(previous)
+            .zip(owners)
+            .zip(runtime_arrays)
+            .enumerate()
     {
         let AssignmentValue {
             value,
             ty,
-            provenance,
+            provenance: _,
             call_flag,
             joined_source: _,
+            runtime_array_source: _,
         } = staged;
         let Some(destination) = install_assignment_destination(state, target, &ty, destination)
         else {
@@ -2931,7 +3032,7 @@ fn emit_project_assignment<'ctx, 'module>(
             call_flag,
             joined_owner,
         )?;
-        transition_runtime_array_assignment(context, state, target, &ty, &provenance)?;
+        transition_runtime_array_assignment(context, state, target, runtime_array)?;
         store_value(context, state, destination, &ty, value)?;
     }
     Ok(EmitValue::Unit)
@@ -3104,27 +3205,17 @@ fn transition_runtime_array_assignment<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     target: &crate::scalar::ScalarAssignmentTarget,
-    ty: &ScalarType,
-    provenance: &RuntimeArrayAssignmentProvenance,
+    staged: Option<RuntimeArrayAssignment<'ctx>>,
 ) -> Result<(), String> {
-    if !matches!(ty, ScalarType::RuntimeArray { .. }) {
-        return Ok(());
-    }
+    let Some(staged) = staged else { return Ok(()) };
     let crate::ScalarPlace::Name { name, .. } = &target.place else {
         return Ok(());
     };
-    let source_is_target = provenance.source_name.as_deref() == Some(name);
-    if !source_is_target {
-        release_runtime_array_owner(context, state, name)?;
+    if let Some(previous) = staged.previous {
+        ownership::consume_runtime_array_release(context, state, previous)?;
     }
-    let owns = provenance.result.owns();
-    state.runtime_array_owners.insert(name.clone(), owns);
+    state.runtime_array_owners.insert(name.clone(), staged.owns);
     state.runtime_array_allocations.insert(name.clone(), false);
-    if owns && !source_is_target {
-        if let Some(source) = provenance.source_name.as_ref() {
-            state.runtime_array_owners.insert(source.clone(), false);
-        }
-    }
     Ok(())
 }
 
@@ -3400,6 +3491,17 @@ fn materialize_assignment_values<'ctx, 'module>(
     let mut values = Vec::new();
     for expression in expressions {
         let provenance = runtime_array_assignment_provenance(state, expression);
+        let runtime_array_source = if provenance.result.owns() {
+            provenance.source_name.as_ref().map(|name| {
+                state
+                    .storage
+                    .get(name)
+                    .expect("owning runtime-array lexical storage")
+                    .0
+            })
+        } else {
+            None
+        };
         let value = emit(
             state,
             expression,
@@ -3447,6 +3549,7 @@ fn materialize_assignment_values<'ctx, 'module>(
                     provenance: provenance.clone(),
                     call_flag: None,
                     joined_source: None,
+                    runtime_array_source: None,
                 });
                 position += 1;
                 continue;
@@ -3477,6 +3580,7 @@ fn materialize_assignment_values<'ctx, 'module>(
                 provenance: provenance.clone(),
                 call_flag: call_flags.get(&output_position).copied(),
                 joined_source,
+                runtime_array_source,
             });
             position += 1;
         }
