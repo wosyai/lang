@@ -3493,10 +3493,40 @@ pub(super) struct ModuleCallSites {
     functions: BTreeMap<usize, FunctionCallSites>,
 }
 
+#[cfg(test)]
+impl ModuleCallSites {
+    pub(super) fn function(&self, item: usize) -> &FunctionCallSites {
+        &self.functions[&item]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct OccurrenceOrdinal(pub(super) usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OccurrenceRole {
+    Expression,
+    Place,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct OccurrenceMetadata {
+    pub(super) role: OccurrenceRole,
+    pub(super) span: ByteSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CallOccurrence {
+    pub(super) ordinal: OccurrenceOrdinal,
+    pub(super) site: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct FunctionCallSites {
     pub(super) sites: Vec<ResolvedCallSite>,
     pub(super) arms: Vec<FunctionCallSites>,
+    pub(super) occurrences: Vec<OccurrenceMetadata>,
+    pub(super) call_occurrences: Vec<CallOccurrence>,
 }
 
 pub(super) struct ProjectCallSiteResults {
@@ -3523,15 +3553,25 @@ struct ValidatedCallResolver<'a> {
     extern_callables: &'a BTreeMap<(String, String), (SourceIdentity, ByteSpan)>,
     modules: &'a [CallResolutionModule<'a>],
     sites: Vec<ResolvedCallSite>,
+    occurrences: Vec<OccurrenceMetadata>,
+    call_occurrences: Vec<CallOccurrence>,
 }
 
 impl ValidatedCallResolver<'_> {
+    fn record_occurrence(&mut self, role: OccurrenceRole, span: ByteSpan) -> OccurrenceOrdinal {
+        let ordinal = OccurrenceOrdinal(self.occurrences.len());
+        self.occurrences.push(OccurrenceMetadata { role, span });
+        ordinal
+    }
+
     fn expression(
         &mut self,
         expression: &ScalarExpression,
         names: &BTreeMap<String, ReferenceBindingId>,
         types: &BTreeMap<String, ScalarType>,
     ) -> Result<(), ReferenceAnalysisError> {
+        let ordinal =
+            self.record_occurrence(OccurrenceRole::Expression, expression_span(expression));
         match expression {
             ScalarExpression::Call {
                 receiver,
@@ -3638,10 +3678,11 @@ impl ValidatedCallResolver<'_> {
                     source_span: SourceSpan::new(self.source.clone(), *span),
                     target,
                 };
-                if let Some(existing) = self
+                let site_index = if let Some((index, existing)) = self
                     .sites
                     .iter()
-                    .find(|existing| existing.source_span == site.source_span)
+                    .enumerate()
+                    .find(|(_, existing)| existing.source_span == site.source_span)
                 {
                     if existing.target != site.target {
                         return Err(ReferenceAnalysisError::MissingContext {
@@ -3649,9 +3690,16 @@ impl ValidatedCallResolver<'_> {
                             reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
                         });
                     }
+                    index
                 } else {
+                    let index = self.sites.len();
                     self.sites.push(site);
-                }
+                    index
+                };
+                self.call_occurrences.push(CallOccurrence {
+                    ordinal,
+                    site: site_index,
+                });
                 for argument in arguments {
                     self.expression(argument, names, types)?;
                 }
@@ -3705,6 +3753,7 @@ impl ValidatedCallResolver<'_> {
         names: &BTreeMap<String, ReferenceBindingId>,
         types: &BTreeMap<String, ScalarType>,
     ) -> Result<(), ReferenceAnalysisError> {
+        self.record_occurrence(OccurrenceRole::Place, scalar_place_target_span(place));
         match place {
             ScalarPlace::Name { .. } => {}
             ScalarPlace::Field { base, .. } => self.place(base, names, types)?,
@@ -3890,6 +3939,8 @@ fn resolve_function_call_sites(
         extern_callables,
         modules,
         sites: Vec::new(),
+        occurrences: Vec::new(),
+        call_occurrences: Vec::new(),
     };
     let mut parameter_names = BTreeMap::new();
     let mut parameter_types = BTreeMap::new();
@@ -3918,6 +3969,8 @@ fn resolve_function_call_sites(
     Ok(FunctionCallSites {
         sites: resolver.sites,
         arms,
+        occurrences: resolver.occurrences,
+        call_occurrences: resolver.call_occurrences,
     })
 }
 

@@ -517,6 +517,8 @@ fn missing_aggregate_policy_table_reports_spanned_invariant() {
         &reference::FunctionCallSites {
             sites: Vec::new(),
             arms: Vec::new(),
+            occurrences: Vec::new(),
+            call_occurrences: Vec::new(),
         },
         &[],
         &[],
@@ -1271,6 +1273,8 @@ fn absent_resolved_assignment_output_is_a_spanned_invariant_error() {
         &reference::FunctionCallSites {
             sites: Vec::new(),
             arms: Vec::new(),
+            occurrences: Vec::new(),
+            call_occurrences: Vec::new(),
         },
         &validated.program.structs,
         &validated.program.enums,
@@ -3529,7 +3533,9 @@ fn assignment_reads_rhs_before_write_and_shadowed_binding_is_diagnosed() {
             &HashSet::new(),
             &reference::FunctionCallSites {
                 sites: Vec::new(),
-                arms: Vec::new()
+                arms: Vec::new(),
+                occurrences: Vec::new(),
+                call_occurrences: Vec::new()
             },
             &[],
             &[],

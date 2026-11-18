@@ -206,9 +206,13 @@ fn template_index_retains_first_source_even_when_its_module_is_empty() {
                     0,
                     FunctionCallSites {
                         sites: Vec::new(),
+                        occurrences: Vec::new(),
+                        call_occurrences: Vec::new(),
                         arms: vec![FunctionCallSites {
                             sites: Vec::new(),
                             arms: Vec::new(),
+                            occurrences: Vec::new(),
+                            call_occurrences: Vec::new(),
                         }],
                     },
                 ),
@@ -217,6 +221,8 @@ fn template_index_retains_first_source_even_when_its_module_is_empty() {
                     FunctionCallSites {
                         sites: Vec::new(),
                         arms: Vec::new(),
+                        occurrences: Vec::new(),
+                        call_occurrences: Vec::new(),
                     },
                 ),
             ]),

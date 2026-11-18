@@ -2,6 +2,8 @@ use super::*;
 use crate::parse_source;
 use reference::stage_observations::{Counts, Scope};
 
+mod occurrence_inventory;
+
 fn parsed(text: &str) -> wosy_syntax::ParseResult {
     let identity = SourceIdentity::new(
         "project".into(),

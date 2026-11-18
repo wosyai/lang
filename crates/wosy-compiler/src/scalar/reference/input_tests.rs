@@ -278,14 +278,20 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
             &module_names,
             &FunctionCallSites {
                 sites: Vec::new(),
+                occurrences: Vec::new(),
+                call_occurrences: Vec::new(),
                 arms: vec![
                     FunctionCallSites {
                         sites: Vec::new(),
                         arms: Vec::new(),
+                        occurrences: Vec::new(),
+                        call_occurrences: Vec::new(),
                     },
                     FunctionCallSites {
                         sites: Vec::new(),
                         arms: Vec::new(),
+                        occurrences: Vec::new(),
+                        call_occurrences: Vec::new(),
                     },
                 ],
             },
