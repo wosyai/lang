@@ -141,6 +141,13 @@ pub(super) enum ReferenceValue {
     Uncomputed,
 }
 
+enum ReferenceAssignmentDestination {
+    Name,
+    EvaluationOnly,
+    Through(CfgPointId),
+    Resolved(ReferencePlaceId),
+}
+
 impl<'a> ReferenceFlowBuilder<'a> {
     pub(super) fn new(
         source: &SourceIdentity,
@@ -1498,6 +1505,44 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(())
     }
 
+    fn assignment_destination(
+        &mut self,
+        target: &ScalarAssignmentTarget,
+        scope: ReferenceScopeId,
+    ) -> Result<ReferenceAssignmentDestination, ReferenceAnalysisError> {
+        if matches!(target.place, ScalarPlace::Name { .. }) {
+            return Ok(ReferenceAssignmentDestination::Name);
+        }
+        if let ScalarPlace::Name { name, span } = reference_root(&target.place) {
+            if self.module_names.contains(name) && !self.names.contains_key(name) {
+                self.point(
+                    CfgPointKind::Evaluate(ScalarExpression::Name {
+                        name: name.clone(),
+                        span: *span,
+                    }),
+                    target.target_span,
+                    scope,
+                    BTreeSet::new(),
+                );
+                return Ok(ReferenceAssignmentDestination::EvaluationOnly);
+            }
+        }
+        self.place_expressions(&target.place, scope)?;
+        if let ScalarPlace::Dereference { span, .. } = reference_root(&target.place) {
+            let pointer_point = *self.dereference_points.get(span).ok_or_else(|| {
+                self.missing_context(
+                    target.target_span,
+                    ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                )
+            })?;
+            Ok(ReferenceAssignmentDestination::Through(pointer_point))
+        } else {
+            Ok(ReferenceAssignmentDestination::Resolved(
+                self.assignment_place(&target.place, target.target_span)?,
+            ))
+        }
+    }
+
     fn block(
         &mut self,
         block: &ScalarBlock,
@@ -1651,8 +1696,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             }
                         }
                     }
-                    for (position, (target, (value, rhs_point))) in
-                        assignment.targets.iter().zip(values).enumerate()
+                    let destinations = assignment
+                        .targets
+                        .iter()
+                        .zip(&values)
+                        .map(|(target, _)| self.assignment_destination(target, scope))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for (position, ((target, (value, rhs_point)), destination)) in assignment
+                        .targets
+                        .iter()
+                        .zip(values)
+                        .zip(destinations)
+                        .enumerate()
                     {
                         if let ScalarPlace::Name { name, span } = &target.place {
                             let id = if let Some(id) = self.names.get(name) {
@@ -1736,33 +1791,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 self.point(assign, *span, scope, BTreeSet::new());
                             }
                         } else {
-                            if let ScalarPlace::Name { name, span } = reference_root(&target.place)
+                            if let ReferenceAssignmentDestination::Through(pointer_point) =
+                                destination
                             {
-                                if self.module_names.contains(name)
-                                    && !self.names.contains_key(name)
-                                {
-                                    self.point(
-                                        CfgPointKind::Evaluate(ScalarExpression::Name {
-                                            name: name.clone(),
-                                            span: *span,
-                                        }),
-                                        target.target_span,
-                                        scope,
-                                        BTreeSet::new(),
-                                    );
-                                    continue;
-                                }
-                            }
-                            self.place_expressions(&target.place, scope)?;
-                            if let ScalarPlace::Dereference { span, .. } =
-                                reference_root(&target.place)
-                            {
-                                let pointer_point = *self.dereference_points.get(span).ok_or_else(|| {
-                                    self.missing_context(
-                                        target.target_span,
-                                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
-                                    )
-                                })?;
                                 let assign = CfgPointKind::AssignThrough {
                                     place: target.place.clone(),
                                     pointer_point,
@@ -1793,8 +1824,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     }
                                 }
                             } else {
-                                let target_place =
-                                    self.assignment_place(&target.place, target.target_span)?;
+                                let target_place = match destination {
+                                    ReferenceAssignmentDestination::EvaluationOnly => continue,
+                                    ReferenceAssignmentDestination::Resolved(place) => place,
+                                    ReferenceAssignmentDestination::Name
+                                    | ReferenceAssignmentDestination::Through(_) => {
+                                        unreachable!("staged projected assignment destination")
+                                    }
+                                };
                                 let assign = CfgPointKind::Assign {
                                     target: target_place,
                                     rhs_point,
