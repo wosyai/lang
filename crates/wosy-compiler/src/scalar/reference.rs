@@ -1702,6 +1702,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         .zip(&values)
                         .map(|(target, _)| self.assignment_destination(target, scope))
                         .collect::<Result<Vec<_>, _>>()?;
+                    let capture = if assignment.targets.len() > 1 {
+                        Some(self.point(
+                            CfgPointKind::CaptureAssignmentPrevious { writes: Vec::new() },
+                            assignment.span,
+                            scope,
+                            BTreeSet::new(),
+                        ))
+                    } else {
+                        None
+                    };
                     for (position, ((target, (value, rhs_point)), destination)) in assignment
                         .targets
                         .iter()
@@ -1861,6 +1871,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 }
                             }
                         }
+                        if let Some(capture) = capture {
+                            let install = self.cursor.expect("assignment install point");
+                            let CfgPointKind::CaptureAssignmentPrevious { writes } =
+                                &mut self.cfg.points[capture.0].kind
+                            else {
+                                unreachable!("assignment group capture")
+                            };
+                            writes.push(install);
+                        }
                     }
                 }
                 ScalarBlockItem::While(loop_) => {
@@ -1963,6 +1982,7 @@ struct ReferenceEdgeState {
     point_values: Vec<Option<BTreeSet<ReferenceOriginId>>>,
     return_outputs: BTreeMap<usize, BTreeSet<ReferenceOriginId>>,
     moved: Vec<(ReferencePlaceId, SourceSpan)>,
+    assignment_previous: BTreeMap<CfgPointId, BTreeSet<ReferenceOriginId>>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -2117,12 +2137,111 @@ fn write_projected_reference(
     });
 }
 
+fn assignment_pointer_candidates(
+    place: &ScalarPlace,
+    origins: &BTreeSet<ReferenceOriginId>,
+    facts: &[ReferenceOrigin],
+) -> Vec<InvalidationCandidate> {
+    origins
+        .iter()
+        .filter_map(|origin| {
+            let loan = match &facts[origin.0] {
+                ReferenceOrigin::Fresh { loan, .. }
+                | ReferenceOrigin::BorrowedFrom { loan, .. } => loan,
+                ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => return None,
+            };
+            let mut resolved_place = loan.origin_place.clone();
+            resolved_place.place = place.clone();
+            collect_reference_projections(place, None, &mut resolved_place.projections);
+            Some(InvalidationCandidate {
+                origin: *origin,
+                place: resolved_place,
+                loan: loan.clone(),
+            })
+        })
+        .collect()
+}
+
+fn previous_place_origins(
+    state: &ReferenceEdgeState,
+    facts: &[ReferenceOrigin],
+    target: &ReferencePlaceId,
+) -> BTreeSet<ReferenceOriginId> {
+    if target.projections.is_empty() {
+        state
+            .bindings
+            .get(&target.binding)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        state
+            .bindings
+            .values()
+            .flat_map(|origins| origins.iter().copied())
+            .filter(|origin| match &facts[origin.0] {
+                ReferenceOrigin::Fresh { loan, .. }
+                | ReferenceOrigin::BorrowedFrom { loan, .. } => {
+                    reference_places_overlap(&loan.origin_place, target)
+                }
+                ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
+            })
+            .collect()
+    }
+}
+
+fn previous_candidate_origins(
+    state: &ReferenceEdgeState,
+    facts: &[ReferenceOrigin],
+    candidates: &[InvalidationCandidate],
+) -> BTreeSet<ReferenceOriginId> {
+    state
+        .bindings
+        .values()
+        .flat_map(|origins| origins.iter().copied())
+        .filter(|origin| match &facts[origin.0] {
+            ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. } => {
+                !candidates
+                    .iter()
+                    .any(|candidate| candidate.origin == *origin)
+                    && candidates.iter().any(|candidate| {
+                        reference_places_overlap(&loan.origin_place, &candidate.place)
+                    })
+            }
+            ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
+        })
+        .collect()
+}
+
+fn previous_origin_loans(
+    origins: &BTreeSet<ReferenceOriginId>,
+    facts: &[ReferenceOrigin],
+) -> Vec<ReferenceLoanId> {
+    origins
+        .iter()
+        .filter_map(|origin| match &facts[origin.0] {
+            ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. } => {
+                Some(loan.clone())
+            }
+            ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => None,
+        })
+        .collect()
+}
+
 fn transfer_reference_facts(
     cfg: &mut ScalarReferenceCfg,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
     contracts: &[ConcreteReferenceOutputContract],
 ) -> Vec<ReferenceAnalysisError> {
     let original_points = cfg.points.clone();
+    let grouped_installs = original_points
+        .iter()
+        .filter_map(|point| match &point.kind {
+            CfgPointKind::CaptureAssignmentPrevious { writes } => Some(writes.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
     for point in &original_points {
         let dependencies = match &point.kind {
@@ -2365,27 +2484,18 @@ fn transfer_reference_facts(
                         unreachable!()
                     };
                     for origin in &origins {
-                        let loan = match &cfg.facts[origin.0] {
-                            ReferenceOrigin::Fresh { loan, .. }
-                            | ReferenceOrigin::BorrowedFrom { loan, .. } => loan,
-                            ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => {
-                                errors.push(ReferenceAnalysisError::MissingContext {
+                        if matches!(
+                            &cfg.facts[origin.0],
+                            ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. }
+                        ) {
+                            errors.push(ReferenceAnalysisError::MissingContext {
                                 source_span: point.source_span.clone(),
                                 reason:
                                     ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
                             });
-                                continue;
-                            }
-                        };
-                        let mut resolved_place = loan.origin_place.clone();
-                        resolved_place.place = place.clone();
-                        collect_reference_projections(place, None, &mut resolved_place.projections);
-                        candidates.push(InvalidationCandidate {
-                            origin: *origin,
-                            place: resolved_place,
-                            loan: loan.clone(),
-                        });
+                        }
                     }
+                    candidates.extend(assignment_pointer_candidates(place, &origins, &cfg.facts));
                 } else {
                     errors.push(ReferenceAnalysisError::MissingContext {
                         source_span: point.source_span.clone(),
@@ -2613,74 +2723,68 @@ fn transfer_reference_facts(
                     .projected
                     .retain(|known| &known.place.binding != binding);
             }
-            if let CfgPointKind::Assign {
-                target,
-                previous_origins,
-                previous_loans,
-                ..
-            } = &mut point.kind
-            {
-                *previous_origins = if target.projections.is_empty() {
-                    state
-                        .bindings
-                        .get(&target.binding)
-                        .cloned()
-                        .unwrap_or_default()
-                } else {
-                    state
-                        .bindings
-                        .values()
-                        .flat_map(|origins| origins.iter().copied())
-                        .filter(|origin| match &cfg.facts[origin.0] {
-                            ReferenceOrigin::Fresh { loan, .. }
-                            | ReferenceOrigin::BorrowedFrom { loan, .. } => {
-                                reference_places_overlap(&loan.origin_place, target)
-                            }
-                            ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
-                        })
-                        .collect()
-                };
-                *previous_loans = previous_origins
-                    .iter()
-                    .filter_map(|origin| match &cfg.facts[origin.0] {
-                        ReferenceOrigin::Fresh { loan, .. }
-                        | ReferenceOrigin::BorrowedFrom { loan, .. } => Some(loan.clone()),
-                        ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => None,
-                    })
-                    .collect();
-            }
-            if let CfgPointKind::AssignThrough {
-                candidates,
-                previous_origins,
-                previous_loans,
-                ..
-            } = &mut point.kind
-            {
-                *previous_origins = state
-                    .bindings
-                    .values()
-                    .flat_map(|origins| origins.iter().copied())
-                    .filter(|origin| match &cfg.facts[origin.0] {
-                        ReferenceOrigin::Fresh { loan, .. }
-                        | ReferenceOrigin::BorrowedFrom { loan, .. } => {
-                            !candidates
-                                .iter()
-                                .any(|candidate| candidate.origin == *origin)
-                                && candidates.iter().any(|candidate| {
-                                    reference_places_overlap(&loan.origin_place, &candidate.place)
-                                })
+            if let CfgPointKind::CaptureAssignmentPrevious { writes } = &point.kind {
+                for write in writes {
+                    let origins = match &original_points[write.0].kind {
+                        CfgPointKind::Assign { target, .. } => {
+                            previous_place_origins(&state, &cfg.facts, target)
                         }
-                        ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
+                        CfgPointKind::AssignThrough {
+                            place,
+                            pointer_point,
+                            ..
+                        } => {
+                            let candidates = match &state.point_values[pointer_point.0] {
+                                Some(origins) => {
+                                    assignment_pointer_candidates(place, origins, &cfg.facts)
+                                }
+                                None => Vec::new(),
+                            };
+                            previous_candidate_origins(&state, &cfg.facts, &candidates)
+                        }
+                        _ => unreachable!("captured operation is an assignment install"),
+                    };
+                    state.assignment_previous.insert(*write, origins);
+                }
+            }
+            let previous = match &point.kind {
+                CfgPointKind::Assign { target, .. } => Some(if grouped_installs.contains(&id) {
+                    state
+                        .assignment_previous
+                        .remove(&id)
+                        .expect("grouped assignment previous origins")
+                } else {
+                    previous_place_origins(&state, &cfg.facts, target)
+                }),
+                CfgPointKind::AssignThrough { candidates, .. } => {
+                    Some(if grouped_installs.contains(&id) {
+                        state
+                            .assignment_previous
+                            .remove(&id)
+                            .expect("grouped assignment previous origins")
+                    } else {
+                        previous_candidate_origins(&state, &cfg.facts, candidates)
                     })
-                    .collect();
-                *previous_loans = previous_origins
-                    .iter()
-                    .filter_map(|origin| match &cfg.facts[origin.0] {
-                        ReferenceOrigin::Fresh { loan, .. }
-                        | ReferenceOrigin::BorrowedFrom { loan, .. } => Some(loan.clone()),
-                        ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => None,
-                    })
-                    .collect();
+                }
+                _ => None,
+            };
+            if let Some(origins) = previous {
+                match &mut point.kind {
+                    CfgPointKind::Assign {
+                        previous_origins,
+                        previous_loans,
+                        ..
+                    }
+                    | CfgPointKind::AssignThrough {
+                        previous_origins,
+                        previous_loans,
+                        ..
+                    } => {
+                        *previous_loans = previous_origin_loans(&origins, &cfg.facts);
+                        *previous_origins = origins;
+                    }
+                    _ => unreachable!("assignment previous origins"),
+                }
             }
             let read_places = match &point.kind {
                 CfgPointKind::ReadPlace { candidates, .. } => candidates.as_slice(),

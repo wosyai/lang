@@ -431,6 +431,9 @@ pub enum ReleaseTarget {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CfgPointKind {
     Entry,
+    CaptureAssignmentPrevious {
+        writes: Vec<CfgPointId>,
+    },
     ScopeEnter,
     ScopeExit,
     Evaluate(ScalarExpression),

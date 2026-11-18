@@ -57,9 +57,28 @@ fn checked_assignment_retains_original_destination_before_retargeting_on_both_pi
             else {
                 unreachable!()
             };
+            let capture = cfg
+                .points
+                .iter()
+                .find(|point| matches!(point.kind, CfgPointKind::CaptureAssignmentPrevious { .. }))
+                .expect("assignment group capture");
+            let CfgPointKind::CaptureAssignmentPrevious { writes } = &capture.kind else {
+                unreachable!()
+            };
+            assert_eq!(writes, &[direct.id, through.id]);
+            let ScalarBlockItem::Assignment(assignment) = &function.body.items[3] else {
+                panic!("retargeting assignment")
+            };
+            assert_eq!(
+                capture.source_span,
+                SourceSpan::new(single.program.source.clone(), assignment.span)
+            );
+            assert_eq!(capture.scope, direct.scope);
+            assert_eq!(capture.possible_origins, Some(BTreeSet::new()));
             assert!(pointer_rhs.0 < byte_rhs.0);
             assert!(byte_rhs.0 < pointer_point.0);
-            assert!(pointer_point.0 < direct.id.0);
+            assert!(pointer_point.0 < capture.id.0);
+            assert!(capture.id.0 < direct.id.0);
             assert!(direct.id.0 < through.id.0);
             let rhs_start = text.find("&!second, 9").unwrap() as u32;
             assert_eq!(
@@ -137,6 +156,233 @@ fn checked_assignment_retains_original_destination_before_retargeting_on_both_pi
                 loan.origin_place.binding.declaration_span,
                 ByteSpan::new(second, second + 6)
             );
+        }
+    }
+}
+
+#[test]
+fn grouped_projected_writes_consume_saved_previous_origins_including_empty_sets() {
+    let source = source();
+    let span = ByteSpan::new(0, 100);
+    let binding = |position| ReferenceBindingId {
+        source: source.clone(),
+        function_span: span,
+        declaration_span: ByteSpan::new(position, position + 1),
+        block_span: span,
+        kind: ReferenceBindingKind::Declared,
+    };
+    let cell = binding(1);
+    let watch = binding(2);
+    let field = ScalarFieldReference::Resolved(ScalarStructFieldId {
+        structure: ScalarStructId {
+            source: source.clone(),
+            index: 0,
+        },
+        index: 0,
+    });
+    let projected = ReferencePlaceId {
+        source: source.clone(),
+        function_span: span,
+        declaration_span: cell.declaration_span,
+        block_span: span,
+        binding: cell.clone(),
+        projections: vec![ReferencePlaceProjection::Field(field.clone())],
+        place: ScalarPlace::Field {
+            base: Box::new(ScalarPlace::Name {
+                name: "cell".into(),
+                span: cell.declaration_span,
+            }),
+            field,
+            span: ByteSpan::new(10, 20),
+        },
+    };
+    let loans = (0..3)
+        .map(|position| ReferenceLoanId {
+            mode: ScalarReferenceMutability::Shared,
+            origin_place: projected.clone(),
+            creation_span: ByteSpan::new(30 + position, 31 + position),
+            parent: None,
+        })
+        .collect::<Vec<_>>();
+    let facts = loans
+        .iter()
+        .enumerate()
+        .map(|(parameter, loan)| ReferenceOrigin::BorrowedFrom {
+            parameter,
+            loan: loan.clone(),
+        })
+        .collect::<Vec<_>>();
+    for seeded in [false, true] {
+        for through in [false, true] {
+            let mut points = Vec::new();
+            let mut add = |kind, possible_origins| {
+                let index = points.len();
+                points.push(ReferenceFlowPoint {
+                    id: CfgPointId(index),
+                    kind,
+                    source_span: SourceSpan::new(
+                        source.clone(),
+                        ByteSpan::new(50 + index as u32, 51 + index as u32),
+                    ),
+                    scope: ReferenceScopeId(0),
+                    possible_origins,
+                    successors: if index < 8 {
+                        vec![CfgPointId(index + 1)]
+                    } else {
+                        Vec::new()
+                    },
+                });
+            };
+            add(CfgPointKind::Entry, Some(BTreeSet::new()));
+            add(
+                CfgPointKind::Borrow {
+                    place: projected.clone(),
+                    loan: loans[0].clone(),
+                },
+                Some(BTreeSet::from([ReferenceOriginId(0)])),
+            );
+            add(
+                CfgPointKind::Bind {
+                    binding: watch.clone(),
+                },
+                Some(if seeded {
+                    BTreeSet::from([ReferenceOriginId(0)])
+                } else {
+                    BTreeSet::new()
+                }),
+            );
+            add(
+                CfgPointKind::Borrow {
+                    place: projected.clone(),
+                    loan: loans[1].clone(),
+                },
+                Some(BTreeSet::from([ReferenceOriginId(1)])),
+            );
+            add(
+                CfgPointKind::Borrow {
+                    place: projected.clone(),
+                    loan: loans[2].clone(),
+                },
+                Some(BTreeSet::from([ReferenceOriginId(2)])),
+            );
+            add(
+                CfgPointKind::Evaluate(ScalarExpression::Integer {
+                    value: 0.into(),
+                    span: ByteSpan::new(55, 56),
+                }),
+                Some(BTreeSet::new()),
+            );
+            add(
+                CfgPointKind::CaptureAssignmentPrevious {
+                    writes: vec![CfgPointId(7), CfgPointId(8)],
+                },
+                Some(BTreeSet::new()),
+            );
+            add(
+                CfgPointKind::Assign {
+                    target: ReferencePlaceId {
+                        source: source.clone(),
+                        function_span: span,
+                        declaration_span: watch.declaration_span,
+                        block_span: span,
+                        binding: watch.clone(),
+                        projections: Vec::new(),
+                        place: ScalarPlace::Name {
+                            name: "watch".into(),
+                            span: watch.declaration_span,
+                        },
+                    },
+                    rhs_point: CfgPointId(3),
+                    previous_origins: BTreeSet::new(),
+                    previous_loans: Vec::new(),
+                },
+                None,
+            );
+            add(
+                if through {
+                    CfgPointKind::AssignThrough {
+                        place: ScalarPlace::Dereference {
+                            pointer: Box::new(ScalarExpression::Name {
+                                name: "selector".into(),
+                                span: ByteSpan::new(58, 59),
+                            }),
+                            span: ByteSpan::new(57, 59),
+                        },
+                        pointer_point: CfgPointId(4),
+                        rhs_point: CfgPointId(5),
+                        candidates: Vec::new(),
+                        previous_origins: BTreeSet::new(),
+                        previous_loans: Vec::new(),
+                    }
+                } else {
+                    CfgPointKind::Assign {
+                        target: projected.clone(),
+                        rhs_point: CfgPointId(5),
+                        previous_origins: BTreeSet::new(),
+                        previous_loans: Vec::new(),
+                    }
+                },
+                Some(BTreeSet::new()),
+            );
+            let mut grouped = ScalarReferenceCfg {
+                facts: facts.clone(),
+                points,
+                initial_points: Vec::new(),
+                allocations: BTreeSet::new(),
+                specialized_policies: Vec::new(),
+            };
+            let mut per_write = grouped.clone();
+            per_write.points[6].kind = CfgPointKind::Join;
+            let errors = transfer_reference_facts(&mut grouped, &BTreeMap::new(), &[]);
+            assert!(
+                errors.is_empty(),
+                "seeded={seeded} through={through}: {errors:?}"
+            );
+            let expected = if seeded {
+                BTreeSet::from([ReferenceOriginId(0)])
+            } else {
+                BTreeSet::new()
+            };
+            let (previous_origins, previous_loans) = match &grouped.points[8].kind {
+                CfgPointKind::Assign {
+                    previous_origins,
+                    previous_loans,
+                    ..
+                }
+                | CfgPointKind::AssignThrough {
+                    previous_origins,
+                    previous_loans,
+                    ..
+                } => (previous_origins, previous_loans),
+                _ => unreachable!(),
+            };
+            assert_eq!(previous_origins, &expected);
+            assert_eq!(
+                previous_loans,
+                &if seeded {
+                    vec![loans[0].clone()]
+                } else {
+                    Vec::new()
+                }
+            );
+            assert!(!previous_origins.contains(&ReferenceOriginId(1)));
+            let errors = transfer_reference_facts(&mut per_write, &BTreeMap::new(), &[]);
+            assert!(errors.is_empty(), "{errors:?}");
+            let (previous_origins, previous_loans) = match &per_write.points[8].kind {
+                CfgPointKind::Assign {
+                    previous_origins,
+                    previous_loans,
+                    ..
+                }
+                | CfgPointKind::AssignThrough {
+                    previous_origins,
+                    previous_loans,
+                    ..
+                } => (previous_origins, previous_loans),
+                _ => unreachable!(),
+            };
+            assert_eq!(previous_origins, &BTreeSet::from([ReferenceOriginId(1)]));
+            assert_eq!(previous_loans, &vec![loans[1].clone()]);
         }
     }
 }
