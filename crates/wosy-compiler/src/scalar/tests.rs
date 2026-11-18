@@ -3575,30 +3575,17 @@ fn unresolved_name_and_deliberately_empty_internal_origin_are_explicit() {
     let ScalarItem::Function(function) = &result.program.items[0] else {
         panic!("function")
     };
-    let mut builder = ReferenceFlowBuilder {
-        source: result.program.source.clone(),
-        function_span: function.span,
-        names: BTreeMap::new(),
-        module_names: HashSet::new(),
-        call_sites: Vec::new(),
-        origins: HashMap::new(),
-        checked: HashSet::new(),
-        binding_types: HashMap::new(),
-        structs: Vec::new(),
-        enums: Vec::new(),
-        generic_parameters: BTreeSet::new(),
-        assignment_outputs: HashMap::new(),
-        dereference_points: HashMap::new(),
-        cfg: ScalarReferenceCfg {
-            facts: Vec::new(),
-            points: Vec::new(),
-            initial_points: Vec::new(),
-            allocations: BTreeSet::new(),
-            specialized_policies: Vec::new(),
-        },
-        next_scope: 0,
-        cursor: None,
-    };
+    let module_names = HashSet::new();
+    let assignment_outputs = HashMap::new();
+    let mut builder = ReferenceFlowBuilder::new(
+        &result.program.source,
+        function,
+        &module_names,
+        &[],
+        &[],
+        &[],
+        &assignment_outputs,
+    );
     let binding = ReferenceBindingId {
         source: result.program.source.clone(),
         function_span: function.span,

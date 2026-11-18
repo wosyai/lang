@@ -1,6 +1,9 @@
 use super::*;
 
 #[cfg(test)]
+mod input_tests;
+
+#[cfg(test)]
 pub(in crate::scalar) mod stage_observations {
     use super::*;
 
@@ -85,19 +88,19 @@ pub(super) fn record_program_reference_origins(
     errors
 }
 
-pub(super) struct ReferenceFlowBuilder {
+pub(super) struct ReferenceFlowBuilder<'a> {
     pub(super) source: SourceIdentity,
     pub(super) function_span: ByteSpan,
     pub(super) names: BTreeMap<String, ReferenceBindingId>,
-    pub(super) module_names: HashSet<String>,
-    pub(super) call_sites: Vec<ResolvedCallSite>,
+    pub(super) module_names: &'a HashSet<String>,
+    pub(super) call_sites: &'a [ResolvedCallSite],
     pub(super) origins: HashMap<ReferenceBindingId, BTreeSet<ReferenceOriginId>>,
     pub(super) checked: HashSet<ReferenceBindingId>,
     pub(super) binding_types: HashMap<ReferenceBindingId, ScalarType>,
-    pub(super) structs: Vec<ScalarStruct>,
-    pub(super) enums: Vec<ScalarEnum>,
+    pub(super) structs: &'a [ScalarStruct],
+    pub(super) enums: &'a [ScalarEnum],
     pub(super) generic_parameters: BTreeSet<String>,
-    pub(super) assignment_outputs: HashMap<ResolvedAssignmentOutputId, ScalarType>,
+    pub(super) assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
     pub(super) dereference_points: HashMap<ByteSpan, CfgPointId>,
     pub(super) cfg: ScalarReferenceCfg,
     pub(super) next_scope: usize,
@@ -111,7 +114,46 @@ pub(super) enum ReferenceValue {
     Uncomputed,
 }
 
-impl ReferenceFlowBuilder {
+impl<'a> ReferenceFlowBuilder<'a> {
+    pub(super) fn new(
+        source: &SourceIdentity,
+        function: &ScalarFunction,
+        module_names: &'a HashSet<String>,
+        call_sites: &'a [ResolvedCallSite],
+        structs: &'a [ScalarStruct],
+        enums: &'a [ScalarEnum],
+        assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
+    ) -> Self {
+        Self {
+            source: source.clone(),
+            function_span: function.span,
+            names: BTreeMap::new(),
+            module_names,
+            call_sites,
+            origins: HashMap::new(),
+            checked: HashSet::new(),
+            binding_types: HashMap::new(),
+            structs,
+            enums,
+            generic_parameters: function
+                .generic_parameters
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect(),
+            assignment_outputs,
+            dereference_points: HashMap::new(),
+            cfg: ScalarReferenceCfg {
+                facts: Vec::new(),
+                points: Vec::new(),
+                initial_points: Vec::new(),
+                allocations: BTreeSet::new(),
+                specialized_policies: Vec::new(),
+            },
+            next_scope: 0,
+            cursor: None,
+        }
+    }
+
     fn assignment_output_types(
         &self,
         assignment: &ScalarAssignment,
@@ -1223,13 +1265,13 @@ impl ReferenceFlowBuilder {
                     }
                 }
                 let ty = self.indexed_move_type(place)?;
-                let policy = copy_policy(&ty, &self.structs, &self.enums, &self.generic_parameters)
+                let policy = copy_policy(&ty, self.structs, self.enums, &self.generic_parameters)
                     .map_err(|_| {
-                        self.missing_context(
-                            *span,
-                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
-                        )
-                    })?;
+                    self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                    )
+                })?;
                 match policy {
                     CopyPolicy::Copy => return Ok(()),
                     CopyPolicy::Move => {
@@ -1264,13 +1306,13 @@ impl ReferenceFlowBuilder {
                     ));
                 };
                 let ty = self.indexed_move_type(place)?;
-                let policy = copy_policy(&ty, &self.structs, &self.enums, &self.generic_parameters)
+                let policy = copy_policy(&ty, self.structs, self.enums, &self.generic_parameters)
                     .map_err(|_| {
-                        self.missing_context(
-                            *span,
-                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
-                        )
-                    })?;
+                    self.missing_context(
+                        *span,
+                        ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                    )
+                })?;
                 if policy == CopyPolicy::Copy {
                     return Ok(());
                 }
@@ -1321,8 +1363,8 @@ impl ReferenceFlowBuilder {
             }
             _ => return Ok(()),
         };
-        let policy = copy_policy(&ty, &self.structs, &self.enums, &self.generic_parameters)
-            .map_err(|_| {
+        let policy =
+            copy_policy(&ty, self.structs, self.enums, &self.generic_parameters).map_err(|_| {
                 self.missing_context(span, ReferenceAnalysisErrorReason::MissingResolvedBinding)
             })?;
         if policy == CopyPolicy::Copy {
@@ -4040,34 +4082,15 @@ pub(super) fn record_function_reference_origins(
             assignment_outputs,
         ));
     }
-    let mut builder = ReferenceFlowBuilder {
-        source: source.clone(),
-        function_span: function.span,
-        names: BTreeMap::new(),
-        module_names: module_names.clone(),
-        call_sites: call_sites.to_vec(),
-        origins: HashMap::new(),
-        checked: HashSet::new(),
-        binding_types: HashMap::new(),
-        structs: structs.to_vec(),
-        enums: enums.to_vec(),
-        generic_parameters: function
-            .generic_parameters
-            .iter()
-            .map(|parameter| parameter.name.clone())
-            .collect(),
-        assignment_outputs: assignment_outputs.clone(),
-        dereference_points: HashMap::new(),
-        cfg: ScalarReferenceCfg {
-            facts: Vec::new(),
-            points: Vec::new(),
-            initial_points: Vec::new(),
-            allocations: BTreeSet::new(),
-            specialized_policies: Vec::new(),
-        },
-        next_scope: 0,
-        cursor: None,
-    };
+    let mut builder = ReferenceFlowBuilder::new(
+        source,
+        function,
+        module_names,
+        call_sites,
+        structs,
+        enums,
+        assignment_outputs,
+    );
     builder.point(
         CfgPointKind::Entry,
         function.span,
