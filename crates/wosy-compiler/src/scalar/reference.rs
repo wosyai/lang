@@ -4082,6 +4082,32 @@ pub(super) fn record_function_reference_origins(
             assignment_outputs,
         ));
     }
+    let (cfg, current_errors) = derive_function_reference_cfg(
+        source,
+        function,
+        module_names,
+        call_sites,
+        structs,
+        enums,
+        assignment_outputs,
+        errors.is_empty(),
+    );
+    function.reference_cfg = cfg;
+    errors.extend(current_errors);
+    errors
+}
+
+fn derive_function_reference_cfg(
+    source: &SourceIdentity,
+    function: &ScalarFunction,
+    module_names: &HashSet<String>,
+    call_sites: &[ResolvedCallSite],
+    structs: &[ScalarStruct],
+    enums: &[ScalarEnum],
+    assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
+    prior_children_succeeded: bool,
+) -> (ScalarReferenceCfg, Vec<ReferenceAnalysisError>) {
+    let mut errors = Vec::new();
     let mut builder = ReferenceFlowBuilder::new(
         source,
         function,
@@ -4178,12 +4204,11 @@ pub(super) fn record_function_reference_origins(
             }
         }
     }
-    if errors.is_empty() && !builder.cfg.points.is_empty() {
+    if prior_children_succeeded && errors.is_empty() && !builder.cfg.points.is_empty() {
         builder.cfg.initial_points = builder.cfg.points.clone();
         let _ = transfer_reference_facts(&mut builder.cfg, &BTreeMap::new(), &[]);
     }
-    function.reference_cfg = builder.cfg;
-    errors
+    (builder.cfg, errors)
 }
 
 pub(super) fn expand_conditional_final_outputs(block: &mut ScalarBlock, outputs: &[ScalarOutput]) {
