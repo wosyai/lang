@@ -16,6 +16,29 @@ mod assignment_destinations;
 
 mod complete_results;
 
+fn assert_project_reference_results(
+    left: &ProjectReferenceResults,
+    right: &ProjectReferenceResults,
+) {
+    fn assert_function(left: &FunctionReferenceResult, right: &FunctionReferenceResult) {
+        assert_eq!(left.cfg, right.cfg);
+        assert_eq!(left.arms.len(), right.arms.len());
+        for (left, right) in left.arms.iter().zip(&right.arms) {
+            assert_function(left, right);
+        }
+    }
+    assert_eq!(left.errors, right.errors);
+    assert_eq!(left.updates.len(), right.updates.len());
+    for ((left_module, left), (right_module, right)) in left.updates.iter().zip(&right.updates) {
+        assert_eq!(left_module, right_module);
+        assert_eq!(left.len(), right.len());
+        for ((left_item, left), (right_item, right)) in left.iter().zip(right) {
+            assert_eq!(left_item, right_item);
+            assert_function(left, right);
+        }
+    }
+}
+
 const TEXT: &str = "%%start\nstruct copy Point { u8 value; }\nenum Marker { ready; }\npick = overload { u8(u8) => fn(input) { u8 next = input; next }; u32(u32) => fn(input) { u32 next = input; next }; };\nu8(Point) read = fn(input) { next = input; pick(next.value) };\n%%end";
 
 fn source() -> SourceIdentity {

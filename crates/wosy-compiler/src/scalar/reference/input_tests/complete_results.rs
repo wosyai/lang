@@ -122,9 +122,10 @@ fn complete_project_analysis_preserves_ordinals_specializations_and_ordered_part
             let modules = typed.project.modules;
             let before = modules.clone();
             let calls = resolve_project_call_sites(&modules);
+            let before_calls = calls.modules.clone();
             let scope = layout::observations::Scope::new();
             let stages = stage_observations::Scope::new();
-            let results = analyze_project_references(&modules, calls);
+            let results = analyze_project_references(&modules, &calls);
             let counts = scope.counts();
             let stage_counts = stages.counts();
             assert_eq!(counts.program_copies, 0);
@@ -142,6 +143,15 @@ fn complete_project_analysis_preserves_ordinals_specializations_and_ordered_part
             );
             drop(stages);
             drop(scope);
+            let scope = layout::observations::Scope::new();
+            let stages = stage_observations::Scope::new();
+            let repeated = analyze_project_references(&modules, &calls);
+            assert_eq!(scope.counts(), counts);
+            assert_eq!(stages.counts(), stage_counts);
+            drop(stages);
+            drop(scope);
+            assert_project_reference_results(&results, &repeated);
+            assert_eq!(calls.modules, before_calls);
             assert_eq!(modules, before);
             assert_eq!(results.errors.is_empty(), !failing);
             if failing {
@@ -167,10 +177,9 @@ fn complete_project_analysis_preserves_ordinals_specializations_and_ordered_part
                 vec![0, 1, 2]
             );
             let mut installed = modules.clone();
-            let calls = resolve_project_call_sites(&installed);
             let scope = layout::observations::Scope::new();
             let stages = stage_observations::Scope::new();
-            let errors = record_project_reference_origins(&mut installed, calls);
+            let errors = record_project_reference_origins(&mut installed, &calls);
             assert_eq!(scope.counts(), counts);
             assert_eq!(stages.counts(), stage_counts);
             drop(stages);

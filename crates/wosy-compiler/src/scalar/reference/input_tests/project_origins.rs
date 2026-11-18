@@ -57,7 +57,7 @@ fn actual_project_origin_stage_copies_one_aggregate_inventory_and_preserves_conv
         let calls = resolve_project_call_sites(&derived.modules);
         let scope = layout::observations::Scope::new();
         let stages = stage_observations::Scope::new();
-        let (mut updates, errors, _) = derive_project_reference_origins(&derived.modules, calls);
+        let (mut updates, errors, _) = derive_project_reference_origins(&derived.modules, &calls);
         assert!(errors.is_empty(), "{errors:?}");
         let counts = scope.counts();
         assert_eq!(counts.program_copies, 0);
@@ -178,7 +178,26 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
         drop(views);
         let calls = resolve_project_call_sites(&modules);
         let before_analysis = modules.clone();
-        let complete = analyze_project_references(&modules, calls);
+        let before_calls = calls.modules.clone();
+        let scope = layout::observations::Scope::new();
+        let stages = stage_observations::Scope::new();
+        let complete = analyze_project_references(&modules, &calls);
+        let counts = scope.counts();
+        let stage_counts = stages.counts();
+        assert_eq!(stage_counts.call_sites, 0);
+        drop(stages);
+        drop(scope);
+        let scope = layout::observations::Scope::new();
+        let stages = stage_observations::Scope::new();
+        let repeated = analyze_project_references(&modules, &calls);
+        assert_eq!(scope.counts(), counts);
+        assert_eq!(stages.counts(), stage_counts);
+        drop(stages);
+        drop(scope);
+        assert_project_reference_results(&repeated, &complete);
+        assert_eq!(calls.modules, before_calls);
+        let mut repeated_install = before_analysis.clone();
+        repeated.install(&mut repeated_install);
         assert_eq!(modules, before_analysis);
         assert_eq!(complete.errors, vec![expected.clone()]);
         assert_eq!(
@@ -189,10 +208,9 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
                 .collect::<Vec<_>>(),
             vec![1]
         );
-        let calls = resolve_project_call_sites(&modules);
         let scope = layout::observations::Scope::new();
         let stages = stage_observations::Scope::new();
-        let errors = record_project_reference_origins(&mut modules, calls);
+        let errors = record_project_reference_origins(&mut modules, &calls);
         assert_eq!(errors, vec![expected]);
         assert_eq!(
             stages.counts(),
@@ -212,6 +230,7 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
         let mut moved = before_analysis;
         assert_eq!(complete.install(&mut moved), errors);
         assert_eq!(moved, modules);
+        assert_eq!(repeated_install, modules);
         for item in &modules[1].items {
             let ScalarItem::Function(function) = item else {
                 panic!("function")
@@ -222,7 +241,7 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
         let calls = resolve_project_call_sites(&failed_only);
         let scope = layout::observations::Scope::new();
         assert_eq!(
-            record_project_reference_origins(&mut failed_only, calls).len(),
+            record_project_reference_origins(&mut failed_only, &calls).len(),
             1
         );
         assert_eq!(scope.counts(), layout::observations::Counts::default());
@@ -267,7 +286,7 @@ fn recursive_checkpoints_isolate_child_sibling_and_module_errors() {
         }
         let calls = resolve_project_call_sites(&modules);
         assert_eq!(
-            record_project_reference_origins(&mut modules, calls),
+            record_project_reference_origins(&mut modules, &calls),
             expected
         );
         for module in &modules {
@@ -372,7 +391,7 @@ fn ordered_project_call_slots_keep_origin_then_lookup_errors_and_partial_attachm
         assert!(calls.modules[2].is_ok());
         let scope = layout::observations::Scope::new();
         let stages = stage_observations::Scope::new();
-        let errors = record_project_reference_origins(&mut modules, calls);
+        let errors = record_project_reference_origins(&mut modules, &calls);
         assert_eq!(scope.counts(), layout::observations::Counts::default());
         assert_eq!(
             stages.counts(),
@@ -432,7 +451,7 @@ fn empty_project_calls_have_zero_slots_and_query_enters_only_convergence() {
     let calls = resolve_project_call_sites(&modules);
     assert!(calls.modules.is_empty());
     assert_eq!(stages.counts(), stage_observations::Counts::default());
-    assert!(record_project_reference_origins(&mut modules, calls).is_empty());
+    assert!(record_project_reference_origins(&mut modules, &calls).is_empty());
     assert_eq!(
         stages.counts(),
         stage_observations::Counts {

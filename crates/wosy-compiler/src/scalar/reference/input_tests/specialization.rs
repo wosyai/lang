@@ -157,7 +157,7 @@ fn actual_project_specialization_reuses_one_inventory_and_retains_imported_arm_p
         let mut derived = typed.project;
         let calls = resolve_project_call_sites(&derived.modules);
         let scope = layout::observations::Scope::new();
-        assert!(record_project_reference_origins(&mut derived.modules, calls).is_empty());
+        assert!(record_project_reference_origins(&mut derived.modules, &calls).is_empty());
         assert_eq!(scope.counts().struct_copies, 2);
         assert_eq!(scope.counts().module_copies, 0);
         assert_eq!(scope.counts().cfg_copies, 2);

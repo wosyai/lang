@@ -3987,7 +3987,7 @@ fn install_module_reference_results(
 
 pub(super) fn record_project_reference_origins(
     modules: &mut [ScalarModule],
-    call_sites: ProjectCallSiteResults,
+    call_sites: &ProjectCallSiteResults,
 ) -> Vec<ReferenceAnalysisError> {
     analyze_project_references(modules, call_sites).install(modules)
 }
@@ -4008,7 +4008,7 @@ impl ProjectReferenceResults {
 
 fn analyze_project_references(
     modules: &[ScalarModule],
-    call_sites: ProjectCallSiteResults,
+    call_sites: &ProjectCallSiteResults,
 ) -> ProjectReferenceResults {
     let (mut updates, mut errors, inventory) =
         derive_and_converge_project_references(modules, call_sites);
@@ -4030,7 +4030,7 @@ fn analyze_project_references(
 
 fn derive_and_converge_project_references(
     modules: &[ScalarModule],
-    call_sites: ProjectCallSiteResults,
+    call_sites: &ProjectCallSiteResults,
 ) -> (
     Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
     Vec<ReferenceAnalysisError>,
@@ -4054,7 +4054,7 @@ fn derive_and_converge_project_references(
 
 fn derive_project_reference_origins(
     modules: &[ScalarModule],
-    call_sites: ProjectCallSiteResults,
+    call_sites: &ProjectCallSiteResults,
 ) -> (
     Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
     Vec<ReferenceAnalysisError>,
@@ -4063,7 +4063,7 @@ fn derive_project_reference_origins(
     let mut inventory = None;
     let mut updates = Vec::new();
     let mut errors = Vec::new();
-    for (index, (module, calls)) in modules.iter().zip(call_sites.modules).enumerate() {
+    for (index, (module, calls)) in modules.iter().zip(&call_sites.modules).enumerate() {
         match calls {
             Ok(sites) => {
                 let (structs, enums) = inventory.get_or_insert_with(|| {
@@ -4081,7 +4081,7 @@ fn derive_project_reference_origins(
                 let (results, current_errors) = derive_module_reference_origins(
                     &module.source,
                     &module.items,
-                    &sites,
+                    sites,
                     structs,
                     enums,
                     module.resolved_assignment_outputs.as_map(),
@@ -4089,7 +4089,7 @@ fn derive_project_reference_origins(
                 updates.push((index, results));
                 errors.extend(current_errors);
             }
-            Err(error) => errors.push(error),
+            Err(error) => errors.push(error.clone()),
         }
     }
     (updates, errors, inventory)
