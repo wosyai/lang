@@ -10,13 +10,7 @@ fn standalone_detached_convergence_propagates_checked_returns_without_integral_c
         let typed = typecheck_scalar_program(declarations, target);
         assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
         let mut program = typed.program;
-        let module = ScalarModule::from_program(program.clone(), Vec::new());
-        let call_sites = resolve_module_call_sites(
-            &program.source,
-            &program.items,
-            std::slice::from_ref(&module),
-        )
-        .unwrap();
+        let call_sites = resolve_program_call_sites(&program).unwrap();
         let public = derive_scalar_program_with_layout(&parsed.result, target);
         assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
         let scope = layout::observations::Scope::new();
@@ -81,13 +75,7 @@ fn standalone_detached_failure_installs_exact_partial_cfg_and_ownership_error() 
         let typed = typecheck_scalar_program(declarations, target);
         assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
         let mut program = typed.program;
-        let module = ScalarModule::from_program(program.clone(), Vec::new());
-        let call_sites = resolve_module_call_sites(
-            &program.source,
-            &program.items,
-            std::slice::from_ref(&module),
-        )
-        .unwrap();
+        let call_sites = resolve_program_call_sites(&program).unwrap();
         let public = derive_scalar_program_with_layout(&parsed.result, target);
         let scope = layout::observations::Scope::new();
         let stages = stage_observations::Scope::new();

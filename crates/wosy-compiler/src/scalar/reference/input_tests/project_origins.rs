@@ -146,8 +146,13 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
         ]));
         assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
         let mut modules = typed.project.modules;
+        let views = modules
+            .iter()
+            .map(CallResolutionModule::module)
+            .collect::<Vec<_>>();
         let sites =
-            resolve_module_call_sites(&modules[0].source, &modules[0].items, &modules).unwrap();
+            resolve_module_call_sites(&modules[0].source, &modules[0].items, &views).unwrap();
+        drop(views);
         let original = modules[0].clone();
         assert!(record_module_reference_origins(
             &original.source,
@@ -163,8 +168,13 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
         };
         identity.name = "renamed".into();
         let untouched = modules[0].clone();
+        let views = modules
+            .iter()
+            .map(CallResolutionModule::module)
+            .collect::<Vec<_>>();
         let expected =
-            resolve_module_call_sites(&modules[0].source, &modules[0].items, &modules).unwrap_err();
+            resolve_module_call_sites(&modules[0].source, &modules[0].items, &views).unwrap_err();
+        drop(views);
         let scope = layout::observations::Scope::new();
         let stages = stage_observations::Scope::new();
         let errors = record_project_reference_origins(&mut modules);

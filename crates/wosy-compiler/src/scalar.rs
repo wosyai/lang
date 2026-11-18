@@ -2202,8 +2202,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
         mut diagnostics,
     } = typecheck_scalar_program(declarations, target_layout);
     if diagnostics.is_empty() {
-        let module = ScalarModule::from_program(program.clone(), Vec::new());
-        let call_sites = resolve_module_call_sites(&program.source, &program.items, &[module]);
+        let call_sites = resolve_program_call_sites(&program);
         diagnostics.extend(
             call_sites
                 .map(|sites| record_program_reference_origins(&mut program, &sites))
@@ -3374,7 +3373,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
 
 mod reference;
 use reference::{
-    expand_conditional_final_outputs, record_program_reference_origins, resolve_module_call_sites,
+    expand_conditional_final_outputs, record_program_reference_origins, resolve_program_call_sites,
 };
 fn derive_type(node: &CstNode) -> ScalarType {
     let actual = if matches!(node.kind(), SyntaxKind::TypeSpec | SyntaxKind::Punctuation) {

@@ -8,6 +8,8 @@ mod output_contracts;
 
 mod specialization;
 
+mod call_resolution;
+
 const TEXT: &str = "%%start\nstruct copy Point { u8 value; }\nenum Marker { ready; }\npick = overload { u8(u8) => fn(input) { u8 next = input; next }; u32(u32) => fn(input) { u32 next = input; next }; };\nu8(Point) read = fn(input) { next = input; pick(next.value) };\n%%end";
 
 fn source() -> SourceIdentity {
@@ -27,13 +29,7 @@ fn real_constructor_borrows_all_five_nonempty_inventories_by_identity() {
     let typed = typecheck_scalar_program(extracted, ScalarTargetLayout::WASM32);
     assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
     let program = typed.program;
-    let module = ScalarModule::from_program(program.clone(), Vec::new());
-    let call_sites = resolve_module_call_sites(
-        &program.source,
-        &program.items,
-        std::slice::from_ref(&module),
-    )
-    .unwrap();
+    let call_sites = resolve_program_call_sites(&program).unwrap();
     let module_names = HashSet::from(["pick".to_owned(), "read".to_owned()]);
     let ScalarItem::Function(function) = &program.items[1] else {
         panic!("read")
@@ -72,13 +68,7 @@ fn actual_function_and_arm_consumers_copy_zero_aggregates_and_match_public_cfgs(
         let typed = typecheck_scalar_program(extracted, target);
         assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
         let mut program = typed.program;
-        let module = ScalarModule::from_program(program.clone(), Vec::new());
-        let call_sites = resolve_module_call_sites(
-            &program.source,
-            &program.items,
-            std::slice::from_ref(&module),
-        )
-        .unwrap();
+        let call_sites = resolve_program_call_sites(&program).unwrap();
         let module_names = HashSet::from(["pick".to_owned(), "read".to_owned()]);
         let public = derive_scalar_program_with_layout(&parsed.result, target);
         assert_eq!(public.diagnostics, typed.diagnostics);
@@ -129,13 +119,7 @@ fn immutable_producer_preserves_preexisting_cfg_and_entire_input_on_both_targets
         assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
         let program = public.program;
         let before = program.clone();
-        let module = ScalarModule::from_program(program.clone(), Vec::new());
-        let call_sites = resolve_module_call_sites(
-            &program.source,
-            &program.items,
-            std::slice::from_ref(&module),
-        )
-        .unwrap();
+        let call_sites = resolve_program_call_sites(&program).unwrap();
         let module_names = HashSet::from(["pick".to_owned(), "read".to_owned()]);
         for item in &program.items {
             let ScalarItem::Function(function) = item else {

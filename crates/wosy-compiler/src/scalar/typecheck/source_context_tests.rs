@@ -93,9 +93,10 @@ fn standalone_extern_validation_has_zero_constructions_and_copies_across_indepen
             assert_eq!(program.source, source());
             assert_eq!(program.items.len(), externs + 1);
             drop(scope);
-            assert!(outer.counts().module_constructions > 0);
-            assert!(outer.counts().program_copies > 0);
-            assert!(outer.counts().cfg_copies > 0);
+            assert_eq!(outer.counts().module_constructions, 0);
+            assert_eq!(outer.counts().program_copies, 0);
+            assert_eq!(outer.counts().module_copies, 0);
+            assert_eq!(outer.counts().cfg_copies, 0);
         }
     }
 }
@@ -125,9 +126,10 @@ fn standalone_place_entry_borrows_actual_declarations_and_resolves_fields_withou
                 let public = layout::observations::Scope::new();
                 let result = derive_scalar_program_with_layout(&parsed.result, target_layout);
                 assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-                assert!(public.counts().program_copies > 0);
-                assert!(public.counts().struct_copies > 0);
-                assert!(public.counts().cfg_copies > 0);
+                assert_eq!(public.counts().program_copies, 0);
+                assert_eq!(public.counts().module_copies, 0);
+                assert_eq!(public.counts().struct_copies, 0);
+                assert_eq!(public.counts().cfg_copies, 0);
                 drop(public);
                 let mut program = result.program;
                 assert_eq!(program.structs.len(), structs);

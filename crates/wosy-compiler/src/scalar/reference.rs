@@ -3313,12 +3313,46 @@ pub(super) fn reference_places_overlap(left: &ReferencePlaceId, right: &Referenc
     true
 }
 
+struct CallResolutionModule<'a> {
+    source: &'a SourceIdentity,
+    items: &'a [ScalarItem],
+    namespace_bindings: &'a [ScalarNamespaceBinding],
+    structs: &'a [ScalarStruct],
+}
+
+impl<'a> CallResolutionModule<'a> {
+    fn program(program: &'a ScalarProgram) -> Self {
+        Self {
+            source: &program.source,
+            items: &program.items,
+            namespace_bindings: &[],
+            structs: &program.structs,
+        }
+    }
+
+    fn module(module: &'a ScalarModule) -> Self {
+        Self {
+            source: &module.source,
+            items: &module.items,
+            namespace_bindings: &module.namespace_bindings,
+            structs: &module.structs,
+        }
+    }
+}
+
+pub(super) fn resolve_program_call_sites(
+    program: &ScalarProgram,
+) -> Result<Vec<ResolvedCallSite>, ReferenceAnalysisError> {
+    let modules = [CallResolutionModule::program(program)];
+    resolve_module_call_sites(&program.source, &program.items, &modules)
+}
+
 struct ValidatedCallResolver<'a> {
     source: &'a SourceIdentity,
     function_span: ByteSpan,
     module_callables: &'a BTreeMap<(Option<String>, String), (SourceIdentity, ByteSpan)>,
     extern_callables: &'a BTreeMap<(String, String), (SourceIdentity, ByteSpan)>,
-    modules: &'a [ScalarModule],
+    modules: &'a [CallResolutionModule<'a>],
     sites: Vec<ResolvedCallSite>,
 }
 
@@ -3589,32 +3623,32 @@ impl ValidatedCallResolver<'_> {
     }
 }
 
-pub(super) fn resolve_module_call_sites(
+fn resolve_module_call_sites(
     source: &SourceIdentity,
     items: &[ScalarItem],
-    modules: &[ScalarModule],
+    modules: &[CallResolutionModule<'_>],
 ) -> Result<Vec<ResolvedCallSite>, ReferenceAnalysisError> {
     #[cfg(test)]
     stage_observations::record_call_sites();
-    let current = modules.iter().find(|module| &module.source == source);
+    let current = modules.iter().find(|module| module.source == source);
     let mut module_callables = BTreeMap::new();
     let mut extern_callables = BTreeMap::new();
     for module in modules {
-        let receiver = if &module.source == source {
+        let receiver = if module.source == source {
             None
         } else {
             current.and_then(|current| {
                 current
                     .namespace_bindings
                     .iter()
-                    .find(|binding| binding.target == module.source)
+                    .find(|binding| &binding.target == module.source)
                     .map(|binding| binding.binding.clone())
             })
         };
-        if &module.source != source && receiver.is_none() {
+        if module.source != source && receiver.is_none() {
             continue;
         }
-        for item in &module.items {
+        for item in module.items {
             match item {
                 ScalarItem::Function(function) => {
                     module_callables.insert(
@@ -3630,7 +3664,7 @@ pub(super) fn resolve_module_call_sites(
                         (module.source.clone(), binding.name_span),
                     );
                 }
-                ScalarItem::Extern(extern_decl) if &module.source == source => {
+                ScalarItem::Extern(extern_decl) if module.source == source => {
                     for function in &extern_decl.functions {
                         extern_callables.insert(
                             (extern_decl.binding.clone(), function.name.clone()),
@@ -3663,7 +3697,7 @@ fn resolve_function_call_sites(
     function: &ScalarFunction,
     module_callables: &BTreeMap<(Option<String>, String), (SourceIdentity, ByteSpan)>,
     extern_callables: &BTreeMap<(String, String), (SourceIdentity, ByteSpan)>,
-    modules: &[ScalarModule],
+    modules: &[CallResolutionModule<'_>],
     sites: &mut Vec<ResolvedCallSite>,
 ) -> Result<(), ReferenceAnalysisError> {
     for arm in &function.overload_arms {
@@ -3845,8 +3879,12 @@ fn derive_project_reference_origins(
     let mut inventory = None;
     let mut updates = Vec::new();
     let mut errors = Vec::new();
+    let call_modules = modules
+        .iter()
+        .map(CallResolutionModule::module)
+        .collect::<Vec<_>>();
     for (index, module) in modules.iter().enumerate() {
-        match resolve_module_call_sites(&module.source, &module.items, modules) {
+        match resolve_module_call_sites(&module.source, &module.items, &call_modules) {
             Ok(sites) => {
                 let (structs, enums) = inventory.get_or_insert_with(|| {
                     (

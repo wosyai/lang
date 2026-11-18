@@ -83,8 +83,7 @@ fn actual_standalone_specialization_has_only_concrete_template_scratch_copies() 
         let typed = typecheck_scalar_program(declarations, target);
         assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
         let mut program = typed.program;
-        let module = ScalarModule::from_program(program.clone(), Vec::new());
-        let sites = resolve_module_call_sites(&program.source, &program.items, &[module]).unwrap();
+        let sites = resolve_program_call_sites(&program).unwrap();
         let public = derive_scalar_program_with_layout(&parsed.result, target);
         assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
         let scope = layout::observations::Scope::new();
