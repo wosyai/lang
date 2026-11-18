@@ -2253,7 +2253,7 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
     diagnostics
 }
 
-pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
+fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
     let mut project = project;
     let mut diagnostics = Vec::new();
     for module in &mut project.modules {
@@ -2733,6 +2733,17 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
     }
     drop(overloads);
     drop(owners);
+    ScalarProjectValidation {
+        project,
+        diagnostics,
+    }
+}
+
+pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
+    let ScalarProjectValidation {
+        mut project,
+        mut diagnostics,
+    } = typecheck_scalar_project(project);
     if diagnostics.is_empty() {
         let modules = project.modules.clone();
         for module in &mut project.modules {
@@ -4633,3 +4644,6 @@ mod tests;
 
 #[cfg(test)]
 mod extraction_tests;
+
+#[cfg(test)]
+mod project_static_tests;

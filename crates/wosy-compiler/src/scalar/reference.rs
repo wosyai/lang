@@ -1,5 +1,70 @@
 use super::*;
 
+#[cfg(test)]
+pub(in crate::scalar) mod stage_observations {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(in crate::scalar) struct Counts {
+        pub call_sites: usize,
+        pub reference_origins: usize,
+        pub output_contracts: usize,
+        pub copy_specialization: usize,
+    }
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<Counts>> = const { RefCell::new(None) };
+    }
+
+    pub(in crate::scalar) struct Scope {
+        previous: Option<Counts>,
+    }
+
+    impl Scope {
+        pub(in crate::scalar) fn new() -> Self {
+            Self {
+                previous: ACTIVE.with(|active| active.replace(Some(Counts::default()))),
+            }
+        }
+
+        pub(in crate::scalar) fn counts(&self) -> Counts {
+            ACTIVE.with(|active| {
+                *active
+                    .borrow()
+                    .as_ref()
+                    .expect("active reference-stage observations")
+            })
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.replace(self.previous.take()));
+        }
+    }
+
+    fn record(operation: impl FnOnce(&mut Counts)) {
+        ACTIVE.with(|active| {
+            if let Some(counts) = active.borrow_mut().as_mut() {
+                operation(counts);
+            }
+        });
+    }
+
+    pub(super) fn record_call_sites() {
+        record(|counts| counts.call_sites += 1);
+    }
+    pub(super) fn record_reference_origins() {
+        record(|counts| counts.reference_origins += 1);
+    }
+    pub(super) fn record_output_contracts() {
+        record(|counts| counts.output_contracts += 1);
+    }
+    pub(super) fn record_copy_specialization() {
+        record(|counts| counts.copy_specialization += 1);
+    }
+}
+
 pub(super) fn record_program_reference_origins(
     program: &mut ScalarProgram,
     call_sites: &[ResolvedCallSite],
@@ -3460,6 +3525,8 @@ pub(super) fn resolve_module_call_sites(
     items: &[ScalarItem],
     modules: &[ScalarModule],
 ) -> Result<Vec<ResolvedCallSite>, ReferenceAnalysisError> {
+    #[cfg(test)]
+    stage_observations::record_call_sites();
     let current = modules.iter().find(|module| &module.source == source);
     let mut module_callables = BTreeMap::new();
     let mut extern_callables = BTreeMap::new();
@@ -3584,6 +3651,8 @@ pub(super) fn record_module_reference_origins(
     enums: &[ScalarEnum],
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
 ) -> Vec<ReferenceAnalysisError> {
+    #[cfg(test)]
+    stage_observations::record_reference_origins();
     let module_names = items
         .iter()
         .filter_map(|item| match item {
@@ -3750,6 +3819,8 @@ fn transfer_function_output_contracts(
 pub(super) fn resolve_reference_output_contracts(
     modules: &mut [ScalarModule],
 ) -> Vec<ReferenceAnalysisError> {
+    #[cfg(test)]
+    stage_observations::record_output_contracts();
     let mut contracts = Vec::new();
     loop {
         let mut concrete = Vec::new();
@@ -3795,6 +3866,8 @@ pub(super) fn record_specialized_copy_policies(
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
 ) -> Vec<ReferenceAnalysisError> {
+    #[cfg(test)]
+    stage_observations::record_copy_specialization();
     let mut errors = Vec::new();
     for item in items {
         if let ScalarItem::Function(function) = item {
