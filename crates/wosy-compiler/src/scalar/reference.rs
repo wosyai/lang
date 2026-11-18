@@ -1434,43 +1434,40 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(())
     }
 
+    fn project_call_output(&mut self, producer: CfgPointId, output: usize) -> CfgPointId {
+        let point = &self.cfg.points[producer.0];
+        let CfgPointKind::Call {
+            expression,
+            output: 0,
+            target,
+            argument_points,
+        } = &point.kind
+        else {
+            unreachable!("evaluated output-zero call")
+        };
+        let kind = CfgPointKind::Call {
+            expression: expression.clone(),
+            output,
+            target: target.clone(),
+            argument_points: argument_points.clone(),
+        };
+        self.point_with_origins(kind, point.source_span.range, point.scope, None)
+    }
+
     fn additional_receivers(
         &mut self,
         binding: &ScalarBinding,
         block: &ScalarBlock,
         scope: ReferenceScopeId,
         declared: &mut Vec<(String, ReferenceBindingId, Option<ReferenceBindingId>)>,
+        call_producer: Option<CfgPointId>,
     ) -> Result<(), ReferenceAnalysisError> {
         for (position, receiver) in binding.receivers.iter().enumerate().skip(1) {
             let value = &binding.output_values[position].value;
             if binding.output_origin == ScalarBindingOutputOrigin::IndependentExpressions {
                 self.expression(value, scope)?;
-            } else if matches!(value, ScalarExpression::Call { .. }) {
-                let argument_points = self
-                    .cfg
-                    .points
-                    .iter()
-                    .rev()
-                    .find_map(|point| match &point.kind {
-                        CfgPointKind::Call {
-                            expression,
-                            output: 0,
-                            argument_points,
-                            ..
-                        } if expression == value => Some(argument_points.clone()),
-                        _ => None,
-                    })
-                    .expect("evaluated multi-output call");
-                self.uncomputed_point(
-                    CfgPointKind::Call {
-                        expression: value.clone(),
-                        output: position,
-                        target: self.call_target(value)?,
-                        argument_points,
-                    },
-                    expression_span(value),
-                    scope,
-                );
+            } else if let Some(producer) = call_producer {
+                self.project_call_output(producer, position);
             }
             let id = ReferenceBindingId {
                 source: self.source.clone(),
@@ -1527,6 +1524,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     } else {
                         self.expression(&binding.value, scope)?
                     };
+                    let call_producer = if binding.output_origin
+                        == ScalarBindingOutputOrigin::SingleExpression
+                        && matches!(binding.value, ScalarExpression::Call { .. })
+                    {
+                        Some(self.cursor.expect("evaluated binding call"))
+                    } else {
+                        None
+                    };
                     self.move_value(&binding.value, scope)?;
                     let id = ReferenceBindingId {
                         source: self.source.clone(),
@@ -1572,7 +1577,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             );
                             let old = self.names.insert(binding.name.clone(), id.clone());
                             declared.push((binding.name.clone(), id, old));
-                            self.additional_receivers(binding, block, scope, &mut declared)?;
+                            self.additional_receivers(
+                                binding,
+                                block,
+                                scope,
+                                &mut declared,
+                                call_producer,
+                            )?;
                             continue;
                         }
                         ReferenceValue::Uncomputed => None,
@@ -1600,7 +1611,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         );
                     }
                     declared.push((binding.name.clone(), id, old));
-                    self.additional_receivers(binding, block, scope, &mut declared)?;
+                    self.additional_receivers(binding, block, scope, &mut declared, call_producer)?;
                 }
                 ScalarBlockItem::Expression(expression) => {
                     let value = self.expression(expression, scope)?;
@@ -1633,35 +1644,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     }
                     if assignment.values.len() == 1 {
                         if let ScalarExpression::Call { .. } = &assignment.values[0] {
-                            let argument_points = self
-                                .cfg
-                                .points
-                                .iter()
-                                .rev()
-                                .find_map(|point| match &point.kind {
-                                    CfgPointKind::Call {
-                                        expression,
-                                        output: 0,
-                                        argument_points,
-                                        ..
-                                    } if expression == &assignment.values[0] => {
-                                        Some(argument_points.clone())
-                                    }
-                                    _ => None,
-                                })
-                                .expect("evaluated assignment call");
+                            let producer = values[0].1;
                             for position in 1..assignment.targets.len() {
-                                let rhs_point = self.point_with_origins(
-                                    CfgPointKind::Call {
-                                        expression: assignment.values[0].clone(),
-                                        output: position,
-                                        target: self.call_target(&assignment.values[0])?,
-                                        argument_points: argument_points.clone(),
-                                    },
-                                    expression_span(&assignment.values[0]),
-                                    scope,
-                                    None,
-                                );
+                                let rhs_point = self.project_call_output(producer, position);
                                 values.push((ReferenceValue::Uncomputed, rhs_point));
                             }
                         }
