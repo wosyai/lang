@@ -5984,7 +5984,12 @@ pub(super) fn validate(
                     }
                     if function.body.final_output_values.len() == 1
                         && matches!(
-                            function.body.final_output_values[0].value,
+                            function
+                                .body
+                                .final_expressions()
+                                .next()
+                                .expect("final output")
+                                .0,
                             ScalarExpression::If { .. }
                         )
                     {
@@ -5997,16 +6002,25 @@ pub(super) fn validate(
                     }
                     if function.body.final_output_values.len() == 1
                         && matches!(
-                            &function.body.final_output_values[0].value,
+                            function
+                                .body
+                                .final_expressions()
+                                .next()
+                                .expect("final output")
+                                .0,
                             ScalarExpression::Call { .. }
                         )
                     {
-                        let value = &function.body.final_output_values[0];
+                        let (expression, value) = function
+                            .body
+                            .final_expressions()
+                            .next()
+                            .expect("final output");
                         if let Some(actual_outputs) =
-                            call_output_sequence(&value.value, &scope, program, overloads)
+                            call_output_sequence(expression, &scope, program, overloads)
                         {
                             expression_type_expected(
-                                &value.value,
+                                expression,
                                 &actual_outputs
                                     .outputs
                                     .first()
@@ -6052,14 +6066,11 @@ pub(super) fn validate(
                                 function.body.span,
                             ));
                         }
-                        for (value, output) in function
-                            .body
-                            .final_output_values
-                            .iter()
-                            .zip(&outputs.outputs)
+                        for ((expression, value), output) in
+                            function.body.final_expressions().zip(&outputs.outputs)
                         {
                             let actual = expression_type_expected(
-                                &value.value,
+                                expression,
                                 &output.ty,
                                 &scope,
                                 &visible_names,
@@ -7682,12 +7693,12 @@ fn validate_conditional_output_arity(
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     if block.final_output_values.len() == output_count {
-        for output in &block.final_output_values {
+        for (expression, _) in block.final_expressions() {
             if let ScalarExpression::If {
                 then_branch,
                 else_branch,
                 ..
-            } = &output.value
+            } = expression
             {
                 validate_conditional_output_arity(then_branch, output_count, program, diagnostics);
                 validate_conditional_output_arity(else_branch, output_count, program, diagnostics);
@@ -7695,12 +7706,13 @@ fn validate_conditional_output_arity(
         }
         return;
     }
-    if let [output] = block.final_output_values.as_slice() {
+    if block.final_output_values.len() == 1 {
+        let (expression, _) = block.final_expressions().next().expect("final output");
         if let ScalarExpression::If {
             then_branch,
             else_branch,
             ..
-        } = &output.value
+        } = expression
         {
             validate_conditional_output_arity(then_branch, output_count, program, diagnostics);
             validate_conditional_output_arity(else_branch, output_count, program, diagnostics);

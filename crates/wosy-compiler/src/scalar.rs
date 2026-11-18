@@ -1771,6 +1771,19 @@ enum ScalarBlockItemRole<'a> {
 }
 
 impl ScalarBlock {
+    fn final_expressions(&self) -> impl Iterator<Item = (&ScalarExpression, &ScalarOutputValue)> {
+        let first_output = self.items.len() - self.final_output_values.len();
+        self.items[first_output..]
+            .iter()
+            .zip(&self.final_output_values)
+            .map(|(item, metadata)| {
+                let ScalarBlockItem::Expression(expression) = item else {
+                    unreachable!("canonical final output is an expression item")
+                };
+                (expression, metadata)
+            })
+    }
+
     fn items_with_output_roles(
         &self,
     ) -> impl Iterator<Item = (&ScalarBlockItem, ScalarBlockItemRole<'_>)> {
@@ -2632,20 +2645,25 @@ fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
                         }
                         if function.body.final_output_values.len() == 1
                             && matches!(
-                                &function.body.final_output_values[0].value,
+                                function
+                                    .body
+                                    .final_expressions()
+                                    .next()
+                                    .expect("final output")
+                                    .0,
                                 ScalarExpression::Call { .. }
                             )
                         {
-                            let value = &function.body.final_output_values[0];
+                            let (expression, value) = function
+                                .body
+                                .final_expressions()
+                                .next()
+                                .expect("final output");
                             if let Some(actual_outputs) = call_output_sequence_in_module(
-                                &value.value,
-                                &scope,
-                                module,
-                                &modules,
-                                &overloads,
+                                expression, &scope, module, &modules, &overloads,
                             ) {
                                 expression_type_in_module_expected(
-                                    &value.value,
+                                    expression,
                                     actual_outputs.outputs.first().map(|output| &output.ty),
                                     &scope,
                                     &visible_names,
@@ -2688,14 +2706,11 @@ fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
                                     function.body.span,
                                 ));
                             }
-                            for (value, output) in function
-                                .body
-                                .final_output_values
-                                .iter()
-                                .zip(&outputs.outputs)
+                            for ((expression, value), output) in
+                                function.body.final_expressions().zip(&outputs.outputs)
                             {
                                 let actual = expression_type_in_module_expected(
-                                    &value.value,
+                                    expression,
                                     Some(&output.ty),
                                     &scope,
                                     &visible_names,

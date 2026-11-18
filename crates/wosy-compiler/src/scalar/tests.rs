@@ -5,6 +5,8 @@ use super::typecheck::block_type;
 use super::*;
 use crate::parse_source;
 
+mod canonical_final_validation;
+
 fn source() -> SourceIdentity {
     SourceIdentity::new(
         "project".into(),
