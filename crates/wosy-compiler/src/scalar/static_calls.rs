@@ -74,7 +74,7 @@ impl PreparedScalarProject {
 
 pub struct ScalarBuildValidation<'a> {
     prepared: &'a PreparedScalarProject,
-    _results: reference::ProjectReferenceResults,
+    results: reference::ProjectReferenceResults,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -85,6 +85,16 @@ impl<'a> ScalarBuildValidation<'a> {
 
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
+    }
+
+    pub(crate) fn reference_cfg(
+        &self,
+        module_ordinal: usize,
+        item_ordinal: usize,
+        arm_index: Option<usize>,
+    ) -> Option<&ScalarReferenceCfg> {
+        self.results
+            .reference_cfg(module_ordinal, item_ordinal, arm_index)
     }
 }
 
@@ -97,7 +107,7 @@ pub fn analyze_scalar_build(prepared: &PreparedScalarProject) -> ScalarBuildVali
         .collect();
     ScalarBuildValidation {
         prepared,
-        _results: results,
+        results,
         diagnostics,
     }
 }

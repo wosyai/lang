@@ -11,9 +11,11 @@ use super::storage_type;
 use super::{LlvmFunction, LlvmFunctionAttributes, LlvmPartition, LlvmValueType};
 use crate::scalar::{CfgPointKind, CoreOperationId, ReleaseTarget, ScalarOverloadSelection};
 use crate::{
-    derive_scalar_program, derive_scalar_program_with_layout, parse_source,
-    validate_scalar_project, ScalarModule, ScalarOutput, ScalarOutputSequence, ScalarProject,
-    ScalarTargetLayout, ScalarType,
+    analyze_scalar_build, derive_scalar_declarations_from_cst, derive_scalar_program,
+    derive_scalar_program_with_layout, emit_scalar_build_project_llvm, parse_source,
+    prepare_scalar_project, validate_scalar_project, ScalarItem, ScalarModule,
+    ScalarNamespaceBinding, ScalarOutput, ScalarOutputSequence, ScalarPreparationInputs,
+    ScalarProject, ScalarTargetLayout, ScalarType,
 };
 use wosy_syntax::{ByteSpan, SourceIdentity};
 
@@ -1528,6 +1530,155 @@ fn joined_projections_of_one_owner_apply_each_core_effect_once() {
                 assert!(!body.contains("%core_effect_target"), "{llvm}");
             }
         }
+    }
+}
+
+#[test]
+fn detached_project_llvm_matches_attached_for_invalidation_and_selected_overload() {
+    let root = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let child = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/child.w".into(),
+        "r1".into(),
+    );
+    let root_cst = parse_source(
+        root.clone(),
+        "%%start
+child = namespace package \"src/child.w\";
+unit(u64) discard = fn(count) { u8[count] direct; direct[0] = 3; unsafe { core.invalidate(&direct); } };
+u8 outside = 2;
+*u8 outside_ref = &outside;
+bool use_fresh = true;
+*u8 selected = child.select(outside_ref, use_fresh);
+%%end".into(),
+        &[],
+    );
+    let child_cst = parse_source(
+        child.clone(),
+        "%%start
+*u8(*u8, bool) choose = fn(input, flag) { u8 local = 1; if (flag) { &local } else { input } };
+select = overload {
+    i64(i64) => fn(value) { value };
+    *u8(*u8, bool) => fn(input, flag) { choose(input, flag) };
+};
+%%end"
+            .into(),
+        &[],
+    );
+    assert!(
+        root_cst.diagnostics.is_empty(),
+        "{:?}",
+        root_cst.diagnostics
+    );
+    assert!(
+        child_cst.diagnostics.is_empty(),
+        "{:?}",
+        child_cst.diagnostics
+    );
+    for target_layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let declarations = derive_scalar_declarations_from_cst(root_cst.result.canonical_cst());
+        let namespace = declarations.namespaces().next().unwrap();
+        let binding = ScalarNamespaceBinding {
+            binding: namespace.binding.clone(),
+            span: namespace.span,
+            target: child.clone(),
+        };
+        let prepared = prepare_scalar_project(
+            vec![
+                (
+                    derive_scalar_declarations_from_cst(child_cst.result.canonical_cst()),
+                    Vec::new(),
+                ),
+                (declarations, vec![binding]),
+            ],
+            vec![root.clone(), child.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|invalid| panic!("{:?}", invalid.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let legacy = validate_scalar_project(prepared.project().clone());
+        assert!(legacy.diagnostics.is_empty(), "{:?}", legacy.diagnostics);
+
+        let detached_ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        assert_eq!(
+            detached_ir,
+            emit_scalar_project_llvm(&legacy).unwrap().to_text()
+        );
+        assert!(
+            detached_ir.contains("store i1 false, ptr %direct_live"),
+            "{detached_ir}"
+        );
+        assert!(
+            detached_ir.lines().any(|line| line.contains("call ")
+                && line.contains("@wosy_generic__")
+                && line.contains("ptr %checked_return_owner_0")),
+            "{detached_ir}"
+        );
+
+        let ScalarItem::Function(overload) = &legacy.project.modules[0].items[1] else {
+            panic!("expected overload at its original project position");
+        };
+        let arm = &overload.overload_arms[1];
+        assert!(!arm.reference_cfg.points.is_empty());
+        let missing = super::emit_project_llvm(&legacy.project, &|module, item, arm, function| {
+            if (module, item, arm) == (0, 1, Some(1)) {
+                build.reference_cfg(module, item, Some(overload.overload_arms.len()))
+            } else {
+                Some(&function.reference_cfg)
+            }
+        })
+        .unwrap_err();
+        assert!(
+            missing.starts_with("internal error: missing reference CFG"),
+            "{missing}"
+        );
+        assert!(missing.contains(&format!("{child:?}")), "{missing}");
+        assert!(
+            missing.contains(&format!(
+                "at {}..{} (module 0, item 1, arm Some(1))",
+                arm.span.start, arm.span.end
+            )),
+            "{missing}"
+        );
+    }
+}
+
+#[test]
+fn detached_project_llvm_rejects_build_diagnostics() {
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let parsed = parse_source(
+        source.clone(),
+        "%%start\nstruct Payload { u8 value; }\nPayload(Payload) consume = fn(input) { next = input; next; next };\n%%end".into(),
+        &[],
+    );
+    for target_layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_scalar_project(
+            vec![(
+                derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                Vec::new(),
+            )],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|invalid| panic!("{:?}", invalid.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert_eq!(build.diagnostics()[0].code, "B0003");
+        assert_eq!(
+            emit_scalar_build_project_llvm(&build).unwrap_err(),
+            "cannot emit LLVM for an invalid scalar project"
+        );
     }
 }
 

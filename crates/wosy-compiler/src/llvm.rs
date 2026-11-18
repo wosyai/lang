@@ -22,9 +22,10 @@ use crate::scalar::{
     ScalarFieldReference, ScalarOutputValue, ScalarOverloadSelection, ScalarReferenceCfg,
 };
 use crate::{
-    BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarExpression,
-    ScalarFunction, ScalarItem, ScalarModule, ScalarProjectValidation, ScalarStruct,
-    ScalarTargetLayout, ScalarType, ScalarValidation, ScalarWhile,
+    BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarBuildValidation,
+    ScalarExpression, ScalarFunction, ScalarItem, ScalarModule, ScalarProject,
+    ScalarProjectValidation, ScalarStruct, ScalarTargetLayout, ScalarType, ScalarValidation,
+    ScalarWhile,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -332,17 +333,9 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         functions.insert(function.name.clone(), value);
         call_targets.insert(function.name.clone(), function.name.clone());
     }
-    let specializations = generic_specializations(
-        &validation.program.items,
-        |name| {
-            validation.program.items.iter().find_map(|item| match item {
-                ScalarItem::Function(function) if function.name == name => Some(function),
-                _ => None,
-            })
-        },
-        |name| name.to_owned(),
-    )?;
-    for (lookup, function, name) in &specializations {
+    let specializations =
+        generic_specializations(&validation.program.items, |name| name.to_owned())?;
+    for (lookup, LlvmSpecialization { function, name, .. }) in &specializations {
         let value = module.add_function(
             name,
             definition_function_type(&context, function, &function.reference_cfg, target_layout)?,
@@ -366,7 +359,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
                 receiver.is_none().then_some((name, selection))
             }),
     );
-    for (lookup, function, name) in &overloads {
+    for (lookup, LlvmSpecialization { function, name, .. }) in &overloads {
         let value = module.add_function(
             name,
             definition_function_type(&context, function, &function.reference_cfg, target_layout)?,
@@ -434,7 +427,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             );
         }
     }
-    for (_, function, name) in specializations.iter().chain(overloads.iter()) {
+    for (_, LlvmSpecialization { function, name, .. }) in specializations.iter().chain(&overloads) {
         insert_function_result_provenance(
             &mut runtime_array_results,
             &mut dynamic_owner_outputs,
@@ -475,7 +468,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             target_layout,
         )?;
     }
-    for (_, function, name) in &specializations {
+    for (_, LlvmSpecialization { function, name, .. }) in &specializations {
         emit_function(
             &context,
             &builder,
@@ -495,7 +488,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
             target_layout,
         )?;
     }
-    for (_, function, name) in &overloads {
+    for (_, LlvmSpecialization { function, name, .. }) in &overloads {
         emit_function(
             &context,
             &builder,
@@ -547,24 +540,62 @@ pub fn emit_scalar_project_llvm(
     if !validation.diagnostics.is_empty() {
         return Err("cannot emit LLVM for an invalid scalar project".into());
     }
-    let modules = validation
-        .project
+    emit_project_llvm(&validation.project, &|_, _, _, function| {
+        Some(&function.reference_cfg)
+    })
+}
+
+pub fn emit_scalar_build_project_llvm(
+    validation: &ScalarBuildValidation<'_>,
+) -> Result<LlvmPartition, String> {
+    if !validation.diagnostics().is_empty() {
+        return Err("cannot emit LLVM for an invalid scalar project".into());
+    }
+    emit_project_llvm(validation.prepared().project(), &|module, item, arm, _| {
+        validation.reference_cfg(module, item, arm)
+    })
+}
+
+fn emit_project_llvm<'a>(
+    project: &'a ScalarProject,
+    reference_cfg: &dyn Fn(
+        usize,
+        usize,
+        Option<usize>,
+        &'a ScalarFunction,
+    ) -> Option<&'a ScalarReferenceCfg>,
+) -> Result<LlvmPartition, String> {
+    let ordered_modules = project
         .initialization_order
         .iter()
         .map(|source| {
-            validation
-                .project
+            project
                 .modules
                 .iter()
-                .find(|module| module.source == *source)
+                .enumerate()
+                .find(|(_, module)| module.source == *source)
                 .ok_or_else(|| format!("missing module {}", source.path))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let modules = ordered_modules
+        .iter()
+        .map(|&(_, module)| module)
+        .collect::<Vec<_>>();
+    let require_cfg = |module_ordinal, item_ordinal, arm_index, function: &'a ScalarFunction| {
+        reference_cfg(module_ordinal, item_ordinal, arm_index, function).ok_or_else(|| {
+            let source = &project.modules[module_ordinal].source;
+            let span = function.span;
+            format!(
+                "internal error: missing reference CFG for {} in {source:?} at {}..{} (module {module_ordinal}, item {item_ordinal}, arm {arm_index:?})",
+                function.name, span.start, span.end,
+            )
+        })
+    };
     let all_structs = modules
         .iter()
         .flat_map(|module| module.structs.iter())
         .collect::<Vec<_>>();
-    let layouts = crate::scalar::layout::ScalarLayoutIndex::project(&validation.project.modules);
+    let layouts = crate::scalar::layout::ScalarLayoutIndex::project(&project.modules);
     let module_name = modules
         .first()
         .ok_or_else(|| "project has no reachable modules".to_owned())?
@@ -574,8 +605,7 @@ pub fn emit_scalar_project_llvm(
     let context = Context::create();
     let module = ManuallyDrop::new(context.create_module(&module_name));
     let builder = context.create_builder();
-    let target_layout = validation
-        .project
+    let target_layout = project
         .modules
         .first()
         .ok_or_else(|| "project has no reachable modules".to_owned())?
@@ -586,8 +616,8 @@ pub fn emit_scalar_project_llvm(
     let mut externs = Vec::new();
     let mut call_targets = BTreeMap::new();
     let mut definitions = Vec::new();
-    for source_module in &modules {
-        for item in &source_module.items {
+    for &(module_ordinal, source_module) in &ordered_modules {
+        for (item_ordinal, item) in source_module.items.iter().enumerate() {
             if let ScalarItem::Binding(binding) = item {
                 for (name, ty) in binding_receivers(binding).iter() {
                     if *ty == ScalarType::Unit {
@@ -606,14 +636,10 @@ pub fn emit_scalar_project_llvm(
                     continue;
                 }
                 let name = project_function_name(&source_module.source, &function.name);
+                let cfg = require_cfg(module_ordinal, item_ordinal, None, function)?;
                 let value = module.add_function(
                     &name,
-                    definition_function_type(
-                        &context,
-                        function,
-                        &function.reference_cfg,
-                        target_layout,
-                    )?,
+                    definition_function_type(&context, function, cfg, target_layout)?,
                     None,
                 );
                 for (index, parameter) in function.parameters.iter().enumerate() {
@@ -624,7 +650,7 @@ pub fn emit_scalar_project_llvm(
                 functions.insert(name.clone(), value);
                 call_targets.insert(name.clone(), name.clone());
                 signatures.insert(name.clone(), function.signature.clone());
-                definitions.push((source_module, function, name));
+                definitions.push((source_module, function, cfg, name));
             }
             if let ScalarItem::Extern(extern_decl) = item {
                 let module_name = match &extern_decl.actual_module {
@@ -659,26 +685,22 @@ pub fn emit_scalar_project_llvm(
         }
     }
     let mut project_specializations = Vec::new();
-    for source_module in &modules {
-        let specializations = generic_specializations(
-            &source_module.items,
-            |name| {
-                source_module.items.iter().find_map(|item| match item {
-                    ScalarItem::Function(function) if function.name == name => Some(function),
-                    _ => None,
-                })
-            },
-            |name| project_function_name(&source_module.source, name),
-        )?;
-        for (lookup, function, name) in specializations {
+    for &(module_ordinal, source_module) in &ordered_modules {
+        let specializations = generic_specializations(&source_module.items, |name| {
+            project_function_name(&source_module.source, name)
+        })?;
+        for (lookup, specialization) in specializations {
+            let LlvmSpecialization {
+                function,
+                name,
+                template,
+                item_ordinal,
+                arm_index,
+            } = specialization;
+            let cfg = require_cfg(module_ordinal, item_ordinal, arm_index, template)?;
             let value = module.add_function(
                 &name,
-                definition_function_type(
-                    &context,
-                    &function,
-                    &function.reference_cfg,
-                    target_layout,
-                )?,
+                definition_function_type(&context, &function, cfg, target_layout)?,
                 None,
             );
             for (index, parameter) in function.parameters.iter().enumerate() {
@@ -689,11 +711,11 @@ pub fn emit_scalar_project_llvm(
             call_targets.insert(lookup, name.clone());
             signatures.insert(name.clone(), function.signature.clone());
             functions.insert(name.clone(), value);
-            project_specializations.push((source_module, function, name));
+            project_specializations.push((source_module, function, cfg, name));
         }
     }
     let mut project_overloads = Vec::new();
-    for source_module in &modules {
+    for &(module_ordinal, source_module) in &ordered_modules {
         let selections = modules.iter().flat_map(|calling_module| {
             selected_overload_selections(&calling_module.items)
                 .into_iter()
@@ -710,19 +732,22 @@ pub fn emit_scalar_project_llvm(
                     _ => None,
                 })
         });
-        for (lookup, function, name) in selected_overload_specializations(
+        for (lookup, specialization) in selected_overload_specializations(
             &source_module.items,
             |name| project_function_name(&source_module.source, name),
             selections,
         ) {
+            let LlvmSpecialization {
+                function,
+                name,
+                template,
+                item_ordinal,
+                arm_index,
+            } = specialization;
+            let cfg = require_cfg(module_ordinal, item_ordinal, arm_index, template)?;
             let value = module.add_function(
                 &name,
-                definition_function_type(
-                    &context,
-                    &function,
-                    &function.reference_cfg,
-                    target_layout,
-                )?,
+                definition_function_type(&context, &function, cfg, target_layout)?,
                 None,
             );
             for (index, parameter) in function.parameters.iter().enumerate() {
@@ -733,7 +758,7 @@ pub fn emit_scalar_project_llvm(
             call_targets.insert(lookup, name.clone());
             signatures.insert(name.clone(), function.signature.clone());
             functions.insert(name.clone(), value);
-            project_overloads.push((source_module, function, name));
+            project_overloads.push((source_module, function, cfg, name));
         }
     }
     functions.insert(
@@ -742,34 +767,25 @@ pub fn emit_scalar_project_llvm(
     );
     let mut runtime_array_results = BTreeMap::new();
     let mut dynamic_owner_outputs = BTreeMap::new();
-    for (_, function, name) in &definitions {
+    for (_, function, cfg, name) in &definitions {
         insert_function_result_provenance(
             &mut runtime_array_results,
             &mut dynamic_owner_outputs,
             name,
             function,
-            &function.reference_cfg,
+            cfg,
         );
     }
-    for (_, function, name) in &project_specializations {
+    for (_, function, cfg, name) in project_specializations.iter().chain(&project_overloads) {
         insert_function_result_provenance(
             &mut runtime_array_results,
             &mut dynamic_owner_outputs,
             name,
             function,
-            &function.reference_cfg,
+            cfg,
         );
     }
-    for (_, function, name) in &project_overloads {
-        insert_function_result_provenance(
-            &mut runtime_array_results,
-            &mut dynamic_owner_outputs,
-            name,
-            function,
-            &function.reference_cfg,
-        );
-    }
-    for (source_module, function, name) in definitions {
+    for (source_module, function, cfg, name) in definitions {
         emit_project_function(
             &context,
             &builder,
@@ -779,7 +795,7 @@ pub fn emit_scalar_project_llvm(
             &runtime_array_results,
             &dynamic_owner_outputs,
             function,
-            &function.reference_cfg,
+            cfg,
             source_module,
             &modules,
             &globals,
@@ -790,7 +806,9 @@ pub fn emit_scalar_project_llvm(
             target_layout,
         )?;
     }
-    for (source_module, function, name) in &project_specializations {
+    for (source_module, function, cfg, name) in
+        project_specializations.iter().chain(&project_overloads)
+    {
         emit_project_function(
             &context,
             &builder,
@@ -800,28 +818,7 @@ pub fn emit_scalar_project_llvm(
             &runtime_array_results,
             &dynamic_owner_outputs,
             function,
-            &function.reference_cfg,
-            source_module,
-            &modules,
-            &globals,
-            name,
-            &module,
-            &all_structs,
-            &layouts,
-            target_layout,
-        )?;
-    }
-    for (source_module, function, name) in &project_overloads {
-        emit_project_function(
-            &context,
-            &builder,
-            &functions,
-            &call_targets,
-            &signatures,
-            &runtime_array_results,
-            &dynamic_owner_outputs,
-            function,
-            &function.reference_cfg,
+            cfg,
             source_module,
             &modules,
             &globals,
@@ -3978,11 +3975,18 @@ fn encoded_llvm_name<'a>(prefix: &str, components: impl IntoIterator<Item = &'a 
     symbol
 }
 
-fn generic_specializations<'a>(
+struct LlvmSpecialization<'a> {
+    function: ScalarFunction,
+    name: String,
+    template: &'a ScalarFunction,
+    item_ordinal: usize,
+    arm_index: Option<usize>,
+}
+
+fn generic_specializations(
     items: &[ScalarItem],
-    function: impl Fn(&str) -> Option<&'a ScalarFunction>,
     symbol: impl Fn(&str) -> String,
-) -> Result<Vec<(String, ScalarFunction, String)>, String> {
+) -> Result<BTreeMap<String, LlvmSpecialization<'_>>, String> {
     let mut calls = Vec::new();
     for item in items {
         match item {
@@ -3993,7 +3997,17 @@ fn generic_specializations<'a>(
     }
     let mut specializations = BTreeMap::new();
     for (name, arguments) in calls {
-        let Some(function) = function(&name) else {
+        let Some((item_ordinal, function)) =
+            items
+                .iter()
+                .enumerate()
+                .find_map(|(index, item)| match item {
+                    ScalarItem::Function(function) if function.name == name => {
+                        Some((index, function))
+                    }
+                    _ => None,
+                })
+        else {
             continue;
         };
         if function.generic_parameters.is_empty() {
@@ -4007,35 +4021,39 @@ fn generic_specializations<'a>(
         let lookup = generic_specialization_key(&base, &arguments);
         let name = generic_specialization_name(&base, &arguments);
         specializations.entry(lookup).or_insert_with(|| {
-            let mut function = function.clone();
-            function.signature = signature;
-            function.generic_parameters.clear();
-            (function, name)
+            let mut body = function.clone();
+            body.signature = signature;
+            body.generic_parameters.clear();
+            LlvmSpecialization {
+                function: body,
+                name,
+                template: function,
+                item_ordinal,
+                arm_index: None,
+            }
         });
     }
-    Ok(specializations
-        .into_iter()
-        .map(|(lookup, (function, name))| (lookup, function, name))
-        .collect())
+    Ok(specializations)
 }
 
 fn selected_overload_specializations(
     items: &[ScalarItem],
     symbol: impl Fn(&str) -> String,
     selections: impl IntoIterator<Item = (String, ScalarOverloadSelection)>,
-) -> Vec<(String, ScalarFunction, String)> {
+) -> BTreeMap<String, LlvmSpecialization<'_>> {
     let overloads = items
         .iter()
-        .filter_map(|item| match item {
+        .enumerate()
+        .filter_map(|(index, item)| match item {
             ScalarItem::Function(function) if !function.overload_arms.is_empty() => {
-                Some((function.name.as_str(), function))
+                Some((function.name.as_str(), (index, function)))
             }
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
     let mut selections = selections.into_iter().collect::<Vec<_>>();
     let mut specializations = BTreeMap::new();
-    for (name, overload) in &overloads {
+    for (name, (_, overload)) in &overloads {
         for (arm_index, arm) in overload.overload_arms.iter().enumerate() {
             if arm.generic_parameters.is_empty() {
                 selections.push((
@@ -4049,7 +4067,7 @@ fn selected_overload_specializations(
         }
     }
     for (name, selection) in selections {
-        let Some(overload) = overloads.get(name.as_str()) else {
+        let Some(&(item_ordinal, overload)) = overloads.get(name.as_str()) else {
             continue;
         };
         let Some(arm) = overload.overload_arms.get(selection.arm_index) else {
@@ -4061,9 +4079,9 @@ fn selected_overload_specializations(
             .iter()
             .map(|parameter| selection.substitutions[&parameter.name].clone())
             .collect::<Vec<_>>();
-        let mut arm = arm.clone();
-        arm.signature = substitute_generic_signature(&arm, &arguments);
-        arm.generic_parameters.clear();
+        let mut function = arm.clone();
+        function.signature = substitute_generic_signature(&function, &arguments);
+        function.generic_parameters.clear();
         let lookup = selected_overload_lookup_key(&base, &selection);
         let name = generic_specialization_name(
             &encoded_llvm_name(
@@ -4072,12 +4090,15 @@ fn selected_overload_specializations(
             ),
             &arguments,
         );
-        specializations.entry(lookup).or_insert((arm, name));
+        specializations.entry(lookup).or_insert(LlvmSpecialization {
+            function,
+            name,
+            template: arm,
+            item_ordinal,
+            arm_index: Some(selection.arm_index),
+        });
     }
     specializations
-        .into_iter()
-        .map(|(lookup, (function, name))| (lookup, function, name))
-        .collect()
 }
 
 fn selected_overload_selections(

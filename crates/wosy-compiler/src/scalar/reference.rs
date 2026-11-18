@@ -4927,6 +4927,28 @@ impl ProjectReferenceResults {
         &self.errors
     }
 
+    pub(super) fn reference_cfg(
+        &self,
+        module_ordinal: usize,
+        item_ordinal: usize,
+        arm_index: Option<usize>,
+    ) -> Option<&ScalarReferenceCfg> {
+        let module = self
+            .updates
+            .binary_search_by_key(&module_ordinal, |(ordinal, _)| *ordinal)
+            .ok()?;
+        let items = &self.updates[module].1;
+        let item = items
+            .binary_search_by_key(&item_ordinal, |(ordinal, _)| *ordinal)
+            .ok()?;
+        let result = &items[item].1;
+        let body = match arm_index {
+            Some(arm) => result.arms.get(arm)?,
+            None => result,
+        };
+        Some(&body.cfg)
+    }
+
     pub(super) fn install(self, modules: &mut [ScalarModule]) -> Vec<ReferenceAnalysisError> {
         for (index, results) in self.updates {
             install_module_reference_results(&mut modules[index].items, results);
