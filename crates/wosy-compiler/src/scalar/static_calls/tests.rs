@@ -8,6 +8,8 @@ mod neutral_assignments;
 
 mod neutral_branches;
 
+mod neutral_blocks;
+
 fn parsed(text: &str) -> wosy_syntax::ParseResult {
     let identity = SourceIdentity::new(
         "project".into(),

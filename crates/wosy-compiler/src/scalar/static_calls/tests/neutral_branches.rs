@@ -1,11 +1,12 @@
 use super::*;
-use crate::scalar::control::{BlockPosition, ConditionalRegion, ValueArm};
+use crate::scalar::control::{BlockPosition, ConditionalRegion};
 use reference::{
     FunctionCallSites, OccurrenceEdge as Edge, OccurrenceNode as Node, OccurrenceParent as Parent,
 };
 
-fn assert_arm(row: &FunctionCallSites, arm: &ValueArm, syntax: &ScalarBlock) {
-    assert_eq!(row.structure.blocks[arm.block.0], syntax.span);
+fn assert_arm(row: &FunctionCallSites, arm: reference::BlockOrdinal, syntax: &ScalarBlock) {
+    let region = &row.structure.blocks[arm.0];
+    assert_eq!(region.span, syntax.span);
     let expected = syntax
         .items_with_output_roles()
         .enumerate()
@@ -16,11 +17,11 @@ fn assert_arm(row: &FunctionCallSites, arm: &ValueArm, syntax: &ScalarBlock) {
             ScalarBlockItemRole::Ordinary => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(arm.outputs.len(), expected.len());
-    for (slot, (item, output, span)) in arm.outputs.iter().zip(expected) {
+    assert_eq!(region.final_outputs().count(), expected.len());
+    for (slot, (item, output, span)) in region.final_outputs().zip(expected) {
         assert_eq!((slot.item, slot.output, slot.span), (item, output, span));
         assert_eq!(
-            row.structure.edges[&(Parent::Block(arm.block), Edge::FinalOutput { item, output })],
+            row.structure.edges[&(Parent::Block(arm), Edge::FinalOutput { item, output })],
             Node::Expression(slot.expression)
         );
     }
@@ -100,8 +101,8 @@ fn prepared_branch_regions_preserve_polarity_continuations_and_inherited_query_e
         let ConditionalRegion::Value {
             span,
             condition: test,
-            then_arm,
-            else_arm,
+            then_block,
+            else_block,
             resume,
         } = &choose.conditionals[&choose_ordinal]
         else {
@@ -113,8 +114,8 @@ fn prepared_branch_regions_preserve_polarity_continuations_and_inherited_query_e
             choose.structure.edges[&(Parent::Expression(choose_ordinal), Edge::Condition)],
             Node::Expression(*test)
         );
-        assert_arm(choose, then_arm, then_branch);
-        assert_arm(choose, else_arm, else_branch);
+        assert_arm(choose, *then_block, then_branch);
+        assert_arm(choose, *else_block, else_branch);
         let ScalarExpression::Call { arguments, .. } = condition.as_ref() else {
             panic!("effectful condition call")
         };
@@ -154,7 +155,7 @@ fn prepared_branch_regions_preserve_polarity_continuations_and_inherited_query_e
         };
         assert_eq!(span, expression_span(unit));
         assert_eq!(fallthrough, unit_ordinal);
-        assert_eq!(route.structure.blocks[then_block.0], unit_body.span);
+        assert_eq!(route.structure.blocks[then_block.0].span, unit_body.span);
         assert_eq!(
             route.structure.edges[&(Parent::Expression(unit_ordinal), Edge::Condition)],
             Node::Expression(test)

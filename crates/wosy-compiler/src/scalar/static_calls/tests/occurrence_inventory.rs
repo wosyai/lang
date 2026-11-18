@@ -199,7 +199,7 @@ fn preparation_publishes_stable_callable_owned_expression_place_and_call_ordinal
             panic!("actual function item ordinal")
         };
         let arm = &function.overload_arms[0];
-        assert_eq!(row.structure.blocks[0], arm.body.span);
+        assert_eq!(row.structure.blocks[0].span, arm.body.span);
         let ScalarBlockItem::Expression(ScalarExpression::If {
             then_branch,
             else_branch,
@@ -208,8 +208,8 @@ fn preparation_publishes_stable_callable_owned_expression_place_and_call_ordinal
         else {
             panic!("conditional item")
         };
-        assert_eq!(row.structure.blocks[1], then_branch.span);
-        assert_eq!(row.structure.blocks[2], else_branch.span);
+        assert_eq!(row.structure.blocks[1].span, then_branch.span);
+        assert_eq!(row.structure.blocks[2].span, else_branch.span);
         let ScalarBlockItem::LocalBinding(binding) = &arm.body.items[0] else {
             panic!("projected binding")
         };

@@ -20,17 +20,13 @@ pub(super) struct AssignmentSlot {
     pub(super) target_span: ByteSpan,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum AssignmentContinuation {
-    Unit,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AssignmentGroup {
     pub(super) span: ByteSpan,
     evaluations: Vec<AssignmentEvaluation>,
     projections: Vec<AssignmentProjection>,
     slots: Vec<AssignmentSlot>,
+    next: BlockPosition,
 }
 
 impl AssignmentGroup {
@@ -39,12 +35,14 @@ impl AssignmentGroup {
         evaluations: Vec<AssignmentEvaluation>,
         projections: Vec<AssignmentProjection>,
         slots: Vec<AssignmentSlot>,
+        next: BlockPosition,
     ) -> Self {
         Self {
             span,
             evaluations,
             projections,
             slots,
+            next,
         }
     }
 
@@ -68,8 +66,8 @@ impl AssignmentGroup {
         self.slots.iter()
     }
 
-    pub(super) fn continuation(&self) -> AssignmentContinuation {
-        AssignmentContinuation::Unit
+    pub(super) fn continuation(&self) -> BlockPosition {
+        self.next
     }
 }
 
@@ -82,9 +80,54 @@ pub(super) struct FinalOutputSlot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ValueArm {
-    pub(super) block: BlockOrdinal,
-    pub(super) outputs: Vec<FinalOutputSlot>,
+pub(super) enum BindingOutput {
+    Evaluate {
+        position: usize,
+        expression: OccurrenceOrdinal,
+    },
+    ProjectPrimary {
+        output: usize,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BindingRegion {
+    pub(super) primary: OccurrenceOrdinal,
+    pub(super) secondary: Vec<BindingOutput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum BlockItemKind {
+    Binding(BindingRegion),
+    Evaluation { expression: OccurrenceOrdinal },
+    FinalOutput(FinalOutputSlot),
+    Assignment { group: BlockPosition },
+    While { region: BlockPosition },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BlockItem {
+    pub(super) position: usize,
+    pub(super) kind: BlockItemKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BlockRegion {
+    pub(super) span: ByteSpan,
+    pub(super) items: Vec<BlockItem>,
+}
+
+impl BlockRegion {
+    pub(super) fn new(span: ByteSpan, items: Vec<BlockItem>) -> Self {
+        Self { span, items }
+    }
+
+    pub(super) fn final_outputs(&self) -> impl Iterator<Item = &FinalOutputSlot> {
+        self.items.iter().filter_map(|item| match &item.kind {
+            BlockItemKind::FinalOutput(slot) => Some(slot),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,8 +135,8 @@ pub(super) enum ConditionalRegion {
     Value {
         span: ByteSpan,
         condition: OccurrenceOrdinal,
-        then_arm: ValueArm,
-        else_arm: ValueArm,
+        then_block: BlockOrdinal,
+        else_block: BlockOrdinal,
         resume: OccurrenceOrdinal,
     },
     Unit {

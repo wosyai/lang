@@ -1,5 +1,5 @@
 use super::*;
-use crate::scalar::control::AssignmentContinuation;
+use crate::scalar::control::BlockPosition;
 use reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent};
 
 #[test]
@@ -39,7 +39,13 @@ fn preparation_publishes_neutral_assignment_stages_consumed_by_the_existing_quer
             };
             let group = &row.assignments[&(row.structure.root, item)];
             assert_eq!(group.span, assignment.span);
-            assert_eq!(group.continuation(), AssignmentContinuation::Unit);
+            assert_eq!(
+                group.continuation(),
+                BlockPosition {
+                    block: row.structure.root,
+                    item: item + 1
+                }
+            );
             let evaluations = group.rhs_evaluations().collect::<Vec<_>>();
             assert_eq!(evaluations.len(), assignment.values.len());
             for (position, evaluation) in evaluations.iter().enumerate() {

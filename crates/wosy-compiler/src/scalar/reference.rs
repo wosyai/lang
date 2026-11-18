@@ -1,9 +1,7 @@
+use super::control::{AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentSlot};
 use super::control::{
-    AssignmentContinuation, AssignmentEvaluation, AssignmentGroup, AssignmentProjection,
-    AssignmentSlot,
-};
-use super::control::{
-    BlockPosition, ConditionalRegion, FinalOutputSlot, ShortCircuitRegion, ValueArm, WhileRegion,
+    BindingOutput, BindingRegion, BlockItem, BlockItemKind, BlockPosition, BlockRegion,
+    ConditionalRegion, FinalOutputSlot, ShortCircuitRegion, WhileRegion,
 };
 use super::*;
 
@@ -590,9 +588,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let (condition_ordinal, then_block) = match region {
             ConditionalRegion::Value {
                 condition,
-                then_arm,
+                then_block,
                 ..
-            } => (*condition, then_arm.block),
+            } => (*condition, *then_block),
             ConditionalRegion::Unit {
                 condition,
                 then_block,
@@ -620,10 +618,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
         self.checked = incoming_checked.clone();
         self.cursor = Some(branch);
         let (else_value, else_end) = if let Some(else_branch) = else_branch {
-            let ConditionalRegion::Value { else_arm, .. } = region else {
+            let ConditionalRegion::Value { else_block, .. } = region else {
                 unreachable!("value conditional region")
             };
-            let result = self.block(else_branch, else_arm.block)?;
+            let result = self.block(else_branch, *else_block)?;
             (result, self.cursor.expect("else branch terminal"))
         } else {
             (None, branch)
@@ -1721,25 +1719,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
         scope: ReferenceScopeId,
         declared: &mut Vec<(String, ReferenceBindingId, Option<ReferenceBindingId>)>,
         call_producer: Option<CfgPointId>,
-        parent: OccurrenceParent,
-        item: usize,
+        region: &BindingRegion,
     ) -> Result<(), ReferenceAnalysisError> {
         for (position, receiver) in binding.receivers.iter().enumerate().skip(1) {
-            match binding.output_source(position) {
-                ScalarBindingOutput::Evaluate(value) => {
-                    self.expression_child(
-                        value,
-                        scope,
-                        parent,
-                        OccurrenceEdge::BindingRoot {
-                            item,
-                            output: position,
-                        },
-                    )?;
+            match &region.secondary[position - 1] {
+                BindingOutput::Evaluate {
+                    position: source,
+                    expression,
+                } => {
+                    self.expression(&binding.output_values[*source].value, scope, *expression)?;
                 }
-                ScalarBindingOutput::ProjectPrimary { output } => {
+                BindingOutput::ProjectPrimary { output } => {
                     if let Some(producer) = call_producer {
-                        self.project_call_output(producer, output);
+                        self.project_call_output(producer, *output);
                     }
                 }
             }
@@ -1819,24 +1811,41 @@ impl<'a> ReferenceFlowBuilder<'a> {
     ) -> Result<Option<ReferenceValue>, ReferenceAnalysisError> {
         let scope = ReferenceScopeId(self.next_scope);
         self.next_scope += 1;
-        self.point(CfgPointKind::ScopeEnter, block.span, scope, BTreeSet::new());
+        let calls = self.call_sites;
+        let region = &calls.structure.blocks[ordinal.0];
+        assert_eq!(
+            region.items.len(),
+            block.items.len(),
+            "mismatched block item count in {:?}",
+            self.source
+        );
+        self.point(
+            CfgPointKind::ScopeEnter,
+            region.span,
+            scope,
+            BTreeSet::new(),
+        );
         let mut declared = Vec::new();
         let mut result = None;
         let mut return_values = Vec::new();
-        let parent = OccurrenceParent::Block(ordinal);
-        for (item_index, (item, role)) in block.items_with_output_roles().enumerate() {
-            match item {
-                ScalarBlockItem::LocalBinding(binding) => {
-                    let ScalarBindingOutput::Evaluate(primary) = binding.output_source(0) else {
-                        unreachable!("primary binding output evaluates its source")
-                    };
-                    let primary_ordinal = self.expression_ordinal(
-                        parent,
-                        OccurrenceEdge::BindingRoot {
-                            item: item_index,
-                            output: 0,
-                        },
-                    );
+        let mut next_item = 0;
+        while next_item < region.items.len() {
+            let record = &region.items[next_item];
+            assert_eq!(
+                record.position, next_item,
+                "mismatched block item position in {:?}",
+                self.source
+            );
+            let item_index = record.position;
+            next_item = item_index + 1;
+            let item = &block.items[item_index];
+            match (item, &record.kind) {
+                (
+                    ScalarBlockItem::LocalBinding(binding),
+                    BlockItemKind::Binding(binding_region),
+                ) => {
+                    let primary = &binding.value;
+                    let primary_ordinal = binding_region.primary;
                     let value = if matches!(binding.declared_type, ScalarType::RawPointer(_))
                         && matches!(primary, ScalarExpression::Name { name, .. } if name == "null")
                     {
@@ -1909,8 +1918,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 scope,
                                 &mut declared,
                                 call_producer,
-                                parent,
-                                item_index,
+                                binding_region,
                             )?;
                             continue;
                         }
@@ -1945,28 +1953,24 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         scope,
                         &mut declared,
                         call_producer,
-                        parent,
-                        item_index,
+                        binding_region,
                     )?;
                 }
-                ScalarBlockItem::Expression(expression) => {
-                    let edge = match &role {
-                        ScalarBlockItemRole::Ordinary => {
-                            OccurrenceEdge::ExpressionItem { item: item_index }
-                        }
-                        ScalarBlockItemRole::FinalOutput { output, .. } => {
-                            OccurrenceEdge::FinalOutput {
-                                item: item_index,
-                                output: *output,
-                            }
-                        }
+                (
+                    ScalarBlockItem::Expression(expression),
+                    kind @ (BlockItemKind::Evaluation { .. } | BlockItemKind::FinalOutput(_)),
+                ) => {
+                    let ordinal = match kind {
+                        BlockItemKind::Evaluation { expression } => *expression,
+                        BlockItemKind::FinalOutput(slot) => slot.expression,
+                        _ => unreachable!("expression item region"),
                     };
-                    let ordinal = self.expression_ordinal(parent, edge);
                     let value = self.expression(expression, scope, ordinal)?;
                     let value_point = self.cursor.expect("evaluated output expression");
                     self.move_value(expression, scope, ordinal)?;
-                    if let ScalarBlockItemRole::FinalOutput { output, metadata } = role {
-                        return_values.push((output, value_point, metadata));
+                    if let BlockItemKind::FinalOutput(slot) = kind {
+                        let metadata = &block.final_output_values[slot.output];
+                        return_values.push(value_point);
                         if matches!(value, ReferenceValue::Checked(_)) {
                             result = Some(value);
                         } else if matches!(value, ReferenceValue::Uncomputed)
@@ -1976,10 +1980,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                     }
                 }
-                ScalarBlockItem::Assignment(assignment) => {
+                (
+                    ScalarBlockItem::Assignment(assignment),
+                    BlockItemKind::Assignment { group: key },
+                ) => {
                     let output_types = self.assignment_output_types(assignment)?;
                     let calls = self.call_sites;
-                    let group = &calls.assignments[&(ordinal, item_index)];
+                    let group = &calls.assignments[&(key.block, key.item)];
                     let mut values = Vec::new();
                     for evaluation in group.rhs_evaluations() {
                         let value = &assignment.values[evaluation.position];
@@ -2181,13 +2188,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             writes.push(install);
                         }
                     }
-                    match group.continuation() {
-                        AssignmentContinuation::Unit => {}
-                    }
+                    let continuation = group.continuation();
+                    assert_eq!(
+                        continuation,
+                        BlockPosition {
+                            block: ordinal,
+                            item: item_index + 1
+                        }
+                    );
+                    next_item = continuation.item;
                 }
-                ScalarBlockItem::While(loop_) => {
-                    let region = self.call_sites.loops[&(ordinal, item_index)];
-                    let (body, test) = region.body_to_test();
+                (ScalarBlockItem::While(loop_), BlockItemKind::While { region: key }) => {
+                    let loop_region = self.call_sites.loops[&(key.block, key.item)];
+                    let (body, test) = loop_region.body_to_test();
                     let loop_head = self.point(
                         CfgPointKind::LoopTest {
                             condition: loop_.condition.clone(),
@@ -2216,32 +2229,40 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     self.checked = checked;
                     self.cursor = Some(branch);
                     self.point(CfgPointKind::Join, loop_.span, scope, BTreeSet::new());
+                    assert_eq!(
+                        loop_region.on_false,
+                        BlockPosition {
+                            block: ordinal,
+                            item: item_index + 1
+                        }
+                    );
+                    next_item = loop_region.on_false.item;
                 }
+                _ => panic!(
+                    "mismatched block item {ordinal:?}/{item_index} in {:?}",
+                    self.source
+                ),
             }
         }
         if scope == ReferenceScopeId(0) {
-            for (output, value_point, metadata) in return_values {
+            for (slot, value_point) in region.final_outputs().zip(return_values) {
+                let metadata = &block.final_output_values[slot.output];
                 self.uncomputed_point(
                     CfgPointKind::ReturnOutput {
-                        output,
+                        output: slot.output,
                         value_point,
                         checked: matches!(metadata.ty, ScalarType::CheckedReference { .. }),
                     },
-                    metadata.span,
+                    slot.span,
                     scope,
                 );
             }
         }
-        self.point(CfgPointKind::ScopeExit, block.span, scope, BTreeSet::new());
-        if scope == ReferenceScopeId(0) && !block.final_output_values.is_empty() {
+        self.point(CfgPointKind::ScopeExit, region.span, scope, BTreeSet::new());
+        if scope == ReferenceScopeId(0) && region.final_outputs().next().is_some() {
             let return_span = ByteSpan::new(
-                block
-                    .final_output_values
-                    .first()
-                    .expect("output")
-                    .span
-                    .start,
-                block.final_output_values.last().expect("output").span.end,
+                region.final_outputs().next().expect("output").span.start,
+                region.final_outputs().last().expect("output").span.end,
             );
             if let Some(value) = &result {
                 match value {
@@ -3841,7 +3862,7 @@ pub(super) enum OccurrenceNode {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct OccurrenceStructure {
     pub(super) root: BlockOrdinal,
-    pub(super) blocks: Vec<ByteSpan>,
+    pub(super) blocks: Vec<BlockRegion>,
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
 }
 
@@ -3849,7 +3870,7 @@ impl OccurrenceStructure {
     fn new(span: ByteSpan) -> Self {
         Self {
             root: BlockOrdinal(0),
-            blocks: vec![span],
+            blocks: vec![BlockRegion::new(span, Vec::new())],
             edges: HashMap::new(),
         }
     }
@@ -4141,14 +4162,14 @@ impl ValidatedCallResolver<'_> {
             } => {
                 let condition =
                     self.expression_at(condition, names, types, parent, OccurrenceEdge::Condition)?;
-                let then_arm = self.block(
+                let then_block = self.block(
                     then_branch,
                     names,
                     types,
                     parent,
                     OccurrenceEdge::ThenBranch,
                 )?;
-                let else_arm = self.block(
+                let else_block = self.block(
                     else_branch,
                     names,
                     types,
@@ -4162,8 +4183,8 @@ impl ValidatedCallResolver<'_> {
                         ConditionalRegion::Value {
                             span: expression_span(expression),
                             condition,
-                            then_arm,
-                            else_arm,
+                            then_block,
+                            else_block,
                             resume: ordinal,
                         }
                     )
@@ -4176,7 +4197,7 @@ impl ValidatedCallResolver<'_> {
             } => {
                 let condition =
                     self.expression_at(condition, names, types, parent, OccurrenceEdge::Condition)?;
-                let then_arm = self.block(
+                let then_block = self.block(
                     then_branch,
                     names,
                     types,
@@ -4190,7 +4211,7 @@ impl ValidatedCallResolver<'_> {
                         ConditionalRegion::Unit {
                             span: expression_span(expression),
                             condition,
-                            then_block: then_arm.block,
+                            then_block,
                             fallthrough: ordinal,
                         }
                     )
@@ -4285,19 +4306,18 @@ impl ValidatedCallResolver<'_> {
         outer_types: &BTreeMap<String, ScalarType>,
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
-    ) -> Result<ValueArm, ReferenceAnalysisError> {
+    ) -> Result<BlockOrdinal, ReferenceAnalysisError> {
         let ordinal = BlockOrdinal(self.structure.blocks.len());
-        self.structure.blocks.push(block.span);
+        self.structure
+            .blocks
+            .push(BlockRegion::new(block.span, Vec::new()));
         assert!(self
             .structure
             .edges
             .insert((parent, edge), OccurrenceNode::Block(ordinal))
             .is_none());
-        let outputs = self.block_items(block, outer, outer_types, ordinal)?;
-        Ok(ValueArm {
-            block: ordinal,
-            outputs,
-        })
+        self.block_items(block, outer, outer_types, ordinal)?;
+        Ok(ordinal)
     }
 
     fn block_items(
@@ -4306,18 +4326,18 @@ impl ValidatedCallResolver<'_> {
         outer: &BTreeMap<String, ReferenceBindingId>,
         outer_types: &BTreeMap<String, ScalarType>,
         ordinal: BlockOrdinal,
-    ) -> Result<Vec<FinalOutputSlot>, ReferenceAnalysisError> {
+    ) -> Result<(), ReferenceAnalysisError> {
         let parent = OccurrenceParent::Block(ordinal);
-        let mut outputs = Vec::new();
+        let mut items = Vec::new();
         let mut names = outer.clone();
         let mut types = outer_types.clone();
         for (item_index, (item, role)) in block.items_with_output_roles().enumerate() {
-            match item {
+            let kind = match item {
                 ScalarBlockItem::LocalBinding(binding) => {
                     let ScalarBindingOutput::Evaluate(primary) = binding.output_source(0) else {
                         unreachable!("primary binding output evaluates its source")
                     };
-                    self.expression(
+                    let primary = self.expression_at(
                         primary,
                         &names,
                         &types,
@@ -4327,21 +4347,36 @@ impl ValidatedCallResolver<'_> {
                             output: 0,
                         },
                     )?;
-                    for position in 1..binding.output_values.len() {
-                        if let ScalarBindingOutput::Evaluate(value) =
-                            binding.output_source(position)
-                        {
-                            self.expression(
-                                value,
-                                &names,
-                                &types,
-                                parent,
-                                OccurrenceEdge::BindingRoot {
-                                    item: item_index,
-                                    output: position,
-                                },
-                            )?;
+                    let output_count = match binding.output_origin {
+                        ScalarBindingOutputOrigin::SingleExpression => binding.receivers.len(),
+                        ScalarBindingOutputOrigin::IndependentExpressions => {
+                            binding.output_values.len()
                         }
+                    };
+                    let mut secondary = Vec::with_capacity(output_count.saturating_sub(1));
+                    for position in 1..output_count {
+                        let output = match binding.output_source(position) {
+                            ScalarBindingOutput::Evaluate(value) => {
+                                let expression = self.expression_at(
+                                    value,
+                                    &names,
+                                    &types,
+                                    parent,
+                                    OccurrenceEdge::BindingRoot {
+                                        item: item_index,
+                                        output: position,
+                                    },
+                                )?;
+                                BindingOutput::Evaluate {
+                                    position,
+                                    expression,
+                                }
+                            }
+                            ScalarBindingOutput::ProjectPrimary { output } => {
+                                BindingOutput::ProjectPrimary { output }
+                            }
+                        };
+                        secondary.push(output);
                     }
                     for receiver in &binding.receivers {
                         types.insert(receiver.name.clone(), receiver.ty.clone());
@@ -4356,6 +4391,7 @@ impl ValidatedCallResolver<'_> {
                             },
                         );
                     }
+                    BlockItemKind::Binding(BindingRegion { primary, secondary })
                 }
                 ScalarBlockItem::Expression(expression) => {
                     let edge = match &role {
@@ -4371,13 +4407,16 @@ impl ValidatedCallResolver<'_> {
                     };
                     let expression =
                         self.expression_at(expression, &names, &types, parent, edge)?;
-                    if let ScalarBlockItemRole::FinalOutput { output, metadata } = role {
-                        outputs.push(FinalOutputSlot {
-                            item: item_index,
-                            output,
-                            expression,
-                            span: metadata.span,
-                        });
+                    match role {
+                        ScalarBlockItemRole::FinalOutput { output, metadata } => {
+                            BlockItemKind::FinalOutput(FinalOutputSlot {
+                                item: item_index,
+                                output,
+                                expression,
+                                span: metadata.span,
+                            })
+                        }
+                        ScalarBlockItemRole::Ordinary => BlockItemKind::Evaluation { expression },
                     }
                 }
                 ScalarBlockItem::Assignment(assignment) => {
@@ -4428,7 +4467,16 @@ impl ValidatedCallResolver<'_> {
                         .assignments
                         .insert(
                             (ordinal, item_index),
-                            AssignmentGroup::new(assignment.span, evaluations, projections, slots)
+                            AssignmentGroup::new(
+                                assignment.span,
+                                evaluations,
+                                projections,
+                                slots,
+                                BlockPosition {
+                                    block: ordinal,
+                                    item: item_index + 1
+                                }
+                            )
                         )
                         .is_none());
                     for target in &assignment.targets {
@@ -4454,6 +4502,12 @@ impl ValidatedCallResolver<'_> {
                             }
                         }
                     }
+                    BlockItemKind::Assignment {
+                        group: BlockPosition {
+                            block: ordinal,
+                            item: item_index,
+                        },
+                    }
                 }
                 ScalarBlockItem::While(while_expression) => {
                     let test = self.expression_at(
@@ -4477,7 +4531,7 @@ impl ValidatedCallResolver<'_> {
                             WhileRegion {
                                 span: while_expression.span,
                                 test,
-                                body: body.block,
+                                body,
                                 on_false: BlockPosition {
                                     block: ordinal,
                                     item: item_index + 1
@@ -4485,10 +4539,21 @@ impl ValidatedCallResolver<'_> {
                             }
                         )
                         .is_none());
+                    BlockItemKind::While {
+                        region: BlockPosition {
+                            block: ordinal,
+                            item: item_index,
+                        },
+                    }
                 }
-            }
+            };
+            items.push(BlockItem {
+                position: item_index,
+                kind,
+            });
         }
-        Ok(outputs)
+        self.structure.blocks[ordinal.0] = BlockRegion::new(block.span, items);
+        Ok(())
     }
 }
 
