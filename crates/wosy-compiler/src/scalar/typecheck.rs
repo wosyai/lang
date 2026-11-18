@@ -5856,6 +5856,7 @@ pub(super) fn validate(
     }
     let mut scope = declarations.clone();
     for item in items {
+        inference.set_validation_root(item);
         match item {
             ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
             ScalarItem::Binding(binding) => {

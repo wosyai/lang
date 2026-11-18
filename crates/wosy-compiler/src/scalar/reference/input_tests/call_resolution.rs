@@ -267,7 +267,8 @@ fn standalone_call_lookup_borrows_actual_inputs_and_preserves_complete_indirect_
                 &module.items,
                 &module.namespace_bindings,
                 &views,
-                module.resolved_assignment_outputs.as_map()
+                module.resolved_assignment_outputs.as_map(),
+                WalkMode::StructuralOnly,
             )
             .unwrap()
             .functions[&1]

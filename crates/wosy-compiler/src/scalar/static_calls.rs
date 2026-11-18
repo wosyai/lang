@@ -10,12 +10,16 @@ impl PreparedProgram {
         declarations: ScalarSourceDeclarations,
         target_layout: ScalarTargetLayout,
     ) -> Result<Self, ScalarValidation> {
-        let validation = typecheck_scalar_program(declarations, target_layout);
+        let (validation, initialization_outputs) =
+            typecheck_scalar_program_with_initialization_outputs(declarations, target_layout);
         if !validation.diagnostics.is_empty() {
             return Err(validation);
         }
         let program = validation.program;
-        let calls = reference::resolve_program_call_sites(&program);
+        let calls = reference::resolve_program_call_sites_with_initialization_outputs(
+            &program,
+            initialization_outputs,
+        );
         Ok(Self { program, calls })
     }
 
@@ -45,12 +49,16 @@ pub struct PreparedScalarProject {
 
 impl PreparedScalarProject {
     pub(super) fn new(project: ScalarProject) -> Result<Self, ScalarProjectValidation> {
-        let validation = typecheck_scalar_project(project);
+        let (validation, initialization_outputs) =
+            typecheck_scalar_project_with_initialization_outputs(project);
         if !validation.diagnostics.is_empty() {
             return Err(validation);
         }
         let project = validation.project;
-        let calls = reference::resolve_project_call_sites(&project.modules);
+        let calls = reference::resolve_project_call_sites_with_initialization_outputs(
+            &project.modules,
+            initialization_outputs,
+        );
         Ok(Self { project, calls })
     }
 

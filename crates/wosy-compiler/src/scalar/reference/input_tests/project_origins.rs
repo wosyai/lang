@@ -157,6 +157,7 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
             &modules[0].namespace_bindings,
             &views,
             modules[0].resolved_assignment_outputs.as_map(),
+            WalkMode::StructuralOnly,
         )
         .unwrap();
         drop(views);
@@ -184,6 +185,7 @@ fn module_lookup_failure_preserves_prior_slots_and_later_modules_still_attach() 
             &modules[0].namespace_bindings,
             &views,
             modules[0].resolved_assignment_outputs.as_map(),
+            WalkMode::StructuralOnly,
         )
         .unwrap_err();
         drop(views);
@@ -732,7 +734,7 @@ fn prepared_module_initialization_publishes_nested_canonical_occurrences() {
         assert!(rhs.expression.0 < destination.destination.0);
         assert_eq!(
             destination.replacement,
-            AssignmentReplacement::StructuralOnly
+            AssignmentReplacement::Resolved(ScalarType::I32)
         );
         assert_eq!(group.previous_observations().next(), Some(destination));
         assert_eq!(group.installs().next(), Some(destination));
@@ -744,5 +746,111 @@ fn prepared_module_initialization_publishes_nested_canonical_occurrences() {
             }
         );
         assert_eq!(topology.calls, [short.right, rhs.expression]);
+    }
+}
+
+#[test]
+fn prepared_module_initialization_preserves_ordered_replacement_types() {
+    let text = "%%start
+(i32, bool)() pair = fn() { 7, true };
+(bool, i32)() reverse = fn() { false, 9 };
+i32 number = 0;
+bool flag = false;
+i32 initialized = if (true) { number, flag = pair(); number } else { 0 };
+if (true) { flag, number = reverse(); };
+%%end";
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "root.w".into(),
+        "r1".into(),
+    );
+    for target_layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let stages = stage_observations::Scope::new();
+        let prepared = crate::prepare_scalar_project(
+            vec![(declarations, Vec::new())],
+            vec![source.clone()],
+            crate::ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        assert_eq!(
+            stages.counts(),
+            stage_observations::Counts {
+                call_sites: 1,
+                ..Default::default()
+            }
+        );
+        let region = prepared.initialization_region(0).unwrap();
+        let ModuleInitializationDetail::Occurrences(topology) = &region.detail else {
+            panic!("prepared initialization topology");
+        };
+        let root = OccurrenceParent::Block(topology.structure.root);
+        let OccurrenceNode::Expression(binding) =
+            topology.structure.edges[&(root, OccurrenceEdge::BindingRoot { item: 4, output: 0 })]
+        else {
+            panic!("binding initializer");
+        };
+        let OccurrenceNode::Expression(executable) =
+            topology.structure.edges[&(root, OccurrenceEdge::ExpressionItem { item: 5 })]
+        else {
+            panic!("executable expression");
+        };
+        let ConditionalRegion::Value {
+            then_block: binding_branch,
+            ..
+        } = topology.conditionals[&binding]
+        else {
+            panic!("binding conditional");
+        };
+        let ConditionalRegion::Unit {
+            then_block: executable_branch,
+            ..
+        } = topology.conditionals[&executable]
+        else {
+            panic!("executable conditional");
+        };
+        assert_eq!(topology.assignments.len(), 2);
+        for (branch, expected) in [
+            (
+                binding_branch,
+                [("number", ScalarType::I32), ("flag", ScalarType::Bool)],
+            ),
+            (
+                executable_branch,
+                [("flag", ScalarType::Bool), ("number", ScalarType::I32)],
+            ),
+        ] {
+            let group = &topology.assignments[&(branch, 0)];
+            let evaluations = group.rhs_evaluations().copied().collect::<Vec<_>>();
+            assert_eq!(evaluations.len(), 1);
+            assert_eq!(evaluations[0].position, 0);
+            assert_eq!(
+                group.projected_outputs().copied().collect::<Vec<_>>(),
+                [AssignmentProjection {
+                    producer: evaluations[0],
+                    output: 1
+                }]
+            );
+            assert_eq!(group.destinations().len(), expected.len());
+            for (position, (slot, (name, ty))) in group.destinations().zip(expected).enumerate() {
+                assert_eq!(slot.position, position);
+                assert_eq!(
+                    topology.structure.edges[&(
+                        OccurrenceParent::Block(branch),
+                        OccurrenceEdge::AssignmentDestination {
+                            item: 0,
+                            destination: position
+                        },
+                    )],
+                    OccurrenceNode::Place(slot.destination)
+                );
+                let span = topology.occurrences[slot.destination.0].span;
+                assert_eq!(&text[span.start as usize..span.end as usize], name);
+                assert_eq!(slot.replacement, AssignmentReplacement::Resolved(ty));
+            }
+        }
     }
 }

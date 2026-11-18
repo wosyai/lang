@@ -67,9 +67,26 @@ impl ScalarAssignmentTyping {
     }
 }
 
+#[derive(Default)]
+// Preparation-local address identity. Validation and the structural walk borrow the same
+// AST nodes; intervening ownership moves preserve their Vec buffers, and overload selections
+// update fields in place. Keys are compared only and never dereferenced or published.
+pub(super) struct ModuleAssignmentOutputs(HashMap<*const ScalarAssignment, Vec<ScalarType>>);
+
+impl ModuleAssignmentOutputs {
+    pub(super) fn take(&mut self, assignment: &ScalarAssignment) -> std::vec::IntoIter<ScalarType> {
+        self.0
+            .remove(&std::ptr::from_ref(assignment))
+            .unwrap_or_default()
+            .into_iter()
+    }
+}
+
 pub(super) struct ScalarInferenceBuilder<'a> {
     owners: &'a ScalarAssignmentOwners,
     assignments: HashMap<ResolvedAssignmentOutputId, ScalarType>,
+    module_outputs: ModuleAssignmentOutputs,
+    in_module_initialization: bool,
 }
 
 impl<'a> ScalarInferenceBuilder<'a> {
@@ -77,12 +94,28 @@ impl<'a> ScalarInferenceBuilder<'a> {
         Self {
             owners,
             assignments: HashMap::new(),
+            module_outputs: ModuleAssignmentOutputs::default(),
+            in_module_initialization: false,
         }
     }
+
+    #[cfg(test)]
     pub(super) fn freeze(self) -> ScalarAssignmentTyping {
-        ScalarAssignmentTyping {
-            assignments: self.assignments,
-        }
+        self.finish().0
+    }
+
+    pub(super) fn finish(self) -> (ScalarAssignmentTyping, ModuleAssignmentOutputs) {
+        (
+            ScalarAssignmentTyping {
+                assignments: self.assignments,
+            },
+            self.module_outputs,
+        )
+    }
+
+    pub(super) fn set_validation_root(&mut self, item: &ScalarItem) {
+        self.in_module_initialization =
+            matches!(item, ScalarItem::Binding(_) | ScalarItem::Executable(_));
     }
 
     pub(super) fn record_assignment_outputs(
@@ -91,6 +124,18 @@ impl<'a> ScalarInferenceBuilder<'a> {
         assignment: &ScalarAssignment,
         outputs: &ScalarOutputSequence,
     ) {
+        if self.in_module_initialization {
+            self.module_outputs.0.insert(
+                std::ptr::from_ref(assignment),
+                outputs
+                    .outputs
+                    .iter()
+                    .take(assignment.targets.len())
+                    .map(|output| output.ty.clone())
+                    .collect(),
+            );
+            return;
+        }
         let Some(function_span) = self.owners.function_span(assignment.span) else {
             return;
         };

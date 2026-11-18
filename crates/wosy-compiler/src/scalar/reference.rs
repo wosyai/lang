@@ -3792,8 +3792,26 @@ impl<'a> CallResolutionModule<'a> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn resolve_program_call_sites(
     program: &ScalarProgram,
+) -> Result<ModuleCallSites, ReferenceAnalysisError> {
+    resolve_program_call_sites_impl(program, WalkMode::StructuralOnly)
+}
+
+pub(super) fn resolve_program_call_sites_with_initialization_outputs(
+    program: &ScalarProgram,
+    initialization_outputs: ModuleAssignmentOutputs,
+) -> Result<ModuleCallSites, ReferenceAnalysisError> {
+    resolve_program_call_sites_impl(
+        program,
+        WalkMode::ModuleInitialization(initialization_outputs),
+    )
+}
+
+fn resolve_program_call_sites_impl(
+    program: &ScalarProgram,
+    initialization_mode: WalkMode<'_>,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
     let modules = [CallResolutionModule::program(program)];
     resolve_module_call_sites(
@@ -3802,6 +3820,7 @@ pub(super) fn resolve_program_call_sites(
         &[],
         &modules,
         program.resolved_assignment_outputs.as_map(),
+        initialization_mode,
     )
 }
 
@@ -3970,7 +3989,32 @@ impl ProjectCallSiteResults {
     }
 }
 
+#[cfg(test)]
 pub(super) fn resolve_project_call_sites(modules: &[ScalarModule]) -> ProjectCallSiteResults {
+    resolve_project_call_sites_impl(modules, ModuleInitializationInputs::StructuralOnly)
+}
+
+pub(super) fn resolve_project_call_sites_with_initialization_outputs(
+    modules: &[ScalarModule],
+    initialization_outputs: Vec<ModuleAssignmentOutputs>,
+) -> ProjectCallSiteResults {
+    assert_eq!(modules.len(), initialization_outputs.len());
+    resolve_project_call_sites_impl(
+        modules,
+        ModuleInitializationInputs::Typed(initialization_outputs.into_iter()),
+    )
+}
+
+enum ModuleInitializationInputs {
+    Typed(std::vec::IntoIter<ModuleAssignmentOutputs>),
+    #[cfg(test)]
+    StructuralOnly,
+}
+
+fn resolve_project_call_sites_impl(
+    modules: &[ScalarModule],
+    mut initialization_inputs: ModuleInitializationInputs,
+) -> ProjectCallSiteResults {
     let views = modules
         .iter()
         .map(CallResolutionModule::module)
@@ -3979,12 +4023,20 @@ pub(super) fn resolve_project_call_sites(modules: &[ScalarModule]) -> ProjectCal
         modules: modules
             .iter()
             .map(|module| {
+                let initialization_mode = match &mut initialization_inputs {
+                    ModuleInitializationInputs::Typed(outputs) => WalkMode::ModuleInitialization(
+                        outputs.next().expect("one typing table per module"),
+                    ),
+                    #[cfg(test)]
+                    ModuleInitializationInputs::StructuralOnly => WalkMode::StructuralOnly,
+                };
                 resolve_module_call_sites(
                     &module.source,
                     &module.items,
                     &module.namespace_bindings,
                     &views,
                     module.resolved_assignment_outputs.as_map(),
+                    initialization_mode,
                 )
             })
             .collect(),
@@ -4005,6 +4057,7 @@ struct CallableWalk<'a> {
 
 enum WalkMode<'a> {
     Callable(CallableWalk<'a>),
+    ModuleInitialization(ModuleAssignmentOutputs),
     StructuralOnly,
 }
 
@@ -4234,7 +4287,9 @@ impl StructuralWalker<'_> {
                     WalkMode::Callable(callable) => {
                         callable.register_call(ordinal, expression, names, types)?;
                     }
-                    WalkMode::StructuralOnly => self.structural_calls.push(ordinal),
+                    WalkMode::ModuleInitialization(_) | WalkMode::StructuralOnly => {
+                        self.structural_calls.push(ordinal);
+                    }
                 }
                 for (position, argument) in arguments.iter().enumerate() {
                     self.expression(
@@ -4476,7 +4531,8 @@ impl StructuralWalker<'_> {
         binding: &ScalarBinding,
         position: BlockPosition,
     ) -> Result<BindingInitialization, ReferenceAnalysisError> {
-        let mode = std::mem::replace(&mut self.mode, WalkMode::StructuralOnly);
+        let callable = matches!(&self.mode, WalkMode::Callable(_))
+            .then(|| std::mem::replace(&mut self.mode, WalkMode::StructuralOnly));
         let names = BTreeMap::new();
         let types = BTreeMap::new();
         let lengths = binding
@@ -4502,7 +4558,9 @@ impl StructuralWalker<'_> {
                 })
             })
             .collect::<Result<Vec<_>, _>>();
-        self.mode = mode;
+        if let Some(callable) = callable {
+            self.mode = callable;
+        }
         Ok(BindingInitialization::Allocation { lengths: lengths? })
     }
 
@@ -4667,6 +4725,10 @@ impl StructuralWalker<'_> {
                         output,
                     })
                     .collect();
+                let mut module_outputs = match &mut self.mode {
+                    WalkMode::ModuleInitialization(outputs) => outputs.take(assignment),
+                    _ => std::vec::IntoIter::default(),
+                };
                 let mut slots = Vec::new();
                 for (destination, target) in assignment.targets.iter().enumerate() {
                     let place = self.place_at(
@@ -4681,6 +4743,10 @@ impl StructuralWalker<'_> {
                     )?;
                     let replacement = match &self.mode {
                         WalkMode::StructuralOnly => AssignmentReplacement::StructuralOnly,
+                        WalkMode::ModuleInitialization(_) => module_outputs.next().map_or(
+                            AssignmentReplacement::Missing,
+                            AssignmentReplacement::Resolved,
+                        ),
                         WalkMode::Callable(callable) => callable
                             .assignment_outputs
                             .get(&ResolvedAssignmentOutputId {
@@ -4789,6 +4855,7 @@ fn resolve_module_call_sites(
     namespace_bindings: &[ScalarNamespaceBinding],
     modules: &[CallResolutionModule<'_>],
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
+    initialization_mode: WalkMode<'_>,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
     #[cfg(test)]
     stage_observations::record_call_sites();
@@ -4854,7 +4921,7 @@ fn resolve_module_call_sites(
     }
     let mut initialization = module_initialization_region(source, items, namespace_bindings);
     initialization.detail = ModuleInitializationDetail::Occurrences(Box::new(
-        walk_module_initialization(&initialization, items),
+        walk_module_initialization(&initialization, items, initialization_mode),
     ));
     Ok(ModuleCallSites {
         functions,
@@ -4865,8 +4932,9 @@ fn resolve_module_call_sites(
 fn walk_module_initialization(
     region: &ModuleInitializationRegion,
     items: &[ScalarItem],
+    initialization_mode: WalkMode<'_>,
 ) -> ModuleInitializationTopology {
-    let mut walker = StructuralWalker::new(WalkMode::StructuralOnly, ByteSpan::new(0, 0));
+    let mut walker = StructuralWalker::new(initialization_mode, ByteSpan::new(0, 0));
     let root = walker.structure.root;
     let mut scope = WalkScope::default();
     let mut block_items = Vec::new();

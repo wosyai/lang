@@ -2246,10 +2246,18 @@ pub fn derive_scalar_declarations_from_cst(
     }
 }
 
+#[cfg(test)]
 fn typecheck_scalar_program(
     declarations: ScalarSourceDeclarations,
     target_layout: ScalarTargetLayout,
 ) -> ScalarValidation {
+    typecheck_scalar_program_with_initialization_outputs(declarations, target_layout).0
+}
+
+fn typecheck_scalar_program_with_initialization_outputs(
+    declarations: ScalarSourceDeclarations,
+    target_layout: ScalarTargetLayout,
+) -> (ScalarValidation, ModuleAssignmentOutputs) {
     let ScalarSourceDeclarations {
         source,
         items,
@@ -2275,18 +2283,24 @@ fn typecheck_scalar_program(
     let mut validation_diagnostics = validate(&program, &typing, &mut inference);
     let mut diagnostics = diagnostics;
     diagnostics.append(&mut validation_diagnostics);
-    if diagnostics.is_empty() {
+    let module_outputs = if diagnostics.is_empty() {
         record_overload_selections(&mut program, &overloads);
-        program.resolved_assignment_outputs = inference.freeze();
+        let (callable_outputs, module_outputs) = inference.finish();
+        program.resolved_assignment_outputs = callable_outputs;
+        module_outputs
     } else {
         drop(inference);
-    }
+        ModuleAssignmentOutputs::default()
+    };
     drop(overloads);
     drop(owners);
-    ScalarValidation {
-        program,
-        diagnostics,
-    }
+    (
+        ScalarValidation {
+            program,
+            diagnostics,
+        },
+        module_outputs,
+    )
 }
 
 pub fn derive_scalar_program_from_cst_with_layout(
@@ -2303,8 +2317,8 @@ pub fn derive_scalar_program_from_cst_with_layout(
 mod declarations;
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
+use inference::{ModuleAssignmentOutputs, ScalarAssignmentOwners, ScalarInferenceBuilder};
 pub use inference::{ResolvedAssignmentOutputId, ScalarAssignmentTyping};
-use inference::{ScalarAssignmentOwners, ScalarInferenceBuilder};
 mod overload;
 use overload::{
     record_overload_selections, record_project_overload_selections, ScalarOverloadEnvironment,
@@ -2337,7 +2351,14 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
     diagnostics
 }
 
+#[cfg(test)]
 fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
+    typecheck_scalar_project_with_initialization_outputs(project).0
+}
+
+fn typecheck_scalar_project_with_initialization_outputs(
+    project: ScalarProject,
+) -> (ScalarProjectValidation, Vec<ModuleAssignmentOutputs>) {
     let mut project = project;
     let mut diagnostics = Vec::new();
     for module in &mut project.modules {
@@ -2508,6 +2529,7 @@ fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
             }
         }
         for item in items {
+            inference.set_validation_root(item);
             match item {
                 ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
                 ScalarItem::Binding(binding) => {
@@ -2809,20 +2831,31 @@ fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
     }
     drop(module_items);
     drop(modules);
-    if diagnostics.is_empty() {
+    let module_outputs = if diagnostics.is_empty() {
         record_project_overload_selections(&mut project, &overloads);
-        for (module, inference) in project.modules.iter_mut().zip(inferences) {
-            module.resolved_assignment_outputs = inference.freeze();
-        }
+        project
+            .modules
+            .iter_mut()
+            .zip(inferences)
+            .map(|(module, inference)| {
+                let (callable_outputs, module_outputs) = inference.finish();
+                module.resolved_assignment_outputs = callable_outputs;
+                module_outputs
+            })
+            .collect()
     } else {
         drop(inferences);
-    }
+        Vec::new()
+    };
     drop(overloads);
     drop(owners);
-    ScalarProjectValidation {
-        project,
-        diagnostics,
-    }
+    (
+        ScalarProjectValidation {
+            project,
+            diagnostics,
+        },
+        module_outputs,
+    )
 }
 
 pub fn prepare_scalar_project(
