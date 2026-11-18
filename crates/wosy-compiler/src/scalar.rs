@@ -2760,34 +2760,11 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
         mut diagnostics,
     } = typecheck_scalar_project(project);
     if diagnostics.is_empty() {
-        let modules = project.modules.clone();
-        for module in &mut project.modules {
-            let call_sites = resolve_module_call_sites(&module.source, &module.items, &modules);
-            diagnostics.extend(
-                call_sites
-                    .map(|sites| {
-                        let structs = modules
-                            .iter()
-                            .flat_map(|module| module.structs.clone())
-                            .collect::<Vec<_>>();
-                        let enums = modules
-                            .iter()
-                            .flat_map(|module| module.enums.clone())
-                            .collect::<Vec<_>>();
-                        record_module_reference_origins(
-                            &module.source,
-                            &mut module.items,
-                            &sites,
-                            &structs,
-                            &enums,
-                            module.resolved_assignment_outputs.as_map(),
-                        )
-                    })
-                    .unwrap_or_else(|error| vec![error])
-                    .into_iter()
-                    .map(|error| error.diagnostic()),
-            );
-        }
+        diagnostics.extend(
+            reference::record_project_reference_origins(&mut project.modules)
+                .into_iter()
+                .map(|error| error.diagnostic()),
+        );
     }
     if diagnostics.is_empty() {
         diagnostics.extend(
@@ -3435,8 +3412,8 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
 
 mod reference;
 use reference::{
-    expand_conditional_final_outputs, record_module_reference_origins,
-    record_program_reference_origins, record_specialized_copy_policies, resolve_module_call_sites,
+    expand_conditional_final_outputs, record_program_reference_origins,
+    record_specialized_copy_policies, resolve_module_call_sites,
     resolve_reference_output_contracts,
 };
 fn derive_type(node: &CstNode) -> ScalarType {

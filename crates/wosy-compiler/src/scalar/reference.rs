@@ -3693,6 +3693,29 @@ pub(super) fn record_module_reference_origins(
     enums: &[ScalarEnum],
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
 ) -> Vec<ReferenceAnalysisError> {
+    let (updates, errors) = derive_module_reference_origins(
+        source,
+        items,
+        call_sites,
+        structs,
+        enums,
+        assignment_outputs,
+    );
+    install_module_reference_results(items, updates);
+    errors
+}
+
+fn derive_module_reference_origins(
+    source: &SourceIdentity,
+    items: &[ScalarItem],
+    call_sites: &[ResolvedCallSite],
+    structs: &[ScalarStruct],
+    enums: &[ScalarEnum],
+    assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
+) -> (
+    Vec<(usize, FunctionReferenceResult)>,
+    Vec<ReferenceAnalysisError>,
+) {
     #[cfg(test)]
     stage_observations::record_reference_origins();
     let module_names = items
@@ -3706,18 +3729,76 @@ pub(super) fn record_module_reference_origins(
         })
         .collect::<HashSet<_>>();
     let mut errors = Vec::new();
-    for item in items {
+    let mut updates = Vec::new();
+    for (index, item) in items.iter().enumerate() {
         if let ScalarItem::Function(function) = item {
-            errors.extend(record_function_reference_origins(
-                source,
-                function,
-                &module_names,
-                call_sites,
-                structs,
-                enums,
-                assignment_outputs,
+            updates.push((
+                index,
+                derive_function_reference_result(
+                    source,
+                    function,
+                    &module_names,
+                    call_sites,
+                    structs,
+                    enums,
+                    assignment_outputs,
+                    &mut errors,
+                ),
             ));
         }
+    }
+    (updates, errors)
+}
+
+fn install_module_reference_results(
+    items: &mut [ScalarItem],
+    updates: Vec<(usize, FunctionReferenceResult)>,
+) {
+    for (index, result) in updates {
+        let ScalarItem::Function(function) = &mut items[index] else {
+            unreachable!("function result ordinal")
+        };
+        result.install(function);
+    }
+}
+
+pub(super) fn record_project_reference_origins(
+    modules: &mut [ScalarModule],
+) -> Vec<ReferenceAnalysisError> {
+    let mut inventory = None;
+    let mut updates = Vec::new();
+    let mut errors = Vec::new();
+    for (index, module) in modules.iter().enumerate() {
+        match resolve_module_call_sites(&module.source, &module.items, modules) {
+            Ok(sites) => {
+                let (structs, enums) = inventory.get_or_insert_with(|| {
+                    (
+                        modules
+                            .iter()
+                            .flat_map(|module| module.structs.iter().cloned())
+                            .collect::<Vec<_>>(),
+                        modules
+                            .iter()
+                            .flat_map(|module| module.enums.iter().cloned())
+                            .collect::<Vec<_>>(),
+                    )
+                });
+                let (results, current_errors) = derive_module_reference_origins(
+                    &module.source,
+                    &module.items,
+                    &sites,
+                    structs,
+                    enums,
+                    module.resolved_assignment_outputs.as_map(),
+                );
+                updates.push((index, results));
+                errors.extend(current_errors);
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    for (index, results) in updates {
+        install_module_reference_results(&mut modules[index].items, results);
     }
     errors
 }
@@ -4061,6 +4142,22 @@ fn record_function_specialized_copy_policies(
     errors
 }
 
+struct FunctionReferenceResult {
+    cfg: ScalarReferenceCfg,
+    arms: Vec<FunctionReferenceResult>,
+}
+
+impl FunctionReferenceResult {
+    fn install(self, function: &mut ScalarFunction) {
+        assert_eq!(self.arms.len(), function.overload_arms.len());
+        for (result, arm) in self.arms.into_iter().zip(&mut function.overload_arms) {
+            result.install(arm);
+        }
+        function.reference_cfg = self.cfg;
+    }
+}
+
+#[cfg(test)]
 pub(super) fn record_function_reference_origins(
     source: &SourceIdentity,
     function: &mut ScalarFunction,
@@ -4071,8 +4168,34 @@ pub(super) fn record_function_reference_origins(
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
 ) -> Vec<ReferenceAnalysisError> {
     let mut errors = Vec::new();
-    for arm in &mut function.overload_arms {
-        errors.extend(record_function_reference_origins(
+    let result = derive_function_reference_result(
+        source,
+        function,
+        module_names,
+        call_sites,
+        structs,
+        enums,
+        assignment_outputs,
+        &mut errors,
+    );
+    result.install(function);
+    errors
+}
+
+fn derive_function_reference_result(
+    source: &SourceIdentity,
+    function: &ScalarFunction,
+    module_names: &HashSet<String>,
+    call_sites: &[ResolvedCallSite],
+    structs: &[ScalarStruct],
+    enums: &[ScalarEnum],
+    assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
+    errors: &mut Vec<ReferenceAnalysisError>,
+) -> FunctionReferenceResult {
+    let entry_errors = errors.len();
+    let mut arms = Vec::new();
+    for arm in &function.overload_arms {
+        arms.push(derive_function_reference_result(
             source,
             arm,
             module_names,
@@ -4080,6 +4203,7 @@ pub(super) fn record_function_reference_origins(
             structs,
             enums,
             assignment_outputs,
+            errors,
         ));
     }
     let (cfg, current_errors) = derive_function_reference_cfg(
@@ -4090,11 +4214,10 @@ pub(super) fn record_function_reference_origins(
         structs,
         enums,
         assignment_outputs,
-        errors.is_empty(),
+        errors.len() == entry_errors,
     );
-    function.reference_cfg = cfg;
     errors.extend(current_errors);
-    errors
+    FunctionReferenceResult { cfg, arms }
 }
 
 fn derive_function_reference_cfg(
