@@ -2531,6 +2531,71 @@ fn recombine_conditional_branch(
     branch
 }
 
+enum AssignmentDestination<'ctx> {
+    Unit,
+    Existing(PointerValue<'ctx>),
+    NewStorage {
+        name: String,
+        slot: PointerValue<'ctx>,
+    },
+}
+
+fn retain_assignment_destination<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    target: &crate::scalar::ScalarAssignmentTarget,
+    ty: &ScalarType,
+) -> Result<AssignmentDestination<'ctx>, String> {
+    if *ty == ScalarType::Unit {
+        return Ok(AssignmentDestination::Unit);
+    }
+    match &target.place {
+        crate::ScalarPlace::Name { name, .. } => {
+            match state.storage.get(name).map(|(slot, _)| *slot).or_else(|| {
+                state
+                    .globals
+                    .get(name)
+                    .map(|(global, _)| global.as_pointer_value())
+            }) {
+                Some(destination) => Ok(AssignmentDestination::Existing(destination)),
+                None => {
+                    let slot = entry_alloca(
+                        state,
+                        storage_type(context, ty, state.layouts, state.target_layout)?,
+                        name,
+                    )?;
+                    Ok(AssignmentDestination::NewStorage {
+                        name: name.clone(),
+                        slot,
+                    })
+                }
+            }
+        }
+        place => Ok(AssignmentDestination::Existing(place_pointer(
+            context, state, place, None,
+        )?)),
+    }
+}
+
+fn install_assignment_destination<'ctx>(
+    state: &mut EmitState<'ctx, '_>,
+    target: &crate::scalar::ScalarAssignmentTarget,
+    ty: &ScalarType,
+    destination: AssignmentDestination<'ctx>,
+) -> Option<PointerValue<'ctx>> {
+    match destination {
+        AssignmentDestination::Unit => {
+            state.values.insert(target.target.clone(), EmitValue::Unit);
+            None
+        }
+        AssignmentDestination::Existing(pointer) => Some(pointer),
+        AssignmentDestination::NewStorage { name, slot } => {
+            state.storage.insert(name, (slot, ty.clone()));
+            Some(slot)
+        }
+    }
+}
+
 fn emit_assignment<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -2551,34 +2616,22 @@ fn emit_assignment<'ctx, 'module>(
             None => emit_expression(context, state, value),
         },
     )?;
-    for (position, (target, (value, ty, provenance, call_flag))) in
-        assignment.targets.iter().zip(values).enumerate()
+    let destinations = assignment
+        .targets
+        .iter()
+        .zip(&values)
+        .map(|(target, (_, ty, _, _))| retain_assignment_destination(context, state, target, ty))
+        .collect::<Result<Vec<_>, String>>()?;
+    for (position, ((target, (value, ty, provenance, call_flag)), destination)) in assignment
+        .targets
+        .iter()
+        .zip(values)
+        .zip(destinations)
+        .enumerate()
     {
-        if ty == ScalarType::Unit {
-            state.values.insert(target.target.clone(), EmitValue::Unit);
+        let Some(destination) = install_assignment_destination(state, target, &ty, destination)
+        else {
             continue;
-        }
-        let destination = match &target.place {
-            crate::ScalarPlace::Name { name, .. } => {
-                match state.storage.get(name).map(|(slot, _)| *slot).or_else(|| {
-                    state
-                        .globals
-                        .get(name)
-                        .map(|(global, _)| global.as_pointer_value())
-                }) {
-                    Some(destination) => destination,
-                    None => {
-                        let slot = entry_alloca(
-                            state,
-                            storage_type(context, &ty, state.layouts, state.target_layout)?,
-                            name,
-                        )?;
-                        state.storage.insert(name.clone(), (slot, ty.clone()));
-                        slot
-                    }
-                }
-            }
-            place => place_pointer(context, state, place, None)?,
         };
         let expression = if assignment.values.len() == 1 {
             &assignment.values[0]
@@ -2637,47 +2690,41 @@ fn emit_project_assignment<'ctx, 'module>(
             None => emit_project_expression(context, state, value, module, modules),
         },
     )?;
-    for (position, (target, (value, ty, provenance, call_flag))) in
-        assignment.targets.iter().zip(values).enumerate()
-    {
-        if ty == ScalarType::Unit {
-            state.values.insert(target.target.clone(), EmitValue::Unit);
-            continue;
-        }
-        let destination = if let Some(receiver) = target.receiver.as_ref().filter(|receiver| {
-            module
-                .namespace_bindings
-                .iter()
-                .any(|namespace| namespace.binding == **receiver)
-        }) {
-            let target_module = project_namespace_target(module, modules, receiver)?;
-            let (global, _) = project_member_global(state, target_module, &target.target)?;
-            global
-                .ok_or_else(|| format!("unknown LLVM member storage {}", target.target))?
-                .as_pointer_value()
-        } else {
-            match &target.place {
-                crate::ScalarPlace::Name { name, .. } => {
-                    match state.storage.get(name).map(|(slot, _)| *slot).or_else(|| {
-                        state
-                            .globals
-                            .get(name)
-                            .map(|(global, _)| global.as_pointer_value())
-                    }) {
-                        Some(destination) => destination,
-                        None => {
-                            let slot = entry_alloca(
-                                state,
-                                storage_type(context, &ty, state.layouts, state.target_layout)?,
-                                name,
-                            )?;
-                            state.storage.insert(name.clone(), (slot, ty.clone()));
-                            slot
-                        }
-                    }
-                }
-                place => place_pointer(context, state, place, None)?,
+    let destinations = assignment
+        .targets
+        .iter()
+        .zip(&values)
+        .map(|(target, (_, ty, _, _))| {
+            if *ty == ScalarType::Unit {
+                return Ok(AssignmentDestination::Unit);
             }
+            if let Some(receiver) = target.receiver.as_ref().filter(|receiver| {
+                module
+                    .namespace_bindings
+                    .iter()
+                    .any(|namespace| namespace.binding == **receiver)
+            }) {
+                let target_module = project_namespace_target(module, modules, receiver)?;
+                let (global, _) = project_member_global(state, target_module, &target.target)?;
+                let pointer = global
+                    .ok_or_else(|| format!("unknown LLVM member storage {}", target.target))?
+                    .as_pointer_value();
+                Ok(AssignmentDestination::Existing(pointer))
+            } else {
+                retain_assignment_destination(context, state, target, ty)
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for (position, ((target, (value, ty, provenance, call_flag)), destination)) in assignment
+        .targets
+        .iter()
+        .zip(values)
+        .zip(destinations)
+        .enumerate()
+    {
+        let Some(destination) = install_assignment_destination(state, target, &ty, destination)
+        else {
+            continue;
         };
         let expression = if assignment.values.len() == 1 {
             &assignment.values[0]

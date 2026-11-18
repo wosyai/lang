@@ -2658,6 +2658,103 @@ fn materializes_multi_output_assignments_before_ordered_writes() {
 }
 
 #[test]
+fn assignment_destinations_are_retained_before_any_write_on_both_targets() {
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let text = "%%start\nunit() check = fn { u8 first = 1; u8 second = 2; *!u8 selected = &!first; selected, *selected = &!second, 9; u8 observed = *selected; u8 first_expected = 9; u8 observed_expected = 2; if (first != first_expected || observed != observed_expected) { core.system_panic(); }; };\ncheck();\n%%end";
+    for (layout, pointer_width) in [
+        (ScalarTargetLayout::WASM32, "i32"),
+        (ScalarTargetLayout::NATIVE64, "i64"),
+    ] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for llvm in [
+            emit_scalar_llvm(&single).unwrap().to_text(),
+            emit_scalar_project_llvm(&project).unwrap().to_text(),
+        ] {
+            let lines = llvm.lines().collect::<Vec<_>>();
+            let selected_stores = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    (line.contains(&format!("store {pointer_width} "))
+                        && line.contains(", ptr %selected,"))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(selected_stores.len(), 2, "{llvm}");
+            let byte_write = lines
+                .iter()
+                .position(|line| line.contains("store i8 ") && line.contains(", ptr %deref,"))
+                .unwrap_or_else(|| panic!("retained byte destination: {llvm}"));
+            let selector_loads = lines
+                .iter()
+                .enumerate()
+                .filter(|(index, line)| {
+                    *index > selected_stores[0]
+                        && *index < byte_write
+                        && line.contains(&format!("load {pointer_width}, ptr %selected,"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(selector_loads.len(), 1, "{llvm}");
+            let (selector_index, selector_line) = selector_loads[0];
+            assert!(selected_stores[0] < selector_index, "{llvm}");
+            assert!(selector_index < selected_stores[1], "{llvm}");
+            assert!(selected_stores[1] < byte_write, "{llvm}");
+            let selector_value = selector_line.split_whitespace().next().unwrap();
+            let conversion = lines
+                .iter()
+                .enumerate()
+                .find(|(_, line)| {
+                    line.contains(&format!("inttoptr {pointer_width} {selector_value} to ptr"))
+                })
+                .expect("retained selector pointer");
+            assert!(selector_index < conversion.0, "{llvm}");
+            assert!(conversion.0 < selected_stores[1], "{llvm}");
+            let retained_pointer = conversion.1.split_whitespace().next().unwrap();
+            let staged_nine = lines
+                .iter()
+                .position(|line| line.contains("store i8 9, ptr %assignment_value"))
+                .expect("staged byte replacement");
+            let replacement_slot = lines[staged_nine]
+                .split_once(", ptr ")
+                .unwrap()
+                .1
+                .split(',')
+                .next()
+                .unwrap();
+            let replacement_load = lines
+                .iter()
+                .enumerate()
+                .find(|(_, line)| line.contains(&format!("load i8, ptr {replacement_slot},")))
+                .expect("materialized byte replacement");
+            assert!(staged_nine < replacement_load.0, "{llvm}");
+            assert!(replacement_load.0 < selector_index, "{llvm}");
+            let replacement = replacement_load.1.split_whitespace().next().unwrap();
+            assert!(
+                lines[byte_write]
+                    .contains(&format!("store i8 {replacement}, ptr {retained_pointer},")),
+                "{llvm}"
+            );
+        }
+    }
+}
+
+#[test]
 fn emits_distinct_independent_output_values_in_source_order() {
     let source = SourceIdentity::new(
         "project".into(),
