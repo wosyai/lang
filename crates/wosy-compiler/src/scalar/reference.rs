@@ -1701,21 +1701,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
                 ScalarBlockItem::Assignment(assignment) => {
                     let output_types = self.assignment_output_types(assignment)?;
+                    let rhs = assignment.rhs();
                     let mut values = Vec::new();
-                    for value in &assignment.values {
+                    for (_, value) in rhs.evaluations() {
                         let result = self.expression(value, scope)?;
                         let rhs_point = self.cursor.expect("evaluated assignment output");
                         self.move_value(value, scope)?;
                         values.push((result, rhs_point));
                     }
-                    if assignment.values.len() == 1 {
-                        if let ScalarExpression::Call { .. } = &assignment.values[0] {
-                            let producer = values[0].1;
-                            for position in 1..assignment.targets.len() {
-                                let rhs_point = self.project_call_output(producer, position);
-                                values.push((ReferenceValue::Uncomputed, rhs_point));
-                            }
-                        }
+                    for position in rhs.projected_outputs() {
+                        let producer = values[0].1;
+                        let rhs_point = self.project_call_output(producer, position);
+                        values.push((ReferenceValue::Uncomputed, rhs_point));
                     }
                     let destinations = assignment
                         .targets
@@ -3760,7 +3757,7 @@ impl ValidatedCallResolver<'_> {
                     self.expression(expression, &names, &types)?
                 }
                 ScalarBlockItem::Assignment(assignment) => {
-                    for value in &assignment.values {
+                    for (_, value) in assignment.rhs().evaluations() {
                         self.expression(value, &names, &types)?;
                     }
                     for target in &assignment.targets {

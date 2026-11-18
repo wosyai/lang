@@ -16,6 +16,8 @@ mod binding_outputs;
 
 mod block_outputs;
 
+mod assignment_outputs;
+
 mod assignment_destinations;
 
 mod complete_results;

@@ -1810,6 +1810,34 @@ pub struct ScalarAssignment {
     pub span: ByteSpan,
 }
 
+struct ScalarAssignmentRhs<'a> {
+    values: &'a [ScalarExpression],
+    target_count: usize,
+}
+
+impl ScalarAssignment {
+    fn rhs(&self) -> ScalarAssignmentRhs<'_> {
+        ScalarAssignmentRhs {
+            values: &self.values,
+            target_count: self.targets.len(),
+        }
+    }
+}
+
+impl ScalarAssignmentRhs<'_> {
+    fn evaluations(&self) -> impl Iterator<Item = (usize, &ScalarExpression)> {
+        self.values.iter().enumerate()
+    }
+
+    fn projected_outputs(&self) -> std::ops::Range<usize> {
+        if matches!(self.values, [ScalarExpression::Call { .. }]) {
+            1..self.target_count
+        } else {
+            0..0
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarAssignmentTarget {
     pub receiver: Option<String>,
