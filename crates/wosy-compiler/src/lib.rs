@@ -43,9 +43,8 @@ pub fn core_runtime(backend: &str, output: &str) -> Result<&'static str, String>
 mod tests {
     use super::ScalarNamespaceBinding;
     use super::{
-        core_runtime, derive_scalar_program, derive_scalar_program_from_cst,
-        emit_scalar_project_llvm, parse_source, validate_scalar_project, ScalarModule,
-        ScalarProject,
+        core_runtime, derive_scalar_program, emit_scalar_project_llvm, parse_source,
+        validate_scalar_project, ScalarModule, ScalarProject,
     };
     use wosy_syntax::{ByteSpan, CanonicalCstRoot, CanonicalCstSnapshot, SourceIdentity};
 
@@ -148,6 +147,11 @@ enum ReadLineStatus { line; eof; }
 
     #[test]
     fn archived_decomposed_read_line_snapshot_deserializes_and_reaches_project_validation() {
+        use super::{
+            analyze_scalar_build, derive_scalar_declarations_from_cst, prepare_scalar_project,
+            ScalarPreparationInputs, ScalarTargetLayout,
+        };
+
         let source = SourceIdentity::new(
             "project".into(),
             "package".into(),
@@ -171,7 +175,7 @@ enum ReadLineStatus { line; eof; }
             output.result.reconstruct()
         );
 
-        let scalar = derive_scalar_program_from_cst(&canonical);
+        let bootstrap_declarations = derive_scalar_declarations_from_cst(&canonical);
         let preview_source = SourceIdentity::new(
             "project".into(),
             "package".into(),
@@ -184,25 +188,31 @@ enum ReadLineStatus { line; eof; }
             &[],
         );
         assert!(preview.diagnostics.is_empty(), "{:?}", preview.diagnostics);
-        let preview_scalar = derive_scalar_program(&preview.result);
-        let validation = validate_scalar_project(ScalarProject::new(
+        let preview_declarations =
+            derive_scalar_declarations_from_cst(preview.result.canonical_cst());
+        let prepared = prepare_scalar_project(
             vec![
-                ScalarModule::from_program(
-                    scalar.program,
+                (
+                    bootstrap_declarations,
                     vec![ScalarNamespaceBinding {
                         binding: "preview1".into(),
                         target: preview_source.clone(),
                         span: ByteSpan::new(0, 0),
                     }],
                 ),
-                ScalarModule::from_program(preview_scalar.program, Vec::new()),
+                (preview_declarations, Vec::new()),
             ],
             vec![source, preview_source],
-        ));
+            ScalarPreparationInputs {
+                target_layout: ScalarTargetLayout::WASM32,
+            },
+        )
+        .unwrap_or_else(|error| panic!("prepare archived project: {:?}", error.diagnostics));
+        let validation = analyze_scalar_build(&prepared);
         assert!(
-            validation.diagnostics.is_empty(),
+            validation.diagnostics().is_empty(),
             "{:?}",
-            validation.diagnostics
+            validation.diagnostics()
         );
     }
 }
