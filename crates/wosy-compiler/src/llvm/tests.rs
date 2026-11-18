@@ -4124,6 +4124,113 @@ fn assignment_destinations_are_retained_before_any_write_on_both_targets() {
 }
 
 #[test]
+fn assignment_selector_effects_execute_once_after_rhs_on_both_targets() {
+    for (target_layout, pointer_type, text) in [
+        (
+            ScalarTargetLayout::NATIVE64,
+            "i64",
+            include_str!("../../../../tests/fixtures/build/static_assignment_destinations_native/project/src/main.w"),
+        ),
+        (
+            ScalarTargetLayout::WASM32,
+            "i32",
+            include_str!("../../../../tests/fixtures/build/static_assignment_destinations_wasm/project/src/main.w"),
+        ),
+    ] {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = prepare_scalar_project(
+            vec![(
+                derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                Vec::new(),
+            )],
+            vec![source],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|invalid| panic!("{:?}", invalid.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let llvm = emit_scalar_build_single_module_llvm(&build)
+            .expect("selector witness LLVM")
+            .to_text();
+        assert_eq!(llvm.matches("call void @check_selector_effects()").count(), 1);
+        let (body, _) = llvm
+            .split_once("define void @check_selector_effects()")
+            .expect("selector witness function")
+            .1
+            .split_once("\n}")
+            .expect("end of selector witness function");
+        let lines = body.lines().collect::<Vec<_>>();
+        let once = |instruction: &str| {
+            let mut matches = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.contains(instruction));
+            let matched = matches
+                .next()
+                .unwrap_or_else(|| panic!("{instruction}: {body}"));
+            assert!(matches.next().is_none(), "{instruction}: {body}");
+            matched
+        };
+        let value = |line: &str| line.split_whitespace().next().unwrap().to_owned();
+        let (rhs, _) = once("call i8 @replacement()");
+        let (selector, selector_call) = once("call i64 @select_index(");
+        let selector_input = selector_call
+            .split_once("@select_index(i64 ")
+            .unwrap()
+            .1
+            .strip_suffix(')')
+            .unwrap();
+        let (index_read, _) = once(&format!("{selector_input} = load i64, ptr %index,"));
+        let (element, element_address) = once(&format!("i32 0, i64 {}", value(selector_call)));
+        assert!(element_address.contains("getelementptr inbounds [2 x i8]"), "{body}");
+        let (address, checked_address) = once(&format!(
+            "ptrtoint ptr {} to {pointer_type}",
+            value(element_address)
+        ));
+        let (retain, retained_item) = once(&format!("call {pointer_type} @retain_item("));
+        assert!(
+            retained_item.contains(&format!("{pointer_type} {}", value(checked_address))),
+            "{body}"
+        );
+        let (freeze, destination) = once(&format!(
+            "inttoptr {pointer_type} {} to ptr",
+            value(retained_item)
+        ));
+        let index_stores = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains("store i64 ") && line.contains(", ptr %index,"))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let [index_init, index_write] = index_stores.as_slice() else {
+            panic!("expected initialized index and one assignment write: {body}");
+        };
+        let (item_write, store) = once(&format!(", ptr {},", value(destination)));
+        assert!(store.contains("store i8 "), "{body}");
+        let sequence = [
+            *index_init,
+            rhs,
+            index_read,
+            selector,
+            element,
+            address,
+            retain,
+            freeze,
+            *index_write,
+            item_write,
+        ];
+        assert!(sequence.windows(2).all(|pair| pair[0] < pair[1]), "{body}");
+    }
+}
+
+#[test]
 fn emits_distinct_independent_output_values_in_source_order() {
     let source = SourceIdentity::new(
         "project".into(),
