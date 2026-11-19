@@ -4,6 +4,8 @@ use reference::stage_observations::{Counts, Scope};
 
 mod occurrence_inventory;
 
+mod occurrence_completeness;
+
 mod neutral_assignments;
 
 mod neutral_branches;
