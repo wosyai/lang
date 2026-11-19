@@ -889,71 +889,69 @@ bool(u8) _parse_is_digit10 = fn(byte) {
 	byte >= 48 && byte <= 57
 };
 
-(f64, bool)(*?u8, u64, u64) _parse_float_f64 = fn(data, start, end) {
+(u64, f64, i32, bool, bool, bool, bool)(*?u8, u64, u64, f64, i32, bool, bool, bool, bool) _parse_range_float_integer = fn(data, pos, end, mant, extra_scale, valid, saw_int, last_underscore, int_done) {
 	u64 one = core.int_extend<u64>(1);
-	f64 zero_value = 0.0;
+	u64 two = core.int_extend<u64>(2);
 	f64 ten_value = 10.0;
 	f64 big_limit = 1.0e300;
-	f64 f64_max = 1.7976931348623157e308;
 	u8 zero_digit = 48;
-	i32 zero_count = 0;
 	i32 one_count = 1;
-	i32 ten_count = 10;
-	i32 cap = 1000000;
-	i32 limit = 1000;
-	i32 neg_limit = zero_count - limit;
-	f64 mant = zero_value;
-	i32 extra_scale = zero_count;
-	u64 pos = start;
-	bool valid = true;
-	bool saw_int = false;
-	bool last_underscore = false;
-	i32 frac_count = zero_count;
-	i32 exp_value = zero_count;
-	bool exp_negative = false;
-	bool int_done = false;
-	while (pos < end && valid && !int_done) {
-		u8 byte = _parse_float_byte(data, pos);
-		bool digit = _parse_is_digit10(byte);
-		bool underscore = _parse_is_underscore(byte);
-		if (digit) {
-			u8 small_int = byte - zero_digit;
-			u64 wide_digit = core.int_extend<u64>(small_int);
-			f64 digit_value = core.uint_to_float<f64>(wide_digit);
-			mant = mant * ten_value + digit_value;
-			if (mant > big_limit) {
-				mant = mant / ten_value;
-				extra_scale = extra_scale + one_count;
+	if (pos < end && valid && !int_done) {
+		u64 length = end - pos;
+		if (length > one) {
+			u64 mid = pos + length / two;
+			pos, mant, extra_scale, valid, saw_int, last_underscore, int_done = _parse_range_float_integer(data, pos, mid, mant, extra_scale, valid, saw_int, last_underscore, int_done);
+			if (valid && !int_done) {
+				pos, mant, extra_scale, valid, saw_int, last_underscore, int_done = _parse_range_float_integer(data, pos, end, mant, extra_scale, valid, saw_int, last_underscore, int_done);
 			};
-			last_underscore = false;
-			saw_int = true;
-			pos = pos + one;
 		} else {
-			if (underscore) {
-				if (!saw_int) { valid = false; };
-				if (last_underscore) { valid = false; };
-				last_underscore = true;
+			u8 byte = _parse_float_byte(data, pos);
+			bool digit = _parse_is_digit10(byte);
+			bool underscore = _parse_is_underscore(byte);
+			if (digit) {
+				u8 small_int = byte - zero_digit;
+				u64 wide_digit = core.int_extend<u64>(small_int);
+				f64 digit_value = core.uint_to_float<f64>(wide_digit);
+				mant = mant * ten_value + digit_value;
+				if (mant > big_limit) {
+					mant = mant / ten_value;
+					extra_scale = extra_scale + one_count;
+				};
+				last_underscore = false;
+				saw_int = true;
 				pos = pos + one;
 			} else {
-				int_done = true;
+				if (underscore) {
+					if (!saw_int) { valid = false; };
+					if (last_underscore) { valid = false; };
+					last_underscore = true;
+					pos = pos + one;
+				} else {
+					int_done = true;
+				};
 			};
-		}
-	}
-	if (last_underscore) { valid = false; };
-	if (!saw_int) { valid = false; };
-	bool has_dot = false;
-	if (valid && pos < end) {
-		u8 byte = _parse_float_byte(data, pos);
-		if (_parse_is_dot(byte)) {
-			has_dot = true;
-			pos = pos + one;
 		};
 	};
-	if (valid && has_dot) {
-		bool frac_started = false;
-		bool frac_trail = false;
-		bool frac_done = false;
-		while (pos < end && valid && !frac_done) {
+	pos, mant, extra_scale, valid, saw_int, last_underscore, int_done
+};
+
+(u64, f64, i32, i32, bool, bool, bool, bool)(*?u8, u64, u64, f64, i32, i32, bool, bool, bool, bool) _parse_range_float_fraction = fn(data, pos, end, mant, extra_scale, frac_count, valid, frac_started, frac_trail, frac_done) {
+	u64 one = core.int_extend<u64>(1);
+	u64 two = core.int_extend<u64>(2);
+	f64 ten_value = 10.0;
+	f64 big_limit = 1.0e300;
+	u8 zero_digit = 48;
+	i32 one_count = 1;
+	i32 cap = 1000000;
+	if (pos < end && valid && !frac_done) {
+		u64 length = end - pos;
+		if (length > one) {
+			u64 mid = pos + length / two;
+			pos, mant, extra_scale, frac_count, valid, frac_started, frac_trail, frac_done = _parse_range_float_fraction(data, pos, mid, mant, extra_scale, frac_count, valid, frac_started, frac_trail, frac_done);
+			if (valid && !frac_done) {
+				pos, mant, extra_scale, frac_count, valid, frac_started, frac_trail, frac_done = _parse_range_float_fraction(data, pos, end, mant, extra_scale, frac_count, valid, frac_started, frac_trail, frac_done);
+			};
+		} else {
 			u8 byte = _parse_float_byte(data, pos);
 			bool digit = _parse_is_digit10(byte);
 			bool underscore = _parse_is_underscore(byte);
@@ -979,8 +977,113 @@ bool(u8) _parse_is_digit10 = fn(byte) {
 				} else {
 					frac_done = true;
 				};
-			}
-		}
+			};
+		};
+	};
+	pos, mant, extra_scale, frac_count, valid, frac_started, frac_trail, frac_done
+};
+
+(u64, i32, bool, bool, bool, bool)(*?u8, u64, u64, i32, bool, bool, bool, bool) _parse_range_float_exponent = fn(data, pos, end, exp_value, valid, exp_started, exp_trail, exp_done) {
+	u64 one = core.int_extend<u64>(1);
+	u64 two = core.int_extend<u64>(2);
+	u8 zero_digit = 48;
+	i32 ten_count = 10;
+	i32 cap = 1000000;
+	if (pos < end && valid && !exp_done) {
+		u64 length = end - pos;
+		if (length > one) {
+			u64 mid = pos + length / two;
+			pos, exp_value, valid, exp_started, exp_trail, exp_done = _parse_range_float_exponent(data, pos, mid, exp_value, valid, exp_started, exp_trail, exp_done);
+			if (valid && !exp_done) {
+				pos, exp_value, valid, exp_started, exp_trail, exp_done = _parse_range_float_exponent(data, pos, end, exp_value, valid, exp_started, exp_trail, exp_done);
+			};
+		} else {
+			u8 byte = _parse_float_byte(data, pos);
+			bool digit = _parse_is_digit10(byte);
+			bool underscore = _parse_is_underscore(byte);
+			if (digit) {
+				u8 small = byte - zero_digit;
+				i32 piece = core.int_extend<i32>(small);
+				if (exp_value < cap) { exp_value = exp_value * ten_count + piece; };
+				exp_started = true;
+				exp_trail = false;
+				pos = pos + one;
+			} else {
+				if (underscore) {
+					if (!exp_started) { valid = false; };
+					if (exp_trail) { valid = false; };
+					exp_trail = true;
+					pos = pos + one;
+				} else {
+					exp_done = true;
+				};
+			};
+		};
+	};
+	pos, exp_value, valid, exp_started, exp_trail, exp_done
+};
+
+f64(f64, i32) _parse_scale_float_up = fn(scaled, steps) {
+	if (steps > 0) {
+		if (steps == 1) {
+			f64 ten_value = 10.0;
+			scaled = scaled * ten_value;
+		} else {
+			i32 half = steps / 2;
+			scaled = _parse_scale_float_up(scaled, half);
+			scaled = _parse_scale_float_up(scaled, steps - half);
+		};
+	};
+	scaled
+};
+
+f64(f64, i32) _parse_scale_float_down = fn(scaled, steps) {
+	if (steps > 0) {
+		if (steps == 1) {
+			f64 ten_value = 10.0;
+			scaled = scaled / ten_value;
+		} else {
+			i32 half = steps / 2;
+			scaled = _parse_scale_float_down(scaled, half);
+			scaled = _parse_scale_float_down(scaled, steps - half);
+		};
+	};
+	scaled
+};
+
+(f64, bool)(*?u8, u64, u64) _parse_float_f64 = fn(data, start, end) {
+	u64 one = core.int_extend<u64>(1);
+	f64 zero_value = 0.0;
+	f64 f64_max = 1.7976931348623157e308;
+	i32 zero_count = 0;
+	i32 limit = 1000;
+	i32 neg_limit = zero_count - limit;
+	u64 pos = start;
+	f64 mant = zero_value;
+	i32 extra_scale = zero_count;
+	bool valid = true;
+	bool saw_int = false;
+	bool last_underscore = false;
+	bool int_done = false;
+	pos, mant, extra_scale, valid, saw_int, last_underscore, int_done = _parse_range_float_integer(data, pos, end, mant, extra_scale, valid, saw_int, last_underscore, int_done);
+	i32 frac_count = zero_count;
+	i32 exp_value = zero_count;
+	bool exp_negative = false;
+	if (last_underscore) { valid = false; };
+	if (!saw_int) { valid = false; };
+	bool has_dot = false;
+	if (valid && pos < end) {
+		u8 byte = _parse_float_byte(data, pos);
+		if (_parse_is_dot(byte)) {
+			has_dot = true;
+			pos = pos + one;
+		};
+	};
+	if (valid && has_dot) {
+		bool frac_started = false;
+		bool frac_trail = false;
+		bool frac_done = false;
+		pos, mant, extra_scale, frac_count, valid, frac_started, frac_trail, frac_done = _parse_range_float_fraction(data, pos, end, mant, extra_scale, frac_count, valid, frac_started, frac_trail, frac_done);
 		if (frac_trail) { valid = false; };
 	};
 	bool has_exp = false;
@@ -1004,28 +1107,7 @@ bool(u8) _parse_is_digit10 = fn(byte) {
 		bool exp_started = false;
 		bool exp_trail = false;
 		bool exp_done = false;
-		while (pos < end && valid && !exp_done) {
-			u8 byte = _parse_float_byte(data, pos);
-			bool digit = _parse_is_digit10(byte);
-			bool underscore = _parse_is_underscore(byte);
-			if (digit) {
-				u8 small = byte - zero_digit;
-				i32 piece = core.int_extend<i32>(small);
-				if (exp_value < cap) { exp_value = exp_value * ten_count + piece; };
-				exp_started = true;
-				exp_trail = false;
-				pos = pos + one;
-			} else {
-				if (underscore) {
-					if (!exp_started) { valid = false; };
-					if (exp_trail) { valid = false; };
-					exp_trail = true;
-					pos = pos + one;
-				} else {
-					exp_done = true;
-				};
-			}
-		}
+		pos, exp_value, valid, exp_started, exp_trail, exp_done = _parse_range_float_exponent(data, pos, end, exp_value, valid, exp_started, exp_trail, exp_done);
 		if (!exp_started) { valid = false; };
 		if (exp_trail) { valid = false; };
 	};
@@ -1046,15 +1128,9 @@ bool(u8) _parse_is_digit10 = fn(byte) {
 					i32 steps = adjusted;
 					if (steps < zero_count) { steps = zero_count - steps; };
 					if (adjusted > zero_count) {
-						while (steps > zero_count) {
-							scaled = scaled * ten_value;
-							steps = steps - one_count;
-						}
+						scaled = _parse_scale_float_up(scaled, steps);
 					} else {
-						while (steps > zero_count) {
-							scaled = scaled / ten_value;
-							steps = steps - one_count;
-						}
+						scaled = _parse_scale_float_down(scaled, steps);
 					};
 				};
 			};
