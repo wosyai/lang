@@ -61,5 +61,11 @@ unit() check = fn {
 	};
 };
 
+u64(u64, bool) replace_wide = fn(value, done) {
+	if (done) { value } else { replace_wide(0 + 1, true) }
+};
+
 check();
+u64 wide_result = replace_wide(4294967296, false);
+if (wide_result != 1) { core.system_panic(); };
 %%end
