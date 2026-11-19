@@ -203,6 +203,7 @@ impl PreparedScalarProject {
             .remove_body_allocation_length_target(module, item, arm)
     }
 
+    #[cfg(test)]
     fn analyze(&self) -> reference::ProjectReferenceResults {
         reference::analyze_project_references(&self.project.modules, &self.calls)
     }
@@ -254,7 +255,11 @@ impl<'a> ScalarBuildValidation<'a> {
 }
 
 pub fn analyze_scalar_build(prepared: &PreparedScalarProject) -> ScalarBuildValidation<'_> {
-    let results = prepared.analyze();
+    let results = reference::analyze_project_references_with_call_points(
+        &prepared.project.modules,
+        &prepared.calls,
+        true,
+    );
     let diagnostics = results
         .errors()
         .iter()

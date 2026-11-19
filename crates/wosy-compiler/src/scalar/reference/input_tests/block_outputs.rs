@@ -40,6 +40,7 @@ fn checked_tail_conditional_publishes_one_producer_with_ordered_outputs() {
         generic_parameters: Vec::new(),
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg {
+            primary_call_points: HashMap::new(),
             facts: Vec::new(),
             points: Vec::new(),
             initial_points: Vec::new(),
@@ -214,6 +215,7 @@ fn check_detached_tail_conditional(text: &str, check: impl Fn(&ScalarReferenceCf
             generic_parameters: Vec::new(),
             overload_arms: Vec::new(),
             reference_cfg: ScalarReferenceCfg {
+                primary_call_points: HashMap::new(),
                 facts: Vec::new(),
                 points: Vec::new(),
                 initial_points: Vec::new(),

@@ -664,6 +664,7 @@ fn grouped_projected_writes_consume_saved_previous_origins_including_empty_sets(
                 Some(BTreeSet::new()),
             );
             let mut grouped = ScalarReferenceCfg {
+                primary_call_points: HashMap::new(),
                 facts: facts.clone(),
                 points,
                 initial_points: Vec::new(),

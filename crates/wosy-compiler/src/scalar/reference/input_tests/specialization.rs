@@ -214,7 +214,7 @@ fn template_index_retains_first_source_even_when_its_module_is_empty() {
         .call_occurrences
         .clear();
     let (mut second_results, errors) =
-        derive_module_reference_origins(&second.source, &second.items, &calls, &[], &[]);
+        derive_module_reference_origins(&second.source, &second.items, &calls, &[], &[], false);
     assert!(!errors.is_empty());
     let views = [
         ModuleReferenceView {

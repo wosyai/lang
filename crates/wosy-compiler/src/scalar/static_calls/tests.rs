@@ -18,6 +18,7 @@ mod checked_call_signatures;
 
 mod callable_body_call_nodes;
 
+mod call_points;
 mod self_tail;
 
 fn parsed(text: &str) -> wosy_syntax::ParseResult {

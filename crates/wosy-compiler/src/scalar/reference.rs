@@ -172,6 +172,7 @@ fn derive_and_converge_program_references(
         call_sites,
         &program.structs,
         &program.enums,
+        false,
     );
     if errors.is_empty() {
         errors.extend(resolve_reference_output_contracts(&mut [
@@ -186,6 +187,7 @@ fn derive_and_converge_program_references(
 }
 
 pub(super) struct ReferenceFlowBuilder<'a> {
+    capture_call_points: bool,
     pub(super) source: SourceIdentity,
     pub(super) function_span: ByteSpan,
     pub(super) names: BTreeMap<String, ReferenceBindingId>,
@@ -259,6 +261,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         enums: &'a [ScalarEnum],
     ) -> Self {
         Self {
+            capture_call_points: false,
             source: source.clone(),
             function_span: function.span,
             names: BTreeMap::new(),
@@ -277,6 +280,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 .collect(),
             dereference_points: HashMap::new(),
             cfg: ScalarReferenceCfg {
+                primary_call_points: HashMap::new(),
                 facts: Vec::new(),
                 points: Vec::new(),
                 initial_points: Vec::new(),
@@ -1145,13 +1149,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     target,
                     argument_points,
                 };
-                if let Some(origins) = cast_origins {
-                    self.point(call, span, scope, origins.clone());
-                    Ok(ReferenceValue::Checked(origins))
-                } else {
-                    self.uncomputed_point(call, span, scope);
-                    Ok(ReferenceValue::Uncomputed)
+                let id = self.point_with_origins(call, span, scope, cast_origins.clone());
+                if self.capture_call_points {
+                    let previous = self.cfg.primary_call_points.insert(ordinal, id);
+                    assert!(previous.is_none(), "duplicate CFG call for {ordinal:?}");
                 }
+                Ok(cast_origins.map_or(ReferenceValue::Uncomputed, ReferenceValue::Checked))
             }
             ScalarExpression::Binary {
                 operator,
@@ -4709,7 +4712,7 @@ impl ModuleCallSites {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) struct OccurrenceOrdinal(pub(super) usize);
+pub(crate) struct OccurrenceOrdinal(pub(super) usize);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct BlockOrdinal(pub(super) usize);
@@ -6710,7 +6713,7 @@ pub(super) fn record_module_reference_origins(
     enums: &[ScalarEnum],
 ) -> Vec<ReferenceAnalysisError> {
     let (updates, errors) =
-        derive_module_reference_origins(source, items, call_sites, structs, enums);
+        derive_module_reference_origins(source, items, call_sites, structs, enums, false);
     install_module_reference_results(items, updates);
     errors
 }
@@ -6721,6 +6724,7 @@ fn derive_module_reference_origins(
     call_sites: &ModuleCallSites,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
+    capture_call_points: bool,
 ) -> (
     Vec<(usize, FunctionReferenceResult)>,
     Vec<ReferenceAnalysisError>,
@@ -6750,6 +6754,7 @@ fn derive_module_reference_origins(
                     &call_sites.functions[&index],
                     structs,
                     enums,
+                    capture_call_points,
                     &mut errors,
                 ),
             ));
@@ -6822,8 +6827,16 @@ pub(super) fn analyze_project_references(
     modules: &[ScalarModule],
     call_sites: &ProjectCallSiteResults,
 ) -> ProjectReferenceResults {
+    analyze_project_references_with_call_points(modules, call_sites, false)
+}
+
+pub(super) fn analyze_project_references_with_call_points(
+    modules: &[ScalarModule],
+    call_sites: &ProjectCallSiteResults,
+    capture_call_points: bool,
+) -> ProjectReferenceResults {
     let (mut updates, mut errors, inventory) =
-        derive_and_converge_project_references(modules, call_sites);
+        derive_and_converge_project_references(modules, call_sites, capture_call_points);
     if errors.is_empty() && !modules.is_empty() {
         let (structs, enums) =
             inventory.expect("successful module call lookup built aggregate inventory");
@@ -6843,13 +6856,14 @@ pub(super) fn analyze_project_references(
 fn derive_and_converge_project_references(
     modules: &[ScalarModule],
     call_sites: &ProjectCallSiteResults,
+    capture_call_points: bool,
 ) -> (
     Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
     Vec<ReferenceAnalysisError>,
     Option<(Vec<ScalarStruct>, Vec<ScalarEnum>)>,
 ) {
     let (mut updates, mut errors, inventory) =
-        derive_project_reference_origins(modules, call_sites);
+        derive_project_reference_origins(modules, call_sites, capture_call_points);
     if errors.is_empty() {
         let mut views = updates
             .iter_mut()
@@ -6867,6 +6881,7 @@ fn derive_and_converge_project_references(
 fn derive_project_reference_origins(
     modules: &[ScalarModule],
     call_sites: &ProjectCallSiteResults,
+    capture_call_points: bool,
 ) -> (
     Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
     Vec<ReferenceAnalysisError>,
@@ -6896,6 +6911,7 @@ fn derive_project_reference_origins(
                     sites,
                     structs,
                     enums,
+                    capture_call_points,
                 );
                 updates.push((index, results));
                 errors.extend(current_errors);
@@ -7334,6 +7350,7 @@ pub(super) fn record_function_reference_origins(
         call_sites,
         structs,
         enums,
+        false,
         &mut errors,
     );
     result.install(function);
@@ -7347,6 +7364,7 @@ fn derive_function_reference_result(
     call_sites: &FunctionCallSites,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
+    capture_call_points: bool,
     errors: &mut Vec<ReferenceAnalysisError>,
 ) -> FunctionReferenceResult {
     let entry_errors = errors.len();
@@ -7360,22 +7378,20 @@ fn derive_function_reference_result(
             calls,
             structs,
             enums,
+            capture_call_points,
             errors,
         ));
     }
-    let (cfg, current_errors) = derive_function_reference_cfg(
-        source,
-        function,
-        module_names,
-        call_sites,
-        structs,
-        enums,
-        errors.len() == entry_errors,
-    );
+    let mut builder =
+        ReferenceFlowBuilder::new(source, function, module_names, call_sites, structs, enums);
+    builder.capture_call_points = capture_call_points;
+    let (cfg, current_errors) =
+        build_function_reference_cfg(builder, function, errors.len() == entry_errors);
     errors.extend(current_errors);
     FunctionReferenceResult { cfg, arms }
 }
 
+#[cfg(test)]
 fn derive_function_reference_cfg(
     source: &SourceIdentity,
     function: &ScalarFunction,
@@ -7385,9 +7401,18 @@ fn derive_function_reference_cfg(
     enums: &[ScalarEnum],
     prior_children_succeeded: bool,
 ) -> (ScalarReferenceCfg, Vec<ReferenceAnalysisError>) {
-    let mut errors = Vec::new();
-    let mut builder =
+    let builder =
         ReferenceFlowBuilder::new(source, function, module_names, call_sites, structs, enums);
+    build_function_reference_cfg(builder, function, prior_children_succeeded)
+}
+
+fn build_function_reference_cfg(
+    mut builder: ReferenceFlowBuilder<'_>,
+    function: &ScalarFunction,
+    prior_children_succeeded: bool,
+) -> (ScalarReferenceCfg, Vec<ReferenceAnalysisError>) {
+    let mut errors = Vec::new();
+    let call_sites = builder.call_sites;
     builder.point(
         CfgPointKind::Entry,
         function.span,
@@ -7398,7 +7423,7 @@ fn derive_function_reference_cfg(
         builder.names.insert(
             slot.name.clone(),
             ReferenceBindingId {
-                source: source.clone(),
+                source: builder.source.clone(),
                 function_span: function.span,
                 declaration_span: slot.span,
                 block_span: function.body.span,
@@ -7418,7 +7443,7 @@ fn derive_function_reference_cfg(
             let loan = ReferenceLoanId {
                 mode: *mutability,
                 origin_place: ReferencePlaceId {
-                    source: source.clone(),
+                    source: builder.source.clone(),
                     function_span: function.span,
                     declaration_span: *span,
                     block_span: function.body.span,

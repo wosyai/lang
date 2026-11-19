@@ -181,6 +181,7 @@ fn projected_checked_return(independent_scalar_if: bool) -> ScalarFunction {
         generic_parameters: Vec::new(),
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg {
+            primary_call_points: Default::default(),
             facts,
             points,
             initial_points: Vec::new(),

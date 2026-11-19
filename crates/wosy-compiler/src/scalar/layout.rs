@@ -675,6 +675,7 @@ impl Clone for ScalarReferenceCfg {
             initial_points: self.initial_points.clone(),
             allocations: self.allocations.clone(),
             specialized_policies: self.specialized_policies.clone(),
+            primary_call_points: self.primary_call_points.clone(),
         }
     }
 }

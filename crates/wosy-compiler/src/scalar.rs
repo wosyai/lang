@@ -529,7 +529,7 @@ pub enum CfgPointKind {
 }
 
 #[cfg_attr(not(test), derive(Clone))]
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ScalarReferenceCfg {
     pub facts: Vec<ReferenceOrigin>,
     pub points: Vec<ReferenceFlowPoint>,
@@ -537,6 +537,41 @@ pub struct ScalarReferenceCfg {
     pub allocations: BTreeSet<ReferenceBindingId>,
     #[serde(skip)]
     pub specialized_policies: Vec<SpecializedCopyPolicy>,
+    #[serde(skip)]
+    pub(crate) primary_call_points: HashMap<reference::OccurrenceOrdinal, CfgPointId>,
+}
+
+impl PartialEq for ScalarReferenceCfg {
+    fn eq(&self, other: &Self) -> bool {
+        self.facts == other.facts
+            && self.points == other.points
+            && self.initial_points == other.initial_points
+            && self.allocations == other.allocations
+            && self.specialized_policies == other.specialized_policies
+    }
+}
+
+impl Eq for ScalarReferenceCfg {}
+
+impl ScalarReferenceCfg {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the next frame-reuse unit")
+    )]
+    pub(crate) fn primary_call_point(
+        &self,
+        ordinal: reference::OccurrenceOrdinal,
+    ) -> Option<CfgPointId> {
+        let &id = self.primary_call_points.get(&ordinal)?;
+        [&self.points, &self.initial_points]
+            .into_iter()
+            .all(|points| {
+                points.get(id.0).is_some_and(|point| {
+                    point.id == id && matches!(point.kind, CfgPointKind::Call { output: 0, .. })
+                })
+            })
+            .then_some(id)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3403,6 +3438,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         generic_parameters: Vec::new(),
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg {
+            primary_call_points: HashMap::new(),
             facts: Vec::new(),
             points: Vec::new(),
             initial_points: Vec::new(),
@@ -3504,6 +3540,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                     .map_or_else(Vec::new, derive_generic_parameters),
                 overload_arms: Vec::new(),
                 reference_cfg: ScalarReferenceCfg {
+                    primary_call_points: HashMap::new(),
                     facts: Vec::new(),
                     points: Vec::new(),
                     initial_points: Vec::new(),
@@ -3532,6 +3569,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
         generic_parameters: Vec::new(),
         overload_arms: arms,
         reference_cfg: ScalarReferenceCfg {
+            primary_call_points: HashMap::new(),
             facts: Vec::new(),
             points: Vec::new(),
             initial_points: Vec::new(),
