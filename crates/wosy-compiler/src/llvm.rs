@@ -25,7 +25,7 @@ use crate::scalar::{
     CfgPointKind, CoreOperationId, InvalidationCandidate, InvalidationInputs, ReferenceBindingKind,
     ReferenceOrigin, ReleaseTarget, ResolvedCallTarget, ScalarAllocationIdentity,
     ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState, ScalarBindingOutputOrigin,
-    ScalarFieldReference, ScalarOutputValue, ScalarOverloadSelection, ScalarReferenceCfg,
+    ScalarFieldReference, ScalarOverloadSelection, ScalarReferenceCfg,
 };
 use crate::{
     BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarBuildValidation,
@@ -102,7 +102,6 @@ struct EmitState<'ctx, 'module> {
     joined_return_bindings: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
     joined_assignment_owners: BTreeMap<(u32, u32), CheckedAssignmentOwner>,
     return_output_types: Vec<ScalarType>,
-    return_body_span: Option<wosy_syntax::ByteSpan>,
     checked_call_owners: BTreeMap<(u32, u32, usize), CheckedCallOwner>,
     checked_owner_flags: BTreeMap<String, inkwell::values::IntValue<'ctx>>,
     call_owner_flags: BTreeMap<usize, inkwell::values::IntValue<'ctx>>,
@@ -1616,7 +1615,6 @@ fn emit_function<'ctx, 'module>(
                 .collect(),
             _ => return Err("function has no callable signature".to_owned()),
         },
-        return_body_span: Some(function.body.span),
         checked_call_owners: checked_call_owners(reference_cfg)?,
         checked_owner_flags: BTreeMap::new(),
         call_owner_flags: BTreeMap::new(),
@@ -1686,7 +1684,9 @@ fn emit_function<'ctx, 'module>(
         _ => return Err("function has no callable signature".into()),
     };
     let result = match function.body.items.as_slice() {
-        [ScalarBlockItem::Expression(expression)] => {
+        [ScalarBlockItem::Expression(expression)]
+            if canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
+        {
             if outputs.outputs.len() == 1 {
                 emit_typed_expression(context, &mut state, expression, &outputs.outputs[0].ty)?
             } else {
@@ -1707,7 +1707,12 @@ fn emit_function<'ctx, 'module>(
                 }
             }
         }
-        _ => emit_block(context, &mut state, &function.body)?,
+        _ => emit_block_at(
+            context,
+            &mut state,
+            &function.body,
+            BlockEmission::Return(outputs),
+        )?,
     };
     if let [ScalarBlockItem::Expression(expression)] = function.body.items.as_slice() {
         for output in state.return_owner_slots.keys().copied().collect::<Vec<_>>() {
@@ -1755,7 +1760,6 @@ fn emit_main<'ctx, 'module>(
         joined_return_bindings: BTreeMap::new(),
         joined_assignment_owners: BTreeMap::new(),
         return_output_types: Vec::new(),
-        return_body_span: None,
         checked_call_owners: BTreeMap::new(),
         checked_owner_flags: BTreeMap::new(),
         call_owner_flags: BTreeMap::new(),
@@ -1879,7 +1883,6 @@ fn emit_project_function<'ctx, 'module>(
                 .collect(),
             _ => return Err("function has no callable signature".to_owned()),
         },
-        return_body_span: Some(function.body.span),
         checked_call_owners: checked_call_owners(reference_cfg)?,
         checked_owner_flags: BTreeMap::new(),
         call_owner_flags: BTreeMap::new(),
@@ -1949,7 +1952,9 @@ fn emit_project_function<'ctx, 'module>(
         _ => return Err("function has no callable signature".into()),
     };
     let result = match function.body.items.as_slice() {
-        [ScalarBlockItem::Expression(expression)] => {
+        [ScalarBlockItem::Expression(expression)]
+            if canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
+        {
             if outputs.outputs.len() == 1 {
                 emit_project_typed_expression(
                     context,
@@ -1983,7 +1988,14 @@ fn emit_project_function<'ctx, 'module>(
                 }
             }
         }
-        _ => emit_project_block(context, &mut state, &function.body, source_module, modules)?,
+        _ => emit_project_block_at(
+            context,
+            &mut state,
+            &function.body,
+            source_module,
+            modules,
+            BlockEmission::Return(outputs),
+        )?,
     };
     if let [ScalarBlockItem::Expression(expression)] = function.body.items.as_slice() {
         for output in state.return_owner_slots.keys().copied().collect::<Vec<_>>() {
@@ -2031,7 +2043,6 @@ fn emit_project_main<'ctx, 'module>(
         joined_return_bindings: BTreeMap::new(),
         joined_assignment_owners: BTreeMap::new(),
         return_output_types: Vec::new(),
-        return_body_span: None,
         checked_call_owners: BTreeMap::new(),
         checked_owner_flags: BTreeMap::new(),
         call_owner_flags: BTreeMap::new(),
@@ -2264,10 +2275,69 @@ fn initialize_project_module<'ctx, 'module>(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum BlockEmission<'a> {
+    Ordinary,
+    Return(&'a crate::ScalarOutputSequence),
+    TailArm(&'a crate::ScalarOutputSequence),
+}
+
+impl<'a> BlockEmission<'a> {
+    fn ordered_outputs(self) -> Option<&'a crate::ScalarOutputSequence> {
+        match self {
+            Self::Return(outputs) | Self::TailArm(outputs) if outputs.outputs.len() > 1 => {
+                Some(outputs)
+            }
+            _ => None,
+        }
+    }
+}
+
+struct CanonicalTailIf<'syntax, 'signature> {
+    condition: &'syntax ScalarExpression,
+    then_branch: &'syntax ScalarBlock,
+    else_branch: &'syntax ScalarBlock,
+    outputs: &'signature crate::ScalarOutputSequence,
+}
+
+fn canonical_tail_if<'syntax, 'signature>(
+    block: &'syntax ScalarBlock,
+    emission: BlockEmission<'signature>,
+) -> Option<CanonicalTailIf<'syntax, 'signature>> {
+    let outputs = emission.ordered_outputs()?;
+    if block.final_output_values.len() != 1 {
+        return None;
+    }
+    let (expression, _) = block.final_expressions().next()?;
+    match expression {
+        ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => Some(CanonicalTailIf {
+            condition,
+            then_branch,
+            else_branch,
+            outputs,
+        }),
+        _ => None,
+    }
+}
+
 fn emit_block<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     block: &ScalarBlock,
+) -> Result<EmitValue<'ctx>, String> {
+    emit_block_at(context, state, block, BlockEmission::Ordinary)
+}
+
+fn emit_block_at<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    block: &ScalarBlock,
+    emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
     let storage = state.storage.clone();
     let values = state.values.clone();
@@ -2291,27 +2361,10 @@ fn emit_block<'ctx, 'module>(
             ScalarBlockItem::While(expression) => emit_while(context, state, expression)?,
         };
     }
-    if !block.final_output_values.is_empty() {
-        result = emit_final_outputs(context, state, block)?;
+    if !block.final_output_values.is_empty() || matches!(emission, BlockEmission::TailArm(_)) {
+        result = emit_final_outputs(context, state, block, emission)?;
     }
-    if state.return_body_span == Some(block.span) {
-        result = materialize_return_branch(context, state, block, result)?;
-        let outputs = crate::ScalarOutputSequence {
-            outputs: block
-                .final_output_values
-                .iter()
-                .map(|output| crate::ScalarOutput {
-                    ty: output.ty.clone(),
-                    span: output.span,
-                })
-                .collect(),
-            span: block.span,
-        };
-        result = materialize_fresh_return_outputs(context, state, result, &outputs)?;
-        state.fresh_return_outputs.clear();
-    } else {
-        result = materialize_return_branch(context, state, block, result)?;
-    }
+    result = finish_block_return(context, state, block, result, emission)?;
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
     state.storage = storage;
@@ -2337,6 +2390,24 @@ fn emit_project_block<'ctx, 'module>(
     block: &ScalarBlock,
     module: &ScalarModule,
     modules: &[&ScalarModule],
+) -> Result<EmitValue<'ctx>, String> {
+    emit_project_block_at(
+        context,
+        state,
+        block,
+        module,
+        modules,
+        BlockEmission::Ordinary,
+    )
+}
+
+fn emit_project_block_at<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    block: &ScalarBlock,
+    module: &ScalarModule,
+    modules: &[&ScalarModule],
+    emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
     let storage = state.storage.clone();
     let values = state.values.clone();
@@ -2366,27 +2437,10 @@ fn emit_project_block<'ctx, 'module>(
             }
         };
     }
-    if !block.final_output_values.is_empty() {
-        result = emit_project_final_outputs(context, state, block, module, modules)?;
+    if !block.final_output_values.is_empty() || matches!(emission, BlockEmission::TailArm(_)) {
+        result = emit_project_final_outputs(context, state, block, module, modules, emission)?;
     }
-    if state.return_body_span == Some(block.span) {
-        result = materialize_return_branch(context, state, block, result)?;
-        let outputs = crate::ScalarOutputSequence {
-            outputs: block
-                .final_output_values
-                .iter()
-                .map(|output| crate::ScalarOutput {
-                    ty: output.ty.clone(),
-                    span: output.span,
-                })
-                .collect(),
-            span: block.span,
-        };
-        result = materialize_fresh_return_outputs(context, state, result, &outputs)?;
-        state.fresh_return_outputs.clear();
-    } else {
-        result = materialize_return_branch(context, state, block, result)?;
-    }
+    result = finish_block_return(context, state, block, result, emission)?;
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
     state.storage = storage;
@@ -2410,7 +2464,25 @@ fn emit_final_outputs<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     block: &ScalarBlock,
+    emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
+    if let Some(tail) = canonical_tail_if(block, emission) {
+        let condition =
+            take_basic(emit_expression(context, state, tail.condition)?)?.into_int_value();
+        return emit_if_value(
+            context,
+            state,
+            condition,
+            tail.then_branch,
+            tail.else_branch,
+            |state, branch| {
+                emit_block_at(context, state, branch, BlockEmission::TailArm(tail.outputs))
+            },
+        );
+    }
+    if let BlockEmission::TailArm(outputs) = emission {
+        return emit_ordered_final_outputs(context, state, block, outputs, None);
+    }
     if block.final_output_values.len() == 1 {
         let output = &block.final_output_values[0];
         if matches!(&output.value, ScalarExpression::Call { .. }) {
@@ -2435,22 +2507,6 @@ fn emit_final_outputs<'ctx, 'module>(
         transfer_runtime_array_return(state, block, &output.value, &output.ty);
         transfer_automatic_return_result(state, &output.value);
         return Ok(value);
-    }
-    if let Some((condition, then_branch, else_branch)) = recombine_conditional_final_outputs(block)
-    {
-        for output in &block.final_output_values {
-            transfer_runtime_array_return(state, block, &output.value, &output.ty);
-            transfer_automatic_return_result(state, &output.value);
-        }
-        let condition = take_basic(emit_expression(context, state, &condition)?)?.into_int_value();
-        return emit_if_value(
-            context,
-            state,
-            condition,
-            &then_branch,
-            &else_branch,
-            |state, branch| emit_block(context, state, branch),
-        );
     }
     let outputs = crate::ScalarOutputSequence {
         outputs: block
@@ -2489,7 +2545,38 @@ fn emit_project_final_outputs<'ctx, 'module>(
     block: &ScalarBlock,
     module: &ScalarModule,
     modules: &[&ScalarModule],
+    emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
+    if let Some(tail) = canonical_tail_if(block, emission) {
+        let condition = take_basic(emit_project_expression(
+            context,
+            state,
+            tail.condition,
+            module,
+            modules,
+        )?)?
+        .into_int_value();
+        return emit_if_value(
+            context,
+            state,
+            condition,
+            tail.then_branch,
+            tail.else_branch,
+            |state, branch| {
+                emit_project_block_at(
+                    context,
+                    state,
+                    branch,
+                    module,
+                    modules,
+                    BlockEmission::TailArm(tail.outputs),
+                )
+            },
+        );
+    }
+    if let BlockEmission::TailArm(outputs) = emission {
+        return emit_ordered_final_outputs(context, state, block, outputs, Some((module, modules)));
+    }
     if block.final_output_values.len() == 1 {
         let output = &block.final_output_values[0];
         if matches!(&output.value, ScalarExpression::Call { .. }) {
@@ -2521,25 +2608,6 @@ fn emit_project_final_outputs<'ctx, 'module>(
         transfer_runtime_array_return(state, block, &output.value, &output.ty);
         transfer_automatic_return_result(state, &output.value);
         return Ok(value);
-    }
-    if let Some((condition, then_branch, else_branch)) = recombine_conditional_final_outputs(block)
-    {
-        for output in &block.final_output_values {
-            transfer_runtime_array_return(state, block, &output.value, &output.ty);
-            transfer_automatic_return_result(state, &output.value);
-        }
-        let condition = take_basic(emit_project_expression(
-            context, state, &condition, module, modules,
-        )?)?
-        .into_int_value();
-        return emit_if_value(
-            context,
-            state,
-            condition,
-            &then_branch,
-            &else_branch,
-            |state, branch| emit_project_block(context, state, branch, module, modules),
-        );
     }
     let outputs = crate::ScalarOutputSequence {
         outputs: block
@@ -2581,80 +2649,39 @@ fn emit_project_final_outputs<'ctx, 'module>(
     build_aggregate(context, state, &outputs, values)
 }
 
-fn recombine_conditional_final_outputs(
+fn emit_ordered_final_outputs<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
     block: &ScalarBlock,
-) -> Option<(ScalarExpression, ScalarBlock, ScalarBlock)> {
-    let ScalarExpression::If {
-        condition,
-        then_branch,
-        else_branch,
-        ..
-    } = &block.final_output_values.first()?.value
-    else {
-        return None;
-    };
-    let conditional_span = block.final_output_values.first()?.span;
-    let mut then_outputs = Vec::new();
-    let mut else_outputs = Vec::new();
-    for output in &block.final_output_values {
-        let ScalarExpression::If {
-            condition: output_condition,
-            then_branch: output_then_branch,
-            else_branch: output_else_branch,
-            ..
-        } = &output.value
-        else {
-            return None;
-        };
-        if output.span != conditional_span || output_condition != condition {
-            return None;
-        }
-        let [then_output] = output_then_branch.final_output_values.as_slice() else {
-            return None;
-        };
-        let [else_output] = output_else_branch.final_output_values.as_slice() else {
-            return None;
-        };
-        let mut then_output = then_output.clone();
-        then_output.ty = output.ty.clone();
-        then_outputs.push(then_output);
-        let mut else_output = else_output.clone();
-        else_output.ty = output.ty.clone();
-        else_outputs.push(else_output);
+    outputs: &crate::ScalarOutputSequence,
+    project: Option<(&ScalarModule, &[&ScalarModule])>,
+) -> Result<EmitValue<'ctx>, String> {
+    if block.final_output_values.len() != outputs.outputs.len() {
+        return Err("conditional arm has the wrong number of LLVM outputs".into());
     }
-    Some((
-        (**condition).clone(),
-        recombine_conditional_branch(then_branch, then_outputs),
-        recombine_conditional_branch(else_branch, else_outputs),
-    ))
-}
-
-fn recombine_conditional_branch(
-    branch: &ScalarBlock,
-    final_output_values: Vec<ScalarOutputValue>,
-) -> ScalarBlock {
-    let final_start = branch.items.len() - branch.final_output_values.len();
-    let mut branch = branch.clone();
-    branch.items.truncate(final_start);
-    branch.terminated_items.truncate(final_start);
-    branch.items.extend(
-        final_output_values
-            .iter()
-            .map(|output| ScalarBlockItem::Expression(output.value.clone())),
-    );
-    branch
-        .terminated_items
-        .extend(final_output_values.iter().map(|_| false));
-    branch.final_output_values = final_output_values;
-    branch.expressions = branch
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            ScalarBlockItem::Expression(expression) => Some(expression.clone()),
-            _ => None,
+    let values = block
+        .final_expressions()
+        .zip(&outputs.outputs)
+        .map(|((expression, _), output)| match project {
+            Some((module, modules)) => emit_project_typed_expression(
+                context, state, expression, &output.ty, module, modules,
+            ),
+            None => emit_typed_expression(context, state, expression, &output.ty),
         })
-        .collect();
-    branch
+        .collect::<Result<Vec<_>, _>>()?;
+    if !state
+        .branch_return_outputs
+        .contains_key(&(block.span.start, block.span.end))
+    {
+        for (position, (expression, _)) in block.final_expressions().enumerate() {
+            record_forwarded_return_owner(context, state, expression, position)?;
+        }
+    }
+    for ((expression, _), output) in block.final_expressions().zip(&outputs.outputs) {
+        transfer_runtime_array_return(state, block, expression, &output.ty);
+        transfer_automatic_return_result(state, expression);
+    }
+    build_aggregate(context, state, outputs, values)
 }
 
 enum AssignmentDestination<'ctx> {
@@ -3962,8 +3989,8 @@ use expression::{
 };
 mod return_memory;
 use return_memory::{
-    emit_automatic_return_result, emit_return, materialize_fresh_return_outputs,
-    materialize_return_branch, record_forwarded_return_owner, transfer_automatic_return_result,
+    emit_automatic_return_result, emit_return, finish_block_return, record_forwarded_return_owner,
+    transfer_automatic_return_result,
 };
 fn project_function_name(source: &wosy_syntax::SourceIdentity, name: &str) -> String {
     let mut symbol = String::from("wosy_fn");

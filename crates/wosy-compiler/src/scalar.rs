@@ -522,6 +522,10 @@ pub enum CfgPointKind {
         checked: bool,
     },
     Return,
+    ConditionalOutput {
+        then_point: CfgPointId,
+        else_point: CfgPointId,
+    },
 }
 
 #[cfg_attr(not(test), derive(Clone))]
@@ -1763,8 +1767,11 @@ pub struct ScalarBlock {
 }
 
 struct ScalarTailConditional<'a> {
+    expression: &'a ScalarExpression,
+    condition: &'a ScalarExpression,
     then_branch: &'a ScalarBlock,
     else_branch: &'a ScalarBlock,
+    span: ByteSpan,
 }
 
 enum ScalarBlockItemRole<'a> {
@@ -1776,7 +1783,9 @@ enum ScalarBlockItemRole<'a> {
 }
 
 impl ScalarBlock {
-    fn final_expressions(&self) -> impl Iterator<Item = (&ScalarExpression, &ScalarOutputValue)> {
+    pub(crate) fn final_expressions(
+        &self,
+    ) -> impl Iterator<Item = (&ScalarExpression, &ScalarOutputValue)> {
         let first_output = self.items.len() - self.final_output_values.len();
         self.items[first_output..]
             .iter()
@@ -1795,16 +1804,20 @@ impl ScalarBlock {
         }
         let (expression, _) = self.final_expressions().next().expect("final output");
         let ScalarExpression::If {
+            condition,
             then_branch,
             else_branch,
-            ..
+            span,
         } = expression
         else {
             return None;
         };
         Some(ScalarTailConditional {
+            expression,
+            condition,
             then_branch,
             else_branch,
+            span: *span,
         })
     }
 
@@ -2359,11 +2372,12 @@ use resolution::{
 mod typecheck;
 use typecheck::{
     block_item_type_in_module, block_type_in_module, block_type_in_module_expected,
-    call_output_sequence_in_module, declare_module_name, expect_module_type, expression_span,
-    expression_type_in_module_expected, is_integer_type, is_module_private_name, module_diagnostic,
-    operator, unused_binding_spans, validate, validate_extern, validate_identifier_style,
-    validate_module_generic_type, validate_module_type, validate_output_receivers_in_module,
-    validate_unit_if_positions_in_module,
+    call_output_sequence_in_module, check_final_output_prefix, declare_module_name,
+    expect_module_type, expression_span, expression_type_in_module_expected, is_integer_type,
+    is_module_private_name, module_diagnostic, operator, unused_binding_spans, validate,
+    validate_extern, validate_identifier_style, validate_module_generic_type, validate_module_type,
+    validate_output_receivers_in_module, validate_overload_tail_conditionals,
+    validate_tail_conditional_return, validate_unit_if_positions_in_module, TailConditionalTyping,
 };
 use typecheck::{split_module_typing, ScalarModuleTyping, ScalarProgramTyping};
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
@@ -2617,7 +2631,21 @@ fn typecheck_scalar_project_with_occurrences(
                     );
                 }
                 ScalarItem::Function(function) => {
+                    let typing = TailConditionalTyping::Module {
+                        module,
+                        modules: &modules,
+                    };
                     if !function.overload_arms.is_empty() {
+                        validate_overload_tail_conditionals(
+                            function,
+                            &declarations,
+                            &declaration_names,
+                            &folded_declarations,
+                            typing,
+                            &mut diagnostics,
+                            &overloads,
+                            &mut inference,
+                        );
                         continue;
                     }
                     let ScalarType::Callable {
@@ -2638,62 +2666,42 @@ fn typecheck_scalar_project_with_occurrences(
                     let mut scope = declarations.clone();
                     let mut visible_names = declaration_names.clone();
                     let mut folded_names = folded_declarations.clone();
-                    for (index, name) in function.parameters.iter().enumerate() {
-                        validate_identifier_style(
-                            &module.source,
-                            name,
-                            function.parameter_spans[index],
-                            &mut diagnostics,
-                        );
-                        if index < parameters.len()
-                            && declare_module_name(
-                                module,
-                                name,
-                                function.span,
-                                &mut visible_names,
-                                &mut folded_names,
-                                &mut diagnostics,
-                            )
-                        {
-                            scope.insert(name.clone(), parameters[index].clone());
-                        }
-                    }
+                    typing.declare_parameters(
+                        function,
+                        parameters,
+                        &mut scope,
+                        &mut visible_names,
+                        &mut folded_names,
+                        &mut diagnostics,
+                    );
                     if outputs.outputs.len() > 1 && !function.body.final_output_values.is_empty() {
-                        let final_start =
-                            function.body.items.len() - function.body.final_output_values.len();
-                        for item in &function.body.items[..final_start] {
-                            let _ = match item {
-                                ScalarBlockItem::Expression(
-                                    expression @ (ScalarExpression::If { .. }
-                                    | ScalarExpression::UnitIf { .. }),
-                                ) => expression_type_in_module_expected(
-                                    expression,
-                                    Some(&ScalarType::Unit),
-                                    &scope,
-                                    &visible_names,
-                                    &folded_names,
-                                    module,
-                                    &modules,
-                                    &mut diagnostics,
-                                    false,
-                                    &overloads,
-                                    &mut inference,
-                                ),
-                                _ => block_item_type_in_module(
-                                    item,
-                                    &mut scope,
-                                    &mut visible_names,
-                                    &mut folded_names,
-                                    module,
-                                    &modules,
-                                    &mut diagnostics,
-                                    false,
-                                    &overloads,
-                                    &mut inference,
-                                ),
-                            };
-                        }
-                        if function.body.final_output_values.len() == 1
+                        let tail = function.body.tail_conditional();
+                        let unsafe_context = tail.is_some() && function.body.unsafe_context;
+                        check_final_output_prefix(
+                            &function.body,
+                            &mut scope,
+                            &mut visible_names,
+                            &mut folded_names,
+                            typing,
+                            &mut diagnostics,
+                            unsafe_context,
+                            &overloads,
+                            &mut inference,
+                        );
+                        if let Some(tail) = tail {
+                            validate_tail_conditional_return(
+                                tail,
+                                &outputs.outputs,
+                                &scope,
+                                &visible_names,
+                                &folded_names,
+                                typing,
+                                &mut diagnostics,
+                                unsafe_context,
+                                &overloads,
+                                &mut inference,
+                            );
+                        } else if function.body.final_output_values.len() == 1
                             && matches!(
                                 function
                                     .body
@@ -3380,7 +3388,6 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         .map(|node| derive_block(node))
         .expect("function block");
     if let ScalarType::Callable { outputs, .. } = &signature {
-        expand_conditional_final_outputs(&mut body, &outputs.outputs);
         for (value, output) in body.final_output_values.iter_mut().zip(&outputs.outputs) {
             value.ty = output.ty.clone();
         }
@@ -3479,7 +3486,6 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                     .expect("overload arm block"),
             );
             if let ScalarType::Callable { outputs, .. } = &signature {
-                expand_conditional_final_outputs(&mut body, &outputs.outputs);
                 for (value, output) in body.final_output_values.iter_mut().zip(&outputs.outputs) {
                     value.ty = output.ty.clone();
                 }
@@ -3538,7 +3544,6 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
 pub(crate) mod control;
 mod reference;
 mod static_calls;
-use reference::expand_conditional_final_outputs;
 pub use static_calls::{analyze_scalar_build, PreparedScalarProject, ScalarBuildValidation};
 fn derive_type(node: &CstNode) -> ScalarType {
     let actual = if matches!(node.kind(), SyntaxKind::TypeSpec | SyntaxKind::Punctuation) {

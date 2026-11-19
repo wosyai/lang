@@ -1,22 +1,24 @@
 use super::*;
+use crate::scalar::{CfgPointId, ReferenceFlowPoint};
+
+type ReturnBranches =
+    BTreeMap<(u32, u32), (BTreeSet<usize>, BTreeSet<usize>, BTreeMap<usize, String>)>;
 
 pub(super) fn fresh_return_outputs(
     function: &ScalarFunction,
     reference_cfg: &ScalarReferenceCfg,
-) -> Result<
-    (
-        BTreeSet<usize>,
-        BTreeMap<(u32, u32), (BTreeSet<usize>, BTreeSet<usize>, BTreeMap<usize, String>)>,
-    ),
-    String,
-> {
+) -> Result<(BTreeSet<usize>, ReturnBranches), String> {
+    let projected = matches!(&function.signature, ScalarType::Callable { outputs, .. }
+        if outputs.outputs.len() > 1)
+        && projected_return_arms(&function.body).is_some();
     let mut result = BTreeSet::new();
     let mut external_outputs = BTreeSet::new();
+    let mut projected_returns = BTreeMap::new();
     for point in &reference_cfg.points {
         let CfgPointKind::ReturnOutput {
             output,
             checked: true,
-            ..
+            value_point,
         } = point.kind
         else {
             continue;
@@ -53,6 +55,9 @@ pub(super) fn fresh_return_outputs(
         if external {
             external_outputs.insert(output);
         }
+        if projected {
+            projected_returns.insert(output, (point.id, value_point));
+        }
     }
     let mixed = result
         .intersection(&external_outputs)
@@ -60,6 +65,20 @@ pub(super) fn fresh_return_outputs(
         .collect::<BTreeSet<_>>();
     let mut branches = BTreeMap::new();
     for output in &mixed {
+        if projected {
+            let &(return_point, value_point) = &projected_returns[output];
+            record_projected_return_branches(
+                function,
+                reference_cfg,
+                &function.body,
+                return_point,
+                value_point,
+                *output,
+                *output,
+                &mut branches,
+            )?;
+            continue;
+        }
         let final_output = function
             .body
             .final_output_values
@@ -75,6 +94,99 @@ pub(super) fn fresh_return_outputs(
     }
     result.retain(|output| !mixed.contains(output));
     Ok((result, branches))
+}
+
+fn projected_return_arms(block: &ScalarBlock) -> Option<[&ScalarBlock; 2]> {
+    if block.final_output_values.len() != 1 {
+        return None;
+    }
+    let (expression, _) = block.final_expressions().next()?;
+    return_if_arms(expression)
+}
+
+fn return_if_arms(expression: &ScalarExpression) -> Option<[&ScalarBlock; 2]> {
+    let ScalarExpression::If {
+        then_branch,
+        else_branch,
+        ..
+    } = expression
+    else {
+        return None;
+    };
+    Some([then_branch, else_branch])
+}
+
+fn record_projected_return_branches(
+    function: &ScalarFunction,
+    reference_cfg: &ScalarReferenceCfg,
+    block: &ScalarBlock,
+    consumer: CfgPointId,
+    value_point: CfgPointId,
+    syntax_output: usize,
+    output: usize,
+    branches: &mut ReturnBranches,
+) -> Result<(), String> {
+    let point = reference_cfg
+        .points
+        .get(value_point.0)
+        .filter(|point| point.id == value_point && value_point < consumer)
+        .ok_or_else(|| {
+            format!("invalid return output {output} value link {consumer:?} -> {value_point:?}")
+        })?;
+    let final_expression = block.final_expressions().nth(syntax_output);
+    let conditional = projected_return_arms(block)
+        .map(|arms| (arms, syntax_output))
+        .or_else(|| {
+            let (expression, _) = final_expression?;
+            return_if_arms(expression).map(|arms| (arms, 0))
+        });
+    if let Some((arms, arm_output)) = conditional {
+        let CfgPointKind::ConditionalOutput {
+            then_point,
+            else_point,
+        } = point.kind
+        else {
+            return Err(format!(
+                "return output {output} has no conditional output at {value_point:?}"
+            ));
+        };
+        if then_point == else_point {
+            return Err(format!(
+                "return output {output} has identical arm links at {value_point:?}"
+            ));
+        }
+        for (arm, arm_point) in arms.into_iter().zip([then_point, else_point]) {
+            record_projected_return_branches(
+                function,
+                reference_cfg,
+                arm,
+                value_point,
+                arm_point,
+                arm_output,
+                output,
+                branches,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if matches!(point.kind, CfgPointKind::ConditionalOutput { .. }) {
+        return Err(format!(
+            "return branch for output {output} has an unexpected conditional output at {value_point:?}"
+        ));
+    }
+    let (expression, metadata) =
+        final_expression.ok_or_else(|| format!("return branch has no output {output}"))?;
+    record_return_branch_owner(
+        function,
+        reference_cfg,
+        block,
+        expression,
+        metadata.span,
+        point,
+        output,
+        branches,
+    )
 }
 
 pub(super) fn dynamic_return_outputs(
@@ -211,10 +323,7 @@ fn record_return_branches(
     reference_cfg: &ScalarReferenceCfg,
     expression: &ScalarExpression,
     output: usize,
-    branches: &mut BTreeMap<
-        (u32, u32),
-        (BTreeSet<usize>, BTreeSet<usize>, BTreeMap<usize, String>),
-    >,
+    branches: &mut ReturnBranches,
 ) -> Result<(), String> {
     let ScalarExpression::If {
         then_branch,
@@ -299,43 +408,67 @@ fn record_return_branches(
                 points.len()
             ));
         };
-        let origins = point
-            .possible_origins
-            .as_ref()
-            .expect("checked typed point");
-        let local = origins.iter().any(|id| matches!(
-            &reference_cfg.facts[id.0],
-            ReferenceOrigin::Fresh { allocation, .. }
-                if allocation.function_span == function.span && allocation.source == point.source_span.source
-        ));
-        let external = origins.iter().any(|id| match &reference_cfg.facts[id.0] {
-            ReferenceOrigin::BorrowedFrom { .. } => true,
-            ReferenceOrigin::Fresh { allocation, .. } => {
-                allocation.function_span != function.span
-                    || allocation.source != point.source_span.source
-            }
-            ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
-        });
-        let selected = branches
-            .entry((branch.span.start, branch.span.end))
-            .or_default();
-        selected.1.insert(output);
-        if local && external {
-            let ScalarExpression::Name { name, .. } = &value.value else {
-                return Err(format!(
-                    "return branch at {:?} has joined owners without a binding",
-                    value.span
-                ));
-            };
-            selected.2.insert(output, name.clone());
-            continue;
-        }
-        if local {
-            selected.0.insert(output);
-        }
+        record_return_branch_owner(
+            function,
+            reference_cfg,
+            branch,
+            &value.value,
+            value.span,
+            point,
+            output,
+            branches,
+        )?;
     }
     Ok(())
 }
+
+fn record_return_branch_owner(
+    function: &ScalarFunction,
+    reference_cfg: &ScalarReferenceCfg,
+    branch: &ScalarBlock,
+    expression: &ScalarExpression,
+    span: wosy_syntax::ByteSpan,
+    point: &ReferenceFlowPoint,
+    output: usize,
+    branches: &mut ReturnBranches,
+) -> Result<(), String> {
+    let origins = point
+        .possible_origins
+        .as_ref()
+        .filter(|origins| !origins.is_empty())
+        .ok_or_else(|| format!("return branch at {span:?} has 0 typed origin points"))?;
+    let local = origins.iter().any(|id| matches!(
+        &reference_cfg.facts[id.0],
+        ReferenceOrigin::Fresh { allocation, .. }
+            if allocation.function_span == function.span && allocation.source == point.source_span.source
+    ));
+    let external = origins.iter().any(|id| match &reference_cfg.facts[id.0] {
+        ReferenceOrigin::BorrowedFrom { .. } => true,
+        ReferenceOrigin::Fresh { allocation, .. } => {
+            allocation.function_span != function.span
+                || allocation.source != point.source_span.source
+        }
+        ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
+    });
+    let selected = branches
+        .entry((branch.span.start, branch.span.end))
+        .or_default();
+    selected.1.insert(output);
+    if local && external {
+        let ScalarExpression::Name { name, .. } = expression else {
+            return Err(format!(
+                "return branch at {span:?} has joined owners without a binding"
+            ));
+        };
+        selected.2.insert(output, name.clone());
+    } else if local {
+        selected.0.insert(output);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;
 
 pub(super) fn checked_call_owners(
     reference_cfg: &ScalarReferenceCfg,

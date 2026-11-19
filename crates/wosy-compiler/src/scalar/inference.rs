@@ -75,6 +75,7 @@ impl ScalarAssignmentTyping {
 pub(super) struct PreparationOccurrenceTyping {
     module_assignments: HashMap<*const ScalarAssignment, Vec<ScalarType>>,
     calls: HashMap<*const ScalarExpression, CheckedCallSignature>,
+    tail_conditional_outputs: HashMap<*const ScalarExpression, Vec<ScalarType>>,
     expressions: HashMap<*const ScalarExpression, CheckedExpressionType>,
     places: HashMap<*const ScalarPlace, ScalarType>,
 }
@@ -100,6 +101,14 @@ impl PreparationOccurrenceTyping {
         expression: &ScalarExpression,
     ) -> Option<CheckedCallSignature> {
         self.calls.remove(&std::ptr::from_ref(expression))
+    }
+
+    pub(super) fn take_tail_conditional_outputs(
+        &mut self,
+        expression: &ScalarExpression,
+    ) -> Option<Vec<ScalarType>> {
+        self.tail_conditional_outputs
+            .remove(&std::ptr::from_ref(expression))
     }
 
     pub(super) fn take_expression_type(
@@ -252,6 +261,19 @@ impl<'a> ScalarInferenceBuilder<'a> {
                 overload_arm,
             },
         );
+    }
+
+    pub(super) fn record_tail_conditional_outputs(
+        &mut self,
+        expression: &ScalarExpression,
+        types: &[ScalarType],
+    ) {
+        debug_assert!(types.len() > 1);
+        if !self.suppress_checked_occurrences && !types.iter().any(contains_error_type) {
+            self.occurrences
+                .tail_conditional_outputs
+                .insert(std::ptr::from_ref(expression), types.to_vec());
+        }
     }
 
     pub(super) fn set_validation_root(&mut self, item: &ScalarItem) {

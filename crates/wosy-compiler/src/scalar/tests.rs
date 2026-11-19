@@ -9025,20 +9025,85 @@ fn derives_local_pair_returns_in_source_order() {
 
 #[test]
 fn derives_conditional_output_lists_by_position() {
-    let result = validate_text(
-        "%%start\n(i32, bool)() pair = fn { if (true) { 1, true } else { 2, false } };\n%%end",
-    );
+    let text =
+        "%%start\n(i32, bool)() pair = fn { if (true) { 1, true } else { 2, false } };\n%%end";
+    let result = validate_text(text);
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     let ScalarItem::Function(function) = &result.program.items[0] else {
         panic!("conditional pair function")
     };
-    assert_eq!(function.body.final_output_values.len(), 2);
-    assert_eq!(function.body.final_output_values[0].ty, ScalarType::I32);
-    assert_eq!(function.body.final_output_values[1].ty, ScalarType::Bool);
+    assert_eq!(function.body.items.len(), 1);
+    assert_eq!(function.body.final_output_values.len(), 1);
     assert!(matches!(
-        &function.body.final_output_values[0].value,
-        ScalarExpression::If { .. }
+        &function.body.items[0],
+        ScalarBlockItem::Expression(ScalarExpression::If { .. })
     ));
+
+    let parsed = parse_source(source(), text.into(), &[]);
+    let (validated, occurrences) = typecheck_scalar_program_with_occurrences(
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+        ScalarTargetLayout::NATIVE64,
+    );
+    let calls =
+        reference::resolve_program_call_sites_with_occurrences(&validated.program, occurrences)
+            .expect("checked conditional occurrences");
+    let structure = &calls.function(0).structure;
+    let root = &structure.blocks[structure.root.0];
+    let outputs = root.final_outputs().collect::<Vec<_>>();
+    let [first, second] = outputs.as_slice() else {
+        panic!("two ordered outputs");
+    };
+    assert_eq!((first.item, first.output), (0, 0));
+    assert_eq!((second.item, second.output), (0, 1));
+    assert_eq!(first.expression, second.expression);
+    assert_eq!(
+        structure.conditional_output_projections[&first.expression].types,
+        [ScalarType::I32, ScalarType::Bool],
+    );
+}
+
+#[test]
+fn validates_overload_tail_conditional_outputs_in_both_drivers() {
+    for (parameters, then_arm, expected_diagnostic) in [
+        ("bool", "{ 17, local_flag }", None),
+        ("bool", "{ 17 }", Some(("B0004", "17"))),
+        (
+            "bool",
+            "{ 17, 1 }",
+            Some(("B0006", "if (local_flag) { 17, 1 } else { 42, false }")),
+        ),
+        (
+            "i32",
+            "{ 17, true }",
+            Some(("B0005", "if (local_flag) { 17, true } else { 42, false }")),
+        ),
+    ] {
+        let text = format!(
+            "%%start\nchoose = overload {{\n(u16, bool)({parameters}) => fn(flag) {{ {parameters} local_flag = flag; if (local_flag) {then_arm} else {{ 42, false }} }};\ni32() => fn {{ 1 }};\n}};\n%%end"
+        );
+        let source = source();
+        let single = validate_text(&text);
+        let module = module_from_text(source.clone(), &text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(module, Vec::new())],
+            vec![source],
+        ));
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if let Some((code, fragment)) = expected_diagnostic {
+                let diagnostic = diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.code == code)
+                    .unwrap_or_else(|| panic!("missing {code}: {diagnostics:?}"));
+                let start = text.find(fragment).unwrap();
+                assert_eq!(
+                    diagnostic.labels[0].span.range,
+                    ByteSpan::new(start as u32, (start + fragment.len()) as u32),
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            }
+        }
+    }
 }
 
 #[test]

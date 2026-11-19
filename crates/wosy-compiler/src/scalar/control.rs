@@ -192,6 +192,11 @@ pub(super) struct FinalOutputSlot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ConditionalOutputProjection {
+    pub(super) types: Vec<ScalarType>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum BindingOutput {
     Evaluate {
         position: usize,
@@ -284,18 +289,33 @@ pub(super) struct BlockItem {
 pub(super) struct BlockRegion {
     pub(super) span: ByteSpan,
     pub(super) items: Vec<BlockItem>,
+    projected_outputs: Vec<FinalOutputSlot>,
 }
 
 impl BlockRegion {
     pub(super) fn new(span: ByteSpan, items: Vec<BlockItem>) -> Self {
-        Self { span, items }
+        Self {
+            span,
+            items,
+            projected_outputs: Vec::new(),
+        }
+    }
+
+    pub(super) fn project_tail_outputs(&mut self, primary: FinalOutputSlot, arity: usize) {
+        debug_assert_eq!(primary.output, 0);
+        debug_assert!(self.projected_outputs.is_empty());
+        self.projected_outputs
+            .extend((1..arity).map(|output| FinalOutputSlot { output, ..primary }));
     }
 
     pub(super) fn final_outputs(&self) -> impl Iterator<Item = &FinalOutputSlot> {
-        self.items.iter().filter_map(|item| match &item.kind {
-            BlockItemKind::FinalOutput(slot) => Some(slot),
-            _ => None,
-        })
+        self.items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                BlockItemKind::FinalOutput(slot) => Some(slot),
+                _ => None,
+            })
+            .chain(&self.projected_outputs)
     }
 }
 

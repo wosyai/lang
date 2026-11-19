@@ -3,9 +3,10 @@ use super::control::NamespaceTarget;
 use super::control::{
     module_initialization_region, BindingAllocationLengthSlot, BindingInitialization,
     BindingOutput, BindingOutputs, BindingReceiverSlot, BindingRegion, BlockItem, BlockItemKind,
-    BlockPosition, BlockRegion, CheckedCallSignature, CheckedOccurrenceTypes, ConditionalRegion,
-    FinalOutputSlot, ModuleInitializationDetail, ModuleInitializationRegion,
-    ModuleInitializationStepKind, ModuleInitializationTopology, ShortCircuitRegion, WhileRegion,
+    BlockPosition, BlockRegion, CheckedCallSignature, CheckedOccurrenceTypes,
+    ConditionalOutputProjection, ConditionalRegion, FinalOutputSlot, ModuleInitializationDetail,
+    ModuleInitializationRegion, ModuleInitializationStepKind, ModuleInitializationTopology,
+    ShortCircuitRegion, WhileRegion,
 };
 use super::control::{
     AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentReplacement,
@@ -169,6 +170,17 @@ pub(super) enum ReferenceValue {
     Other,
     Checked(BTreeSet<ReferenceOriginId>),
     Uncomputed,
+}
+
+#[derive(Default)]
+struct ReferenceBlockResult {
+    scalar: Option<ReferenceValue>,
+    output_points: Vec<CfgPointId>,
+}
+
+struct ReferenceConditionalArm {
+    end: CfgPointId,
+    result: ReferenceBlockResult,
 }
 
 enum ReferenceAssignmentDestination {
@@ -575,26 +587,27 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(BTreeSet::from([self.intern(fact)]))
     }
 
-    fn conditional(
+    fn conditional_branches(
         &mut self,
         condition: &ScalarExpression,
         then_branch: &ScalarBlock,
         else_branch: Option<&ScalarBlock>,
-        span: ByteSpan,
         scope: ReferenceScopeId,
         region: &ConditionalRegion,
-    ) -> Result<ReferenceValue, ReferenceAnalysisError> {
-        let (condition_ordinal, then_block) = match region {
+        projected_origins: bool,
+    ) -> Result<[ReferenceConditionalArm; 2], ReferenceAnalysisError> {
+        let (condition_ordinal, then_block, else_block) = match region {
             ConditionalRegion::Value {
                 condition,
                 then_block,
+                else_block,
                 ..
-            } => (*condition, *then_block),
+            } => (*condition, *then_block, Some(*else_block)),
             ConditionalRegion::Unit {
                 condition,
                 then_block,
                 ..
-            } => (*condition, *then_block),
+            } => (*condition, *then_block, None),
         };
         self.expression(condition, scope, condition_ordinal)?;
         let branch = self.point(
@@ -608,38 +621,71 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let incoming_names = self.names.clone();
         let incoming_origins = self.origins.clone();
         let incoming_checked = self.checked.clone();
-        let then_value = self.block(then_branch, then_block)?;
-        let then_end = self.cursor.expect("then branch terminal");
+        let then_arm = ReferenceConditionalArm {
+            result: self.block_result(then_branch, then_block, projected_origins)?,
+            end: self.cursor.expect("then branch terminal"),
+        };
         let then_checked = self.checked.clone();
 
         self.names = incoming_names;
         self.origins = incoming_origins.clone();
         self.checked = incoming_checked.clone();
         self.cursor = Some(branch);
-        let (else_value, else_end) = if let Some(else_branch) = else_branch {
-            let ConditionalRegion::Value { else_block, .. } = region else {
-                unreachable!("value conditional region")
-            };
-            let result = self.block(else_branch, *else_block)?;
-            (result, self.cursor.expect("else branch terminal"))
-        } else {
-            (None, branch)
+        let else_arm = match (else_branch, else_block) {
+            (Some(else_branch), Some(else_block)) => ReferenceConditionalArm {
+                result: self.block_result(else_branch, else_block, projected_origins)?,
+                end: self.cursor.expect("else branch terminal"),
+            },
+            (None, None) => ReferenceConditionalArm {
+                result: ReferenceBlockResult::default(),
+                end: branch,
+            },
+            _ => unreachable!("conditional syntax and region disagree on else arm"),
         };
         self.checked.extend(then_checked);
         self.origins.clear();
         self.cursor = None;
-        let joined_value = then_value.is_some() && else_value.is_some();
-        let join = if joined_value {
-            self.point_with_origins(CfgPointKind::Join, span, scope, None)
-        } else {
-            self.point(CfgPointKind::Join, span, scope, BTreeSet::new())
+        Ok([then_arm, else_arm])
+    }
+
+    fn conditional(
+        &mut self,
+        condition: &ScalarExpression,
+        then_branch: &ScalarBlock,
+        else_branch: Option<&ScalarBlock>,
+        span: ByteSpan,
+        scope: ReferenceScopeId,
+        region: &ConditionalRegion,
+        projected_origins: bool,
+    ) -> Result<ReferenceValue, ReferenceAnalysisError> {
+        let [then_arm, else_arm] = self.conditional_branches(
+            condition,
+            then_branch,
+            else_branch,
+            scope,
+            region,
+            projected_origins,
+        )?;
+        let joined_value = then_arm.result.scalar.is_some() && else_arm.result.scalar.is_some();
+        let join = match (
+            projected_origins,
+            then_arm.result.output_points.as_slice(),
+            else_arm.result.output_points.as_slice(),
+        ) {
+            (true, [then_point], [else_point]) => self.point_with_origins(
+                CfgPointKind::ConditionalOutput {
+                    then_point: *then_point,
+                    else_point: *else_point,
+                },
+                span,
+                scope,
+                None,
+            ),
+            _ if joined_value => self.point_with_origins(CfgPointKind::Join, span, scope, None),
+            _ => self.point(CfgPointKind::Join, span, scope, BTreeSet::new()),
         };
-        self.cfg.points[then_end.0].successors.push(join);
-        if else_end != branch {
-            self.cfg.points[else_end.0].successors.push(join);
-        } else {
-            self.cfg.points[branch.0].successors.push(join);
-        }
+        self.cfg.points[then_arm.end.0].successors.push(join);
+        self.cfg.points[else_arm.end.0].successors.push(join);
         Ok(if joined_value {
             ReferenceValue::Uncomputed
         } else {
@@ -647,11 +693,81 @@ impl<'a> ReferenceFlowBuilder<'a> {
         })
     }
 
+    fn projected_conditional(
+        &mut self,
+        expression: &ScalarExpression,
+        scope: ReferenceScopeId,
+        block: &BlockRegion,
+        primary: &FinalOutputSlot,
+        row: &ConditionalOutputProjection,
+    ) -> Result<ReferenceBlockResult, ReferenceAnalysisError> {
+        let ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } = expression
+        else {
+            unreachable!("checked output projection requires a value conditional")
+        };
+        let region = &self.call_sites.conditionals[&primary.expression];
+        let [then_arm, else_arm] = self.conditional_branches(
+            condition,
+            then_branch,
+            Some(else_branch),
+            scope,
+            region,
+            true,
+        )?;
+        let arity = row.types.len();
+        assert!(arity > 1);
+        assert_eq!(then_arm.result.output_points.len(), arity);
+        assert_eq!(else_arm.result.output_points.len(), arity);
+        let mut result = ReferenceBlockResult {
+            scalar: None,
+            output_points: Vec::with_capacity(arity),
+        };
+        for (output, slot) in block.final_outputs().enumerate() {
+            assert_eq!(
+                (slot.item, slot.output, slot.expression),
+                (primary.item, output, primary.expression),
+            );
+            if matches!(row.types[output], ScalarType::CheckedReference { .. }) {
+                result.scalar = Some(ReferenceValue::Uncomputed);
+            }
+            let point = self.point_with_origins(
+                CfgPointKind::ConditionalOutput {
+                    then_point: then_arm.result.output_points[output],
+                    else_point: else_arm.result.output_points[output],
+                },
+                slot.span,
+                scope,
+                None,
+            );
+            result.output_points.push(point);
+        }
+        assert_eq!(result.output_points.len(), arity);
+        let first = result.output_points[0];
+        self.cfg.points[then_arm.end.0].successors.push(first);
+        self.cfg.points[else_arm.end.0].successors.push(first);
+        Ok(result)
+    }
+
     pub(super) fn expression(
         &mut self,
         expression: &ScalarExpression,
         scope: ReferenceScopeId,
         ordinal: OccurrenceOrdinal,
+    ) -> Result<ReferenceValue, ReferenceAnalysisError> {
+        self.expression_with_projected_origins(expression, scope, ordinal, false)
+    }
+
+    fn expression_with_projected_origins(
+        &mut self,
+        expression: &ScalarExpression,
+        scope: ReferenceScopeId,
+        ordinal: OccurrenceOrdinal,
+        projected_origins: bool,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
         let span = expression_span(expression);
         let parent = OccurrenceParent::Expression(ordinal);
@@ -676,6 +792,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     span,
                     scope,
                     region,
+                    projected_origins,
                 )
             }
             ScalarExpression::UnitIf {
@@ -689,7 +806,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     "expected unit conditional at {ordinal:?} in {:?}",
                     self.source
                 );
-                self.conditional(condition, then_branch, None, span, scope, region)
+                self.conditional(condition, then_branch, None, span, scope, region, false)
             }
             ScalarExpression::Block(block) => match self
                 .block(block, self.block_ordinal(parent, OccurrenceEdge::BlockBody))?
@@ -1805,6 +1922,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
         block: &ScalarBlock,
         ordinal: BlockOrdinal,
     ) -> Result<Option<ReferenceValue>, ReferenceAnalysisError> {
+        Ok(self.block_result(block, ordinal, false)?.scalar)
+    }
+
+    fn block_result(
+        &mut self,
+        block: &ScalarBlock,
+        ordinal: BlockOrdinal,
+        projected_origins: bool,
+    ) -> Result<ReferenceBlockResult, ReferenceAnalysisError> {
         let scope = ReferenceScopeId(self.next_scope);
         self.next_scope += 1;
         let calls = self.call_sites;
@@ -1822,8 +1948,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             BTreeSet::new(),
         );
         let mut declared = Vec::new();
-        let mut result = None;
-        let mut return_values = Vec::new();
+        let mut result = ReferenceBlockResult::default();
         let mut next_item = 0;
         while next_item < region.items.len() {
             let record = &region.items[next_item];
@@ -1960,10 +2085,26 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 ) => {
                     let ordinal = match kind {
                         BlockItemKind::Evaluation { expression } => *expression,
-                        BlockItemKind::FinalOutput(slot) => slot.expression,
+                        BlockItemKind::FinalOutput(slot) => {
+                            if let Some(row) = calls
+                                .structure
+                                .conditional_output_projections
+                                .get(&slot.expression)
+                            {
+                                result = self
+                                    .projected_conditional(expression, scope, region, slot, row)?;
+                                continue;
+                            }
+                            slot.expression
+                        }
                         _ => unreachable!("expression item region"),
                     };
-                    let value = self.expression(expression, scope, ordinal)?;
+                    let value = self.expression_with_projected_origins(
+                        expression,
+                        scope,
+                        ordinal,
+                        projected_origins && matches!(kind, BlockItemKind::FinalOutput(_)),
+                    )?;
                     let value_point = self.cursor.expect("evaluated output expression");
                     self.move_value(expression, scope, ordinal)?;
                     if let BlockItemKind::FinalOutput(slot) = kind {
@@ -1972,13 +2113,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         } else {
                             &block.final_output_values[slot.output].ty
                         };
-                        return_values.push(value_point);
+                        result.output_points.push(value_point);
                         if matches!(value, ReferenceValue::Checked(_)) {
-                            result = Some(value);
+                            result.scalar = Some(value);
                         } else if matches!(value, ReferenceValue::Uncomputed)
                             && matches!(ty, ScalarType::CheckedReference { .. })
                         {
-                            result = Some(value);
+                            result.scalar = Some(value);
                         }
                     }
                 }
@@ -2247,7 +2388,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
         }
         if scope == ReferenceScopeId(0) {
-            for (slot, value_point) in region.final_outputs().zip(return_values) {
+            for (slot, &value_point) in region.final_outputs().zip(&result.output_points) {
                 let metadata = &calls.boundary.root_outputs[slot.output];
                 assert_eq!(metadata.output, slot.output);
                 self.uncomputed_point(
@@ -2267,7 +2408,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 region.final_outputs().next().expect("output").span.start,
                 region.final_outputs().last().expect("output").span.end,
             );
-            if let Some(value) = &result {
+            if let Some(value) = &result.scalar {
                 match value {
                     ReferenceValue::Checked(origins) => {
                         self.point(CfgPointKind::Return, return_span, scope, origins.clone());
@@ -2579,6 +2720,10 @@ fn transfer_reference_facts(
             | CfgPointKind::DeferredMoveThrough { pointer_point, .. } => vec![*pointer_point],
             CfgPointKind::Assign { rhs_point, .. } => vec![*rhs_point],
             CfgPointKind::ReturnOutput { value_point, .. } => vec![*value_point],
+            CfgPointKind::ConditionalOutput {
+                then_point,
+                else_point,
+            } => vec![*then_point, *else_point],
             CfgPointKind::Call {
                 argument_points, ..
             } => argument_points.clone(),
@@ -3462,6 +3607,15 @@ fn transfer_reference_facts(
                     }
                 }
                 CfgPointKind::Join if point.possible_origins.is_none() => state.value.clone(),
+                CfgPointKind::ConditionalOutput {
+                    then_point,
+                    else_point,
+                } => {
+                    let then_value = &state.point_values[then_point.0];
+                    let else_value = &state.point_values[else_point.0];
+                    debug_assert!(then_value.is_none() || else_value.is_none());
+                    then_value.as_ref().or(else_value.as_ref()).cloned()
+                }
                 CfgPointKind::Return => Some(
                     state
                         .return_outputs
@@ -3899,6 +4053,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) blocks: Vec<BlockRegion>,
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
+    pub(super) conditional_output_projections:
+        HashMap<OccurrenceOrdinal, ConditionalOutputProjection>,
 }
 
 impl OccurrenceStructure {
@@ -3908,6 +4064,7 @@ impl OccurrenceStructure {
             blocks: vec![BlockRegion::new(span, Vec::new())],
             edges: HashMap::new(),
             checked_types: CheckedOccurrenceTypes::default(),
+            conditional_output_projections: HashMap::new(),
         }
     }
 }
@@ -4550,7 +4707,7 @@ impl StructuralWalker<'_, '_> {
                 &mut scope,
             )?);
         }
-        self.structure.blocks[ordinal.0] = BlockRegion::new(block.span, items);
+        self.structure.blocks[ordinal.0].items = items;
         Ok(())
     }
 
@@ -4714,17 +4871,33 @@ impl StructuralWalker<'_, '_> {
                         }
                     }
                 };
-                let expression = self.expression_at(expression, names, types, parent, edge)?;
+                let producer = self.expression_at(expression, names, types, parent, edge)?;
                 match role {
                     ScalarBlockItemRole::FinalOutput { output, metadata } => {
-                        BlockItemKind::FinalOutput(FinalOutputSlot {
+                        let mut slot = FinalOutputSlot {
                             item: item_index,
                             output,
-                            expression,
+                            expression: producer,
                             span: metadata.span,
-                        })
+                        };
+                        if let Some(types) = self
+                            .occurrence_typing
+                            .take_tail_conditional_outputs(expression)
+                        {
+                            slot.span = expression_span(expression);
+                            self.structure.blocks[ordinal.0]
+                                .project_tail_outputs(slot, types.len());
+                            assert!(self
+                                .structure
+                                .conditional_output_projections
+                                .insert(producer, ConditionalOutputProjection { types })
+                                .is_none());
+                        }
+                        BlockItemKind::FinalOutput(slot)
                     }
-                    ScalarBlockItemRole::Ordinary => BlockItemKind::Evaluation { expression },
+                    ScalarBlockItemRole::Ordinary => BlockItemKind::Evaluation {
+                        expression: producer,
+                    },
                 }
             }
             ScalarBlockItem::Assignment(assignment) => {
@@ -5107,42 +5280,19 @@ fn resolve_function_call_sites(
     else {
         unreachable!("validated function signature")
     };
-    let boundary = CallableBoundary {
-        parameters: function
-            .parameters
-            .iter()
-            .zip(&function.parameter_spans)
-            .enumerate()
-            .map(|(ordinal, (name, span))| ParameterSlot {
-                ordinal,
-                name: name.clone(),
-                span: *span,
-                ty: parameters[ordinal].clone(),
-            })
-            .collect(),
-        results: outputs
-            .outputs
-            .iter()
-            .enumerate()
-            .map(|(ordinal, output)| DeclaredResultSlot {
-                ordinal,
-                span: output.span,
-                ty: output.ty.clone(),
-            })
-            .collect(),
-        root_outputs: function
-            .body
-            .final_output_values
-            .iter()
-            .enumerate()
-            .map(|(output, metadata)| RootOutputType {
-                output,
-                ty: metadata.ty.clone(),
-            })
-            .collect(),
-        generics: function.generic_parameters.clone(),
-    };
-    for slot in &boundary.parameters {
+    let parameters = function
+        .parameters
+        .iter()
+        .zip(&function.parameter_spans)
+        .enumerate()
+        .map(|(ordinal, (name, span))| ParameterSlot {
+            ordinal,
+            name: name.clone(),
+            span: *span,
+            ty: parameters[ordinal].clone(),
+        })
+        .collect::<Vec<_>>();
+    for slot in &parameters {
         parameter_types.insert(slot.name.clone(), slot.ty.clone());
         parameter_names.insert(
             slot.name.clone(),
@@ -5155,12 +5305,48 @@ fn resolve_function_call_sites(
             },
         );
     }
-    resolver.block_items(
-        &function.body,
-        &parameter_names,
-        &parameter_types,
-        resolver.structure.root,
-    )?;
+    let root = resolver.structure.root;
+    resolver.block_items(&function.body, &parameter_names, &parameter_types, root)?;
+    let root_conditional = resolver.structure.blocks[root.0]
+        .items
+        .last()
+        .and_then(|item| match &item.kind {
+            BlockItemKind::FinalOutput(slot) => resolver
+                .structure
+                .conditional_output_projections
+                .get(&slot.expression),
+            _ => None,
+        });
+    let root_output = |(output, ty): (usize, &ScalarType)| RootOutputType {
+        output,
+        ty: ty.clone(),
+    };
+    let root_outputs = match root_conditional {
+        Some(row) => row.types.iter().enumerate().map(root_output).collect(),
+        None => function
+            .body
+            .final_output_values
+            .iter()
+            .map(|value| &value.ty)
+            .enumerate()
+            .map(root_output)
+            .collect(),
+    };
+    let boundary = CallableBoundary {
+        parameters,
+        results: outputs
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(ordinal, output)| DeclaredResultSlot {
+                ordinal,
+                span: output.span,
+                ty: output.ty.clone(),
+            })
+            .collect(),
+        root_outputs,
+        generics: function.generic_parameters.clone(),
+    };
     let WalkMode::Callable(callable) = resolver.mode else {
         unreachable!("callable structural traversal")
     };
@@ -5960,88 +6146,4 @@ fn derive_function_reference_cfg(
         let _ = transfer_reference_facts(&mut builder.cfg, &BTreeMap::new(), &[]);
     }
     (builder.cfg, errors)
-}
-
-pub(super) fn expand_conditional_final_outputs(block: &mut ScalarBlock, outputs: &[ScalarOutput]) {
-    let output_count = outputs.len();
-    if block.final_output_values.len() != 1 || output_count < 2 {
-        return;
-    }
-    let ScalarExpression::If {
-        condition,
-        then_branch,
-        else_branch,
-        ..
-    } = &block.final_output_values[0].value
-    else {
-        return;
-    };
-    let mut then_branch = then_branch.clone();
-    let mut else_branch = else_branch.clone();
-    expand_conditional_final_outputs(&mut then_branch, outputs);
-    expand_conditional_final_outputs(&mut else_branch, outputs);
-    if then_branch.final_output_values.len() != output_count
-        || else_branch.final_output_values.len() != output_count
-    {
-        return;
-    }
-    let condition = condition.clone();
-    let conditional_span = span_of(&block.final_output_values[0].value);
-    block.final_output_values = (0..output_count)
-        .map(|position| {
-            let value = ScalarExpression::If {
-                condition: condition.clone(),
-                then_branch: select_final_output(&then_branch, position, &outputs[position].ty),
-                else_branch: select_final_output(&else_branch, position, &outputs[position].ty),
-                span: conditional_span,
-            };
-            ScalarOutputValue {
-                position,
-                ty: ScalarType::Error,
-                span: span_of(&value),
-                value,
-            }
-        })
-        .collect();
-    let final_items = block
-        .final_output_values
-        .iter()
-        .map(|output| ScalarBlockItem::Expression(output.value.clone()));
-    let final_start = block.items.len() - 1;
-    block.items.truncate(final_start);
-    block.terminated_items.truncate(final_start);
-    block.items.extend(final_items);
-    block
-        .terminated_items
-        .extend((0..output_count).map(|_| false));
-    block.expressions = block
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            ScalarBlockItem::Expression(expression) => Some(expression.clone()),
-            _ => None,
-        })
-        .collect();
-}
-
-fn select_final_output(block: &ScalarBlock, position: usize, ty: &ScalarType) -> ScalarBlock {
-    let mut selected = block.clone();
-    let final_start = selected.items.len() - selected.final_output_values.len();
-    selected.items.truncate(final_start);
-    selected.terminated_items.truncate(final_start);
-    selected.final_output_values = vec![block.final_output_values[position].clone()];
-    selected.final_output_values[0].ty = ty.clone();
-    selected.items.push(ScalarBlockItem::Expression(
-        selected.final_output_values[0].value.clone(),
-    ));
-    selected.terminated_items.push(false);
-    selected.expressions = selected
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            ScalarBlockItem::Expression(expression) => Some(expression.clone()),
-            _ => None,
-        })
-        .collect();
-    selected
 }

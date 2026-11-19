@@ -1,8 +1,11 @@
 use super::*;
-use crate::scalar::control::{CheckedCallSignature, ModuleInitializationDetail};
+use crate::scalar::control::{
+    BindingInitialization, BindingOutput, BlockItemKind, CheckedCallSignature, ConditionalRegion,
+    ModuleInitializationDetail,
+};
 use crate::scalar::reference::{
-    FunctionCallSites, OccurrenceEdge as Edge, OccurrenceNode as Node, OccurrenceOrdinal,
-    OccurrenceParent as Parent, OccurrenceStructure,
+    CallOccurrence, FunctionCallSites, OccurrenceEdge as Edge, OccurrenceNode as Node,
+    OccurrenceOrdinal, OccurrenceParent as Parent, OccurrenceRole, OccurrenceStructure,
 };
 
 fn child(structure: &OccurrenceStructure, parent: Parent, edge: Edge) -> OccurrenceOrdinal {
@@ -472,5 +475,210 @@ fn prepared_contextual_overload_keeps_selected_arm_and_ordered_mixed_outputs() {
         )
         .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
         check(program.calls.as_ref().unwrap().function(2));
+    }
+}
+
+#[test]
+fn recursive_calls_retain_static_occurrences_and_ordered_positions() {
+    let parsed = parsed(
+        "%%start
+(i32, bool)(i32, bool) descend = fn(count, flag) {
+    if (count == 0) { count, flag } else {
+        i32 remaining, bool result = descend(count - 1, flag);
+        remaining, result
+    }
+};
+(bool, i32)(i32, bool) even_step = fn(count, flag) {
+    if (count == 0) { flag, count } else {
+        bool result, i32 remaining = odd_step(flag, count - 1);
+        result, remaining
+    }
+};
+(bool, i32)(bool, i32) odd_step = fn(flag, count) {
+    if (count == 0) { !flag, count } else {
+        bool result, i32 remaining = even_step(count - 1, flag);
+        result, remaining
+    }
+};
+%%end",
+    );
+    let number_first = [ScalarType::I32, ScalarType::Bool];
+    let flag_first = [ScalarType::Bool, ScalarType::I32];
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let stages = Scope::new();
+        let prepared = prepare_extracted(&parsed, target);
+        assert_eq!(
+            stages.counts(),
+            Counts {
+                call_sites: 1,
+                ..Counts::default()
+            }
+        );
+        drop(stages);
+
+        let [module] = prepared.project().modules.as_slice() else {
+            panic!("one prepared source module")
+        };
+        assert_eq!(module.source, parsed.source);
+        assert_eq!(module.target_layout, target);
+        let [ScalarItem::Function(descend), ScalarItem::Function(even), ScalarItem::Function(odd)] =
+            module.items.as_slice()
+        else {
+            panic!("three recursive source declarations")
+        };
+        assert_eq!(descend.name, "descend");
+        assert_eq!(even.name, "even_step");
+        assert_eq!(odd.name, "odd_step");
+        for (item, (caller, callee, parameters, outputs)) in [
+            (descend, descend, &number_first, &number_first),
+            (even, odd, &flag_first, &flag_first),
+            (odd, even, &number_first, &flag_first),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = prepared.calls.function(0, item);
+            let structure = &row.structure;
+            let root_outputs = structure.blocks[structure.root.0]
+                .final_outputs()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                root_outputs
+                    .iter()
+                    .map(|slot| slot.output)
+                    .collect::<Vec<_>>(),
+                [0, 1],
+            );
+            let branch = root_outputs[0].expression;
+            let ConditionalRegion::Value {
+                then_block,
+                else_block,
+                ..
+            } = &row.conditionals[&branch]
+            else {
+                panic!("recursive function with a base branch")
+            };
+            let Some((
+                ScalarExpression::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                },
+                _,
+            )) = caller.body.final_expressions().next()
+            else {
+                panic!("source conditional")
+            };
+            assert_eq!(structure.blocks[then_block.0].span, then_branch.span);
+            let ScalarBlockItem::LocalBinding(source_binding) = &else_branch.items[0] else {
+                panic!("recursive call binding")
+            };
+            let ScalarExpression::Call { arguments, .. } = &source_binding.value else {
+                panic!("syntactic recursive call")
+            };
+            let recursive = &structure.blocks[else_block.0];
+            assert_eq!(recursive.span, else_branch.span);
+            let BlockItemKind::Binding(binding) = &recursive.items[0].kind else {
+                panic!("canonical binding region")
+            };
+            let BindingInitialization::Outputs(values) = &binding.initialization else {
+                panic!("recursive call output positions")
+            };
+            let call = values.primary;
+            let call_span = expression_span(&source_binding.value);
+            assert_eq!(
+                row.call_occurrences,
+                [CallOccurrence {
+                    ordinal: call,
+                    site: 0,
+                }]
+            );
+            assert_eq!(row.sites.len(), 1);
+            assert_eq!(
+                row.sites[0].source_span,
+                SourceSpan::new(module.source.clone(), call_span)
+            );
+            assert_eq!(row.occurrences[call.0].role, OccurrenceRole::Expression);
+            assert_eq!(row.occurrences[call.0].span, call_span);
+            assert_eq!(
+                row.occurrences
+                    .iter()
+                    .filter(|entry| entry.span == call_span)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                row.sites[0].target,
+                ResolvedCallTarget::ModuleCallable {
+                    source: module.source.clone(),
+                    declaration_span: callee.name_span,
+                    concrete: ConcreteCallSelection::Declaration,
+                }
+            );
+
+            let parent = Parent::Expression(call);
+            assert_eq!(arguments.len(), parameters.len());
+            let positions =
+                [0, 1].map(|position| child(structure, parent, Edge::CallArgument(position)));
+            assert!(positions[0].0 < positions[1].0);
+            for ((ordinal, argument), ty) in positions.into_iter().zip(arguments).zip(parameters) {
+                assert_eq!(row.occurrences[ordinal.0].span, expression_span(argument));
+                assert_eq!(&structure.checked_types.expressions[&ordinal], ty);
+            }
+            assert_eq!(row.checked_call_signatures.len(), 1);
+            assert_signature(
+                &row.checked_call_signatures[&call],
+                parameters,
+                outputs,
+                None,
+            );
+            assert_eq!(
+                child(
+                    structure,
+                    Parent::Block(*else_block),
+                    Edge::BindingRoot { item: 0, output: 0 },
+                ),
+                call
+            );
+            assert_eq!(
+                values.secondary,
+                [BindingOutput::ProjectPrimary { output: 1 }]
+            );
+            assert_eq!(
+                binding
+                    .receivers()
+                    .iter()
+                    .map(|slot| (slot.position, &slot.ty))
+                    .collect::<Vec<_>>(),
+                outputs.iter().enumerate().collect::<Vec<_>>()
+            );
+        }
+
+        let initialization = prepared.initialization_region(0).unwrap().clone();
+        let inventory = [0, 1, 2].map(|item| prepared.calls.function(0, item).clone());
+        let builds = [(), ()].map(|()| {
+            let stages = Scope::new();
+            let build = crate::analyze_scalar_build(&prepared);
+            assert!(
+                build.diagnostics().is_empty(),
+                "{target:?}: {:?}",
+                build.diagnostics()
+            );
+            assert_query_stages(stages.counts(), true);
+            assert!(std::ptr::eq(build.prepared(), &prepared));
+            assert_eq!(prepared.initialization_region(0), Some(&initialization));
+            for (item, before) in inventory.iter().enumerate() {
+                assert_eq!(prepared.calls.function(0, item), before);
+            }
+            build
+        });
+        for item in 0..inventory.len() {
+            let [first, second] = builds
+                .each_ref()
+                .map(|build| build.reference_cfg(0, item, None).unwrap());
+            assert!(!first.points.is_empty());
+            assert!(!std::ptr::eq(first, second));
+            assert_eq!(first, second);
+        }
     }
 }

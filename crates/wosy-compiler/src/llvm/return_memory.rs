@@ -237,11 +237,29 @@ pub(super) fn materialize_fresh_return_outputs<'ctx, 'module>(
     build_aggregate(context, state, outputs, values)
 }
 
-pub(super) fn materialize_return_branch<'ctx, 'module>(
+pub(super) fn finish_block_return<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     block: &ScalarBlock,
     value: EmitValue<'ctx>,
+    emission: BlockEmission<'_>,
+) -> Result<EmitValue<'ctx>, String> {
+    let value =
+        materialize_return_branch(context, state, block, value, emission.ordered_outputs())?;
+    if let BlockEmission::Return(outputs) = emission {
+        let value = materialize_fresh_return_outputs(context, state, value, outputs)?;
+        state.fresh_return_outputs.clear();
+        return Ok(value);
+    }
+    Ok(value)
+}
+
+fn materialize_return_branch<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    block: &ScalarBlock,
+    value: EmitValue<'ctx>,
+    ordered_outputs: Option<&crate::ScalarOutputSequence>,
 ) -> Result<EmitValue<'ctx>, String> {
     let Some((indices, covered, joined)) = state
         .branch_return_outputs
@@ -271,25 +289,31 @@ pub(super) fn materialize_return_branch<'ctx, 'module>(
     if indices.is_empty() {
         return Ok(value);
     }
-    let outputs = crate::ScalarOutputSequence {
-        outputs: block
-            .final_output_values
-            .iter()
-            .enumerate()
-            .map(|(position, output)| crate::ScalarOutput {
-                ty: state.return_output_types[if block.final_output_values.len() == 1 {
-                    *indices.iter().next().expect("selected return output")
-                } else {
-                    position
-                }]
-                .clone(),
-                span: output.span,
-            })
-            .collect(),
-        span: block.span,
+    let scalar_or_legacy_outputs;
+    let outputs = if let Some(outputs) = ordered_outputs {
+        outputs
+    } else {
+        scalar_or_legacy_outputs = crate::ScalarOutputSequence {
+            outputs: block
+                .final_output_values
+                .iter()
+                .enumerate()
+                .map(|(position, output)| crate::ScalarOutput {
+                    ty: state.return_output_types[if block.final_output_values.len() == 1 {
+                        *indices.iter().next().expect("selected return output")
+                    } else {
+                        position
+                    }]
+                    .clone(),
+                    span: output.span,
+                })
+                .collect(),
+            span: block.span,
+        };
+        &scalar_or_legacy_outputs
     };
     let previous = std::mem::replace(&mut state.fresh_return_outputs, indices);
-    let result = materialize_fresh_return_outputs(context, state, value, &outputs);
+    let result = materialize_fresh_return_outputs(context, state, value, outputs);
     state.fresh_return_outputs = previous;
     result
 }

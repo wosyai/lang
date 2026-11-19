@@ -3947,6 +3947,74 @@ fn emits_ordered_multi_output_aggregate_returns_calls_and_receivers() {
 }
 
 #[test]
+fn emits_canonical_tail_conditionals_in_both_routes_and_targets() {
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let parse = |outputs: &str| {
+        parse_source(
+            source.clone(),
+            format!(
+                "%%start\nbool() choose = fn {{ true }};\n{outputs:11}() pair = fn {{ if (choose()) {{ if (true) {{ 17, true }} else {{ 42, false }} }} else {{ 8, true }} }};\n%%end"
+            ),
+            &[],
+        )
+    };
+    let parsed = parse("(i32, bool)");
+    // The one-output declaration preserves the raw body during extraction; the
+    // output field's fixed width keeps the original source spans.
+    let raw = parse("i32");
+    assert!(raw.diagnostics.is_empty(), "{:?}", raw.diagnostics);
+    let raw = derive_scalar_program(&raw.result);
+    let [_, ScalarItem::Function(pair)] = raw.program.items.as_slice() else {
+        panic!("expected choose and pair");
+    };
+    assert_eq!(pair.body.final_expressions().count(), 1);
+
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let mut single = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let mut project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                single.program.clone(),
+                Vec::new(),
+            )],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for items in [
+            &mut single.program.items,
+            &mut project.project.modules[0].items,
+        ] {
+            let [_, ScalarItem::Function(function)] = items.as_mut_slice() else {
+                panic!("expected choose and pair");
+            };
+            assert_eq!(function.body.span, pair.body.span);
+            function.body = pair.body.clone();
+        }
+
+        for llvm in [
+            emit_scalar_llvm(&single)
+                .expect("canonical single LLVM")
+                .to_text(),
+            emit_scalar_project_llvm(&project)
+                .expect("canonical project LLVM")
+                .to_text(),
+        ] {
+            assert_eq!(llvm.matches("call i1").count(), 1, "{llvm}");
+            assert_eq!(llvm.matches("phi { i32, i1 }").count(), 2, "{llvm}");
+            assert!(llvm.contains("{ i32 17, i1 true }"), "{llvm}");
+            assert!(llvm.contains("{ i32 42, i1 false }"), "{llvm}");
+            assert!(llvm.contains("{ i32 8, i1 true }"), "{llvm}");
+            assert!(llvm.contains("ret { i32, i1 }"), "{llvm}");
+        }
+    }
+}
+
+#[test]
 fn emits_nested_conditional_multi_outputs_in_aggregate_order() {
     let source = SourceIdentity::new(
         "project".into(),

@@ -41,6 +41,8 @@ pub(super) fn split_module_typing(
 mod callable_context_tests;
 #[cfg(test)]
 mod source_context_tests;
+#[cfg(test)]
+mod tail_conditional_tests;
 
 pub(super) fn validate_module_type(
     source: &SourceIdentity,
@@ -573,6 +575,460 @@ pub(super) fn block_type_in_module_expected(
         }
     }
     result
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum TailConditionalTyping<'a> {
+    Program(&'a ScalarProgramTyping<'a>),
+    Module {
+        module: &'a ScalarModuleTyping<'a>,
+        modules: &'a [ScalarModuleTyping<'a>],
+    },
+}
+
+impl TailConditionalTyping<'_> {
+    pub(super) fn declare_parameters(
+        self,
+        function: &ScalarFunction,
+        parameters: &[ScalarType],
+        scope: &mut BTreeMap<String, ScalarType>,
+        visible_names: &mut BTreeSet<String>,
+        folded_names: &mut BTreeMap<String, (String, ByteSpan)>,
+        diagnostics: &mut Vec<super::Diagnostic>,
+    ) {
+        for (index, name) in function.parameters.iter().enumerate() {
+            let span = function.parameter_spans[index];
+            match self {
+                Self::Program(program) => {
+                    validate_program_identifier_style(program, name, span, diagnostics);
+                }
+                Self::Module { module, .. } => {
+                    validate_identifier_style(module.source, name, span, diagnostics);
+                }
+            }
+            let Some(ty) = parameters.get(index) else {
+                continue;
+            };
+            let declared = match self {
+                Self::Program(program) => declare_program_name(
+                    program,
+                    name,
+                    function.span,
+                    visible_names,
+                    folded_names,
+                    diagnostics,
+                ),
+                Self::Module { module, .. } => declare_module_name(
+                    module,
+                    name,
+                    function.span,
+                    visible_names,
+                    folded_names,
+                    diagnostics,
+                ),
+            };
+            if declared {
+                scope.insert(name.clone(), ty.clone());
+            }
+        }
+    }
+
+    fn expression_type(
+        self,
+        expression: &ScalarExpression,
+        expected: Option<&ScalarType>,
+        scope: &BTreeMap<String, ScalarType>,
+        visible_names: &BTreeSet<String>,
+        folded_names: &BTreeMap<String, (String, ByteSpan)>,
+        diagnostics: &mut Vec<super::Diagnostic>,
+        unsafe_context: bool,
+        overloads: &ScalarTypingView<'_>,
+        inference: &mut ScalarInferenceBuilder<'_>,
+    ) -> ScalarType {
+        match (self, expected) {
+            (Self::Program(program), None) => expression_type(
+                expression,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            ),
+            (Self::Program(program), Some(expected)) => expression_type_expected(
+                expression,
+                expected,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            ),
+            (Self::Module { module, modules }, None) => expression_type_in_module(
+                expression,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            ),
+            (Self::Module { module, modules }, Some(expected)) => {
+                expression_type_in_module_expected(
+                    expression,
+                    Some(expected),
+                    scope,
+                    visible_names,
+                    folded_names,
+                    module,
+                    modules,
+                    diagnostics,
+                    unsafe_context,
+                    overloads,
+                    inference,
+                )
+            }
+        }
+    }
+
+    fn block_item_type(
+        self,
+        item: &ScalarBlockItem,
+        scope: &mut BTreeMap<String, ScalarType>,
+        visible_names: &mut BTreeSet<String>,
+        folded_names: &mut BTreeMap<String, (String, ByteSpan)>,
+        diagnostics: &mut Vec<super::Diagnostic>,
+        unsafe_context: bool,
+        overloads: &ScalarTypingView<'_>,
+        inference: &mut ScalarInferenceBuilder<'_>,
+    ) -> ScalarType {
+        match self {
+            Self::Program(program) => block_item_type(
+                item,
+                scope,
+                visible_names,
+                folded_names,
+                program,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            ),
+            Self::Module { module, modules } => block_item_type_in_module(
+                item,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            ),
+        }
+    }
+
+    fn diagnostic(self, code: &str, message: &str, span: ByteSpan) -> super::Diagnostic {
+        match self {
+            Self::Program(program) => diagnostic(program, code, message, span),
+            Self::Module { module, .. } => module_diagnostic(module, code, message, span),
+        }
+    }
+}
+
+pub(super) fn validate_overload_tail_conditionals(
+    function: &ScalarFunction,
+    declarations: &BTreeMap<String, ScalarType>,
+    declaration_names: &BTreeSet<String>,
+    folded_declarations: &BTreeMap<String, (String, ByteSpan)>,
+    typing: TailConditionalTyping<'_>,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarTypingView<'_>,
+    inference: &mut ScalarInferenceBuilder<'_>,
+) {
+    for arm in &function.overload_arms {
+        let ScalarType::Callable {
+            outputs,
+            parameters,
+        } = &arm.signature
+        else {
+            continue;
+        };
+        let Some(tail) = arm
+            .body
+            .tail_conditional()
+            .filter(|_| outputs.outputs.len() > 1)
+        else {
+            continue;
+        };
+        if arm.parameters.len() != parameters.len() {
+            diagnostics.push(typing.diagnostic(
+                "B0004",
+                "function parameter arity does not match its type",
+                arm.span,
+            ));
+        }
+        let mut scope = declarations.clone();
+        let mut visible_names = declaration_names.clone();
+        let mut folded_names = folded_declarations.clone();
+        typing.declare_parameters(
+            arm,
+            parameters,
+            &mut scope,
+            &mut visible_names,
+            &mut folded_names,
+            diagnostics,
+        );
+        check_final_output_prefix(
+            &arm.body,
+            &mut scope,
+            &mut visible_names,
+            &mut folded_names,
+            typing,
+            diagnostics,
+            arm.body.unsafe_context,
+            overloads,
+            inference,
+        );
+        validate_tail_conditional_return(
+            tail,
+            &outputs.outputs,
+            &scope,
+            &visible_names,
+            &folded_names,
+            typing,
+            diagnostics,
+            arm.body.unsafe_context,
+            overloads,
+            inference,
+        );
+    }
+}
+
+pub(super) fn validate_tail_conditional_return(
+    tail: ScalarTailConditional<'_>,
+    expected: &[ScalarOutput],
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    typing: TailConditionalTyping<'_>,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+    overloads: &ScalarTypingView<'_>,
+    inference: &mut ScalarInferenceBuilder<'_>,
+) {
+    let span = tail.span;
+    let actual = tail_conditional_types(
+        tail,
+        expected,
+        scope,
+        visible_names,
+        folded_names,
+        typing,
+        diagnostics,
+        unsafe_context,
+        overloads,
+        inference,
+    );
+    for (output, actual) in expected.iter().zip(&actual) {
+        match typing {
+            TailConditionalTyping::Program(program) => {
+                expect_type(program, &output.ty, actual, span, diagnostics);
+            }
+            TailConditionalTyping::Module { module, .. } => {
+                expect_module_type(module, &output.ty, actual, span, diagnostics);
+            }
+        }
+    }
+}
+
+pub(super) fn tail_conditional_types(
+    tail: ScalarTailConditional<'_>,
+    expected: &[ScalarOutput],
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    typing: TailConditionalTyping<'_>,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+    overloads: &ScalarTypingView<'_>,
+    inference: &mut ScalarInferenceBuilder<'_>,
+) -> Vec<ScalarType> {
+    debug_assert!(expected.len() > 1);
+    let diagnostics_before = diagnostics.len();
+    let condition_type = typing.expression_type(
+        tail.condition,
+        None,
+        scope,
+        visible_names,
+        folded_names,
+        diagnostics,
+        unsafe_context,
+        overloads,
+        inference,
+    );
+    if !is_error_type(&condition_type) && !scalar_type_equal(&condition_type, &ScalarType::Bool) {
+        diagnostics.push(typing.diagnostic(
+            "B0005",
+            "conditional expression requires bool",
+            tail.span,
+        ));
+    }
+    let mut check_arm = |block| {
+        conditional_arm_types(
+            block,
+            expected,
+            scope,
+            visible_names,
+            folded_names,
+            typing,
+            diagnostics,
+            unsafe_context,
+            overloads,
+            inference,
+        )
+    };
+    let mut actual = check_arm(tail.then_branch);
+    let else_types = check_arm(tail.else_branch);
+    for (then_type, else_type) in actual.iter_mut().zip(else_types) {
+        if is_error_type(then_type) || is_error_type(&else_type) {
+            *then_type = ScalarType::Error;
+        } else if !scalar_type_equal(then_type, &else_type) {
+            diagnostics.push(typing.diagnostic(
+                "B0006",
+                "conditional branches must have equal types",
+                tail.span,
+            ));
+        }
+    }
+    inference.record_expression_type(tail.expression, &actual[0], true);
+    if diagnostics.len() == diagnostics_before
+        && scalar_type_equal(&condition_type, &ScalarType::Bool)
+    {
+        inference.record_tail_conditional_outputs(tail.expression, &actual);
+    }
+    actual
+}
+
+pub(super) fn check_final_output_prefix(
+    block: &ScalarBlock,
+    scope: &mut BTreeMap<String, ScalarType>,
+    visible_names: &mut BTreeSet<String>,
+    folded_names: &mut BTreeMap<String, (String, ByteSpan)>,
+    typing: TailConditionalTyping<'_>,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+    overloads: &ScalarTypingView<'_>,
+    inference: &mut ScalarInferenceBuilder<'_>,
+) {
+    let final_start = block.items.len() - block.final_output_values.len();
+    for item in &block.items[..final_start] {
+        match item {
+            ScalarBlockItem::Expression(
+                expression @ (ScalarExpression::If { .. } | ScalarExpression::UnitIf { .. }),
+            ) => typing.expression_type(
+                expression,
+                Some(&ScalarType::Unit),
+                scope,
+                visible_names,
+                folded_names,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            ),
+            _ => typing.block_item_type(
+                item,
+                scope,
+                visible_names,
+                folded_names,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            ),
+        };
+    }
+}
+
+fn conditional_arm_types(
+    block: &ScalarBlock,
+    expected: &[ScalarOutput],
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    typing: TailConditionalTyping<'_>,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+    overloads: &ScalarTypingView<'_>,
+    inference: &mut ScalarInferenceBuilder<'_>,
+) -> Vec<ScalarType> {
+    let mut scope = scope.clone();
+    let mut visible_names = visible_names.clone();
+    let mut folded_names = folded_names.clone();
+    let unsafe_context = unsafe_context || block.unsafe_context;
+    check_final_output_prefix(
+        block,
+        &mut scope,
+        &mut visible_names,
+        &mut folded_names,
+        typing,
+        diagnostics,
+        unsafe_context,
+        overloads,
+        inference,
+    );
+    if let Some(tail) = block.tail_conditional() {
+        return tail_conditional_types(
+            tail,
+            expected,
+            &scope,
+            &visible_names,
+            &folded_names,
+            typing,
+            diagnostics,
+            unsafe_context,
+            overloads,
+            inference,
+        );
+    }
+    if block.final_output_values.len() != expected.len() {
+        diagnostics.push(
+            typing.diagnostic(
+                "B0004",
+                "function output arity does not match its final output list",
+                block
+                    .final_output_values
+                    .first()
+                    .map_or(block.span, |output| output.span),
+            ),
+        );
+    }
+    let mut actual = Vec::with_capacity(expected.len());
+    for ((expression, _), output) in block.final_expressions().zip(expected) {
+        actual.push(typing.expression_type(
+            expression,
+            Some(&output.ty),
+            &scope,
+            &visible_names,
+            &folded_names,
+            diagnostics,
+            unsafe_context,
+            overloads,
+            inference,
+        ));
+    }
+    actual.resize(expected.len(), ScalarType::Error);
+    actual
 }
 
 pub(super) fn block_item_type_in_module(
@@ -6052,7 +6508,18 @@ pub(super) fn validate(
                 );
             }
             ScalarItem::Function(function) => {
+                let typing = TailConditionalTyping::Program(program);
                 if !function.overload_arms.is_empty() {
+                    validate_overload_tail_conditionals(
+                        function,
+                        &declarations,
+                        &declaration_names,
+                        &folded_declarations,
+                        typing,
+                        &mut diagnostics,
+                        overloads,
+                        inference,
+                    );
                     continue;
                 }
                 let ScalarType::Callable {
@@ -6065,78 +6532,42 @@ pub(super) fn validate(
                 let mut scope = declarations.clone();
                 let mut visible_names = declaration_names.clone();
                 let mut folded_names = folded_declarations.clone();
-                for (index, name) in function.parameters.iter().enumerate() {
-                    validate_program_identifier_style(
-                        program,
-                        name,
-                        function.parameter_spans[index],
-                        &mut diagnostics,
-                    );
-                    if index < parameters.len()
-                        && declare_program_name(
-                            program,
-                            name,
-                            function.span,
-                            &mut visible_names,
-                            &mut folded_names,
-                            &mut diagnostics,
-                        )
-                    {
-                        scope.insert(name.clone(), parameters[index].clone());
-                    }
-                }
+                typing.declare_parameters(
+                    function,
+                    parameters,
+                    &mut scope,
+                    &mut visible_names,
+                    &mut folded_names,
+                    &mut diagnostics,
+                );
                 if outputs.outputs.len() > 1 && !function.body.final_output_values.is_empty() {
-                    let final_start =
-                        function.body.items.len() - function.body.final_output_values.len();
-                    for item in &function.body.items[..final_start] {
-                        let _ = match item {
-                            ScalarBlockItem::Expression(
-                                expression @ (ScalarExpression::If { .. }
-                                | ScalarExpression::UnitIf { .. }),
-                            ) => expression_type_expected(
-                                expression,
-                                &ScalarType::Unit,
-                                &scope,
-                                &visible_names,
-                                &folded_names,
-                                program,
-                                &mut diagnostics,
-                                false,
-                                overloads,
-                                inference,
-                            ),
-                            _ => block_item_type(
-                                item,
-                                &mut scope,
-                                &mut visible_names,
-                                &mut folded_names,
-                                program,
-                                &mut diagnostics,
-                                false,
-                                overloads,
-                                inference,
-                            ),
-                        };
-                    }
-                    if function.body.final_output_values.len() == 1
-                        && matches!(
-                            function
-                                .body
-                                .final_expressions()
-                                .next()
-                                .expect("final output")
-                                .0,
-                            ScalarExpression::If { .. }
-                        )
-                    {
-                        validate_conditional_output_arity(
-                            &function.body,
-                            outputs.outputs.len(),
-                            program,
+                    let tail = function.body.tail_conditional();
+                    let unsafe_context = tail.is_some() && function.body.unsafe_context;
+                    check_final_output_prefix(
+                        &function.body,
+                        &mut scope,
+                        &mut visible_names,
+                        &mut folded_names,
+                        typing,
+                        &mut diagnostics,
+                        unsafe_context,
+                        overloads,
+                        inference,
+                    );
+                    if let Some(tail) = tail {
+                        validate_tail_conditional_return(
+                            tail,
+                            &outputs.outputs,
+                            &scope,
+                            &visible_names,
+                            &folded_names,
+                            typing,
                             &mut diagnostics,
+                            unsafe_context,
+                            overloads,
+                            inference,
                         );
-                    }
-                    if function.body.final_output_values.len() == 1
+                    } else if function.body.final_output_values.len() == 1
                         && matches!(
                             function
                                 .body
@@ -7869,47 +8300,6 @@ fn check_expression_type(
             inference,
         ),
     }
-}
-
-fn validate_conditional_output_arity(
-    block: &ScalarBlock,
-    output_count: usize,
-    program: &ScalarProgramTyping<'_>,
-    diagnostics: &mut Vec<super::Diagnostic>,
-) {
-    if block.final_output_values.len() == output_count {
-        for (expression, _) in block.final_expressions() {
-            if let ScalarExpression::If {
-                then_branch,
-                else_branch,
-                ..
-            } = expression
-            {
-                validate_conditional_output_arity(then_branch, output_count, program, diagnostics);
-                validate_conditional_output_arity(else_branch, output_count, program, diagnostics);
-            }
-        }
-        return;
-    }
-    if let Some(ScalarTailConditional {
-        then_branch,
-        else_branch,
-        ..
-    }) = block.tail_conditional()
-    {
-        validate_conditional_output_arity(then_branch, output_count, program, diagnostics);
-        validate_conditional_output_arity(else_branch, output_count, program, diagnostics);
-        return;
-    }
-    diagnostics.push(diagnostic(
-        program,
-        "B0004",
-        "function output arity does not match its final output list",
-        block
-            .final_output_values
-            .first()
-            .map_or(block.span, |output| output.span),
-    ));
 }
 
 fn expect_type(
