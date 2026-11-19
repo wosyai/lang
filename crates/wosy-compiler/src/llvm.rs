@@ -86,6 +86,7 @@ enum EmitValue<'ctx> {
 }
 
 struct EmitState<'ctx, 'module> {
+    canonical_initializer: bool,
     builder: &'ctx Builder<'ctx>,
     module: &'module Module<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -534,6 +535,7 @@ fn emit_single_module_llvm<'a>(
         &globals,
         items,
         initialization_region,
+        generic_input,
         &module,
         &structs,
         &layouts,
@@ -902,6 +904,7 @@ fn emit_project_llvm<'a>(
         &dynamic_owner_outputs,
         &modules,
         &regions,
+        generic_input,
         &globals,
         &module,
         &all_structs,
@@ -1197,10 +1200,19 @@ fn emit_binding_value<'ctx, 'module>(
             emit_expression(context, state, &binding.value)
         }
         ScalarBindingOutputOrigin::IndependentExpressions => {
+            let canonical = state.canonical_initializer;
             let values = binding
                 .output_values
                 .iter()
-                .map(|output| emit_typed_expression(context, state, &output.value, &output.ty))
+                .enumerate()
+                .map(|(position, output)| {
+                    let expression = if canonical && position == 0 {
+                        &binding.value
+                    } else {
+                        &output.value
+                    };
+                    emit_typed_expression(context, state, expression, &output.ty)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             build_aggregate(context, state, &binding.output_sequence, values)
         }
@@ -1578,17 +1590,19 @@ fn emit_project_binding_value<'ctx, 'module>(
             emit_project_expression(context, state, &binding.value, module, modules)
         }
         ScalarBindingOutputOrigin::IndependentExpressions => {
+            let canonical = state.canonical_initializer;
             let values = binding
                 .output_values
                 .iter()
-                .map(|output| {
+                .enumerate()
+                .map(|(position, output)| {
+                    let expression = if canonical && position == 0 {
+                        &binding.value
+                    } else {
+                        &output.value
+                    };
                     emit_project_typed_expression(
-                        context,
-                        state,
-                        &output.value,
-                        &output.ty,
-                        module,
-                        modules,
+                        context, state, expression, &output.ty, module, modules,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1626,6 +1640,7 @@ fn emit_function<'ctx, 'module>(
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
+        canonical_initializer: false,
         builder,
         module,
         functions,
@@ -1767,6 +1782,7 @@ fn emit_main<'ctx, 'module>(
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     items: &[ScalarItem],
     initialization_region: &ModuleInitializationRegion,
+    generic_input: GenericInitializerInput,
     module: &'module Module<'ctx>,
     structs: &'module [&'module ScalarStruct],
     layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
@@ -1778,6 +1794,7 @@ fn emit_main<'ctx, 'module>(
     let entry = context.append_basic_block(main, "entry");
     builder.position_at_end(entry);
     let mut state = EmitState {
+        canonical_initializer: matches!(generic_input, GenericInitializerInput::PreparedRows),
         builder,
         module,
         functions,
@@ -1894,6 +1911,7 @@ fn emit_project_function<'ctx, 'module>(
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
+        canonical_initializer: false,
         builder,
         module,
         functions,
@@ -2049,6 +2067,7 @@ fn emit_project_main<'ctx, 'module>(
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     modules: &[&ScalarModule],
     regions: &[&ModuleInitializationRegion],
+    generic_input: GenericInitializerInput,
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     module: &'module Module<'ctx>,
     structs: &'module [&'module ScalarStruct],
@@ -2061,6 +2080,7 @@ fn emit_project_main<'ctx, 'module>(
     let entry = context.append_basic_block(main, "entry");
     builder.position_at_end(entry);
     let mut state = EmitState {
+        canonical_initializer: matches!(generic_input, GenericInitializerInput::PreparedRows),
         builder,
         module,
         functions,
@@ -2493,6 +2513,21 @@ fn emit_project_block_at<'ctx, 'module>(
     Ok(result)
 }
 
+fn final_output_expression(
+    block: &ScalarBlock,
+    position: usize,
+    canonical: bool,
+) -> &ScalarExpression {
+    if !canonical {
+        return &block.final_output_values[position].value;
+    }
+    let first_output = block.items.len() - block.final_output_values.len();
+    let ScalarBlockItem::Expression(expression) = &block.items[first_output + position] else {
+        unreachable!("canonical final output is an expression item")
+    };
+    expression
+}
+
 fn emit_final_outputs<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -2516,29 +2551,31 @@ fn emit_final_outputs<'ctx, 'module>(
     if let BlockEmission::TailArm(outputs) = emission {
         return emit_ordered_final_outputs(context, state, block, outputs, None);
     }
+    let canonical = state.canonical_initializer;
     if block.final_output_values.len() == 1 {
         let output = &block.final_output_values[0];
-        if matches!(&output.value, ScalarExpression::Call { .. }) {
-            transfer_runtime_array_return(state, block, &output.value, &output.ty);
-            transfer_automatic_return_result(state, &output.value);
-            let value = emit_expression(context, state, &output.value)?;
+        let expression = final_output_expression(block, 0, canonical);
+        if matches!(expression, ScalarExpression::Call { .. }) {
+            transfer_runtime_array_return(state, block, expression, &output.ty);
+            transfer_automatic_return_result(state, expression);
+            let value = emit_expression(context, state, expression)?;
             if !state
                 .branch_return_outputs
                 .contains_key(&(block.span.start, block.span.end))
             {
-                record_forwarded_return_owner(context, state, &output.value, output.position)?;
+                record_forwarded_return_owner(context, state, expression, output.position)?;
             }
             return Ok(value);
         }
-        let value = emit_typed_expression(context, state, &output.value, &output.ty)?;
+        let value = emit_typed_expression(context, state, expression, &output.ty)?;
         if !state
             .branch_return_outputs
             .contains_key(&(block.span.start, block.span.end))
         {
-            record_forwarded_return_owner(context, state, &output.value, output.position)?;
+            record_forwarded_return_owner(context, state, expression, output.position)?;
         }
-        transfer_runtime_array_return(state, block, &output.value, &output.ty);
-        transfer_automatic_return_result(state, &output.value);
+        transfer_runtime_array_return(state, block, expression, &output.ty);
+        transfer_automatic_return_result(state, expression);
         return Ok(value);
     }
     let outputs = crate::ScalarOutputSequence {
@@ -2555,19 +2592,25 @@ fn emit_final_outputs<'ctx, 'module>(
     let values = block
         .final_output_values
         .iter()
-        .map(|output| emit_typed_expression(context, state, &output.value, &output.ty))
+        .enumerate()
+        .map(|(position, output)| {
+            let expression = final_output_expression(block, position, canonical);
+            emit_typed_expression(context, state, expression, &output.ty)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     if !state
         .branch_return_outputs
         .contains_key(&(block.span.start, block.span.end))
     {
-        for (position, output) in block.final_output_values.iter().enumerate() {
-            record_forwarded_return_owner(context, state, &output.value, position)?;
+        for position in 0..block.final_output_values.len() {
+            let expression = final_output_expression(block, position, canonical);
+            record_forwarded_return_owner(context, state, expression, position)?;
         }
     }
-    for output in &block.final_output_values {
-        transfer_runtime_array_return(state, block, &output.value, &output.ty);
-        transfer_automatic_return_result(state, &output.value);
+    for (position, output) in block.final_output_values.iter().enumerate() {
+        let expression = final_output_expression(block, position, canonical);
+        transfer_runtime_array_return(state, block, expression, &output.ty);
+        transfer_automatic_return_result(state, expression);
     }
     build_aggregate(context, state, &outputs, values)
 }
@@ -2610,36 +2653,32 @@ fn emit_project_final_outputs<'ctx, 'module>(
     if let BlockEmission::TailArm(outputs) = emission {
         return emit_ordered_final_outputs(context, state, block, outputs, Some((module, modules)));
     }
+    let canonical = state.canonical_initializer;
     if block.final_output_values.len() == 1 {
         let output = &block.final_output_values[0];
-        if matches!(&output.value, ScalarExpression::Call { .. }) {
-            transfer_runtime_array_return(state, block, &output.value, &output.ty);
-            transfer_automatic_return_result(state, &output.value);
-            let value = emit_project_expression(context, state, &output.value, module, modules)?;
+        let expression = final_output_expression(block, 0, canonical);
+        if matches!(expression, ScalarExpression::Call { .. }) {
+            transfer_runtime_array_return(state, block, expression, &output.ty);
+            transfer_automatic_return_result(state, expression);
+            let value = emit_project_expression(context, state, expression, module, modules)?;
             if !state
                 .branch_return_outputs
                 .contains_key(&(block.span.start, block.span.end))
             {
-                record_forwarded_return_owner(context, state, &output.value, output.position)?;
+                record_forwarded_return_owner(context, state, expression, output.position)?;
             }
             return Ok(value);
         }
-        let value = emit_project_typed_expression(
-            context,
-            state,
-            &output.value,
-            &output.ty,
-            module,
-            modules,
-        )?;
+        let value =
+            emit_project_typed_expression(context, state, expression, &output.ty, module, modules)?;
         if !state
             .branch_return_outputs
             .contains_key(&(block.span.start, block.span.end))
         {
-            record_forwarded_return_owner(context, state, &output.value, output.position)?;
+            record_forwarded_return_owner(context, state, expression, output.position)?;
         }
-        transfer_runtime_array_return(state, block, &output.value, &output.ty);
-        transfer_automatic_return_result(state, &output.value);
+        transfer_runtime_array_return(state, block, expression, &output.ty);
+        transfer_automatic_return_result(state, expression);
         return Ok(value);
     }
     let outputs = crate::ScalarOutputSequence {
@@ -2656,28 +2695,25 @@ fn emit_project_final_outputs<'ctx, 'module>(
     let values = block
         .final_output_values
         .iter()
-        .map(|output| {
-            emit_project_typed_expression(
-                context,
-                state,
-                &output.value,
-                &output.ty,
-                module,
-                modules,
-            )
+        .enumerate()
+        .map(|(position, output)| {
+            let expression = final_output_expression(block, position, canonical);
+            emit_project_typed_expression(context, state, expression, &output.ty, module, modules)
         })
         .collect::<Result<Vec<_>, _>>()?;
     if !state
         .branch_return_outputs
         .contains_key(&(block.span.start, block.span.end))
     {
-        for (position, output) in block.final_output_values.iter().enumerate() {
-            record_forwarded_return_owner(context, state, &output.value, position)?;
+        for position in 0..block.final_output_values.len() {
+            let expression = final_output_expression(block, position, canonical);
+            record_forwarded_return_owner(context, state, expression, position)?;
         }
     }
-    for output in &block.final_output_values {
-        transfer_runtime_array_return(state, block, &output.value, &output.ty);
-        transfer_automatic_return_result(state, &output.value);
+    for (position, output) in block.final_output_values.iter().enumerate() {
+        let expression = final_output_expression(block, position, canonical);
+        transfer_runtime_array_return(state, block, expression, &output.ty);
+        transfer_automatic_return_result(state, expression);
     }
     build_aggregate(context, state, &outputs, values)
 }

@@ -20,6 +20,102 @@ use crate::{
 use wosy_syntax::{ByteSpan, SourceIdentity};
 
 #[test]
+fn prepared_initializer_emits_canonical_binding_and_block_outputs() {
+    use crate::ScalarExpression;
+
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let parsed = parse_source(
+        source.clone(),
+        "%%start
+i32(i32) echo = fn(value) { value };
+i32 first, i32 second = echo(11) + 1, echo(22);
+i32 nested = unsafe { echo(33) };
+%%end"
+            .into(),
+        &[],
+    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![(
+                derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                Vec::new(),
+            )],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let original = [
+            emit_scalar_build_single_module_llvm(&build)
+                .unwrap()
+                .to_text(),
+            emit_scalar_build_project_llvm(&build).unwrap().to_text(),
+        ];
+
+        let mut project = prepared.project().clone();
+        let module = &mut project.modules[0];
+        let [_, ScalarItem::Binding(binding), ScalarItem::Binding(nested)] =
+            module.items.as_mut_slice()
+        else {
+            panic!("expected function and two bindings");
+        };
+        let ScalarExpression::Block(block) = &mut nested.value else {
+            panic!("expected initializer block");
+        };
+        for mirror in [
+            &mut binding.output_values[0],
+            &mut block.final_output_values[0],
+        ] {
+            mirror.value = ScalarExpression::Integer {
+                value: 99.into(),
+                span: mirror.span,
+            };
+        }
+
+        let region = prepared.initialization_region(0).unwrap();
+        let input = super::GenericInitializerInput::PreparedRows;
+        let emitted = [
+            super::emit_single_module_llvm(
+                &source,
+                &module.items,
+                region,
+                &module.structs,
+                &module.layouts,
+                target_layout,
+                input,
+                &|item, arm, _| build.reference_cfg(0, item, arm),
+            )
+            .unwrap()
+            .to_text(),
+            super::emit_project_llvm(
+                &project,
+                &|_| Some(region),
+                input,
+                &|module, item, arm, _| build.reference_cfg(module, item, arm),
+            )
+            .unwrap()
+            .to_text(),
+        ];
+        for (route, (original, emitted)) in original.iter().zip(&emitted).enumerate() {
+            for argument in [11, 22, 33] {
+                assert!(
+                    original.contains(&format!("(i32 {argument})")),
+                    "{original}"
+                );
+            }
+            assert_eq!(emitted, original, "{target_layout:?}, route {route}");
+        }
+    }
+}
+
+#[test]
 fn prepared_initializer_emits_generic_runtime_array_length_on_both_targets() {
     let source = SourceIdentity::new(
         "project".into(),
