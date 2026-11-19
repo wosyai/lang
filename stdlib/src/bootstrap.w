@@ -146,21 +146,29 @@ ReadLineStatus(u8[], u64, ReadLineStatus) _read_line_utf8_status = fn(bytes, len
 	result
 };
 
-ReadLineStatus() _read_line_discard = fn {
+i32(*!u8) _read_line_discard_step = fn(view) {
 	u64 zero = core.int_extend<u64>(0);
 	u64 one = core.int_extend<u64>(1);
-	u8[1] scratch = [0];
-	bool reading = true;
-	ReadLineStatus status = ReadLineStatus::limit_exceeded;
-	while (reading) {
-		u64 count = zero;
-		bool complete = false;
-		unsafe { count, complete = read_into(&?scratch[0], one); };
-		if (!complete) { status = ReadLineStatus::io_error; reading = false; };
-		if (complete && count == zero) { reading = false; };
-		if (complete && count != zero && scratch[0] == 10) { reading = false; };
+	u64 count = zero;
+	bool complete = false;
+	unsafe { count, complete = read_into(&?*view, one); };
+	if (!complete) { 2 } else {
+		if (count == zero) { 1 } else {
+			if (*view == 10) { 1 } else { 0 }
+		}
 	}
-	status
+};
+
+i32(*!u8, i32) _read_line_discard_continue = fn(view, outcome) {
+	if (outcome == 0) { _read_line_discard_continue(view, _read_line_discard_step(view)) } else { outcome }
+};
+
+ReadLineStatus() _read_line_discard = fn {
+	u8[1] scratch = [0];
+	*!u8 view = &!scratch[0];
+	i32 first = _read_line_discard_step(view);
+	i32 outcome = _read_line_discard_continue(view, first);
+	if (outcome == 2) { ReadLineStatus::io_error } else { ReadLineStatus::limit_exceeded }
 };
 
 (*utf8, ReadLineStatus)(u64, u8, bool) _read_line_allocated = fn(max_bytes, first, pending_cr) {
