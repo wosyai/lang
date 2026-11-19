@@ -2546,6 +2546,34 @@ pub(super) fn expression_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    let ty = check_expression_type_in_module(
+        expression,
+        scope,
+        visible_names,
+        folded_names,
+        module,
+        modules,
+        diagnostics,
+        unsafe_context,
+        overloads,
+        inference,
+    );
+    inference.record_expression_type(expression, &ty, false);
+    ty
+}
+
+fn check_expression_type_in_module(
+    expression: &ScalarExpression,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+    overloads: &ScalarTypingView<'_>,
+    inference: &mut ScalarInferenceBuilder<'_>,
+) -> ScalarType {
     match expression {
         ScalarExpression::Name { name, span } if name == "null" => {
             diagnostics.push(module_diagnostic(
@@ -3430,6 +3458,36 @@ pub(super) fn expression_type_in_module_expected(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    let ty = check_expression_type_in_module_expected(
+        expression,
+        expected,
+        scope,
+        visible_names,
+        folded_names,
+        module,
+        modules,
+        diagnostics,
+        unsafe_context,
+        overloads,
+        inference,
+    );
+    inference.record_expression_type(expression, &ty, expected.is_some());
+    ty
+}
+
+fn check_expression_type_in_module_expected(
+    expression: &ScalarExpression,
+    expected: Option<&ScalarType>,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+    overloads: &ScalarTypingView<'_>,
+    inference: &mut ScalarInferenceBuilder<'_>,
+) -> ScalarType {
     if expected.is_some_and(is_error_type) {
         return ScalarType::Error;
     }
@@ -3454,7 +3512,7 @@ pub(super) fn expression_type_in_module_expected(
                 return ScalarType::Error;
             }
             let diagnostics_before_arguments = diagnostics.len();
-            let argument_types = inference.without_call_signatures(|inference| {
+            let argument_types = inference.without_checked_occurrences(|inference| {
                 arguments
                     .iter()
                     .map(|argument| {
@@ -4729,6 +4787,19 @@ pub(super) fn place_type(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    let ty = check_place_type(place, scope, program, diagnostics, overloads, inference);
+    inference.record_place_type(place, &ty);
+    ty
+}
+
+fn check_place_type(
+    place: &ScalarPlace,
+    scope: &BTreeMap<String, ScalarType>,
+    program: &ScalarProgramTyping<'_>,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarTypingView<'_>,
+    inference: &mut ScalarInferenceBuilder<'_>,
+) -> ScalarType {
     match place {
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
             diagnostics.push(diagnostic(program, "B0001", "unknown name", *span));
@@ -4836,6 +4907,28 @@ pub(super) fn place_type(
 }
 
 pub(super) fn place_type_in_module(
+    place: &ScalarPlace,
+    scope: &BTreeMap<String, ScalarType>,
+    module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>],
+    diagnostics: &mut Vec<super::Diagnostic>,
+    overloads: &ScalarTypingView<'_>,
+    inference: &mut ScalarInferenceBuilder<'_>,
+) -> ScalarType {
+    let ty = check_place_type_in_module(
+        place,
+        scope,
+        module,
+        modules,
+        diagnostics,
+        overloads,
+        inference,
+    );
+    inference.record_place_type(place, &ty);
+    ty
+}
+
+fn check_place_type_in_module(
     place: &ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,
     module: &ScalarModuleTyping<'_>,
@@ -6929,6 +7022,32 @@ pub(super) fn expression_type(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    let ty = check_expression_type(
+        expression,
+        scope,
+        visible_names,
+        folded_names,
+        program,
+        diagnostics,
+        unsafe_context,
+        overloads,
+        inference,
+    );
+    inference.record_expression_type(expression, &ty, false);
+    ty
+}
+
+fn check_expression_type(
+    expression: &ScalarExpression,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    program: &ScalarProgramTyping<'_>,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+    overloads: &ScalarTypingView<'_>,
+    inference: &mut ScalarInferenceBuilder<'_>,
+) -> ScalarType {
     match expression {
         ScalarExpression::RawAddress { place, span } => {
             if !unsafe_context {
@@ -7444,7 +7563,7 @@ pub(super) fn expression_type(
                 .flatten()
             {
                 let diagnostics_before_arguments = diagnostics.len();
-                let argument_types = inference.without_call_signatures(|inference| {
+                let argument_types = inference.without_checked_occurrences(|inference| {
                     arguments
                         .iter()
                         .map(|argument| {
@@ -7814,6 +7933,34 @@ fn expression_type_expected(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    let ty = check_expression_type_expected(
+        expression,
+        expected,
+        scope,
+        visible_names,
+        folded_names,
+        program,
+        diagnostics,
+        unsafe_context,
+        overloads,
+        inference,
+    );
+    inference.record_expression_type(expression, &ty, true);
+    ty
+}
+
+fn check_expression_type_expected(
+    expression: &ScalarExpression,
+    expected: &ScalarType,
+    scope: &BTreeMap<String, ScalarType>,
+    visible_names: &BTreeSet<String>,
+    folded_names: &BTreeMap<String, (String, ByteSpan)>,
+    program: &ScalarProgramTyping<'_>,
+    diagnostics: &mut Vec<super::Diagnostic>,
+    unsafe_context: bool,
+    overloads: &ScalarTypingView<'_>,
+    inference: &mut ScalarInferenceBuilder<'_>,
+) -> ScalarType {
     if is_error_type(expected) {
         return ScalarType::Error;
     }
@@ -7837,7 +7984,7 @@ fn expression_type_expected(
                 return ScalarType::Error;
             }
             let diagnostics_before_arguments = diagnostics.len();
-            let argument_types = inference.without_call_signatures(|inference| {
+            let argument_types = inference.without_checked_occurrences(|inference| {
                 arguments
                     .iter()
                     .map(|argument| {

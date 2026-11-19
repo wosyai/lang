@@ -75,6 +75,13 @@ impl ScalarAssignmentTyping {
 pub(super) struct PreparationOccurrenceTyping {
     module_assignments: HashMap<*const ScalarAssignment, Vec<ScalarType>>,
     calls: HashMap<*const ScalarExpression, CheckedCallSignature>,
+    expressions: HashMap<*const ScalarExpression, CheckedExpressionType>,
+    places: HashMap<*const ScalarPlace, ScalarType>,
+}
+
+struct CheckedExpressionType {
+    ty: ScalarType,
+    contextual: bool,
 }
 
 impl PreparationOccurrenceTyping {
@@ -94,6 +101,40 @@ impl PreparationOccurrenceTyping {
     ) -> Option<CheckedCallSignature> {
         self.calls.remove(&std::ptr::from_ref(expression))
     }
+
+    pub(super) fn take_expression_type(
+        &mut self,
+        expression: &ScalarExpression,
+    ) -> Option<ScalarType> {
+        self.expressions
+            .remove(&std::ptr::from_ref(expression))
+            .map(|checked| checked.ty)
+    }
+
+    pub(super) fn take_place_type(&mut self, place: &ScalarPlace) -> Option<ScalarType> {
+        self.places.remove(&std::ptr::from_ref(place))
+    }
+}
+
+fn contains_error_type(ty: &ScalarType) -> bool {
+    match ty {
+        ScalarType::Error => true,
+        ScalarType::RawPointer(inner)
+        | ScalarType::CheckedReference { inner, .. }
+        | ScalarType::Array { element: inner, .. }
+        | ScalarType::RuntimeArray { element: inner, .. } => contains_error_type(inner),
+        ScalarType::Callable {
+            outputs,
+            parameters,
+        } => {
+            outputs
+                .outputs
+                .iter()
+                .any(|output| contains_error_type(&output.ty))
+                || parameters.iter().any(contains_error_type)
+        }
+        _ => false,
+    }
 }
 
 pub(super) struct ScalarInferenceBuilder<'a> {
@@ -101,7 +142,7 @@ pub(super) struct ScalarInferenceBuilder<'a> {
     assignments: HashMap<ResolvedAssignmentOutputId, ScalarType>,
     occurrences: PreparationOccurrenceTyping,
     in_module_initialization: bool,
-    suppress_call_signatures: bool,
+    suppress_checked_occurrences: bool,
 }
 
 impl<'a> ScalarInferenceBuilder<'a> {
@@ -111,13 +152,13 @@ impl<'a> ScalarInferenceBuilder<'a> {
             assignments: HashMap::new(),
             occurrences: PreparationOccurrenceTyping::default(),
             in_module_initialization: false,
-            suppress_call_signatures: true,
+            suppress_checked_occurrences: true,
         }
     }
 
     pub(super) fn for_validation(owners: &'a ScalarAssignmentOwners) -> Self {
         Self {
-            suppress_call_signatures: false,
+            suppress_checked_occurrences: false,
             ..Self::new(owners)
         }
     }
@@ -136,14 +177,49 @@ impl<'a> ScalarInferenceBuilder<'a> {
         )
     }
 
-    pub(super) fn without_call_signatures(
+    pub(super) fn without_checked_occurrences(
         &mut self,
         check_arguments: impl FnOnce(&mut Self) -> Vec<ScalarType>,
     ) -> Vec<ScalarType> {
-        let previous = std::mem::replace(&mut self.suppress_call_signatures, true);
+        let previous = std::mem::replace(&mut self.suppress_checked_occurrences, true);
         let arguments = check_arguments(self);
-        self.suppress_call_signatures = previous;
+        self.suppress_checked_occurrences = previous;
         arguments
+    }
+
+    pub(super) fn record_expression_type(
+        &mut self,
+        expression: &ScalarExpression,
+        ty: &ScalarType,
+        contextual: bool,
+    ) {
+        if self.suppress_checked_occurrences || contains_error_type(ty) {
+            return;
+        }
+        let key = std::ptr::from_ref(expression);
+        if contextual
+            || !self
+                .occurrences
+                .expressions
+                .get(&key)
+                .is_some_and(|row| row.contextual)
+        {
+            self.occurrences.expressions.insert(
+                key,
+                CheckedExpressionType {
+                    ty: ty.clone(),
+                    contextual,
+                },
+            );
+        }
+    }
+
+    pub(super) fn record_place_type(&mut self, place: &ScalarPlace, ty: &ScalarType) {
+        if !self.suppress_checked_occurrences && !contains_error_type(ty) {
+            self.occurrences
+                .places
+                .insert(std::ptr::from_ref(place), ty.clone());
+        }
     }
 
     pub(super) fn record_call_signature(
@@ -153,7 +229,7 @@ impl<'a> ScalarInferenceBuilder<'a> {
         outputs: &ScalarOutputSequence,
         overload_arm: Option<usize>,
     ) {
-        if self.suppress_call_signatures
+        if self.suppress_checked_occurrences
             || matches!(expression, ScalarExpression::Call { receiver: Some(receiver), .. } if receiver == "core")
         {
             return;

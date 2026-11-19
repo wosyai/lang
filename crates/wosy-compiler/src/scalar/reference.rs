@@ -3,9 +3,9 @@ use super::control::NamespaceTarget;
 use super::control::{
     module_initialization_region, BindingAllocationLengthSlot, BindingInitialization,
     BindingOutput, BindingOutputs, BindingReceiverSlot, BindingRegion, BlockItem, BlockItemKind,
-    BlockPosition, BlockRegion, CheckedCallSignature, ConditionalRegion, FinalOutputSlot,
-    ModuleInitializationDetail, ModuleInitializationRegion, ModuleInitializationStepKind,
-    ModuleInitializationTopology, ShortCircuitRegion, WhileRegion,
+    BlockPosition, BlockRegion, CheckedCallSignature, CheckedOccurrenceTypes, ConditionalRegion,
+    FinalOutputSlot, ModuleInitializationDetail, ModuleInitializationRegion,
+    ModuleInitializationStepKind, ModuleInitializationTopology, ShortCircuitRegion, WhileRegion,
 };
 use super::control::{
     AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentReplacement,
@@ -3898,6 +3898,7 @@ pub(super) struct OccurrenceStructure {
     pub(super) root: BlockOrdinal,
     pub(super) blocks: Vec<BlockRegion>,
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
+    pub(super) checked_types: CheckedOccurrenceTypes,
 }
 
 impl OccurrenceStructure {
@@ -3906,6 +3907,7 @@ impl OccurrenceStructure {
             root: BlockOrdinal(0),
             blocks: vec![BlockRegion::new(span, Vec::new())],
             edges: HashMap::new(),
+            checked_types: CheckedOccurrenceTypes::default(),
         }
     }
 }
@@ -4152,6 +4154,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             parent,
             edge,
         );
+        if let Some(ty) = self.occurrence_typing.take_expression_type(expression) {
+            self.structure.checked_types.expressions.insert(ordinal, ty);
+        }
         self.expression_children(expression, names, types, ordinal)?;
         Ok(ordinal)
     }
@@ -4476,6 +4481,9 @@ impl StructuralWalker<'_, '_> {
             parent,
             edge,
         );
+        if let Some(ty) = self.occurrence_typing.take_place_type(place) {
+            self.structure.checked_types.places.insert(ordinal, ty);
+        }
         let parent = OccurrenceParent::Place(ordinal);
         match place {
             ScalarPlace::Name { .. } => {}

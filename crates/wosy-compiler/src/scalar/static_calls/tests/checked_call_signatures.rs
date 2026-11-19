@@ -12,6 +12,93 @@ fn child(structure: &OccurrenceStructure, parent: Parent, edge: Edge) -> Occurre
     ordinal
 }
 
+#[test]
+fn public_prepare_retains_checked_expression_and_place_types_by_occurrence() {
+    let parsed = parsed(
+        "%%start\nu16 initial = 1;\n\
+         (i16, u8)() run = fn() { u8[2] cells = [1, 2]; cells; -1, cells[0] };\n%%end",
+    );
+    let check = |initialization: &control::ModuleInitializationRegion,
+                 function: &FunctionCallSites| {
+        let ModuleInitializationDetail::Occurrences(topology) = &initialization.detail else {
+            panic!("module initialization occurrences")
+        };
+        let initial = child(
+            &topology.structure,
+            Parent::Block(topology.structure.root),
+            Edge::BindingRoot { item: 0, output: 0 },
+        );
+        assert_eq!(
+            topology.structure.checked_types.expressions[&initial],
+            ScalarType::U16,
+        );
+
+        let structure = &function.structure;
+        let types = &structure.checked_types;
+        let mut outputs = structure.blocks[structure.root.0].final_outputs();
+        let first = outputs.next().unwrap();
+        let second = outputs.next().unwrap();
+        assert_eq!((first.output, second.output), (0, 1));
+        assert!(first.expression.0 < second.expression.0);
+        assert!(outputs.next().is_none());
+        for slot in [first, second] {
+            assert_eq!(
+                child(
+                    structure,
+                    Parent::Block(structure.root),
+                    Edge::FinalOutput {
+                        item: slot.item,
+                        output: slot.output,
+                    },
+                ),
+                slot.expression,
+            );
+        }
+        assert_eq!(types.expressions[&first.expression], ScalarType::I16);
+        assert_eq!(types.expressions[&second.expression], ScalarType::U8);
+
+        let negated_literal = child(
+            structure,
+            Parent::Expression(first.expression),
+            Edge::UnaryOperand,
+        );
+        assert_eq!(types.expressions.get(&negated_literal), None);
+
+        let Node::Place(place) =
+            structure.edges[&(Parent::Expression(second.expression), Edge::ExpressionPlace)]
+        else {
+            panic!("indexed place")
+        };
+        assert_ne!(place, second.expression);
+        assert_eq!(types.places[&place], ScalarType::U8);
+        assert_eq!(types.expressions.get(&place), None);
+        assert_eq!(types.places.get(&second.expression), None);
+        let Node::Place(base) = structure.edges[&(Parent::Place(place), Edge::PlaceBase)] else {
+            panic!("indexed base")
+        };
+        assert!(matches!(
+            &types.places[&base],
+            ScalarType::Array { element, length: 2, .. } if **element == ScalarType::U8
+        ));
+        let index = child(structure, Parent::Place(place), Edge::PlaceIndex);
+        assert_eq!(types.expressions[&index], ScalarType::U64);
+    };
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let project = prepare_extracted(&parsed, target);
+        check(
+            project.initialization_region(0).unwrap(),
+            project.calls.function(0, 1),
+        );
+        let program = PreparedProgram::new(
+            derive_scalar_declarations_from_cst(parsed.canonical_cst()),
+            target,
+        )
+        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        let calls = program.calls.as_ref().unwrap();
+        check(&calls.initialization, calls.function(1));
+    }
+}
+
 fn assert_signature(
     row: &CheckedCallSignature,
     parameters: &[ScalarType],
@@ -129,6 +216,15 @@ fn prepared_contextual_overload_keeps_selected_arm_and_ordered_mixed_outputs() {
             Parent::Expression(call),
             Edge::CallArgument(1),
         );
+        let literal = child(
+            &function.structure,
+            Parent::Expression(call),
+            Edge::CallArgument(0),
+        );
+        let types = &function.structure.checked_types.expressions;
+        assert_eq!(types[&literal], ScalarType::I64);
+        assert_eq!(types[&argument], ScalarType::Bool);
+        assert_eq!(types[&call], ScalarType::I64);
         assert_eq!(
             function
                 .call_occurrences

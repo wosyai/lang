@@ -36,6 +36,12 @@ pub(super) struct CheckedCallSignature {
     pub(super) overload_arm: Option<usize>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct CheckedOccurrenceTypes {
+    pub(super) expressions: HashMap<OccurrenceOrdinal, ScalarType>,
+    pub(super) places: HashMap<OccurrenceOrdinal, ScalarType>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModuleInitializationStep {
     pub(crate) item: usize,
