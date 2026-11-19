@@ -17,8 +17,8 @@ use inkwell::{FloatPredicate, IntPredicate};
 use serde::{Deserialize, Serialize};
 
 use crate::scalar::control::{
-    module_initialization_region, ModuleInitializationCallTarget, ModuleInitializationRegion,
-    ModuleInitializationStepKind, NamespaceTarget,
+    module_initialization_region, InitializerCallNodes, ModuleInitializationCallTarget,
+    ModuleInitializationRegion, ModuleInitializationStepKind, NamespaceTarget,
 };
 use crate::scalar::layout::ScalarTargetLayouts;
 use crate::scalar::{
@@ -86,7 +86,8 @@ enum EmitValue<'ctx> {
 }
 
 struct EmitState<'ctx, 'module> {
-    canonical_initializer: bool,
+    initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
+    initializer_symbols: Option<&'module InitializerSymbols>,
     builder: &'ctx Builder<'ctx>,
     module: &'module Module<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -335,6 +336,12 @@ fn emit_single_module_llvm<'a>(
         &'a ScalarFunction,
     ) -> Option<&'a ScalarReferenceCfg>,
 ) -> Result<LlvmPartition, String> {
+    let initializer_nodes = match generic_input {
+        GenericInitializerInput::RawItems => None,
+        GenericInitializerInput::PreparedRows => {
+            Some(initialization_region.bind_call_nodes(items)?)
+        }
+    };
     let require_cfg = |item_ordinal, arm_index, function: &'a ScalarFunction| {
         reference_cfg(item_ordinal, arm_index, function).ok_or_else(|| {
             let span = function.span;
@@ -379,11 +386,15 @@ fn emit_single_module_llvm<'a>(
     let mut externs = Vec::new();
     let mut functions = BTreeMap::new();
     let mut call_targets = BTreeMap::new();
+    let mut initializer_symbols = InitializerSymbols::default();
     let mut definitions = Vec::new();
     for (item_ordinal, item) in items.iter().enumerate() {
         let ScalarItem::Function(function) = item else {
             continue;
         };
+        if initializer_nodes.is_some() {
+            initializer_symbols.function(source, function, function.name.clone());
+        }
         if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
             continue;
         }
@@ -412,12 +423,19 @@ fn emit_single_module_llvm<'a>(
         .remove(&0)
         .expect("single prepared module has a specialization set"),
     };
+    let mut initializer_overloads = prepared_initializer_overloads(
+        initializer_nodes.iter().map(|_| initialization_region),
+        &initializer_symbols,
+    )?;
     let overloads = selected_overload_specializations(
         items,
         str::to_owned,
-        selected_overload_selections(items).into_iter().filter_map(
-            |(receiver, name, selection)| receiver.is_none().then_some((name, selection)),
-        ),
+        selected_overload_selections(items, generic_input)
+            .into_iter()
+            .filter_map(|(receiver, name, selection)| {
+                receiver.is_none().then_some((name, selection))
+            })
+            .chain(initializer_overloads.remove(source).into_iter().flatten()),
     );
     for (
         lookup,
@@ -467,6 +485,13 @@ fn emit_single_module_llvm<'a>(
                     function_type(&context, &function.signature, target_layout)?.0,
                     None,
                 );
+                if initializer_nodes.is_some() {
+                    initializer_symbols.external(
+                        source,
+                        function.name_span,
+                        &identity.internal_name,
+                    );
+                }
                 call_targets.insert(key, identity.internal_name.clone());
                 signatures.insert(identity.internal_name.clone(), function.signature.clone());
                 functions.insert(identity.internal_name.clone(), value);
@@ -535,7 +560,8 @@ fn emit_single_module_llvm<'a>(
         &globals,
         items,
         initialization_region,
-        generic_input,
+        initializer_nodes.as_ref(),
+        &initializer_symbols,
         &module,
         &structs,
         &layouts,
@@ -627,6 +653,16 @@ fn emit_project_llvm<'a>(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let initializer_nodes = match generic_input {
+        GenericInitializerInput::RawItems => None,
+        GenericInitializerInput::PreparedRows => Some(
+            modules
+                .iter()
+                .zip(&regions)
+                .map(|(module, region)| region.bind_call_nodes(&module.items))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    };
     let require_cfg = |module_ordinal, item_ordinal, arm_index, function: &'a ScalarFunction| {
         reference_cfg(module_ordinal, item_ordinal, arm_index, function).ok_or_else(|| {
             let source = &project.modules[module_ordinal].source;
@@ -661,6 +697,7 @@ fn emit_project_llvm<'a>(
     let mut signatures = BTreeMap::new();
     let mut externs = Vec::new();
     let mut call_targets = BTreeMap::new();
+    let mut initializer_symbols = InitializerSymbols::default();
     let mut definitions = Vec::new();
     for &(module_ordinal, source_module) in &ordered_modules {
         for (item_ordinal, item) in source_module.items.iter().enumerate() {
@@ -678,10 +715,13 @@ fn emit_project_llvm<'a>(
                 }
             }
             if let ScalarItem::Function(function) = item {
+                let name = project_function_name(&source_module.source, &function.name);
+                if initializer_nodes.is_some() {
+                    initializer_symbols.function(&source_module.source, function, name.clone());
+                }
                 if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
                     continue;
                 }
-                let name = project_function_name(&source_module.source, &function.name);
                 let cfg = require_cfg(module_ordinal, item_ordinal, None, function)?;
                 let value = module.add_function(
                     &name,
@@ -722,6 +762,13 @@ fn emit_project_llvm<'a>(
                         module_name,
                         &function.name,
                     );
+                    if initializer_nodes.is_some() {
+                        initializer_symbols.external(
+                            &source_module.source,
+                            function.name_span,
+                            &identity.internal_name,
+                        );
+                    }
                     call_targets.insert(key, identity.internal_name.clone());
                     signatures.insert(identity.internal_name.clone(), function.signature.clone());
                     functions.insert(identity.internal_name.clone(), value);
@@ -780,9 +827,15 @@ fn emit_project_llvm<'a>(
         }
     }
     let mut project_overloads = Vec::new();
+    let mut initializer_overloads = prepared_initializer_overloads(
+        initializer_nodes
+            .iter()
+            .flat_map(|_| regions.iter().copied()),
+        &initializer_symbols,
+    )?;
     for &(module_ordinal, source_module) in &ordered_modules {
         let selections = modules.iter().flat_map(|calling_module| {
-            selected_overload_selections(&calling_module.items)
+            selected_overload_selections(&calling_module.items, generic_input)
                 .into_iter()
                 .filter_map(|(receiver, name, selection)| match receiver {
                     None if calling_module.source == source_module.source => {
@@ -800,7 +853,12 @@ fn emit_project_llvm<'a>(
         for (lookup, specialization) in selected_overload_specializations(
             &source_module.items,
             |name| project_function_name(&source_module.source, name),
-            selections,
+            selections.chain(
+                initializer_overloads
+                    .remove(&source_module.source)
+                    .into_iter()
+                    .flatten(),
+            ),
         ) {
             let LlvmSpecialization {
                 function,
@@ -904,7 +962,8 @@ fn emit_project_llvm<'a>(
         &dynamic_owner_outputs,
         &modules,
         &regions,
-        generic_input,
+        initializer_nodes.as_deref(),
+        &initializer_symbols,
         &globals,
         &module,
         &all_structs,
@@ -1200,7 +1259,7 @@ fn emit_binding_value<'ctx, 'module>(
             emit_expression(context, state, &binding.value)
         }
         ScalarBindingOutputOrigin::IndependentExpressions => {
-            let canonical = state.canonical_initializer;
+            let canonical = state.initializer_nodes.is_some();
             let values = binding
                 .output_values
                 .iter()
@@ -1316,7 +1375,7 @@ fn store_binding_outputs<'ctx, 'module>(
         )?;
         store_value(context, state, slot, ty, value)?;
         state.storage.insert(name.clone(), (slot, ty.clone()));
-        transition_runtime_array_binding_initialization(state, name, ty, &binding.value);
+        transition_runtime_array_binding_initialization(state, name, ty, &binding.value)?;
         transition_automatic_return_result_binding_initialization(
             state,
             name,
@@ -1475,11 +1534,11 @@ fn transition_runtime_array_binding_initialization(
     name: &str,
     ty: &ScalarType,
     value: &ScalarExpression,
-) {
+) -> Result<(), String> {
     if !matches!(ty, ScalarType::RuntimeArray { .. }) {
-        return;
+        return Ok(());
     }
-    let provenance = runtime_array_assignment_provenance(state, value);
+    let provenance = runtime_array_assignment_provenance(state, value)?;
     let owns = provenance.result.owns();
     state.runtime_array_owners.insert(name.into(), owns);
     state.runtime_array_allocations.insert(name.into(), false);
@@ -1488,13 +1547,14 @@ fn transition_runtime_array_binding_initialization(
             state.runtime_array_owners.insert(source, false);
         }
     }
+    Ok(())
 }
 
 fn runtime_array_assignment_provenance(
     state: &EmitState<'_, '_>,
     expression: &ScalarExpression,
-) -> RuntimeArrayAssignmentProvenance {
-    match expression {
+) -> Result<RuntimeArrayAssignmentProvenance, String> {
+    Ok(match expression {
         ScalarExpression::Name { name, .. } => RuntimeArrayAssignmentProvenance {
             result: if state
                 .runtime_array_owners
@@ -1508,6 +1568,20 @@ fn runtime_array_assignment_provenance(
             },
             source_name: Some(name.clone()),
         },
+        ScalarExpression::Call { .. } if state.initializer_nodes.is_some() => {
+            let row = state
+                .initializer_target(expression)?
+                .expect("prepared initializer call");
+            let target = state.initializer_symbol(row)?;
+            RuntimeArrayAssignmentProvenance {
+                result: target
+                    .as_ref()
+                    .and_then(|target| state.runtime_array_results.get(target))
+                    .copied()
+                    .unwrap_or(RuntimeArrayResultProvenance::FreshCall),
+                source_name: None,
+            }
+        }
         ScalarExpression::Call {
             receiver,
             name,
@@ -1542,7 +1616,7 @@ fn runtime_array_assignment_provenance(
             result: RuntimeArrayResultProvenance::FixedWidening,
             source_name: None,
         },
-    }
+    })
 }
 
 fn insert_function_result_provenance(
@@ -1590,7 +1664,7 @@ fn emit_project_binding_value<'ctx, 'module>(
             emit_project_expression(context, state, &binding.value, module, modules)
         }
         ScalarBindingOutputOrigin::IndependentExpressions => {
-            let canonical = state.canonical_initializer;
+            let canonical = state.initializer_nodes.is_some();
             let values = binding
                 .output_values
                 .iter()
@@ -1640,7 +1714,8 @@ fn emit_function<'ctx, 'module>(
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
-        canonical_initializer: false,
+        initializer_nodes: None,
+        initializer_symbols: None,
         builder,
         module,
         functions,
@@ -1782,7 +1857,8 @@ fn emit_main<'ctx, 'module>(
     globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     items: &[ScalarItem],
     initialization_region: &ModuleInitializationRegion,
-    generic_input: GenericInitializerInput,
+    initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
+    initializer_symbols: &'module InitializerSymbols,
     module: &'module Module<'ctx>,
     structs: &'module [&'module ScalarStruct],
     layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
@@ -1794,7 +1870,8 @@ fn emit_main<'ctx, 'module>(
     let entry = context.append_basic_block(main, "entry");
     builder.position_at_end(entry);
     let mut state = EmitState {
-        canonical_initializer: matches!(generic_input, GenericInitializerInput::PreparedRows),
+        initializer_nodes,
+        initializer_symbols: Some(initializer_symbols),
         builder,
         module,
         functions,
@@ -1860,7 +1937,7 @@ fn emit_main<'ctx, 'module>(
                         name,
                         ty,
                         &binding.value,
-                    );
+                    )?;
                 }
             }
             (ModuleInitializationStepKind::ExecutableItem, ScalarItem::Executable(item)) => {
@@ -1911,7 +1988,8 @@ fn emit_project_function<'ctx, 'module>(
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
-        canonical_initializer: false,
+        initializer_nodes: None,
+        initializer_symbols: None,
         builder,
         module,
         functions,
@@ -2067,7 +2145,8 @@ fn emit_project_main<'ctx, 'module>(
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     modules: &[&ScalarModule],
     regions: &[&ModuleInitializationRegion],
-    generic_input: GenericInitializerInput,
+    initializer_nodes: Option<&'module [InitializerCallNodes<'module>]>,
+    initializer_symbols: &'module InitializerSymbols,
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     module: &'module Module<'ctx>,
     structs: &'module [&'module ScalarStruct],
@@ -2080,7 +2159,8 @@ fn emit_project_main<'ctx, 'module>(
     let entry = context.append_basic_block(main, "entry");
     builder.position_at_end(entry);
     let mut state = EmitState {
-        canonical_initializer: matches!(generic_input, GenericInitializerInput::PreparedRows),
+        initializer_nodes: None,
+        initializer_symbols: Some(initializer_symbols),
         builder,
         module,
         functions,
@@ -2122,6 +2202,7 @@ fn emit_project_main<'ctx, 'module>(
         0,
         modules,
         regions,
+        initializer_nodes,
         globals,
         &mut Vec::new(),
     )?;
@@ -2139,6 +2220,7 @@ fn initialize_project_module<'ctx, 'module>(
     position: usize,
     modules: &[&'module ScalarModule],
     regions: &[&ModuleInitializationRegion],
+    initializer_nodes: Option<&'module [InitializerCallNodes<'module>]>,
     globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
     initialized: &mut Vec<wosy_syntax::SourceIdentity>,
 ) -> Result<(), String> {
@@ -2149,6 +2231,9 @@ fn initialize_project_module<'ctx, 'module>(
         return Ok(());
     }
     initialized.push(module.source.clone());
+
+    let previous_nodes = state.initializer_nodes;
+    state.initializer_nodes = initializer_nodes.map(|nodes| &nodes[position]);
 
     let values = state.values.clone();
     let storage = state.storage.clone();
@@ -2195,6 +2280,7 @@ fn initialize_project_module<'ctx, 'module>(
                     position,
                     modules,
                     regions,
+                    initializer_nodes,
                     globals,
                     initialized,
                 )?;
@@ -2266,7 +2352,7 @@ fn initialize_project_module<'ctx, 'module>(
                         name,
                         ty,
                         &binding.value,
-                    );
+                    )?;
                 }
             }
             (ModuleInitializationStepKind::ExecutableItem, ScalarItem::Executable(item)) => {
@@ -2279,6 +2365,7 @@ fn initialize_project_module<'ctx, 'module>(
         }
     }
 
+    state.initializer_nodes = previous_nodes;
     state.globals = current_globals;
     state.values = values;
     let mut retained_storage = storage;
@@ -2551,7 +2638,7 @@ fn emit_final_outputs<'ctx, 'module>(
     if let BlockEmission::TailArm(outputs) = emission {
         return emit_ordered_final_outputs(context, state, block, outputs, None);
     }
-    let canonical = state.canonical_initializer;
+    let canonical = state.initializer_nodes.is_some();
     if block.final_output_values.len() == 1 {
         let output = &block.final_output_values[0];
         let expression = final_output_expression(block, 0, canonical);
@@ -2653,7 +2740,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
     if let BlockEmission::TailArm(outputs) = emission {
         return emit_ordered_final_outputs(context, state, block, outputs, Some((module, modules)));
     }
-    let canonical = state.canonical_initializer;
+    let canonical = state.initializer_nodes.is_some();
     if block.final_output_values.len() == 1 {
         let output = &block.final_output_values[0];
         let expression = final_output_expression(block, 0, canonical);
@@ -3522,6 +3609,14 @@ fn pointer_target_type<'ctx, 'module>(
                 _ => None,
             }),
         ScalarExpression::RawAddress { place, .. } => assignment_place_type(state, place),
+        ScalarExpression::Call { .. } if state.initializer_nodes.is_some() => {
+            match state.initializer_call_output(expression).ok().flatten()? {
+                ScalarType::RawPointer(inner) | ScalarType::CheckedReference { inner, .. } => {
+                    Some(*inner)
+                }
+                _ => None,
+            }
+        }
         ScalarExpression::Call {
             receiver,
             name,
@@ -3598,6 +3693,12 @@ fn dereference_requires_null_guard<'ctx, 'module>(
             .map(|(_, ty)| ty)
             .or_else(|| state.globals.get(name).map(|(_, ty)| ty))
             .is_some_and(|ty| matches!(ty, ScalarType::CheckedReference { .. })),
+        ScalarExpression::Call { .. } if state.initializer_nodes.is_some() => {
+            matches!(
+                state.initializer_call_output(expression),
+                Ok(Some(ScalarType::CheckedReference { .. }))
+            )
+        }
         ScalarExpression::Call {
             receiver,
             name,
@@ -3713,7 +3814,7 @@ fn materialize_assignment_values<'ctx, 'module>(
     let mut position = 0;
     let mut values = Vec::new();
     for expression in expressions {
-        let provenance = runtime_array_assignment_provenance(state, expression);
+        let provenance = runtime_array_assignment_provenance(state, expression)?;
         let runtime_array_source = if provenance.result.owns() {
             provenance.source_name.as_ref().map(|name| {
                 state
@@ -4150,6 +4251,9 @@ enum GenericInitializerInput {
     PreparedRows,
 }
 
+mod initializer_calls;
+use initializer_calls::{prepared_initializer_overloads, InitializerSymbols};
+
 fn prepared_generic_specializations<'a>(
     modules: impl Iterator<
             Item = (
@@ -4348,20 +4452,21 @@ fn selected_overload_specializations(
 
 fn selected_overload_selections(
     items: &[ScalarItem],
+    input: GenericInitializerInput,
 ) -> Vec<(Option<String>, String, ScalarOverloadSelection)> {
     let mut selections = Vec::new();
     for item in items {
         match item {
-            ScalarItem::Binding(binding) => {
+            ScalarItem::Binding(binding) if matches!(input, GenericInitializerInput::RawItems) => {
                 collect_selected_overloads(&binding.value, &mut selections)
             }
             ScalarItem::Function(function) => {
                 collect_selected_overloads_in_block(&function.body, &mut selections)
             }
-            ScalarItem::Executable(item) => {
+            ScalarItem::Executable(item) if matches!(input, GenericInitializerInput::RawItems) => {
                 collect_selected_overloads_in_item(item, &mut selections)
             }
-            ScalarItem::Namespace(_) | ScalarItem::Extern(_) => {}
+            _ => {}
         }
     }
     selections

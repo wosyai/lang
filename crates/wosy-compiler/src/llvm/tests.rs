@@ -19,6 +19,175 @@ use crate::{
 };
 use wosy_syntax::{ByteSpan, SourceIdentity};
 
+fn prepare_initializer_test(
+    text: &str,
+    target_layout: ScalarTargetLayout,
+) -> crate::PreparedScalarProject {
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let parsed = parse_source(source.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    prepare_scalar_project(
+        vec![(
+            derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+            Vec::new(),
+        )],
+        vec![source],
+        ScalarPreparationInputs { target_layout },
+    )
+    .unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics))
+}
+
+fn emit_initializer_test_input(
+    build: &crate::ScalarBuildValidation<'_>,
+    project: &ScalarProject,
+    region: &crate::scalar::control::ModuleInitializationRegion,
+) -> [Result<LlvmPartition, String>; 2] {
+    let module = &project.modules[0];
+    let input = super::GenericInitializerInput::PreparedRows;
+    [
+        super::emit_single_module_llvm(
+            &module.source,
+            &module.items,
+            region,
+            &module.structs,
+            &module.layouts,
+            module.target_layout,
+            input,
+            &|item, arm, _| build.reference_cfg(0, item, arm),
+        ),
+        super::emit_project_llvm(
+            project,
+            &|_| Some(region),
+            input,
+            &|module, item, arm, _| build.reference_cfg(module, item, arm),
+        ),
+    ]
+}
+
+#[test]
+fn prepared_initializer_dispatch_uses_rows_when_call_spelling_differs() {
+    let text = "%%start
+disk = extern wasm \"disk_abi\" { i32(i32) read; };
+i32(i32) echo = fn(value) { value };
+pick = overload { i32(i32) => fn(value) { value }; };
+choose = overload { generic T; T(T) => fn(value) { value }; };
+generic T;
+T(T) identity = fn(value) { value };
+i32 direct = echo(11);
+i32 overloaded = pick(22);
+bool generic_arm = choose(true);
+i32 generic = identity<i32>(33);
+i32 external = disk.read(44);
+i64 extended = core.int_extend<i64>(echo(55));
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let build = analyze_scalar_build(&prepared);
+        let baseline = [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ];
+        let mut project = prepared.project().clone();
+        for item in &mut project.modules[0].items {
+            if let ScalarItem::Binding(binding) = item {
+                let crate::ScalarExpression::Call {
+                    receiver,
+                    name,
+                    overload_selection,
+                    ..
+                } = &mut binding.value
+                else {
+                    panic!("call initializer");
+                };
+                *receiver = Some("not_a_namespace".into());
+                *name = "not_a_callable".into();
+                *overload_selection = None;
+            }
+        }
+        let region = prepared.initialization_region(0).unwrap();
+        let changed = emit_initializer_test_input(&build, &project, region);
+        for (expected, actual) in baseline.into_iter().zip(changed) {
+            let expected = expected.unwrap().to_text();
+            let actual = actual.unwrap().to_text();
+            assert_eq!(expected, actual, "{layout:?}");
+            for argument in [11, 22, 33, 44, 55] {
+                assert!(actual.contains(&format!("(i32 {argument})")), "{actual}");
+            }
+            assert!(actual.contains("sext i32"), "{actual}");
+            assert!(actual.contains("(i1 true)"), "{actual}");
+        }
+    }
+}
+
+#[test]
+fn prepared_initializer_preserves_unsupported_indirect_call_diagnostics() {
+    let text = "%%start\ni32() direct = fn { 11 };\ni32() indirect = direct;\ni32 result = indirect();\n%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let mut project = prepared.project().clone();
+        let module = &mut project.modules[0];
+        let ScalarItem::Binding(binding) = &mut module.items[1] else {
+            panic!("indirect binding");
+        };
+        binding.declared_type = ScalarType::I32;
+        binding.receivers[0].ty = ScalarType::I32;
+        binding.value = crate::ScalarExpression::Integer {
+            value: 0.into(),
+            span: binding.span,
+        };
+        let [single, project] = emit_initializer_test_input(
+            &build,
+            &project,
+            prepared.initialization_region(0).unwrap(),
+        );
+        assert_eq!(single.err().unwrap(), "unknown LLVM callable indirect",);
+        let source = &prepared.project().modules[0].source;
+        assert_eq!(
+            project.err().unwrap(),
+            format!(
+                "unknown LLVM callable {}",
+                project_function_name(source, "indirect")
+            ),
+        );
+    }
+}
+
+#[test]
+fn prepared_initializer_missing_row_is_rejected_by_both_emitters() {
+    let text = "%%start\ni32(i32) echo = fn(value) { value };\ni32 result = echo(11);\n%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let build = analyze_scalar_build(&prepared);
+        let mut region = prepared.initialization_region(0).unwrap().clone();
+        for result in emit_initializer_test_input(&build, prepared.project(), &region) {
+            assert!(result.is_ok());
+        }
+        region.remove_only_call_target();
+        let start = text.find("echo(11)").unwrap();
+        let expected = format!(
+            "internal error: missing initializer call target in {:?} at {start}..{} (occurrence 0)",
+            region.source,
+            start + "echo(11)".len(),
+        );
+        for result in emit_initializer_test_input(&build, prepared.project(), &region) {
+            assert_eq!(
+                result
+                    .err()
+                    .expect("missing selected row must fail emission"),
+                expected,
+                "{layout:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn prepared_initializer_emits_canonical_binding_and_block_outputs() {
     use crate::ScalarExpression;

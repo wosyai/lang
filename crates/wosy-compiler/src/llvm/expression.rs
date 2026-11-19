@@ -127,26 +127,42 @@ pub(super) fn emit_expression<'ctx, 'module>(
             overload_selection,
             ..
         } => {
+            let selected = state.initializer_target(expression)?;
+            let (receiver, name) = match selected {
+                Some(ModuleInitializationCallTarget::Core(operation)) => {
+                    (Some("core"), initializer_core_name(*operation))
+                }
+                Some(target) => {
+                    return emit_selected_initializer_call(
+                        context,
+                        state,
+                        target,
+                        receiver.as_deref(),
+                        name,
+                        arguments,
+                        None,
+                    );
+                }
+                None => (receiver.as_deref(), name.as_str()),
+            };
             if state.invalidations.contains_key(&(span.start, span.end)) {
                 return emit_core_invalidation(context, state, *span, arguments, None);
             }
-            if receiver.as_deref() == Some("core") && name == "alloc" {
+            if receiver == Some("core") && name == "alloc" {
                 return emit_core_alloc(context, state, arguments);
             }
-            if receiver.as_deref() == Some("core") && name == "free" {
+            if receiver == Some("core") && name == "free" {
                 return emit_core_free(context, state, arguments);
             }
-            if receiver.as_deref() == Some("core") && name == "system_panic" {
+            if receiver == Some("core") && name == "system_panic" {
                 return emit_core_system_panic(context, state, arguments);
             }
-            if receiver.as_deref() == Some("core")
-                && matches!(name.as_str(), "int_trunc" | "int_extend")
-            {
+            if receiver == Some("core") && matches!(name, "int_trunc" | "int_extend") {
                 return emit_int_conversion(context, state, name, type_arguments, arguments);
             }
-            if receiver.as_deref() == Some("core")
+            if receiver == Some("core")
                 && matches!(
-                    name.as_str(),
+                    name,
                     "uint_to_float"
                         | "sint_to_float"
                         | "float_to_sint_trunc"
@@ -157,22 +173,25 @@ pub(super) fn emit_expression<'ctx, 'module>(
             {
                 return emit_float_conversion(context, state, name, type_arguments, arguments);
             }
-            if receiver.as_deref() == Some("core") && name == "bitcast" {
+            if receiver == Some("core") && name == "bitcast" {
                 return emit_bitcast(context, state, name, type_arguments, arguments);
             }
-            if receiver.as_deref() == Some("core") && name == "pointer_cast" {
+            if receiver == Some("core") && name == "pointer_cast" {
                 return emit_core_pointer_cast(context, state, name, type_arguments, arguments);
             }
-            if receiver.as_deref() == Some("core") && name == "offset" {
+            if receiver == Some("core") && name == "offset" {
                 return emit_core_offset(context, state, type_arguments, arguments);
             }
-            if receiver.as_deref() == Some("core") && name == "load" {
+            if receiver == Some("core") && name == "load" {
                 return emit_core_load(context, state, type_arguments, arguments);
+            }
+            if selected.is_some() {
+                return Err(format!("unknown LLVM callable core.{name}"));
             }
             emit_call(
                 context,
                 state,
-                receiver.as_deref(),
+                receiver,
                 name,
                 type_arguments,
                 arguments,
@@ -310,6 +329,24 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             overload_selection,
             ..
         } => {
+            let selected = state.initializer_target(expression)?;
+            let (receiver, name) = match selected {
+                Some(ModuleInitializationCallTarget::Core(operation)) => {
+                    (Some("core"), initializer_core_name(*operation))
+                }
+                Some(target) => {
+                    return emit_selected_initializer_call(
+                        context,
+                        state,
+                        target,
+                        receiver.as_deref(),
+                        name,
+                        arguments,
+                        Some(ProjectCallScope { module, modules }),
+                    );
+                }
+                None => (receiver.as_deref(), name.as_str()),
+            };
             if state.invalidations.contains_key(&(span.start, span.end)) {
                 return emit_core_invalidation(
                     context,
@@ -319,18 +356,16 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                     Some(ProjectCallScope { module, modules }),
                 );
             }
-            if receiver.as_deref() == Some("core") && name == "alloc" {
+            if receiver == Some("core") && name == "alloc" {
                 return emit_core_alloc_project(context, state, arguments, module, modules);
             }
-            if receiver.as_deref() == Some("core") && name == "free" {
+            if receiver == Some("core") && name == "free" {
                 return emit_core_free_project(context, state, arguments, module, modules);
             }
-            if receiver.as_deref() == Some("core") && name == "system_panic" {
+            if receiver == Some("core") && name == "system_panic" {
                 return emit_core_system_panic(context, state, arguments);
             }
-            if receiver.as_deref() == Some("core")
-                && matches!(name.as_str(), "int_trunc" | "int_extend")
-            {
+            if receiver == Some("core") && matches!(name, "int_trunc" | "int_extend") {
                 return emit_int_conversion_project(
                     context,
                     state,
@@ -341,9 +376,9 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                     modules,
                 );
             }
-            if receiver.as_deref() == Some("core")
+            if receiver == Some("core")
                 && matches!(
-                    name.as_str(),
+                    name,
                     "uint_to_float"
                         | "sint_to_float"
                         | "float_to_sint_trunc"
@@ -362,7 +397,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                     modules,
                 );
             }
-            if receiver.as_deref() == Some("core") && name == "bitcast" {
+            if receiver == Some("core") && name == "bitcast" {
                 return emit_bitcast_project(
                     context,
                     state,
@@ -373,7 +408,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                     modules,
                 );
             }
-            if receiver.as_deref() == Some("core") && name == "pointer_cast" {
+            if receiver == Some("core") && name == "pointer_cast" {
                 return emit_core_pointer_cast_project(
                     context,
                     state,
@@ -384,7 +419,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                     modules,
                 );
             }
-            if receiver.as_deref() == Some("core") && name == "offset" {
+            if receiver == Some("core") && name == "offset" {
                 return emit_core_offset_project(
                     context,
                     state,
@@ -394,7 +429,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                     modules,
                 );
             }
-            if receiver.as_deref() == Some("core") && name == "load" {
+            if receiver == Some("core") && name == "load" {
                 return emit_core_load_project(
                     context,
                     state,
@@ -404,7 +439,10 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                     modules,
                 );
             }
-            let qualified = if let Some(binding) = receiver.as_deref() {
+            if selected.is_some() {
+                return Err("unknown LLVM extern binding core".to_owned());
+            }
+            let qualified = if let Some(binding) = receiver {
                 if let Some(namespace) = module
                     .namespace_bindings
                     .iter()
@@ -586,6 +624,82 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             return Err("array literal requires an expected fixed array type".to_owned())
         }
     }
+}
+
+fn initializer_core_name(operation: CoreOperationId) -> &'static str {
+    use CoreOperationId::*;
+    match operation {
+        Alloc => "alloc",
+        Free => "free",
+        Invalidate => "invalidate",
+        Rebind => "rebind",
+        SystemPanic => "system_panic",
+        ThisArtifactId => "this_artifact_id",
+        DeclareArtifact => "declare_artifact",
+        IntTrunc => "int_trunc",
+        IntExtend => "int_extend",
+        UintToFloat => "uint_to_float",
+        SintToFloat => "sint_to_float",
+        FloatToSintTrunc => "float_to_sint_trunc",
+        FloatToUintTrunc => "float_to_uint_trunc",
+        FloatTrunc => "float_trunc",
+        FloatExtend => "float_extend",
+        Bitcast => "bitcast",
+        Offset => "offset",
+        Load => "load",
+        PointerCast => "pointer_cast",
+    }
+}
+
+fn emit_selected_initializer_call<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    selected: &ModuleInitializationCallTarget,
+    receiver: Option<&str>,
+    name: &str,
+    arguments: &[ScalarExpression],
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<EmitValue<'ctx>, String> {
+    let Some(target) = state.initializer_symbol(selected)? else {
+        return Err(match (project, receiver, selected) {
+            (Some(project), Some(receiver), _) => {
+                match project
+                    .module
+                    .namespace_bindings
+                    .iter()
+                    .find(|namespace| namespace.binding == receiver)
+                {
+                    Some(namespace) => format!(
+                        "unknown LLVM callable {}",
+                        project_function_name(&namespace.target, name)
+                    ),
+                    None => format!("unknown LLVM extern binding {receiver}"),
+                }
+            }
+            (Some(project), None, _) => format!(
+                "unknown LLVM callable {}",
+                project_function_name(&project.module.source, name)
+            ),
+            (None, Some(receiver), _) => format!("unknown LLVM callable {receiver}.{name}"),
+            (None, None, _) => format!("unknown LLVM callable {name}"),
+        });
+    };
+    let Some(ScalarType::Callable { parameters, .. }) = state.signatures.get(&target) else {
+        return Err(format!(
+            "internal error: missing LLVM initializer callable signature {target}"
+        ));
+    };
+    let values = arguments
+        .iter()
+        .zip(parameters)
+        .map(|(argument, parameter)| match project {
+            Some(ProjectCallScope { module, modules }) => {
+                emit_project_typed_expression(context, state, argument, parameter, module, modules)
+            }
+            None => emit_typed_expression(context, state, argument, parameter),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    emit_call_values(context, state, &target, values)
 }
 
 fn emit_call<'ctx, 'module>(
@@ -1186,6 +1300,9 @@ fn bitcast_source_type(
         ScalarExpression::Binary { left, .. } => {
             bitcast_source_type(state, left, project_module).ok()
         }
+        ScalarExpression::Call { .. } if state.initializer_nodes.is_some() => {
+            state.initializer_call_output(expression)?
+        }
         ScalarExpression::Call {
             receiver,
             name,
@@ -1776,6 +1893,9 @@ fn integer_conversion_source_type(
         ScalarExpression::Binary { left, .. } => {
             integer_conversion_source_type(state, left, project_module).ok()
         }
+        ScalarExpression::Call { .. } if state.initializer_nodes.is_some() => {
+            state.initializer_call_output(expression)?
+        }
         ScalarExpression::Call {
             receiver,
             name,
@@ -1869,6 +1989,9 @@ fn float_conversion_source_type(
         }
         ScalarExpression::Binary { left, .. } => {
             float_conversion_source_type(state, left, project_module).ok()
+        }
+        ScalarExpression::Call { .. } if state.initializer_nodes.is_some() => {
+            state.initializer_call_output(expression)?
         }
         ScalarExpression::Call {
             receiver,

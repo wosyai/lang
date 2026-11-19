@@ -1874,8 +1874,8 @@ impl ScalarAssignment {
     }
 }
 
-impl ScalarAssignmentRhs<'_> {
-    fn evaluations(&self) -> impl Iterator<Item = (usize, &ScalarExpression)> {
+impl<'a> ScalarAssignmentRhs<'a> {
+    fn evaluations(&self) -> impl Iterator<Item = (usize, &'a ScalarExpression)> {
         self.values.iter().enumerate()
     }
 

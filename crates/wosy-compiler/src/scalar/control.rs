@@ -7,6 +7,9 @@ use super::{
 };
 use wosy_syntax::{ByteSpan, SourceIdentity, SourceSpan};
 
+mod initializer_call_nodes;
+pub(crate) use initializer_call_nodes::InitializerCallNodes;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModuleInitializationRegion {
     pub(crate) source: SourceIdentity,
@@ -15,6 +18,24 @@ pub(crate) struct ModuleInitializationRegion {
 }
 
 impl ModuleInitializationRegion {
+    #[cfg(test)]
+    pub(crate) fn remove_only_call_target(&mut self) {
+        let ModuleInitializationDetail::Occurrences(topology) = &mut self.detail else {
+            panic!("prepared initializer topology");
+        };
+        let [ordinal] = topology.calls.as_slice() else {
+            panic!("exactly one initializer call");
+        };
+        assert!(topology.call_targets.remove(ordinal).is_some());
+    }
+
+    pub(crate) fn bind_call_nodes<'a>(
+        &'a self,
+        items: &'a [ScalarItem],
+    ) -> Result<InitializerCallNodes<'a>, String> {
+        InitializerCallNodes::bind(self, items)
+    }
+
     pub(super) fn call_target(
         &self,
         ordinal: OccurrenceOrdinal,
@@ -37,13 +58,8 @@ impl ModuleInitializationRegion {
             ));
         };
         Ok(topology.calls.iter().map(|&ordinal| {
-            self.call_target(ordinal).ok_or_else(|| {
-                let span = topology.occurrences[ordinal.0].span;
-                format!(
-                    "internal error: missing initializer call target in {:?} at {}..{} (occurrence {})",
-                    self.source, span.start, span.end, ordinal.0,
-                )
-            })
+            self.call_target(ordinal)
+                .ok_or_else(|| topology.missing_call_target(&self.source, ordinal))
         }))
     }
 }
@@ -65,6 +81,16 @@ pub(super) struct ModuleInitializationTopology {
     pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
     pub(super) loops: HashMap<(BlockOrdinal, usize), WhileRegion>,
     pub(super) short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
+}
+
+impl ModuleInitializationTopology {
+    fn missing_call_target(&self, source: &SourceIdentity, ordinal: OccurrenceOrdinal) -> String {
+        let span = self.occurrences[ordinal.0].span;
+        format!(
+            "internal error: missing initializer call target in {source:?} at {}..{} (occurrence {})",
+            span.start, span.end, ordinal.0,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
