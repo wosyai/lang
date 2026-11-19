@@ -1,6 +1,202 @@
 use super::*;
-use control::ModuleInitializationDetail;
-use reference::{OccurrenceOrdinal, OccurrenceRole};
+use control::{InitializationMember, InitializationStorage, ModuleInitializationDetail};
+use reference::{InitializerMemberRequirement, OccurrenceOrdinal, OccurrenceRole};
+
+fn initializer_member_tokens(
+    topology: &control::ModuleInitializationTopology,
+) -> Vec<(OccurrenceOrdinal, ByteSpan)> {
+    topology
+        .occurrences
+        .iter()
+        .enumerate()
+        .filter_map(|(index, metadata)| match metadata.initializer_member {
+            InitializerMemberRequirement::Token(span) => Some((OccurrenceOrdinal(index), span)),
+            InitializerMemberRequirement::NotRequired => None,
+        })
+        .collect()
+}
+
+#[test]
+fn initializer_members_retain_selection_and_type_on_both_routes_and_layouts() {
+    let text = "%%start\nstruct Record { u8 field; }\nenum Mode { ready; }\nRecord item = { .field = 1; };\nu8 extracted = item.field;\nMode status = Mode.ready;\n*?Record pointer = null;\nu8 indirect = pointer.field;\n%%end";
+    let parsed = parsed(text);
+    let span = |needle: &str, token: &str| {
+        let start = (text.find(needle).unwrap() + needle.find(token).unwrap()) as u32;
+        ByteSpan::new(start, start + token.len() as u32)
+    };
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let stages = Scope::new();
+        let standalone = PreparedProgram::new(
+            derive_scalar_declarations_from_cst(parsed.canonical_cst()),
+            target,
+        )
+        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        let project = prepare_extracted(&parsed, target);
+        assert_eq!(
+            stages.counts(),
+            Counts {
+                call_sites: 2,
+                ..Default::default()
+            }
+        );
+        drop(stages);
+        let structure = &standalone.program.structs[0];
+        let enumeration = &standalone.program.enums[0];
+        for module in [&standalone.calls, project.calls.module(0)] {
+            let region = &module.initialization;
+            let ModuleInitializationDetail::Occurrences(topology) = &region.detail else {
+                panic!("initializer topology")
+            };
+            let rows = initializer_member_tokens(topology);
+            assert_eq!(
+                rows.iter().map(|(_, span)| *span).collect::<Vec<_>>(),
+                [
+                    span("item.field", "field"),
+                    span("Mode.ready", "ready"),
+                    span("pointer.field", "field")
+                ]
+            );
+            let field =
+                |receiver, receiver_name: &str, through_raw_pointer| InitializationMember::Field {
+                    receiver: InitializationStorage::Module(receiver),
+                    receiver_name: receiver_name.to_owned(),
+                    field: structure.fields[0].id.clone(),
+                    through_raw_pointer,
+                };
+            for ((ordinal, _), (identity, ty)) in rows.iter().zip([
+                (field(span("item =", "item"), "item", false), ScalarType::U8),
+                (
+                    InitializationMember::Enum {
+                        enumeration: enumeration.id.clone(),
+                        tag: 0,
+                    },
+                    ScalarType::Enum(enumeration.id.clone()),
+                ),
+                (
+                    field(span("pointer =", "pointer"), "pointer", true),
+                    ScalarType::U8,
+                ),
+            ]) {
+                assert_eq!(topology.identities.members[ordinal], identity);
+                assert_eq!(topology.structure.checked_types.expressions[ordinal], ty);
+            }
+            let stages = Scope::new();
+            let mut corrupt = module.clone();
+            let ModuleInitializationDetail::Occurrences(topology) =
+                &mut corrupt.initialization.detail
+            else {
+                unreachable!()
+            };
+            for (ordinal, _) in rows.iter().rev() {
+                assert!(topology.identities.members.remove(ordinal).is_some());
+            }
+            assert_eq!(
+                occurrence_obligations::validate_module(&corrupt),
+                Err(ReferenceAnalysisError::MissingContext {
+                    source_span: SourceSpan::new(region.source.clone(), rows[0].1),
+                    reason: ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                })
+            );
+            assert_eq!(stages.counts(), Counts::default());
+        }
+    }
+}
+
+#[test]
+fn initializer_namespace_members_retain_selected_declaration_and_symbol_on_both_layouts() {
+    let root_text = "%%start\nmath = namespace package \"math.w\";\ni32 result = math.value;\ni32(i32) callback = math.identity;\n%%end";
+    let target_text = "%%start\ni32 value = 1;\ni32(i32) identity = fn(input) { input };\n%%end";
+    let root = parsed(root_text);
+    let target = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "math.w".into(),
+        "r1".into(),
+    );
+    let dependency = parse_source(target.clone(), target_text.to_owned(), &[]);
+    assert!(
+        dependency.diagnostics.is_empty(),
+        "{:?}",
+        dependency.diagnostics
+    );
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let declarations = derive_scalar_declarations_from_cst(root.canonical_cst());
+        let namespace = declarations.namespaces().next().unwrap();
+        let binding = ScalarNamespaceBinding {
+            binding: namespace.binding.clone(),
+            span: namespace.span,
+            target: target.clone(),
+        };
+        let qualifier = namespace.binding_span;
+        let stages = Scope::new();
+        let project = crate::prepare_scalar_project(
+            vec![
+                (declarations, vec![binding]),
+                (
+                    derive_scalar_declarations_from_cst(dependency.result.canonical_cst()),
+                    Vec::new(),
+                ),
+            ],
+            vec![target.clone(), root.source.clone()],
+            crate::ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        assert_eq!(
+            stages.counts(),
+            Counts {
+                call_sites: 2,
+                ..Default::default()
+            }
+        );
+        drop(stages);
+        let ModuleInitializationDetail::Occurrences(topology) =
+            &project.initialization_region(0).unwrap().detail
+        else {
+            panic!("initializer topology")
+        };
+        let ordered = initializer_member_tokens(topology);
+        assert_eq!(ordered.len(), 2);
+        for (&(ordinal, _), name) in ordered.iter().zip(["value", "identity"]) {
+            let start = target_text.find(name).unwrap() as u32;
+            assert_eq!(
+                topology.identities.members[&ordinal],
+                InitializationMember::Module {
+                    qualifier,
+                    declaration: SourceSpan::new(
+                        target.clone(),
+                        ByteSpan::new(start, start + name.len() as u32)
+                    ),
+                    name: name.to_owned(),
+                }
+            );
+            assert!(matches!(
+                (
+                    &topology.structure.checked_types.expressions[&ordinal],
+                    name
+                ),
+                (ScalarType::I32, "value") | (ScalarType::Callable { .. }, "identity")
+            ));
+        }
+        let mut corrupt = project.calls.module(0).clone();
+        let ModuleInitializationDetail::Occurrences(topology) = &mut corrupt.initialization.detail
+        else {
+            unreachable!()
+        };
+        for (ordinal, _) in ordered.iter().rev() {
+            assert!(topology.identities.members.remove(ordinal).is_some());
+        }
+        let start = (root_text.find("math.value").unwrap() + "math.".len()) as u32;
+        let stages = Scope::new();
+        assert_eq!(
+            occurrence_obligations::validate_module(&corrupt),
+            Err(ReferenceAnalysisError::MissingContext {
+                source_span: SourceSpan::new(root.source.clone(), ByteSpan::new(start, start + 5)),
+                reason: ReferenceAnalysisErrorReason::MissingResolvedBinding,
+            })
+        );
+        assert_eq!(stages.counts(), Counts::default());
+    }
+}
 
 #[test]
 fn inventories_prepared_initializer_and_callable_occurrences() {

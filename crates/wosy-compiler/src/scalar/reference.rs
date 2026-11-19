@@ -5,10 +5,10 @@ use super::control::{
     BindingOutput, BindingOutputs, BindingReceiverSlot, BindingRegion, BlockItem, BlockItemKind,
     BlockPosition, BlockRegion, CheckedCallSignature, CheckedOccurrenceTypes,
     ConditionalOutputProjection, ConditionalRegion, FinalOutputSlot, FoldedOccurrence,
-    InitializationDestination, InitializationIdentities, InitializationLocal, InitializationName,
-    InitializationStorage, ModuleInitializationCallTarget, ModuleInitializationDetail,
-    ModuleInitializationRegion, ModuleInitializationStepKind, ModuleInitializationTopology,
-    ShortCircuitRegion, SyntheticOccurrence, WhileRegion,
+    InitializationDestination, InitializationIdentities, InitializationLocal, InitializationMember,
+    InitializationName, InitializationStorage, ModuleInitializationCallTarget,
+    ModuleInitializationDetail, ModuleInitializationRegion, ModuleInitializationStepKind,
+    ModuleInitializationTopology, ShortCircuitRegion, SyntheticOccurrence, WhileRegion,
 };
 use super::control::{
     AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentReplacement,
@@ -4749,6 +4749,13 @@ pub(super) struct OccurrenceMetadata {
     pub(super) requires_plain_name: bool,
     pub(super) requires_direct_destination: bool,
     pub(super) requires_named_place_root: bool,
+    pub(super) initializer_member: InitializerMemberRequirement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InitializerMemberRequirement {
+    NotRequired,
+    Token(ByteSpan),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4880,6 +4887,13 @@ impl FunctionCallSites {
 
 pub(super) struct ProjectCallSiteResults {
     modules: Vec<Result<ModuleCallSites, ReferenceAnalysisError>>,
+}
+
+#[cfg(test)]
+impl ProjectCallSiteResults {
+    pub(super) fn module(&self, ordinal: usize) -> &ModuleCallSites {
+        self.modules[ordinal].as_ref().unwrap()
+    }
 }
 
 impl ProjectCallSiteResults {
@@ -5167,6 +5181,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             requires_plain_name: false,
             requires_direct_destination: false,
             requires_named_place_root: false,
+            initializer_member: InitializerMemberRequirement::NotRequired,
         });
         let node = match role {
             OccurrenceRole::Expression => OccurrenceNode::Expression(ordinal),
@@ -5290,6 +5305,59 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             };
             if let Some(identity) = identity {
                 identities.insert(ordinal, identity);
+            }
+        }
+        if let (
+            ScalarExpression::Member {
+                receiver,
+                name,
+                name_span,
+                ..
+            },
+            WalkMode::ModuleInitialization {
+                source,
+                declarations,
+            },
+        ) = (expression, &self.mode)
+        {
+            self.occurrences[ordinal.0].initializer_member =
+                InitializerMemberRequirement::Token(*name_span);
+            let selection = self.occurrence_typing.take_member(expression);
+            let identity = match selection {
+                Some(
+                    CheckedMember::DirectField(ref field)
+                    | CheckedMember::RawPointerField(ref field),
+                ) => initializer_storage(receiver, names, source, declarations).map(|storage| {
+                    InitializationMember::Field {
+                        receiver: storage,
+                        receiver_name: receiver.clone(),
+                        field: field.clone(),
+                        through_raw_pointer: matches!(
+                            selection,
+                            Some(CheckedMember::RawPointerField(_))
+                        ),
+                    }
+                }),
+                Some(CheckedMember::Module(target)) => declarations
+                    .value_token(source, receiver)
+                    .and_then(|qualifier| {
+                        declarations.value_token(&target, name).map(|token| {
+                            InitializationMember::Module {
+                                qualifier,
+                                declaration: SourceSpan::new(target, token),
+                                name: name.clone(),
+                            }
+                        })
+                    }),
+                Some(CheckedMember::Enum { enumeration, tag }) => {
+                    Some(InitializationMember::Enum { enumeration, tag })
+                }
+                None => None,
+            };
+            if let Some(identity) = identity {
+                self.initialization_identities
+                    .members
+                    .insert(ordinal, identity);
             }
         }
         self.expression_children(expression, names, types, ordinal)?;

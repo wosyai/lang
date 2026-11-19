@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 use super::reference::{BlockOrdinal, OccurrenceMetadata, OccurrenceOrdinal, OccurrenceStructure};
 use super::{
-    ConcreteCallSelection, CoreOperationId, ScalarBinding, ScalarItem, ScalarNamespaceBinding,
-    ScalarOutputSequence, ScalarOverloadSelection, ScalarStructFieldId, ScalarType,
+    ConcreteCallSelection, CoreOperationId, ScalarBinding, ScalarEnumId, ScalarItem,
+    ScalarNamespaceBinding, ScalarOutputSequence, ScalarOverloadSelection, ScalarStructFieldId,
+    ScalarType,
 };
 use wosy_syntax::{ByteSpan, SourceIdentity, SourceSpan};
 
@@ -89,16 +90,36 @@ pub(super) struct InitializationIdentities {
     pub(super) names: HashMap<OccurrenceOrdinal, InitializationName>,
     pub(super) roots: HashMap<OccurrenceOrdinal, InitializationStorage>,
     pub(super) destinations: HashMap<OccurrenceOrdinal, InitializationDestination>,
+    pub(super) members: HashMap<OccurrenceOrdinal, InitializationMember>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum InitializationMember {
+    Field {
+        receiver: InitializationStorage,
+        receiver_name: String,
+        field: ScalarStructFieldId,
+        through_raw_pointer: bool,
+    },
+    Module {
+        qualifier: ByteSpan,
+        declaration: SourceSpan,
+        name: String,
+    },
+    Enum {
+        enumeration: ScalarEnumId,
+        tag: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct InitializationLocal {
-    pub(super) declaration_span: ByteSpan,
-    pub(super) block_span: ByteSpan,
+pub(crate) struct InitializationLocal {
+    pub(crate) declaration_span: ByteSpan,
+    pub(crate) block_span: ByteSpan,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum InitializationStorage {
+pub(crate) enum InitializationStorage {
     Lexical(InitializationLocal),
     Module(ByteSpan),
 }

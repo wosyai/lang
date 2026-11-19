@@ -1,3 +1,4 @@
+use super::inference::CheckedMember;
 use super::*;
 
 pub(super) struct ScalarProgramTyping<'a> {
@@ -3262,7 +3263,7 @@ fn check_expression_type_in_module(
             ..
         } => {
             if let Some((enum_id, _)) = enum_member_in_module(module, modules, receiver, name) {
-                if enum_tag.is_none() {
+                let Some(tag) = *enum_tag else {
                     diagnostics.push(module_diagnostic(
                         module,
                         "M0002",
@@ -3270,8 +3271,14 @@ fn check_expression_type_in_module(
                         *name_span,
                     ));
                     return ScalarType::Error;
-                }
-                inference.record_member(expression, None);
+                };
+                inference.record_member(
+                    expression,
+                    CheckedMember::Enum {
+                        enumeration: enum_id.clone(),
+                        tag,
+                    },
+                );
                 return ScalarType::Enum(enum_id);
             }
             if let Some(receiver_type) = scope.get(receiver) {
@@ -3295,7 +3302,11 @@ fn check_expression_type_in_module(
                     };
                     inference.record_member(
                         expression,
-                        matches!(receiver_type, ScalarType::Struct(_)).then_some(&field.id),
+                        if matches!(receiver_type, ScalarType::Struct(_)) {
+                            CheckedMember::DirectField(field.id.clone())
+                        } else {
+                            CheckedMember::RawPointerField(field.id.clone())
+                        },
                     );
                     return field.ty.clone();
                 }
@@ -3323,7 +3334,7 @@ fn check_expression_type_in_module(
                 ));
                 return ScalarType::Error;
             };
-            inference.record_member(expression, None);
+            inference.record_member(expression, CheckedMember::Module(target.source.clone()));
             member.clone()
         }
         ScalarExpression::Integer { value, span } => {
@@ -7770,8 +7781,14 @@ fn check_expression_type(
             .find(|enumeration| enumeration.name == *receiver)
         {
             Some(enumeration) => {
-                if enum_tag.is_some() {
-                    inference.record_member(expression, None);
+                if let Some(tag) = *enum_tag {
+                    inference.record_member(
+                        expression,
+                        CheckedMember::Enum {
+                            enumeration: enumeration.id.clone(),
+                            tag,
+                        },
+                    );
                     ScalarType::Enum(enumeration.id.clone())
                 } else {
                     diagnostics.push(diagnostic(
@@ -7792,7 +7809,11 @@ fn check_expression_type(
                 };
                 inference.record_member(
                     expression,
-                    matches!(receiver_type, Some(ScalarType::Struct(_))).then_some(&field.id),
+                    if matches!(receiver_type, Some(ScalarType::Struct(_))) {
+                        CheckedMember::DirectField(field.id.clone())
+                    } else {
+                        CheckedMember::RawPointerField(field.id.clone())
+                    },
                 );
                 field.ty.clone()
             }

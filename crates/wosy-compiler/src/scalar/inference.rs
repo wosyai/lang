@@ -90,7 +90,9 @@ struct CheckedExpressionType {
 
 pub(super) enum CheckedMember {
     DirectField(ScalarStructFieldId),
-    Other,
+    RawPointerField(ScalarStructFieldId),
+    Enum { enumeration: ScalarEnumId, tag: u32 },
+    Module(SourceIdentity),
 }
 
 impl PreparationOccurrenceTyping {
@@ -263,16 +265,8 @@ impl<'a> ScalarInferenceBuilder<'a> {
         }
     }
 
-    pub(super) fn record_member(
-        &mut self,
-        expression: &ScalarExpression,
-        direct_field: Option<&ScalarStructFieldId>,
-    ) {
+    pub(super) fn record_member(&mut self, expression: &ScalarExpression, member: CheckedMember) {
         if !self.suppress_checked_occurrences {
-            let member = match direct_field {
-                Some(field) => CheckedMember::DirectField(field.clone()),
-                None => CheckedMember::Other,
-            };
             self.occurrences
                 .members
                 .insert(std::ptr::from_ref(expression), member);

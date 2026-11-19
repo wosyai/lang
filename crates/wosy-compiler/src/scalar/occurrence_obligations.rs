@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use super::control::{CheckedCallSignature, InitializationIdentities, ModuleInitializationDetail};
 use super::reference::{
-    CallOccurrence, FunctionCallSites, ModuleCallSites, OccurrenceMetadata, OccurrenceOrdinal,
-    OccurrenceRole, OccurrenceStructure,
+    CallOccurrence, FunctionCallSites, InitializerMemberRequirement, ModuleCallSites,
+    OccurrenceMetadata, OccurrenceOrdinal, OccurrenceRole, OccurrenceStructure,
 };
 use super::{ReferenceAnalysisError, ReferenceAnalysisErrorReason as Reason};
 use wosy_syntax::{SourceIdentity, SourceSpan};
@@ -91,6 +91,15 @@ fn validate_region(
         let is_call = site_calls.next_if_eq(&ordinal).is_some()
             | executable_calls.next_if_eq(&ordinal).is_some();
         let has_signature = is_call && signatures.contains_key(&ordinal);
+        if let InitializerMemberRequirement::Token(span) = metadata.initializer_member {
+            if matches!(&identities, IdentityRows::Initializer(rows) if !rows.members.contains_key(&ordinal))
+            {
+                return Err(ReferenceAnalysisError::MissingContext {
+                    source_span: SourceSpan::new(source.clone(), span),
+                    reason: Reason::MissingResolvedBinding,
+                });
+            }
+        }
         let reason = match metadata.role {
             OccurrenceRole::Expression
                 if metadata.requires_plain_name && !identities.has_name(ordinal) =>
