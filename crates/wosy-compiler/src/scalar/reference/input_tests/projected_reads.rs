@@ -332,7 +332,7 @@ fn static_indexed_root_obligation_rejects_missing_identity_at_the_root_token() {
         let index = row
             .occurrences
             .iter()
-            .position(|metadata| metadata.requires_projected_read_root && metadata.span == span)
+            .position(|metadata| metadata.requires_named_place_root && metadata.span == span)
             .expect("indexed root obligation");
         let NamedPlaceRootFacts::Prepared(roots) = &mut row.named_place_roots else {
             unreachable!()

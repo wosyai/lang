@@ -89,9 +89,9 @@ fn validate_region(
                 Reason::MissingResolvedBinding
             }
             OccurrenceRole::Place
-                if metadata.requires_projected_read_root
-                    && callable
-                        .is_some_and(|row| !row.has_prepared_projected_read_root(ordinal)) =>
+                if metadata.requires_named_place_root
+                    && !structure.resolved_namespace_places.contains_key(&ordinal)
+                    && callable.is_some_and(|row| !row.has_prepared_named_place_root(ordinal)) =>
             {
                 Reason::MissingResolvedBinding
             }

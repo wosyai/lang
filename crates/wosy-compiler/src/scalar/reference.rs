@@ -241,6 +241,11 @@ struct ReferencePlaceRoot<'a> {
     ordinal: OccurrenceOrdinal,
 }
 
+enum PreparedPlaceRoot<'a> {
+    Lexical(&'a ReferenceBindingId),
+    NonLexical,
+}
+
 impl<'a> ReferenceFlowBuilder<'a> {
     pub(super) fn new(
         source: &SourceIdentity,
@@ -474,10 +479,42 @@ impl<'a> ReferenceFlowBuilder<'a> {
         self.names
             .get(name)
             .cloned()
-            .ok_or_else(|| ReferenceAnalysisError::MissingBinding {
-                source_span: SourceSpan::new(self.source.clone(), span),
-                name: name.to_owned(),
-            })
+            .ok_or_else(|| self.missing_binding(name, span))
+    }
+
+    fn missing_binding(&self, name: &str, span: ByteSpan) -> ReferenceAnalysisError {
+        ReferenceAnalysisError::MissingBinding {
+            source_span: SourceSpan::new(self.source.clone(), span),
+            name: name.to_owned(),
+        }
+    }
+
+    fn named_expression_binding(
+        &self,
+        name: &str,
+        span: ByteSpan,
+        ordinal: OccurrenceOrdinal,
+    ) -> Result<ReferenceBindingId, ReferenceAnalysisError> {
+        match self.prepared_name_identity(ordinal, span)? {
+            Some(PlainNameIdentity::Lexical(binding)) => Ok(binding.clone()),
+            Some(PlainNameIdentity::ModuleValue(_) | PlainNameIdentity::Null) => {
+                Err(self.missing_binding(name, span))
+            }
+            None => self.binding(name, span),
+        }
+    }
+
+    fn named_place_binding(
+        &self,
+        name: &str,
+        span: ByteSpan,
+        ordinal: OccurrenceOrdinal,
+    ) -> Result<ReferenceBindingId, ReferenceAnalysisError> {
+        match self.prepared_place_root(ordinal, span)? {
+            Some(PreparedPlaceRoot::Lexical(binding)) => Ok(binding.clone()),
+            Some(PreparedPlaceRoot::NonLexical) => Err(self.missing_binding(name, span)),
+            None => self.binding(name, span),
+        }
     }
 
     fn prepared_name_identity(
@@ -1259,16 +1296,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let root = self.place_root(place, place_ordinal);
                 let parents = match root.place {
                     ScalarPlace::Dereference { pointer, .. } => {
-                        let ReferenceValue::Checked(origins) = self.expression_child(
-                            pointer,
-                            scope,
+                        let pointer_ordinal = self.expression_ordinal(
                             OccurrenceParent::Place(root.ordinal),
                             OccurrenceEdge::DereferencePointer,
-                        )?
+                        );
+                        let ReferenceValue::Checked(origins) =
+                            self.expression(pointer, scope, pointer_ordinal)?
                         else {
                             let binding = match pointer.as_ref() {
                                 ScalarExpression::Name { name, span } => {
-                                    self.binding(name, *span)?
+                                    self.named_expression_binding(name, *span, pointer_ordinal)?
                                 }
                                 _ => return Err(self.missing_context(
                                     span,
@@ -1320,7 +1357,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 },
                                 _,
                             ) => {
-                                let binding = self.binding(name, *name_span)?;
+                                let binding =
+                                    self.named_place_binding(name, *name_span, root.ordinal)?;
                                 (
                                     binding.clone(),
                                     binding.declaration_span,
@@ -1435,7 +1473,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 if let Some(binding) = root_binding {
                     self.read_checked_place_root(binding, *span, scope);
                 } else {
-                    self.place_name(name, *span, scope)?;
+                    match self.prepared_place_root(ordinal, *span)? {
+                        Some(PreparedPlaceRoot::Lexical(binding)) => {
+                            self.read_checked_place_root(binding, *span, scope);
+                        }
+                        Some(PreparedPlaceRoot::NonLexical) => {}
+                        None => self.place_name(name, *span, scope)?,
+                    }
                 }
             }
             ScalarPlace::Dereference { pointer, .. } => {
@@ -1564,11 +1608,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let mut root_binding = None;
         let module_root = if prepared {
             match self.prepared_read_root(canonical_root.as_ref().unwrap())? {
-                Some(NamedPlaceRootIdentity::Lexical(binding)) => {
+                Some(PreparedPlaceRoot::Lexical(binding)) => {
                     root_binding = Some(binding);
                     false
                 }
-                Some(NamedPlaceRootIdentity::ModuleValue(_)) => true,
+                Some(PreparedPlaceRoot::NonLexical) => true,
                 None => false,
             }
         } else {
@@ -1670,16 +1714,38 @@ impl<'a> ReferenceFlowBuilder<'a> {
     fn prepared_read_root(
         &self,
         root: &ReferencePlaceRoot<'_>,
-    ) -> Result<Option<&'a NamedPlaceRootIdentity>, ReferenceAnalysisError> {
+    ) -> Result<Option<PreparedPlaceRoot<'a>>, ReferenceAnalysisError> {
         let ScalarPlace::Name { span, .. } = root.place else {
             return Ok(None);
         };
+        self.prepared_place_root(root.ordinal, *span)
+    }
+
+    fn prepared_place_root(
+        &self,
+        ordinal: OccurrenceOrdinal,
+        span: ByteSpan,
+    ) -> Result<Option<PreparedPlaceRoot<'a>>, ReferenceAnalysisError> {
         let NamedPlaceRootFacts::Prepared(roots) = &self.call_sites.named_place_roots else {
-            unreachable!("prepared projected read");
+            return Ok(None);
         };
-        roots.get(&root.ordinal).map(Some).ok_or_else(|| {
-            self.missing_context(*span, ReferenceAnalysisErrorReason::MissingResolvedBinding)
-        })
+        let identity = match roots.get(&ordinal) {
+            Some(NamedPlaceRootIdentity::Lexical(binding)) => PreparedPlaceRoot::Lexical(binding),
+            Some(NamedPlaceRootIdentity::ModuleValue(_)) => PreparedPlaceRoot::NonLexical,
+            None if self
+                .call_sites
+                .structure
+                .resolved_namespace_places
+                .contains_key(&ordinal) =>
+            {
+                PreparedPlaceRoot::NonLexical
+            }
+            None => {
+                return Err(self
+                    .missing_context(span, ReferenceAnalysisErrorReason::MissingResolvedBinding))
+            }
+        };
+        Ok(Some(identity))
     }
 
     fn prepared_read_place_type(
@@ -1942,7 +2008,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let root = self.place_root(place, ordinal);
                     if matches!(
                         self.prepared_read_root(&root)?,
-                        Some(NamedPlaceRootIdentity::ModuleValue(_))
+                        Some(PreparedPlaceRoot::NonLexical)
                     ) {
                         return Ok(());
                     }
@@ -4637,7 +4703,7 @@ pub(super) struct OccurrenceMetadata {
     pub(super) span: ByteSpan,
     pub(super) requires_plain_name: bool,
     pub(super) requires_direct_destination: bool,
-    pub(super) requires_projected_read_root: bool,
+    pub(super) requires_named_place_root: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4762,7 +4828,7 @@ impl FunctionCallSites {
         matches!(&self.direct_destinations, DirectDestinationFacts::Prepared(rows) if rows.contains_key(&ordinal))
     }
 
-    pub(super) fn has_prepared_projected_read_root(&self, ordinal: OccurrenceOrdinal) -> bool {
+    pub(super) fn has_prepared_named_place_root(&self, ordinal: OccurrenceOrdinal) -> bool {
         matches!(&self.named_place_roots, NamedPlaceRootFacts::Prepared(rows) if rows.contains_key(&ordinal))
     }
 }
@@ -5031,7 +5097,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             span,
             requires_plain_name: false,
             requires_direct_destination: false,
-            requires_projected_read_root: false,
+            requires_named_place_root: false,
         });
         let node = match role {
             OccurrenceRole::Expression => OccurrenceNode::Expression(ordinal),
@@ -5509,14 +5575,7 @@ impl StructuralWalker<'_, '_> {
             | ScalarExpression::CheckedAddress { place, .. }
             | ScalarExpression::Dereference { place, .. }
             | ScalarExpression::IndexedRead { place, .. } => {
-                self.place_at(
-                    place,
-                    names,
-                    types,
-                    parent,
-                    OccurrenceEdge::ExpressionPlace,
-                    matches!(expression, ScalarExpression::IndexedRead { .. }),
-                )?;
+                self.place_at(place, names, types, parent, OccurrenceEdge::ExpressionPlace)?;
             }
             ScalarExpression::StructLiteral { fields, .. } => {
                 for (position, field) in fields.iter().enumerate() {
@@ -5552,7 +5611,6 @@ impl StructuralWalker<'_, '_> {
         types: &BTreeMap<String, ScalarType>,
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
-        projected_read: bool,
     ) -> Result<OccurrenceOrdinal, ReferenceAnalysisError> {
         let ordinal = self.record_occurrence(
             OccurrenceRole::Place,
@@ -5574,13 +5632,15 @@ impl StructuralWalker<'_, '_> {
         match place {
             ScalarPlace::Name { name, .. } => {
                 if let NamedPlaceRootFacts::Prepared(roots) = &mut self.named_place_roots {
-                    self.occurrences[ordinal.0].requires_projected_read_root = projected_read;
-                    if !matches!(edge, OccurrenceEdge::AssignmentDestination { .. })
-                        && !self
+                    if !matches!(edge, OccurrenceEdge::AssignmentDestination { .. }) {
+                        self.occurrences[ordinal.0].requires_named_place_root = true;
+                        if self
                             .structure
                             .resolved_namespace_places
                             .contains_key(&ordinal)
-                    {
+                        {
+                            return Ok(ordinal);
+                        }
                         let resolver = match &self.mode {
                             WalkMode::Callable(callable) => callable.target_resolver,
                             WalkMode::CallableAllocationLength(resolver) => *resolver,
@@ -5609,24 +5669,10 @@ impl StructuralWalker<'_, '_> {
                 }
             }
             ScalarPlace::Field { base, .. } => {
-                self.place_at(
-                    base,
-                    names,
-                    types,
-                    parent,
-                    OccurrenceEdge::PlaceBase,
-                    projected_read,
-                )?;
+                self.place_at(base, names, types, parent, OccurrenceEdge::PlaceBase)?;
             }
             ScalarPlace::Index { base, index, .. } => {
-                self.place_at(
-                    base,
-                    names,
-                    types,
-                    parent,
-                    OccurrenceEdge::PlaceBase,
-                    projected_read,
-                )?;
+                self.place_at(base, names, types, parent, OccurrenceEdge::PlaceBase)?;
                 self.expression(index, names, types, parent, OccurrenceEdge::PlaceIndex)?;
             }
             ScalarPlace::Dereference { pointer, .. } => self.expression(
@@ -5945,7 +5991,6 @@ impl StructuralWalker<'_, '_> {
                             item: item_index,
                             destination,
                         },
-                        false,
                     )?;
                     let replacement = match &self.mode {
                         WalkMode::StructuralOnly | WalkMode::CallableAllocationLength(_) => {
