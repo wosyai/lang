@@ -4324,6 +4324,28 @@ pub(super) struct ProjectCallSiteResults {
 
 impl ProjectCallSiteResults {
     #[cfg(test)]
+    pub(super) fn remove_body_allocation_length_target(
+        &mut self,
+        module: usize,
+        item: usize,
+        arm: usize,
+    ) -> (ByteSpan, usize) {
+        let calls = &mut self.modules[module]
+            .as_mut()
+            .unwrap()
+            .functions
+            .get_mut(&item)
+            .unwrap()
+            .arms[arm];
+        let ordinal = calls.allocation_length_calls[0];
+        calls
+            .allocation_length_call_targets
+            .remove(&ordinal)
+            .unwrap();
+        (calls.occurrences[ordinal.0].span, ordinal.0)
+    }
+
+    #[cfg(test)]
     pub(super) fn function(&self, module: usize, item: usize) -> &FunctionCallSites {
         self.function_body(module, item, None).unwrap()
     }

@@ -70,10 +70,6 @@ impl PreparedScalarProject {
         self.calls.initialization_region(module_ordinal)
     }
 
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "consumed by the next LLVM slice")
-    )]
     pub(crate) fn bind_callable_body_call_nodes<'a>(
         &'a self,
         module_ordinal: usize,
@@ -94,6 +90,17 @@ impl PreparedScalarProject {
                 )
             })?;
         control::CallableBodyCallNodes::bind(&module.source, body, calls)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_body_allocation_length_target(
+        &mut self,
+        module: usize,
+        item: usize,
+        arm: usize,
+    ) -> (wosy_syntax::ByteSpan, usize) {
+        self.calls
+            .remove_body_allocation_length_target(module, item, arm)
     }
 
     fn analyze(&self) -> reference::ProjectReferenceResults {

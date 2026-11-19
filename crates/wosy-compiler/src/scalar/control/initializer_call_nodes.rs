@@ -140,10 +140,6 @@ impl<'a> CallableBodyCallNodes<'a> {
         Ok(nodes)
     }
 
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "consumed by the next LLVM slice")
-    )]
     pub(crate) fn target(
         &self,
         expression: &ScalarExpression,

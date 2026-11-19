@@ -127,13 +127,13 @@ pub(super) fn emit_expression<'ctx, 'module>(
             overload_selection,
             ..
         } => {
-            let selected = state.initializer_target(expression)?;
-            let (receiver, name) = match selected {
-                Some(ModuleInitializationCallTarget::Core(operation)) => {
+            let selected = state.prepared_call(expression)?;
+            let (receiver, name) = match &selected {
+                Some(PreparedCall::Core(operation)) => {
                     (Some("core"), initializer_core_name(*operation))
                 }
                 Some(target) => {
-                    return emit_selected_initializer_call(
+                    return emit_prepared_call(
                         context,
                         state,
                         target,
@@ -145,7 +145,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                 }
                 None => (receiver.as_deref(), name.as_str()),
             };
-            if state.invalidations.contains_key(&(span.start, span.end)) {
+            if uses_invalidation_event(state, &selected, *span)? {
                 return emit_core_invalidation(context, state, *span, arguments, None);
             }
             if receiver == Some("core") && name == "alloc" {
@@ -329,13 +329,13 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             overload_selection,
             ..
         } => {
-            let selected = state.initializer_target(expression)?;
-            let (receiver, name) = match selected {
-                Some(ModuleInitializationCallTarget::Core(operation)) => {
+            let selected = state.prepared_call(expression)?;
+            let (receiver, name) = match &selected {
+                Some(PreparedCall::Core(operation)) => {
                     (Some("core"), initializer_core_name(*operation))
                 }
                 Some(target) => {
-                    return emit_selected_initializer_call(
+                    return emit_prepared_call(
                         context,
                         state,
                         target,
@@ -347,7 +347,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                 }
                 None => (receiver.as_deref(), name.as_str()),
             };
-            if state.invalidations.contains_key(&(span.start, span.end)) {
+            if uses_invalidation_event(state, &selected, *span)? {
                 return emit_core_invalidation(
                     context,
                     state,
@@ -651,18 +651,18 @@ fn initializer_core_name(operation: CoreOperationId) -> &'static str {
     }
 }
 
-fn emit_selected_initializer_call<'ctx, 'module>(
+fn emit_prepared_call<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
-    selected: &ModuleInitializationCallTarget,
+    selected: &PreparedCall,
     receiver: Option<&str>,
     name: &str,
     arguments: &[ScalarExpression],
     project: Option<ProjectCallScope<'_>>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let Some(target) = state.initializer_symbol(selected)? else {
-        return Err(match (project, receiver, selected) {
-            (Some(project), Some(receiver), _) => {
+    let Some(target) = selected.symbol() else {
+        return Err(match (project, receiver) {
+            (Some(project), Some(receiver)) => {
                 match project
                     .module
                     .namespace_bindings
@@ -676,18 +676,16 @@ fn emit_selected_initializer_call<'ctx, 'module>(
                     None => format!("unknown LLVM extern binding {receiver}"),
                 }
             }
-            (Some(project), None, _) => format!(
+            (Some(project), None) => format!(
                 "unknown LLVM callable {}",
                 project_function_name(&project.module.source, name)
             ),
-            (None, Some(receiver), _) => format!("unknown LLVM callable {receiver}.{name}"),
-            (None, None, _) => format!("unknown LLVM callable {name}"),
+            (None, Some(receiver)) => format!("unknown LLVM callable {receiver}.{name}"),
+            (None, None) => format!("unknown LLVM callable {name}"),
         });
     };
-    let Some(ScalarType::Callable { parameters, .. }) = state.signatures.get(&target) else {
-        return Err(format!(
-            "internal error: missing LLVM initializer callable signature {target}"
-        ));
+    let Some(ScalarType::Callable { parameters, .. }) = state.signatures.get(target) else {
+        return Err(state.missing_prepared_signature(target));
     };
     let values = arguments
         .iter()
@@ -699,7 +697,7 @@ fn emit_selected_initializer_call<'ctx, 'module>(
             None => emit_typed_expression(context, state, argument, parameter),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    emit_call_values(context, state, &target, values)
+    emit_call_values(context, state, target, values)
 }
 
 fn emit_call<'ctx, 'module>(
@@ -793,6 +791,22 @@ fn core_effect_owners<'ctx, 'module>(
         }
     }
     Ok(owners.into_values().collect())
+}
+
+fn uses_invalidation_event(
+    state: &EmitState<'_, '_>,
+    selected: &Option<PreparedCall>,
+    span: wosy_syntax::ByteSpan,
+) -> Result<bool, String> {
+    let Some((operation, _, _)) = state.invalidations.get(&(span.start, span.end)) else {
+        return Ok(false);
+    };
+    if let Some(PreparedCall::Core(selected)) = selected {
+        if selected != operation {
+            return Err("core invalidation differs from the prepared call target".into());
+        }
+    }
+    Ok(true)
 }
 
 fn emit_core_invalidation<'ctx, 'module>(
@@ -979,21 +993,21 @@ fn emit_core_invalidation<'ctx, 'module>(
     }
     let raw = take_basic(match project {
         Some(scope) => {
-            emit_project_expression(context, state, &raw_address, scope.module, scope.modules)?
+            emit_project_expression(context, state, &arguments[1], scope.module, scope.modules)?
         }
-        None => emit_expression(context, state, &raw_address)?,
+        None => emit_expression(context, state, &arguments[1])?,
     })?
     .into_int_value();
     let length = take_basic(match project {
         Some(scope) => emit_project_typed_expression(
             context,
             state,
-            &length,
+            &arguments[2],
             &ScalarType::U64,
             scope.module,
             scope.modules,
         )?,
-        None => emit_typed_expression(context, state, &length, &ScalarType::U64)?,
+        None => emit_typed_expression(context, state, &arguments[2], &ScalarType::U64)?,
     })?
     .into_int_value();
     let pointer = state
@@ -1300,8 +1314,8 @@ fn bitcast_source_type(
         ScalarExpression::Binary { left, .. } => {
             bitcast_source_type(state, left, project_module).ok()
         }
-        ScalarExpression::Call { .. } if state.initializer_nodes.is_some() => {
-            state.initializer_call_output(expression)?
+        ScalarExpression::Call { .. } if state.has_prepared_calls() => {
+            state.prepared_call_output(expression)?
         }
         ScalarExpression::Call {
             receiver,
@@ -1893,8 +1907,8 @@ fn integer_conversion_source_type(
         ScalarExpression::Binary { left, .. } => {
             integer_conversion_source_type(state, left, project_module).ok()
         }
-        ScalarExpression::Call { .. } if state.initializer_nodes.is_some() => {
-            state.initializer_call_output(expression)?
+        ScalarExpression::Call { .. } if state.has_prepared_calls() => {
+            state.prepared_call_output(expression)?
         }
         ScalarExpression::Call {
             receiver,
@@ -1990,8 +2004,8 @@ fn float_conversion_source_type(
         ScalarExpression::Binary { left, .. } => {
             float_conversion_source_type(state, left, project_module).ok()
         }
-        ScalarExpression::Call { .. } if state.initializer_nodes.is_some() => {
-            state.initializer_call_output(expression)?
+        ScalarExpression::Call { .. } if state.has_prepared_calls() => {
+            state.prepared_call_output(expression)?
         }
         ScalarExpression::Call {
             receiver,

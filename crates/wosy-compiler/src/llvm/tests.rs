@@ -48,7 +48,7 @@ fn emit_initializer_test_input(
     region: &crate::scalar::control::ModuleInitializationRegion,
 ) -> [Result<LlvmPartition, String>; 2] {
     let module = &project.modules[0];
-    let input = super::GenericInitializerInput::PreparedRows;
+    let input = super::GenericInitializerInput::PreparedRows(build.prepared());
     [
         super::emit_single_module_llvm(
             &module.source,
@@ -67,6 +67,130 @@ fn emit_initializer_test_input(
             &|module, item, arm, _| build.reference_cfg(module, item, arm),
         ),
     ]
+}
+
+const BODY_AUTHORITY_SOURCE: &str = "%%start
+disk = extern wasm \"disk_abi\" { i32(i32) read; };
+u64(u64) length = fn(n) { n };
+i32(i32) echo = fn(n) { n };
+generic T;
+T(T) identity = fn(n) { echo(77); n };
+pick = overload { i32(i32) => fn(n) { disk.read(n) }; };
+choose = overload { generic T; T(T) => fn(n) { echo(88); n }; };
+i64(i32) main_body = fn(n) { i32 value = echo(identity<i32>(n)); value = echo(value); core.int_extend<i64>(pick(value)) };
+bool(bool) demand_generic_arm = fn(n) { choose(n) };
+(i32, i32)(i32) multi = fn(n) { i32 first, i32 second = echo(n) + 1, echo(99); echo(first), echo(second) };
+arrays = overload { u64(u64) => fn(n) { u8[length(n)] bytes; bytes; length(n) }; };
+i32 generic_seed = identity<i32>(1);
+%%end";
+
+#[test]
+fn prepared_body_dispatch_uses_rows_when_call_spelling_differs() {
+    use crate::ScalarExpression;
+
+    fn corrupt_call(expression: &mut ScalarExpression) {
+        if let ScalarExpression::Binary { left, .. } = expression {
+            corrupt_call(left);
+            return;
+        }
+        let ScalarExpression::Call {
+            receiver,
+            name,
+            arguments,
+            overload_selection,
+            ..
+        } = expression
+        else {
+            panic!("canonical call");
+        };
+        *receiver = Some("not_a_namespace".into());
+        *name = "not_a_callable".into();
+        *overload_selection = None;
+        for argument in arguments {
+            if matches!(argument, ScalarExpression::Call { .. }) {
+                corrupt_call(argument);
+            }
+        }
+    }
+
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(BODY_AUTHORITY_SOURCE, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let baseline = [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ];
+        let mut project = prepared.project().clone();
+        for item in &mut project.modules[0].items {
+            let ScalarItem::Function(function) = item else {
+                continue;
+            };
+            for body in std::iter::once(&mut function.body)
+                .chain(function.overload_arms.iter_mut().map(|arm| &mut arm.body))
+            {
+                for item in &mut body.items {
+                    match item {
+                        crate::ScalarBlockItem::Expression(
+                            expression @ ScalarExpression::Call { .. },
+                        ) => corrupt_call(expression),
+                        crate::ScalarBlockItem::LocalBinding(binding) if binding.is_allocation => {
+                            corrupt_call(binding.receivers[0].allocation_length.as_mut().unwrap());
+                        }
+                        crate::ScalarBlockItem::LocalBinding(binding) => {
+                            corrupt_call(&mut binding.value);
+                            for output in binding.output_values.iter_mut().skip(1) {
+                                corrupt_call(&mut output.value);
+                            }
+                        }
+                        crate::ScalarBlockItem::Assignment(assignment) => {
+                            corrupt_call(&mut assignment.values[0]);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let region = prepared.initialization_region(0).unwrap();
+        let changed = emit_initializer_test_input(&build, &project, region);
+        for (expected, actual) in baseline.into_iter().zip(changed) {
+            let expected = expected.unwrap().to_text();
+            let actual = actual.unwrap().to_text();
+            assert_eq!(expected, actual, "{layout:?}");
+            assert!(actual.contains("sext i32"), "{actual}");
+            assert!(actual.contains("(i32 77)"), "{actual}");
+            assert!(actual.contains("(i32 88)"), "{actual}");
+            assert!(actual.contains("(i32 99)"), "{actual}");
+            assert!(actual.contains("call ptr @__wosy_core_alloc"), "{actual}");
+        }
+    }
+}
+
+#[test]
+fn prepared_body_dispatch_rejects_missing_allocation_length_target() {
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let mut prepared = prepare_initializer_test(BODY_AUTHORITY_SOURCE, layout);
+        let item = prepared.project().modules[0]
+            .items
+            .iter()
+            .position(
+                |item| matches!(item, ScalarItem::Function(function) if function.name == "arrays"),
+            )
+            .unwrap();
+        let (span, ordinal) = prepared.remove_body_allocation_length_target(0, item, 0);
+        let source = &prepared.project().modules[0].source;
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for result in [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ] {
+            assert_eq!(result.unwrap_err(), format!(
+                "internal error: missing callable body call target in {source:?} at {}..{} (occurrence {ordinal})",
+                span.start, span.end,
+            ));
+        }
+    }
 }
 
 #[test]
@@ -249,7 +373,7 @@ i32 nested = unsafe { echo(33) };
         }
 
         let region = prepared.initialization_region(0).unwrap();
-        let input = super::GenericInitializerInput::PreparedRows;
+        let input = super::GenericInitializerInput::PreparedRows(build.prepared());
         let emitted = [
             super::emit_single_module_llvm(
                 &source,
@@ -5223,7 +5347,7 @@ fn detached_project_llvm_initializes_interleaved_namespace_diamond_once() {
                     prepared.initialization_region(module)
                 }
             },
-            super::GenericInitializerInput::PreparedRows,
+            super::GenericInitializerInput::PreparedRows(&prepared),
             &|module, item, arm, _| build.reference_cfg(module, item, arm),
         )
         .unwrap_err();
