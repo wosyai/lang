@@ -2878,7 +2878,7 @@ pub fn prepare_scalar_project(
     declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
-) -> Result<PreparedScalarProject, ScalarProjectValidation> {
+) -> Result<PreparedScalarProject, ScalarProjectPreparationRejection> {
     let mut modules = Vec::with_capacity(declarations.len());
     let mut diagnostics = Vec::new();
     for (declarations, namespace_bindings) in declarations {
@@ -2899,10 +2899,12 @@ pub fn prepare_scalar_project(
     }
     let project = ScalarProject::new(modules, initialization_order);
     if !diagnostics.is_empty() {
-        return Err(ScalarProjectValidation {
-            project,
-            diagnostics,
-        });
+        return Err(ScalarProjectPreparationRejection::extraction_or_typing(
+            ScalarProjectValidation {
+                project,
+                diagnostics,
+            },
+        ));
     }
     PreparedScalarProject::new(project)
 }
@@ -2910,7 +2912,7 @@ pub fn prepare_scalar_project(
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
     match PreparedScalarProject::new(project) {
         Ok(prepared) => prepared.finish(),
-        Err(validation) => validation,
+        Err(rejected) => rejected.finish(),
     }
 }
 
@@ -3528,7 +3530,10 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
 pub(crate) mod control;
 mod reference;
 mod static_calls;
-pub use static_calls::{analyze_scalar_build, PreparedScalarProject, ScalarBuildValidation};
+pub use static_calls::{
+    analyze_scalar_build, PreparedScalarProject, ScalarBuildValidation,
+    ScalarProjectPreparationRejection,
+};
 fn derive_type(node: &CstNode) -> ScalarType {
     let actual = if matches!(node.kind(), SyntaxKind::TypeSpec | SyntaxKind::Punctuation) {
         node.descendants()

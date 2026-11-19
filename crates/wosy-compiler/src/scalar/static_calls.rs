@@ -45,17 +45,99 @@ pub struct PreparedScalarProject {
     calls: reference::ProjectCallSiteResults,
 }
 
+/// Rejected preparation with read-only `project` and `diagnostics` inspection.
+pub struct ScalarProjectPreparationRejection {
+    inspection: ScalarProjectValidation,
+    kind: ProjectPreparationRejectionKind,
+}
+
+enum ProjectPreparationRejectionKind {
+    ExtractionOrTyping,
+    StaticLookup(reference::ProjectCallSiteResults),
+}
+
+impl std::ops::Deref for ScalarProjectPreparationRejection {
+    type Target = ScalarProjectValidation;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inspection
+    }
+}
+
+impl std::fmt::Debug for ScalarProjectPreparationRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScalarProjectPreparationRejection")
+            .field("project", &self.project)
+            .field("diagnostics", &self.diagnostics)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ScalarProjectPreparationRejection {
+    pub(super) fn extraction_or_typing(inspection: ScalarProjectValidation) -> Self {
+        Self {
+            inspection,
+            kind: ProjectPreparationRejectionKind::ExtractionOrTyping,
+        }
+    }
+
+    /// Take ownership of the rejected project and preparation diagnostics.
+    pub fn into_inspection(self) -> ScalarProjectValidation {
+        self.inspection
+    }
+
+    /// Return build-facing diagnostics in module order. A static lookup rejection runs the
+    /// existing origin query for modules with retained static rows and discards its results
+    /// after collecting diagnostics.
+    pub fn into_ordered_diagnostics(self) -> Vec<Diagnostic> {
+        match self.kind {
+            ProjectPreparationRejectionKind::ExtractionOrTyping => self.inspection.diagnostics,
+            ProjectPreparationRejectionKind::StaticLookup(calls) => {
+                reference::analyze_project_references(&self.inspection.project.modules, &calls)
+                    .errors()
+                    .iter()
+                    .map(ReferenceAnalysisError::diagnostic)
+                    .collect()
+            }
+        }
+    }
+
+    pub(super) fn finish(self) -> ScalarProjectValidation {
+        match self.kind {
+            ProjectPreparationRejectionKind::ExtractionOrTyping => self.inspection,
+            ProjectPreparationRejectionKind::StaticLookup(calls) => {
+                finish_project_validation(self.inspection.project, &calls)
+            }
+        }
+    }
+}
+
 impl PreparedScalarProject {
-    pub(super) fn new(project: ScalarProject) -> Result<Self, ScalarProjectValidation> {
+    pub(super) fn new(project: ScalarProject) -> Result<Self, ScalarProjectPreparationRejection> {
         let (validation, occurrence_typing) = typecheck_scalar_project_with_occurrences(project);
         if !validation.diagnostics.is_empty() {
-            return Err(validation);
+            return Err(ScalarProjectPreparationRejection::extraction_or_typing(
+                validation,
+            ));
         }
         let project = validation.project;
         let calls = reference::resolve_project_call_sites_with_occurrences(
             &project.modules,
             occurrence_typing,
         );
+        let diagnostics = calls
+            .lookup_errors()
+            .map(ReferenceAnalysisError::diagnostic)
+            .collect::<Vec<_>>();
+        if !diagnostics.is_empty() {
+            return Err(ScalarProjectPreparationRejection {
+                inspection: ScalarProjectValidation {
+                    project,
+                    diagnostics,
+                },
+                kind: ProjectPreparationRejectionKind::StaticLookup(calls),
+            });
+        }
         Ok(Self { project, calls })
     }
 
@@ -107,13 +189,23 @@ impl PreparedScalarProject {
         reference::analyze_project_references(&self.project.modules, &self.calls)
     }
 
-    pub(super) fn finish(mut self) -> ScalarProjectValidation {
-        let results = self.analyze();
-        let errors = results.install(&mut self.project.modules);
-        ScalarProjectValidation {
-            project: self.project,
-            diagnostics: errors.into_iter().map(|error| error.diagnostic()).collect(),
-        }
+    pub(super) fn finish(self) -> ScalarProjectValidation {
+        finish_project_validation(self.project, &self.calls)
+    }
+}
+
+fn finish_project_validation(
+    mut project: ScalarProject,
+    calls: &reference::ProjectCallSiteResults,
+) -> ScalarProjectValidation {
+    let results = reference::analyze_project_references(&project.modules, calls);
+    let errors = results.install(&mut project.modules);
+    ScalarProjectValidation {
+        project,
+        diagnostics: errors
+            .iter()
+            .map(ReferenceAnalysisError::diagnostic)
+            .collect(),
     }
 }
 

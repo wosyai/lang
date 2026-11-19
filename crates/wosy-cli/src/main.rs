@@ -449,7 +449,7 @@ fn compile_project(
         ScalarPreparationInputs { target_layout },
     )
     .map_err(|rejected| {
-        render_project_diagnostics(&rejected.diagnostics, &texts);
+        render_project_diagnostics(&rejected.into_ordered_diagnostics(), &texts);
         "build rejected by semantic diagnostics".to_owned()
     })?;
     #[cfg(test)]
@@ -928,6 +928,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn static_lookup_rejection_skips_build_and_emission() {
+        let (project, configuration) = routing_test_project(
+            "static-lookup-rejection",
+            &[(
+                "main.w",
+                "%%start\nstruct Callback { i32(i32) run; }\ni32(i32) identity = fn(input) { input };\nCallback callback = { .run = identity; };\ni32(i32) invoke = fn(input) { callback.run(input) };\n%%end",
+            )],
+        );
+        let (result, counts) = routing_observations::observe_compile(&project, &configuration);
+        assert_eq!(
+            result.expect_err("reject static call lookup"),
+            "build rejected by semantic diagnostics"
+        );
+        assert_eq!(
+            counts,
+            routing_observations::Counts {
+                extractions: 1,
+                preparations: 1,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]

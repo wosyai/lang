@@ -6568,7 +6568,7 @@ fn assert_ordinary_overload_body_diagnostic(text: &str, code: &str, message: &st
         };
         for (route, diagnostics) in [
             ("standalone", single.diagnostics),
-            ("project", project.diagnostics),
+            ("project", project.into_inspection().diagnostics),
         ] {
             let [diagnostic] = diagnostics.as_slice() else {
                 panic!("{route} {target_layout:?}: {diagnostics:?}");
@@ -6929,7 +6929,7 @@ fn overload_arm_parameter_cannot_shadow_visible_module_binding_on_both_targets()
         };
         for (route, diagnostics) in [
             ("standalone", single.diagnostics),
-            ("project", project.diagnostics),
+            ("project", project.into_inspection().diagnostics),
         ] {
             assert_eq!(
                 diagnostics.len(),

@@ -227,3 +227,142 @@ fn static_rejection_preserves_exact_diagnostics_and_public_zero_query_guard() {
         assert_eq!(public.project, static_result.project);
     }
 }
+
+#[test]
+fn project_static_lookup_rejection_preserves_ordered_mixed_diagnostics() {
+    let lookup = "%%start\nstruct Callback { i32(i32) run; }\ni32(i32) identity = fn(input) { input };\nCallback callback = { .run = identity; };\ni32(i32) invoke = fn(input) { callback.run(input) };\n%%end";
+    let origin = "%%start\nu8 first, u8 second = 1, 2;\nu8() read = fn { second };\n%%end";
+    let valid = "%%start\ni32(i32) identity = fn(input) { input };\n%%end";
+    let inputs = [
+        ("z-origin.w", origin),
+        ("y-lookup.w", lookup),
+        ("x-valid.w", valid),
+        ("b-origin.w", origin),
+        ("a-lookup.w", lookup),
+    ];
+    let sources = inputs.map(|(path, _)| {
+        SourceIdentity::new("project".into(), "package".into(), path.into(), "r1".into())
+    });
+    let declarations = || {
+        sources.iter().zip(inputs).map(|(source, (_, text))| {
+            let parsed = parse_source(source.clone(), text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+            assert!(
+                declarations.diagnostics.is_empty(),
+                "{:?}",
+                declarations.diagnostics
+            );
+            declarations
+        })
+    };
+    let order = sources.iter().rev().cloned().collect::<Vec<_>>();
+    let span = |source: usize, token: &str, start: usize| {
+        let start = start as u32;
+        SourceSpan::new(
+            sources[source].clone(),
+            ByteSpan::new(start, start + token.len() as u32),
+        )
+    };
+    let lookup_error = |source| {
+        let call = "callback.run(input)";
+        Diagnostic {
+            code: "B0003".into(),
+            severity: DiagnosticSeverity::Error,
+            message: "missing resolved call target".into(),
+            labels: vec![DiagnosticLabel {
+                kind: DiagnosticLabelKind::Primary,
+                span: span(source, call, lookup.find(call).unwrap()),
+                message: "missing resolved call target".into(),
+            }],
+            notes: Vec::new(),
+        }
+    };
+    let origin_error = |source| Diagnostic {
+        code: "B0003".into(),
+        severity: DiagnosticSeverity::Error,
+        message: "missing resolved binding".into(),
+        labels: vec![DiagnosticLabel {
+            kind: DiagnosticLabelKind::Primary,
+            span: span(source, "second", origin.rfind("second").unwrap()),
+            message: "missing resolved binding".into(),
+        }],
+        notes: Vec::new(),
+    };
+    let expected = vec![
+        origin_error(0),
+        lookup_error(1),
+        origin_error(3),
+        lookup_error(4),
+    ];
+    for target_layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let stages = Scope::new();
+        let Err(rejected) = prepare_scalar_project(
+            declarations()
+                .map(|declarations| (declarations, Vec::new()))
+                .collect(),
+            order.clone(),
+            ScalarPreparationInputs { target_layout },
+        ) else {
+            panic!("static lookup must reject preparation");
+        };
+        let preparation_counts = Counts {
+            call_sites: inputs.len(),
+            ..Counts::default()
+        };
+        assert_eq!(stages.counts(), preparation_counts);
+        drop(stages);
+        assert_eq!(rejected.diagnostics, vec![lookup_error(1), lookup_error(4)]);
+        assert_eq!(rejected.project.initialization_order, order);
+        assert_empty_cfgs(&rejected.project);
+        let rejected_modules = rejected.project.modules.clone();
+
+        let stages = Scope::new();
+        assert_eq!(rejected.into_ordered_diagnostics(), expected);
+        let diagnostic_counts = Counts {
+            reference_origins: 3,
+            ..Counts::default()
+        };
+        assert_eq!(stages.counts(), diagnostic_counts);
+        drop(stages);
+
+        let modules = declarations()
+            .map(
+                |ScalarSourceDeclarations {
+                     source,
+                     items,
+                     structs,
+                     enums,
+                     ..
+                 }| {
+                    let mut module = ScalarModule::new(source, items, Vec::new());
+                    module.structs = structs;
+                    module.enums = enums;
+                    module.target_layout = target_layout;
+                    module.layouts = ScalarTargetLayouts::new(target_layout);
+                    module
+                },
+            )
+            .collect();
+        let stages = Scope::new();
+        let attached = validate_scalar_project(ScalarProject::new(modules, order.clone()));
+        assert_eq!(
+            stages.counts(),
+            Counts {
+                call_sites: preparation_counts.call_sites,
+                ..diagnostic_counts
+            }
+        );
+        assert_eq!(attached.diagnostics, expected);
+        for index in [1, 4] {
+            assert_eq!(attached.project.modules[index], rejected_modules[index]);
+        }
+        for (module, item) in [(0, 1), (2, 0), (3, 1)] {
+            let ScalarItem::Function(function) = &attached.project.modules[module].items[item]
+            else {
+                panic!("callable at module {module}");
+            };
+            assert!(!function.reference_cfg.points.is_empty(), "module {module}");
+        }
+    }
+}

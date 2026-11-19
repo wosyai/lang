@@ -19,10 +19,10 @@ pub use scalar::{
     ScalarExpression, ScalarExtern, ScalarExternFunction, ScalarFunction, ScalarInitializationNode,
     ScalarItem, ScalarLayout, ScalarModule, ScalarNamespaceBinding, ScalarOutput,
     ScalarOutputReceiver, ScalarOutputSequence, ScalarPlace, ScalarPreparationInputs,
-    ScalarProgram, ScalarProject, ScalarProjectValidation, ScalarSourceDeclarations, ScalarStruct,
-    ScalarStructField, ScalarStructFieldId, ScalarStructId, ScalarStructLiteral,
-    ScalarStructLiteralField, ScalarTargetLayout, ScalarType, ScalarValidation, ScalarWhile,
-    UnaryOperator,
+    ScalarProgram, ScalarProject, ScalarProjectPreparationRejection, ScalarProjectValidation,
+    ScalarSourceDeclarations, ScalarStruct, ScalarStructField, ScalarStructFieldId, ScalarStructId,
+    ScalarStructLiteral, ScalarStructLiteralField, ScalarTargetLayout, ScalarType,
+    ScalarValidation, ScalarWhile, UnaryOperator,
 };
 
 mod llvm;

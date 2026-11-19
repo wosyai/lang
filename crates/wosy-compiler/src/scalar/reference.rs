@@ -4482,6 +4482,12 @@ pub(super) struct ProjectCallSiteResults {
 }
 
 impl ProjectCallSiteResults {
+    pub(super) fn lookup_errors(&self) -> impl Iterator<Item = &ReferenceAnalysisError> {
+        self.modules
+            .iter()
+            .filter_map(|module| module.as_ref().err())
+    }
+
     #[cfg(test)]
     pub(super) fn remove_body_allocation_length_target(
         &mut self,

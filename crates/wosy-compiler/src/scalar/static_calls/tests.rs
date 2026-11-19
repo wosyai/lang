@@ -204,6 +204,8 @@ fn project_preparation_reports_extraction_diagnostics_in_module_order() {
             assert_eq!(module.items.len(), 1);
             assert_eq!(module.layouts.target, target_layout);
         }
+        assert_eq!(rejected.into_ordered_diagnostics(), expected);
+        assert_eq!(stages.counts(), Counts::default());
     }
 }
 
@@ -340,8 +342,9 @@ fn static_rejection_returns_original_validation_with_zero_lookup_or_ownership_en
             panic!("static project rejection")
         };
         assert_eq!(scope.counts(), Counts::default());
-        drop(scope);
         assert_eq!(actual.project, expected.project);
         assert_eq!(actual.diagnostics, expected.diagnostics);
+        assert_eq!(actual.into_ordered_diagnostics(), expected.diagnostics);
+        assert_eq!(scope.counts(), Counts::default());
     }
 }

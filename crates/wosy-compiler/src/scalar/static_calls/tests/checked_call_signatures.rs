@@ -502,7 +502,7 @@ fn preparation_preserves_the_out_of_range_signed_integer_diagnostic_span() {
         let Err(program) = PreparedProgram::new(declarations(), target_layout) else {
             panic!("standalone preparation accepted an out-of-range signed integer")
         };
-        for diagnostics in [project.diagnostics, program.diagnostics] {
+        for diagnostics in [project.into_inspection().diagnostics, program.diagnostics] {
             let [diagnostic] = diagnostics.as_slice() else {
                 panic!("expected one range diagnostic: {diagnostics:?}");
             };
@@ -1339,7 +1339,11 @@ Status() select = fn() {
             order,
             crate::ScalarPreparationInputs { target_layout },
         ) {
-            failures.push(("project", target_layout, failure.diagnostics));
+            failures.push((
+                "project",
+                target_layout,
+                failure.into_inspection().diagnostics,
+            ));
         }
         if let Err(failure) = PreparedProgram::new(
             derive_scalar_declarations_from_cst(parsed.canonical_cst()),
