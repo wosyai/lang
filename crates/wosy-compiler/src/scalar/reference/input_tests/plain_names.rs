@@ -168,42 +168,140 @@ fn prepared_plain_names_reject_missing_rows_at_the_exact_name_span_on_both_targe
 }
 
 #[test]
-fn prepared_plain_names_preserve_secondary_module_receiver_identity_gap() {
-    let text = "%%start\nu8 first, u8 second = 1, 2;\nu8() run = fn { second };\n%%end";
-    let parsed = parse_source(source(), text.into(), &[]);
-    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+fn static_plain_name_obligation_rejects_a_removed_row_at_the_name_token() {
     for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(
-            derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
-            target,
+        let (program, mut calls) = prepare_names(target);
+        for item in [2, 1] {
+            let row = calls.function_mut(item);
+            let ordinal = final_name(row);
+            let PlainNameFacts::Prepared(identities) = &mut row.plain_names else {
+                panic!("prepared name identities");
+            };
+            assert!(identities.remove(&ordinal).is_some());
+            assert!(row
+                .structure
+                .checked_types
+                .expressions
+                .contains_key(&ordinal));
+        }
+        let start = TEXT.find("{ input }").unwrap() as u32 + 2;
+        let span = SourceSpan::new(program.source.clone(), ByteSpan::new(start, start + 5));
+        let stages = stage_observations::Scope::new();
+        let error = occurrence_obligations::validate_module(&calls).unwrap_err();
+        assert_eq!(stages.counts(), stage_observations::Counts::default());
+        assert_eq!(
+            error,
+            ReferenceAnalysisError::MissingContext {
+                source_span: span.clone(),
+                reason: ReferenceAnalysisErrorReason::MissingResolvedBinding,
+            }
         );
-        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
-        let program = typed.program;
-        let raw = resolve_program_call_sites(&program).unwrap();
-        let prepared = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let message = "missing resolved binding";
+        assert_eq!(
+            error.diagnostic(),
+            Diagnostic {
+                code: "B0003".into(),
+                severity: DiagnosticSeverity::Error,
+                message: message.into(),
+                labels: vec![DiagnosticLabel {
+                    kind: DiagnosticLabelKind::Primary,
+                    span,
+                    message: message.into(),
+                }],
+                notes: Vec::new(),
+            }
+        );
+    }
+}
+
+#[test]
+fn prepared_plain_names_select_secondary_module_receiver_on_both_routes_and_targets() {
+    let text = "%%start\nu8 first, u8 second = 1, 2;\nu8() run = fn { second };\n%%end";
+    let source = source();
+    let parsed = parse_source(source.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let declarations = || derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+    let token_span = |start| ByteSpan::new(start, start + 6);
+    let declaration = token_span(text.find("second").unwrap() as u32);
+    let occurrence = token_span(text.rfind("second").unwrap() as u32);
+    let assert_identity = |row: &FunctionCallSites| {
+        let ordinal = final_name(row);
+        assert_eq!(row.occurrences[ordinal.0].span, occurrence);
+        let PlainNameFacts::Prepared(identities) = &row.plain_names else {
+            panic!("prepared name identities");
+        };
+        assert_eq!(
+            identities[&ordinal],
+            PlainNameIdentity::ModuleValue(SourceSpan::new(source.clone(), declaration))
+        );
+    };
+    let lookup_only = stage_observations::Counts {
+        call_sites: 1,
+        ..stage_observations::Counts::default()
+    };
+    let build_only = stage_observations::Counts {
+        reference_origins: 1,
+        output_contracts: 1,
+        copy_specialization: 1,
+        ..stage_observations::Counts::default()
+    };
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let stages = stage_observations::Scope::new();
+        let standalone = static_calls::PreparedProgram::new(declarations(), target)
+            .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        assert_eq!(stages.counts(), lookup_only);
+        assert_identity(standalone.function_calls(1));
+        drop(stages);
+
+        let stages = stage_observations::Scope::new();
+        let finished = standalone.finish();
+        assert_eq!(stages.counts(), build_only);
+        assert!(
+            finished.diagnostics.is_empty(),
+            "{:?}",
+            finished.diagnostics
+        );
+        drop(stages);
+
+        let stages = stage_observations::Scope::new();
+        let prepared = prepare_scalar_project(
+            vec![(declarations(), Vec::new())],
+            vec![source.clone()],
+            ScalarPreparationInputs {
+                target_layout: target,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        assert_eq!(stages.counts(), lookup_only);
+        assert_identity(prepared.function_calls(0, 1));
+        drop(stages);
+
+        let stages = stage_observations::Scope::new();
+        let build = analyze_scalar_build(&prepared);
+        assert_eq!(stages.counts(), build_only);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        drop(stages);
+
+        let program = finished.program;
         let ScalarItem::Function(function) = &program.items[1] else {
             panic!("run declaration");
         };
+        let raw = resolve_program_call_sites(&program).unwrap();
         let module_names = HashSet::from(["first".to_owned(), "run".to_owned()]);
-        let diagnostic = |calls: &ModuleCallSites| {
-            let (_, errors) = derive_function_reference_cfg(
-                &program.source,
-                function,
-                &module_names,
-                calls.function(1),
-                &program.structs,
-                &program.enums,
-                true,
-            );
-            assert_eq!(errors.len(), 1, "{errors:?}");
-            errors[0].diagnostic()
-        };
-        let start = text.rfind("second").unwrap() as u32;
+        let (_, errors) = derive_function_reference_cfg(
+            &program.source,
+            function,
+            &module_names,
+            raw.function(1),
+            &program.structs,
+            &program.enums,
+            true,
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
         let expected = ReferenceAnalysisError::MissingBinding {
-            source_span: SourceSpan::new(program.source.clone(), ByteSpan::new(start, start + 6)),
+            source_span: SourceSpan::new(source.clone(), occurrence),
             name: "second".to_owned(),
         };
-        assert_eq!(diagnostic(&raw), expected.diagnostic());
-        assert_eq!(diagnostic(&prepared), expected.diagnostic());
+        assert_eq!(errors[0].diagnostic(), expected.diagnostic());
     }
 }

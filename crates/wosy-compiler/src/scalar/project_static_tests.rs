@@ -231,7 +231,7 @@ fn static_rejection_preserves_exact_diagnostics_and_public_zero_query_guard() {
 #[test]
 fn project_static_lookup_rejection_preserves_ordered_mixed_diagnostics() {
     let lookup = "%%start\nstruct Callback { i32(i32) run; }\ni32(i32) identity = fn(input) { input };\nCallback callback = { .run = identity; };\ni32(i32) invoke = fn(input) { callback.run(input) };\n%%end";
-    let origin = "%%start\nu8 first, u8 second = 1, 2;\nu8() read = fn { second };\n%%end";
+    let origin = "%%start\nu8[2] first, u8[2] second = [1, 2], [3, 4];\nu8() read = fn { second[0] };\n%%end";
     let valid = "%%start\ni32(i32) identity = fn(input) { input };\n%%end";
     let inputs = [
         ("z-origin.w", origin),

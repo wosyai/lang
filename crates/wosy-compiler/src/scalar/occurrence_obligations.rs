@@ -39,7 +39,7 @@ fn validate_callable(
         &row.call_occurrences,
         &row.allocation_length_calls,
         &row.checked_call_signatures,
-        row.first_unresolved_placeholder_name,
+        Some(row),
     )?;
     for arm in &row.arms {
         validate_callable(source, arm)?;
@@ -54,7 +54,7 @@ fn validate_region(
     site_calls: &[CallOccurrence],
     executable_calls: &[OccurrenceOrdinal],
     signatures: &HashMap<OccurrenceOrdinal, CheckedCallSignature>,
-    first_unresolved_placeholder_name: Option<OccurrenceOrdinal>,
+    callable: Option<&FunctionCallSites>,
 ) -> Result<(), ReferenceAnalysisError> {
     let mut site_calls = site_calls.iter().map(|call| call.ordinal).peekable();
     let mut executable_calls = executable_calls.iter().copied().peekable();
@@ -64,7 +64,10 @@ fn validate_region(
             | executable_calls.next_if_eq(&ordinal).is_some();
         let has_signature = is_call && signatures.contains_key(&ordinal);
         let reason = match metadata.role {
-            OccurrenceRole::Expression if first_unresolved_placeholder_name == Some(ordinal) => {
+            OccurrenceRole::Expression
+                if metadata.requires_plain_name
+                    && callable.is_some_and(|row| !row.has_prepared_plain_name(ordinal)) =>
+            {
                 Reason::MissingResolvedBinding
             }
             OccurrenceRole::Expression

@@ -4165,6 +4165,9 @@ impl<'a> CallDeclarationIndex<'a> {
                             },
                         );
                         for receiver in binding.receivers.iter().skip(1) {
+                            headers
+                                .value_tokens
+                                .insert(&receiver.name, receiver.name_span);
                             headers.bindings.insert(
                                 &receiver.name,
                                 CallBindingHeader {
@@ -4403,6 +4406,7 @@ pub(super) enum OccurrenceRole {
 pub(super) struct OccurrenceMetadata {
     pub(super) role: OccurrenceRole,
     pub(super) span: ByteSpan,
+    pub(super) requires_plain_name: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4479,7 +4483,6 @@ pub(super) struct FunctionCallSites {
     pub(super) allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     plain_names: PlainNameFacts,
-    pub(super) first_unresolved_placeholder_name: Option<OccurrenceOrdinal>,
     members: MemberFacts,
     query_allocation_outputs: HashMap<(BlockOrdinal, usize), BindingOutputs>,
     pub(super) structure: OccurrenceStructure,
@@ -4487,6 +4490,12 @@ pub(super) struct FunctionCallSites {
     pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
     pub(super) loops: HashMap<(BlockOrdinal, usize), WhileRegion>,
     pub(super) short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
+}
+
+impl FunctionCallSites {
+    pub(super) fn has_prepared_plain_name(&self, ordinal: OccurrenceOrdinal) -> bool {
+        matches!(&self.plain_names, PlainNameFacts::Prepared(rows) if rows.contains_key(&ordinal))
+    }
 }
 
 pub(super) struct ProjectCallSiteResults {
@@ -4683,7 +4692,6 @@ struct StructuralWalker<'a, 'typing> {
     occurrence_typing: &'typing mut PreparationOccurrenceTyping,
     checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     plain_names: PlainNameFacts,
-    first_unresolved_placeholder_name: Option<OccurrenceOrdinal>,
     members: MemberFacts,
     allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     initialization_call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
@@ -4716,7 +4724,6 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             occurrence_typing,
             checked_call_signatures: HashMap::new(),
             plain_names,
-            first_unresolved_placeholder_name: None,
             members,
             allocation_length_call_targets: HashMap::new(),
             initialization_call_targets: HashMap::new(),
@@ -4738,7 +4745,11 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         edge: OccurrenceEdge,
     ) -> OccurrenceOrdinal {
         let ordinal = OccurrenceOrdinal(self.occurrences.len());
-        self.occurrences.push(OccurrenceMetadata { role, span });
+        self.occurrences.push(OccurrenceMetadata {
+            role,
+            span,
+            requires_plain_name: false,
+        });
         let node = match role {
             OccurrenceRole::Expression => OccurrenceNode::Expression(ordinal),
             OccurrenceRole::Place => OccurrenceNode::Place(ordinal),
@@ -4783,6 +4794,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         if let (ScalarExpression::Name { name, .. }, PlainNameFacts::Prepared(identities)) =
             (expression, &mut self.plain_names)
         {
+            self.occurrences[ordinal.0].requires_plain_name = true;
             let resolver = match &self.mode {
                 WalkMode::Callable(callable) => callable.target_resolver,
                 WalkMode::CallableAllocationLength(resolver) => *resolver,
@@ -4813,9 +4825,6 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             };
             if let Some(identity) = identity {
                 identities.insert(ordinal, identity);
-            } else if matches!(edge, OccurrenceEdge::QueryAllocationPlaceholder { .. }) {
-                self.first_unresolved_placeholder_name
-                    .get_or_insert(ordinal);
             }
         }
         if let (ScalarExpression::Member { receiver, .. }, MemberFacts::Prepared(identities)) =
@@ -6015,7 +6024,6 @@ fn resolve_function_call_sites(
         allocation_length_call_targets: resolver.allocation_length_call_targets,
         checked_call_signatures: resolver.checked_call_signatures,
         plain_names: resolver.plain_names,
-        first_unresolved_placeholder_name: resolver.first_unresolved_placeholder_name,
         members: resolver.members,
         query_allocation_outputs: callable.query_allocation_outputs,
         structure: resolver.structure,

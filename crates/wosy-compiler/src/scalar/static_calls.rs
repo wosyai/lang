@@ -6,6 +6,11 @@ pub(super) struct PreparedProgram {
 }
 
 impl PreparedProgram {
+    #[cfg(test)]
+    pub(super) fn function_calls(&self, item: usize) -> &reference::FunctionCallSites {
+        self.calls.function(item)
+    }
+
     pub(super) fn new(
         declarations: ScalarSourceDeclarations,
         target_layout: ScalarTargetLayout,
@@ -117,6 +122,15 @@ impl ScalarProjectPreparationRejection {
 }
 
 impl PreparedScalarProject {
+    #[cfg(test)]
+    pub(super) fn function_calls(
+        &self,
+        module: usize,
+        item: usize,
+    ) -> &reference::FunctionCallSites {
+        self.calls.function(module, item)
+    }
+
     pub(super) fn new(project: ScalarProject) -> Result<Self, ScalarProjectPreparationRejection> {
         let (validation, occurrence_typing) = typecheck_scalar_project_with_occurrences(project);
         if !validation.diagnostics.is_empty() {
