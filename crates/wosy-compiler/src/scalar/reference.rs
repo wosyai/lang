@@ -4,7 +4,7 @@ use super::control::{
     module_initialization_region, BindingAllocationLengthSlot, BindingInitialization,
     BindingOutput, BindingOutputs, BindingReceiverSlot, BindingRegion, BlockItem, BlockItemKind,
     BlockPosition, BlockRegion, CheckedCallSignature, CheckedOccurrenceTypes,
-    ConditionalOutputProjection, ConditionalRegion, FinalOutputSlot,
+    ConditionalOutputProjection, ConditionalRegion, FinalOutputSlot, FoldedOccurrence,
     ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationRegion,
     ModuleInitializationStepKind, ModuleInitializationTopology, ShortCircuitRegion, WhileRegion,
 };
@@ -4235,6 +4235,7 @@ pub(super) struct OccurrenceStructure {
     pub(super) blocks: Vec<BlockRegion>,
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
+    pub(super) folded_expressions: HashMap<OccurrenceOrdinal, FoldedOccurrence>,
     pub(super) conditional_output_projections:
         HashMap<OccurrenceOrdinal, ConditionalOutputProjection>,
 }
@@ -4246,6 +4247,7 @@ impl OccurrenceStructure {
             blocks: vec![BlockRegion::new(span, Vec::new())],
             edges: HashMap::new(),
             checked_types: CheckedOccurrenceTypes::default(),
+            folded_expressions: HashMap::new(),
             conditional_output_projections: HashMap::new(),
         }
     }
@@ -4535,6 +4537,10 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         );
         if let Some(ty) = self.occurrence_typing.take_expression_type(expression) {
             self.structure.checked_types.expressions.insert(ordinal, ty);
+        }
+        if let Some(folded) = self.occurrence_typing.take_folded_expression(expression) {
+            debug_assert_eq!(edge, OccurrenceEdge::UnaryOperand);
+            self.structure.folded_expressions.insert(ordinal, folded);
         }
         self.expression_children(expression, names, types, ordinal)?;
         Ok(ordinal)

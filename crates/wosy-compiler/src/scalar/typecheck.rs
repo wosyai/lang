@@ -3404,7 +3404,11 @@ fn check_expression_type_in_module(
             if matches!(operator, UnaryOperator::Negate) {
                 if let ScalarExpression::Integer { value, .. } = operand.as_ref() {
                     let value = -value;
+                    let diagnostics_before_range = diagnostics.len();
                     validate_integer_range(module, &value, *span, diagnostics);
+                    if diagnostics.len() == diagnostics_before_range {
+                        inference.record_folded_signed_integer_magnitude(operand);
+                    }
                     return ScalarType::I32;
                 }
             }
@@ -4275,7 +4279,11 @@ fn check_expression_type_in_module_expected(
             ) = expected
             {
                 let value = -value;
+                let diagnostics_before_range = diagnostics.len();
                 validate_integer_range_for_type(module, &value, *span, expected, diagnostics);
+                if diagnostics.len() == diagnostics_before_range {
+                    inference.record_folded_signed_integer_magnitude(operand);
+                }
                 return expected.clone();
             }
         }
@@ -7845,7 +7853,11 @@ fn check_expression_type(
             if matches!(operator, UnaryOperator::Negate) {
                 if let ScalarExpression::Integer { value, .. } = operand.as_ref() {
                     let value = -value;
+                    let diagnostics_before_range = diagnostics.len();
                     validate_integer_range_program(program, &value, *span, diagnostics);
+                    if diagnostics.len() == diagnostics_before_range {
+                        inference.record_folded_signed_integer_magnitude(operand);
+                    }
                     return ScalarType::I32;
                 }
             }
@@ -8682,6 +8694,7 @@ fn check_expression_type_expected(
             if let ScalarExpression::Integer { value, .. } = operand.as_ref() {
                 let value = -value;
                 if is_integer_type(expected) {
+                    let diagnostics_before_range = diagnostics.len();
                     validate_integer_range_for_type_program(
                         program,
                         &value,
@@ -8689,6 +8702,9 @@ fn check_expression_type_expected(
                         expected,
                         diagnostics,
                     );
+                    if diagnostics.len() == diagnostics_before_range {
+                        inference.record_folded_signed_integer_magnitude(operand);
+                    }
                     return expected.clone();
                 }
             }

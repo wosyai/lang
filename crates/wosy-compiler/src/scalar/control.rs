@@ -125,6 +125,11 @@ pub(super) struct CheckedOccurrenceTypes {
     pub(super) places: HashMap<OccurrenceOrdinal, ScalarType>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FoldedOccurrence {
+    SignedIntegerMagnitude,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModuleInitializationStep {
     pub(crate) item: usize,

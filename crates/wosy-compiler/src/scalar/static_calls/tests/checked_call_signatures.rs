@@ -1,7 +1,7 @@
 use super::*;
 use crate::scalar::control::{
     BindingInitialization, BindingOutput, BlockItemKind, CheckedCallSignature, ConditionalRegion,
-    ModuleInitializationDetail,
+    FoldedOccurrence, ModuleInitializationDetail,
 };
 use crate::scalar::overload::observations as overload_observations;
 use crate::scalar::reference::{
@@ -410,6 +410,119 @@ fn public_prepare_retains_checked_expression_and_place_types_by_occurrence() {
         .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
         let calls = program.calls.as_ref().unwrap();
         check(&calls.initialization, calls.function(1));
+    }
+}
+
+#[test]
+fn preparation_publishes_signed_integer_magnitudes_as_folded_unary_operands() {
+    let parsed = parsed(
+        "%%start\n-2147483648;\ni8 narrow = -128;\ni8() run = fn { -2147483648; -128 };\n%%end",
+    );
+    let check_signed_pair = |structure: &OccurrenceStructure,
+                             occurrences: &[reference::OccurrenceMetadata],
+                             roots: [Edge; 2],
+                             spans: [ByteSpan; 2]| {
+        assert_eq!(structure.folded_expressions.len(), 2);
+        for (index, ((edge, span), ty)) in roots
+            .into_iter()
+            .zip(spans)
+            .zip([ScalarType::I32, ScalarType::I8])
+            .enumerate()
+        {
+            let signed = child(structure, Parent::Block(structure.root), edge);
+            let magnitude = child(structure, Parent::Expression(signed), Edge::UnaryOperand);
+            assert_eq!(signed, OccurrenceOrdinal(index * 2));
+            assert_eq!(magnitude, OccurrenceOrdinal(index * 2 + 1));
+            assert_eq!(occurrences[signed.0].span, span);
+            assert_eq!(
+                occurrences[magnitude.0].span,
+                ByteSpan::new(span.start + 1, span.end)
+            );
+            assert_eq!(structure.checked_types.expressions[&signed], ty);
+            assert_eq!(structure.checked_types.expressions.get(&magnitude), None);
+            assert_eq!(
+                structure.folded_expressions[&magnitude],
+                FoldedOccurrence::SignedIntegerMagnitude,
+            );
+        }
+    };
+    let check = |initialization: &control::ModuleInitializationRegion,
+                 function: &FunctionCallSites| {
+        let ModuleInitializationDetail::Occurrences(topology) = &initialization.detail else {
+            panic!("module initialization occurrences")
+        };
+        check_signed_pair(
+            &topology.structure,
+            &topology.occurrences,
+            [
+                Edge::ExpressionItem { item: 0 },
+                Edge::BindingRoot { item: 1, output: 0 },
+            ],
+            [ByteSpan::new(8, 19), ByteSpan::new(33, 37)],
+        );
+        check_signed_pair(
+            &function.structure,
+            &function.occurrences,
+            [
+                Edge::ExpressionItem { item: 0 },
+                Edge::FinalOutput { item: 1, output: 0 },
+            ],
+            [ByteSpan::new(55, 66), ByteSpan::new(68, 72)],
+        );
+    };
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let project = prepare_extracted(&parsed, target);
+        check(
+            project.initialization_region(0).unwrap(),
+            project.calls.function(0, 2),
+        );
+        let program = PreparedProgram::new(
+            derive_scalar_declarations_from_cst(parsed.canonical_cst()),
+            target,
+        )
+        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        let calls = program.calls.as_ref().unwrap();
+        check(&calls.initialization, calls.function(2));
+    }
+}
+
+#[test]
+fn preparation_preserves_the_out_of_range_signed_integer_diagnostic_span() {
+    let parsed = parsed("%%start\ni32 value = -2147483649;\n%%end");
+    let declarations = || derive_scalar_declarations_from_cst(parsed.canonical_cst());
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = declarations().source().clone();
+        let Err(project) = crate::prepare_scalar_project(
+            vec![(declarations(), Vec::new())],
+            vec![source.clone()],
+            crate::ScalarPreparationInputs { target_layout },
+        ) else {
+            panic!("project preparation accepted an out-of-range signed integer")
+        };
+        let Err(program) = PreparedProgram::new(declarations(), target_layout) else {
+            panic!("standalone preparation accepted an out-of-range signed integer")
+        };
+        for diagnostics in [project.diagnostics, program.diagnostics] {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected one range diagnostic: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.code, "B0010");
+            assert_eq!(
+                diagnostic.message,
+                "integer literal is outside the resolved target type range"
+            );
+            let [label] = diagnostic.labels.as_slice() else {
+                panic!("expected one signed literal label: {diagnostic:?}");
+            };
+            assert_eq!(label.kind, crate::DiagnosticLabelKind::Primary);
+            assert_eq!(
+                label.span,
+                SourceSpan {
+                    source: source.clone(),
+                    range: ByteSpan::new(20, 31)
+                }
+            );
+        }
     }
 }
 

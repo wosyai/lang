@@ -1,4 +1,4 @@
-use super::control::CheckedCallSignature;
+use super::control::{CheckedCallSignature, FoldedOccurrence};
 use super::*;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -77,6 +77,7 @@ pub(super) struct PreparationOccurrenceTyping {
     calls: HashMap<*const ScalarExpression, CheckedCallSignature>,
     tail_conditional_outputs: HashMap<*const ScalarExpression, Vec<ScalarType>>,
     expressions: HashMap<*const ScalarExpression, CheckedExpressionType>,
+    folded_expressions: HashMap<*const ScalarExpression, FoldedOccurrence>,
     places: HashMap<*const ScalarPlace, ScalarType>,
 }
 
@@ -118,6 +119,14 @@ impl PreparationOccurrenceTyping {
         self.expressions
             .remove(&std::ptr::from_ref(expression))
             .map(|checked| checked.ty)
+    }
+
+    pub(super) fn take_folded_expression(
+        &mut self,
+        expression: &ScalarExpression,
+    ) -> Option<FoldedOccurrence> {
+        self.folded_expressions
+            .remove(&std::ptr::from_ref(expression))
     }
 
     pub(super) fn take_place_type(&mut self, place: &ScalarPlace) -> Option<ScalarType> {
@@ -229,6 +238,15 @@ impl<'a> ScalarInferenceBuilder<'a> {
                     ty: ty.clone(),
                     contextual,
                 },
+            );
+        }
+    }
+
+    pub(super) fn record_folded_signed_integer_magnitude(&mut self, operand: &ScalarExpression) {
+        if !self.suppress_checked_occurrences {
+            self.occurrences.folded_expressions.insert(
+                std::ptr::from_ref(operand),
+                FoldedOccurrence::SignedIntegerMagnitude,
             );
         }
     }
