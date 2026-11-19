@@ -9,7 +9,9 @@ use super::{
 use wosy_syntax::{ByteSpan, SourceIdentity, SourceSpan};
 
 mod initializer_call_nodes;
-pub(crate) use initializer_call_nodes::{CallableBodyCallNodes, InitializerCallNodes};
+pub(crate) use initializer_call_nodes::{
+    BoundInitializerMember, CallableBodyCallNodes, InitializerCallNodes,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModuleInitializationRegion {
@@ -19,6 +21,35 @@ pub(crate) struct ModuleInitializationRegion {
 }
 
 impl ModuleInitializationRegion {
+    #[cfg(test)]
+    pub(crate) fn remove_first_member_fact(&mut self, remove_type: bool) -> (ByteSpan, usize) {
+        use super::reference::InitializerMemberRequirement;
+        let ModuleInitializationDetail::Occurrences(topology) = &mut self.detail else {
+            panic!("prepared initializer topology");
+        };
+        let (index, span) = topology
+            .occurrences
+            .iter()
+            .enumerate()
+            .find_map(|(index, metadata)| match metadata.initializer_member {
+                InitializerMemberRequirement::Token(span) => Some((index, span)),
+                InitializerMemberRequirement::NotRequired => None,
+            })
+            .expect("initializer member");
+        let ordinal = OccurrenceOrdinal(index);
+        if remove_type {
+            assert!(topology
+                .structure
+                .checked_types
+                .expressions
+                .remove(&ordinal)
+                .is_some());
+        } else {
+            assert!(topology.identities.members.remove(&ordinal).is_some());
+        }
+        (span, index)
+    }
+
     #[cfg(test)]
     pub(crate) fn remove_only_call_target(&mut self) {
         let ModuleInitializationDetail::Occurrences(topology) = &mut self.detail else {

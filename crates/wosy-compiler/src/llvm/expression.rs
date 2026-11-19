@@ -1,4 +1,87 @@
+use super::memory::{load_place_value, resolved_field_pointer};
 use super::*;
+use crate::scalar::control::{BoundInitializerMember, InitializationMember, InitializationStorage};
+
+fn prepared_initializer_member<'a>(
+    state: &EmitState<'_, 'a>,
+    expression: &ScalarExpression,
+) -> Result<Option<BoundInitializerMember<'a>>, String> {
+    state
+        .initializer_nodes
+        .map(|nodes| nodes.member(expression))
+        .transpose()
+}
+
+fn emit_initializer_member<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    member: BoundInitializerMember<'_>,
+    expression: &ScalarExpression,
+    project_path: bool,
+) -> Result<EmitValue<'ctx>, String> {
+    match member.identity {
+        InitializationMember::Enum { tag, .. } => Ok(EmitValue::Basic(
+            context.i32_type().const_int(u64::from(*tag), false).into(),
+        )),
+        InitializationMember::Field {
+            receiver,
+            receiver_name,
+            field,
+            through_raw_pointer,
+        } => {
+            if *through_raw_pointer {
+                if project_path {
+                    return Err(format!("unknown namespace binding {receiver_name}"));
+                }
+                let ScalarExpression::Member { name, .. } = expression else {
+                    unreachable!()
+                };
+                return Err(format!("unknown LLVM member {receiver_name}.{name}"));
+            }
+            let base = match receiver {
+                InitializationStorage::Lexical(_) => {
+                    state.storage.get(receiver_name).map(|(slot, _)| *slot)
+                }
+                InitializationStorage::Module(_) => state
+                    .globals
+                    .get(receiver_name)
+                    .map(|(global, _)| global.as_pointer_value()),
+            }
+            .ok_or_else(|| format!("unknown LLVM place {receiver_name}"))?;
+            let pointer = resolved_field_pointer(context, state, base, field)?;
+            load_place_value(context, state, pointer, member.ty)
+        }
+        InitializationMember::Module {
+            declaration, name, ..
+        } => {
+            if *member.ty == ScalarType::Unit {
+                return Ok(EmitValue::Unit);
+            }
+            let key = project_global_name(&declaration.source, name);
+            let (global, _) = state.all_globals.get(&key).ok_or_else(|| {
+                if matches!(member.ty, ScalarType::Callable { .. }) {
+                    format!("unknown LLVM member {name}")
+                } else {
+                    format!("unknown LLVM member storage {name}")
+                }
+            })?;
+            let address = global.as_pointer_value();
+            if matches!(member.ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
+                return Ok(EmitValue::Basic(address.into()));
+            }
+            Ok(EmitValue::Basic(
+                state
+                    .builder
+                    .build_load(
+                        storage_type(context, member.ty, state.layouts, state.target_layout)?,
+                        address,
+                        name,
+                    )
+                    .map_err(builder_error)?,
+            ))
+        }
+    }
+}
 
 pub(super) fn emit_expression<'ctx, 'module>(
     context: &'ctx Context,
@@ -65,6 +148,9 @@ pub(super) fn emit_expression<'ctx, 'module>(
             enum_tag,
             ..
         } => {
+            if let Some(member) = prepared_initializer_member(state, expression)? {
+                return emit_initializer_member(context, state, member, expression, false);
+            }
             if let Some(tag) = enum_tag {
                 return Ok(EmitValue::Basic(
                     context.i32_type().const_int(u64::from(*tag), false).into(),
@@ -280,6 +366,9 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             enum_tag,
             ..
         } => {
+            if let Some(member) = prepared_initializer_member(state, expression)? {
+                return emit_initializer_member(context, state, member, expression, true);
+            }
             if let Some(tag) = enum_tag {
                 return Ok(EmitValue::Basic(
                     context.i32_type().const_int(u64::from(*tag), false).into(),
@@ -560,7 +649,10 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             right,
             ..
         } => {
-            let unsigned = project_expression_is_unsigned(state, left, module, modules);
+            let unsigned = match prepared_initializer_unsigned(state, left)? {
+                Some(unsigned) => unsigned,
+                None => project_expression_is_unsigned(state, left, module, modules),
+            };
             let left = emit_project_expression(context, state, left, module, modules)?;
             emit_binary_with_rhs(
                 context,
@@ -1285,6 +1377,9 @@ fn bitcast_source_type(
     project_module: Option<&ScalarModule>,
 ) -> Result<ScalarType, String> {
     let ty = match expression {
+        ScalarExpression::Member { .. } if state.initializer_nodes.is_some() => {
+            prepared_initializer_member(state, expression)?.map(|member| member.ty.clone())
+        }
         ScalarExpression::Name { name, .. } => state
             .storage
             .get(name)
@@ -1881,6 +1976,9 @@ fn integer_conversion_source_type(
     project_module: Option<&ScalarModule>,
 ) -> Result<ScalarType, String> {
     let ty = match expression {
+        ScalarExpression::Member { .. } if state.initializer_nodes.is_some() => {
+            prepared_initializer_member(state, expression)?.map(|member| member.ty.clone())
+        }
         ScalarExpression::Name { name, .. } => state
             .storage
             .get(name)
@@ -1977,6 +2075,9 @@ fn float_conversion_source_type(
     project_module: Option<&ScalarModule>,
 ) -> Result<ScalarType, String> {
     let ty = match expression {
+        ScalarExpression::Member { .. } if state.initializer_nodes.is_some() => {
+            prepared_initializer_member(state, expression)?.map(|member| member.ty.clone())
+        }
         ScalarExpression::Name { name, .. } => state
             .storage
             .get(name)
@@ -2159,7 +2260,10 @@ fn emit_binary<'ctx, 'module>(
     left: &ScalarExpression,
     right: &ScalarExpression,
 ) -> Result<EmitValue<'ctx>, String> {
-    let unsigned = expression_is_unsigned(state, left);
+    let unsigned = match prepared_initializer_unsigned(state, left)? {
+        Some(unsigned) => unsigned,
+        None => expression_is_unsigned(state, left),
+    };
     let left = emit_expression(context, state, left)?;
     emit_binary_with_rhs(
         context,
@@ -2170,6 +2274,29 @@ fn emit_binary<'ctx, 'module>(
         ExpressionPath::Single,
         unsigned,
     )
+}
+
+fn prepared_initializer_unsigned(
+    state: &EmitState<'_, '_>,
+    expression: &ScalarExpression,
+) -> Result<Option<bool>, String> {
+    match expression {
+        ScalarExpression::Member { .. } => Ok(prepared_initializer_member(state, expression)?.map(
+            |member| {
+                matches!(
+                    member.ty,
+                    ScalarType::U8
+                        | ScalarType::U16
+                        | ScalarType::U32
+                        | ScalarType::U64
+                        | ScalarType::U128
+                )
+            },
+        )),
+        ScalarExpression::Unary { operand, .. } => prepared_initializer_unsigned(state, operand),
+        ScalarExpression::Binary { left, .. } => prepared_initializer_unsigned(state, left),
+        _ => Ok(None),
+    }
 }
 
 fn expression_is_unsigned<'ctx, 'module>(

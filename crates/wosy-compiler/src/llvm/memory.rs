@@ -339,32 +339,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
             let ScalarFieldReference::Resolved(field) = field else {
                 return Err("unresolved LLVM struct field".to_owned());
             };
-            let structure = structure(state.structs, field.structure.clone())?;
-            let resolved = structure
-                .fields
-                .get(field.index)
-                .filter(|candidate| candidate.id == *field)
-                .ok_or_else(|| format!("unknown LLVM struct field {}", field.index))?;
-            let byte_type = context.i8_type();
-            let offset = byte_type.const_int(
-                state
-                    .layouts
-                    .field(field)
-                    .and_then(|result| result.offset)
-                    .ok_or_else(|| {
-                        format!("LLVM struct field {} has no valid offset", field.index)
-                    })?,
-                false,
-            );
-            unsafe {
-                state.builder.build_in_bounds_gep(
-                    byte_type,
-                    base,
-                    &[offset],
-                    resolved.name.as_str(),
-                )
-            }
-            .map_err(builder_error)
+            resolved_field_pointer(context, state, base, field)
         }
         crate::ScalarPlace::Index { base, index, .. } => {
             let base_pointer = place_pointer(context, state, base, project)?;
@@ -414,6 +389,35 @@ pub(super) fn place_pointer<'ctx, 'module>(
     }
 }
 
+pub(super) fn resolved_field_pointer<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    base: PointerValue<'ctx>,
+    field: &crate::ScalarStructFieldId,
+) -> Result<PointerValue<'ctx>, String> {
+    let structure = structure(state.structs, field.structure.clone())?;
+    let resolved = structure
+        .fields
+        .get(field.index)
+        .filter(|candidate| candidate.id == *field)
+        .ok_or_else(|| format!("unknown LLVM struct field {}", field.index))?;
+    let byte_type = context.i8_type();
+    let offset = byte_type.const_int(
+        state
+            .layouts
+            .field(field)
+            .and_then(|result| result.offset)
+            .ok_or_else(|| format!("LLVM struct field {} has no valid offset", field.index))?,
+        false,
+    );
+    unsafe {
+        state
+            .builder
+            .build_in_bounds_gep(byte_type, base, &[offset], resolved.name.as_str())
+    }
+    .map_err(builder_error)
+}
+
 pub(super) fn emit_place_value<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -455,6 +459,15 @@ pub(super) fn emit_place_value_in_project<'ctx, 'module>(
         crate::ScalarPlace::Index { .. } => assignment_place_type(state, place)
             .ok_or_else(|| "unknown LLVM indexed place type".to_owned())?,
     };
+    load_place_value(context, state, pointer, &ty)
+}
+
+pub(super) fn load_place_value<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    pointer: PointerValue<'ctx>,
+    ty: &ScalarType,
+) -> Result<EmitValue<'ctx>, String> {
     if matches!(
         ty,
         ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }
@@ -465,7 +478,7 @@ pub(super) fn emit_place_value_in_project<'ctx, 'module>(
         state
             .builder
             .build_load(
-                basic_type(context, &ty, state.target_layout)?,
+                basic_type(context, ty, state.target_layout)?,
                 pointer,
                 "place",
             )

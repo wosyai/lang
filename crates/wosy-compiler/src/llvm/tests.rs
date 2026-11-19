@@ -313,6 +313,180 @@ fn prepared_initializer_missing_row_is_rejected_by_both_emitters() {
 }
 
 #[test]
+fn prepared_initializer_member_authority_on_both_emitters_and_layouts() {
+    use crate::ScalarExpression as Expr;
+    let text = "%%start
+struct Record { u8 small; i32 signed_value; f32 floating; }
+struct Boxed { u8 payload; }
+enum Mode { waiting; ready; }
+Record data = { .small = 200; .signed_value = -7; .floating = 1.5; };
+Mode status = Mode.ready;
+Boxed wrapped = { .payload = unsafe { data.small }; };
+bool comparison = data.small < 201;
+u16 widened = core.int_extend<u16>(data.small);
+u32 bits = core.bitcast<u32>(data.signed_value);
+f64 extended = core.float_extend<f64>(data.floating);
+%%end";
+    fn mutate(expr: &mut Expr) {
+        match expr {
+            Expr::Member {
+                receiver,
+                name,
+                enum_tag,
+                ..
+            } => {
+                *receiver = "decoy_receiver".into();
+                *name = "decoy_member".into();
+                *enum_tag = Some(99);
+            }
+            Expr::StructLiteral { fields, .. } => {
+                for field in fields {
+                    mutate(&mut field.value);
+                }
+            }
+            Expr::Block(block) => {
+                for item in &mut block.items {
+                    if let crate::ScalarBlockItem::Expression(expr) = item {
+                        mutate(expr);
+                    }
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                mutate(left);
+                mutate(right);
+            }
+            Expr::Call { arguments, .. } => {
+                for argument in arguments {
+                    mutate(argument);
+                }
+            }
+            _ => {}
+        }
+    }
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let build = analyze_scalar_build(&prepared);
+        let region = prepared.initialization_region(0).unwrap();
+        let baseline = emit_initializer_test_input(&build, prepared.project(), region);
+        let mut mutated = prepared.project().clone();
+        for item in &mut mutated.modules[0].items {
+            if let ScalarItem::Binding(binding) = item {
+                mutate(&mut binding.value);
+            }
+        }
+        for (expected, changed) in baseline
+            .into_iter()
+            .zip(emit_initializer_test_input(&build, &mutated, region))
+        {
+            let expected = expected.unwrap().to_text();
+            assert_eq!(changed.unwrap().to_text(), expected);
+            for fragment in ["icmp ult i8", "zext i8", "fpext float", "store i32 1"] {
+                assert!(expected.contains(fragment), "{fragment}: {expected}");
+            }
+        }
+        for (remove_type, fact) in [(false, "identity"), (true, "type")] {
+            let mut corrupt = region.clone();
+            let (span, ordinal) = corrupt.remove_first_member_fact(remove_type);
+            let start = (text.find("Mode.ready").unwrap() + "Mode.".len()) as u32;
+            assert_eq!(span, ByteSpan::new(start, start + 5));
+            let expected = format!("internal error: missing initializer member {fact} in {:?} at {start}..{} (occurrence {ordinal})", region.source, start + 5);
+            for result in emit_initializer_test_input(&build, &mutated, &corrupt) {
+                assert_eq!(result.unwrap_err(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn prepared_initializer_namespace_member_uses_selected_storage_on_both_layouts() {
+    let root_text = "%%start\nmath = namespace package \"math.w\";\ni32 result = math.value;\nstruct Boxed { i32 field; }\nBoxed nested = { .field = math.value; };\n%%end";
+    let source = |path: &str| {
+        SourceIdentity::new("project".into(), "package".into(), path.into(), "r1".into())
+    };
+    let main = source("main.w");
+    let math = source("math.w");
+    let declarations = |source, text: &str| {
+        let parsed = parse_source(source, text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+    };
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let root = declarations(main.clone(), root_text);
+        let namespace = root.namespaces().next().unwrap();
+        let binding = ScalarNamespaceBinding {
+            binding: namespace.binding.clone(),
+            span: namespace.span,
+            target: math.clone(),
+        };
+        let prepared = prepare_scalar_project(
+            vec![
+                (root, vec![binding]),
+                (
+                    declarations(math.clone(), "%%start\ni32 value = 7;\n%%end"),
+                    Vec::new(),
+                ),
+            ],
+            vec![main.clone(), math.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap();
+        let build = analyze_scalar_build(&prepared);
+        let baseline = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        assert!(
+            baseline.contains(&format!(
+                "load i32, ptr @{}",
+                project_global_name(&math, "value")
+            )),
+            "{baseline}"
+        );
+        let mut mutated = prepared.project().clone();
+        for item in &mut mutated.modules[0].items[1..] {
+            let ScalarItem::Binding(binding) = item else {
+                panic!("initializer binding")
+            };
+            let expression = match &mut binding.value {
+                crate::ScalarExpression::StructLiteral { fields, .. } => &mut fields[0].value,
+                expression => expression,
+            };
+            let crate::ScalarExpression::Member {
+                receiver,
+                name,
+                enum_tag,
+                ..
+            } = expression
+            else {
+                panic!("namespace member")
+            };
+            *receiver = "decoy_receiver".into();
+            *name = "decoy_member".into();
+            *enum_tag = Some(99);
+        }
+        let input = super::GenericInitializerInput::PreparedRows(&prepared);
+        let emit = |region: &crate::scalar::control::ModuleInitializationRegion| {
+            super::emit_project_llvm(
+                &mutated,
+                &|module| {
+                    if module == 0 {
+                        Some(region)
+                    } else {
+                        prepared.initialization_region(module)
+                    }
+                },
+                input,
+                &|module, item, arm, _| build.reference_cfg(module, item, arm),
+            )
+        };
+        let region = prepared.initialization_region(0).unwrap();
+        assert_eq!(emit(region).unwrap().to_text(), baseline);
+        let mut corrupt = region.clone();
+        let (span, ordinal) = corrupt.remove_first_member_fact(false);
+        let start = (root_text.find("math.value").unwrap() + "math.".len()) as u32;
+        assert_eq!(span, ByteSpan::new(start, start + 5));
+        assert_eq!(emit(&corrupt).unwrap_err(), format!("internal error: missing initializer member identity in {main:?} at {start}..{} (occurrence {ordinal})", start + 5));
+    }
+}
+
+#[test]
 fn prepared_initializer_emits_canonical_binding_and_block_outputs() {
     use crate::ScalarExpression;
 

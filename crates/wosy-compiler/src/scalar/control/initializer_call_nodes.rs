@@ -13,7 +13,14 @@ use super::*;
 pub(crate) struct InitializerCallNodes<'a> {
     source: &'a SourceIdentity,
     targets: HashMap<*const ScalarExpression, &'a ModuleInitializationCallTarget>,
+    members: HashMap<*const ScalarExpression, BoundInitializerMember<'a>>,
     items: PhantomData<&'a [ScalarItem]>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BoundInitializerMember<'a> {
+    pub(crate) identity: &'a InitializationMember,
+    pub(crate) ty: &'a ScalarType,
 }
 
 impl<'a> InitializerCallNodes<'a> {
@@ -30,9 +37,40 @@ impl<'a> InitializerCallNodes<'a> {
         let mut nodes = Self {
             source: &region.source,
             targets: HashMap::with_capacity(topology.calls.len()),
+            members: HashMap::with_capacity(topology.identities.members.len()),
             items: PhantomData,
         };
-        let mut bind_call = |ordinal, expression: &'a ScalarExpression| {
+        let mut bind_call = |ordinal: OccurrenceOrdinal, expression: &'a ScalarExpression| {
+            if matches!(expression, ScalarExpression::Member { .. }) {
+                use super::super::reference::InitializerMemberRequirement;
+                let InitializerMemberRequirement::Token(span) =
+                    topology.occurrences[ordinal.0].initializer_member
+                else {
+                    return Err(format!(
+                        "internal error: missing initializer member token in {:?} (occurrence {})",
+                        region.source, ordinal.0
+                    ));
+                };
+                let missing = |fact| {
+                    format!("internal error: missing initializer member {fact} in {:?} at {}..{} (occurrence {})", region.source, span.start, span.end, ordinal.0)
+                };
+                let identity = topology
+                    .identities
+                    .members
+                    .get(&ordinal)
+                    .ok_or_else(|| missing("identity"))?;
+                let ty = topology
+                    .structure
+                    .checked_types
+                    .expressions
+                    .get(&ordinal)
+                    .ok_or_else(|| missing("type"))?;
+                nodes.members.insert(
+                    std::ptr::from_ref(expression),
+                    BoundInitializerMember { identity, ty },
+                );
+                return Ok(());
+            }
             let target = topology
                 .call_targets
                 .get(&ordinal)
@@ -89,6 +127,24 @@ impl<'a> InitializerCallNodes<'a> {
                 )
             })
     }
+
+    pub(crate) fn member(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Result<BoundInitializerMember<'a>, String> {
+        self.members
+            .get(&std::ptr::from_ref(expression))
+            .copied()
+            .ok_or_else(|| {
+                let ScalarExpression::Member { name_span, .. } = expression else {
+                    unreachable!("member expression")
+                };
+                format!(
+                    "internal error: missing canonical initializer member node in {:?} at {}..{}",
+                    self.source, name_span.start, name_span.end
+                )
+            })
+    }
 }
 
 pub(crate) struct CallableBodyCallNodes<'a> {
@@ -120,6 +176,9 @@ impl<'a> CallableBodyCallNodes<'a> {
             body: PhantomData,
         };
         let mut bind_call = |ordinal: OccurrenceOrdinal, expression: &'a ScalarExpression| {
+            if matches!(expression, ScalarExpression::Member { .. }) {
+                return Ok(());
+            }
             let target = targets_by_ordinal.get(&ordinal).copied().ok_or_else(|| {
                 let span = calls.occurrences[ordinal.0].span;
                 format!(
@@ -231,8 +290,8 @@ impl<'a> Binder<'a, '_> {
                     self.expression(parent, Edge::AggregateElement(index), element)?;
                 }
             }
+            ScalarExpression::Member { .. } => (self.bind_call)(ordinal, expression)?,
             ScalarExpression::Name { .. }
-            | ScalarExpression::Member { .. }
             | ScalarExpression::Integer { .. }
             | ScalarExpression::InvalidInteger { .. }
             | ScalarExpression::Float { .. }
