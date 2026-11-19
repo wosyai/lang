@@ -187,6 +187,16 @@ impl<'a> ScalarInferenceBuilder<'a> {
         arguments
     }
 
+    pub(super) fn probe_raw_dereference(
+        &mut self,
+        check_pointer: impl FnOnce(&mut Self) -> ScalarType,
+    ) -> bool {
+        let previous = std::mem::replace(&mut self.suppress_checked_occurrences, true);
+        let is_raw = matches!(check_pointer(self), ScalarType::RawPointer(_));
+        self.suppress_checked_occurrences = previous;
+        is_raw
+    }
+
     pub(super) fn record_expression_type(
         &mut self,
         expression: &ScalarExpression,

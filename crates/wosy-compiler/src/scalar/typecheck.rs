@@ -827,6 +827,7 @@ fn assignment_type_in_module(
                     diagnostics,
                 ) {
                     scope.insert(name.clone(), output.ty.clone());
+                    inference.record_place_type(&target.place, &output.ty);
                 }
             }
         }
@@ -879,6 +880,7 @@ fn assignment_target_type_in_module(
                     target.target_span,
                 ));
             }
+            inference.record_place_type(&target.place, &expected);
             return Some(expected);
         }
     }
@@ -892,6 +894,9 @@ fn assignment_target_type_in_module(
                     "assignment targets a SCREAMING_SNAKE_CASE const binding",
                     *span,
                 ));
+            }
+            if let Some(ty) = &expected {
+                inference.record_place_type(&target.place, ty);
             }
             expected
         }
@@ -4471,7 +4476,7 @@ fn writable_place_contains_raw_dereference(
                 inference,
             )
         }
-        ScalarPlace::Dereference { pointer, .. } => matches!(
+        ScalarPlace::Dereference { pointer, .. } => inference.probe_raw_dereference(|inference| {
             expression_type(
                 pointer,
                 scope,
@@ -4482,9 +4487,8 @@ fn writable_place_contains_raw_dereference(
                 true,
                 overloads,
                 inference,
-            ),
-            ScalarType::RawPointer(_)
-        ),
+            )
+        }),
     }
 }
 
@@ -4510,7 +4514,7 @@ fn writable_place_contains_raw_dereference_in_module(
                 inference,
             )
         }
-        ScalarPlace::Dereference { pointer, .. } => matches!(
+        ScalarPlace::Dereference { pointer, .. } => inference.probe_raw_dereference(|inference| {
             expression_type_in_module(
                 pointer,
                 scope,
@@ -4522,9 +4526,8 @@ fn writable_place_contains_raw_dereference_in_module(
                 true,
                 overloads,
                 inference,
-            ),
-            ScalarType::RawPointer(_)
-        ),
+            )
+        }),
     }
 }
 
@@ -4536,9 +4539,9 @@ fn writable_path_type(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    match place {
+    let ty = match place {
         ScalarPlace::Name { .. } => {
-            place_type(place, scope, program, diagnostics, overloads, inference)
+            check_place_type(place, scope, program, diagnostics, overloads, inference)
         }
         ScalarPlace::Dereference { pointer, span } => match expression_type(
             pointer,
@@ -4632,7 +4635,9 @@ fn writable_path_type(
                 }
             }
         }
-    }
+    };
+    inference.record_place_type(place, &ty);
+    ty
 }
 
 fn writable_path_type_in_module(
@@ -4644,8 +4649,8 @@ fn writable_path_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    match place {
-        ScalarPlace::Name { .. } => place_type_in_module(
+    let ty = match place {
+        ScalarPlace::Name { .. } => check_place_type_in_module(
             place,
             scope,
             module,
@@ -4776,7 +4781,9 @@ fn writable_path_type_in_module(
                 }
             }
         }
-    }
+    };
+    inference.record_place_type(place, &ty);
+    ty
 }
 
 pub(super) fn place_type(
@@ -6888,6 +6895,7 @@ fn assignment_type(
                     diagnostics,
                 ) {
                     scope.insert(name.clone(), output.ty.clone());
+                    inference.record_place_type(&target.place, &output.ty);
                 }
             }
         }
@@ -6913,6 +6921,9 @@ fn assignment_target_type(
                     "assignment targets a SCREAMING_SNAKE_CASE const binding",
                     *span,
                 ));
+            }
+            if let Some(ty) = &expected {
+                inference.record_place_type(&target.place, ty);
             }
             expected
         }

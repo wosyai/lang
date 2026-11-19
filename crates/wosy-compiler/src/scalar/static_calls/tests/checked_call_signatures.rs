@@ -99,6 +99,142 @@ fn public_prepare_retains_checked_expression_and_place_types_by_occurrence() {
     }
 }
 
+fn place_child(structure: &OccurrenceStructure, parent: Parent, edge: Edge) -> OccurrenceOrdinal {
+    let Node::Place(ordinal) = structure.edges[&(parent, edge)] else {
+        panic!("place occurrence")
+    };
+    ordinal
+}
+
+fn destination(structure: &OccurrenceStructure, item: usize) -> OccurrenceOrdinal {
+    place_child(
+        structure,
+        Parent::Block(structure.root),
+        Edge::AssignmentDestination {
+            item,
+            destination: 0,
+        },
+    )
+}
+
+#[test]
+fn prepare_retains_checked_assignment_destination_paths() {
+    let parsed = parsed(
+        "%%start
+struct Record { u8 value; u8[2] bytes; }
+unit(*!Record, *!u16) run = fn(writer, number) {
+    u8 existing = 0;
+    existing = 1;
+    inferred = true;
+    u8[2] cells = [1, 2];
+    cells[0] = 3;
+    (*writer).value = 4;
+    (*writer).bytes[1] = 5;
+    *number = 6;
+    existing; inferred; cells;
+};
+%%end",
+    );
+    let check = |structure: &OccurrenceStructure| {
+        let types = &structure.checked_types;
+        let base = |place| place_child(structure, Parent::Place(place), Edge::PlaceBase);
+        let array = |place| {
+            assert!(matches!(
+                &types.places[&place],
+                ScalarType::Array { element, length: 2, .. } if **element == ScalarType::U8
+            ));
+        };
+        let mutable_pointer = |place, inner: &ScalarType| {
+            let pointer = child(structure, Parent::Place(place), Edge::DereferencePointer);
+            assert!(matches!(
+                &types.expressions[&pointer],
+                ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner: checked }
+                    if checked.as_ref() == inner
+            ));
+        };
+        let index = |place| {
+            let selector = child(structure, Parent::Place(place), Edge::PlaceIndex);
+            assert_eq!(types.expressions[&selector], ScalarType::U64);
+        };
+        assert_eq!(types.places[&destination(structure, 1)], ScalarType::U8);
+        assert_eq!(types.places[&destination(structure, 2)], ScalarType::Bool);
+
+        let cell = destination(structure, 4);
+        let field = destination(structure, 5);
+        let byte = destination(structure, 6);
+        for place in [cell, field, byte] {
+            assert_eq!(types.places[&place], ScalarType::U8);
+        }
+        for place in [cell, byte] {
+            array(base(place));
+            index(place);
+        }
+        let record = &types.places[&base(field)];
+        assert!(matches!(record, ScalarType::Struct(_)));
+        assert_eq!(&types.places[&base(base(byte))], record);
+        mutable_pointer(base(field), record);
+        mutable_pointer(base(base(byte)), record);
+
+        let scalar = destination(structure, 7);
+        assert_eq!(types.places[&scalar], ScalarType::U16);
+        mutable_pointer(scalar, &ScalarType::U16);
+    };
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let project = prepare_extracted(&parsed, target_layout);
+        check(&project.calls.function(0, 0).structure);
+        let program = PreparedProgram::new(
+            derive_scalar_declarations_from_cst(parsed.canonical_cst()),
+            target_layout,
+        )
+        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        check(&program.calls.as_ref().unwrap().function(0).structure);
+    }
+}
+
+#[test]
+fn prepare_retains_checked_namespace_assignment_destination() {
+    let main = parsed(
+        "%%start\nimported = namespace package \"values.w\";\n\
+         unit() run = fn { imported.value = 4; };\n%%end",
+    );
+    let dependency = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "values.w".into(),
+        "r1".into(),
+    );
+    let values = parse_source(
+        dependency.clone(),
+        "%%start\nu16 value = 1;\n%%end".into(),
+        &[],
+    );
+    assert!(values.diagnostics.is_empty(), "{:?}", values.diagnostics);
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let main_declarations = derive_scalar_declarations_from_cst(main.canonical_cst());
+        let namespace = main_declarations.namespaces().next().unwrap();
+        let binding = ScalarNamespaceBinding {
+            binding: namespace.binding.clone(),
+            target: dependency.clone(),
+            span: namespace.span,
+        };
+        let project = crate::prepare_scalar_project(
+            vec![
+                (main_declarations, vec![binding]),
+                (
+                    derive_scalar_declarations_from_cst(values.result.canonical_cst()),
+                    Vec::new(),
+                ),
+            ],
+            vec![dependency.clone(), main.source.clone()],
+            crate::ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        let structure = &project.calls.function(0, 1).structure;
+        let place = destination(structure, 0);
+        assert_eq!(structure.checked_types.places[&place], ScalarType::U16);
+    }
+}
+
 fn assert_signature(
     row: &CheckedCallSignature,
     parameters: &[ScalarType],
