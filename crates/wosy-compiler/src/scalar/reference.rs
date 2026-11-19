@@ -18,6 +18,39 @@ use super::*;
 mod input_tests;
 
 #[cfg(test)]
+pub(super) mod call_site_comparisons {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ACTIVE: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(in crate::scalar) struct Scope(Option<usize>);
+
+    impl Scope {
+        pub(in crate::scalar) fn new() -> Self {
+            Self(ACTIVE.replace(Some(0)))
+        }
+
+        pub(in crate::scalar) fn count(&self) -> usize {
+            ACTIVE.get().expect("active call-site comparisons")
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            ACTIVE.set(self.0);
+        }
+    }
+
+    pub(super) fn record() {
+        if let Some(count) = ACTIVE.get() {
+            ACTIVE.set(Some(count + 1));
+        }
+    }
+}
+
+#[cfg(test)]
 pub(in crate::scalar) mod stage_observations {
     use super::*;
 
@@ -4361,12 +4394,30 @@ fn resolve_project_call_sites_impl(
     }
 }
 
+#[derive(Eq, PartialEq)]
+struct CallSiteSpan(ByteSpan);
+
+impl Ord for CallSiteSpan {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        #[cfg(test)]
+        call_site_comparisons::record();
+        (self.0.start, self.0.end).cmp(&(other.0.start, other.0.end))
+    }
+}
+
+impl PartialOrd for CallSiteSpan {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 struct CallableWalk<'a> {
     source: &'a SourceIdentity,
     function_span: ByteSpan,
     declarations: &'a CallDeclarationIndex<'a>,
     assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
     sites: Vec<ResolvedCallSite>,
+    site_by_span: BTreeMap<CallSiteSpan, usize>,
     call_occurrences: Vec<CallOccurrence>,
     query_allocation_outputs: HashMap<(BlockOrdinal, usize), BindingOutputs>,
 }
@@ -4498,6 +4549,8 @@ impl CallableWalk<'_> {
         names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
     ) -> Result<(), ReferenceAnalysisError> {
+        use std::collections::btree_map::Entry;
+
         let ScalarExpression::Call {
             receiver,
             receiver_span,
@@ -4562,27 +4615,23 @@ impl CallableWalk<'_> {
                 })
         };
         let target = target.ok_or_else(missing)?;
-        let site = ResolvedCallSite {
-            source_span: SourceSpan::new(self.source.clone(), *span),
-            target,
-        };
-        let site_index = if let Some((index, existing)) = self
-            .sites
-            .iter()
-            .enumerate()
-            .find(|(_, existing)| existing.source_span == site.source_span)
-        {
-            if existing.target != site.target {
-                return Err(ReferenceAnalysisError::MissingContext {
-                    source_span: site.source_span,
-                    reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
-                });
+        let site_index = match self.site_by_span.entry(CallSiteSpan(*span)) {
+            Entry::Occupied(entry) => {
+                let index = *entry.get();
+                if self.sites[index].target != target {
+                    return Err(missing());
+                }
+                index
             }
-            index
-        } else {
-            let index = self.sites.len();
-            self.sites.push(site);
-            index
+            Entry::Vacant(entry) => {
+                let index = self.sites.len();
+                self.sites.push(ResolvedCallSite {
+                    source_span: SourceSpan::new(self.source.clone(), *span),
+                    target,
+                });
+                entry.insert(index);
+                index
+            }
         };
         self.call_occurrences.push(CallOccurrence {
             ordinal,
@@ -5497,6 +5546,7 @@ fn resolve_function_call_sites(
         declarations,
         assignment_outputs,
         sites: Vec::new(),
+        site_by_span: BTreeMap::new(),
         call_occurrences: Vec::new(),
         query_allocation_outputs: HashMap::new(),
     };

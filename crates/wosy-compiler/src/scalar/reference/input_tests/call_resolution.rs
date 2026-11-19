@@ -280,6 +280,40 @@ fn standalone_call_lookup_borrows_actual_inputs_and_preserves_complete_indirect_
 }
 
 #[test]
+fn same_callable_equal_call_spans_with_different_targets_keep_exact_diagnostic() {
+    let text = "%%start\nbool(bool) first = fn(flag) { flag };\nbool(bool) second = fn(flag) { flag };\nunit() probe = fn() { first(true); second(true); };\n%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let typed = typecheck_scalar_program(
+            derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+            target,
+        );
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let mut program = typed.program;
+        let ScalarItem::Function(probe) = &mut program.items[2] else {
+            panic!("probe")
+        };
+        let [ScalarBlockItem::Expression(ScalarExpression::Call { span: first, .. }), ScalarBlockItem::Expression(ScalarExpression::Call { span: second, .. })] =
+            probe.body.items.as_mut_slice()
+        else {
+            panic!("two independent calls")
+        };
+        let span = *first;
+        assert_ne!(span, *second);
+        *second = span;
+
+        assert_eq!(
+            resolve_program_call_sites(&program).unwrap_err(),
+            ReferenceAnalysisError::MissingContext {
+                source_span: SourceSpan::new(program.source.clone(), span),
+                reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
+            }
+        );
+    }
+}
+
+#[test]
 fn standalone_lookup_failure_keeps_exact_spanned_invariant_diagnostic() {
     let text = "%%start\ni32(i32) identity = fn(input) { input };\ni32(i32) caller = fn(input) { identity(input) };\n%%end";
     for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {

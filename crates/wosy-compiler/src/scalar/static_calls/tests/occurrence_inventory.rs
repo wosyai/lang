@@ -5,6 +5,67 @@ use reference::{
 use reference::{CallOccurrence, OccurrenceOrdinal, OccurrenceRole};
 
 #[test]
+fn preparation_bounds_legacy_site_key_comparisons_as_calls_grow() {
+    const CALL: &str = "echo(true)";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let mut previous = None;
+        for count in [128_usize, 256, 512] {
+            let mut text = String::from(
+                "%%start\nbool(bool) echo = fn(flag) { flag };\nunit() probe = fn() {\n",
+            );
+            let spans = (0..count)
+                .map(|_| {
+                    let start = text.len() as u32;
+                    text.push_str(CALL);
+                    let end = text.len() as u32;
+                    text.push_str(";\n");
+                    ByteSpan::new(start, end)
+                })
+                .collect::<Vec<_>>();
+            text.push_str("};\n%%end");
+            let parsed = parsed(&text);
+            let (prepared, comparisons) = {
+                let scope = reference::call_site_comparisons::Scope::new();
+                (prepare_extracted(&parsed, target), scope.count())
+            };
+            let row = prepared.calls.function(0, 1);
+            assert_eq!(row.sites.len(), count);
+            assert_eq!(row.call_occurrences.len(), count);
+            assert_eq!(row.occurrences.len(), 2 * count);
+            for (index, span) in spans.into_iter().enumerate() {
+                let ordinal = OccurrenceOrdinal(2 * index);
+                assert_eq!(
+                    row.call_occurrences[index],
+                    CallOccurrence {
+                        ordinal,
+                        site: index,
+                    }
+                );
+                assert_eq!(row.occurrences[ordinal.0].span, span);
+                assert_eq!(
+                    row.sites[index].source_span,
+                    SourceSpan::new(parsed.source.clone(), span)
+                );
+            }
+
+            eprintln!("{target:?}: {count} calls, {comparisons} site key comparisons");
+            let bound = 5 * count * count.ilog2() as usize;
+            assert!(
+                (count - 1..=bound).contains(&comparisons),
+                "{target:?}: {count} calls took {comparisons} comparisons (bound {bound})"
+            );
+            if let Some(previous) = previous {
+                assert!(
+                    comparisons < 3 * previous,
+                    "{target:?}: {previous} -> {comparisons}"
+                );
+            }
+            previous = Some(comparisons);
+        }
+    }
+}
+
+#[test]
 fn preparation_publishes_stable_callable_owned_expression_place_and_call_ordinals() {
     let text = "%%start\nu8 padding = 0;\nbool(bool) echo = fn(flag) { flag };\n(u8, bool)(bool) pair = fn(flag) { u8 value = 1; value, flag };\nu64(bool) index = fn(flag) { flag; 0 };\nprobe = overload { unit(bool) => fn(flag) { u8 a, bool valid = pair(echo(flag)); a; valid; u8[2] cells = [1, 2]; if (flag) { echo(flag); } else { echo(flag); }; cells[index(flag)] = a; cells; }; unit(u8) => fn(byte) { byte; }; };\n%%end";
     let mut expected_inventory = None;
