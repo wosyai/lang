@@ -152,12 +152,10 @@ u64 wide = core.int_extend<u64>(third);
             let span = topology.occurrences[ordinal.0].span;
             assert_eq!(&text[span.start as usize..span.end as usize], spelling);
             assert_eq!(initialization.call_target(ordinal), Some(&selection));
-            if !matches!(selection, Target::Core(_)) {
-                assert!(
-                    topology.checked_call_signatures.contains_key(&ordinal),
-                    "{spelling}"
-                );
-            }
+            assert!(
+                topology.checked_call_signatures.contains_key(&ordinal),
+                "{spelling}"
+            );
         }
     }
 }
@@ -794,6 +792,267 @@ fn prepare_publishes_checked_core_memory_signatures_in_initialization_and_functi
                 ..Counts::default()
             }
         );
+    }
+}
+
+#[test]
+fn prepare_publishes_checked_core_value_signatures_in_initialization_and_functions() {
+    use crate::scalar::control::ModuleInitializationCallTarget as Target;
+    use CoreOperationId::*;
+    use ScalarType::*;
+
+    let body = "
+        u64 extended = core.int_extend<u64>(1);
+        u8 truncated = core.int_trunc<u8>(1);
+        f64 from_unsigned = core.uint_to_float<f64>(42);
+        f32 from_signed = core.sint_to_float<f32>(-3);
+        i32 to_signed = core.float_to_sint_trunc<i32>(from_unsigned);
+        u64 to_unsigned = core.float_to_uint_trunc<u64>(from_signed);
+        f32 narrow = core.float_trunc<f32>(1.5);
+        f64 wide = core.float_extend<f64>(1.5);
+        u32 bits = core.bitcast<u32>('a');
+        artifact_id current = core.this_artifact_id();
+        extended; truncated; to_signed; to_unsigned; narrow; wide; bits; current;
+        unsafe {
+            u16 slot = 0;
+            *?u16 raw = &?slot;
+            *?u16 next = core.offset<u16>(raw, -1);
+            u16 loaded = core.load<u16>(next);
+            *?u8 cast = core.pointer_cast<*?u8>(raw);
+            *u16 checked = core.pointer_cast<*u16>(raw);
+            loaded; cast; checked;
+        };";
+    let text = format!("%%start\nunit() run = fn {{ {body} }};\nunsafe {{ {body} }};\n%%end");
+    let parsed = parsed(&text);
+    let raw_u16 = RawPointer(Box::new(U16));
+    let raw_u8 = RawPointer(Box::new(U8));
+    let shared_u16 = CheckedReference {
+        mutability: ScalarReferenceMutability::Shared,
+        inner: Box::new(U16),
+    };
+    let expected: [(_, _, &[ScalarType], _); 14] = [
+        ("core.int_extend<u64>(1)", IntExtend, &[I32], U64),
+        ("core.int_trunc<u8>(1)", IntTrunc, &[I64], U8),
+        ("core.uint_to_float<f64>(42)", UintToFloat, &[U32], F64),
+        ("core.sint_to_float<f32>(-3)", SintToFloat, &[I32], F32),
+        (
+            "core.float_to_sint_trunc<i32>(from_unsigned)",
+            FloatToSintTrunc,
+            &[F64],
+            I32,
+        ),
+        (
+            "core.float_to_uint_trunc<u64>(from_signed)",
+            FloatToUintTrunc,
+            &[F32],
+            U64,
+        ),
+        ("core.float_trunc<f32>(1.5)", FloatTrunc, &[F64], F32),
+        ("core.float_extend<f64>(1.5)", FloatExtend, &[F32], F64),
+        ("core.bitcast<u32>('a')", Bitcast, &[Char], U32),
+        ("core.this_artifact_id()", ThisArtifactId, &[], ArtifactId),
+        (
+            "core.offset<u16>(raw, -1)",
+            Offset,
+            &[raw_u16.clone(), I64],
+            raw_u16.clone(),
+        ),
+        (
+            "core.load<u16>(next)",
+            Load,
+            std::slice::from_ref(&raw_u16),
+            U16,
+        ),
+        (
+            "core.pointer_cast<*?u8>(raw)",
+            PointerCast,
+            std::slice::from_ref(&raw_u16),
+            raw_u8,
+        ),
+        (
+            "core.pointer_cast<*u16>(raw)",
+            PointerCast,
+            std::slice::from_ref(&raw_u16),
+            shared_u16,
+        ),
+    ];
+    let check = |initialization: &control::ModuleInitializationRegion,
+                 function: &FunctionCallSites| {
+        let ModuleInitializationDetail::Occurrences(topology) = &initialization.detail else {
+            panic!("module initialization occurrences")
+        };
+        assert_eq!(topology.calls.len(), expected.len());
+        assert_eq!(function.call_occurrences.len(), expected.len());
+        for ((&module_call, function_call), (spelling, operation, parameters, output)) in topology
+            .calls
+            .iter()
+            .zip(&function.call_occurrences)
+            .zip(&expected)
+        {
+            assert_eq!(
+                initialization.call_target(module_call),
+                Some(&Target::Core(*operation))
+            );
+            assert_eq!(
+                function.sites[function_call.site].target,
+                ResolvedCallTarget::Core(*operation)
+            );
+            for (structure, ordinal, span, signature) in [
+                (
+                    &topology.structure,
+                    module_call,
+                    topology.occurrences[module_call.0].span,
+                    topology.checked_call_signatures.get(&module_call),
+                ),
+                (
+                    &function.structure,
+                    function_call.ordinal,
+                    function.occurrences[function_call.ordinal.0].span,
+                    function.checked_call_signatures.get(&function_call.ordinal),
+                ),
+            ] {
+                let signature =
+                    signature.unwrap_or_else(|| panic!("missing signature for {spelling}"));
+                assert_eq!(signature.outputs.span, span);
+                assert_eq!(&text[span.start as usize..span.end as usize], *spelling);
+                assert_signature(signature, parameters, std::slice::from_ref(output), None);
+                assert_eq!(&structure.checked_types.expressions[&ordinal], output);
+                for (position, parameter) in parameters.iter().enumerate() {
+                    let argument = child(
+                        structure,
+                        Parent::Expression(ordinal),
+                        Edge::CallArgument(position),
+                    );
+                    assert_eq!(&structure.checked_types.expressions[&argument], parameter);
+                }
+            }
+        }
+    };
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let project = prepare_extracted(&parsed, target);
+        check(
+            project.initialization_region(0).unwrap(),
+            project.calls.function(0, 0),
+        );
+        let program = PreparedProgram::new(
+            derive_scalar_declarations_from_cst(parsed.canonical_cst()),
+            target,
+        )
+        .unwrap_or_else(|failure| panic!("{target:?}: {:?}", failure.diagnostics));
+        let calls = program.calls.as_ref().unwrap();
+        check(&calls.initialization, calls.function(0));
+    }
+}
+
+#[test]
+fn prepare_publishes_declare_artifact_signature_only_with_checked_utf8_context() {
+    use crate::scalar::control::ModuleInitializationCallTarget as Target;
+
+    let body = "artifact_id initial = core.declare_artifact(\"module\");
+                artifact_id() run = fn { core.declare_artifact(\"callable\") };";
+    let main = parsed(&format!(
+        "%%start\nstd = namespace std \"bootstrap.w\";\n{body}\n%%end"
+    ));
+    let standalone = parsed(&format!("%%start\n{body}\n%%end"));
+    let std_source = SourceIdentity::new(
+        "project".into(),
+        "std".into(),
+        "bootstrap.w".into(),
+        "r1".into(),
+    );
+    let std = parse_source(
+        std_source.clone(),
+        "%%start\nstruct utf8 { *?u8 data; u64 length; }\n%%end".into(),
+        &[],
+    );
+    assert!(std.diagnostics.is_empty(), "{:?}", std.diagnostics);
+
+    let check = |initialization: &control::ModuleInitializationRegion,
+                 function: &FunctionCallSites,
+                 utf8: Option<&ScalarType>| {
+        let ModuleInitializationDetail::Occurrences(topology) = &initialization.detail else {
+            panic!("module initialization occurrences")
+        };
+        let [module_call] = topology.calls.as_slice() else {
+            panic!("one initialization call")
+        };
+        let [function_call] = function.call_occurrences.as_slice() else {
+            panic!("one callable call")
+        };
+        let operation = CoreOperationId::DeclareArtifact;
+        assert_eq!(
+            initialization.call_target(*module_call),
+            Some(&Target::Core(operation))
+        );
+        assert_eq!(
+            function.sites[function_call.site].target,
+            ResolvedCallTarget::Core(operation)
+        );
+        for (structure, ordinal, signature) in [
+            (
+                &topology.structure,
+                *module_call,
+                topology.checked_call_signatures.get(module_call),
+            ),
+            (
+                &function.structure,
+                function_call.ordinal,
+                function.checked_call_signatures.get(&function_call.ordinal),
+            ),
+        ] {
+            let argument = child(
+                structure,
+                Parent::Expression(ordinal),
+                Edge::CallArgument(0),
+            );
+            assert_eq!(structure.checked_types.expressions.get(&argument), utf8);
+            if let Some(utf8) = utf8 {
+                assert_signature(
+                    signature.expect("checked artifact declaration signature"),
+                    std::slice::from_ref(utf8),
+                    &[ScalarType::ArtifactId],
+                    None,
+                );
+            } else {
+                assert_eq!(signature, None);
+            }
+        }
+    };
+
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let declarations = derive_scalar_declarations_from_cst(main.canonical_cst());
+        let namespace = declarations.namespaces().next().unwrap();
+        let binding = ScalarNamespaceBinding {
+            binding: namespace.binding.clone(),
+            target: std_source.clone(),
+            span: namespace.binding_span,
+        };
+        let project = crate::prepare_scalar_project(
+            vec![
+                (declarations, vec![binding]),
+                (
+                    derive_scalar_declarations_from_cst(std.result.canonical_cst()),
+                    Vec::new(),
+                ),
+            ],
+            vec![std_source.clone(), main.source.clone()],
+            crate::ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|failure| panic!("{target_layout:?}: {:?}", failure.diagnostics));
+        let utf8 = ScalarType::Struct(project.project().modules[1].structs[0].id.clone());
+        check(
+            project.initialization_region(0).unwrap(),
+            project.calls.function(0, 2),
+            Some(&utf8),
+        );
+
+        let program = PreparedProgram::new(
+            derive_scalar_declarations_from_cst(standalone.canonical_cst()),
+            target_layout,
+        )
+        .unwrap_or_else(|failure| panic!("{target_layout:?}: {:?}", failure.diagnostics));
+        let calls = program.calls.as_ref().unwrap();
+        check(&calls.initialization, calls.function(1), None);
     }
 }
 

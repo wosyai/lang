@@ -256,14 +256,17 @@ impl<'a> ScalarInferenceBuilder<'a> {
         self.insert_checked_call(expression, parameters.to_vec(), outputs.clone(), overload);
     }
 
-    pub(super) fn record_core_memory_signature(
+    pub(super) fn record_core_call_signature(
         &mut self,
         expression: &ScalarExpression,
         parameters: Vec<ScalarType>,
         result: &ScalarType,
         span: ByteSpan,
     ) {
-        if self.suppress_checked_occurrences || parameters.iter().any(contains_error_type) {
+        if self.suppress_checked_occurrences
+            || contains_error_type(result)
+            || parameters.iter().any(contains_error_type)
+        {
             return;
         }
         let outputs = ScalarOutputSequence {

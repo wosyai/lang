@@ -1756,7 +1756,7 @@ fn type_core_memory_in_module(
         _ => unreachable!(),
     };
     if diagnostics.len() == diagnostics_before_call {
-        inference.record_core_memory_signature(expression, parameters, &result, span);
+        inference.record_core_call_signature(expression, parameters, &result, span);
     }
     result
 }
@@ -1963,12 +1963,13 @@ fn type_core_memory(
         _ => unreachable!(),
     };
     if diagnostics.len() == diagnostics_before_call {
-        inference.record_core_memory_signature(expression, parameters, &result, span);
+        inference.record_core_call_signature(expression, parameters, &result, span);
     }
     result
 }
 
 fn type_core_int_conversion_in_module(
+    expression: &ScalarExpression,
     operation: &str,
     type_arguments: &[ScalarTypeArgument],
     arguments: &[ScalarExpression],
@@ -2011,6 +2012,7 @@ fn type_core_int_conversion_in_module(
         ));
         return ScalarType::Error;
     }
+    let diagnostics_before_call = diagnostics.len();
     let source_context = integer_conversion_source_context(operation, destination, &arguments[0]);
     let actual = expression_type_in_module_expected(
         &arguments[0],
@@ -2052,6 +2054,9 @@ fn type_core_int_conversion_in_module(
     if is_error_type(&actual) || source_width.is_none() {
         ScalarType::Error
     } else {
+        if diagnostics.len() == diagnostics_before_call {
+            inference.record_core_call_signature(expression, vec![actual], destination, span);
+        }
         destination.clone()
     }
 }
@@ -2065,6 +2070,7 @@ fn is_bitcast_scalar(ty: &ScalarType) -> bool {
 }
 
 fn type_core_bitcast_in_module(
+    expression: &ScalarExpression,
     operation: &str,
     type_arguments: &[ScalarTypeArgument],
     arguments: &[ScalarExpression],
@@ -2107,6 +2113,7 @@ fn type_core_bitcast_in_module(
         ));
         return ScalarType::Error;
     }
+    let diagnostics_before_call = diagnostics.len();
     let actual = expression_type_in_module_expected(
         &arguments[0],
         None,
@@ -2148,10 +2155,14 @@ fn type_core_bitcast_in_module(
         ));
         return ScalarType::Error;
     }
+    if diagnostics.len() == diagnostics_before_call {
+        inference.record_core_call_signature(expression, vec![actual], destination, span);
+    }
     destination.clone()
 }
 
 fn type_core_pointer_cast_in_module(
+    expression: &ScalarExpression,
     operation: &str,
     type_arguments: &[ScalarTypeArgument],
     arguments: &[ScalarExpression],
@@ -2166,6 +2177,7 @@ fn type_core_pointer_cast_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    let diagnostics_before_call = diagnostics.len();
     if !unsafe_context {
         diagnostics.push(module_diagnostic(
             module,
@@ -2231,6 +2243,9 @@ fn type_core_pointer_cast_in_module(
         ));
         return ScalarType::Error;
     }
+    if diagnostics.len() == diagnostics_before_call {
+        inference.record_core_call_signature(expression, vec![actual], destination, span);
+    }
     destination.clone()
 }
 fn float_conversion_destination_matches(operation: &str, destination: &ScalarType) -> bool {
@@ -2283,6 +2298,7 @@ fn float_conversion_direction_mismatched(
 }
 
 fn type_core_float_conversion_in_module(
+    expression: &ScalarExpression,
     operation: &str,
     type_arguments: &[ScalarTypeArgument],
     arguments: &[ScalarExpression],
@@ -2325,6 +2341,7 @@ fn type_core_float_conversion_in_module(
         ));
         return ScalarType::Error;
     }
+    let diagnostics_before_call = diagnostics.len();
     let source_context = integer_conversion_source_context(operation, destination, &arguments[0]);
     let actual = expression_type_in_module_expected(
         &arguments[0],
@@ -2359,11 +2376,15 @@ fn type_core_float_conversion_in_module(
     if is_error_type(&actual) || !source_valid {
         ScalarType::Error
     } else {
+        if diagnostics.len() == diagnostics_before_call {
+            inference.record_core_call_signature(expression, vec![actual], destination, span);
+        }
         destination.clone()
     }
 }
 
 fn type_core_float_conversion(
+    expression: &ScalarExpression,
     operation: &str,
     type_arguments: &[ScalarTypeArgument],
     arguments: &[ScalarExpression],
@@ -2405,6 +2426,7 @@ fn type_core_float_conversion(
         ));
         return ScalarType::Error;
     }
+    let diagnostics_before_call = diagnostics.len();
     let source_context = integer_conversion_source_context(operation, destination, &arguments[0]);
     let actual = match source_context {
         Some(source) => expression_type_expected(
@@ -2451,11 +2473,15 @@ fn type_core_float_conversion(
     if is_error_type(&actual) || !source_valid {
         ScalarType::Error
     } else {
+        if diagnostics.len() == diagnostics_before_call {
+            inference.record_core_call_signature(expression, vec![actual], destination, span);
+        }
         destination.clone()
     }
 }
 
 fn type_core_int_conversion(
+    expression: &ScalarExpression,
     operation: &str,
     type_arguments: &[ScalarTypeArgument],
     arguments: &[ScalarExpression],
@@ -2497,6 +2523,7 @@ fn type_core_int_conversion(
         ));
         return ScalarType::Error;
     }
+    let diagnostics_before_call = diagnostics.len();
     let source_context = integer_conversion_source_context(operation, destination, &arguments[0]);
     let actual = match source_context {
         Some(source) => expression_type_expected(
@@ -2550,11 +2577,15 @@ fn type_core_int_conversion(
     if is_error_type(&actual) || source_width.is_none() {
         ScalarType::Error
     } else {
+        if diagnostics.len() == diagnostics_before_call {
+            inference.record_core_call_signature(expression, vec![actual], destination, span);
+        }
         destination.clone()
     }
 }
 
 fn type_core_bitcast(
+    expression: &ScalarExpression,
     operation: &str,
     type_arguments: &[ScalarTypeArgument],
     arguments: &[ScalarExpression],
@@ -2596,6 +2627,7 @@ fn type_core_bitcast(
         ));
         return ScalarType::Error;
     }
+    let diagnostics_before_call = diagnostics.len();
     let actual = expression_type(
         &arguments[0],
         scope,
@@ -2635,10 +2667,14 @@ fn type_core_bitcast(
         ));
         return ScalarType::Error;
     }
+    if diagnostics.len() == diagnostics_before_call {
+        inference.record_core_call_signature(expression, vec![actual], destination, span);
+    }
     destination.clone()
 }
 
 fn type_core_pointer_cast(
+    expression: &ScalarExpression,
     operation: &str,
     type_arguments: &[ScalarTypeArgument],
     arguments: &[ScalarExpression],
@@ -2652,6 +2688,7 @@ fn type_core_pointer_cast(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    let diagnostics_before_call = diagnostics.len();
     if !unsafe_context {
         diagnostics.push(diagnostic(
             program,
@@ -2716,9 +2753,13 @@ fn type_core_pointer_cast(
         ));
         return ScalarType::Error;
     }
+    if diagnostics.len() == diagnostics_before_call {
+        inference.record_core_call_signature(expression, vec![actual], destination, span);
+    }
     destination.clone()
 }
 fn type_core_raw_memory_in_module(
+    expression: &ScalarExpression,
     operation: &str,
     type_arguments: &[ScalarTypeArgument],
     arguments: &[ScalarExpression],
@@ -2733,6 +2774,7 @@ fn type_core_raw_memory_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    let diagnostics_before_call = diagnostics.len();
     if !unsafe_context {
         diagnostics.push(module_diagnostic(
             module,
@@ -2820,7 +2862,7 @@ fn type_core_raw_memory_in_module(
             }
         }
     }
-    if operation == "offset" {
+    let count = if operation == "offset" {
         let count = expression_type_in_module_expected(
             &arguments[1],
             Some(&ScalarType::I64),
@@ -2844,18 +2886,30 @@ fn type_core_raw_memory_in_module(
         if is_error_type(&count) {
             valid = false;
         }
-    }
+        Some(count)
+    } else {
+        None
+    };
     if !valid || is_error_type(&pointer) || is_error_type(pointee) {
         return ScalarType::Error;
     }
-    if operation == "offset" {
+    let result = if operation == "offset" {
         ScalarType::RawPointer(Box::new(pointee.clone()))
     } else {
         pointee.clone()
+    };
+    if diagnostics.len() == diagnostics_before_call {
+        let parameters = match count {
+            Some(count) => vec![pointer, count],
+            None => vec![pointer],
+        };
+        inference.record_core_call_signature(expression, parameters, &result, span);
     }
+    result
 }
 
 fn type_core_raw_memory(
+    expression: &ScalarExpression,
     operation: &str,
     type_arguments: &[ScalarTypeArgument],
     arguments: &[ScalarExpression],
@@ -2869,6 +2923,7 @@ fn type_core_raw_memory(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    let diagnostics_before_call = diagnostics.len();
     if !unsafe_context {
         diagnostics.push(diagnostic(
             program,
@@ -2955,7 +3010,7 @@ fn type_core_raw_memory(
             }
         }
     }
-    if operation == "offset" {
+    let count = if operation == "offset" {
         let count = expression_type_expected(
             &arguments[1],
             &ScalarType::I64,
@@ -2978,15 +3033,26 @@ fn type_core_raw_memory(
         if is_error_type(&count) {
             valid = false;
         }
-    }
+        Some(count)
+    } else {
+        None
+    };
     if !valid || is_error_type(&pointer) || is_error_type(pointee) {
         return ScalarType::Error;
     }
-    if operation == "offset" {
+    let result = if operation == "offset" {
         ScalarType::RawPointer(Box::new(pointee.clone()))
     } else {
         pointee.clone()
+    };
+    if diagnostics.len() == diagnostics_before_call {
+        let parameters = match count {
+            Some(count) => vec![pointer, count],
+            None => vec![pointer],
+        };
+        inference.record_core_call_signature(expression, parameters, &result, span);
     }
+    result
 }
 
 fn integer_conversion_source_context(
@@ -3511,7 +3577,9 @@ fn check_expression_type_in_module(
                     ));
                     return ScalarType::Error;
                 }
-                return ScalarType::ArtifactId;
+                let result = ScalarType::ArtifactId;
+                inference.record_core_call_signature(expression, Vec::new(), &result, *span);
+                return result;
             }
             if receiver.as_deref() == Some("core") && name == "declare_artifact" {
                 if arguments.len() != 1 {
@@ -3523,6 +3591,7 @@ fn check_expression_type_in_module(
                     ));
                     return ScalarType::Error;
                 }
+                let diagnostics_before_call = diagnostics.len();
                 let actual = expression_type_in_module_expected(
                     &arguments[0],
                     Some(&utf8_type_from_namespace_target(
@@ -3546,7 +3615,16 @@ fn check_expression_type_in_module(
                 return if is_error_type(&actual) {
                     ScalarType::Error
                 } else {
-                    ScalarType::ArtifactId
+                    let result = ScalarType::ArtifactId;
+                    if diagnostics.len() == diagnostics_before_call {
+                        inference.record_core_call_signature(
+                            expression,
+                            vec![actual],
+                            &result,
+                            *span,
+                        );
+                    }
+                    result
                 };
             }
             if receiver.as_deref() == Some("core")
@@ -3575,6 +3653,7 @@ fn check_expression_type_in_module(
                 && matches!(name.as_str(), "int_trunc" | "int_extend")
             {
                 return type_core_int_conversion_in_module(
+                    expression,
                     name,
                     type_arguments,
                     arguments,
@@ -3602,6 +3681,7 @@ fn check_expression_type_in_module(
                 )
             {
                 return type_core_float_conversion_in_module(
+                    expression,
                     name,
                     type_arguments,
                     arguments,
@@ -3619,6 +3699,7 @@ fn check_expression_type_in_module(
             }
             if receiver.as_deref() == Some("core") && name == "bitcast" {
                 return type_core_bitcast_in_module(
+                    expression,
                     name,
                     type_arguments,
                     arguments,
@@ -3636,6 +3717,7 @@ fn check_expression_type_in_module(
             }
             if receiver.as_deref() == Some("core") && matches!(name.as_str(), "offset" | "load") {
                 return type_core_raw_memory_in_module(
+                    expression,
                     name,
                     type_arguments,
                     arguments,
@@ -3653,6 +3735,7 @@ fn check_expression_type_in_module(
             }
             if receiver.as_deref() == Some("core") && name == "pointer_cast" {
                 return type_core_pointer_cast_in_module(
+                    expression,
                     name,
                     type_arguments,
                     arguments,
@@ -7922,7 +8005,9 @@ fn check_expression_type(
                     ));
                     return ScalarType::Error;
                 }
-                return ScalarType::ArtifactId;
+                let result = ScalarType::ArtifactId;
+                inference.record_core_call_signature(expression, Vec::new(), &result, *span);
+                return result;
             }
             if receiver.as_deref() == Some("core") && name == "declare_artifact" {
                 if arguments.len() != 1 {
@@ -7978,6 +8063,7 @@ fn check_expression_type(
                 && matches!(name.as_str(), "int_trunc" | "int_extend")
             {
                 return type_core_int_conversion(
+                    expression,
                     name,
                     type_arguments,
                     arguments,
@@ -8004,6 +8090,7 @@ fn check_expression_type(
                 )
             {
                 return type_core_float_conversion(
+                    expression,
                     name,
                     type_arguments,
                     arguments,
@@ -8020,6 +8107,7 @@ fn check_expression_type(
             }
             if receiver.as_deref() == Some("core") && name == "bitcast" {
                 return type_core_bitcast(
+                    expression,
                     name,
                     type_arguments,
                     arguments,
@@ -8036,6 +8124,7 @@ fn check_expression_type(
             }
             if receiver.as_deref() == Some("core") && matches!(name.as_str(), "offset" | "load") {
                 return type_core_raw_memory(
+                    expression,
                     name,
                     type_arguments,
                     arguments,
@@ -8052,6 +8141,7 @@ fn check_expression_type(
             }
             if receiver.as_deref() == Some("core") && name == "pointer_cast" {
                 return type_core_pointer_cast(
+                    expression,
                     name,
                     type_arguments,
                     arguments,
