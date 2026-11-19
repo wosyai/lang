@@ -657,40 +657,54 @@ impl<'a> ReferenceFlowBuilder<'a> {
     fn pointer_cast_origins(
         &mut self,
         raw: &ScalarExpression,
+        ordinal: OccurrenceOrdinal,
         mutability: ScalarReferenceMutability,
         span: ByteSpan,
     ) -> Result<BTreeSet<ReferenceOriginId>, ReferenceAnalysisError> {
-        let fact = if matches!(raw, ScalarExpression::Name { name, .. } if name == "null") {
+        let is_null = match raw {
+            ScalarExpression::Name { name, span } => {
+                match self.prepared_name_identity(ordinal, *span)? {
+                    Some(identity) => matches!(identity, PlainNameIdentity::Null),
+                    None => name == "null",
+                }
+            }
+            _ => false,
+        };
+        let fact = if is_null {
             ReferenceOrigin::Null { span }
         } else {
             let binding = match raw {
                 ScalarExpression::Name {
                     name,
                     span: raw_span,
-                } => self.binding(name, *raw_span)?,
-                ScalarExpression::RawAddress { place, .. }
-                    if matches!(reference_root(place), ScalarPlace::Name { .. }) =>
-                {
-                    let ScalarPlace::Name {
-                        name,
-                        span: raw_span,
-                    } = reference_root(place)
-                    else {
-                        unreachable!()
-                    };
-                    self.binding(name, *raw_span)?
+                } => Some(self.named_expression_binding(name, *raw_span, ordinal)?),
+                ScalarExpression::RawAddress { place, .. } => {
+                    let root = self.place_root(
+                        place,
+                        self.place_ordinal(
+                            OccurrenceParent::Expression(ordinal),
+                            OccurrenceEdge::ExpressionPlace,
+                        ),
+                    );
+                    match root.place {
+                        ScalarPlace::Name { name, span } => {
+                            Some(self.named_place_binding(name, *span, root.ordinal)?)
+                        }
+                        _ => None,
+                    }
                 }
-                _ => ReferenceBindingId {
-                    source: self.source.clone(),
-                    function_span: self.function_span,
-                    declaration_span: span,
-                    block_span: self.function_span,
-                    kind: ReferenceBindingKind::CallOutput {
-                        point: CfgPointId(self.cfg.points.len()),
-                        output: 0,
-                    },
-                },
+                _ => None,
             };
+            let binding = binding.unwrap_or_else(|| ReferenceBindingId {
+                source: self.source.clone(),
+                function_span: self.function_span,
+                declaration_span: span,
+                block_span: self.function_span,
+                kind: ReferenceBindingKind::CallOutput {
+                    point: CfgPointId(self.cfg.points.len()),
+                    output: 0,
+                },
+            });
             let place = match raw {
                 ScalarExpression::Name {
                     name,
@@ -982,18 +996,39 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let target = self.call_target(expression, ordinal)?;
                 let mut address = None;
                 let mut checked_release_address = None;
+                let mut named_release_binding = None;
                 let mut argument_points = Vec::new();
                 for (position, argument) in arguments.iter().enumerate() {
                     let ordinal =
                         self.expression_ordinal(parent, OccurrenceEdge::CallArgument(position));
                     self.expression(argument, scope, ordinal)?;
                     argument_points.push(self.cursor.expect("evaluated call argument"));
-                    if position == 0
-                        && target == ResolvedCallTarget::Core(CoreOperationId::Free)
-                        && (matches!(argument, ScalarExpression::CheckedAddress { .. })
-                            || matches!(argument, ScalarExpression::Name { name, .. } if self.names.get(name).is_some_and(|binding| self.checked.contains(binding))))
-                    {
-                        checked_release_address = self.cursor;
+                    if position == 0 && target == ResolvedCallTarget::Core(CoreOperationId::Free) {
+                        match argument {
+                            ScalarExpression::CheckedAddress { .. } => {
+                                checked_release_address = self.cursor
+                            }
+                            ScalarExpression::Name { name, span } => {
+                                named_release_binding = match self
+                                    .prepared_name_identity(ordinal, *span)?
+                                {
+                                    Some(PlainNameIdentity::Lexical(binding)) => {
+                                        Some(binding.clone())
+                                    }
+                                    Some(
+                                        PlainNameIdentity::Null | PlainNameIdentity::ModuleValue(_),
+                                    ) => None,
+                                    None => self.names.get(name).cloned(),
+                                };
+                                if named_release_binding
+                                    .as_ref()
+                                    .is_some_and(|binding| self.checked.contains(binding))
+                                {
+                                    checked_release_address = self.cursor;
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     if position == 0
                         && matches!(
@@ -1066,7 +1101,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         span: argument_span,
                     }] = arguments.as_slice()
                     {
-                        let binding = self.binding(place_name, *argument_span)?;
+                        let binding = named_release_binding
+                            .ok_or_else(|| self.missing_binding(place_name, *argument_span))?;
                         self.point(
                             CfgPointKind::Release {
                                 target: ReleaseTarget::Raw { binding },
@@ -1084,7 +1120,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     ) => match type_arguments.as_slice() {
                         [argument] => match &argument.ty {
                             ScalarType::CheckedReference { mutability, .. } => {
-                                Some(self.pointer_cast_origins(&arguments[0], *mutability, span)?)
+                                Some(self.pointer_cast_origins(
+                                    &arguments[0],
+                                    self.expression_ordinal(
+                                        parent,
+                                        OccurrenceEdge::CallArgument(0),
+                                    ),
+                                    *mutability,
+                                    span,
+                                )?)
                             }
                             _ => None,
                         },

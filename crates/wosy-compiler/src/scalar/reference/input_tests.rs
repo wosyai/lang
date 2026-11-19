@@ -28,6 +28,8 @@ mod projected_reads;
 
 mod address_creation;
 
+mod core_provenance;
+
 mod complete_results;
 
 mod callable_boundary;
