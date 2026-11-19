@@ -1,14 +1,32 @@
 use std::collections::HashMap;
 
 use super::reference::{BlockOrdinal, OccurrenceMetadata, OccurrenceOrdinal, OccurrenceStructure};
-use super::{ScalarBinding, ScalarItem, ScalarNamespaceBinding, ScalarOutputSequence, ScalarType};
-use wosy_syntax::{ByteSpan, SourceIdentity};
+use super::{
+    ConcreteCallSelection, CoreOperationId, ScalarBinding, ScalarItem, ScalarNamespaceBinding,
+    ScalarOutputSequence, ScalarOverloadSelection, ScalarStructFieldId, ScalarType,
+};
+use wosy_syntax::{ByteSpan, SourceIdentity, SourceSpan};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModuleInitializationRegion {
     pub(crate) source: SourceIdentity,
     pub(crate) steps: Vec<ModuleInitializationStep>,
     pub(super) detail: ModuleInitializationDetail,
+}
+
+impl ModuleInitializationRegion {
+    #[allow(dead_code)]
+    pub(super) fn call_target(
+        &self,
+        ordinal: OccurrenceOrdinal,
+    ) -> Option<&ModuleInitializationCallTarget> {
+        match &self.detail {
+            ModuleInitializationDetail::DispatchOnly => None,
+            ModuleInitializationDetail::Occurrences(topology) => {
+                topology.call_targets.get(&ordinal)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -22,6 +40,7 @@ pub(super) struct ModuleInitializationTopology {
     pub(super) structure: OccurrenceStructure,
     pub(super) occurrences: Vec<OccurrenceMetadata>,
     pub(super) calls: Vec<OccurrenceOrdinal>,
+    pub(super) call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
     pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
@@ -29,11 +48,26 @@ pub(super) struct ModuleInitializationTopology {
     pub(super) short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ModuleInitializationCallTarget {
+    Core(CoreOperationId),
+    Direct {
+        declaration: SourceSpan,
+        concrete: ConcreteCallSelection,
+    },
+    Extern(SourceSpan),
+    CallableBinding(SourceSpan),
+    CallableField {
+        receiver: SourceSpan,
+        field: ScalarStructFieldId,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct CheckedCallSignature {
     pub(super) parameters: Vec<ScalarType>,
     pub(super) outputs: ScalarOutputSequence,
-    pub(super) overload_arm: Option<usize>,
+    pub(super) overload: Option<ScalarOverloadSelection>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

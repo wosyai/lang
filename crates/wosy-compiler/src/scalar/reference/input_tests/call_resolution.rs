@@ -266,9 +266,9 @@ fn standalone_call_lookup_borrows_actual_inputs_and_preserves_complete_indirect_
                 &module.source,
                 &module.items,
                 &module.namespace_bindings,
-                &views,
+                &CallDeclarationIndex::new(&views),
                 module.resolved_assignment_outputs.as_map(),
-                WalkMode::StructuralOnly,
+                false,
                 PreparationOccurrenceTyping::default(),
             )
             .unwrap()

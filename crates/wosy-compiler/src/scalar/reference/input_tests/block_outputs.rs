@@ -82,9 +82,7 @@ fn checked_tail_conditional_publishes_one_producer_with_ordered_outputs() {
     let calls = resolve_function_call_sites(
         &source,
         &function,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-        &[],
+        &CallDeclarationIndex::default(),
         &HashMap::new(),
         &mut checked,
     )

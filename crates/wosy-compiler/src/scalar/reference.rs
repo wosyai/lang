@@ -4,9 +4,9 @@ use super::control::{
     module_initialization_region, BindingAllocationLengthSlot, BindingInitialization,
     BindingOutput, BindingOutputs, BindingReceiverSlot, BindingRegion, BlockItem, BlockItemKind,
     BlockPosition, BlockRegion, CheckedCallSignature, CheckedOccurrenceTypes,
-    ConditionalOutputProjection, ConditionalRegion, FinalOutputSlot, ModuleInitializationDetail,
-    ModuleInitializationRegion, ModuleInitializationStepKind, ModuleInitializationTopology,
-    ShortCircuitRegion, WhileRegion,
+    ConditionalOutputProjection, ConditionalRegion, FinalOutputSlot,
+    ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationRegion,
+    ModuleInitializationStepKind, ModuleInitializationTopology, ShortCircuitRegion, WhileRegion,
 };
 use super::control::{
     AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentReplacement,
@@ -3946,37 +3946,173 @@ impl<'a> CallResolutionModule<'a> {
     }
 }
 
+#[derive(Default)]
+struct CallDeclarationIndex<'a> {
+    modules: HashMap<&'a SourceIdentity, CallDeclarationHeaders<'a>>,
+    structs: BTreeMap<&'a ScalarStructId, &'a ScalarStruct>,
+}
+
+#[derive(Default)]
+struct CallDeclarationHeaders<'a> {
+    namespaces: HashMap<&'a str, &'a SourceIdentity>,
+    functions: HashMap<&'a str, (ByteSpan, bool)>,
+    bindings: HashMap<&'a str, CallBindingHeader<'a>>,
+    externs: HashMap<&'a str, HashMap<&'a str, ByteSpan>>,
+}
+
+struct CallBindingHeader<'a> {
+    span: ByteSpan,
+    ty: &'a ScalarType,
+    module_member: bool,
+}
+
+enum CallDeclaration<'a> {
+    Function(&'a SourceIdentity, ByteSpan, bool),
+    Binding(&'a SourceIdentity, ByteSpan),
+    Extern(&'a SourceIdentity, ByteSpan),
+}
+
+impl<'a> CallDeclarationIndex<'a> {
+    fn new(modules: &[CallResolutionModule<'a>]) -> Self {
+        let mut index = Self::default();
+        for module in modules {
+            let mut headers = CallDeclarationHeaders::default();
+            for binding in module.namespace_bindings {
+                headers
+                    .namespaces
+                    .entry(&binding.binding)
+                    .or_insert(&binding.target);
+            }
+            for item in module.items {
+                match item {
+                    ScalarItem::Function(function) => {
+                        headers.functions.insert(
+                            &function.name,
+                            (function.name_span, !function.overload_arms.is_empty()),
+                        );
+                    }
+                    ScalarItem::Binding(binding) => {
+                        headers.bindings.insert(
+                            &binding.name,
+                            CallBindingHeader {
+                                span: binding.name_span,
+                                ty: &binding.declared_type,
+                                module_member: true,
+                            },
+                        );
+                        for receiver in binding.receivers.iter().skip(1) {
+                            headers.bindings.insert(
+                                &receiver.name,
+                                CallBindingHeader {
+                                    span: receiver.name_span,
+                                    ty: &receiver.ty,
+                                    module_member: false,
+                                },
+                            );
+                        }
+                    }
+                    ScalarItem::Extern(group) => {
+                        headers.externs.entry(&group.binding).or_insert_with(|| {
+                            let mut members = HashMap::new();
+                            for function in &group.functions {
+                                members
+                                    .entry(function.name.as_str())
+                                    .or_insert(function.name_span);
+                            }
+                            members
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            index.modules.entry(module.source).or_insert(headers);
+            for structure in module.structs {
+                index.structs.entry(&structure.id).or_insert(structure);
+            }
+        }
+        index
+    }
+
+    fn callable(
+        &self,
+        source: &'a SourceIdentity,
+        receiver: Option<&str>,
+        name: &str,
+    ) -> Option<CallDeclaration<'a>> {
+        let local = self.modules.get(source)?;
+        let (source, headers) = match receiver {
+            None => (source, local),
+            Some(receiver) => match local.namespaces.get(receiver) {
+                Some(target) if !is_module_private_name(name) => {
+                    (*target, self.modules.get(target)?)
+                }
+                Some(_) => return None,
+                None => {
+                    return Some(CallDeclaration::Extern(
+                        source,
+                        *local.externs.get(receiver)?.get(name)?,
+                    ))
+                }
+            },
+        };
+        if let Some(&(span, overloaded)) = headers.functions.get(name) {
+            return Some(CallDeclaration::Function(source, span, overloaded));
+        }
+        let binding = headers.bindings.get(name)?;
+        if !matches!(binding.ty, ScalarType::Callable { .. })
+            || (receiver.is_some() && !binding.module_member)
+        {
+            return None;
+        }
+        Some(CallDeclaration::Binding(source, binding.span))
+    }
+
+    fn binding(&self, source: &SourceIdentity, name: &str) -> Option<(ByteSpan, &'a ScalarType)> {
+        let binding = self.modules.get(source)?.bindings.get(name)?;
+        Some((binding.span, binding.ty))
+    }
+
+    fn has_value(&self, source: &SourceIdentity, name: &str) -> bool {
+        self.modules.get(source).is_some_and(|headers| {
+            headers.bindings.contains_key(name) || headers.functions.contains_key(name)
+        })
+    }
+
+    fn field(&self, ty: &ScalarType, name: &str) -> Option<&'a ScalarStructField> {
+        let ScalarType::Struct(id) = ty else {
+            return None;
+        };
+        resolved_struct_field(ty, name, std::slice::from_ref(*self.structs.get(id)?))
+    }
+}
+
 #[cfg(test)]
 pub(super) fn resolve_program_call_sites(
     program: &ScalarProgram,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
-    resolve_program_call_sites_impl(
-        program,
-        WalkMode::StructuralOnly,
-        PreparationOccurrenceTyping::default(),
-    )
+    resolve_program_call_sites_impl(program, false, PreparationOccurrenceTyping::default())
 }
 
 pub(super) fn resolve_program_call_sites_with_occurrences(
     program: &ScalarProgram,
     occurrence_typing: PreparationOccurrenceTyping,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
-    resolve_program_call_sites_impl(program, WalkMode::ModuleInitialization, occurrence_typing)
+    resolve_program_call_sites_impl(program, true, occurrence_typing)
 }
 
 fn resolve_program_call_sites_impl(
     program: &ScalarProgram,
-    initialization_mode: WalkMode<'_>,
+    select_initialization_calls: bool,
     occurrence_typing: PreparationOccurrenceTyping,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
-    let modules = [CallResolutionModule::program(program)];
+    let declarations = CallDeclarationIndex::new(&[CallResolutionModule::program(program)]);
     resolve_module_call_sites(
         &program.source,
         &program.items,
         &[],
-        &modules,
+        &declarations,
         program.resolved_assignment_outputs.as_map(),
-        initialization_mode,
+        select_initialization_calls,
         occurrence_typing,
     )
 }
@@ -4182,28 +4318,29 @@ fn resolve_project_call_sites_impl(
         .iter()
         .map(CallResolutionModule::module)
         .collect::<Vec<_>>();
+    let declarations = CallDeclarationIndex::new(&views);
     ProjectCallSiteResults {
         modules: modules
             .iter()
             .map(|module| {
-                let (initialization_mode, occurrence_typing) = match &mut occurrence_inputs {
+                let (select_initialization_calls, occurrence_typing) = match &mut occurrence_inputs
+                {
                     OccurrenceTypingInputs::Typed(occurrences) => (
-                        WalkMode::ModuleInitialization,
+                        true,
                         occurrences.next().expect("one typing table per module"),
                     ),
                     #[cfg(test)]
-                    OccurrenceTypingInputs::StructuralOnly => (
-                        WalkMode::StructuralOnly,
-                        PreparationOccurrenceTyping::default(),
-                    ),
+                    OccurrenceTypingInputs::StructuralOnly => {
+                        (false, PreparationOccurrenceTyping::default())
+                    }
                 };
                 resolve_module_call_sites(
                     &module.source,
                     &module.items,
                     &module.namespace_bindings,
-                    &views,
+                    &declarations,
                     module.resolved_assignment_outputs.as_map(),
-                    initialization_mode,
+                    select_initialization_calls,
                     occurrence_typing,
                 )
             })
@@ -4214,9 +4351,7 @@ fn resolve_project_call_sites_impl(
 struct CallableWalk<'a> {
     source: &'a SourceIdentity,
     function_span: ByteSpan,
-    module_callables: &'a BTreeMap<(Option<String>, String), (SourceIdentity, ByteSpan)>,
-    extern_callables: &'a BTreeMap<(String, String), (SourceIdentity, ByteSpan)>,
-    modules: &'a [CallResolutionModule<'a>],
+    declarations: &'a CallDeclarationIndex<'a>,
     assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
     sites: Vec<ResolvedCallSite>,
     call_occurrences: Vec<CallOccurrence>,
@@ -4225,13 +4360,34 @@ struct CallableWalk<'a> {
 
 enum WalkMode<'a> {
     Callable(CallableWalk<'a>),
-    ModuleInitialization,
+    ModuleInitialization {
+        source: &'a SourceIdentity,
+        declarations: &'a CallDeclarationIndex<'a>,
+    },
     StructuralOnly,
+}
+
+#[derive(Clone, Copy)]
+struct WalkBinding {
+    declaration_span: ByteSpan,
+    block_span: ByteSpan,
+}
+
+impl WalkBinding {
+    fn reference_id(self, source: &SourceIdentity, function_span: ByteSpan) -> ReferenceBindingId {
+        ReferenceBindingId {
+            source: source.clone(),
+            function_span,
+            declaration_span: self.declaration_span,
+            block_span: self.block_span,
+            kind: ReferenceBindingKind::Declared,
+        }
+    }
 }
 
 #[derive(Default)]
 struct WalkScope {
-    names: BTreeMap<String, ReferenceBindingId>,
+    names: BTreeMap<String, WalkBinding>,
     types: BTreeMap<String, ScalarType>,
 }
 
@@ -4239,6 +4395,7 @@ struct StructuralWalker<'a, 'typing> {
     mode: WalkMode<'a>,
     occurrence_typing: &'typing mut PreparationOccurrenceTyping,
     checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
+    initialization_call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
     structural_calls: Vec<OccurrenceOrdinal>,
     occurrences: Vec<OccurrenceMetadata>,
     structure: OccurrenceStructure,
@@ -4258,6 +4415,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             mode,
             occurrence_typing,
             checked_call_signatures: HashMap::new(),
+            initialization_call_targets: HashMap::new(),
             structural_calls: Vec::new(),
             occurrences: Vec::new(),
             structure: OccurrenceStructure::new(span),
@@ -4288,7 +4446,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
     fn expression(
         &mut self,
         expression: &ScalarExpression,
-        names: &BTreeMap<String, ReferenceBindingId>,
+        names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
@@ -4300,7 +4458,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
     fn expression_at(
         &mut self,
         expression: &ScalarExpression,
-        names: &BTreeMap<String, ReferenceBindingId>,
+        names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
@@ -4324,7 +4482,7 @@ impl CallableWalk<'_> {
         &mut self,
         ordinal: OccurrenceOrdinal,
         expression: &ScalarExpression,
-        names: &BTreeMap<String, ReferenceBindingId>,
+        names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
     ) -> Result<(), ReferenceAnalysisError> {
         let ScalarExpression::Call {
@@ -4338,53 +4496,30 @@ impl CallableWalk<'_> {
         else {
             unreachable!("callable registration requires a call occurrence")
         };
+        let missing = || missing_call_target(self.source, *span);
         let target = if receiver.as_deref() == Some("core") {
             CoreOperationId::from_name(name).map(ResolvedCallTarget::Core)
-        } else if receiver.is_none() {
-            names
-                .get(name)
-                .cloned()
-                .map(ResolvedCallTarget::LocalCallable)
-                .or_else(|| {
-                    self.module_callables.get(&(None, name.clone())).map(
-                        |(source, declaration_span)| ResolvedCallTarget::ModuleCallable {
-                            source: source.clone(),
-                            declaration_span: *declaration_span,
-                            concrete: match overload_selection {
-                                Some(selection) => {
-                                    ConcreteCallSelection::Overload(selection.clone())
-                                }
-                                None => ConcreteCallSelection::Declaration,
-                            },
-                        },
-                    )
-                })
-        } else if let Some(receiver_type) = receiver.as_ref().and_then(|binding| types.get(binding))
+        } else if let Some(binding) = receiver.is_none().then(|| names.get(name)).flatten() {
+            Some(ResolvedCallTarget::LocalCallable(
+                binding.reference_id(self.source, self.function_span),
+            ))
+        } else if let Some((binding_name, receiver_type)) = receiver
+            .as_ref()
+            .and_then(|binding| Some((binding, types.get(binding)?)))
         {
-            let ScalarType::Struct(id) = receiver_type else {
-                return Err(ReferenceAnalysisError::MissingContext {
-                    source_span: SourceSpan::new(self.source.clone(), *span),
-                    reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
-                });
-            };
             let field = self
-                .modules
-                .iter()
-                .find_map(|module| module.structs.iter().find(|structure| structure.id == *id))
-                .and_then(|structure| {
-                    resolved_struct_field(receiver_type, name, std::slice::from_ref(structure))
-                })
-                .expect("validated callable field");
-            let binding_name = receiver.as_ref().expect("typed field receiver");
-            let binding = names.get(binding_name).expect("validated receiver binding");
-            let receiver_span = receiver_span.expect("validated receiver source span");
+                .declarations
+                .field(receiver_type, name)
+                .ok_or_else(missing)?;
+            let binding = names.get(binding_name).ok_or_else(missing)?;
+            let receiver_span = receiver_span.ok_or_else(missing)?;
             Some(ResolvedCallTarget::CallableField {
                 receiver_place: ReferencePlaceId {
                     source: self.source.clone(),
                     function_span: self.function_span,
                     declaration_span: binding.declaration_span,
                     block_span: binding.block_span,
-                    binding: binding.clone(),
+                    binding: binding.reference_id(self.source, self.function_span),
                     projections: Vec::new(),
                     place: ScalarPlace::Name {
                         name: binding_name.clone(),
@@ -4394,33 +4529,26 @@ impl CallableWalk<'_> {
                 field: field.id.clone(),
             })
         } else {
-            self.module_callables
-                .get(&(receiver.clone(), name.clone()))
-                .map(
-                    |(source, declaration_span)| ResolvedCallTarget::ModuleCallable {
-                        source: source.clone(),
-                        declaration_span: *declaration_span,
-                        concrete: match overload_selection {
-                            Some(selection) => ConcreteCallSelection::Overload(selection.clone()),
-                            None => ConcreteCallSelection::Declaration,
-                        },
-                    },
-                )
-                .or_else(|| {
-                    self.extern_callables
-                        .get(&(receiver.clone().expect("qualified call"), name.clone()))
-                        .map(
-                            |(source, declaration_span)| ResolvedCallTarget::ExternCallable {
-                                source: source.clone(),
-                                declaration_span: *declaration_span,
-                            },
-                        )
+            self.declarations
+                .callable(self.source, receiver.as_deref(), name)
+                .map(|declaration| match declaration {
+                    CallDeclaration::Function(source, declaration_span, _)
+                    | CallDeclaration::Binding(source, declaration_span) => {
+                        ResolvedCallTarget::ModuleCallable {
+                            source: source.clone(),
+                            declaration_span,
+                            concrete: concrete_selection(overload_selection),
+                        }
+                    }
+                    CallDeclaration::Extern(source, declaration_span) => {
+                        ResolvedCallTarget::ExternCallable {
+                            source: source.clone(),
+                            declaration_span,
+                        }
+                    }
                 })
         };
-        let target = target.ok_or_else(|| ReferenceAnalysisError::MissingContext {
-            source_span: SourceSpan::new(self.source.clone(), *span),
-            reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
-        })?;
+        let target = target.ok_or_else(missing)?;
         let site = ResolvedCallSite {
             source_span: SourceSpan::new(self.source.clone(), *span),
             target,
@@ -4451,11 +4579,93 @@ impl CallableWalk<'_> {
     }
 }
 
+fn missing_call_target(source: &SourceIdentity, span: ByteSpan) -> ReferenceAnalysisError {
+    ReferenceAnalysisError::MissingContext {
+        source_span: SourceSpan::new(source.clone(), span),
+        reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
+    }
+}
+
+fn concrete_selection(selection: &Option<ScalarOverloadSelection>) -> ConcreteCallSelection {
+    match selection {
+        Some(selection) => ConcreteCallSelection::Overload(selection.clone()),
+        None => ConcreteCallSelection::Declaration,
+    }
+}
+
+fn initialization_call_target(
+    source: &SourceIdentity,
+    declarations: &CallDeclarationIndex<'_>,
+    expression: &ScalarExpression,
+    names: &BTreeMap<String, WalkBinding>,
+    types: &BTreeMap<String, ScalarType>,
+    signature: Option<&CheckedCallSignature>,
+) -> Result<ModuleInitializationCallTarget, ReferenceAnalysisError> {
+    use ModuleInitializationCallTarget as Target;
+    let ScalarExpression::Call {
+        receiver,
+        name,
+        span,
+        ..
+    } = expression
+    else {
+        unreachable!("initialization call registration requires a call occurrence")
+    };
+    let missing = || missing_call_target(source, *span);
+    if receiver.as_deref() == Some("core") {
+        return CoreOperationId::from_name(name)
+            .map(Target::Core)
+            .ok_or_else(missing);
+    }
+    if let Some(receiver) = receiver {
+        let binding = match names.get(receiver) {
+            Some(binding) => types.get(receiver).map(|ty| (binding.declaration_span, ty)),
+            None => declarations.binding(source, receiver),
+        };
+        if let Some((span, ty @ ScalarType::Struct(_))) = binding {
+            let field = declarations.field(ty, name).ok_or_else(missing)?;
+            return Ok(Target::CallableField {
+                receiver: SourceSpan::new(source.clone(), span),
+                field: field.id.clone(),
+            });
+        }
+    } else if let Some(binding) = names.get(name) {
+        return Ok(Target::CallableBinding(SourceSpan::new(
+            source.clone(),
+            binding.declaration_span,
+        )));
+    }
+    Ok(
+        match declarations
+            .callable(source, receiver.as_deref(), name)
+            .ok_or_else(missing)?
+        {
+            CallDeclaration::Function(source, span, overloaded) => Target::Direct {
+                declaration: SourceSpan::new(source.clone(), span),
+                concrete: if overloaded {
+                    let selection = signature
+                        .and_then(|row| row.overload.clone())
+                        .ok_or_else(missing)?;
+                    ConcreteCallSelection::Overload(selection)
+                } else {
+                    ConcreteCallSelection::Declaration
+                },
+            },
+            CallDeclaration::Binding(source, span) => {
+                Target::CallableBinding(SourceSpan::new(source.clone(), span))
+            }
+            CallDeclaration::Extern(source, span) => {
+                Target::Extern(SourceSpan::new(source.clone(), span))
+            }
+        },
+    )
+}
+
 impl StructuralWalker<'_, '_> {
     fn expression_children(
         &mut self,
         expression: &ScalarExpression,
-        names: &BTreeMap<String, ReferenceBindingId>,
+        names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
         ordinal: OccurrenceOrdinal,
     ) -> Result<(), ReferenceAnalysisError> {
@@ -4469,7 +4679,25 @@ impl StructuralWalker<'_, '_> {
                     WalkMode::Callable(callable) => {
                         callable.register_call(ordinal, expression, names, types)?;
                     }
-                    WalkMode::ModuleInitialization | WalkMode::StructuralOnly => {
+                    WalkMode::ModuleInitialization {
+                        source,
+                        declarations,
+                    } => {
+                        let target = initialization_call_target(
+                            source,
+                            declarations,
+                            expression,
+                            names,
+                            types,
+                            self.checked_call_signatures.get(&ordinal),
+                        )?;
+                        self.structural_calls.push(ordinal);
+                        assert!(self
+                            .initialization_call_targets
+                            .insert(ordinal, target)
+                            .is_none());
+                    }
+                    WalkMode::StructuralOnly => {
                         self.structural_calls.push(ordinal);
                     }
                 }
@@ -4616,7 +4844,7 @@ impl StructuralWalker<'_, '_> {
     fn place(
         &mut self,
         place: &ScalarPlace,
-        names: &BTreeMap<String, ReferenceBindingId>,
+        names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
@@ -4627,7 +4855,7 @@ impl StructuralWalker<'_, '_> {
     fn place_at(
         &mut self,
         place: &ScalarPlace,
-        names: &BTreeMap<String, ReferenceBindingId>,
+        names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
@@ -4665,7 +4893,7 @@ impl StructuralWalker<'_, '_> {
     fn block(
         &mut self,
         block: &ScalarBlock,
-        outer: &BTreeMap<String, ReferenceBindingId>,
+        outer: &BTreeMap<String, WalkBinding>,
         outer_types: &BTreeMap<String, ScalarType>,
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
@@ -4686,7 +4914,7 @@ impl StructuralWalker<'_, '_> {
     fn block_items(
         &mut self,
         block: &ScalarBlock,
-        outer: &BTreeMap<String, ReferenceBindingId>,
+        outer: &BTreeMap<String, WalkBinding>,
         outer_types: &BTreeMap<String, ScalarType>,
         ordinal: BlockOrdinal,
     ) -> Result<(), ReferenceAnalysisError> {
@@ -4715,11 +4943,16 @@ impl StructuralWalker<'_, '_> {
         &mut self,
         binding: &ScalarBinding,
         position: BlockPosition,
+        scope: &WalkScope,
     ) -> Result<BindingInitialization, ReferenceAnalysisError> {
         let callable = matches!(&self.mode, WalkMode::Callable(_))
             .then(|| std::mem::replace(&mut self.mode, WalkMode::StructuralOnly));
         let names = BTreeMap::new();
         let types = BTreeMap::new();
+        let (names, types) = match &self.mode {
+            WalkMode::ModuleInitialization { .. } => (&scope.names, &scope.types),
+            _ => (&names, &types),
+        };
         let lengths = binding
             .receivers
             .iter()
@@ -4728,8 +4961,8 @@ impl StructuralWalker<'_, '_> {
             .map(|(receiver, length)| {
                 let expression = self.expression_at(
                     length,
-                    &names,
-                    &types,
+                    names,
+                    types,
                     OccurrenceParent::Block(position.block),
                     OccurrenceEdge::BindingAllocationLength {
                         item: position.item,
@@ -4817,23 +5050,23 @@ impl StructuralWalker<'_, '_> {
                     .insert((position.block, position.item), outputs)
                     .is_none());
             }
-            self.binding_allocation_lengths(binding, position)?
+            self.binding_allocation_lengths(binding, position, scope)?
         } else {
             BindingInitialization::Outputs(self.binding_outputs(binding, position, scope)?)
         };
-        if let WalkMode::Callable(callable) = &self.mode {
+        if matches!(
+            self.mode,
+            WalkMode::Callable(_) | WalkMode::ModuleInitialization { .. }
+        ) {
             for receiver in &binding.receivers {
                 scope
                     .types
                     .insert(receiver.name.clone(), receiver.ty.clone());
                 scope.names.insert(
                     receiver.name.clone(),
-                    ReferenceBindingId {
-                        source: callable.source.clone(),
-                        function_span: callable.function_span,
+                    WalkBinding {
                         declaration_span: receiver.name_span,
                         block_span,
-                        kind: ReferenceBindingKind::Declared,
                     },
                 );
             }
@@ -4927,7 +5160,7 @@ impl StructuralWalker<'_, '_> {
                     })
                     .collect();
                 let mut module_outputs = match &mut self.mode {
-                    WalkMode::ModuleInitialization => {
+                    WalkMode::ModuleInitialization { .. } => {
                         self.occurrence_typing.take_assignment(assignment)
                     }
                     _ => std::vec::IntoIter::default(),
@@ -4946,7 +5179,7 @@ impl StructuralWalker<'_, '_> {
                     )?;
                     let replacement = match &self.mode {
                         WalkMode::StructuralOnly => AssignmentReplacement::StructuralOnly,
-                        WalkMode::ModuleInitialization => module_outputs.next().map_or(
+                        WalkMode::ModuleInitialization { .. } => module_outputs.next().map_or(
                             AssignmentReplacement::Missing,
                             AssignmentReplacement::Resolved,
                         ),
@@ -4969,6 +5202,32 @@ impl StructuralWalker<'_, '_> {
                         replacement,
                     });
                 }
+                if let WalkMode::ModuleInitialization {
+                    source,
+                    declarations,
+                } = &self.mode
+                {
+                    if ordinal != self.structure.root {
+                        for (target, slot) in assignment.targets.iter().zip(&slots) {
+                            if let ScalarPlace::Name { name, .. } = &target.place {
+                                if !names.contains_key(name)
+                                    && !declarations.has_value(source, name)
+                                {
+                                    if let AssignmentReplacement::Resolved(ty) = &slot.replacement {
+                                        types.insert(name.clone(), ty.clone());
+                                        names.insert(
+                                            name.clone(),
+                                            WalkBinding {
+                                                declaration_span: target.target_span,
+                                                block_span,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 assert!(self
                     .assignments
                     .insert(
@@ -4985,7 +5244,7 @@ impl StructuralWalker<'_, '_> {
                         ),
                     )
                     .is_none());
-                if let WalkMode::Callable(callable) = &self.mode {
+                if let WalkMode::Callable(_) = &self.mode {
                     for target in &assignment.targets {
                         if let ScalarPlace::Name { name, .. } = &target.place {
                             if !names.contains_key(name) {
@@ -4998,12 +5257,9 @@ impl StructuralWalker<'_, '_> {
                                 }
                                 names.insert(
                                     name.clone(),
-                                    ReferenceBindingId {
-                                        source: callable.source.clone(),
-                                        function_span: callable.function_span,
+                                    WalkBinding {
                                         declaration_span: target.target_span,
                                         block_span,
-                                        kind: ReferenceBindingKind::Declared,
                                     },
                                 );
                             }
@@ -5056,68 +5312,20 @@ fn resolve_module_call_sites(
     source: &SourceIdentity,
     items: &[ScalarItem],
     namespace_bindings: &[ScalarNamespaceBinding],
-    modules: &[CallResolutionModule<'_>],
+    declarations: &CallDeclarationIndex<'_>,
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
-    initialization_mode: WalkMode<'_>,
+    select_initialization_calls: bool,
     mut occurrence_typing: PreparationOccurrenceTyping,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
     #[cfg(test)]
     stage_observations::record_call_sites();
-    let current = modules.iter().find(|module| module.source == source);
-    let mut module_callables = BTreeMap::new();
-    let mut extern_callables = BTreeMap::new();
-    for module in modules {
-        let receiver = if module.source == source {
-            None
-        } else {
-            current.and_then(|current| {
-                current
-                    .namespace_bindings
-                    .iter()
-                    .find(|binding| &binding.target == module.source)
-                    .map(|binding| binding.binding.clone())
-            })
-        };
-        if module.source != source && receiver.is_none() {
-            continue;
-        }
-        for item in module.items {
-            match item {
-                ScalarItem::Function(function) => {
-                    module_callables.insert(
-                        (receiver.clone(), function.name.clone()),
-                        (module.source.clone(), function.name_span),
-                    );
-                }
-                ScalarItem::Binding(binding)
-                    if matches!(binding.declared_type, ScalarType::Callable { .. }) =>
-                {
-                    module_callables.insert(
-                        (receiver.clone(), binding.name.clone()),
-                        (module.source.clone(), binding.name_span),
-                    );
-                }
-                ScalarItem::Extern(extern_decl) if module.source == source => {
-                    for function in &extern_decl.functions {
-                        extern_callables.insert(
-                            (extern_decl.binding.clone(), function.name.clone()),
-                            (module.source.clone(), function.name_span),
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
     let mut functions = BTreeMap::new();
     for (index, item) in items.iter().enumerate() {
         if let ScalarItem::Function(function) = item {
             let calls = resolve_function_call_sites(
                 source,
                 function,
-                &module_callables,
-                &extern_callables,
-                modules,
+                declarations,
                 assignment_outputs,
                 &mut occurrence_typing,
             )?;
@@ -5125,13 +5333,21 @@ fn resolve_module_call_sites(
         }
     }
     let mut initialization = module_initialization_region(source, items, namespace_bindings);
+    let initialization_mode = if select_initialization_calls {
+        WalkMode::ModuleInitialization {
+            source,
+            declarations,
+        }
+    } else {
+        WalkMode::StructuralOnly
+    };
     initialization.detail =
         ModuleInitializationDetail::Occurrences(Box::new(walk_module_initialization(
             &initialization,
             items,
             initialization_mode,
             &mut occurrence_typing,
-        )));
+        )?));
     Ok(ModuleCallSites {
         functions,
         initialization,
@@ -5143,11 +5359,10 @@ fn walk_module_initialization(
     items: &[ScalarItem],
     initialization_mode: WalkMode<'_>,
     occurrence_typing: &mut PreparationOccurrenceTyping,
-) -> ModuleInitializationTopology {
+) -> Result<ModuleInitializationTopology, ReferenceAnalysisError> {
     let mut walker =
         StructuralWalker::new(initialization_mode, ByteSpan::new(0, 0), occurrence_typing);
     let root = walker.structure.root;
-    let mut scope = WalkScope::default();
     let mut block_items = Vec::new();
     let mut extent: Option<ByteSpan> = None;
     for step in &region.steps {
@@ -5161,9 +5376,12 @@ fn walk_module_initialization(
                 ScalarItem::Namespace(namespace),
             ) => namespace.span,
             (ModuleInitializationStepKind::BindingInitialization, ScalarItem::Binding(binding)) => {
-                let binding_region = walker
-                    .binding_region(binding, position, binding.span, &mut scope)
-                    .expect("neutral module binding traversal");
+                let binding_region = walker.binding_region(
+                    binding,
+                    position,
+                    binding.span,
+                    &mut WalkScope::default(),
+                )?;
                 block_items.push(BlockItem {
                     position: position.item,
                     kind: BlockItemKind::Binding(binding_region),
@@ -5177,17 +5395,13 @@ fn walk_module_initialization(
                     ScalarBlockItem::Assignment(assignment) => assignment.span,
                     ScalarBlockItem::While(while_expression) => while_expression.span,
                 };
-                block_items.push(
-                    walker
-                        .block_item(
-                            item,
-                            ScalarBlockItemRole::Ordinary,
-                            position,
-                            span,
-                            &mut scope,
-                        )
-                        .expect("neutral module executable traversal"),
-                );
+                block_items.push(walker.block_item(
+                    item,
+                    ScalarBlockItemRole::Ordinary,
+                    position,
+                    span,
+                    &mut WalkScope::default(),
+                )?);
                 span
             }
             _ => unreachable!("dispatch derives from this exact item slice"),
@@ -5204,16 +5418,17 @@ fn walk_module_initialization(
         root_block.span = span;
     }
     root_block.items = block_items;
-    ModuleInitializationTopology {
+    Ok(ModuleInitializationTopology {
         structure: walker.structure,
         occurrences: walker.occurrences,
         calls: walker.structural_calls,
+        call_targets: walker.initialization_call_targets,
         checked_call_signatures: walker.checked_call_signatures,
         assignments: walker.assignments,
         conditionals: walker.conditionals,
         loops: walker.loops,
         short_circuits: walker.short_circuits,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -5225,9 +5440,7 @@ pub(super) fn test_function_call_sites(
     resolve_function_call_sites(
         source,
         function,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-        &[],
+        &CallDeclarationIndex::default(),
         assignment_outputs,
         &mut PreparationOccurrenceTyping::default(),
     )
@@ -5237,9 +5450,7 @@ pub(super) fn test_function_call_sites(
 fn resolve_function_call_sites(
     source: &SourceIdentity,
     function: &ScalarFunction,
-    module_callables: &BTreeMap<(Option<String>, String), (SourceIdentity, ByteSpan)>,
-    extern_callables: &BTreeMap<(String, String), (SourceIdentity, ByteSpan)>,
-    modules: &[CallResolutionModule<'_>],
+    declarations: &CallDeclarationIndex<'_>,
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
     occurrence_typing: &mut PreparationOccurrenceTyping,
 ) -> Result<FunctionCallSites, ReferenceAnalysisError> {
@@ -5248,9 +5459,7 @@ fn resolve_function_call_sites(
         arms.push(resolve_function_call_sites(
             source,
             arm,
-            module_callables,
-            extern_callables,
-            modules,
+            declarations,
             assignment_outputs,
             occurrence_typing,
         )?);
@@ -5258,9 +5467,7 @@ fn resolve_function_call_sites(
     let callable = CallableWalk {
         source,
         function_span: function.span,
-        module_callables,
-        extern_callables,
-        modules,
+        declarations,
         assignment_outputs,
         sites: Vec::new(),
         call_occurrences: Vec::new(),
@@ -5296,12 +5503,9 @@ fn resolve_function_call_sites(
         parameter_types.insert(slot.name.clone(), slot.ty.clone());
         parameter_names.insert(
             slot.name.clone(),
-            ReferenceBindingId {
-                source: source.clone(),
-                function_span: function.span,
+            WalkBinding {
                 declaration_span: slot.span,
                 block_span: function.body.span,
-                kind: ReferenceBindingKind::Declared,
             },
         );
     }

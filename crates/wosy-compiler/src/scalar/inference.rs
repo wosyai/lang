@@ -246,7 +246,7 @@ impl<'a> ScalarInferenceBuilder<'a> {
         expression: &ScalarExpression,
         parameters: &[ScalarType],
         outputs: &ScalarOutputSequence,
-        overload_arm: Option<usize>,
+        overload: Option<ScalarOverloadSelection>,
     ) {
         if self.suppress_checked_occurrences
             || matches!(expression, ScalarExpression::Call { receiver: Some(receiver), .. } if receiver == "core")
@@ -258,7 +258,7 @@ impl<'a> ScalarInferenceBuilder<'a> {
             CheckedCallSignature {
                 parameters: parameters.to_vec(),
                 outputs: outputs.clone(),
-                overload_arm,
+                overload,
             },
         );
     }

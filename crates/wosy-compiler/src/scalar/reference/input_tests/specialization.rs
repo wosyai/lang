@@ -201,9 +201,9 @@ fn template_index_retains_first_source_even_when_its_module_is_empty() {
         &second.source,
         &second.items,
         &second.namespace_bindings,
-        &[CallResolutionModule::module(&second)],
+        &CallDeclarationIndex::new(&[CallResolutionModule::module(&second)]),
         second.resolved_assignment_outputs.as_map(),
-        WalkMode::StructuralOnly,
+        false,
         PreparationOccurrenceTyping::default(),
     )
     .unwrap();

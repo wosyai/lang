@@ -18,6 +18,151 @@ fn child(structure: &OccurrenceStructure, parent: Parent, edge: Edge) -> Occurre
 }
 
 #[test]
+fn prepare_publishes_module_call_targets_by_canonical_ordinal_on_both_layouts() {
+    use crate::scalar::control::ModuleInitializationCallTarget as Target;
+
+    let text = "%%start
+left = namespace package \"library.w\";
+right = namespace package \"library.w\";
+disk = extern wasm \"disk_abi\" { i32() read; };
+struct Reader { i32() read; }
+i32() local = fn { 7 };
+i32() global = local;
+i32 padding, i32() secondary = 0, local;
+Reader reader = { .read = local; };
+i32 first = left.read();
+i32 second = if (true) { i32() local = global; copy = local; local() + copy() + right.read() } else { disk.read() };
+i32 third = reader.read() + global() + secondary() + local();
+i32 selected = right.pick(13);
+u64 wide = core.int_extend<u64>(third);
+%%end";
+    let main = parsed(text);
+    let library_source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "library.w".into(),
+        "r1".into(),
+    );
+    let library_text = "%%start\ni32() read = fn { 11 };\npick = overload { i32(i32) => fn(value) { value }; };\n%%end";
+    let library = parse_source(library_source.clone(), library_text.into(), &[]);
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    let location = |source: &SourceIdentity, text: &str, marker: &str, len: u32| {
+        let start = text.find(marker).unwrap() as u32;
+        SourceSpan::new(source.clone(), ByteSpan::new(start, start + len))
+    };
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let declarations = derive_scalar_declarations_from_cst(main.canonical_cst());
+        let namespaces = declarations.items[..2]
+            .iter()
+            .map(|item| {
+                let ScalarItem::Namespace(namespace) = item else {
+                    panic!("namespace")
+                };
+                ScalarNamespaceBinding {
+                    binding: namespace.binding.clone(),
+                    target: library_source.clone(),
+                    span: namespace.binding_span,
+                }
+            })
+            .collect();
+        let stages = Scope::new();
+        let prepared = crate::prepare_scalar_project(
+            vec![
+                (declarations, namespaces),
+                (
+                    derive_scalar_declarations_from_cst(library.result.canonical_cst()),
+                    Vec::new(),
+                ),
+            ],
+            vec![library_source.clone(), main.source.clone()],
+            crate::ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
+        assert_eq!(
+            stages.counts(),
+            Counts {
+                call_sites: 2,
+                ..Counts::default()
+            }
+        );
+        let initialization = prepared.initialization_region(0).unwrap();
+        let ModuleInitializationDetail::Occurrences(topology) = &initialization.detail else {
+            panic!("module initialization topology")
+        };
+        let imported = Target::Direct {
+            declaration: location(&library_source, library_text, "read =", 4),
+            concrete: ConcreteCallSelection::Declaration,
+        };
+        let expected = [
+            ("left.read()", imported.clone()),
+            (
+                "local()",
+                Target::CallableBinding(location(&main.source, text, "local = global", 5)),
+            ),
+            (
+                "copy()",
+                Target::CallableBinding(location(&main.source, text, "copy =", 4)),
+            ),
+            ("right.read()", imported),
+            (
+                "disk.read()",
+                Target::Extern(location(&main.source, text, "read;", 4)),
+            ),
+            (
+                "reader.read()",
+                Target::CallableField {
+                    receiver: location(&main.source, text, "reader =", 6),
+                    field: prepared.project().modules[0].structs[0].fields[0]
+                        .id
+                        .clone(),
+                },
+            ),
+            (
+                "global()",
+                Target::CallableBinding(location(&main.source, text, "global =", 6)),
+            ),
+            (
+                "secondary()",
+                Target::CallableBinding(location(&main.source, text, "secondary =", 9)),
+            ),
+            (
+                "local()",
+                Target::Direct {
+                    declaration: location(&main.source, text, "local = fn", 5),
+                    concrete: ConcreteCallSelection::Declaration,
+                },
+            ),
+            (
+                "right.pick(13)",
+                Target::Direct {
+                    declaration: location(&library_source, library_text, "pick =", 4),
+                    concrete: ConcreteCallSelection::Overload(ScalarOverloadSelection {
+                        arm_index: 0,
+                        substitutions: BTreeMap::new(),
+                    }),
+                },
+            ),
+            (
+                "core.int_extend<u64>(third)",
+                Target::Core(CoreOperationId::IntExtend),
+            ),
+        ];
+        assert_eq!(topology.calls.len(), expected.len());
+        for (&ordinal, (spelling, selection)) in topology.calls.iter().zip(expected) {
+            let span = topology.occurrences[ordinal.0].span;
+            assert_eq!(&text[span.start as usize..span.end as usize], spelling);
+            assert_eq!(initialization.call_target(ordinal), Some(&selection));
+            if !matches!(selection, Target::Core(_)) {
+                assert!(
+                    topology.checked_call_signatures.contains_key(&ordinal),
+                    "{spelling}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn prepare_rejects_nested_extern_symbols_through_either_import_alias() {
     let text = "%%start
 left = namespace package \"library.w\";
@@ -501,7 +646,10 @@ fn assert_signature(
             .collect::<Vec<_>>(),
         outputs.iter().collect::<Vec<_>>(),
     );
-    assert_eq!(row.overload_arm, overload_arm);
+    assert_eq!(
+        row.overload.as_ref().map(|selection| selection.arm_index),
+        overload_arm
+    );
 }
 
 #[test]

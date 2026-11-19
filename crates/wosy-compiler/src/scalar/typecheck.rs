@@ -4143,12 +4143,7 @@ fn check_expression_type_in_module_expected(
                 );
             }
             if diagnostics.len() == diagnostics_before_arguments {
-                inference.record_call_signature(
-                    expression,
-                    &parameters,
-                    &outputs,
-                    Some(selection.arm_index),
-                );
+                inference.record_call_signature(expression, &parameters, &outputs, Some(selection));
             }
             return scalar_call_result_in_module(&outputs);
         }
@@ -8185,7 +8180,7 @@ fn check_expression_type(
                         expression,
                         &parameters,
                         &outputs,
-                        Some(selection.arm_index),
+                        Some(selection),
                     );
                 }
                 return scalar_call_result(&outputs);
@@ -8558,12 +8553,7 @@ fn check_expression_type_expected(
                 );
             }
             if diagnostics.len() == diagnostics_before_arguments {
-                inference.record_call_signature(
-                    expression,
-                    &parameters,
-                    &outputs,
-                    Some(selection.arm_index),
-                );
+                inference.record_call_signature(expression, &parameters, &outputs, Some(selection));
             }
             return scalar_call_result(&outputs);
         }
