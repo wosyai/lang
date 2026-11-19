@@ -266,6 +266,18 @@ fn public_prepare_retains_typed_allocation_lengths_without_query_calls() {
             "n",
             "3",
         );
+        let ScalarItem::Function(length) = &prepared.project().modules[0].items[0] else {
+            panic!("length declaration")
+        };
+        let target = ResolvedCallTarget::ModuleCallable {
+            source: parsed.source.clone(),
+            declaration_span: length.name_span,
+            concrete: ConcreteCallSelection::Declaration,
+        };
+        assert_eq!(function.allocation_length_call_targets.len(), 2);
+        for call in &function.allocation_length_calls {
+            assert_eq!(function.allocation_length_call_targets[call], target);
+        }
         let root = Parent::Block(function.structure.root);
         assert_ne!(
             function.structure.edges[&(
@@ -283,6 +295,7 @@ fn public_prepare_retains_typed_allocation_lengths_without_query_calls() {
         let [site] = function.sites.as_slice() else {
             panic!("only the final-output call belongs to the query")
         };
+        assert_eq!(site.target, target);
         let span = site.source_span.range;
         assert_eq!(&text[span.start as usize..span.end as usize], "length(n)");
         let output = function.structure.blocks[function.structure.root.0]
@@ -301,6 +314,57 @@ fn public_prepare_retains_typed_allocation_lengths_without_query_calls() {
                 .count(),
             1
         );
+    }
+}
+
+#[test]
+fn callable_allocation_length_targets_use_pre_binding_scope() {
+    let parsed = parsed(
+        "%%start\ngeneric T;\nT(T) echo = fn(value) { value };\n\
+         unit((u64(u64))) run = fn(length) { u8[echo<u64>(length(1))] bytes; bytes; };\n%%end",
+    );
+    for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_extracted(&parsed, target);
+        let items = &prepared.project().modules[0].items;
+        let (ScalarItem::Function(echo), ScalarItem::Function(run)) = (&items[0], &items[1]) else {
+            panic!("echo and run declarations")
+        };
+        let function = prepared.calls.function(0, 1);
+        let [outer, inner] = function.allocation_length_calls.as_slice() else {
+            panic!("generic length call and its callable parameter argument")
+        };
+        assert_eq!(function.allocation_length_call_targets.len(), 2);
+        assert_eq!(
+            function.allocation_length_call_targets[outer],
+            ResolvedCallTarget::ModuleCallable {
+                source: parsed.source.clone(),
+                declaration_span: echo.name_span,
+                concrete: ConcreteCallSelection::Declaration,
+            },
+        );
+        assert_eq!(
+            function.allocation_length_call_targets[inner],
+            ResolvedCallTarget::LocalCallable(ReferenceBindingId {
+                source: parsed.source.clone(),
+                function_span: run.span,
+                declaration_span: run.parameter_spans[0],
+                block_span: run.body.span,
+                kind: ReferenceBindingKind::Declared,
+            }),
+        );
+        assert_eq!(
+            function.structure.edges[&(Parent::Expression(*outer), Edge::CallArgument(0))],
+            Node::Expression(*inner),
+        );
+        assert!(function.sites.is_empty());
+        assert!(function.call_occurrences.is_empty());
+        let build = crate::analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let cfg = build.reference_cfg(0, 1, None).unwrap();
+        assert!(cfg
+            .points
+            .iter()
+            .all(|point| !matches!(point.kind, CfgPointKind::Call { .. })));
     }
 }
 

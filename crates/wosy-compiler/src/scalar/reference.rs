@@ -4148,7 +4148,7 @@ pub(super) fn resolve_program_call_sites_with_occurrences(
 
 fn resolve_program_call_sites_impl(
     program: &ScalarProgram,
-    select_initialization_calls: bool,
+    select_executable_calls: bool,
     occurrence_typing: PreparationOccurrenceTyping,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
     let declarations = CallDeclarationIndex::new(&[CallResolutionModule::program(program)]);
@@ -4158,7 +4158,7 @@ fn resolve_program_call_sites_impl(
         &[],
         &declarations,
         program.resolved_assignment_outputs.as_map(),
-        select_initialization_calls,
+        select_executable_calls,
         occurrence_typing,
     )
 }
@@ -4308,6 +4308,7 @@ pub(super) struct FunctionCallSites {
     pub(super) occurrences: Vec<OccurrenceMetadata>,
     pub(super) call_occurrences: Vec<CallOccurrence>,
     pub(super) allocation_length_calls: Vec<OccurrenceOrdinal>,
+    pub(super) allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     query_allocation_outputs: HashMap<(BlockOrdinal, usize), BindingOutputs>,
     pub(super) structure: OccurrenceStructure,
@@ -4371,8 +4372,7 @@ fn resolve_project_call_sites_impl(
         modules: modules
             .iter()
             .map(|module| {
-                let (select_initialization_calls, occurrence_typing) = match &mut occurrence_inputs
-                {
+                let (select_executable_calls, occurrence_typing) = match &mut occurrence_inputs {
                     OccurrenceTypingInputs::Typed(occurrences) => (
                         true,
                         occurrences.next().expect("one typing table per module"),
@@ -4388,7 +4388,7 @@ fn resolve_project_call_sites_impl(
                     &module.namespace_bindings,
                     &declarations,
                     module.resolved_assignment_outputs.as_map(),
-                    select_initialization_calls,
+                    select_executable_calls,
                     occurrence_typing,
                 )
             })
@@ -4413,10 +4413,16 @@ impl PartialOrd for CallSiteSpan {
     }
 }
 
-struct CallableWalk<'a> {
+#[derive(Clone, Copy)]
+struct CallableTargetResolver<'a> {
     source: &'a SourceIdentity,
     function_span: ByteSpan,
     declarations: &'a CallDeclarationIndex<'a>,
+}
+
+struct CallableWalk<'a> {
+    target_resolver: CallableTargetResolver<'a>,
+    select_allocation_length_calls: bool,
     assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
     sites: Vec<ResolvedCallSite>,
     site_by_span: BTreeMap<CallSiteSpan, usize>,
@@ -4426,6 +4432,7 @@ struct CallableWalk<'a> {
 
 enum WalkMode<'a> {
     Callable(CallableWalk<'a>),
+    CallableAllocationLength(CallableTargetResolver<'a>),
     ModuleInitialization {
         source: &'a SourceIdentity,
         declarations: &'a CallDeclarationIndex<'a>,
@@ -4461,6 +4468,7 @@ struct StructuralWalker<'a, 'typing> {
     mode: WalkMode<'a>,
     occurrence_typing: &'typing mut PreparationOccurrenceTyping,
     checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
+    allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     initialization_call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
     structural_calls: Vec<OccurrenceOrdinal>,
     occurrences: Vec<OccurrenceMetadata>,
@@ -4481,6 +4489,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             mode,
             occurrence_typing,
             checked_call_signatures: HashMap::new(),
+            allocation_length_call_targets: HashMap::new(),
             initialization_call_targets: HashMap::new(),
             structural_calls: Vec::new(),
             occurrences: Vec::new(),
@@ -4547,16 +4556,13 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
     }
 }
 
-impl CallableWalk<'_> {
-    fn register_call(
-        &mut self,
-        ordinal: OccurrenceOrdinal,
+impl CallableTargetResolver<'_> {
+    fn resolve(
+        &self,
         expression: &ScalarExpression,
         names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
-    ) -> Result<(), ReferenceAnalysisError> {
-        use std::collections::btree_map::Entry;
-
+    ) -> Result<ResolvedCallTarget, ReferenceAnalysisError> {
         let ScalarExpression::Call {
             receiver,
             receiver_span,
@@ -4620,19 +4626,35 @@ impl CallableWalk<'_> {
                     }
                 })
         };
-        let target = target.ok_or_else(missing)?;
-        let site_index = match self.site_by_span.entry(CallSiteSpan(*span)) {
+        target.ok_or_else(missing)
+    }
+}
+
+impl CallableWalk<'_> {
+    fn register_call(
+        &mut self,
+        ordinal: OccurrenceOrdinal,
+        expression: &ScalarExpression,
+        names: &BTreeMap<String, WalkBinding>,
+        types: &BTreeMap<String, ScalarType>,
+    ) -> Result<(), ReferenceAnalysisError> {
+        use std::collections::btree_map::Entry;
+
+        let target = self.target_resolver.resolve(expression, names, types)?;
+        let span = expression_span(expression);
+        let source = self.target_resolver.source;
+        let site_index = match self.site_by_span.entry(CallSiteSpan(span)) {
             Entry::Occupied(entry) => {
                 let index = *entry.get();
                 if self.sites[index].target != target {
-                    return Err(missing());
+                    return Err(missing_call_target(source, span));
                 }
                 index
             }
             Entry::Vacant(entry) => {
                 let index = self.sites.len();
                 self.sites.push(ResolvedCallSite {
-                    source_span: SourceSpan::new(self.source.clone(), *span),
+                    source_span: SourceSpan::new(source.clone(), span),
                     target,
                 });
                 entry.insert(index);
@@ -4760,6 +4782,14 @@ impl StructuralWalker<'_, '_> {
                 match &mut self.mode {
                     WalkMode::Callable(callable) => {
                         callable.register_call(ordinal, expression, names, types)?;
+                    }
+                    WalkMode::CallableAllocationLength(resolver) => {
+                        let target = resolver.resolve(expression, names, types)?;
+                        self.structural_calls.push(ordinal);
+                        assert!(self
+                            .allocation_length_call_targets
+                            .insert(ordinal, target)
+                            .is_none());
                     }
                     WalkMode::ModuleInitialization {
                         source,
@@ -5027,12 +5057,22 @@ impl StructuralWalker<'_, '_> {
         position: BlockPosition,
         scope: &WalkScope,
     ) -> Result<BindingInitialization, ReferenceAnalysisError> {
-        let callable = matches!(&self.mode, WalkMode::Callable(_))
-            .then(|| std::mem::replace(&mut self.mode, WalkMode::StructuralOnly));
+        let callable = if let WalkMode::Callable(callable) = &self.mode {
+            let length_mode = if callable.select_allocation_length_calls {
+                WalkMode::CallableAllocationLength(callable.target_resolver)
+            } else {
+                WalkMode::StructuralOnly
+            };
+            Some(std::mem::replace(&mut self.mode, length_mode))
+        } else {
+            None
+        };
         let names = BTreeMap::new();
         let types = BTreeMap::new();
         let (names, types) = match &self.mode {
-            WalkMode::ModuleInitialization { .. } => (&scope.names, &scope.types),
+            WalkMode::ModuleInitialization { .. } | WalkMode::CallableAllocationLength(_) => {
+                (&scope.names, &scope.types)
+            }
             _ => (&names, &types),
         };
         let lengths = binding
@@ -5138,7 +5178,9 @@ impl StructuralWalker<'_, '_> {
         };
         if matches!(
             self.mode,
-            WalkMode::Callable(_) | WalkMode::ModuleInitialization { .. }
+            WalkMode::Callable(_)
+                | WalkMode::CallableAllocationLength(_)
+                | WalkMode::ModuleInitialization { .. }
         ) {
             for receiver in &binding.receivers {
                 scope
@@ -5260,7 +5302,9 @@ impl StructuralWalker<'_, '_> {
                         },
                     )?;
                     let replacement = match &self.mode {
-                        WalkMode::StructuralOnly => AssignmentReplacement::StructuralOnly,
+                        WalkMode::StructuralOnly | WalkMode::CallableAllocationLength(_) => {
+                            AssignmentReplacement::StructuralOnly
+                        }
                         WalkMode::ModuleInitialization { .. } => module_outputs.next().map_or(
                             AssignmentReplacement::Missing,
                             AssignmentReplacement::Resolved,
@@ -5268,8 +5312,8 @@ impl StructuralWalker<'_, '_> {
                         WalkMode::Callable(callable) => callable
                             .assignment_outputs
                             .get(&ResolvedAssignmentOutputId {
-                                source: callable.source.clone(),
-                                function_span: callable.function_span,
+                                source: callable.target_resolver.source.clone(),
+                                function_span: callable.target_resolver.function_span,
                                 target_span: target.target_span,
                                 output_index: destination,
                             })
@@ -5326,7 +5370,10 @@ impl StructuralWalker<'_, '_> {
                         ),
                     )
                     .is_none());
-                if let WalkMode::Callable(_) = &self.mode {
+                if matches!(
+                    &self.mode,
+                    WalkMode::Callable(_) | WalkMode::CallableAllocationLength(_)
+                ) {
                     for target in &assignment.targets {
                         if let ScalarPlace::Name { name, .. } = &target.place {
                             if !names.contains_key(name) {
@@ -5396,7 +5443,7 @@ fn resolve_module_call_sites(
     namespace_bindings: &[ScalarNamespaceBinding],
     declarations: &CallDeclarationIndex<'_>,
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
-    select_initialization_calls: bool,
+    select_executable_calls: bool,
     mut occurrence_typing: PreparationOccurrenceTyping,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
     #[cfg(test)]
@@ -5409,13 +5456,14 @@ fn resolve_module_call_sites(
                 function,
                 declarations,
                 assignment_outputs,
+                select_executable_calls,
                 &mut occurrence_typing,
             )?;
             functions.insert(index, calls);
         }
     }
     let mut initialization = module_initialization_region(source, items, namespace_bindings);
-    let initialization_mode = if select_initialization_calls {
+    let initialization_mode = if select_executable_calls {
         WalkMode::ModuleInitialization {
             source,
             declarations,
@@ -5524,6 +5572,7 @@ pub(super) fn test_function_call_sites(
         function,
         &CallDeclarationIndex::default(),
         assignment_outputs,
+        false,
         &mut PreparationOccurrenceTyping::default(),
     )
     .expect("test callable without call declarations")
@@ -5534,6 +5583,7 @@ fn resolve_function_call_sites(
     function: &ScalarFunction,
     declarations: &CallDeclarationIndex<'_>,
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
+    select_allocation_length_calls: bool,
     occurrence_typing: &mut PreparationOccurrenceTyping,
 ) -> Result<FunctionCallSites, ReferenceAnalysisError> {
     let mut arms = Vec::new();
@@ -5543,13 +5593,17 @@ fn resolve_function_call_sites(
             arm,
             declarations,
             assignment_outputs,
+            select_allocation_length_calls,
             occurrence_typing,
         )?);
     }
     let callable = CallableWalk {
-        source,
-        function_span: function.span,
-        declarations,
+        target_resolver: CallableTargetResolver {
+            source,
+            function_span: function.span,
+            declarations,
+        },
+        select_allocation_length_calls,
         assignment_outputs,
         sites: Vec::new(),
         site_by_span: BTreeMap::new(),
@@ -5644,6 +5698,7 @@ fn resolve_function_call_sites(
         occurrences: resolver.occurrences,
         call_occurrences: callable.call_occurrences,
         allocation_length_calls: resolver.structural_calls,
+        allocation_length_call_targets: resolver.allocation_length_call_targets,
         checked_call_signatures: resolver.checked_call_signatures,
         query_allocation_outputs: callable.query_allocation_outputs,
         structure: resolver.structure,

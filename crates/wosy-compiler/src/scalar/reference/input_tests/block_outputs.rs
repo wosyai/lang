@@ -84,6 +84,7 @@ fn checked_tail_conditional_publishes_one_producer_with_ordered_outputs() {
         &function,
         &CallDeclarationIndex::default(),
         &HashMap::new(),
+        true,
         &mut checked,
     )
     .unwrap();
