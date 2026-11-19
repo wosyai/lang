@@ -17,6 +17,8 @@ use super::control::{
 use super::inference::CheckedMember;
 use super::*;
 
+mod self_tail;
+
 #[cfg(test)]
 mod input_tests;
 
@@ -4856,6 +4858,7 @@ pub(super) struct FunctionCallSites {
     pub(super) arms: Vec<FunctionCallSites>,
     pub(super) occurrences: Vec<OccurrenceMetadata>,
     pub(super) call_occurrences: Vec<CallOccurrence>,
+    pub(super) self_tail_candidates: Vec<OccurrenceOrdinal>,
     pub(super) allocation_length_calls: Vec<OccurrenceOrdinal>,
     pub(super) allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
@@ -6381,7 +6384,7 @@ fn resolve_module_call_sites(
     let mut functions = BTreeMap::new();
     for (index, item) in items.iter().enumerate() {
         if let ScalarItem::Function(function) = item {
-            let calls = resolve_function_call_sites(
+            let mut calls = resolve_function_call_sites(
                 source,
                 function,
                 declarations,
@@ -6389,6 +6392,9 @@ fn resolve_module_call_sites(
                 select_executable_calls,
                 &mut occurrence_typing,
             )?;
+            if select_executable_calls {
+                calls.self_tail_candidates = self_tail::select(source, function, &calls);
+            }
             functions.insert(index, calls);
         }
     }
@@ -6633,6 +6639,7 @@ fn resolve_function_call_sites(
         arms,
         occurrences: resolver.occurrences,
         call_occurrences: callable.call_occurrences,
+        self_tail_candidates: Vec::new(),
         allocation_length_calls: resolver.structural_calls,
         allocation_length_call_targets: resolver.allocation_length_call_targets,
         checked_call_signatures: resolver.checked_call_signatures,

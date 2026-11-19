@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{collections::HashSet, marker::PhantomData};
 
 use super::super::reference::{
     FunctionCallSites, OccurrenceEdge as Edge, OccurrenceNode as Node, OccurrenceParent as Parent,
@@ -150,6 +150,7 @@ impl<'a> InitializerCallNodes<'a> {
 pub(crate) struct CallableBodyCallNodes<'a> {
     source: &'a SourceIdentity,
     targets: HashMap<*const ScalarExpression, &'a ResolvedCallTarget>,
+    self_tail_candidates: HashSet<*const ScalarExpression>,
     body: PhantomData<&'a ScalarBlock>,
 }
 
@@ -173,6 +174,7 @@ impl<'a> CallableBodyCallNodes<'a> {
         let mut nodes = Self {
             source,
             targets: HashMap::with_capacity(targets_by_ordinal.len()),
+            self_tail_candidates: HashSet::with_capacity(calls.self_tail_candidates.len()),
             body: PhantomData,
         };
         let mut bind_call = |ordinal: OccurrenceOrdinal, expression: &'a ScalarExpression| {
@@ -186,7 +188,15 @@ impl<'a> CallableBodyCallNodes<'a> {
                     span.start, span.end, ordinal.0,
                 )
             })?;
-            nodes.targets.insert(std::ptr::from_ref(expression), target);
+            let node = std::ptr::from_ref(expression);
+            nodes.targets.insert(node, target);
+            if calls
+                .self_tail_candidates
+                .binary_search_by_key(&ordinal.0, |candidate| candidate.0)
+                .is_ok()
+            {
+                nodes.self_tail_candidates.insert(node);
+            }
             Ok(())
         };
         Binder {
@@ -196,7 +206,23 @@ impl<'a> CallableBodyCallNodes<'a> {
             bind_call: &mut bind_call,
         }
         .block_items(Parent::Block(calls.structure.root), body)?;
+        if nodes.self_tail_candidates.len() != calls.self_tail_candidates.len() {
+            return Err(format!(
+                "internal error: self-tail candidates do not match canonical callable body in {source:?}"
+            ));
+        }
         Ok(nodes)
+    }
+
+    #[allow(dead_code, reason = "consumed by the LLVM lowering unit")]
+    pub(crate) fn has_self_tail_candidates(&self) -> bool {
+        !self.self_tail_candidates.is_empty()
+    }
+
+    #[allow(dead_code, reason = "consumed by the LLVM lowering unit")]
+    pub(crate) fn is_self_tail_candidate(&self, expression: &ScalarExpression) -> bool {
+        self.self_tail_candidates
+            .contains(&std::ptr::from_ref(expression))
     }
 
     pub(crate) fn target(
