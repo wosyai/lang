@@ -1,5 +1,7 @@
 use super::*;
 
+pub(in crate::scalar) mod checked;
+
 pub(super) fn select(
     source: &SourceIdentity,
     function: &ScalarFunction,
@@ -21,6 +23,14 @@ pub(super) fn select(
         return Vec::new();
     }
 
+    returned_self_calls(source, function, calls)
+}
+
+fn returned_self_calls(
+    source: &SourceIdentity,
+    function: &ScalarFunction,
+    calls: &FunctionCallSites,
+) -> Vec<OccurrenceOrdinal> {
     let resolved: HashMap<_, _> = calls
         .call_occurrences
         .iter()

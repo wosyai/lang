@@ -554,10 +554,6 @@ impl PartialEq for ScalarReferenceCfg {
 impl Eq for ScalarReferenceCfg {}
 
 impl ScalarReferenceCfg {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the next frame-reuse unit")
-    )]
     pub(crate) fn primary_call_point(
         &self,
         ordinal: reference::OccurrenceOrdinal,

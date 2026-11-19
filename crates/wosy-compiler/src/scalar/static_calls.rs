@@ -243,6 +243,30 @@ impl<'a> ScalarBuildValidation<'a> {
         &self.diagnostics
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "proof consumer is a separate unit")
+    )]
+    pub(crate) fn checked_self_tail_forwarding(
+        &self,
+        module: usize,
+        item: usize,
+    ) -> Option<reference::OccurrenceOrdinal> {
+        if !self.diagnostics.is_empty() {
+            return None;
+        }
+        let module_row = self.prepared.project.modules.get(module)?;
+        let ScalarItem::Function(function) = module_row.items.get(item)? else {
+            return None;
+        };
+        reference::self_tail::checked::prove(
+            &module_row.source,
+            function,
+            self.prepared.calls.function_body(module, item, None)?,
+            self.reference_cfg(module, item, None)?,
+        )
+    }
+
     pub(crate) fn reference_cfg(
         &self,
         module_ordinal: usize,
