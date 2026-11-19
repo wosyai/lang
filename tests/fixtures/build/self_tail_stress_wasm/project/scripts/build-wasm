@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+import subprocess
+import sys
+
+partition, output_dir, manifest, runtime = sys.argv[1:]
+object_path = output_dir + "/main.o"
+wrapper_object_path = output_dir + "/start.o"
+runtime_object_path = output_dir + "/runtime.o"
+for source, object_file in (
+    (partition, object_path),
+    ("scripts/start.ll", wrapper_object_path),
+    (runtime, runtime_object_path),
+):
+    subprocess.run(
+        ["clang", "--target=wasm32-wasi", "-O0", "-c", "-x", "ir", source, "-o", object_file],
+        check=True,
+    )
+subprocess.run(
+    [
+        "wasm-ld", "--no-entry", "--allow-undefined", "--export=_start",
+        "-z", "stack-size=32768", object_path, wrapper_object_path, runtime_object_path,
+        "-o", output_dir + "/main",
+    ],
+    check=True,
+)
