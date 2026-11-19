@@ -6,7 +6,8 @@ use super::control::{
     BlockPosition, BlockRegion, CheckedCallSignature, CheckedOccurrenceTypes,
     ConditionalOutputProjection, ConditionalRegion, FinalOutputSlot, FoldedOccurrence,
     ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationRegion,
-    ModuleInitializationStepKind, ModuleInitializationTopology, ShortCircuitRegion, WhileRegion,
+    ModuleInitializationStepKind, ModuleInitializationTopology, ShortCircuitRegion,
+    SyntheticOccurrence, WhileRegion,
 };
 use super::control::{
     AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentReplacement,
@@ -4365,6 +4366,7 @@ pub(super) struct OccurrenceStructure {
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
     pub(super) folded_expressions: HashMap<OccurrenceOrdinal, FoldedOccurrence>,
+    pub(super) synthetic_expressions: HashMap<OccurrenceOrdinal, SyntheticOccurrence>,
     pub(super) conditional_output_projections:
         HashMap<OccurrenceOrdinal, ConditionalOutputProjection>,
 }
@@ -4377,6 +4379,7 @@ impl OccurrenceStructure {
             edges: HashMap::new(),
             checked_types: CheckedOccurrenceTypes::default(),
             folded_expressions: HashMap::new(),
+            synthetic_expressions: HashMap::new(),
             conditional_output_projections: HashMap::new(),
         }
     }
@@ -5389,8 +5392,8 @@ impl StructuralWalker<'_, '_> {
         let parent = OccurrenceParent::Block(position.block);
         let item_index = position.item;
         let WalkScope { names, types } = scope;
-        let edge = |output| {
-            if binding.is_allocation {
+        let mut evaluate = |value: &ScalarExpression, output| {
+            let edge = if binding.is_allocation {
                 OccurrenceEdge::QueryAllocationPlaceholder {
                     item: item_index,
                     output,
@@ -5400,12 +5403,22 @@ impl StructuralWalker<'_, '_> {
                     item: item_index,
                     output,
                 }
+            };
+            let ordinal = self.expression_at(value, names, types, parent, edge)?;
+            if matches!(edge, OccurrenceEdge::QueryAllocationPlaceholder { .. })
+                && matches!(value, ScalarExpression::Integer { value, span }
+                    if *span == binding.span && value == &BigInt::from(0))
+            {
+                self.structure
+                    .synthetic_expressions
+                    .insert(ordinal, SyntheticOccurrence::QueryAllocationPlaceholder);
             }
+            Ok::<_, ReferenceAnalysisError>(ordinal)
         };
         let ScalarBindingOutput::Evaluate(primary) = binding.output_source(0) else {
             unreachable!("primary binding output evaluates its source")
         };
-        let primary = self.expression_at(primary, names, types, parent, edge(0))?;
+        let primary = evaluate(primary, 0)?;
         let output_count = match binding.output_origin {
             ScalarBindingOutputOrigin::SingleExpression => binding.receivers.len(),
             ScalarBindingOutputOrigin::IndependentExpressions => binding.output_values.len(),
@@ -5413,14 +5426,10 @@ impl StructuralWalker<'_, '_> {
         let mut secondary = Vec::with_capacity(output_count.saturating_sub(1));
         for position in 1..output_count {
             let output = match binding.output_source(position) {
-                ScalarBindingOutput::Evaluate(value) => {
-                    let expression =
-                        self.expression_at(value, names, types, parent, edge(position))?;
-                    BindingOutput::Evaluate {
-                        position,
-                        expression,
-                    }
-                }
+                ScalarBindingOutput::Evaluate(value) => BindingOutput::Evaluate {
+                    position,
+                    expression: evaluate(value, position)?,
+                },
                 ScalarBindingOutput::ProjectPrimary { output } => {
                     BindingOutput::ProjectPrimary { output }
                 }

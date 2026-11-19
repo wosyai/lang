@@ -1,7 +1,7 @@
 use super::*;
 use crate::scalar::control::{
     BindingAllocationLengthSlot, BindingInitialization, BindingOutput, BindingOutputs,
-    BlockItemKind, ModuleInitializationDetail,
+    BlockItemKind, ModuleInitializationDetail, SyntheticOccurrence,
 };
 use reference::{
     OccurrenceEdge as Edge, OccurrenceMetadata, OccurrenceNode as Node, OccurrenceOrdinal,
@@ -182,7 +182,7 @@ fn prepared_block_table_owns_ordered_bindings_nested_scopes_and_final_output_slo
 
 #[test]
 fn public_prepare_retains_typed_allocation_lengths_without_query_calls() {
-    let text = "%%start\nu64(u64) length = fn(n) { n };\nu8[length(length(1) + 2)] module_bytes;\nu64(u64) run = fn(n) { u8[length(length(n) + 3)] local_bytes; local_bytes; length(n) };\n%%end";
+    let text = "%%start\nu64(u64) length = fn(n) { n };\nu8[length(length(1) + 2)] module_bytes;\nu64(u64) run = fn(n) { u8[length(length(n) + 3)] local_bytes; local_bytes; u64 zero = 0; zero; length(n) };\n%%end";
     let parsed = parsed(text);
     let check = |structure: &OccurrenceStructure,
                  occurrences: &[OccurrenceMetadata],
@@ -218,6 +218,10 @@ fn public_prepare_retains_typed_allocation_lengths_without_query_calls() {
             structure.edges[&(root, Edge::BindingAllocationLength { item, position: 0 })],
             Node::Expression(*expression)
         );
+        assert_eq!(
+            structure.checked_types.expressions[expression],
+            ScalarType::U64
+        );
         let child = |parent, edge| {
             let Node::Expression(child) = structure.edges[&(Parent::Expression(parent), edge)]
             else {
@@ -240,7 +244,16 @@ fn public_prepare_retains_typed_allocation_lengths_without_query_calls() {
         assert_eq!(spelling(child(argument, Edge::BinaryRight)), increment);
     };
     for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let stages = Scope::new();
         let prepared = prepare_extracted(&parsed, target);
+        assert_eq!(
+            stages.counts(),
+            Counts {
+                call_sites: 1,
+                ..Counts::default()
+            }
+        );
+        drop(stages);
         let initialization = prepared.initialization_region(0).unwrap();
         let ModuleInitializationDetail::Occurrences(topology) = &initialization.detail else {
             panic!("module initialization topology")
@@ -257,6 +270,7 @@ fn public_prepare_retains_typed_allocation_lengths_without_query_calls() {
             Parent::Block(topology.structure.root),
             Edge::QueryAllocationPlaceholder { item: 1, output: 0 },
         )));
+        assert!(topology.structure.synthetic_expressions.is_empty());
         let function = prepared.calls.function(0, 2);
         check(
             &function.structure,
@@ -291,6 +305,46 @@ fn public_prepare_retains_typed_allocation_lengths_without_query_calls() {
                     position: 0
                 }
             )],
+        );
+        let Node::Expression(placeholder) = function.structure.edges[&(
+            root,
+            Edge::QueryAllocationPlaceholder { item: 0, output: 0 },
+        )] else {
+            panic!("query allocation expression")
+        };
+        assert_eq!(placeholder, OccurrenceOrdinal(0));
+        let ScalarItem::Function(run) = &prepared.project().modules[0].items[2] else {
+            panic!("run declaration")
+        };
+        let ScalarBlockItem::LocalBinding(binding) = &run.body.items[0] else {
+            panic!("allocation binding")
+        };
+        assert_eq!(function.occurrences[placeholder.0].span, binding.span);
+        assert!(
+            matches!(&binding.value, ScalarExpression::Integer { value, span }
+            if value == &BigInt::from(0) && *span == binding.span)
+        );
+        assert_eq!(function.structure.synthetic_expressions.len(), 1);
+        assert_eq!(
+            function.structure.synthetic_expressions[&placeholder],
+            SyntheticOccurrence::QueryAllocationPlaceholder,
+        );
+        assert!(!function
+            .structure
+            .checked_types
+            .expressions
+            .contains_key(&placeholder));
+        assert!(function.structure.folded_expressions.is_empty());
+        let Node::Expression(zero) =
+            function.structure.edges[&(root, Edge::BindingRoot { item: 2, output: 0 })]
+        else {
+            panic!("ordinary zero expression")
+        };
+        let span = function.occurrences[zero.0].span;
+        assert_eq!(&text[span.start as usize..span.end as usize], "0");
+        assert_eq!(
+            function.structure.checked_types.expressions[&zero],
+            ScalarType::U64
         );
         let [site] = function.sites.as_slice() else {
             panic!("only the final-output call belongs to the query")

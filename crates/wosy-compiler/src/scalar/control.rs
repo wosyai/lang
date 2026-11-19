@@ -130,6 +130,11 @@ pub(super) enum FoldedOccurrence {
     SignedIntegerMagnitude,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SyntheticOccurrence {
+    QueryAllocationPlaceholder,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModuleInitializationStep {
     pub(crate) item: usize,
