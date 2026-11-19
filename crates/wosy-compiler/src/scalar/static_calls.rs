@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) struct PreparedProgram {
     program: ScalarProgram,
-    calls: Result<reference::ModuleCallSites, ReferenceAnalysisError>,
+    calls: reference::ModuleCallSites,
 }
 
 impl PreparedProgram {
@@ -10,29 +10,33 @@ impl PreparedProgram {
         declarations: ScalarSourceDeclarations,
         target_layout: ScalarTargetLayout,
     ) -> Result<Self, ScalarValidation> {
-        let (validation, occurrence_typing) =
+        let (mut validation, occurrence_typing) =
             typecheck_scalar_program_with_occurrences(declarations, target_layout);
         if !validation.diagnostics.is_empty() {
             return Err(validation);
         }
-        let program = validation.program;
-        let calls =
-            reference::resolve_program_call_sites_with_occurrences(&program, occurrence_typing);
-        Ok(Self { program, calls })
+        let calls = match reference::resolve_program_call_sites_with_occurrences(
+            &validation.program,
+            occurrence_typing,
+        ) {
+            Ok(calls) => calls,
+            Err(error) => {
+                validation.diagnostics.push(error.diagnostic());
+                return Err(validation);
+            }
+        };
+        Ok(Self {
+            program: validation.program,
+            calls,
+        })
     }
 
-    fn analyze(&self) -> Result<reference::ProgramReferenceResults, ReferenceAnalysisError> {
-        match &self.calls {
-            Ok(calls) => Ok(reference::analyze_program_references(&self.program, calls)),
-            Err(error) => Err(error.clone()),
-        }
+    fn analyze(&self) -> reference::ProgramReferenceResults {
+        reference::analyze_program_references(&self.program, &self.calls)
     }
 
     pub(super) fn finish(mut self) -> ScalarValidation {
-        let errors = match self.analyze() {
-            Ok(results) => results.install(&mut self.program),
-            Err(error) => vec![error],
-        };
+        let errors = self.analyze().install(&mut self.program);
         ScalarValidation {
             program: self.program,
             diagnostics: errors.into_iter().map(|error| error.diagnostic()).collect(),

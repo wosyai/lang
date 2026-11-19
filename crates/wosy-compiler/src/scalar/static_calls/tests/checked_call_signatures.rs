@@ -408,7 +408,7 @@ fn public_prepare_retains_checked_expression_and_place_types_by_occurrence() {
             target,
         )
         .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
-        let calls = program.calls.as_ref().unwrap();
+        let calls = &program.calls;
         check(&calls.initialization, calls.function(1));
     }
 }
@@ -481,7 +481,7 @@ fn preparation_publishes_signed_integer_magnitudes_as_folded_unary_operands() {
             target,
         )
         .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
-        let calls = program.calls.as_ref().unwrap();
+        let calls = &program.calls;
         check(&calls.initialization, calls.function(2));
     }
 }
@@ -609,7 +609,7 @@ struct Record { u8 value; }
             target_layout,
         )
         .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
-        check(&program.calls.as_ref().unwrap().function(0).structure);
+        check(&program.calls.function(0).structure);
     }
 }
 
@@ -694,7 +694,7 @@ unit(*!Record, *!u16) run = fn(writer, number) {
             target_layout,
         )
         .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
-        check(&program.calls.as_ref().unwrap().function(0).structure);
+        check(&program.calls.function(0).structure);
     }
 }
 
@@ -896,7 +896,7 @@ fn prepare_publishes_checked_core_memory_signatures_in_initialization_and_functi
             target,
         )
         .unwrap_or_else(|failure| panic!("{target:?}: {:?}", failure.diagnostics));
-        let calls = program.calls.as_ref().unwrap();
+        let calls = &program.calls;
         check(&calls.initialization, calls.function(0));
         assert_eq!(
             stages.counts(),
@@ -1052,7 +1052,7 @@ fn prepare_publishes_checked_core_value_signatures_in_initialization_and_functio
             target,
         )
         .unwrap_or_else(|failure| panic!("{target:?}: {:?}", failure.diagnostics));
-        let calls = program.calls.as_ref().unwrap();
+        let calls = &program.calls;
         check(&calls.initialization, calls.function(0));
     }
 }
@@ -1180,7 +1180,7 @@ artifact_id(bool, utf8) run = fn(choose, input) {
         )
         .unwrap_or_else(|failure| panic!("{target_layout:?}: {:?}", failure.diagnostics));
         let utf8 = ScalarType::Struct(program.program.structs[0].id.clone());
-        let calls = program.calls.as_ref().unwrap();
+        let calls = &program.calls;
         check(&calls.initialization, calls.function(1), &utf8);
     }
 }
@@ -1306,7 +1306,7 @@ u32(u32) run = fn(input) {
             target_layout,
         )
         .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
-        let calls = program.calls.as_ref().unwrap();
+        let calls = &program.calls;
         let ModuleInitializationDetail::Occurrences(topology) = &calls.initialization.detail else {
             panic!("module initialization occurrences")
         };
@@ -1428,7 +1428,7 @@ fn prepared_generic_calls_keep_concrete_signatures_at_module_body_and_length_edg
             target,
         )
         .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
-        let calls = program.calls.as_ref().unwrap();
+        let calls = &program.calls;
         check(&calls.initialization, calls.function(3));
     }
 }
@@ -1493,7 +1493,7 @@ fn prepared_contextual_overload_keeps_selected_arm_and_ordered_mixed_outputs() {
             target,
         )
         .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
-        check(program.calls.as_ref().unwrap().function(2));
+        check(program.calls.function(2));
     }
 }
 

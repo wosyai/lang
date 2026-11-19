@@ -30,7 +30,7 @@ fn prepared_block_table_owns_ordered_bindings_nested_scopes_and_final_output_slo
         assert_eq!(copies.counts().cfg_copies, 0);
         drop(copies);
         drop(stages);
-        let calls = prepared.calls.as_ref().unwrap();
+        let calls = &prepared.calls;
         let pair = calls.function(0);
         let pair_block = &pair.structure.blocks[pair.structure.root.0];
         let ScalarItem::Function(pair_syntax) = &prepared.program.items[0] else {
@@ -127,7 +127,7 @@ fn prepared_block_table_owns_ordered_bindings_nested_scopes_and_final_output_slo
         assert_eq!(root.final_outputs().count(), 0);
         let before = prepared.program.clone();
         let stages = Scope::new();
-        let results = prepared.analyze().unwrap();
+        let results = prepared.analyze();
         assert_eq!(
             stages.counts(),
             Counts {

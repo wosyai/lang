@@ -49,7 +49,7 @@ fn prepared_branch_regions_preserve_polarity_continuations_and_inherited_query_e
         assert_eq!(copies.counts().cfg_copies, 0);
         drop(copies);
         drop(stages);
-        let calls = prepared.calls.as_ref().unwrap();
+        let calls = &prepared.calls;
         for (item, polarity, bypass) in [(3, true, false), (4, false, true)] {
             let row = calls.function(item);
             let ScalarItem::Function(function) = &prepared.program.items[item] else {
@@ -186,7 +186,7 @@ fn prepared_branch_regions_preserve_polarity_continuations_and_inherited_query_e
         );
         let before = prepared.program.clone();
         let stages = Scope::new();
-        let results = prepared.analyze().unwrap();
+        let results = prepared.analyze();
         assert_eq!(
             stages.counts(),
             Counts {

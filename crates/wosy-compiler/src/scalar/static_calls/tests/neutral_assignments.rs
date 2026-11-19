@@ -24,7 +24,7 @@ fn preparation_publishes_neutral_assignment_stages_consumed_by_the_existing_quer
         assert_eq!(copies.counts().cfg_copies, 0);
         drop(copies);
         drop(stages);
-        let row = prepared.calls.as_ref().unwrap().function(3);
+        let row = prepared.calls.function(3);
         let ScalarItem::Function(function) = &prepared.program.items[3] else {
             panic!("probe")
         };
@@ -149,7 +149,7 @@ fn preparation_publishes_neutral_assignment_stages_consumed_by_the_existing_quer
         let before = prepared.program.clone();
         let stages = Scope::new();
         let copies = layout::observations::Scope::new();
-        let results = prepared.analyze().unwrap();
+        let results = prepared.analyze();
         assert_eq!(
             stages.counts(),
             Counts {

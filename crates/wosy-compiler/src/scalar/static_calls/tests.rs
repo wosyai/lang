@@ -234,7 +234,7 @@ fn standalone_preparation_retains_static_inputs_for_repeatable_owned_queries_and
             for _ in 0..2 {
                 let scope = Scope::new();
                 let copies = layout::observations::Scope::new();
-                let result = prepared.analyze().unwrap();
+                let result = prepared.analyze();
                 assert_query_stages(scope.counts(), valid);
                 assert_eq!(copies.counts().program_copies, 0);
                 assert_eq!(copies.counts().module_copies, 0);
@@ -310,6 +310,56 @@ fn project_preparation_retains_static_inputs_for_repeatable_owned_queries_and_le
             assert_eq!(public.project, finished.project);
             assert_eq!(public.diagnostics, finished.diagnostics);
         }
+    }
+}
+
+#[test]
+fn standalone_static_lookup_rejection_preserves_typed_program_and_exact_diagnostic() {
+    let text = "%%start\nstruct Callback { i32(i32) run; }\ni32(i32) identity = fn(input) { input };\nCallback handler = { .run = identity; };\ni32(i32) invoke = fn(input) { handler.run(input) };\n%%end";
+    let parsed = parsed(text);
+    let declarations = || derive_scalar_declarations_from_cst(parsed.canonical_cst());
+    let message = "missing resolved call target";
+    let call = "handler.run(input)";
+    let start = text.find(call).unwrap() as u32;
+    let expected = vec![Diagnostic {
+        code: "B0003".into(),
+        severity: DiagnosticSeverity::Error,
+        message: message.into(),
+        labels: vec![DiagnosticLabel {
+            kind: DiagnosticLabelKind::Primary,
+            span: SourceSpan::new(
+                declarations().source().clone(),
+                ByteSpan::new(start, start + call.len() as u32),
+            ),
+            message: message.into(),
+        }],
+        notes: Vec::new(),
+    }];
+    let lookup_only = Counts {
+        call_sites: 1,
+        ..Counts::default()
+    };
+    for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let scope = Scope::new();
+        let (typed, _) = typecheck_scalar_program_with_occurrences(declarations(), target);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        assert_eq!(scope.counts(), Counts::default());
+        drop(scope);
+
+        let scope = Scope::new();
+        let Err(rejected) = PreparedProgram::new(declarations(), target) else {
+            panic!("static lookup must reject standalone preparation");
+        };
+        assert_eq!(scope.counts(), lookup_only);
+        drop(scope);
+        assert_eq!(rejected.program, typed.program);
+        assert_eq!(rejected.diagnostics, expected);
+
+        let scope = Scope::new();
+        let public = derive_scalar_program_from_cst_with_layout(parsed.canonical_cst(), target);
+        assert_eq!(scope.counts(), lookup_only);
+        assert_eq!(public.program, rejected.program);
+        assert_eq!(public.diagnostics, expected);
     }
 }
 

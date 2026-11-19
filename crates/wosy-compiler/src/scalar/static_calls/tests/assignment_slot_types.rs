@@ -18,7 +18,7 @@ fn reference_queries_keep_frozen_assignment_types_after_legacy_table_removal() {
             }
         );
         drop(stages);
-        let row = prepared.calls.as_ref().unwrap().function(1);
+        let row = prepared.calls.function(1);
         assert_eq!(row.assignments.len(), 2);
         for group in row.assignments.values() {
             assert_eq!(
@@ -35,7 +35,7 @@ fn reference_queries_keep_frozen_assignment_types_after_legacy_table_removal() {
         let static_rows = row.clone();
         let before = prepared.program.clone();
         let stages = Scope::new();
-        let first = prepared.analyze().unwrap();
+        let first = prepared.analyze();
         assert_eq!(
             stages.counts(),
             Counts {
@@ -53,10 +53,10 @@ fn reference_queries_keep_frozen_assignment_types_after_legacy_table_removal() {
         assert_eq!(prepared.program.resolved_assignment_outputs.len(), 4);
         prepared.program.resolved_assignment_outputs = ScalarAssignmentTyping::default();
         let stripped = prepared.program.clone();
-        assert_eq!(prepared.calls.as_ref().unwrap().function(1), &static_rows);
+        assert_eq!(prepared.calls.function(1), &static_rows);
         let stages = Scope::new();
         let copies = layout::observations::Scope::new();
-        let second = prepared.analyze().unwrap();
+        let second = prepared.analyze();
         assert_eq!(
             stages.counts(),
             Counts {

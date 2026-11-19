@@ -88,7 +88,7 @@ fn preparation_publishes_stable_callable_owned_expression_place_and_call_ordinal
         assert_eq!(copies.counts().cfg_copies, 0);
         drop(copies);
         drop(scope);
-        let calls = prepared.calls.as_ref().unwrap();
+        let calls = &prepared.calls;
         let owner = calls.function(4);
         assert!(owner.occurrences.is_empty());
         assert_eq!(owner.arms.len(), 2);
@@ -367,7 +367,7 @@ fn preparation_publishes_stable_callable_owned_expression_place_and_call_ordinal
         }
         let before = prepared.program.clone();
         let scope = Scope::new();
-        let results = prepared.analyze().unwrap();
+        let results = prepared.analyze();
         assert_eq!(scope.counts().call_sites, 0);
         drop(scope);
         let mut installed = before.clone();
@@ -448,7 +448,7 @@ fn preparation_keeps_equal_span_independent_occurrences_and_earlier_legacy_call_
         assert_eq!(copies.counts().cfg_copies, 0);
         drop(copies);
         drop(scope);
-        let row = prepared.calls.as_ref().unwrap().function(1);
+        let row = prepared.calls.function(1);
         let root = Parent::Block(row.structure.root);
         assert_eq!(row.structure.blocks.len(), 1);
         assert_eq!(row.structure.edges.len(), 10);
@@ -496,13 +496,13 @@ fn preparation_keeps_equal_span_independent_occurrences_and_earlier_legacy_call_
         let sites_before = row.sites.clone();
         let before = prepared.program.clone();
         let scope = Scope::new();
-        let results = prepared.analyze().unwrap();
+        let results = prepared.analyze();
         assert_eq!(scope.counts().call_sites, 0);
         drop(scope);
         let mut installed = before.clone();
         assert!(results.install(&mut installed).is_empty());
         assert_eq!(prepared.program, before);
-        let row = prepared.calls.as_mut().unwrap().function_mut(1);
+        let row = prepared.calls.function_mut(1);
         assert_eq!(row.call_occurrences.remove(1).ordinal, OccurrenceOrdinal(5));
         assert_eq!(
             row.call_occurrences,
@@ -513,7 +513,7 @@ fn preparation_keeps_equal_span_independent_occurrences_and_earlier_legacy_call_
         );
         assert_eq!(row.sites, sites_before);
         let scope = Scope::new();
-        let results = prepared.analyze().unwrap();
+        let results = prepared.analyze();
         assert_eq!(scope.counts().call_sites, 0);
         drop(scope);
         let mut partial = before.clone();
