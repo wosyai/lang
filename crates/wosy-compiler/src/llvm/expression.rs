@@ -2512,7 +2512,7 @@ fn emit_binary_with_rhs<'ctx, 'module>(
     Ok(EmitValue::Basic(phi.as_basic_value()))
 }
 
-fn emit_binary_values<'ctx, 'module>(
+pub(super) fn emit_binary_values<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     operator: &BinaryOperator,
     left: EmitValue<'ctx>,

@@ -1,4 +1,4 @@
-use std::{collections::HashSet, marker::PhantomData};
+use std::marker::PhantomData;
 
 use super::super::reference::{
     FunctionCallSites, OccurrenceEdge as Edge, OccurrenceNode as Node, OccurrenceParent as Parent,
@@ -83,6 +83,7 @@ impl<'a> InitializerCallNodes<'a> {
             source: &region.source,
             region: "initializer",
             bind_call: &mut bind_call,
+            bind_type: None,
         };
         let root = Parent::Block(topology.structure.root);
         for step in &region.steps {
@@ -150,7 +151,8 @@ impl<'a> InitializerCallNodes<'a> {
 pub(crate) struct CallableBodyCallNodes<'a> {
     source: &'a SourceIdentity,
     targets: HashMap<*const ScalarExpression, &'a ResolvedCallTarget>,
-    self_tail_candidates: HashSet<*const ScalarExpression>,
+    self_tail_candidates: HashMap<*const ScalarExpression, &'a ScalarExpression>,
+    expression_types: HashMap<*const ScalarExpression, &'a ScalarType>,
     scalar_self_tail_types: bool,
     body: PhantomData<&'a ScalarBlock>,
 }
@@ -175,10 +177,18 @@ impl<'a> CallableBodyCallNodes<'a> {
         let mut nodes = Self {
             source,
             targets: HashMap::with_capacity(targets_by_ordinal.len()),
-            self_tail_candidates: HashSet::with_capacity(calls.self_tail_candidates.len()),
+            self_tail_candidates: HashMap::with_capacity(calls.self_tail_candidates.len()),
+            expression_types: HashMap::new(),
             scalar_self_tail_types: !calls.self_tail_candidates.is_empty()
                 && super::super::reference::self_tail::scalar_body_types(calls),
             body: PhantomData,
+        };
+        let mut bind_type = |ordinal, expression| {
+            if let Some(ty) = calls.structure.checked_types.expressions.get(&ordinal) {
+                nodes
+                    .expression_types
+                    .insert(std::ptr::from_ref(expression), ty);
+            }
         };
         let mut bind_call = |ordinal: OccurrenceOrdinal, expression: &'a ScalarExpression| {
             if matches!(expression, ScalarExpression::Member { .. }) {
@@ -198,7 +208,7 @@ impl<'a> CallableBodyCallNodes<'a> {
                 .binary_search_by_key(&ordinal.0, |candidate| candidate.0)
                 .is_ok()
             {
-                nodes.self_tail_candidates.insert(node);
+                nodes.self_tail_candidates.insert(node, expression);
             }
             Ok(())
         };
@@ -207,6 +217,7 @@ impl<'a> CallableBodyCallNodes<'a> {
             source,
             region: "callable body",
             bind_call: &mut bind_call,
+            bind_type: (!calls.self_tail_candidates.is_empty()).then_some(&mut bind_type as _),
         }
         .block_items(Parent::Block(calls.structure.root), body)?;
         if nodes.self_tail_candidates.len() != calls.self_tail_candidates.len() {
@@ -227,7 +238,17 @@ impl<'a> CallableBodyCallNodes<'a> {
 
     pub(crate) fn is_self_tail_candidate(&self, expression: &ScalarExpression) -> bool {
         self.self_tail_candidates
-            .contains(&std::ptr::from_ref(expression))
+            .contains_key(&std::ptr::from_ref(expression))
+    }
+
+    pub(crate) fn self_tail_candidates(&self) -> impl Iterator<Item = &'a ScalarExpression> + '_ {
+        self.self_tail_candidates.values().copied()
+    }
+
+    pub(crate) fn expression_type(&self, expression: &ScalarExpression) -> Option<&'a ScalarType> {
+        self.expression_types
+            .get(&std::ptr::from_ref(expression))
+            .copied()
     }
 
     pub(crate) fn target(
@@ -252,6 +273,7 @@ struct Binder<'a, 'bind> {
     source: &'a SourceIdentity,
     region: &'static str,
     bind_call: &'bind mut dyn FnMut(OccurrenceOrdinal, &'a ScalarExpression) -> Result<(), String>,
+    bind_type: Option<&'bind mut dyn FnMut(OccurrenceOrdinal, &'a ScalarExpression)>,
 }
 
 impl<'a> Binder<'a, '_> {
@@ -271,6 +293,9 @@ impl<'a> Binder<'a, '_> {
         let Some(&Node::Expression(ordinal)) = self.structure.edges.get(&(parent, edge)) else {
             return Err(self.invalid_edge(parent, edge));
         };
+        if let Some(bind_type) = &mut self.bind_type {
+            bind_type(ordinal, expression);
+        }
         let parent = Parent::Expression(ordinal);
         match expression {
             ScalarExpression::Call { arguments, .. } => {

@@ -130,6 +130,55 @@ fn self_tail_test_symbol(source: &SourceIdentity, project: bool, name: &str) -> 
     }
 }
 
+#[test]
+fn prepared_self_tail_writes_checked_u64_width() {
+    let text = "%%start
+u64(u64, bool) wide = fn(value, done) {
+    if (done) { value } else { wide(0 + 1, true) }
+};
+u64(u64, bool) overflow = fn(value, done) {
+    if (done) { value } else { overflow((2147483647 + 2147483647) + 3, true) }
+};
+i32(i32, bool) ordinary = fn(value, done) {
+    if (done) { value } else { ordinary(-value, true) }
+};
+u64 result = wide(4294967296, false);
+if (result != 1) { core.system_panic(); };
+%%end";
+    let mut failures = Vec::new();
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (project, partition) in [
+            (false, emit_scalar_build_single_module_llvm(&build)),
+            (true, emit_scalar_build_project_llvm(&build)),
+        ] {
+            let ir = partition.unwrap().to_text();
+            let symbol = self_tail_test_symbol(source, project, "wide");
+            let body = self_tail_test_body(&ir, "i64", &symbol);
+            if !body.contains("store i64 1, ptr %value")
+                || body.contains("store i32")
+                || body.matches("br label %self_tail.header").count() != 2
+                || !ir.contains(&format!("call i64 @{symbol}(i64 4294967296, i1 false)"))
+            {
+                failures.push(format!("{layout:?} project={project}: {body}"));
+            }
+            let overflow = self_tail_test_symbol(source, project, "overflow");
+            let body = self_tail_test_body(&ir, "i64", &overflow);
+            if !body.contains("store i64 4294967297, ptr %value") {
+                failures.push(format!("{layout:?} project={project}: {body}"));
+            }
+            let ordinary = self_tail_test_symbol(source, project, "ordinary");
+            let body = self_tail_test_body(&ir, "i32", &ordinary);
+            assert!(body.contains(&format!("call i32 @{ordinary}(")), "{body}");
+            assert!(!body.contains("self_tail.header"), "{body}");
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 fn self_tail_test_body<'a>(ir: &'a str, ty: &str, symbol: &str) -> &'a str {
     ir.split_once(&format!("define {ty} @{symbol}("))
         .unwrap_or_else(|| panic!("missing definition {symbol}: {ir}"))

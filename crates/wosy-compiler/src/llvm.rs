@@ -1870,7 +1870,7 @@ fn emit_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if self_tail::eligible(&state, function, reference_cfg) {
+    if self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(context, &mut state, value, function, None);
     }
     let result = match function.body.items.as_slice() {
@@ -2151,7 +2151,7 @@ fn emit_project_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if self_tail::eligible(&state, function, reference_cfg) {
+    if self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(
             context,
             &mut state,
