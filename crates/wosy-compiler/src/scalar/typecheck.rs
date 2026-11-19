@@ -4278,6 +4278,9 @@ fn checked_address_type(
         ));
         return ScalarType::Error;
     }
+    if matches!(place, ScalarPlace::Dereference { .. }) {
+        inference.record_place_type(place, &inner);
+    }
     ScalarType::CheckedReference {
         mutability,
         inner: Box::new(inner),
@@ -4363,6 +4366,9 @@ fn checked_address_type_in_module(
             span,
         ));
         return ScalarType::Error;
+    }
+    if matches!(place, ScalarPlace::Dereference { .. }) {
+        inference.record_place_type(place, &inner);
     }
     ScalarType::CheckedReference {
         mutability,
@@ -5164,7 +5170,7 @@ fn checked_dereference_type(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    match place {
+    let ty = match place {
         ScalarPlace::Dereference { pointer, span } => checked_dereference_target_type(
             pointer,
             *span,
@@ -5199,6 +5205,7 @@ fn checked_dereference_type(
                 overloads,
                 inference,
             );
+            inference.record_place_type(base, &base_type);
             let ScalarFieldReference::Resolved(field) = field else {
                 let ScalarFieldReference::Unresolved { span, .. } = field else {
                     unreachable!("field reference")
@@ -5263,7 +5270,9 @@ fn checked_dereference_type(
             ));
             ScalarType::Error
         }
-    }
+    };
+    inference.record_place_type(place, &ty);
+    ty
 }
 
 fn checked_dereference_type_in_module(
@@ -5277,8 +5286,8 @@ fn checked_dereference_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    let (pointer, dereference_span, field) = match place {
-        ScalarPlace::Dereference { pointer, span } => (pointer, *span, None),
+    let (dereference, pointer, dereference_span, field) = match place {
+        ScalarPlace::Dereference { pointer, span } => (place, pointer, *span, None),
         ScalarPlace::Field {
             base,
             field,
@@ -5297,7 +5306,12 @@ fn checked_dereference_type_in_module(
                 ));
                 return ScalarType::Error;
             };
-            (pointer, *dereference_span, Some((field, *field_span)))
+            (
+                base.as_ref(),
+                pointer,
+                *dereference_span,
+                Some((field, *field_span)),
+            )
         }
         ScalarPlace::Name { .. } => {
             diagnostics.push(module_diagnostic(
@@ -5361,6 +5375,7 @@ fn checked_dereference_type_in_module(
             return ScalarType::Error;
         }
     };
+    inference.record_place_type(dereference, &inner);
     let (field, field_span) = match field {
         None => return inner,
         Some((ScalarFieldReference::Resolved(field), field_span)) => (field, field_span),
@@ -5410,6 +5425,7 @@ fn checked_dereference_type_in_module(
         ));
         ScalarType::Error
     } else {
+        inference.record_place_type(place, &candidate.ty);
         candidate.ty
     }
 }

@@ -106,6 +106,86 @@ fn place_child(structure: &OccurrenceStructure, parent: Parent, edge: Edge) -> O
     ordinal
 }
 
+#[test]
+fn prepare_retains_checked_dereference_and_reborrow_place_types() {
+    let parsed = parsed(
+        "%%start
+struct Record { u8 value; }
+(u16, u8, *!u32, *u16)(*u16, *Record, *!u32) run = fn(shared, item, writer) {
+    *(&*shared), (*item).value, &!(*writer), &*(&*shared)
+};
+%%end",
+    );
+    let check = |structure: &OccurrenceStructure| {
+        let types = &structure.checked_types;
+        let place = |expression, expected: &ScalarType| {
+            let place = place_child(
+                structure,
+                Parent::Expression(expression),
+                Edge::ExpressionPlace,
+            );
+            assert_eq!(types.places.get(&place), Some(expected));
+            assert!(!types.places.contains_key(&expression));
+            place
+        };
+        let pointer = |dereference| {
+            child(
+                structure,
+                Parent::Place(dereference),
+                Edge::DereferencePointer,
+            )
+        };
+        let reference = |mutability, inner| ScalarType::CheckedReference {
+            mutability,
+            inner: Box::new(inner),
+        };
+        let shared = reference(ScalarReferenceMutability::Shared, ScalarType::U16);
+        let mutable = reference(ScalarReferenceMutability::Mutable, ScalarType::U32);
+        let mut outputs = structure.blocks[structure.root.0].final_outputs();
+        let read = outputs.next().unwrap().expression;
+        let field = outputs.next().unwrap().expression;
+        let mutable_address = outputs.next().unwrap().expression;
+        let nested_address = outputs.next().unwrap().expression;
+        assert!(outputs.next().is_none());
+
+        assert_eq!(types.expressions[&read], ScalarType::U16);
+        assert_eq!(types.expressions[&field], ScalarType::U8);
+        assert_eq!(types.expressions[&mutable_address], mutable);
+        assert_eq!(types.expressions[&nested_address], shared);
+
+        for expression in [read, nested_address] {
+            let reborrow = pointer(place(expression, &ScalarType::U16));
+            assert_eq!(types.expressions[&reborrow], shared);
+            let parent = pointer(place(reborrow, &ScalarType::U16));
+            assert_eq!(types.expressions[&parent], shared);
+        }
+        let parent = pointer(place(mutable_address, &ScalarType::U32));
+        assert_eq!(types.expressions[&parent], mutable);
+
+        let base = place_child(
+            structure,
+            Parent::Place(place(field, &ScalarType::U8)),
+            Edge::PlaceBase,
+        );
+        let record = &types.places[&base];
+        assert!(matches!(record, ScalarType::Struct(_)));
+        assert_eq!(
+            types.expressions[&pointer(base)],
+            reference(ScalarReferenceMutability::Shared, record.clone()),
+        );
+    };
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let project = prepare_extracted(&parsed, target_layout);
+        check(&project.calls.function(0, 0).structure);
+        let program = PreparedProgram::new(
+            derive_scalar_declarations_from_cst(parsed.canonical_cst()),
+            target_layout,
+        )
+        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        check(&program.calls.as_ref().unwrap().function(0).structure);
+    }
+}
+
 fn destination(structure: &OccurrenceStructure, item: usize) -> OccurrenceOrdinal {
     place_child(
         structure,
