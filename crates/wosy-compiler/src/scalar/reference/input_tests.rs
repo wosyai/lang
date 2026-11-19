@@ -24,6 +24,8 @@ mod direct_destinations;
 
 mod dereference_points;
 
+mod projected_reads;
+
 mod complete_results;
 
 mod callable_boundary;

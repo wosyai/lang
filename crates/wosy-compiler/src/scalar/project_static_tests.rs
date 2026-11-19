@@ -231,7 +231,7 @@ fn static_rejection_preserves_exact_diagnostics_and_public_zero_query_guard() {
 #[test]
 fn project_static_lookup_rejection_preserves_ordered_mixed_diagnostics() {
     let lookup = "%%start\nstruct Callback { i32(i32) run; }\ni32(i32) identity = fn(input) { input };\nCallback callback = { .run = identity; };\ni32(i32) invoke = fn(input) { callback.run(input) };\n%%end";
-    let origin = "%%start\nu8[2] first, u8[2] second = [1, 2], [3, 4];\nu8() read = fn { second[0] };\n%%end";
+    let origin = "%%start\nstruct Payload { i32 value; }\nPayload(Payload[2], u64) take = fn(values, index) { values[index] };\n%%end";
     let valid = "%%start\ni32(i32) identity = fn(input) { input };\n%%end";
     let inputs = [
         ("z-origin.w", origin),
@@ -281,11 +281,15 @@ fn project_static_lookup_rejection_preserves_ordered_mixed_diagnostics() {
     let origin_error = |source| Diagnostic {
         code: "B0003".into(),
         severity: DiagnosticSeverity::Error,
-        message: "missing resolved binding".into(),
+        message: "array elements cannot be moved individually".into(),
         labels: vec![DiagnosticLabel {
             kind: DiagnosticLabelKind::Primary,
-            span: span(source, "second", origin.rfind("second").unwrap()),
-            message: "missing resolved binding".into(),
+            span: span(
+                source,
+                "values[index] ",
+                origin.find("values[index]").unwrap(),
+            ),
+            message: "array elements cannot be moved individually".into(),
         }],
         notes: Vec::new(),
     };
@@ -357,7 +361,7 @@ fn project_static_lookup_rejection_preserves_ordered_mixed_diagnostics() {
         for index in [1, 4] {
             assert_eq!(attached.project.modules[index], rejected_modules[index]);
         }
-        for (module, item) in [(0, 1), (2, 0), (3, 1)] {
+        for (module, item) in [(0, 0), (2, 0), (3, 0)] {
             let ScalarItem::Function(function) = &attached.project.modules[module].items[item]
             else {
                 panic!("callable at module {module}");

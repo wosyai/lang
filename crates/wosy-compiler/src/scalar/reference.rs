@@ -1549,44 +1549,72 @@ impl<'a> ReferenceFlowBuilder<'a> {
         scope: ReferenceScopeId,
         source: CheckedReadSource<'_>,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
-        if !matches!(source, CheckedReadSource::PreparedMember { .. }) {
-            if matches!(reference_root(place), ScalarPlace::Name { name, .. }
-                if self.module_names.contains(name) && !self.names.contains_key(name))
-            {
-                self.point(
-                    CfgPointKind::Evaluate(expression.clone()),
-                    span,
-                    scope,
-                    BTreeSet::new(),
-                );
-                return Ok(ReferenceValue::Other);
+        let canonical_root = match source {
+            CheckedReadSource::Place(ordinal) => Some(self.place_root(place, ordinal)),
+            _ => None,
+        };
+        let root = canonical_root
+            .as_ref()
+            .map_or_else(|| reference_root(place), |root| root.place);
+        let prepared = matches!(source, CheckedReadSource::Place(_))
+            && matches!(
+                self.call_sites.named_place_roots,
+                NamedPlaceRootFacts::Prepared(_)
+            );
+        let mut root_binding = None;
+        let module_root = if prepared {
+            match self.prepared_read_root(canonical_root.as_ref().unwrap())? {
+                Some(NamedPlaceRootIdentity::Lexical(binding)) => {
+                    root_binding = Some(binding);
+                    false
+                }
+                Some(NamedPlaceRootIdentity::ModuleValue(_)) => true,
+                None => false,
             }
+        } else {
+            !matches!(source, CheckedReadSource::PreparedMember { .. })
+                && matches!(root, ScalarPlace::Name { name, .. }
+                    if self.module_names.contains(name) && !self.names.contains_key(name))
+        };
+        if module_root {
+            self.point(
+                CfgPointKind::Evaluate(expression.clone()),
+                span,
+                scope,
+                BTreeSet::new(),
+            );
+            return Ok(ReferenceValue::Other);
         }
         let reads_checked_value = match source {
             CheckedReadSource::PreparedMember { ty, .. } => {
                 matches!(ty, ScalarType::CheckedReference { .. })
             }
+            CheckedReadSource::Place(ordinal) if prepared => matches!(
+                self.prepared_read_place_type(ordinal, place)?,
+                ScalarType::CheckedReference { .. }
+            ),
             _ => matches!(
-                self.indexed_move_type(place)?,
+                self.raw_indexed_move_type(place)?,
                 ScalarType::CheckedReference { .. }
             ),
         };
-        let reads_checked_aggregate = if let ScalarPlace::Dereference { pointer, .. } =
-            reference_root(place)
-        {
-            matches!(
-                pointer.as_ref(),
-                ScalarExpression::Name { name, .. }
-                    if matches!(self.binding_types.get(&self.binding(name, span)?),
-                        Some(ScalarType::CheckedReference { inner, .. })
-                            if matches!(inner.as_ref(), ScalarType::Struct(_) | ScalarType::Array { .. }))
-            )
+        let pointer_type = if let ScalarPlace::Dereference { pointer, .. } = root {
+            if prepared {
+                self.prepared_read_pointer_type(canonical_root.as_ref().unwrap(), pointer)?
+            } else if let ScalarExpression::Name { name, .. } = pointer.as_ref() {
+                self.binding_types.get(&self.binding(name, span)?)
+            } else {
+                None
+            }
         } else {
-            false
+            None
         };
+        let reads_checked_aggregate = matches!(pointer_type,
+            Some(ScalarType::CheckedReference { inner, .. })
+                if matches!(inner.as_ref(), ScalarType::Struct(_) | ScalarType::Array { .. }));
         if !reads_checked_value
             && !reads_checked_aggregate
-            && matches!(reference_root(place), ScalarPlace::Dereference { pointer, .. } if !matches!(pointer.as_ref(), ScalarExpression::Name { .. }))
+            && matches!(root, ScalarPlace::Dereference { pointer, .. } if !matches!(pointer.as_ref(), ScalarExpression::Name { .. }))
         {
             self.read_place_expressions(place, scope, source)?;
             self.point(
@@ -1597,27 +1625,28 @@ impl<'a> ReferenceFlowBuilder<'a> {
             );
             return Ok(ReferenceValue::Other);
         }
-        self.read_place_expressions(place, scope, source)?;
-        let pointer_point = match source {
-            CheckedReadSource::SyntheticMember | CheckedReadSource::PreparedMember { .. } => None,
-            CheckedReadSource::Place(ordinal) => {
-                let root = self.place_root(place, ordinal);
-                match root.place {
-                    ScalarPlace::Dereference { span, .. } => {
-                        Some(*self.dereference_points.get(&root.ordinal).ok_or_else(|| {
-                            self.missing_context(
-                                *span,
-                                ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
-                            )
-                        })?)
-                    }
-                    ScalarPlace::Name { .. } => None,
-                    ScalarPlace::Field { .. } | ScalarPlace::Index { .. } => unreachable!(),
+        if let (CheckedReadSource::Place(ordinal), Some(binding)) = (source, root_binding) {
+            self.place_expressions_with_binding(place, scope, ordinal, Some(binding))?;
+        } else {
+            self.read_place_expressions(place, scope, source)?;
+        }
+        let pointer_point = match canonical_root {
+            None => None,
+            Some(root) => match root.place {
+                ScalarPlace::Dereference { span, .. } => {
+                    Some(*self.dereference_points.get(&root.ordinal).ok_or_else(|| {
+                        self.missing_context(
+                            *span,
+                            ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                        )
+                    })?)
                 }
-            }
+                ScalarPlace::Name { .. } => None,
+                ScalarPlace::Field { .. } | ScalarPlace::Index { .. } => unreachable!(),
+            },
         };
-        let candidates = match source {
-            CheckedReadSource::PreparedMember { binding, .. } => {
+        let candidates = match (source, root_binding) {
+            (CheckedReadSource::PreparedMember { binding, .. }, _) | (_, Some(binding)) => {
                 vec![self.reference_place(place, binding.clone(), None)]
             }
             _ if pointer_point.is_none() => vec![self.assignment_place(place, span)?],
@@ -1636,6 +1665,81 @@ impl<'a> ReferenceFlowBuilder<'a> {
             self.point(event, span, scope, BTreeSet::new());
             Ok(ReferenceValue::Other)
         }
+    }
+
+    fn prepared_read_root(
+        &self,
+        root: &ReferencePlaceRoot<'_>,
+    ) -> Result<Option<&'a NamedPlaceRootIdentity>, ReferenceAnalysisError> {
+        let ScalarPlace::Name { span, .. } = root.place else {
+            return Ok(None);
+        };
+        let NamedPlaceRootFacts::Prepared(roots) = &self.call_sites.named_place_roots else {
+            unreachable!("prepared projected read");
+        };
+        roots.get(&root.ordinal).map(Some).ok_or_else(|| {
+            self.missing_context(*span, ReferenceAnalysisErrorReason::MissingResolvedBinding)
+        })
+    }
+
+    fn prepared_read_place_type(
+        &self,
+        ordinal: OccurrenceOrdinal,
+        place: &ScalarPlace,
+    ) -> Result<&'a ScalarType, ReferenceAnalysisError> {
+        self.call_sites
+            .structure
+            .checked_types
+            .places
+            .get(&ordinal)
+            .ok_or_else(|| {
+                self.missing_context(
+                    scalar_place_target_span(place),
+                    ReferenceAnalysisErrorReason::MissingCheckedPlaceType { ordinal: ordinal.0 },
+                )
+            })
+    }
+
+    fn prepared_read_pointer_type(
+        &self,
+        root: &ReferencePlaceRoot<'_>,
+        pointer: &ScalarExpression,
+    ) -> Result<Option<&'a ScalarType>, ReferenceAnalysisError> {
+        let ScalarExpression::Name { name, span } = pointer else {
+            // Preserve the inherited non-name dereference gate (direct core.pointer_cast).
+            self.raw_indexed_move_type(root.place)?;
+            return Ok(None);
+        };
+        let ordinal = self.expression_ordinal(
+            OccurrenceParent::Place(root.ordinal),
+            OccurrenceEdge::DereferencePointer,
+        );
+        if !matches!(
+            self.prepared_name_identity(ordinal, *span)?,
+            Some(PlainNameIdentity::Lexical(_))
+        ) {
+            return Err(ReferenceAnalysisError::MissingBinding {
+                source_span: SourceSpan::new(
+                    self.source.clone(),
+                    scalar_place_target_span(root.place),
+                ),
+                name: name.clone(),
+            });
+        }
+        self.call_sites
+            .structure
+            .checked_types
+            .expressions
+            .get(&ordinal)
+            .map(Some)
+            .ok_or_else(|| {
+                self.missing_context(
+                    *span,
+                    ReferenceAnalysisErrorReason::MissingCheckedExpressionResult {
+                        ordinal: ordinal.0,
+                    },
+                )
+            })
     }
 
     fn place_indices(
@@ -1664,7 +1768,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(())
     }
 
-    fn indexed_move_type(&self, place: &ScalarPlace) -> Result<ScalarType, ReferenceAnalysisError> {
+    fn raw_indexed_move_type(
+        &self,
+        place: &ScalarPlace,
+    ) -> Result<ScalarType, ReferenceAnalysisError> {
         match place {
             ScalarPlace::Name { name, span } => {
                 let binding = self.binding(name, *span)?;
@@ -1676,7 +1783,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 })
             }
             ScalarPlace::Field { base, field, span } => {
-                let ScalarType::Struct(id) = self.indexed_move_type(base)? else {
+                let ScalarType::Struct(id) = self.raw_indexed_move_type(base)? else {
                     return Err(self.missing_context(
                         *span,
                         ReferenceAnalysisErrorReason::MissingResolvedBinding,
@@ -1705,7 +1812,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         )
                     })
             }
-            ScalarPlace::Index { base, span, .. } => match self.indexed_move_type(base)? {
+            ScalarPlace::Index { base, span, .. } => match self.raw_indexed_move_type(base)? {
                 ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
                     Ok(*element)
                 }
@@ -1715,7 +1822,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             ScalarPlace::Dereference { pointer, span } => {
                 let pointer_type = match pointer.as_ref() {
                     ScalarExpression::Name { name, .. } => {
-                        self.indexed_move_type(&ScalarPlace::Name {
+                        self.raw_indexed_move_type(&ScalarPlace::Name {
                             name: name.clone(),
                             span: *span,
                         })?
@@ -1824,12 +1931,33 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 )
             }
             ScalarExpression::IndexedRead { place, span } => {
-                if let ScalarPlace::Name { name, .. } = reference_root(place) {
-                    if self.module_names.contains(name) && !self.names.contains_key(name) {
+                let ty = if matches!(
+                    self.call_sites.named_place_roots,
+                    NamedPlaceRootFacts::Prepared(_)
+                ) {
+                    let ordinal = self.place_ordinal(
+                        OccurrenceParent::Expression(ordinal),
+                        OccurrenceEdge::ExpressionPlace,
+                    );
+                    let root = self.place_root(place, ordinal);
+                    if matches!(
+                        self.prepared_read_root(&root)?,
+                        Some(NamedPlaceRootIdentity::ModuleValue(_))
+                    ) {
                         return Ok(());
                     }
-                }
-                let ty = self.indexed_move_type(place)?;
+                    if let ScalarPlace::Dereference { pointer, .. } = root.place {
+                        self.prepared_read_pointer_type(&root, pointer)?;
+                    }
+                    self.prepared_read_place_type(ordinal, place)?.clone()
+                } else {
+                    if matches!(reference_root(place), ScalarPlace::Name { name, .. }
+                        if self.module_names.contains(name) && !self.names.contains_key(name))
+                    {
+                        return Ok(());
+                    }
+                    self.raw_indexed_move_type(place)?
+                };
                 let policy = copy_policy(&ty, self.structs, self.enums, &self.generic_parameters)
                     .map_err(|_| {
                     self.missing_context(
@@ -1860,20 +1988,29 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
             }
             ScalarExpression::Dereference { place, span } => {
-                let root = self.place_root(
-                    place,
-                    self.place_ordinal(
-                        OccurrenceParent::Expression(ordinal),
-                        OccurrenceEdge::ExpressionPlace,
-                    ),
+                let place_ordinal = self.place_ordinal(
+                    OccurrenceParent::Expression(ordinal),
+                    OccurrenceEdge::ExpressionPlace,
                 );
+                let root = self.place_root(place, place_ordinal);
                 let ScalarPlace::Dereference { pointer, .. } = root.place else {
                     return Err(self.missing_context(
                         *span,
                         ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
                     ));
                 };
-                let ty = self.indexed_move_type(place)?;
+                let prepared = matches!(
+                    self.call_sites.named_place_roots,
+                    NamedPlaceRootFacts::Prepared(_)
+                );
+                let (ty, prepared_pointer_type) = if prepared {
+                    (
+                        self.prepared_read_place_type(place_ordinal, place)?.clone(),
+                        self.prepared_read_pointer_type(&root, pointer)?,
+                    )
+                } else {
+                    (self.raw_indexed_move_type(place)?, None)
+                };
                 let policy = copy_policy(&ty, self.structs, self.enums, &self.generic_parameters)
                     .map_err(|_| {
                     self.missing_context(
@@ -1884,23 +2021,26 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 if policy == CopyPolicy::Copy {
                     return Ok(());
                 }
-                let ScalarExpression::Name { name, .. } = pointer.as_ref() else {
+                let pointer_type = if prepared {
+                    prepared_pointer_type
+                } else if let ScalarExpression::Name { name, .. } = pointer.as_ref() {
+                    let binding = self.binding(name, *span)?;
+                    self.binding_types.get(&binding)
+                } else {
+                    None
+                };
+                if !matches!(
+                    pointer_type,
+                    Some(ScalarType::CheckedReference {
+                        mutability: ScalarReferenceMutability::Mutable,
+                        ..
+                    })
+                ) {
                     return Err(self.missing_context(
                         *span,
                         ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
                     ));
-                };
-                let binding = self.binding(name, *span)?;
-                let Some(ScalarType::CheckedReference {
-                    mutability: ScalarReferenceMutability::Mutable,
-                    ..
-                }) = self.binding_types.get(&binding)
-                else {
-                    return Err(self.missing_context(
-                        *span,
-                        ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
-                    ));
-                };
+                }
                 let pointer_point =
                     *self.dereference_points.get(&root.ordinal).ok_or_else(|| {
                         self.missing_context(
@@ -4497,6 +4637,7 @@ pub(super) struct OccurrenceMetadata {
     pub(super) span: ByteSpan,
     pub(super) requires_plain_name: bool,
     pub(super) requires_direct_destination: bool,
+    pub(super) requires_projected_read_root: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4619,6 +4760,10 @@ impl FunctionCallSites {
 
     pub(super) fn has_prepared_direct_destination(&self, ordinal: OccurrenceOrdinal) -> bool {
         matches!(&self.direct_destinations, DirectDestinationFacts::Prepared(rows) if rows.contains_key(&ordinal))
+    }
+
+    pub(super) fn has_prepared_projected_read_root(&self, ordinal: OccurrenceOrdinal) -> bool {
+        matches!(&self.named_place_roots, NamedPlaceRootFacts::Prepared(rows) if rows.contains_key(&ordinal))
     }
 }
 
@@ -4886,6 +5031,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             span,
             requires_plain_name: false,
             requires_direct_destination: false,
+            requires_projected_read_root: false,
         });
         let node = match role {
             OccurrenceRole::Expression => OccurrenceNode::Expression(ordinal),
@@ -5363,7 +5509,14 @@ impl StructuralWalker<'_, '_> {
             | ScalarExpression::CheckedAddress { place, .. }
             | ScalarExpression::Dereference { place, .. }
             | ScalarExpression::IndexedRead { place, .. } => {
-                self.place(place, names, types, parent, OccurrenceEdge::ExpressionPlace)?
+                self.place_at(
+                    place,
+                    names,
+                    types,
+                    parent,
+                    OccurrenceEdge::ExpressionPlace,
+                    matches!(expression, ScalarExpression::IndexedRead { .. }),
+                )?;
             }
             ScalarExpression::StructLiteral { fields, .. } => {
                 for (position, field) in fields.iter().enumerate() {
@@ -5392,17 +5545,6 @@ impl StructuralWalker<'_, '_> {
         Ok(())
     }
 
-    fn place(
-        &mut self,
-        place: &ScalarPlace,
-        names: &BTreeMap<String, WalkBinding>,
-        types: &BTreeMap<String, ScalarType>,
-        parent: OccurrenceParent,
-        edge: OccurrenceEdge,
-    ) -> Result<(), ReferenceAnalysisError> {
-        self.place_at(place, names, types, parent, edge).map(|_| ())
-    }
-
     fn place_at(
         &mut self,
         place: &ScalarPlace,
@@ -5410,6 +5552,7 @@ impl StructuralWalker<'_, '_> {
         types: &BTreeMap<String, ScalarType>,
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
+        projected_read: bool,
     ) -> Result<OccurrenceOrdinal, ReferenceAnalysisError> {
         let ordinal = self.record_occurrence(
             OccurrenceRole::Place,
@@ -5431,6 +5574,7 @@ impl StructuralWalker<'_, '_> {
         match place {
             ScalarPlace::Name { name, .. } => {
                 if let NamedPlaceRootFacts::Prepared(roots) = &mut self.named_place_roots {
+                    self.occurrences[ordinal.0].requires_projected_read_root = projected_read;
                     if !matches!(edge, OccurrenceEdge::AssignmentDestination { .. })
                         && !self
                             .structure
@@ -5465,10 +5609,24 @@ impl StructuralWalker<'_, '_> {
                 }
             }
             ScalarPlace::Field { base, .. } => {
-                self.place(base, names, types, parent, OccurrenceEdge::PlaceBase)?
+                self.place_at(
+                    base,
+                    names,
+                    types,
+                    parent,
+                    OccurrenceEdge::PlaceBase,
+                    projected_read,
+                )?;
             }
             ScalarPlace::Index { base, index, .. } => {
-                self.place(base, names, types, parent, OccurrenceEdge::PlaceBase)?;
+                self.place_at(
+                    base,
+                    names,
+                    types,
+                    parent,
+                    OccurrenceEdge::PlaceBase,
+                    projected_read,
+                )?;
                 self.expression(index, names, types, parent, OccurrenceEdge::PlaceIndex)?;
             }
             ScalarPlace::Dereference { pointer, .. } => self.expression(
@@ -5787,6 +5945,7 @@ impl StructuralWalker<'_, '_> {
                             item: item_index,
                             destination,
                         },
+                        false,
                     )?;
                     let replacement = match &self.mode {
                         WalkMode::StructuralOnly | WalkMode::CallableAllocationLength(_) => {
