@@ -20,6 +20,122 @@ use crate::{
 use wosy_syntax::{ByteSpan, SourceIdentity};
 
 #[test]
+fn prepared_initializer_emits_generic_runtime_array_length_on_both_targets() {
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let text = "%%start\ngeneric T;\nT(T) echo = fn(value) { value };\n\
+                u8 initial = echo<u8>(1);\n\
+                u8[echo<u64>(2)] module_bytes;\n%%end";
+    let parsed = parse_source(source.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut failures = Vec::new();
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![(
+                derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                Vec::new(),
+            )],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for (route, result) in [
+            ("single", emit_scalar_build_single_module_llvm(&build)),
+            ("project", emit_scalar_build_project_llvm(&build)),
+        ] {
+            match result {
+                Ok(llvm) => {
+                    let ir = llvm.to_text();
+                    assert!(ir.contains("call i64 @"), "{target_layout:?} {route}: {ir}");
+                    assert!(ir.contains("(i64 2)"), "{target_layout:?} {route}: {ir}");
+                }
+                Err(error) => failures.push(format!("{target_layout:?} {route}: {error}")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn prepared_project_initializer_shares_specialization_across_aliases() {
+    let source = |path: &str| {
+        SourceIdentity::new("project".into(), "package".into(), path.into(), "r1".into())
+    };
+    let root = source("src/main.w");
+    let library = source("src/library.w");
+    let main = parse_source(
+        root.clone(),
+        "%%start
+left = namespace package \"library.w\";
+right = namespace package \"library.w\";
+u64 first = left.echo<u64>(1);
+u8[right.echo<u64>(2)] bytes;
+%%end"
+            .into(),
+        &[],
+    );
+    let implementation = parse_source(
+        library.clone(),
+        "%%start\ngeneric T;\nT(T) echo = fn(value) { value };\n%%end".into(),
+        &[],
+    );
+    assert!(main.diagnostics.is_empty(), "{:?}", main.diagnostics);
+    assert!(
+        implementation.diagnostics.is_empty(),
+        "{:?}",
+        implementation.diagnostics,
+    );
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let declarations = derive_scalar_declarations_from_cst(main.result.canonical_cst());
+        let namespaces = declarations
+            .namespaces()
+            .map(|namespace| ScalarNamespaceBinding {
+                binding: namespace.binding.clone(),
+                target: library.clone(),
+                span: namespace.binding_span,
+            })
+            .collect();
+        let prepared = prepare_scalar_project(
+            vec![
+                (declarations, namespaces),
+                (
+                    derive_scalar_declarations_from_cst(implementation.result.canonical_cst()),
+                    Vec::new(),
+                ),
+            ],
+            vec![root.clone(), library.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        let ir = emit_scalar_build_project_llvm(&build)
+            .expect("qualified generic initializer emission")
+            .to_text();
+        let symbol = super::generic_specialization_name(
+            &project_function_name(&library, "echo"),
+            &[ScalarType::U64],
+        );
+        assert_eq!(
+            ir.matches(&format!("define i64 @{symbol}(")).count(),
+            1,
+            "{ir}"
+        );
+        for argument in [1, 2] {
+            assert!(
+                ir.contains(&format!("call i64 @{symbol}(i64 {argument})")),
+                "{ir}"
+            );
+        }
+    }
+}
+
+#[test]
 fn checked_aggregate_reads_materialize_sized_values_on_both_targets_and_pipelines() {
     let source = SourceIdentity::new(
         "project".into(),
@@ -1630,6 +1746,7 @@ select = overload {
         let missing = super::emit_project_llvm(
             &legacy.project,
             &|module| prepared.initialization_region(module),
+            super::GenericInitializerInput::RawItems,
             &|module, item, arm, function| {
                 if (module, item, arm) == (0, 1, Some(1)) {
                     build.reference_cfg(module, item, Some(overload.overload_arms.len()))
@@ -4841,6 +4958,7 @@ fn detached_project_llvm_initializes_interleaved_namespace_diamond_once() {
                     prepared.initialization_region(module)
                 }
             },
+            super::GenericInitializerInput::PreparedRows,
             &|module, item, arm, _| build.reference_cfg(module, item, arm),
         )
         .unwrap_err();

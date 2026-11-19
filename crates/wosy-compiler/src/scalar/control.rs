@@ -15,7 +15,6 @@ pub(crate) struct ModuleInitializationRegion {
 }
 
 impl ModuleInitializationRegion {
-    #[allow(dead_code)]
     pub(super) fn call_target(
         &self,
         ordinal: OccurrenceOrdinal,
@@ -26,6 +25,26 @@ impl ModuleInitializationRegion {
                 topology.call_targets.get(&ordinal)
             }
         }
+    }
+
+    pub(crate) fn call_targets(
+        &self,
+    ) -> Result<impl Iterator<Item = Result<&ModuleInitializationCallTarget, String>>, String> {
+        let ModuleInitializationDetail::Occurrences(topology) = &self.detail else {
+            return Err(format!(
+                "internal error: missing initializer call topology for {:?}",
+                self.source,
+            ));
+        };
+        Ok(topology.calls.iter().map(|&ordinal| {
+            self.call_target(ordinal).ok_or_else(|| {
+                let span = topology.occurrences[ordinal.0].span;
+                format!(
+                    "internal error: missing initializer call target in {:?} at {}..{} (occurrence {})",
+                    self.source, span.start, span.end, ordinal.0,
+                )
+            })
+        }))
     }
 }
 
@@ -54,6 +73,10 @@ pub(crate) enum ModuleInitializationCallTarget {
     Direct {
         declaration: SourceSpan,
         concrete: ConcreteCallSelection,
+    },
+    Generic {
+        declaration: SourceSpan,
+        type_arguments: Vec<ScalarType>,
     },
     Extern(SourceSpan),
     CallableBinding(SourceSpan),

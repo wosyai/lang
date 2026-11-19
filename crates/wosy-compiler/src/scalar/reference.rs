@@ -3955,7 +3955,7 @@ struct CallDeclarationIndex<'a> {
 #[derive(Default)]
 struct CallDeclarationHeaders<'a> {
     namespaces: HashMap<&'a str, &'a SourceIdentity>,
-    functions: HashMap<&'a str, (ByteSpan, bool)>,
+    functions: HashMap<&'a str, (ByteSpan, CallFunctionKind)>,
     bindings: HashMap<&'a str, CallBindingHeader<'a>>,
     externs: HashMap<&'a str, HashMap<&'a str, ByteSpan>>,
 }
@@ -3966,8 +3966,15 @@ struct CallBindingHeader<'a> {
     module_member: bool,
 }
 
+#[derive(Clone, Copy)]
+enum CallFunctionKind {
+    Ordinary,
+    Generic,
+    Overload,
+}
+
 enum CallDeclaration<'a> {
-    Function(&'a SourceIdentity, ByteSpan, bool),
+    Function(&'a SourceIdentity, ByteSpan, CallFunctionKind),
     Binding(&'a SourceIdentity, ByteSpan),
     Extern(&'a SourceIdentity, ByteSpan),
 }
@@ -3986,10 +3993,16 @@ impl<'a> CallDeclarationIndex<'a> {
             for item in module.items {
                 match item {
                     ScalarItem::Function(function) => {
-                        headers.functions.insert(
-                            &function.name,
-                            (function.name_span, !function.overload_arms.is_empty()),
-                        );
+                        let kind = if !function.overload_arms.is_empty() {
+                            CallFunctionKind::Overload
+                        } else if !function.generic_parameters.is_empty() {
+                            CallFunctionKind::Generic
+                        } else {
+                            CallFunctionKind::Ordinary
+                        };
+                        headers
+                            .functions
+                            .insert(&function.name, (function.name_span, kind));
                     }
                     ScalarItem::Binding(binding) => {
                         headers.bindings.insert(
@@ -4055,8 +4068,8 @@ impl<'a> CallDeclarationIndex<'a> {
                 }
             },
         };
-        if let Some(&(span, overloaded)) = headers.functions.get(name) {
-            return Some(CallDeclaration::Function(source, span, overloaded));
+        if let Some(&(span, kind)) = headers.functions.get(name) {
+            return Some(CallDeclaration::Function(source, span, kind));
         }
         let binding = headers.bindings.get(name)?;
         if !matches!(binding.ty, ScalarType::Callable { .. })
@@ -4606,6 +4619,7 @@ fn initialization_call_target(
         receiver,
         name,
         span,
+        type_arguments,
         ..
     } = expression
     else {
@@ -4640,17 +4654,30 @@ fn initialization_call_target(
             .callable(source, receiver.as_deref(), name)
             .ok_or_else(missing)?
         {
-            CallDeclaration::Function(source, span, overloaded) => Target::Direct {
-                declaration: SourceSpan::new(source.clone(), span),
-                concrete: if overloaded {
-                    let selection = signature
-                        .and_then(|row| row.overload.clone())
-                        .ok_or_else(missing)?;
-                    ConcreteCallSelection::Overload(selection)
-                } else {
-                    ConcreteCallSelection::Declaration
-                },
-            },
+            CallDeclaration::Function(source, span, kind) => {
+                let declaration = SourceSpan::new(source.clone(), span);
+                match kind {
+                    CallFunctionKind::Generic => Target::Generic {
+                        declaration,
+                        type_arguments: type_arguments
+                            .iter()
+                            .map(|argument| argument.ty.clone())
+                            .collect(),
+                    },
+                    CallFunctionKind::Ordinary => Target::Direct {
+                        declaration,
+                        concrete: ConcreteCallSelection::Declaration,
+                    },
+                    CallFunctionKind::Overload => Target::Direct {
+                        declaration,
+                        concrete: ConcreteCallSelection::Overload(
+                            signature
+                                .and_then(|row| row.overload.clone())
+                                .ok_or_else(missing)?,
+                        ),
+                    },
+                }
+            }
             CallDeclaration::Binding(source, span) => {
                 Target::CallableBinding(SourceSpan::new(source.clone(), span))
             }

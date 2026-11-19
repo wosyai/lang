@@ -17,8 +17,8 @@ use inkwell::{FloatPredicate, IntPredicate};
 use serde::{Deserialize, Serialize};
 
 use crate::scalar::control::{
-    module_initialization_region, ModuleInitializationRegion, ModuleInitializationStepKind,
-    NamespaceTarget,
+    module_initialization_region, ModuleInitializationCallTarget, ModuleInitializationRegion,
+    ModuleInitializationStepKind, NamespaceTarget,
 };
 use crate::scalar::layout::ScalarTargetLayouts;
 use crate::scalar::{
@@ -283,6 +283,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         &program.structs,
         &program.layouts,
         program.target_layout,
+        GenericInitializerInput::RawItems,
         &|_, _, function| Some(&function.reference_cfg),
     )
 }
@@ -314,17 +315,19 @@ pub fn emit_scalar_build_single_module_llvm(
         &module.structs,
         &module.layouts,
         module.target_layout,
+        GenericInitializerInput::PreparedRows,
         &|item, arm, _| validation.reference_cfg(0, item, arm),
     )
 }
 
 fn emit_single_module_llvm<'a>(
-    source: &wosy_syntax::SourceIdentity,
+    source: &'a wosy_syntax::SourceIdentity,
     items: &'a [ScalarItem],
-    initialization_region: &ModuleInitializationRegion,
+    initialization_region: &'a ModuleInitializationRegion,
     structs: &[ScalarStruct],
     layouts: &ScalarTargetLayouts,
     target_layout: ScalarTargetLayout,
+    generic_input: GenericInitializerInput,
     reference_cfg: &dyn Fn(
         usize,
         Option<usize>,
@@ -399,7 +402,15 @@ fn emit_single_module_llvm<'a>(
         definitions.push((function, cfg, function.name.as_str()));
     }
     let ordinary_count = definitions.len();
-    let specializations = generic_specializations(items, str::to_owned)?;
+    let specializations = match generic_input {
+        GenericInitializerInput::RawItems => generic_specializations(items, str::to_owned)?,
+        GenericInitializerInput::PreparedRows => prepared_generic_specializations(
+            std::iter::once((0, source, items, initialization_region)),
+            |_, name| name.to_owned(),
+        )?
+        .remove(&0)
+        .expect("single prepared module has a specialization set"),
+    };
     let overloads = selected_overload_specializations(
         items,
         str::to_owned,
@@ -556,6 +567,7 @@ pub fn emit_scalar_project_llvm(
     emit_project_llvm(
         &validation.project,
         &|module| regions.get(module),
+        GenericInitializerInput::RawItems,
         &|_, _, _, function| Some(&function.reference_cfg),
     )
 }
@@ -570,6 +582,7 @@ pub fn emit_scalar_build_project_llvm(
     emit_project_llvm(
         prepared.project(),
         &|module| prepared.initialization_region(module),
+        GenericInitializerInput::PreparedRows,
         &|module, item, arm, _| validation.reference_cfg(module, item, arm),
     )
 }
@@ -577,6 +590,7 @@ pub fn emit_scalar_build_project_llvm(
 fn emit_project_llvm<'a>(
     project: &'a ScalarProject,
     initialization_region: &dyn Fn(usize) -> Option<&'a ModuleInitializationRegion>,
+    generic_input: GenericInitializerInput,
     reference_cfg: &dyn Fn(
         usize,
         usize,
@@ -714,11 +728,30 @@ fn emit_project_llvm<'a>(
             }
         }
     }
+    let mut prepared_specializations = match generic_input {
+        GenericInitializerInput::RawItems => BTreeMap::new(),
+        GenericInitializerInput::PreparedRows => prepared_generic_specializations(
+            ordered_modules
+                .iter()
+                .zip(&regions)
+                .map(|(&(ordinal, module), &region)| {
+                    (ordinal, &module.source, module.items.as_slice(), region)
+                }),
+            project_function_name,
+        )?,
+    };
     let mut project_specializations = Vec::new();
     for &(module_ordinal, source_module) in &ordered_modules {
-        let specializations = generic_specializations(&source_module.items, |name| {
-            project_function_name(&source_module.source, name)
-        })?;
+        let specializations = match generic_input {
+            GenericInitializerInput::RawItems => {
+                generic_specializations(&source_module.items, |name| {
+                    project_function_name(&source_module.source, name)
+                })?
+            }
+            GenericInitializerInput::PreparedRows => prepared_specializations
+                .remove(&module_ordinal)
+                .expect("prepared project module has a specialization set"),
+        };
         for (lookup, specialization) in specializations {
             let LlvmSpecialization {
                 function,
@@ -4075,6 +4108,68 @@ struct LlvmSpecialization<'a> {
     arm_index: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+enum GenericInitializerInput {
+    RawItems,
+    PreparedRows,
+}
+
+fn prepared_generic_specializations<'a>(
+    modules: impl Iterator<
+            Item = (
+                usize,
+                &'a wosy_syntax::SourceIdentity,
+                &'a [ScalarItem],
+                &'a ModuleInitializationRegion,
+            ),
+        > + Clone,
+    symbol: impl Fn(&wosy_syntax::SourceIdentity, &str) -> String,
+) -> Result<BTreeMap<usize, BTreeMap<String, LlvmSpecialization<'a>>>, String> {
+    let mut templates = HashMap::new();
+    let mut specializations = BTreeMap::new();
+    for (module_ordinal, source, items, _) in modules.clone() {
+        specializations.insert(module_ordinal, BTreeMap::new());
+        for (item_ordinal, item) in items.iter().enumerate() {
+            if let ScalarItem::Function(function) = item {
+                if !function.generic_parameters.is_empty() && function.overload_arms.is_empty() {
+                    templates.insert(
+                        (source, function.name_span),
+                        (module_ordinal, item_ordinal, function),
+                    );
+                }
+            }
+        }
+    }
+    for (_, _, _, region) in modules {
+        for target in region.call_targets()? {
+            let ModuleInitializationCallTarget::Generic {
+                declaration,
+                type_arguments,
+            } = target?
+            else {
+                continue;
+            };
+            let &(module_ordinal, item_ordinal, function) = templates
+                .get(&(&declaration.source, declaration.range))
+                .ok_or_else(|| {
+                    format!(
+                        "internal error: missing initializer generic declaration {declaration:?}"
+                    )
+                })?;
+            insert_generic_specialization(
+                specializations
+                    .get_mut(&module_ordinal)
+                    .expect("initializer template belongs to an indexed module"),
+                function,
+                item_ordinal,
+                type_arguments,
+                &symbol(&declaration.source, &function.name),
+            )?;
+        }
+    }
+    Ok(specializations)
+}
+
 fn generic_specializations(
     items: &[ScalarItem],
     symbol: impl Fn(&str) -> String,
@@ -4105,27 +4200,43 @@ fn generic_specializations(
         if function.generic_parameters.is_empty() {
             continue;
         }
-        if function.generic_parameters.len() != arguments.len() {
-            return Err("validated generic call has invalid type argument arity".to_owned());
-        }
-        let signature = substitute_generic_signature(function, &arguments);
-        let base = symbol(&name);
-        let lookup = generic_specialization_key(&base, &arguments);
-        let name = generic_specialization_name(&base, &arguments);
-        specializations.entry(lookup).or_insert_with(|| {
-            let mut body = function.clone();
-            body.signature = signature;
-            body.generic_parameters.clear();
-            LlvmSpecialization {
-                function: Cow::Owned(body),
-                name,
-                template: function,
-                item_ordinal,
-                arm_index: None,
-            }
-        });
+        insert_generic_specialization(
+            &mut specializations,
+            function,
+            item_ordinal,
+            &arguments,
+            &symbol(&name),
+        )?;
     }
     Ok(specializations)
+}
+
+fn insert_generic_specialization<'a>(
+    specializations: &mut BTreeMap<String, LlvmSpecialization<'a>>,
+    function: &'a ScalarFunction,
+    item_ordinal: usize,
+    arguments: &[ScalarType],
+    base: &str,
+) -> Result<(), String> {
+    if function.generic_parameters.len() != arguments.len() {
+        return Err("validated generic call has invalid type argument arity".to_owned());
+    }
+    let lookup = generic_specialization_key(base, arguments);
+    specializations.entry(lookup).or_insert_with(|| {
+        let signature = substitute_generic_signature(function, arguments);
+        let name = generic_specialization_name(base, arguments);
+        let mut body = function.clone();
+        body.signature = signature;
+        body.generic_parameters.clear();
+        LlvmSpecialization {
+            function: Cow::Owned(body),
+            name,
+            template: function,
+            item_ordinal,
+            arm_index: None,
+        }
+    });
+    Ok(())
 }
 
 fn selected_overload_specializations(
