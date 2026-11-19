@@ -7891,18 +7891,15 @@ fn validate_conditional_output_arity(
         }
         return;
     }
-    if block.final_output_values.len() == 1 {
-        let (expression, _) = block.final_expressions().next().expect("final output");
-        if let ScalarExpression::If {
-            then_branch,
-            else_branch,
-            ..
-        } = expression
-        {
-            validate_conditional_output_arity(then_branch, output_count, program, diagnostics);
-            validate_conditional_output_arity(else_branch, output_count, program, diagnostics);
-            return;
-        }
+    if let Some(ScalarTailConditional {
+        then_branch,
+        else_branch,
+        ..
+    }) = block.tail_conditional()
+    {
+        validate_conditional_output_arity(then_branch, output_count, program, diagnostics);
+        validate_conditional_output_arity(else_branch, output_count, program, diagnostics);
+        return;
     }
     diagnostics.push(diagnostic(
         program,

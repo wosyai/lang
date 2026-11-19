@@ -1762,6 +1762,11 @@ pub struct ScalarBlock {
     pub unsafe_context: bool,
 }
 
+struct ScalarTailConditional<'a> {
+    then_branch: &'a ScalarBlock,
+    else_branch: &'a ScalarBlock,
+}
+
 enum ScalarBlockItemRole<'a> {
     Ordinary,
     FinalOutput {
@@ -1782,6 +1787,25 @@ impl ScalarBlock {
                 };
                 (expression, metadata)
             })
+    }
+
+    fn tail_conditional(&self) -> Option<ScalarTailConditional<'_>> {
+        if self.final_output_values.len() != 1 {
+            return None;
+        }
+        let (expression, _) = self.final_expressions().next().expect("final output");
+        let ScalarExpression::If {
+            then_branch,
+            else_branch,
+            ..
+        } = expression
+        else {
+            return None;
+        };
+        Some(ScalarTailConditional {
+            then_branch,
+            else_branch,
+        })
     }
 
     fn items_with_output_roles(

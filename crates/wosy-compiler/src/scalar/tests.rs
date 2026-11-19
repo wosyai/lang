@@ -9070,6 +9070,46 @@ fn validates_nested_conditional_output_lists_in_a_project() {
 }
 
 #[test]
+fn tail_conditional_borrows_only_the_single_canonical_final_item() {
+    let result = validate_text(
+        "%%start
+i32() nested = fn { if (true) { if (false) { 1 } else { 2 } } else { 3 } };
+(i32, bool)() independent = fn { (if (true) { 1 } else { 2 }), (if (false) { true } else { false }) };
+%%end",
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let [ScalarItem::Function(nested), ScalarItem::Function(independent)] =
+        result.program.items.as_slice()
+    else {
+        panic!("nested and independent functions");
+    };
+
+    let mut block = &nested.body;
+    for _ in 0..2 {
+        let tail = block.tail_conditional().expect("single tail conditional");
+        let Some(ScalarBlockItem::Expression(ScalarExpression::If {
+            then_branch,
+            else_branch,
+            ..
+        })) = block.items.last()
+        else {
+            panic!("canonical final conditional item");
+        };
+        assert!(std::ptr::eq(tail.then_branch, then_branch));
+        assert!(std::ptr::eq(tail.else_branch, else_branch));
+        block = tail.then_branch;
+    }
+    assert!(block.tail_conditional().is_none());
+
+    let body = &independent.body;
+    assert_eq!(body.final_output_values.len(), 2);
+    assert!(body
+        .final_expressions()
+        .all(|(expression, _)| matches!(expression, ScalarExpression::If { .. })));
+    assert!(body.tail_conditional().is_none());
+}
+
+#[test]
 fn reports_nested_conditional_output_type_at_the_inner_branch() {
     let text = "%%start\n(i32, bool)() pair = fn { if (true) { if (true) { 1, true } else { 2, 3 } } else { 3, true } };\n%%end";
     let validation = validate_text(text);
