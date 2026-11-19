@@ -739,6 +739,12 @@ fn prepare_retains_checked_namespace_assignment_destination() {
         let structure = &project.calls.function(0, 1).structure;
         let place = destination(structure, 0);
         assert_eq!(structure.checked_types.places[&place], ScalarType::U16);
+        let Node::Place(base) = structure.edges[&(Parent::Place(place), Edge::PlaceBase)] else {
+            panic!("namespace base occurrence");
+        };
+        assert_eq!(structure.resolved_namespace_places.len(), 1);
+        assert_eq!(structure.resolved_namespace_places[&base], dependency);
+        assert!(!structure.checked_types.places.contains_key(&base));
     }
 }
 

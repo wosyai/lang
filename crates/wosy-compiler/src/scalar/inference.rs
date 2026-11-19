@@ -80,6 +80,7 @@ pub(super) struct PreparationOccurrenceTyping {
     members: HashMap<*const ScalarExpression, CheckedMember>,
     folded_expressions: HashMap<*const ScalarExpression, FoldedOccurrence>,
     places: HashMap<*const ScalarPlace, ScalarType>,
+    resolved_namespace_places: HashMap<*const ScalarPlace, SourceIdentity>,
 }
 
 struct CheckedExpressionType {
@@ -141,6 +142,14 @@ impl PreparationOccurrenceTyping {
 
     pub(super) fn take_place_type(&mut self, place: &ScalarPlace) -> Option<ScalarType> {
         self.places.remove(&std::ptr::from_ref(place))
+    }
+
+    pub(super) fn take_resolved_namespace_place(
+        &mut self,
+        place: &ScalarPlace,
+    ) -> Option<SourceIdentity> {
+        self.resolved_namespace_places
+            .remove(&std::ptr::from_ref(place))
     }
 }
 
@@ -284,6 +293,18 @@ impl<'a> ScalarInferenceBuilder<'a> {
             self.occurrences
                 .places
                 .insert(std::ptr::from_ref(place), ty.clone());
+        }
+    }
+
+    pub(super) fn record_resolved_namespace_place(
+        &mut self,
+        place: &ScalarPlace,
+        source: &SourceIdentity,
+    ) {
+        if !self.suppress_checked_occurrences {
+            self.occurrences
+                .resolved_namespace_places
+                .insert(std::ptr::from_ref(place), source.clone());
         }
     }
 

@@ -4299,6 +4299,12 @@ pub(super) struct ModuleCallSites {
     pub(super) initialization: ModuleInitializationRegion,
 }
 
+impl ModuleCallSites {
+    pub(super) fn functions_in_item_order(&self) -> impl Iterator<Item = &FunctionCallSites> {
+        self.functions.values()
+    }
+}
+
 #[cfg(test)]
 impl ModuleCallSites {
     pub(super) fn function(&self, item: usize) -> &FunctionCallSites {
@@ -4365,6 +4371,7 @@ pub(super) struct OccurrenceStructure {
     pub(super) blocks: Vec<BlockRegion>,
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
+    pub(super) resolved_namespace_places: HashMap<OccurrenceOrdinal, SourceIdentity>,
     pub(super) folded_expressions: HashMap<OccurrenceOrdinal, FoldedOccurrence>,
     pub(super) synthetic_expressions: HashMap<OccurrenceOrdinal, SyntheticOccurrence>,
     pub(super) conditional_output_projections:
@@ -4378,6 +4385,7 @@ impl OccurrenceStructure {
             blocks: vec![BlockRegion::new(span, Vec::new())],
             edges: HashMap::new(),
             checked_types: CheckedOccurrenceTypes::default(),
+            resolved_namespace_places: HashMap::new(),
             folded_expressions: HashMap::new(),
             synthetic_expressions: HashMap::new(),
             conditional_output_projections: HashMap::new(),
@@ -4471,6 +4479,7 @@ pub(super) struct FunctionCallSites {
     pub(super) allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     plain_names: PlainNameFacts,
+    pub(super) first_unresolved_placeholder_name: Option<OccurrenceOrdinal>,
     members: MemberFacts,
     query_allocation_outputs: HashMap<(BlockOrdinal, usize), BindingOutputs>,
     pub(super) structure: OccurrenceStructure,
@@ -4674,6 +4683,7 @@ struct StructuralWalker<'a, 'typing> {
     occurrence_typing: &'typing mut PreparationOccurrenceTyping,
     checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     plain_names: PlainNameFacts,
+    first_unresolved_placeholder_name: Option<OccurrenceOrdinal>,
     members: MemberFacts,
     allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     initialization_call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
@@ -4706,6 +4716,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             occurrence_typing,
             checked_call_signatures: HashMap::new(),
             plain_names,
+            first_unresolved_placeholder_name: None,
             members,
             allocation_length_call_targets: HashMap::new(),
             initialization_call_targets: HashMap::new(),
@@ -4802,6 +4813,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             };
             if let Some(identity) = identity {
                 identities.insert(ordinal, identity);
+            } else if matches!(edge, OccurrenceEdge::QueryAllocationPlaceholder { .. }) {
+                self.first_unresolved_placeholder_name
+                    .get_or_insert(ordinal);
             }
         }
         if let (ScalarExpression::Member { receiver, .. }, MemberFacts::Prepared(identities)) =
@@ -5259,6 +5273,13 @@ impl StructuralWalker<'_, '_> {
         );
         if let Some(ty) = self.occurrence_typing.take_place_type(place) {
             self.structure.checked_types.places.insert(ordinal, ty);
+        }
+        if edge == OccurrenceEdge::PlaceBase {
+            if let Some(source) = self.occurrence_typing.take_resolved_namespace_place(place) {
+                self.structure
+                    .resolved_namespace_places
+                    .insert(ordinal, source);
+            }
         }
         let parent = OccurrenceParent::Place(ordinal);
         match place {
@@ -5766,10 +5787,14 @@ fn resolve_module_call_sites(
             initialization_mode,
             &mut occurrence_typing,
         )?));
-    Ok(ModuleCallSites {
+    let calls = ModuleCallSites {
         functions,
         initialization,
-    })
+    };
+    if select_executable_calls {
+        occurrence_obligations::validate_module(&calls)?;
+    }
+    Ok(calls)
 }
 
 fn walk_module_initialization(
@@ -5990,6 +6015,7 @@ fn resolve_function_call_sites(
         allocation_length_call_targets: resolver.allocation_length_call_targets,
         checked_call_signatures: resolver.checked_call_signatures,
         plain_names: resolver.plain_names,
+        first_unresolved_placeholder_name: resolver.first_unresolved_placeholder_name,
         members: resolver.members,
         query_allocation_outputs: callable.query_allocation_outputs,
         structure: resolver.structure,

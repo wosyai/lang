@@ -1,97 +1,6 @@
 use super::*;
-use control::{CheckedCallSignature, ModuleInitializationDetail, ModuleInitializationRegion};
-use reference::{
-    FunctionCallSites, OccurrenceMetadata, OccurrenceOrdinal, OccurrenceRole, OccurrenceStructure,
-};
-use std::collections::{HashMap, HashSet};
-
-#[derive(Debug, Eq, PartialEq)]
-enum RequiredFact {
-    ExpressionResult,
-    PlaceType,
-    CallSignature,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct MissingFact {
-    source_span: SourceSpan,
-    ordinal: OccurrenceOrdinal,
-    fact: RequiredFact,
-}
-
-fn missing_facts(
-    source: &SourceIdentity,
-    occurrences: &[OccurrenceMetadata],
-    structure: &OccurrenceStructure,
-    calls: &HashSet<OccurrenceOrdinal>,
-    signatures: &HashMap<OccurrenceOrdinal, CheckedCallSignature>,
-) -> Vec<MissingFact> {
-    let mut missing = Vec::new();
-    for (index, metadata) in occurrences.iter().enumerate() {
-        let ordinal = OccurrenceOrdinal(index);
-        let mut record = |fact| {
-            missing.push(MissingFact {
-                source_span: SourceSpan::new(source.clone(), metadata.span),
-                ordinal,
-                fact,
-            });
-        };
-        let is_call = calls.contains(&ordinal);
-        let has_signature = is_call && signatures.contains_key(&ordinal);
-        match metadata.role {
-            OccurrenceRole::Expression => {
-                if !structure.checked_types.expressions.contains_key(&ordinal)
-                    && !has_signature
-                    && !structure
-                        .conditional_output_projections
-                        .contains_key(&ordinal)
-                    && !structure.folded_expressions.contains_key(&ordinal)
-                    && !structure.synthetic_expressions.contains_key(&ordinal)
-                {
-                    record(RequiredFact::ExpressionResult);
-                }
-            }
-            OccurrenceRole::Place => {
-                if !structure.checked_types.places.contains_key(&ordinal) {
-                    record(RequiredFact::PlaceType);
-                }
-            }
-        }
-        if is_call && !has_signature {
-            record(RequiredFact::CallSignature);
-        }
-    }
-    missing
-}
-
-fn callable_missing(source: &SourceIdentity, row: &FunctionCallSites) -> Vec<MissingFact> {
-    let calls = row
-        .call_occurrences
-        .iter()
-        .map(|call| call.ordinal)
-        .chain(row.allocation_length_calls.iter().copied())
-        .collect();
-    missing_facts(
-        source,
-        &row.occurrences,
-        &row.structure,
-        &calls,
-        &row.checked_call_signatures,
-    )
-}
-
-fn initializer_missing(region: &ModuleInitializationRegion) -> Vec<MissingFact> {
-    let ModuleInitializationDetail::Occurrences(row) = &region.detail else {
-        panic!("prepared initializer topology");
-    };
-    missing_facts(
-        &region.source,
-        &row.occurrences,
-        &row.structure,
-        &row.calls.iter().copied().collect(),
-        &row.checked_call_signatures,
-    )
-}
+use control::ModuleInitializationDetail;
+use reference::{OccurrenceOrdinal, OccurrenceRole};
 
 #[test]
 fn inventories_prepared_initializer_and_callable_occurrences() {
@@ -114,7 +23,6 @@ i8 initial, bool ready = pair(module_signed);
 };
 %%end",
     );
-    let mut incomplete = Vec::new();
     for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         let project = prepare_extracted(&parsed, target);
         let standalone = PreparedProgram::new(
@@ -122,22 +30,21 @@ i8 initial, bool ready = pair(module_signed);
             target,
         )
         .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
-        for (route, init, rows) in [
+        for (init, pair, run) in [
             (
-                "project",
                 project.initialization_region(0).unwrap(),
-                [0, 1, 7].map(|item| project.calls.function(0, item)),
+                project.calls.function(0, 1),
+                project.calls.function(0, 7),
             ),
             (
-                "standalone",
                 &standalone.calls.initialization,
-                [0, 1, 7].map(|item| standalone.calls.function(item)),
+                standalone.calls.function(1),
+                standalone.calls.function(7),
             ),
         ] {
             let ModuleInitializationDetail::Occurrences(initializer) = &init.detail else {
                 panic!("prepared initializer topology");
             };
-            let run = rows[2];
             assert_eq!(initializer.structure.folded_expressions.len(), 1);
             assert!(initializer.structure.synthetic_expressions.is_empty());
             assert_eq!(initializer.calls.len(), 2);
@@ -154,7 +61,6 @@ i8 initial, bool ready = pair(module_signed);
                     2,
                 );
             }
-            let pair = rows[1];
             let pair_root = &pair.structure.blocks[pair.structure.root.0];
             let producer = pair_root.final_outputs().next().unwrap().expression;
             assert_eq!(
@@ -162,15 +68,9 @@ i8 initial, bool ready = pair(module_signed);
                 [ScalarType::I8, ScalarType::Bool],
             );
             for signature in [
-                initializer
-                    .checked_call_signatures
-                    .get(&initializer.calls[1]),
-                run.checked_call_signatures
-                    .get(&run.call_occurrences[0].ordinal),
-            ]
-            .into_iter()
-            .flatten()
-            {
+                &initializer.checked_call_signatures[&initializer.calls[1]],
+                &run.checked_call_signatures[&run.call_occurrences[0].ordinal],
+            ] {
                 assert!(signature
                     .outputs
                     .outputs
@@ -178,44 +78,47 @@ i8 initial, bool ready = pair(module_signed);
                     .map(|output| &output.ty)
                     .eq([&ScalarType::I8, &ScalarType::Bool]));
             }
-            let missing = initializer_missing(init);
-            if !missing.is_empty() {
-                incomplete.push((target, route, "initializer", missing));
-            }
-            for (function, row) in ["length", "pair", "run"].into_iter().zip(rows) {
-                let missing = callable_missing(&init.source, row);
-                if !missing.is_empty() {
-                    incomplete.push((target, route, function, missing));
-                }
-            }
         }
     }
-    assert!(incomplete.is_empty(), "{incomplete:#?}");
 }
 
 #[test]
-fn inventory_attributes_a_removed_checked_expression_row() {
+fn production_obligation_attributes_a_removed_checked_expression_row() {
     let parsed = parsed("%%start\ni32(i32) echo = fn(input) { input };\n%%end");
     for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-        let prepared = prepare_extracted(&parsed, target);
-        let row = prepared.calls.function(0, 0);
-        let source = &prepared.project().modules[0].source;
-        assert!(callable_missing(source, row).is_empty());
-
-        let mut damaged = row.clone();
+        let prepared = PreparedProgram::new(
+            derive_scalar_declarations_from_cst(parsed.canonical_cst()),
+            target,
+        )
+        .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let mut damaged = prepared.calls.clone();
         let ordinal = OccurrenceOrdinal(0);
         assert_eq!(
-            damaged.structure.checked_types.expressions.remove(&ordinal),
+            damaged
+                .function_mut(0)
+                .structure
+                .checked_types
+                .expressions
+                .remove(&ordinal),
             Some(ScalarType::I32),
         );
+        let error = occurrence_obligations::validate_module(&damaged).unwrap_err();
+        let span = SourceSpan::new(parsed.source.clone(), ByteSpan::new(36, 41));
         assert_eq!(
-            callable_missing(source, &damaged),
-            vec![MissingFact {
-                source_span: SourceSpan::new(parsed.source.clone(), ByteSpan::new(36, 41)),
-                ordinal,
-                fact: RequiredFact::ExpressionResult,
-            }],
+            error,
+            ReferenceAnalysisError::MissingContext {
+                source_span: span.clone(),
+                reason: ReferenceAnalysisErrorReason::MissingCheckedExpressionResult { ordinal: 0 },
+            },
         );
-        assert!(callable_missing(source, row).is_empty());
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(
+            diagnostic.message,
+            "missing checked expression result (occurrence 0)"
+        );
+        assert_eq!(diagnostic.labels.len(), 1);
+        assert_eq!(diagnostic.labels[0].span, span);
+        assert_eq!(diagnostic.labels[0].message, diagnostic.message);
     }
 }

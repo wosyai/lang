@@ -1384,6 +1384,11 @@ fn assignment_target_type_in_module(
                 ));
             }
             inference.record_place_type(&target.place, &expected);
+            if let ScalarPlace::Field { base, .. } = &target.place {
+                if matches!(base.as_ref(), ScalarPlace::Name { .. }) {
+                    inference.record_resolved_namespace_place(base, target_module.source);
+                }
+            }
             return Some(expected);
         }
     }

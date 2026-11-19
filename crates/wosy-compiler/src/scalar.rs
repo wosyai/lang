@@ -553,6 +553,9 @@ pub struct SpecializedCopyPolicy {
 pub enum ReferenceAnalysisErrorReason {
     MissingResolvedBinding,
     MissingResolvedCallTarget,
+    MissingCheckedExpressionResult { ordinal: usize },
+    MissingCheckedPlaceType { ordinal: usize },
+    MissingCheckedCallSignature { ordinal: usize },
     MissingCheckedReferenceOrigin,
     MissingRequiredDereferenceOrigin,
     MoveFromArrayElement,
@@ -564,6 +567,9 @@ impl ReferenceAnalysisErrorReason {
         match self {
             Self::MissingResolvedBinding => "missing resolved binding",
             Self::MissingResolvedCallTarget => "missing resolved call target",
+            Self::MissingCheckedExpressionResult { .. } => "missing checked expression result",
+            Self::MissingCheckedPlaceType { .. } => "missing checked place type",
+            Self::MissingCheckedCallSignature { .. } => "missing checked call signature",
             Self::MissingCheckedReferenceOrigin => "missing checked-reference origin",
             Self::MissingRequiredDereferenceOrigin => "missing required dereference origin",
             Self::MoveFromArrayElement => "array elements cannot be moved individually",
@@ -612,7 +618,15 @@ impl ReferenceAnalysisError {
     }
 
     fn diagnostic(&self) -> super::Diagnostic {
-        let message = self.reason().message().to_owned();
+        let reason = self.reason();
+        let message = match reason {
+            ReferenceAnalysisErrorReason::MissingCheckedExpressionResult { ordinal }
+            | ReferenceAnalysisErrorReason::MissingCheckedPlaceType { ordinal }
+            | ReferenceAnalysisErrorReason::MissingCheckedCallSignature { ordinal } => {
+                format!("{} (occurrence {ordinal})", reason.message())
+            }
+            _ => reason.message().to_owned(),
+        };
         let mut labels = vec![super::DiagnosticLabel {
             kind: super::DiagnosticLabelKind::Primary,
             span: self.source_span().clone(),
@@ -3528,6 +3542,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
 }
 
 pub(crate) mod control;
+mod occurrence_obligations;
 mod reference;
 mod static_calls;
 pub use static_calls::{
