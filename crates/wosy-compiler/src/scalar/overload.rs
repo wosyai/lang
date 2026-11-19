@@ -689,7 +689,7 @@ pub(super) mod observations {
     use super::*;
 
     #[derive(Clone, Debug, Default, Eq, PartialEq)]
-    pub(super) struct Payload {
+    pub(in crate::scalar) struct Payload {
         pub callable_headers: usize,
         pub ordinary_parameters: usize,
         pub extern_bindings: usize,
@@ -705,7 +705,7 @@ pub(super) mod observations {
     }
 
     #[derive(Clone, Debug, Default, Eq, PartialEq)]
-    pub(super) struct Counts {
+    pub(in crate::scalar) struct Counts {
         pub contexts: usize,
         pub modules: usize,
         pub recorders: usize,
@@ -737,11 +737,11 @@ pub(super) mod observations {
         static ACTIVE: RefCell<Option<State>> = const { RefCell::new(None) };
     }
 
-    pub(super) struct Scope {
+    pub(in crate::scalar) struct Scope {
         previous: Option<State>,
     }
     impl Scope {
-        pub(super) fn new() -> Self {
+        pub(in crate::scalar) fn new() -> Self {
             Self {
                 previous: ACTIVE.with(|active| {
                     active.replace(Some(State {
@@ -751,7 +751,7 @@ pub(super) mod observations {
                 }),
             }
         }
-        pub(super) fn counts(&self) -> Counts {
+        pub(in crate::scalar) fn counts(&self) -> Counts {
             ACTIVE.with(|active| {
                 active
                     .borrow()

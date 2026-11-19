@@ -3,10 +3,12 @@ use crate::scalar::control::{
     BindingInitialization, BindingOutput, BlockItemKind, CheckedCallSignature, ConditionalRegion,
     ModuleInitializationDetail,
 };
+use crate::scalar::overload::observations as overload_observations;
 use crate::scalar::reference::{
     CallOccurrence, FunctionCallSites, OccurrenceEdge as Edge, OccurrenceNode as Node,
     OccurrenceOrdinal, OccurrenceParent as Parent, OccurrenceRole, OccurrenceStructure,
 };
+use std::fmt::Write;
 
 fn child(structure: &OccurrenceStructure, parent: Parent, edge: Edge) -> OccurrenceOrdinal {
     let Node::Expression(ordinal) = structure.edges[&(parent, edge)] else {
@@ -679,6 +681,214 @@ fn recursive_calls_retain_static_occurrences_and_ordered_positions() {
             assert!(!first.points.is_empty());
             assert!(!std::ptr::eq(first, second));
             assert_eq!(first, second);
+        }
+    }
+}
+
+#[test]
+fn inherent_multi_output_growth_is_counted_separately() {
+    let columns = [
+        ("i32", ScalarType::I32, "11", "21"),
+        ("bool", ScalarType::Bool, "true", "false"),
+        ("u8", ScalarType::U8, "12", "22"),
+        ("u16", ScalarType::U16, "13", "23"),
+    ];
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for outputs in [4, 8, 16] {
+            let columns: Vec<_> = columns.iter().cloned().cycle().take(outputs).collect();
+            let types: Vec<_> = columns.iter().map(|(_, ty, ..)| ty.clone()).collect();
+            let [signature, then_values, else_values] = [0, 1, 2].map(|field| {
+                columns
+                    .iter()
+                    .map(|(name, _, then_value, else_value)| {
+                        [*name, *then_value, *else_value][field]
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            let mut snapshot_at_four_sites = None;
+            for sites in [4, 8, 16] {
+                let mut text = format!(
+                    "%%start\n({signature})(bool) many = fn(flag) {{ if (flag) {{ {then_values} }} else {{ {else_values} }} }};\ni32() run = fn() {{\n"
+                );
+                for site in 0..sites {
+                    let receivers = columns
+                        .iter()
+                        .enumerate()
+                        .map(|(output, (name, ..))| format!("{name} value_{site}_{output}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let flag = site % 2 == 0;
+                    writeln!(text, "{receivers} = many({flag}); value_{site}_0;").unwrap();
+                }
+                text.push_str("0\n};\n%%end");
+                let parsed = parsed(&text);
+                let (prepared, copies, headers) = {
+                    let stages = Scope::new();
+                    let copies = layout::observations::Scope::new();
+                    let headers = overload_observations::Scope::new();
+                    let prepared = prepare_extracted(&parsed, target);
+                    assert_eq!(
+                        stages.counts(),
+                        Counts {
+                            call_sites: 1,
+                            ..Counts::default()
+                        }
+                    );
+                    (prepared, copies.counts(), headers.counts())
+                };
+                assert_eq!(prepared.project().modules[0].target_layout, target);
+                assert_eq!(
+                    [
+                        copies.program_copies,
+                        copies.module_copies,
+                        copies.struct_copies,
+                        copies.cfg_copies,
+                        copies.copied_payload_units,
+                    ],
+                    [0; 5]
+                );
+                assert_eq!(
+                    [
+                        headers.construction_program_copies,
+                        headers.construction_module_copies,
+                        headers.construction_struct_copies,
+                        headers.construction_cfg_copies,
+                        headers.construction_payload_units,
+                    ],
+                    [0; 5]
+                );
+                assert_eq!(
+                    [
+                        headers.program_copies,
+                        headers.module_copies,
+                        headers.struct_copies,
+                        headers.cfg_copies,
+                        headers.copied_context_payload_units,
+                    ],
+                    [0; 5]
+                );
+                assert_eq!((headers.contexts, headers.modules), (1, 1));
+                assert_eq!(headers.snapshot.callable_headers, 2);
+                assert_eq!(headers.snapshot.type_nodes, outputs + 4);
+                if let Some(baseline) = &snapshot_at_four_sites {
+                    assert_eq!(
+                        &headers.snapshot, baseline,
+                        "{target:?}: {sites} × {outputs}"
+                    );
+                } else {
+                    snapshot_at_four_sites = Some(headers.snapshot.clone());
+                }
+
+                let callee = prepared.calls.function(0, 0);
+                let root = &callee.structure.blocks[callee.structure.root.0];
+                assert_eq!(root.items.len(), 1);
+                let BlockItemKind::FinalOutput(primary) = root.items[0].kind else {
+                    panic!("one canonical tail producer");
+                };
+                assert_eq!(callee.conditionals.len(), 1);
+                assert!(callee.conditionals.contains_key(&primary.expression));
+                assert!(callee.call_occurrences.is_empty());
+                assert_eq!(callee.occurrences.len(), 2 + 2 * outputs);
+                let finals: Vec<_> = root.final_outputs().collect();
+                assert_eq!(finals.len(), outputs);
+                assert_eq!(callee.structure.conditional_output_projections.len(), 1);
+                assert_eq!(
+                    callee.structure.conditional_output_projections[&primary.expression].types,
+                    types
+                );
+                for (position, slot) in finals.iter().enumerate() {
+                    assert_eq!(
+                        (slot.expression, slot.output),
+                        (primary.expression, position)
+                    );
+                }
+
+                let caller = prepared.calls.function(0, 1);
+                let structure = &caller.structure;
+                let root = &structure.blocks[structure.root.0];
+                let mut argument_ordinals = HashSet::new();
+                for (_, &node) in structure
+                    .edges
+                    .iter()
+                    .filter(|((_, edge), _)| matches!(edge, Edge::CallArgument(_)))
+                {
+                    let Node::Expression(argument) = node else {
+                        panic!("argument expression")
+                    };
+                    assert!(argument_ordinals.insert(argument));
+                }
+                let argument_count = argument_ordinals.len();
+                assert_eq!(argument_count, sites);
+                assert_eq!(caller.occurrences.len(), 3 * sites + 1);
+                assert_eq!(caller.call_occurrences.len(), sites);
+                assert_eq!(caller.sites.len(), sites);
+                assert_eq!(caller.checked_call_signatures.len(), sites);
+                assert_eq!(root.items.len(), 2 * sites + 1);
+
+                let mut projection_slots = 0;
+                let mut receiver_slots = 0;
+                for (site, entry) in caller.call_occurrences.iter().enumerate() {
+                    let call = entry.ordinal;
+                    assert_eq!(entry.site, site);
+                    let argument =
+                        child(structure, Parent::Expression(call), Edge::CallArgument(0));
+                    assert!(argument_ordinals.remove(&argument));
+                    assert_eq!(
+                        structure.checked_types.expressions[&argument],
+                        ScalarType::Bool
+                    );
+                    assert_signature(
+                        &caller.checked_call_signatures[&call],
+                        &[ScalarType::Bool],
+                        &types,
+                        None,
+                    );
+
+                    let item = 2 * site;
+                    let BlockItemKind::Binding(binding) = &root.items[item].kind else {
+                        panic!("independent call binding group");
+                    };
+                    let BindingInitialization::Outputs(values) = &binding.initialization else {
+                        panic!("ordered call projections");
+                    };
+                    assert_eq!(values.primary, call);
+                    assert_eq!(
+                        child(
+                            structure,
+                            Parent::Block(structure.root),
+                            Edge::BindingRoot { item, output: 0 },
+                        ),
+                        call
+                    );
+                    assert_eq!(values.secondary.len(), outputs - 1);
+                    for (index, output) in values.secondary.iter().enumerate() {
+                        assert_eq!(*output, BindingOutput::ProjectPrimary { output: index + 1 });
+                    }
+                    projection_slots += 1 + values.secondary.len();
+                    assert_eq!(binding.receivers().len(), outputs);
+                    for (position, slot) in binding.receivers().iter().enumerate() {
+                        assert_eq!(slot.position, position);
+                        assert_eq!(slot.name, format!("value_{site}_{position}"));
+                        assert_eq!(slot.ty, types[position]);
+                    }
+                    receiver_slots += binding.receivers().len();
+                }
+                assert!(argument_ordinals.is_empty());
+                let signature_slots: usize = caller
+                    .checked_call_signatures
+                    .values()
+                    .map(|signature| signature.outputs.outputs.len())
+                    .sum();
+                assert_eq!(
+                    [signature_slots, projection_slots, receiver_slots],
+                    [sites * outputs; 3]
+                );
+                eprintln!(
+                    "{target:?} {sites} sites × {outputs} results: {} caller occurrences, {} callee occurrences, {argument_count} argument occurrences; {signature_slots} signature, {projection_slots} binding projection and {receiver_slots} receiver slots; {} compact header type nodes",
+                    caller.occurrences.len(), callee.occurrences.len(), headers.snapshot.type_nodes,
+                );
+            }
         }
     }
 }
