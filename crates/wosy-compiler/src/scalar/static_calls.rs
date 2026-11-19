@@ -70,6 +70,32 @@ impl PreparedScalarProject {
         self.calls.initialization_region(module_ordinal)
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "consumed by the next LLVM slice")
+    )]
+    pub(crate) fn bind_callable_body_call_nodes<'a>(
+        &'a self,
+        module_ordinal: usize,
+        item_ordinal: usize,
+        arm_index: Option<usize>,
+        body: &'a ScalarBlock,
+    ) -> Result<control::CallableBodyCallNodes<'a>, String> {
+        let module = self.project.modules.get(module_ordinal).ok_or_else(|| {
+            format!("internal error: missing callable body module at ordinal {module_ordinal}")
+        })?;
+        let calls = self
+            .calls
+            .function_body(module_ordinal, item_ordinal, arm_index)
+            .ok_or_else(|| {
+                format!(
+                    "internal error: missing callable body call topology in {:?} at item {item_ordinal}, arm {arm_index:?}",
+                    module.source,
+                )
+            })?;
+        control::CallableBodyCallNodes::bind(&module.source, body, calls)
+    }
+
     fn analyze(&self) -> reference::ProjectReferenceResults {
         reference::analyze_project_references(&self.project.modules, &self.calls)
     }

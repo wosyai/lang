@@ -1,12 +1,12 @@
 use std::marker::PhantomData;
 
 use super::super::reference::{
-    OccurrenceEdge as Edge, OccurrenceNode as Node, OccurrenceParent as Parent,
+    FunctionCallSites, OccurrenceEdge as Edge, OccurrenceNode as Node, OccurrenceParent as Parent,
 };
 use super::super::typecheck::expression_span;
 use super::super::{
-    ScalarBindingOutput, ScalarBindingOutputOrigin, ScalarBlock, ScalarBlockItem,
-    ScalarBlockItemRole, ScalarExpression, ScalarPlace,
+    ResolvedCallTarget, ScalarBindingOutput, ScalarBindingOutputOrigin, ScalarBlock,
+    ScalarBlockItem, ScalarBlockItemRole, ScalarExpression, ScalarPlace,
 };
 use super::*;
 
@@ -27,13 +27,24 @@ impl<'a> InitializerCallNodes<'a> {
                 region.source,
             ));
         };
+        let mut nodes = Self {
+            source: &region.source,
+            targets: HashMap::with_capacity(topology.calls.len()),
+            items: PhantomData,
+        };
+        let mut bind_call = |ordinal, expression: &'a ScalarExpression| {
+            let target = topology
+                .call_targets
+                .get(&ordinal)
+                .ok_or_else(|| topology.missing_call_target(&region.source, ordinal))?;
+            nodes.targets.insert(std::ptr::from_ref(expression), target);
+            Ok(())
+        };
         let mut binder = Binder {
-            topology,
-            nodes: Self {
-                source: &region.source,
-                targets: HashMap::with_capacity(topology.calls.len()),
-                items: PhantomData,
-            },
+            structure: &topology.structure,
+            source: &region.source,
+            region: "initializer",
+            bind_call: &mut bind_call,
         };
         let root = Parent::Block(topology.structure.root);
         for step in &region.steps {
@@ -54,13 +65,13 @@ impl<'a> InitializerCallNodes<'a> {
                 _ => unreachable!("initializer dispatch derives from the exact item slice"),
             }
         }
-        if binder.nodes.targets.len() != topology.calls.len() {
+        if nodes.targets.len() != topology.calls.len() {
             return Err(format!(
                 "internal error: initializer call topology does not match canonical items in {:?}",
                 region.source,
             ));
         }
-        Ok(binder.nodes)
+        Ok(nodes)
     }
 
     pub(crate) fn target(
@@ -80,16 +91,88 @@ impl<'a> InitializerCallNodes<'a> {
     }
 }
 
-struct Binder<'a> {
-    topology: &'a ModuleInitializationTopology,
-    nodes: InitializerCallNodes<'a>,
+pub(crate) struct CallableBodyCallNodes<'a> {
+    source: &'a SourceIdentity,
+    targets: HashMap<*const ScalarExpression, &'a ResolvedCallTarget>,
+    body: PhantomData<&'a ScalarBlock>,
 }
 
-impl<'a> Binder<'a> {
+impl<'a> CallableBodyCallNodes<'a> {
+    pub(in crate::scalar) fn bind(
+        source: &'a SourceIdentity,
+        body: &'a ScalarBlock,
+        calls: &'a FunctionCallSites,
+    ) -> Result<Self, String> {
+        let targets_by_ordinal: HashMap<_, _> = calls
+            .call_occurrences
+            .iter()
+            .filter_map(|call| Some((call.ordinal, &calls.sites.get(call.site)?.target)))
+            .chain(
+                calls
+                    .allocation_length_call_targets
+                    .iter()
+                    .map(|(&ordinal, target)| (ordinal, target)),
+            )
+            .collect();
+        let mut nodes = Self {
+            source,
+            targets: HashMap::with_capacity(targets_by_ordinal.len()),
+            body: PhantomData,
+        };
+        let mut bind_call = |ordinal: OccurrenceOrdinal, expression: &'a ScalarExpression| {
+            let target = targets_by_ordinal.get(&ordinal).copied().ok_or_else(|| {
+                let span = calls.occurrences[ordinal.0].span;
+                format!(
+                    "internal error: missing callable body call target in {source:?} at {}..{} (occurrence {})",
+                    span.start, span.end, ordinal.0,
+                )
+            })?;
+            nodes.targets.insert(std::ptr::from_ref(expression), target);
+            Ok(())
+        };
+        Binder {
+            structure: &calls.structure,
+            source,
+            region: "callable body",
+            bind_call: &mut bind_call,
+        }
+        .block_items(Parent::Block(calls.structure.root), body)?;
+        Ok(nodes)
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "consumed by the next LLVM slice")
+    )]
+    pub(crate) fn target(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Result<&'a ResolvedCallTarget, String> {
+        self.targets
+            .get(&std::ptr::from_ref(expression))
+            .copied()
+            .ok_or_else(|| {
+                let span = expression_span(expression);
+                format!(
+                    "internal error: missing canonical callable body call node in {:?} at {}..{}",
+                    self.source, span.start, span.end,
+                )
+            })
+    }
+}
+
+struct Binder<'a, 'bind> {
+    structure: &'a OccurrenceStructure,
+    source: &'a SourceIdentity,
+    region: &'static str,
+    bind_call: &'bind mut dyn FnMut(OccurrenceOrdinal, &'a ScalarExpression) -> Result<(), String>,
+}
+
+impl<'a> Binder<'a, '_> {
     fn invalid_edge(&self, parent: Parent, edge: Edge) -> String {
         format!(
-            "internal error: invalid initializer structural edge {parent:?}/{edge:?} in {:?}",
-            self.nodes.source,
+            "internal error: invalid {} structural edge {parent:?}/{edge:?} in {:?}",
+            self.region, self.source,
         )
     }
 
@@ -99,20 +182,13 @@ impl<'a> Binder<'a> {
         edge: Edge,
         expression: &'a ScalarExpression,
     ) -> Result<(), String> {
-        let Some(&Node::Expression(ordinal)) = self.topology.structure.edges.get(&(parent, edge))
-        else {
+        let Some(&Node::Expression(ordinal)) = self.structure.edges.get(&(parent, edge)) else {
             return Err(self.invalid_edge(parent, edge));
         };
         let parent = Parent::Expression(ordinal);
         match expression {
             ScalarExpression::Call { arguments, .. } => {
-                let target = self.topology.call_targets.get(&ordinal).ok_or_else(|| {
-                    self.topology
-                        .missing_call_target(self.nodes.source, ordinal)
-                })?;
-                self.nodes
-                    .targets
-                    .insert(std::ptr::from_ref(expression), target);
+                (self.bind_call)(ordinal, expression)?;
                 for (index, argument) in arguments.iter().enumerate() {
                     self.expression(parent, Edge::CallArgument(index), argument)?;
                 }
@@ -173,7 +249,7 @@ impl<'a> Binder<'a> {
     }
 
     fn place(&mut self, parent: Parent, edge: Edge, place: &'a ScalarPlace) -> Result<(), String> {
-        let Some(&Node::Place(ordinal)) = self.topology.structure.edges.get(&(parent, edge)) else {
+        let Some(&Node::Place(ordinal)) = self.structure.edges.get(&(parent, edge)) else {
             return Err(self.invalid_edge(parent, edge));
         };
         let parent = Parent::Place(ordinal);
@@ -191,11 +267,15 @@ impl<'a> Binder<'a> {
     }
 
     fn block(&mut self, parent: Parent, edge: Edge, block: &'a ScalarBlock) -> Result<(), String> {
-        let Some(&Node::Block(ordinal)) = self.topology.structure.edges.get(&(parent, edge)) else {
+        let Some(&Node::Block(ordinal)) = self.structure.edges.get(&(parent, edge)) else {
             return Err(self.invalid_edge(parent, edge));
         };
+        self.block_items(Parent::Block(ordinal), block)
+    }
+
+    fn block_items(&mut self, parent: Parent, block: &'a ScalarBlock) -> Result<(), String> {
         for (index, (item, role)) in block.items_with_output_roles().enumerate() {
-            self.item(Parent::Block(ordinal), index, item, role)?;
+            self.item(parent, index, item, role)?;
         }
         Ok(())
     }

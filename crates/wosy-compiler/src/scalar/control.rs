@@ -8,7 +8,7 @@ use super::{
 use wosy_syntax::{ByteSpan, SourceIdentity, SourceSpan};
 
 mod initializer_call_nodes;
-pub(crate) use initializer_call_nodes::InitializerCallNodes;
+pub(crate) use initializer_call_nodes::{CallableBodyCallNodes, InitializerCallNodes};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModuleInitializationRegion {

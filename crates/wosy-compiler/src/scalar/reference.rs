@@ -4325,7 +4325,21 @@ pub(super) struct ProjectCallSiteResults {
 impl ProjectCallSiteResults {
     #[cfg(test)]
     pub(super) fn function(&self, module: usize, item: usize) -> &FunctionCallSites {
-        &self.modules[module].as_ref().unwrap().functions[&item]
+        self.function_body(module, item, None).unwrap()
+    }
+
+    pub(super) fn function_body(
+        &self,
+        module_ordinal: usize,
+        item_ordinal: usize,
+        arm_index: Option<usize>,
+    ) -> Option<&FunctionCallSites> {
+        let module = self.modules.get(module_ordinal)?.as_ref().ok()?;
+        let function = module.functions.get(&item_ordinal)?;
+        match arm_index {
+            Some(arm) => function.arms.get(arm),
+            None => Some(function),
+        }
     }
 
     pub(super) fn initialization_region(
