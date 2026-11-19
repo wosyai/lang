@@ -5,9 +5,10 @@ use super::control::{
     BindingOutput, BindingOutputs, BindingReceiverSlot, BindingRegion, BlockItem, BlockItemKind,
     BlockPosition, BlockRegion, CheckedCallSignature, CheckedOccurrenceTypes,
     ConditionalOutputProjection, ConditionalRegion, FinalOutputSlot, FoldedOccurrence,
-    ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationRegion,
-    ModuleInitializationStepKind, ModuleInitializationTopology, ShortCircuitRegion,
-    SyntheticOccurrence, WhileRegion,
+    InitializationDestination, InitializationIdentities, InitializationLocal, InitializationName,
+    InitializationStorage, ModuleInitializationCallTarget, ModuleInitializationDetail,
+    ModuleInitializationRegion, ModuleInitializationStepKind, ModuleInitializationTopology,
+    ShortCircuitRegion, SyntheticOccurrence, WhileRegion,
 };
 use super::control::{
     AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentReplacement,
@@ -5049,6 +5050,13 @@ struct WalkBinding {
 }
 
 impl WalkBinding {
+    fn initializer_id(self) -> InitializationLocal {
+        InitializationLocal {
+            declaration_span: self.declaration_span,
+            block_span: self.block_span,
+        }
+    }
+
     fn reference_id(self, source: &SourceIdentity, function_span: ByteSpan) -> ReferenceBindingId {
         ReferenceBindingId {
             source: source.clone(),
@@ -5057,6 +5065,21 @@ impl WalkBinding {
             block_span: self.block_span,
             kind: ReferenceBindingKind::Declared,
         }
+    }
+}
+
+fn initializer_storage(
+    name: &str,
+    names: &BTreeMap<String, WalkBinding>,
+    source: &SourceIdentity,
+    declarations: &CallDeclarationIndex<'_>,
+) -> Option<InitializationStorage> {
+    if let Some(binding) = names.get(name) {
+        Some(InitializationStorage::Lexical(binding.initializer_id()))
+    } else {
+        declarations
+            .value_token(source, name)
+            .map(InitializationStorage::Module)
     }
 }
 
@@ -5076,6 +5099,7 @@ struct StructuralWalker<'a, 'typing> {
     members: MemberFacts,
     allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     initialization_call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
+    initialization_identities: InitializationIdentities,
     structural_calls: Vec<OccurrenceOrdinal>,
     occurrences: Vec<OccurrenceMetadata>,
     structure: OccurrenceStructure,
@@ -5118,6 +5142,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             members,
             allocation_length_call_targets: HashMap::new(),
             initialization_call_targets: HashMap::new(),
+            initialization_identities: InitializationIdentities::default(),
             structural_calls: Vec::new(),
             occurrences: Vec::new(),
             structure: OccurrenceStructure::new(span),
@@ -5218,6 +5243,27 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             };
             if let Some(identity) = identity {
                 identities.insert(ordinal, identity);
+            }
+        }
+        if let (
+            ScalarExpression::Name { name, .. },
+            WalkMode::ModuleInitialization {
+                source,
+                declarations,
+            },
+        ) = (expression, &self.mode)
+        {
+            self.occurrences[ordinal.0].requires_plain_name = true;
+            let identity = if name == "null" {
+                Some(InitializationName::Null)
+            } else {
+                initializer_storage(name, names, source, declarations)
+                    .map(InitializationName::Storage)
+            };
+            if let Some(identity) = identity {
+                self.initialization_identities
+                    .names
+                    .insert(ordinal, identity);
             }
         }
         if let (ScalarExpression::Member { receiver, .. }, MemberFacts::Prepared(identities)) =
@@ -5675,6 +5721,28 @@ impl StructuralWalker<'_, '_> {
         let parent = OccurrenceParent::Place(ordinal);
         match place {
             ScalarPlace::Name { name, .. } => {
+                if let WalkMode::ModuleInitialization {
+                    source,
+                    declarations,
+                } = &self.mode
+                {
+                    if !matches!(edge, OccurrenceEdge::AssignmentDestination { .. }) {
+                        self.occurrences[ordinal.0].requires_named_place_root = true;
+                        if !self
+                            .structure
+                            .resolved_namespace_places
+                            .contains_key(&ordinal)
+                        {
+                            if let Some(identity) =
+                                initializer_storage(name, names, source, declarations)
+                            {
+                                self.initialization_identities
+                                    .roots
+                                    .insert(ordinal, identity);
+                            }
+                        }
+                    }
+                }
                 if let NamedPlaceRootFacts::Prepared(roots) = &mut self.named_place_roots {
                     if !matches!(edge, OccurrenceEdge::AssignmentDestination { .. }) {
                         self.occurrences[ordinal.0].requires_named_place_root = true;
@@ -6115,26 +6183,34 @@ impl StructuralWalker<'_, '_> {
                     declarations,
                 } = &self.mode
                 {
-                    if ordinal != self.structure.root {
-                        for (target, slot) in assignment.targets.iter().zip(&slots) {
-                            if let ScalarPlace::Name { name, .. } = &target.place {
-                                if !names.contains_key(name)
-                                    && !declarations.has_value(source, name)
-                                {
-                                    if let AssignmentReplacement::Resolved(ty) = &slot.replacement {
-                                        types.insert(name.clone(), ty.clone());
-                                        names.insert(
-                                            name.clone(),
-                                            WalkBinding {
-                                                declaration_span: target.target_span,
-                                                block_span,
-                                                introduced_by_assignment: true,
-                                            },
-                                        );
-                                    }
-                                }
+                    for (target, slot) in assignment.targets.iter().zip(&slots) {
+                        let ScalarPlace::Name { name, .. } = &target.place else {
+                            continue;
+                        };
+                        self.occurrences[slot.destination.0].requires_direct_destination = true;
+                        let identity = if let Some(storage) =
+                            initializer_storage(name, names, source, declarations)
+                        {
+                            InitializationDestination::Existing(storage)
+                        } else if let AssignmentReplacement::Resolved(ty) = &slot.replacement {
+                            if ordinal == self.structure.root {
+                                InitializationDestination::IntroduceModule(target.target_span)
+                            } else {
+                                let binding = WalkBinding {
+                                    declaration_span: target.target_span,
+                                    block_span,
+                                    introduced_by_assignment: true,
+                                };
+                                types.insert(name.clone(), ty.clone());
+                                names.insert(name.clone(), binding);
+                                InitializationDestination::Introduce(binding.initializer_id())
                             }
-                        }
+                        } else {
+                            continue;
+                        };
+                        self.initialization_identities
+                            .destinations
+                            .insert(slot.destination, identity);
                     }
                 }
                 assert!(self
@@ -6344,6 +6420,7 @@ fn walk_module_initialization(
         calls: walker.structural_calls,
         call_targets: walker.initialization_call_targets,
         checked_call_signatures: walker.checked_call_signatures,
+        identities: walker.initialization_identities,
         assignments: walker.assignments,
         conditionals: walker.conditionals,
         loops: walker.loops,

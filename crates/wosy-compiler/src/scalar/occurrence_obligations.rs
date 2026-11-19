@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::control::{CheckedCallSignature, ModuleInitializationDetail};
+use super::control::{CheckedCallSignature, InitializationIdentities, ModuleInitializationDetail};
 use super::reference::{
     CallOccurrence, FunctionCallSites, ModuleCallSites, OccurrenceMetadata, OccurrenceOrdinal,
     OccurrenceRole, OccurrenceStructure,
@@ -24,7 +24,7 @@ pub(super) fn validate_module(calls: &ModuleCallSites) -> Result<(), ReferenceAn
         &[],
         &initializer.calls,
         &initializer.checked_call_signatures,
-        None,
+        IdentityRows::Initializer(&initializer.identities),
     )
 }
 
@@ -39,12 +39,40 @@ fn validate_callable(
         &row.call_occurrences,
         &row.allocation_length_calls,
         &row.checked_call_signatures,
-        Some(row),
+        IdentityRows::Callable(row),
     )?;
     for arm in &row.arms {
         validate_callable(source, arm)?;
     }
     Ok(())
+}
+
+enum IdentityRows<'a> {
+    Callable(&'a FunctionCallSites),
+    Initializer(&'a InitializationIdentities),
+}
+
+impl IdentityRows<'_> {
+    fn has_name(&self, ordinal: OccurrenceOrdinal) -> bool {
+        match self {
+            Self::Callable(row) => row.has_prepared_plain_name(ordinal),
+            Self::Initializer(rows) => rows.names.contains_key(&ordinal),
+        }
+    }
+
+    fn has_destination(&self, ordinal: OccurrenceOrdinal) -> bool {
+        match self {
+            Self::Callable(row) => row.has_prepared_direct_destination(ordinal),
+            Self::Initializer(rows) => rows.destinations.contains_key(&ordinal),
+        }
+    }
+
+    fn has_root(&self, ordinal: OccurrenceOrdinal) -> bool {
+        match self {
+            Self::Callable(row) => row.has_prepared_named_place_root(ordinal),
+            Self::Initializer(rows) => rows.roots.contains_key(&ordinal),
+        }
+    }
 }
 
 fn validate_region(
@@ -54,7 +82,7 @@ fn validate_region(
     site_calls: &[CallOccurrence],
     executable_calls: &[OccurrenceOrdinal],
     signatures: &HashMap<OccurrenceOrdinal, CheckedCallSignature>,
-    callable: Option<&FunctionCallSites>,
+    identities: IdentityRows<'_>,
 ) -> Result<(), ReferenceAnalysisError> {
     let mut site_calls = site_calls.iter().map(|call| call.ordinal).peekable();
     let mut executable_calls = executable_calls.iter().copied().peekable();
@@ -65,8 +93,7 @@ fn validate_region(
         let has_signature = is_call && signatures.contains_key(&ordinal);
         let reason = match metadata.role {
             OccurrenceRole::Expression
-                if metadata.requires_plain_name
-                    && callable.is_some_and(|row| !row.has_prepared_plain_name(ordinal)) =>
+                if metadata.requires_plain_name && !identities.has_name(ordinal) =>
             {
                 Reason::MissingResolvedBinding
             }
@@ -82,16 +109,14 @@ fn validate_region(
                 Reason::MissingCheckedExpressionResult { ordinal: index }
             }
             OccurrenceRole::Place
-                if metadata.requires_direct_destination
-                    && callable
-                        .is_some_and(|row| !row.has_prepared_direct_destination(ordinal)) =>
+                if metadata.requires_direct_destination && !identities.has_destination(ordinal) =>
             {
                 Reason::MissingResolvedBinding
             }
             OccurrenceRole::Place
                 if metadata.requires_named_place_root
                     && !structure.resolved_namespace_places.contains_key(&ordinal)
-                    && callable.is_some_and(|row| !row.has_prepared_named_place_root(ordinal)) =>
+                    && !identities.has_root(ordinal) =>
             {
                 Reason::MissingResolvedBinding
             }

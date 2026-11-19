@@ -77,10 +77,43 @@ pub(super) struct ModuleInitializationTopology {
     pub(super) calls: Vec<OccurrenceOrdinal>,
     pub(super) call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
     pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
+    pub(super) identities: InitializationIdentities,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
     pub(super) loops: HashMap<(BlockOrdinal, usize), WhileRegion>,
     pub(super) short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct InitializationIdentities {
+    pub(super) names: HashMap<OccurrenceOrdinal, InitializationName>,
+    pub(super) roots: HashMap<OccurrenceOrdinal, InitializationStorage>,
+    pub(super) destinations: HashMap<OccurrenceOrdinal, InitializationDestination>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct InitializationLocal {
+    pub(super) declaration_span: ByteSpan,
+    pub(super) block_span: ByteSpan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InitializationStorage {
+    Lexical(InitializationLocal),
+    Module(ByteSpan),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InitializationName {
+    Storage(InitializationStorage),
+    Null,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InitializationDestination {
+    Existing(InitializationStorage),
+    Introduce(InitializationLocal),
+    IntroduceModule(ByteSpan),
 }
 
 impl ModuleInitializationTopology {

@@ -30,6 +30,8 @@ mod address_creation;
 
 mod core_provenance;
 
+mod initializer_identities;
+
 mod complete_results;
 
 mod callable_boundary;

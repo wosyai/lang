@@ -496,6 +496,7 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
                         occurrences: Vec::new(),
                         calls: Vec::new(),
                         checked_call_signatures: HashMap::new(),
+                        identities: InitializationIdentities::default(),
                         call_targets: HashMap::new(),
                         assignments: HashMap::new(),
                         conditionals: HashMap::new(),
