@@ -1418,10 +1418,24 @@ impl<'a> ReferenceFlowBuilder<'a> {
         scope: ReferenceScopeId,
         ordinal: OccurrenceOrdinal,
     ) -> Result<(), ReferenceAnalysisError> {
+        self.place_expressions_with_binding(place, scope, ordinal, None)
+    }
+
+    fn place_expressions_with_binding(
+        &mut self,
+        place: &ScalarPlace,
+        scope: ReferenceScopeId,
+        ordinal: OccurrenceOrdinal,
+        root_binding: Option<&ReferenceBindingId>,
+    ) -> Result<(), ReferenceAnalysisError> {
         let parent = OccurrenceParent::Place(ordinal);
         match place {
             ScalarPlace::Name { name, span } => {
-                self.place_name(name, *span, scope)?;
+                if let Some(binding) = root_binding {
+                    self.read_checked_place_root(binding, *span, scope);
+                } else {
+                    self.place_name(name, *span, scope)?;
+                }
             }
             ScalarPlace::Dereference { pointer, .. } => {
                 self.expression_child(pointer, scope, parent, OccurrenceEdge::DereferencePointer)?;
@@ -1436,21 +1450,41 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 })?;
                 self.dereference_points.insert(ordinal, point);
             }
-            ScalarPlace::Field { base, .. } => self.place_expressions(
+            ScalarPlace::Field { base, .. } => self.place_expressions_with_binding(
                 base,
                 scope,
                 self.place_ordinal(parent, OccurrenceEdge::PlaceBase),
+                root_binding,
             )?,
             ScalarPlace::Index { base, index, .. } => {
-                self.place_expressions(
+                self.place_expressions_with_binding(
                     base,
                     scope,
                     self.place_ordinal(parent, OccurrenceEdge::PlaceBase),
+                    root_binding,
                 )?;
                 self.expression_child(index, scope, parent, OccurrenceEdge::PlaceIndex)?;
             }
         }
         Ok(())
+    }
+
+    fn read_checked_place_root(
+        &mut self,
+        binding: &ReferenceBindingId,
+        span: ByteSpan,
+        scope: ReferenceScopeId,
+    ) {
+        if self.checked.contains(binding) {
+            self.point(
+                CfgPointKind::Read {
+                    binding: binding.clone(),
+                },
+                span,
+                scope,
+                BTreeSet::new(),
+            );
+        }
     }
 
     fn place_name(
@@ -2005,35 +2039,56 @@ impl<'a> ReferenceFlowBuilder<'a> {
         if matches!(target.place, ScalarPlace::Name { .. }) {
             return Ok(ReferenceAssignmentDestination::Name);
         }
-        if let ScalarPlace::Name { name, span } = reference_root(&target.place) {
-            if self.module_names.contains(name) && !self.names.contains_key(name) {
-                self.point(
-                    CfgPointKind::Evaluate(ScalarExpression::Name {
-                        name: name.clone(),
-                        span: *span,
-                    }),
-                    target.target_span,
-                    scope,
-                    BTreeSet::new(),
-                );
-                return Ok(ReferenceAssignmentDestination::EvaluationOnly);
+        let root = self.place_root(&target.place, ordinal);
+        if let ScalarPlace::Name { name, span } = root.place {
+            let missing_root = || {
+                self.missing_context(*span, ReferenceAnalysisErrorReason::MissingResolvedBinding)
+            };
+            let binding = match &self.call_sites.named_place_roots {
+                NamedPlaceRootFacts::Prepared(roots) => match roots.get(&root.ordinal) {
+                    Some(NamedPlaceRootIdentity::Lexical(binding)) => Some(binding.clone()),
+                    Some(NamedPlaceRootIdentity::ModuleValue(_)) => None,
+                    None if self
+                        .call_sites
+                        .structure
+                        .resolved_namespace_places
+                        .contains_key(&root.ordinal) =>
+                    {
+                        None
+                    }
+                    None => return Err(missing_root()),
+                },
+                NamedPlaceRootFacts::Raw => match self.names.get(name) {
+                    Some(binding) => Some(binding.clone()),
+                    None if self.module_names.contains(name) => None,
+                    None => return Err(missing_root()),
+                },
+            };
+            if let Some(binding) = binding {
+                self.place_expressions_with_binding(&target.place, scope, ordinal, Some(&binding))?;
+                return Ok(ReferenceAssignmentDestination::Resolved(
+                    self.reference_place(&target.place, binding, None),
+                ));
             }
+            self.point(
+                CfgPointKind::Evaluate(ScalarExpression::Name {
+                    name: name.clone(),
+                    span: *span,
+                }),
+                target.target_span,
+                scope,
+                BTreeSet::new(),
+            );
+            return Ok(ReferenceAssignmentDestination::EvaluationOnly);
         }
         self.place_expressions(&target.place, scope, ordinal)?;
-        let root = self.place_root(&target.place, ordinal);
-        if let ScalarPlace::Dereference { .. } = root.place {
-            let pointer_point = *self.dereference_points.get(&root.ordinal).ok_or_else(|| {
-                self.missing_context(
-                    target.target_span,
-                    ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
-                )
-            })?;
-            Ok(ReferenceAssignmentDestination::Through(pointer_point))
-        } else {
-            Ok(ReferenceAssignmentDestination::Resolved(
-                self.assignment_place(&target.place, target.target_span)?,
-            ))
-        }
+        let pointer_point = *self.dereference_points.get(&root.ordinal).ok_or_else(|| {
+            self.missing_context(
+                target.target_span,
+                ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+            )
+        })?;
+        Ok(ReferenceAssignmentDestination::Through(pointer_point))
     }
 
     fn block(
@@ -4458,6 +4513,18 @@ enum PlainNameFacts {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+enum NamedPlaceRootIdentity {
+    Lexical(ReferenceBindingId),
+    ModuleValue(SourceSpan),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum NamedPlaceRootFacts {
+    Raw,
+    Prepared(HashMap<OccurrenceOrdinal, NamedPlaceRootIdentity>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum PreparedMemberIdentity {
     Lexical {
         binding: ReferenceBindingId,
@@ -4483,6 +4550,7 @@ pub(super) struct FunctionCallSites {
     pub(super) allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     plain_names: PlainNameFacts,
+    named_place_roots: NamedPlaceRootFacts,
     members: MemberFacts,
     query_allocation_outputs: HashMap<(BlockOrdinal, usize), BindingOutputs>,
     pub(super) structure: OccurrenceStructure,
@@ -4692,6 +4760,7 @@ struct StructuralWalker<'a, 'typing> {
     occurrence_typing: &'typing mut PreparationOccurrenceTyping,
     checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     plain_names: PlainNameFacts,
+    named_place_roots: NamedPlaceRootFacts,
     members: MemberFacts,
     allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     initialization_call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
@@ -4710,20 +4779,24 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         span: ByteSpan,
         occurrence_typing: &'typing mut PreparationOccurrenceTyping,
     ) -> Self {
-        let (plain_names, members) = if matches!(&mode, WalkMode::Callable(callable) if callable.prepared)
-        {
-            (
+        let (plain_names, named_place_roots, members) = match &mode {
+            WalkMode::Callable(callable) if callable.prepared => (
                 PlainNameFacts::Prepared(HashMap::new()),
+                NamedPlaceRootFacts::Prepared(HashMap::new()),
                 MemberFacts::Prepared(HashMap::new()),
-            )
-        } else {
-            (PlainNameFacts::Raw, MemberFacts::Raw)
+            ),
+            _ => (
+                PlainNameFacts::Raw,
+                NamedPlaceRootFacts::Raw,
+                MemberFacts::Raw,
+            ),
         };
         Self {
             mode,
             occurrence_typing,
             checked_call_signatures: HashMap::new(),
             plain_names,
+            named_place_roots,
             members,
             allocation_length_call_targets: HashMap::new(),
             initialization_call_targets: HashMap::new(),
@@ -5292,7 +5365,41 @@ impl StructuralWalker<'_, '_> {
         }
         let parent = OccurrenceParent::Place(ordinal);
         match place {
-            ScalarPlace::Name { .. } => {}
+            ScalarPlace::Name { name, .. } => {
+                if let NamedPlaceRootFacts::Prepared(roots) = &mut self.named_place_roots {
+                    if !matches!(edge, OccurrenceEdge::AssignmentDestination { .. })
+                        && !self
+                            .structure
+                            .resolved_namespace_places
+                            .contains_key(&ordinal)
+                    {
+                        let resolver = match &self.mode {
+                            WalkMode::Callable(callable) => callable.target_resolver,
+                            WalkMode::CallableAllocationLength(resolver) => *resolver,
+                            _ => unreachable!("named place roots are owned by a prepared callable"),
+                        };
+                        let module = resolver.declarations.value_token(resolver.source, name);
+                        let identity = match names.get(name) {
+                            Some(binding)
+                                if !binding.introduced_by_assignment || module.is_none() =>
+                            {
+                                Some(NamedPlaceRootIdentity::Lexical(
+                                    binding.reference_id(resolver.source, resolver.function_span),
+                                ))
+                            }
+                            _ => module.map(|span| {
+                                NamedPlaceRootIdentity::ModuleValue(SourceSpan::new(
+                                    resolver.source.clone(),
+                                    span,
+                                ))
+                            }),
+                        };
+                        if let Some(identity) = identity {
+                            roots.insert(ordinal, identity);
+                        }
+                    }
+                }
+            }
             ScalarPlace::Field { base, .. } => {
                 self.place(base, names, types, parent, OccurrenceEdge::PlaceBase)?
             }
@@ -6024,6 +6131,7 @@ fn resolve_function_call_sites(
         allocation_length_call_targets: resolver.allocation_length_call_targets,
         checked_call_signatures: resolver.checked_call_signatures,
         plain_names: resolver.plain_names,
+        named_place_roots: resolver.named_place_roots,
         members: resolver.members,
         query_allocation_outputs: callable.query_allocation_outputs,
         structure: resolver.structure,

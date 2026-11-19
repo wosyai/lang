@@ -1,5 +1,344 @@
 use super::*;
 
+const PROJECTED_ASSIGNMENTS: &str = "%%start
+struct Record { u8[2] bytes; u8 value; }
+Record global = { .bytes = [0, 0]; .value = 0; };
+unit(Record, u64) lexical = fn(input, index) { input.bytes[index] = 1; input.value; };
+unit(Record) module = fn(input) { global.value = 2; input.value; };
+%%end";
+
+fn rename_destination_root(place: &mut ScalarPlace, spelling: &str) {
+    match place {
+        ScalarPlace::Name { name, .. } => *name = spelling.to_owned(),
+        ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } => {
+            rename_destination_root(base, spelling);
+        }
+        ScalarPlace::Dereference { .. } => panic!("named destination root"),
+    }
+}
+
+#[test]
+fn prepared_projected_assignment_roots_are_authoritative_on_both_routes_and_layouts() {
+    let source = source();
+    let parsed = parse_source(source.clone(), PROJECTED_ASSIGNMENTS.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let declarations = || derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+    let module_names = HashSet::from([
+        "global".to_owned(),
+        "lexical".to_owned(),
+        "module".to_owned(),
+    ]);
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let stages = stage_observations::Scope::new();
+        let standalone = static_calls::PreparedProgram::new(declarations(), target)
+            .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let project = prepare_scalar_project(
+            vec![(declarations(), Vec::new())],
+            vec![source.clone()],
+            ScalarPreparationInputs {
+                target_layout: target,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        assert_eq!(
+            stages.counts(),
+            stage_observations::Counts {
+                call_sites: 2,
+                ..stage_observations::Counts::default()
+            }
+        );
+        drop(stages);
+        let standalone_calls = [
+            standalone.function_calls(1).clone(),
+            standalone.function_calls(2).clone(),
+        ];
+        let standalone = standalone.finish();
+        assert!(
+            standalone.diagnostics.is_empty(),
+            "{:?}",
+            standalone.diagnostics
+        );
+        let build = analyze_scalar_build(&project);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+
+        for (item, standalone_row) in (1..=2).zip(&standalone_calls) {
+            let ScalarItem::Function(standalone_function) = &standalone.program.items[item] else {
+                panic!("standalone callable");
+            };
+            let ScalarItem::Function(project_function) = &project.project().modules[0].items[item]
+            else {
+                panic!("project callable");
+            };
+            let baseline = &standalone_function.reference_cfg;
+            assert_eq!(build.reference_cfg(0, item, None), Some(baseline));
+            let raw = resolve_program_call_sites(&standalone.program).unwrap();
+            for (function, row) in [
+                (standalone_function, standalone_row),
+                (project_function, project.function_calls(0, item)),
+            ] {
+                let derive = |function: &ScalarFunction, row: &FunctionCallSites| {
+                    derive_function_reference_cfg(
+                        &source,
+                        function,
+                        &module_names,
+                        row,
+                        &standalone.program.structs,
+                        &standalone.program.enums,
+                        true,
+                    )
+                };
+                assert_eq!(
+                    derive(function, raw.function(item)),
+                    (baseline.clone(), Vec::new())
+                );
+                let ordinal = row.assignments[&(row.structure.root, 0)]
+                    .destinations()
+                    .next()
+                    .unwrap()
+                    .destination;
+                let mut function = function.clone();
+                let ScalarBlockItem::Assignment(assignment) = &mut function.body.items[0] else {
+                    panic!("canonical assignment");
+                };
+                let destination = &mut assignment.targets[0];
+                let root_span = scalar_place_target_span(reference_root(&destination.place));
+                let mut root = ordinal;
+                while let Some(OccurrenceNode::Place(base)) = row
+                    .structure
+                    .edges
+                    .get(&(OccurrenceParent::Place(root), OccurrenceEdge::PlaceBase))
+                {
+                    root = *base;
+                }
+                assert_ne!(root, ordinal);
+                assert_eq!(row.occurrences[root.0].span, root_span);
+                let NamedPlaceRootFacts::Prepared(roots) = &row.named_place_roots else {
+                    panic!("prepared roots");
+                };
+                let ScalarItem::Binding(global) = &standalone.program.items[0] else {
+                    panic!("module declaration");
+                };
+                let binding = ReferenceBindingId {
+                    source: source.clone(),
+                    function_span: function.span,
+                    declaration_span: function.parameter_spans[0],
+                    block_span: function.body.span,
+                    kind: ReferenceBindingKind::Declared,
+                };
+                let expected_root = if item == 1 {
+                    NamedPlaceRootIdentity::Lexical(binding.clone())
+                } else {
+                    NamedPlaceRootIdentity::ModuleValue(SourceSpan::new(
+                        source.clone(),
+                        global.name_span,
+                    ))
+                };
+                assert_eq!(roots[&root], expected_root);
+                let spelling = if item == 1 { "global" } else { "input" };
+                rename_destination_root(&mut destination.place, spelling);
+                let destination = destination.clone();
+
+                let mut expected = baseline.clone();
+                for points in [&mut expected.points, &mut expected.initial_points] {
+                    let mut mutations = 0;
+                    for point in points {
+                        match &mut point.kind {
+                            CfgPointKind::Assign { target, .. } if item == 1 => {
+                                assert_eq!(target.binding, binding);
+                                rename_destination_root(&mut target.place, spelling);
+                                mutations += 1;
+                            }
+                            CfgPointKind::Evaluate(ScalarExpression::Name { name, span })
+                                if item == 2 && *span == root_span =>
+                            {
+                                assert_eq!(point.source_span.range, destination.target_span);
+                                *name = spelling.to_owned();
+                                mutations += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    assert_eq!(mutations, 1);
+                }
+                assert_eq!(derive(&function, row), (expected, Vec::new()));
+
+                if item == 1 {
+                    let mut builder = ReferenceFlowBuilder::new(
+                        &source,
+                        &function,
+                        &module_names,
+                        row,
+                        &standalone.program.structs,
+                        &standalone.program.enums,
+                    );
+                    builder.checked.insert(binding.clone());
+                    let selector = &row.boundary.parameters[1];
+                    let selector_binding = ReferenceBindingId {
+                        declaration_span: selector.span,
+                        ..binding.clone()
+                    };
+                    builder
+                        .binding_types
+                        .insert(selector_binding.clone(), selector.ty.clone());
+                    let resolved = builder
+                        .assignment_destination(&destination, ReferenceScopeId(0), ordinal)
+                        .unwrap();
+                    assert!(
+                        matches!(resolved, ReferenceAssignmentDestination::Resolved(place) if place.binding == binding)
+                    );
+                    let [read, index] = builder.cfg.points.as_slice() else {
+                        panic!("one preliminary root read followed by one selector read");
+                    };
+                    assert_eq!(read.source_span.range, root_span);
+                    assert_eq!(
+                        read.kind,
+                        CfgPointKind::Read {
+                            binding: binding.clone()
+                        }
+                    );
+                    assert_eq!(
+                        index.kind,
+                        CfgPointKind::Read {
+                            binding: selector_binding
+                        }
+                    );
+                }
+
+                let mut corrupt = row.clone();
+                let NamedPlaceRootFacts::Prepared(roots) = &mut corrupt.named_place_roots else {
+                    panic!("prepared roots");
+                };
+                assert_eq!(roots.remove(&root), Some(expected_root));
+                let (cfg, errors) = derive(&function, &corrupt);
+                assert_eq!(
+                    errors,
+                    [ReferenceAnalysisError::MissingContext {
+                        source_span: SourceSpan::new(source.clone(), root_span),
+                        reason: ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                    }]
+                );
+                assert!(cfg.points.iter().all(|point| !matches!(
+                    point.kind,
+                    CfgPointKind::Assign { .. }
+                        | CfgPointKind::CaptureAssignmentPrevious { .. }
+                        | CfgPointKind::Evaluate(ScalarExpression::Name { .. })
+                )));
+            }
+        }
+    }
+}
+
+#[test]
+fn prepared_projected_namespace_assignment_uses_selected_base_on_both_layouts() {
+    let source = source();
+    let dependency = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "values.w".into(),
+        "r1".into(),
+    );
+    let main = parse_source(
+        source.clone(),
+        "%%start\nimported = namespace package \"values.w\";\nunit(u16) run = fn(decoy) { imported.value = 4; decoy; };\n%%end".into(),
+        &[],
+    );
+    let values = parse_source(
+        dependency.clone(),
+        "%%start\nu16 value = 1;\n%%end".into(),
+        &[],
+    );
+    assert!(main.diagnostics.is_empty(), "{:?}", main.diagnostics);
+    assert!(values.diagnostics.is_empty(), "{:?}", values.diagnostics);
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let declarations = derive_scalar_declarations_from_cst(main.result.canonical_cst());
+        let namespace = declarations.namespaces().next().unwrap();
+        let binding = ScalarNamespaceBinding {
+            binding: namespace.binding.clone(),
+            target: dependency.clone(),
+            span: namespace.span,
+        };
+        let project = prepare_scalar_project(
+            vec![
+                (declarations, vec![binding]),
+                (
+                    derive_scalar_declarations_from_cst(values.result.canonical_cst()),
+                    Vec::new(),
+                ),
+            ],
+            vec![dependency.clone(), source.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let build = analyze_scalar_build(&project);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let module = &project.project().modules[0];
+        let ScalarItem::Function(function) = &module.items[1] else {
+            panic!("run declaration");
+        };
+        let mut function = function.clone();
+        let ScalarBlockItem::Assignment(assignment) = &mut function.body.items[0] else {
+            panic!("canonical assignment");
+        };
+        let target = &mut assignment.targets[0];
+        let root_span = scalar_place_target_span(reference_root(&target.place));
+        rename_destination_root(&mut target.place, "decoy");
+        let row = project.function_calls(0, 1);
+        let ordinal = row.assignments[&(row.structure.root, 0)]
+            .destinations()
+            .next()
+            .unwrap()
+            .destination;
+        let OccurrenceNode::Place(root) =
+            row.structure.edges[&(OccurrenceParent::Place(ordinal), OccurrenceEdge::PlaceBase)]
+        else {
+            panic!("namespace root ordinal");
+        };
+        assert_eq!(row.structure.resolved_namespace_places[&root], dependency);
+        let module_names = HashSet::from(["imported".to_owned(), "run".to_owned()]);
+        let derive = |row: &FunctionCallSites| {
+            derive_function_reference_cfg(
+                &source,
+                &function,
+                &module_names,
+                row,
+                &module.structs,
+                &module.enums,
+                true,
+            )
+        };
+        let mut expected = build.reference_cfg(0, 1, None).unwrap().clone();
+        for points in [&mut expected.points, &mut expected.initial_points] {
+            let event = points
+                .iter_mut()
+                .find_map(|point| match &mut point.kind {
+                    CfgPointKind::Evaluate(ScalarExpression::Name { name, span })
+                        if *span == root_span =>
+                    {
+                        Some(name)
+                    }
+                    _ => None,
+                })
+                .expect("namespace evaluation-only event");
+            assert_eq!(event, "imported");
+            *event = "decoy".to_owned();
+        }
+        assert_eq!(derive(row), (expected, Vec::new()));
+
+        let mut corrupt = row.clone();
+        assert_eq!(
+            corrupt.structure.resolved_namespace_places.remove(&root),
+            Some(dependency.clone())
+        );
+        assert_eq!(
+            derive(&corrupt).1,
+            [ReferenceAnalysisError::MissingContext {
+                source_span: SourceSpan::new(source.clone(), root_span),
+                reason: ReferenceAnalysisErrorReason::MissingResolvedBinding,
+            }]
+        );
+    }
+}
+
 #[test]
 fn checked_assignment_retains_original_destination_before_retargeting_on_both_pipelines_and_layouts(
 ) {
