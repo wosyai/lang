@@ -1066,7 +1066,6 @@ fn prepare_publishes_declare_artifact_signature_only_with_checked_utf8_context()
     let main = parsed(&format!(
         "%%start\nstd = namespace std \"bootstrap.w\";\n{body}\n%%end"
     ));
-    let standalone = parsed(&format!("%%start\n{body}\n%%end"));
     let std_source = SourceIdentity::new(
         "project".into(),
         "std".into(),
@@ -1079,10 +1078,27 @@ fn prepare_publishes_declare_artifact_signature_only_with_checked_utf8_context()
         &[],
     );
     assert!(std.diagnostics.is_empty(), "{:?}", std.diagnostics);
+    let standalone = parse_source(
+        std_source.clone(),
+        "%%start
+struct utf8 { *?u8 data; u64 length; }
+artifact_id initial = core.declare_artifact(\"module\");
+artifact_id(bool, utf8) run = fn(choose, input) {
+    core.declare_artifact(if (choose) { input } else { \"callable\" })
+};
+%%end"
+            .into(),
+        &[],
+    );
+    assert!(
+        standalone.diagnostics.is_empty(),
+        "{:?}",
+        standalone.diagnostics
+    );
 
     let check = |initialization: &control::ModuleInitializationRegion,
                  function: &FunctionCallSites,
-                 utf8: Option<&ScalarType>| {
+                 utf8: &ScalarType| {
         let ModuleInitializationDetail::Occurrences(topology) = &initialization.detail else {
             panic!("module initialization occurrences")
         };
@@ -1118,17 +1134,16 @@ fn prepare_publishes_declare_artifact_signature_only_with_checked_utf8_context()
                 Parent::Expression(ordinal),
                 Edge::CallArgument(0),
             );
-            assert_eq!(structure.checked_types.expressions.get(&argument), utf8);
-            if let Some(utf8) = utf8 {
-                assert_signature(
-                    signature.expect("checked artifact declaration signature"),
-                    std::slice::from_ref(utf8),
-                    &[ScalarType::ArtifactId],
-                    None,
-                );
-            } else {
-                assert_eq!(signature, None);
-            }
+            assert_eq!(
+                structure.checked_types.expressions.get(&argument),
+                Some(utf8)
+            );
+            assert_signature(
+                signature.expect("checked artifact declaration signature"),
+                std::slice::from_ref(utf8),
+                &[ScalarType::ArtifactId],
+                None,
+            );
         }
     };
 
@@ -1156,16 +1171,81 @@ fn prepare_publishes_declare_artifact_signature_only_with_checked_utf8_context()
         check(
             project.initialization_region(0).unwrap(),
             project.calls.function(0, 2),
-            Some(&utf8),
+            &utf8,
         );
 
         let program = PreparedProgram::new(
-            derive_scalar_declarations_from_cst(standalone.canonical_cst()),
+            derive_scalar_declarations_from_cst(standalone.result.canonical_cst()),
             target_layout,
         )
         .unwrap_or_else(|failure| panic!("{target_layout:?}: {:?}", failure.diagnostics));
+        let utf8 = ScalarType::Struct(program.program.structs[0].id.clone());
         let calls = program.calls.as_ref().unwrap();
-        check(&calls.initialization, calls.function(1), None);
+        check(&calls.initialization, calls.function(1), &utf8);
+    }
+}
+
+#[test]
+fn standalone_prepare_rejects_invalid_declare_artifact_context() {
+    for (package, declarations, operand, code, message) in [
+        (
+            "std",
+            "struct utf8 { *?u8 data; u64 length; }",
+            "true",
+            "B0003",
+            "expression type does not match expected type",
+        ),
+        (
+            "std",
+            "",
+            "missing, \"extra\"",
+            "B0004",
+            "call argument arity does not match callable type",
+        ),
+        ("std", "", "\"name\"", "B0003", "std.utf8 is unavailable"),
+        ("app", "", "\"name\"", "B0003", "std.utf8 is unavailable"),
+        (
+            "app",
+            "struct utf8 { *?u8 data; u64 length; }",
+            "\"name\"",
+            "B0003",
+            "std.utf8 is unavailable",
+        ),
+    ] {
+        let call = format!("core.declare_artifact({operand})");
+        let text = format!("%%start\n{declarations}\nartifact_id artifact = {call};\n%%end");
+        let start = text.find(&call).unwrap();
+        let source = SourceIdentity::new(
+            "project".into(),
+            package.into(),
+            "bootstrap.w".into(),
+            "r1".into(),
+        );
+        let span = SourceSpan::new(
+            source.clone(),
+            ByteSpan::new(start as u32, (start + call.len()) as u32),
+        );
+        let parsed = parse_source(source, text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let result = PreparedProgram::new(
+                derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                target,
+            );
+            let Err(failure) = result else {
+                panic!("{target:?} {package}: {call} passed preparation");
+            };
+            let [diagnostic] = failure.diagnostics.as_slice() else {
+                panic!("{target:?} {package}: {call}: {:?}", failure.diagnostics);
+            };
+            assert_eq!(diagnostic.code, code);
+            assert_eq!(diagnostic.message, message);
+            let [label] = diagnostic.labels.as_slice() else {
+                panic!("one primary call label: {diagnostic:?}");
+            };
+            assert_eq!(label.kind, crate::DiagnosticLabelKind::Primary);
+            assert_eq!(label.span, span);
+        }
     }
 }
 

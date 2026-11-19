@@ -7,6 +7,18 @@ pub(super) struct ScalarProgramTyping<'a> {
     pub target_layout: ScalarTargetLayout,
 }
 
+impl ScalarProgramTyping<'_> {
+    fn local_utf8_id(&self) -> Option<&ScalarStructId> {
+        if self.source.package != "std" {
+            return None;
+        }
+        self.structs
+            .iter()
+            .find(|structure| structure.name == "utf8" && &structure.id.source == self.source)
+            .map(|structure| &structure.id)
+    }
+}
+
 pub(super) struct ScalarModuleTyping<'a> {
     pub source: &'a SourceIdentity,
     pub members: &'a BTreeMap<String, ScalarType>,
@@ -8031,9 +8043,20 @@ fn check_expression_type(
                     ));
                     return ScalarType::Error;
                 }
+                let Some(utf8_id) = program.local_utf8_id() else {
+                    diagnostics.push(diagnostic(
+                        program,
+                        "B0003",
+                        "std.utf8 is unavailable",
+                        *span,
+                    ));
+                    return ScalarType::Error;
+                };
+                let expected = ScalarType::Struct(utf8_id.clone());
+                let diagnostics_before_argument = diagnostics.len();
                 let actual = expression_type_expected(
                     &arguments[0],
-                    &ScalarType::Error,
+                    &expected,
                     scope,
                     visible_names,
                     folded_names,
@@ -8043,12 +8066,13 @@ fn check_expression_type(
                     overloads,
                     inference,
                 );
-                expect_type(program, &ScalarType::Error, &actual, *span, diagnostics);
-                return if is_error_type(&actual) {
-                    ScalarType::Error
-                } else {
-                    ScalarType::ArtifactId
-                };
+                expect_type(program, &expected, &actual, *span, diagnostics);
+                if is_error_type(&actual) || diagnostics.len() != diagnostics_before_argument {
+                    return ScalarType::Error;
+                }
+                let result = ScalarType::ArtifactId;
+                inference.record_core_call_signature(expression, vec![expected], &result, *span);
+                return result;
             }
             if receiver.as_deref() == Some("core")
                 && matches!(
@@ -8598,6 +8622,11 @@ fn check_expression_type_expected(
 ) -> ScalarType {
     if is_error_type(expected) {
         return ScalarType::Error;
+    }
+    if matches!(expression, ScalarExpression::Utf8 { .. })
+        && matches!(expected, ScalarType::Struct(id) if program.local_utf8_id() == Some(id))
+    {
+        return expected.clone();
     }
     if let ScalarExpression::Call {
         receiver: None,
