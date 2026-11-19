@@ -1870,6 +1870,9 @@ fn emit_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
+    if self_tail::eligible(&state, function, reference_cfg) {
+        return self_tail::emit(context, &mut state, value, function, None);
+    }
     let result = match function.body.items.as_slice() {
         [ScalarBlockItem::Expression(expression)]
             if canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
@@ -2148,6 +2151,18 @@ fn emit_project_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
+    if self_tail::eligible(&state, function, reference_cfg) {
+        return self_tail::emit(
+            context,
+            &mut state,
+            value,
+            function,
+            Some(ProjectCallScope {
+                module: source_module,
+                modules,
+            }),
+        );
+    }
     let result = match function.body.items.as_slice() {
         [ScalarBlockItem::Expression(expression)]
             if canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
@@ -4237,6 +4252,7 @@ fn emit_project_while<'ctx, 'module>(
 }
 
 mod expression;
+mod self_tail;
 use expression::{
     emit_expression, emit_if_value, emit_project_expression, emit_project_typed_expression,
 };

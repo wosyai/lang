@@ -61,6 +61,54 @@ pub(super) fn select(
     candidates
 }
 
+pub(in crate::scalar) fn scalar_body_types(calls: &FunctionCallSites) -> bool {
+    calls
+        .structure
+        .checked_types
+        .expressions
+        .values()
+        .all(scalar_or_unit)
+        && calls.call_occurrences.iter().all(|row| {
+            scalar_call_target(&calls.sites[row.site].target)
+                && calls
+                    .checked_call_signatures
+                    .get(&row.ordinal)
+                    .is_some_and(|signature| {
+                        signature.parameters.iter().all(primitive_scalar)
+                            && signature.outputs.outputs.len() <= 1
+                            && signature
+                                .outputs
+                                .outputs
+                                .iter()
+                                .all(|out| scalar_or_unit(&out.ty))
+                    })
+        })
+}
+
+fn scalar_call_target(target: &ResolvedCallTarget) -> bool {
+    matches!(
+        target,
+        ResolvedCallTarget::ModuleCallable { .. }
+            | ResolvedCallTarget::ExternCallable { .. }
+            | ResolvedCallTarget::Core(
+                CoreOperationId::SystemPanic
+                    | CoreOperationId::IntTrunc
+                    | CoreOperationId::IntExtend
+                    | CoreOperationId::UintToFloat
+                    | CoreOperationId::SintToFloat
+                    | CoreOperationId::FloatToSintTrunc
+                    | CoreOperationId::FloatToUintTrunc
+                    | CoreOperationId::FloatTrunc
+                    | CoreOperationId::FloatExtend
+                    | CoreOperationId::Bitcast
+            )
+    )
+}
+
+fn scalar_or_unit(ty: &ScalarType) -> bool {
+    *ty == ScalarType::Unit || primitive_scalar(ty)
+}
+
 fn primitive_scalar(ty: &ScalarType) -> bool {
     matches!(
         ty,

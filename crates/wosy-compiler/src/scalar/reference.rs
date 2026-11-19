@@ -17,7 +17,7 @@ use super::control::{
 use super::inference::CheckedMember;
 use super::*;
 
-mod self_tail;
+pub(super) mod self_tail;
 
 #[cfg(test)]
 mod input_tests;

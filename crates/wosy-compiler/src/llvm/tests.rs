@@ -42,6 +42,179 @@ fn prepare_initializer_test(
     .unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics))
 }
 
+#[test]
+fn prepared_self_tail_stages_crossed_arguments_before_reusing_entry_slots() {
+    let text = "%%start
+i32 phase = 0;
+i32(i32) first = fn(value) { phase = 1; value };
+i32(i32) second = fn(value) { phase = 2; value };
+unit(i32) observe = fn(value) { phase = value; };
+i32(i32, i32, i32) swap = fn(left, right, count) {
+    observe(count);
+    if (count == 0) { left + right } else {
+        swap(first(right), second(left), count - 1)
+    }
+};
+u8(u8, bool) narrow = fn(value, done) {
+    if (done) { value } else { unsafe { narrow(17, true) } }
+};
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (project, result) in [
+            (false, emit_scalar_build_single_module_llvm(&build)),
+            (true, emit_scalar_build_project_llvm(&build)),
+        ] {
+            let symbol = |name| self_tail_test_symbol(source, project, name);
+            let ir = result.unwrap().to_text();
+            let body = self_tail_test_body(&ir, "i32", &symbol("swap"));
+            let (entry, repeated) = body
+                .split_once("self_tail.header:")
+                .unwrap_or_else(|| panic!("{body}"));
+            assert_eq!(entry.matches("alloca i32").count(), 3, "{body}");
+            assert!(!repeated.contains("alloca"), "{body}");
+            assert_eq!(
+                body.matches("br label %self_tail.header").count(),
+                2,
+                "{body}"
+            );
+            assert!(
+                !repeated.contains(&format!("call i32 @{}(", symbol("swap"))),
+                "{body}"
+            );
+            assert!(repeated.contains("ret i32"), "{body}");
+            let expected_order = [
+                "load i32, ptr %right".to_owned(),
+                format!("call i32 @{}(", symbol("first")),
+                "load i32, ptr %left".to_owned(),
+                format!("call i32 @{}(", symbol("second")),
+                "sub i32".to_owned(),
+            ];
+            let backedge = repeated.split_once("self_tail.else:").unwrap().1;
+            assert!(
+                repeated.contains(&format!("call void @{}(", symbol("observe"))),
+                "{body}"
+            );
+            let (mut remaining, stores) = backedge.split_once("store i32").unwrap();
+            for needle in expected_order {
+                remaining = remaining
+                    .split_once(&needle)
+                    .unwrap_or_else(|| panic!("{needle}: {body}"))
+                    .1;
+            }
+            assert!(stores.contains("br label %self_tail.header"), "{body}");
+            assert_eq!(backedge.matches("store i32").count(), 3, "{body}");
+            let narrow = self_tail_test_body(&ir, "i8", &symbol("narrow"));
+            assert!(narrow.contains("store i8 17, ptr %value"), "{narrow}");
+            assert_eq!(narrow.matches("br label %self_tail.header").count(), 2);
+        }
+        let legacy = derive_scalar_program_with_layout(
+            &parse_source(source.clone(), text.into(), &[]).result,
+            layout,
+        );
+        let ir = emit_scalar_llvm(&legacy).unwrap().to_text();
+        let body = self_tail_test_body(&ir, "i32", "swap");
+        assert!(body.contains("call i32 @swap("), "{body}");
+        assert!(!body.contains("self_tail.header"), "{body}");
+    }
+}
+
+fn self_tail_test_symbol(source: &SourceIdentity, project: bool, name: &str) -> String {
+    if project {
+        project_function_name(source, name)
+    } else {
+        name.to_owned()
+    }
+}
+
+fn self_tail_test_body<'a>(ir: &'a str, ty: &str, symbol: &str) -> &'a str {
+    ir.split_once(&format!("define {ty} @{symbol}("))
+        .unwrap_or_else(|| panic!("missing definition {symbol}: {ir}"))
+        .1
+        .split_once("\n}")
+        .unwrap()
+        .0
+}
+
+#[test]
+fn prepared_self_tail_preserves_ordinary_edges_and_resource_cleanup() {
+    let text = "%%start
+i32(i32) non_tail = fn(n) { if (n == 0) { n } else { non_tail(n - 1) + n } };
+i32(i32) mutual_a = fn(n) { mutual_b(n) };
+i32(i32) mutual_b = fn(n) { mutual_a(n) };
+i32(i32) resource = fn(n) {
+    if (n != 0) {
+        u64 length = 2;
+        u8[length] scratch;
+        scratch[0] = 7;
+        scratch[0];
+    };
+    if (n == 0) { 7 } else { resource(n - 1) }
+};
+i32(i32) local = fn(n) {
+    i32 next = n - 1;
+    if (n == 0) { next } else { local(next) }
+};
+u8(*!u8, i32) view = fn(cell, n) {
+    if (n == 0) { *cell } else { view(cell, n - 1) }
+};
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let module = &prepared.project().modules[0];
+        for (item, expected) in [(0, false), (3, true), (4, true), (5, false)] {
+            let ScalarItem::Function(function) = &module.items[item] else {
+                panic!("function {item}");
+            };
+            let nodes = prepared
+                .bind_callable_body_call_nodes(0, item, None, &function.body)
+                .unwrap();
+            assert_eq!(nodes.has_self_tail_candidates(), expected);
+        }
+        assert!(!build
+            .reference_cfg(0, 3, None)
+            .unwrap()
+            .allocations
+            .is_empty());
+        for (project, result) in [
+            (false, emit_scalar_build_single_module_llvm(&build)),
+            (true, emit_scalar_build_project_llvm(&build)),
+        ] {
+            let symbol = |name| self_tail_test_symbol(&module.source, project, name);
+            let ir = result.unwrap().to_text();
+            for (ty, function, callee) in [
+                ("i32", "non_tail", "non_tail"),
+                ("i32", "mutual_a", "mutual_b"),
+                ("i32", "mutual_b", "mutual_a"),
+                ("i32", "resource", "resource"),
+                ("i32", "local", "local"),
+                ("i8", "view", "view"),
+            ] {
+                let body = self_tail_test_body(&ir, ty, &symbol(function));
+                assert!(!body.contains("self_tail.header"), "{body}");
+                assert!(
+                    body.contains(&format!("call {ty} @{}(", symbol(callee))),
+                    "{body}"
+                );
+            }
+            let body = self_tail_test_body(&ir, "i32", &symbol("resource"));
+            let alloc = body.find("call ptr @__wosy_core_alloc(").unwrap();
+            let recur = body
+                .find(&format!("call i32 @{}(", symbol("resource")))
+                .unwrap();
+            let free = body
+                .find("call void @__wosy_core_free(")
+                .unwrap_or_else(|| panic!("missing scoped cleanup: {body}"));
+            assert!(alloc < free && free < recur, "{body}");
+        }
+    }
+}
+
 fn emit_initializer_test_input(
     build: &crate::ScalarBuildValidation<'_>,
     project: &ScalarProject,

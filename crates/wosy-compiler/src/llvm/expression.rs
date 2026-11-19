@@ -779,7 +779,18 @@ fn emit_prepared_call<'ctx, 'module>(
     let Some(ScalarType::Callable { parameters, .. }) = state.signatures.get(target) else {
         return Err(state.missing_prepared_signature(target));
     };
-    let values = arguments
+    let values = emit_contextual_arguments(context, state, arguments, parameters, project)?;
+    emit_call_values(context, state, target, values)
+}
+
+pub(super) fn emit_contextual_arguments<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    arguments: &[ScalarExpression],
+    parameters: &[ScalarType],
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<Vec<EmitValue<'ctx>>, String> {
+    arguments
         .iter()
         .zip(parameters)
         .map(|(argument, parameter)| match project {
@@ -788,8 +799,7 @@ fn emit_prepared_call<'ctx, 'module>(
             }
             None => emit_typed_expression(context, state, argument, parameter),
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    emit_call_values(context, state, target, values)
+        .collect()
 }
 
 fn emit_call<'ctx, 'module>(

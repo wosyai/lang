@@ -151,6 +151,7 @@ pub(crate) struct CallableBodyCallNodes<'a> {
     source: &'a SourceIdentity,
     targets: HashMap<*const ScalarExpression, &'a ResolvedCallTarget>,
     self_tail_candidates: HashSet<*const ScalarExpression>,
+    scalar_self_tail_types: bool,
     body: PhantomData<&'a ScalarBlock>,
 }
 
@@ -175,6 +176,8 @@ impl<'a> CallableBodyCallNodes<'a> {
             source,
             targets: HashMap::with_capacity(targets_by_ordinal.len()),
             self_tail_candidates: HashSet::with_capacity(calls.self_tail_candidates.len()),
+            scalar_self_tail_types: !calls.self_tail_candidates.is_empty()
+                && super::super::reference::self_tail::scalar_body_types(calls),
             body: PhantomData,
         };
         let mut bind_call = |ordinal: OccurrenceOrdinal, expression: &'a ScalarExpression| {
@@ -214,12 +217,14 @@ impl<'a> CallableBodyCallNodes<'a> {
         Ok(nodes)
     }
 
-    #[allow(dead_code, reason = "consumed by the LLVM lowering unit")]
     pub(crate) fn has_self_tail_candidates(&self) -> bool {
         !self.self_tail_candidates.is_empty()
     }
 
-    #[allow(dead_code, reason = "consumed by the LLVM lowering unit")]
+    pub(crate) fn has_scalar_self_tail_types(&self) -> bool {
+        self.scalar_self_tail_types
+    }
+
     pub(crate) fn is_self_tail_candidate(&self, expression: &ScalarExpression) -> bool {
         self.self_tail_candidates
             .contains(&std::ptr::from_ref(expression))
