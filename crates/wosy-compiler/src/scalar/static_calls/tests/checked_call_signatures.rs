@@ -653,6 +653,151 @@ fn assert_signature(
 }
 
 #[test]
+fn prepare_publishes_checked_core_memory_signatures_in_initialization_and_functions() {
+    use crate::scalar::control::ModuleInitializationCallTarget as Target;
+
+    let body = "unsafe {
+        u16 slot = 0;
+        *?u16 raw = &?slot;
+        *?u8 allocated = core.alloc(16, 8);
+        core.free(allocated);
+        core.invalidate(&slot);
+        core.rebind(&!slot, raw, 3);
+        core.free(&!slot);
+        core.free(raw);
+    };
+    core.system_panic();";
+    let text = format!("%%start\nunit() run = fn {{ {body} }};\n{body}\n%%end");
+    let parsed = parsed(&text);
+    let raw_u8 = ScalarType::RawPointer(Box::new(ScalarType::U8));
+    let raw_u16 = ScalarType::RawPointer(Box::new(ScalarType::U16));
+    let reference = |mutability| ScalarType::CheckedReference {
+        mutability,
+        inner: Box::new(ScalarType::U16),
+    };
+    let shared = reference(ScalarReferenceMutability::Shared);
+    let mutable = reference(ScalarReferenceMutability::Mutable);
+    let expected: [(_, _, &[ScalarType], &[ScalarType]); 7] = [
+        (
+            "core.alloc(16, 8)",
+            CoreOperationId::Alloc,
+            &[ScalarType::U64, ScalarType::U64],
+            std::slice::from_ref(&raw_u8),
+        ),
+        (
+            "core.free(allocated)",
+            CoreOperationId::Free,
+            std::slice::from_ref(&raw_u8),
+            &[],
+        ),
+        (
+            "core.invalidate(&slot)",
+            CoreOperationId::Invalidate,
+            &[shared],
+            &[],
+        ),
+        (
+            "core.rebind(&!slot, raw, 3)",
+            CoreOperationId::Rebind,
+            &[mutable.clone(), raw_u16.clone(), ScalarType::U64],
+            &[],
+        ),
+        ("core.free(&!slot)", CoreOperationId::Free, &[mutable], &[]),
+        ("core.free(raw)", CoreOperationId::Free, &[raw_u16], &[]),
+        (
+            "core.system_panic()",
+            CoreOperationId::SystemPanic,
+            &[],
+            &[],
+        ),
+    ];
+    let check_call = |structure: &OccurrenceStructure,
+                      ordinal,
+                      span: ByteSpan,
+                      signature: &CheckedCallSignature,
+                      spelling,
+                      parameters: &[ScalarType],
+                      outputs: &[ScalarType]| {
+        assert_eq!(&text[span.start as usize..span.end as usize], spelling);
+        assert_eq!(signature.outputs.span, span);
+        assert_signature(signature, parameters, outputs, None);
+        for (position, parameter) in parameters.iter().enumerate() {
+            let argument = child(
+                structure,
+                Parent::Expression(ordinal),
+                Edge::CallArgument(position),
+            );
+            assert_eq!(&structure.checked_types.expressions[&argument], parameter);
+        }
+    };
+    let check = |initialization: &control::ModuleInitializationRegion,
+                 function: &FunctionCallSites| {
+        let ModuleInitializationDetail::Occurrences(topology) = &initialization.detail else {
+            panic!("module initialization occurrences")
+        };
+        assert_eq!(topology.calls.len(), expected.len());
+        assert_eq!(topology.checked_call_signatures.len(), expected.len());
+        assert_eq!(function.call_occurrences.len(), expected.len());
+        assert_eq!(function.checked_call_signatures.len(), expected.len());
+        for ((&module_call, function_call), &(spelling, operation, parameters, outputs)) in topology
+            .calls
+            .iter()
+            .zip(&function.call_occurrences)
+            .zip(&expected)
+        {
+            assert_eq!(
+                initialization.call_target(module_call),
+                Some(&Target::Core(operation))
+            );
+            assert_eq!(
+                function.sites[function_call.site].target,
+                ResolvedCallTarget::Core(operation)
+            );
+            for (structure, ordinal, span, signature) in [
+                (
+                    &topology.structure,
+                    module_call,
+                    topology.occurrences[module_call.0].span,
+                    &topology.checked_call_signatures[&module_call],
+                ),
+                (
+                    &function.structure,
+                    function_call.ordinal,
+                    function.occurrences[function_call.ordinal.0].span,
+                    &function.checked_call_signatures[&function_call.ordinal],
+                ),
+            ] {
+                check_call(
+                    structure, ordinal, span, signature, spelling, parameters, outputs,
+                );
+            }
+        }
+    };
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let stages = Scope::new();
+        let project = prepare_extracted(&parsed, target);
+        check(
+            project.initialization_region(0).unwrap(),
+            project.calls.function(0, 0),
+        );
+        let program = PreparedProgram::new(
+            derive_scalar_declarations_from_cst(parsed.canonical_cst()),
+            target,
+        )
+        .unwrap_or_else(|failure| panic!("{target:?}: {:?}", failure.diagnostics));
+        let calls = program.calls.as_ref().unwrap();
+        check(&calls.initialization, calls.function(0));
+        assert_eq!(
+            stages.counts(),
+            Counts {
+                call_sites: 2,
+                ..Counts::default()
+            }
+        );
+    }
+}
+
+#[test]
 fn public_prepare_types_independent_secondary_binding_roots() {
     let parsed = parsed(
         "%%start

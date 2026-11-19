@@ -614,7 +614,7 @@ impl TailConditionalTyping<'_> {
                 if is_error_type(&actual) || diagnostics.len() != diagnostics_before_call {
                     return;
                 }
-                let Some(checked) = inference.checked_call_outputs(expression) else {
+                let Some(checked) = inference.checked_non_core_call_outputs(expression) else {
                     return;
                 };
                 checked
@@ -1549,6 +1549,7 @@ fn while_type_in_module(
 }
 
 fn type_core_memory_in_module(
+    expression: &ScalarExpression,
     operation: &str,
     arguments: &[ScalarExpression],
     span: ByteSpan,
@@ -1562,6 +1563,7 @@ fn type_core_memory_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    let diagnostics_before_call = diagnostics.len();
     if matches!(operation, "alloc" | "free" | "invalidate" | "rebind") && !unsafe_context {
         diagnostics.push(module_diagnostic(
             module,
@@ -1570,7 +1572,7 @@ fn type_core_memory_in_module(
             span,
         ));
     }
-    match operation {
+    let (parameters, result) = match operation {
         "alloc" => {
             if arguments.len() != 2 {
                 diagnostics.push(module_diagnostic(
@@ -1581,6 +1583,7 @@ fn type_core_memory_in_module(
                 ));
                 return ScalarType::Error;
             }
+            let mut parameters = Vec::with_capacity(2);
             for argument in arguments {
                 let actual = expression_type_in_module_expected(
                     argument,
@@ -1602,8 +1605,9 @@ fn type_core_memory_in_module(
                     expression_span(argument),
                     diagnostics,
                 );
+                parameters.push(actual);
             }
-            ScalarType::RawPointer(Box::new(ScalarType::U8))
+            (parameters, ScalarType::RawPointer(Box::new(ScalarType::U8)))
         }
         "free" => {
             let [pointer] = arguments else {
@@ -1654,7 +1658,7 @@ fn type_core_memory_in_module(
                 ));
                 return ScalarType::Error;
             }
-            ScalarType::Unit
+            (vec![actual], ScalarType::Unit)
         }
         "invalidate" | "rebind" => {
             let expected_arity = if operation == "invalidate" { 1 } else { 3 };
@@ -1688,7 +1692,7 @@ fn type_core_memory_in_module(
                     expression_span(address),
                 ));
             }
-            if operation == "rebind" {
+            let parameters = if operation == "rebind" {
                 let raw = &arguments[1];
                 let raw_type = expression_type_in_module(
                     raw,
@@ -1731,8 +1735,11 @@ fn type_core_memory_in_module(
                     expression_span(length),
                     diagnostics,
                 );
-            }
-            ScalarType::Unit
+                vec![actual, raw_type, length_type]
+            } else {
+                vec![actual]
+            };
+            (parameters, ScalarType::Unit)
         }
         "system_panic" => {
             if !arguments.is_empty() {
@@ -1744,13 +1751,18 @@ fn type_core_memory_in_module(
                 ));
                 return ScalarType::Error;
             }
-            ScalarType::Unit
+            (Vec::new(), ScalarType::Unit)
         }
         _ => unreachable!(),
+    };
+    if diagnostics.len() == diagnostics_before_call {
+        inference.record_core_memory_signature(expression, parameters, &result, span);
     }
+    result
 }
 
 fn type_core_memory(
+    expression: &ScalarExpression,
     operation: &str,
     arguments: &[ScalarExpression],
     span: ByteSpan,
@@ -1763,6 +1775,7 @@ fn type_core_memory(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    let diagnostics_before_call = diagnostics.len();
     if matches!(operation, "alloc" | "free" | "invalidate" | "rebind") && !unsafe_context {
         diagnostics.push(diagnostic(
             program,
@@ -1771,7 +1784,7 @@ fn type_core_memory(
             span,
         ));
     }
-    match operation {
+    let (parameters, result) = match operation {
         "alloc" => {
             if arguments.len() != 2 {
                 diagnostics.push(diagnostic(
@@ -1782,6 +1795,7 @@ fn type_core_memory(
                 ));
                 return ScalarType::Error;
             }
+            let mut parameters = Vec::with_capacity(2);
             for argument in arguments {
                 let actual = expression_type_expected(
                     argument,
@@ -1802,8 +1816,9 @@ fn type_core_memory(
                     expression_span(argument),
                     diagnostics,
                 );
+                parameters.push(actual);
             }
-            ScalarType::RawPointer(Box::new(ScalarType::U8))
+            (parameters, ScalarType::RawPointer(Box::new(ScalarType::U8)))
         }
         "free" => {
             let [pointer] = arguments else {
@@ -1853,7 +1868,7 @@ fn type_core_memory(
                 ));
                 return ScalarType::Error;
             }
-            ScalarType::Unit
+            (vec![actual], ScalarType::Unit)
         }
         "invalidate" | "rebind" => {
             let expected_arity = if operation == "invalidate" { 1 } else { 3 };
@@ -1886,7 +1901,7 @@ fn type_core_memory(
                     expression_span(address),
                 ));
             }
-            if operation == "rebind" {
+            let parameters = if operation == "rebind" {
                 let raw = &arguments[1];
                 let raw_type = expression_type(
                     raw,
@@ -1927,8 +1942,11 @@ fn type_core_memory(
                     expression_span(length),
                     diagnostics,
                 );
-            }
-            ScalarType::Unit
+                vec![actual, raw_type, length_type]
+            } else {
+                vec![actual]
+            };
+            (parameters, ScalarType::Unit)
         }
         "system_panic" => {
             if !arguments.is_empty() {
@@ -1940,10 +1958,14 @@ fn type_core_memory(
                 ));
                 return ScalarType::Error;
             }
-            ScalarType::Unit
+            (Vec::new(), ScalarType::Unit)
         }
         _ => unreachable!(),
+    };
+    if diagnostics.len() == diagnostics_before_call {
+        inference.record_core_memory_signature(expression, parameters, &result, span);
     }
+    result
 }
 
 fn type_core_int_conversion_in_module(
@@ -3534,6 +3556,7 @@ fn check_expression_type_in_module(
                 )
             {
                 return type_core_memory_in_module(
+                    expression,
                     name,
                     arguments,
                     *span,
@@ -7937,6 +7960,7 @@ fn check_expression_type(
                 )
             {
                 return type_core_memory(
+                    expression,
                     name,
                     arguments,
                     *span,

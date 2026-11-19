@@ -253,20 +253,58 @@ impl<'a> ScalarInferenceBuilder<'a> {
         {
             return;
         }
+        self.insert_checked_call(expression, parameters.to_vec(), outputs.clone(), overload);
+    }
+
+    pub(super) fn record_core_memory_signature(
+        &mut self,
+        expression: &ScalarExpression,
+        parameters: Vec<ScalarType>,
+        result: &ScalarType,
+        span: ByteSpan,
+    ) {
+        if self.suppress_checked_occurrences || parameters.iter().any(contains_error_type) {
+            return;
+        }
+        let outputs = ScalarOutputSequence {
+            outputs: if *result == ScalarType::Unit {
+                Vec::new()
+            } else {
+                vec![ScalarOutput {
+                    ty: result.clone(),
+                    span,
+                }]
+            },
+            span,
+        };
+        self.insert_checked_call(expression, parameters, outputs, None);
+    }
+
+    fn insert_checked_call(
+        &mut self,
+        expression: &ScalarExpression,
+        parameters: Vec<ScalarType>,
+        outputs: ScalarOutputSequence,
+        overload: Option<ScalarOverloadSelection>,
+    ) {
         self.occurrences.calls.insert(
             std::ptr::from_ref(expression),
             CheckedCallSignature {
-                parameters: parameters.to_vec(),
-                outputs: outputs.clone(),
+                parameters,
+                outputs,
                 overload,
             },
         );
     }
 
-    pub(super) fn checked_call_outputs(
+    pub(super) fn checked_non_core_call_outputs(
         &self,
         expression: &ScalarExpression,
     ) -> Option<&ScalarOutputSequence> {
+        if matches!(expression, ScalarExpression::Call { receiver: Some(receiver), .. } if receiver == "core")
+        {
+            return None;
+        }
         self.occurrences
             .calls
             .get(&std::ptr::from_ref(expression))
