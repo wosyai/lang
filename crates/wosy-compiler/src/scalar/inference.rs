@@ -77,6 +77,7 @@ pub(super) struct PreparationOccurrenceTyping {
     calls: HashMap<*const ScalarExpression, CheckedCallSignature>,
     tail_conditional_outputs: HashMap<*const ScalarExpression, Vec<ScalarType>>,
     expressions: HashMap<*const ScalarExpression, CheckedExpressionType>,
+    members: HashMap<*const ScalarExpression, CheckedMember>,
     folded_expressions: HashMap<*const ScalarExpression, FoldedOccurrence>,
     places: HashMap<*const ScalarPlace, ScalarType>,
 }
@@ -86,7 +87,16 @@ struct CheckedExpressionType {
     contextual: bool,
 }
 
+pub(super) enum CheckedMember {
+    DirectField(ScalarStructFieldId),
+    Other,
+}
+
 impl PreparationOccurrenceTyping {
+    pub(super) fn take_member(&mut self, expression: &ScalarExpression) -> Option<CheckedMember> {
+        self.members.remove(&std::ptr::from_ref(expression))
+    }
+
     pub(super) fn take_assignment(
         &mut self,
         assignment: &ScalarAssignment,
@@ -160,6 +170,7 @@ pub(super) struct ScalarInferenceBuilder<'a> {
     assignments: HashMap<ResolvedAssignmentOutputId, ScalarType>,
     occurrences: PreparationOccurrenceTyping,
     in_module_initialization: bool,
+    capture_callable_assignment_outputs: bool,
     suppress_checked_occurrences: bool,
 }
 
@@ -170,6 +181,7 @@ impl<'a> ScalarInferenceBuilder<'a> {
             assignments: HashMap::new(),
             occurrences: PreparationOccurrenceTyping::default(),
             in_module_initialization: false,
+            capture_callable_assignment_outputs: true,
             suppress_checked_occurrences: true,
         }
     }
@@ -239,6 +251,22 @@ impl<'a> ScalarInferenceBuilder<'a> {
                     contextual,
                 },
             );
+        }
+    }
+
+    pub(super) fn record_member(
+        &mut self,
+        expression: &ScalarExpression,
+        direct_field: Option<&ScalarStructFieldId>,
+    ) {
+        if !self.suppress_checked_occurrences {
+            let member = match direct_field {
+                Some(field) => CheckedMember::DirectField(field.clone()),
+                None => CheckedMember::Other,
+            };
+            self.occurrences
+                .members
+                .insert(std::ptr::from_ref(expression), member);
         }
     }
 
@@ -350,6 +378,10 @@ impl<'a> ScalarInferenceBuilder<'a> {
             matches!(item, ScalarItem::Binding(_) | ScalarItem::Executable(_));
     }
 
+    pub(super) fn set_callable_assignment_output_capture(&mut self, capture: bool) {
+        self.capture_callable_assignment_outputs = capture;
+    }
+
     pub(super) fn record_assignment_outputs(
         &mut self,
         source: &SourceIdentity,
@@ -366,6 +398,9 @@ impl<'a> ScalarInferenceBuilder<'a> {
                     .map(|output| output.ty.clone())
                     .collect(),
             );
+            return;
+        }
+        if !self.capture_callable_assignment_outputs {
             return;
         }
         let Some(function_span) = self.owners.function_span(assignment.span) else {

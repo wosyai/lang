@@ -21,7 +21,7 @@ select = overload {
 pair = overload {
 	generic T;
 	(T, T)(T) => fn(value) {
-		value
+		value, value
 	};
 };
 

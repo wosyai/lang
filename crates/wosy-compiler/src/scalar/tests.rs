@@ -1880,6 +1880,73 @@ fn checked_aggregate_generic_and_overload_outputs_substitute_argument_owner() {
 }
 
 #[test]
+fn ordinary_overload_arm_resolves_explicit_struct_type_argument_on_both_targets() {
+    let text = "%%start\nstruct copy Point { u8 value; }\ngeneric T;\n*T(*T) generic_forward = fn(input) { input };\nforward = overload { *Point(*Point) => fn(input) { generic_forward<Point>(input) }; };\n%%end";
+    let root = source();
+    let parsed = parse_source(root.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let cst = parsed.result.canonical_cst();
+    let mut unresolved = Vec::new();
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_from_cst_with_layout(cst, target);
+        let project = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(cst), Vec::new())],
+            vec![root.clone()],
+            ScalarPreparationInputs {
+                target_layout: target,
+            },
+        );
+        let (project_module, diagnostics) = match &project {
+            Ok(project) => (&project.project().modules[0], &[][..]),
+            Err(failure) => (&failure.project.modules[0], failure.diagnostics.as_slice()),
+        };
+        for (route, items, structure, diagnostics) in [
+            (
+                "standalone",
+                &single.program.items,
+                &single.program.structs[0],
+                single.diagnostics.as_slice(),
+            ),
+            (
+                "project",
+                &project_module.items,
+                &project_module.structs[0],
+                diagnostics,
+            ),
+        ] {
+            let ScalarItem::Function(overload) = &items[1] else {
+                panic!("{route} {target:?}: forward overload declaration");
+            };
+            let [arm] = overload.overload_arms.as_slice() else {
+                panic!("{route} {target:?}: single overload arm");
+            };
+            let ScalarType::Callable { outputs, .. } = &arm.signature else {
+                panic!("{route} {target:?}: callable arm signature");
+            };
+            let mut final_expressions = arm.body.final_expressions();
+            let (expression, output) = final_expressions
+                .next()
+                .expect("canonical final expression");
+            assert!(final_expressions.next().is_none(), "{route} {target:?}");
+            assert_eq!(output.ty, outputs.outputs[0].ty, "{route} {target:?}");
+            let ScalarExpression::Call { type_arguments, .. } = expression else {
+                panic!("{route} {target:?}: canonical generic call");
+            };
+            let [argument] = type_arguments.as_slice() else {
+                panic!("{route} {target:?}: single explicit argument");
+            };
+            if argument.ty != ScalarType::Struct(structure.id.clone()) || !diagnostics.is_empty() {
+                unresolved.push(format!(
+                    "{route} {target:?}: {:?}; {diagnostics:?}",
+                    argument.ty
+                ));
+            }
+        }
+    }
+    assert!(unresolved.is_empty(), "{}", unresolved.join("\n"));
+}
+
+#[test]
 fn returned_reborrow_of_field_preserves_disjoint_caller_place() {
     let text = "%%start\nstruct Payload { u8 value; }\nstruct Pair { Payload left; Payload right; }\n*Payload(*Payload) select_left = fn(input) { input };\nunit() caller = fn { Pair bundle = { .left = { .value = 1; }; .right = { .value = 2; }; }; *Payload left = select_left(&bundle.left); Payload right = bundle.right; left; right; };\n%%end";
     let (single, project) = both_reference_functions(text);
@@ -6442,7 +6509,7 @@ fn derives_and_substitutes_scoped_generic_function_parameters() {
 
 #[test]
 fn resolves_ordinary_and_generic_overload_arms_in_single_file_and_project() {
-    let text = "%%start\ncast = overload {\n    i32(i64) => fn(value) { value };\n    generic T;\n    T(T) => fn(value) { value };\n};\npair = overload {\n    generic T;\n    (T, T)(T) => fn(value) { value };\n};\ni64 wide = 1;\ni32 narrow = cast(wide);\nbool flag = true;\nbool copied = cast(flag);\ni64 first, i64 second = pair(wide);\n%%end";
+    let text = "%%start\ncast = overload {\n    i32(i64) => fn(value) { core.int_trunc<i32>(value) };\n    generic T;\n    T(T) => fn(value) { value };\n};\npair = overload {\n    generic T;\n    (T, T)(T) => fn(value) { value, value };\n};\ni64 wide = 1;\ni32 narrow = cast(wide);\nbool flag = true;\nbool copied = cast(flag);\ni64 first, i64 second = pair(wide);\n%%end";
     let single = validate_text(text);
     assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
     let ScalarItem::Function(overload) = &single.program.items[0] else {
@@ -6457,6 +6524,64 @@ fn resolves_ordinary_and_generic_overload_arms_in_single_file_and_project() {
         vec![source],
     ));
     assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+}
+
+#[test]
+fn ordinary_overload_arm_rejects_implicit_narrowing_on_both_targets() {
+    let text = "%%start\ncast = overload {\n    i32(i64) => fn(value) { value };\n};\n%%end";
+    assert_ordinary_overload_body_diagnostic(
+        text,
+        "B0003",
+        "expression type does not match expected type",
+    );
+}
+
+#[test]
+fn ordinary_overload_arm_rejects_one_value_for_two_outputs_on_both_targets() {
+    let text = "%%start\npair = overload {\n    generic T;\n    (T, T)(T) => fn(value) { value };\n};\n%%end";
+    assert_ordinary_overload_body_diagnostic(
+        text,
+        "B0004",
+        "function output arity does not match its final output list",
+    );
+}
+
+fn assert_ordinary_overload_body_diagnostic(text: &str, code: &str, message: &str) {
+    let root = source();
+    let parsed = parse_source(root.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let cst = parsed.result.canonical_cst();
+    let body = "{ value }";
+    let start = text.find(body).unwrap() as u32;
+    let span = SourceSpan::new(
+        root.clone(),
+        ByteSpan::new(start, start + body.len() as u32),
+    );
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_from_cst_with_layout(cst, target_layout);
+        let Err(project) = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(cst), Vec::new())],
+            vec![root.clone()],
+            ScalarPreparationInputs { target_layout },
+        ) else {
+            panic!("{target_layout:?}: project accepted the invalid overload arm");
+        };
+        for (route, diagnostics) in [
+            ("standalone", single.diagnostics),
+            ("project", project.diagnostics),
+        ] {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{route} {target_layout:?}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.code, code);
+            assert_eq!(diagnostic.message, message);
+            let [label] = diagnostic.labels.as_slice() else {
+                panic!("{diagnostic:?}");
+            };
+            assert_eq!(label.kind, crate::DiagnosticLabelKind::Primary);
+            assert_eq!(label.span, span);
+        }
+    }
 }
 
 #[test]
@@ -6584,7 +6709,7 @@ fn keeps_private_overloads_local_and_reports_imported_private_overloads_at_membe
     let child_source = module_source("src/child.w");
     let child = module_from_text(
             child_source.clone(),
-            "%%start\n_ordinary = overload {\n    i32(i64) => fn(value) { value };\n};\n_identity = overload {\n    i32(i64) => fn(value) { 7 };\n    generic T;\n    T(T) => fn(value) { value };\n};\npublic_ordinary = overload {\n    i32(i64) => fn(value) { value };\n};\npublic_identity = overload {\n    i32(i64) => fn(value) { 7 };\n    generic T;\n    T(T) => fn(value) { value };\n};\ni32 local_ordinary = _ordinary(1);\nchar local_generic = _identity('l');\n%%end",
+            "%%start\n_ordinary = overload {\n    i32(i64) => fn(value) { core.int_trunc<i32>(value) };\n};\n_identity = overload {\n    i32(i64) => fn(value) { 7 };\n    generic T;\n    T(T) => fn(value) { value };\n};\npublic_ordinary = overload {\n    i32(i64) => fn(value) { core.int_trunc<i32>(value) };\n};\npublic_identity = overload {\n    i32(i64) => fn(value) { 7 };\n    generic T;\n    T(T) => fn(value) { value };\n};\ni32 local_ordinary = _ordinary(1);\nchar local_generic = _identity('l');\n%%end",
         );
     let main_source = module_source("src/main.w");
     let main_text = "%%start\nchild = namespace generic_overloads \"src/child.w\";\ni32 public_ordinary = child.public_ordinary(1);\nchar public_value = child.public_identity('p');\ni32 ordinary = child._ordinary(1);\nchar value = child._identity('g');\n%%end";
@@ -6729,7 +6854,7 @@ fn reports_overload_candidate_failures_at_call_spans() {
 
 #[test]
 fn infers_integer_literal_overloads_only_from_unique_parameter_or_output_context() {
-    let constrained = "%%start\nidentity = overload { generic T; T(T) => fn(value) { value }; };\ni64 value = identity(1);\n%%end";
+    let constrained = "%%start\nidentity = overload { generic T; T(T) => fn(input) { input }; };\ni64 value = identity(1);\n%%end";
     let single = validate_text(constrained);
     assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
 
@@ -6776,6 +6901,52 @@ fn infers_integer_literal_overloads_only_from_unique_parameter_or_output_context
         .diagnostics
         .iter()
         .any(|diagnostic| diagnostic.message == "overload call is ambiguous"));
+}
+
+#[test]
+fn overload_arm_parameter_cannot_shadow_visible_module_binding_on_both_targets() {
+    let text = "%%start\nidentity = overload { generic T; T(T) => fn(value) { value }; };\ni64 value = identity(1);\n%%end";
+    let root = source();
+    let parsed = parse_source(root.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let cst = parsed.result.canonical_cst();
+    let expected = [
+        ("B0002", "duplicate declaration", ByteSpan::new(30, 69)),
+        (
+            "B0003",
+            "expression type does not match expected type",
+            ByteSpan::new(59, 68),
+        ),
+    ];
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_from_cst_with_layout(cst, target_layout);
+        let Err(project) = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(cst), Vec::new())],
+            vec![root.clone()],
+            ScalarPreparationInputs { target_layout },
+        ) else {
+            panic!("{target_layout:?}: project accepted the shadowing parameter");
+        };
+        for (route, diagnostics) in [
+            ("standalone", single.diagnostics),
+            ("project", project.diagnostics),
+        ] {
+            assert_eq!(
+                diagnostics.len(),
+                expected.len(),
+                "{route} {target_layout:?}: {diagnostics:?}"
+            );
+            for (diagnostic, (code, message, span)) in diagnostics.iter().zip(expected) {
+                assert_eq!(diagnostic.code, code, "{route} {target_layout:?}");
+                assert_eq!(diagnostic.message, message);
+                let [label] = diagnostic.labels.as_slice() else {
+                    panic!("{diagnostic:?}");
+                };
+                assert_eq!(label.kind, crate::DiagnosticLabelKind::Primary);
+                assert_eq!(label.span, SourceSpan::new(root.clone(), span));
+            }
+        }
+    }
 }
 
 #[test]

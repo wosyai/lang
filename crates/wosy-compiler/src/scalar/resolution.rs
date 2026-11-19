@@ -59,29 +59,14 @@ pub(super) fn resolve_program_types(
                     })
                     .collect();
                 for initializer in secondary_binding_initializers_mut(binding) {
-                    resolve_expression_types(initializer, &names);
+                    resolve_expression_types(initializer, &names, &[]);
                 }
             }
             ScalarItem::Function(function) => {
-                if function.generic_parameters.is_empty() {
-                    function.signature = resolve_type(&function.signature, &names);
-                }
+                resolve_callable_types(function, &names);
                 for arm in &mut function.overload_arms {
-                    if arm.generic_parameters.is_empty() {
-                        arm.signature = resolve_type(&arm.signature, &names);
-                    }
+                    resolve_callable_types(arm, &names);
                 }
-                if let ScalarType::Callable { outputs, .. } = &function.signature {
-                    for (value, output) in function
-                        .body
-                        .final_output_values
-                        .iter_mut()
-                        .zip(&outputs.outputs)
-                    {
-                        value.ty = output.ty.clone();
-                    }
-                }
-                resolve_block_types(&mut function.body, &names);
             }
             ScalarItem::Extern(extern_decl) => {
                 for function in &mut extern_decl.functions {
@@ -94,6 +79,23 @@ pub(super) fn resolve_program_types(
     }
 }
 
+fn resolve_callable_types(function: &mut ScalarFunction, names: &BTreeMap<String, ScalarType>) {
+    if function.generic_parameters.is_empty() {
+        function.signature = resolve_type(&function.signature, names);
+    }
+    if let ScalarType::Callable { outputs, .. } = &function.signature {
+        for (value, output) in function
+            .body
+            .final_output_values
+            .iter_mut()
+            .zip(&outputs.outputs)
+        {
+            value.ty = output.ty.clone();
+        }
+    }
+    resolve_block_types(&mut function.body, names, &function.generic_parameters);
+}
+
 fn resolve_item_types(item: &mut ScalarBlockItem, names: &BTreeMap<String, ScalarType>) {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
@@ -102,80 +104,142 @@ fn resolve_item_types(item: &mut ScalarBlockItem, names: &BTreeMap<String, Scala
                 receiver.ty = resolve_type(&receiver.ty, names);
             }
             for initializer in secondary_binding_initializers_mut(binding) {
-                resolve_expression_types(initializer, names);
+                resolve_expression_types(initializer, names, &[]);
             }
         }
         ScalarBlockItem::Expression(ScalarExpression::Block(block)) => {
-            resolve_block_types(block, names)
+            resolve_block_types(block, names, &[])
         }
         ScalarBlockItem::While(while_expression) => {
-            resolve_block_types(&mut while_expression.body, names)
+            resolve_block_types(&mut while_expression.body, names, &[])
         }
         ScalarBlockItem::Expression(_) | ScalarBlockItem::Assignment(_) => {}
     }
 }
 
-fn resolve_block_types(block: &mut ScalarBlock, names: &BTreeMap<String, ScalarType>) {
+fn resolve_block_types(
+    block: &mut ScalarBlock,
+    names: &BTreeMap<String, ScalarType>,
+    generics: &[ScalarGenericParameter],
+) {
     for item in &mut block.items {
         match item {
             ScalarBlockItem::LocalBinding(binding) => {
-                binding.declared_type = resolve_type(&binding.declared_type, names);
+                binding.declared_type =
+                    resolve_scoped_type(&binding.declared_type, names, generics);
                 for receiver in &mut binding.receivers {
-                    receiver.ty = resolve_type(&receiver.ty, names);
+                    receiver.ty = resolve_scoped_type(&receiver.ty, names, generics);
                 }
-                resolve_expression_types(&mut binding.value, names);
+                resolve_expression_types(&mut binding.value, names, generics);
                 for initializer in secondary_binding_initializers_mut(binding) {
-                    resolve_expression_types(initializer, names);
+                    resolve_expression_types(initializer, names, generics);
                 }
             }
             ScalarBlockItem::While(while_expression) => {
-                resolve_expression_types(&mut while_expression.condition, names);
-                resolve_block_types(&mut while_expression.body, names);
+                resolve_expression_types(&mut while_expression.condition, names, generics);
+                resolve_block_types(&mut while_expression.body, names, generics);
             }
-            ScalarBlockItem::Expression(expression) => resolve_expression_types(expression, names),
+            ScalarBlockItem::Expression(expression) => {
+                resolve_expression_types(expression, names, generics)
+            }
             ScalarBlockItem::Assignment(assignment) => {
-                resolve_expression_types(&mut assignment.value, names);
+                resolve_expression_types(&mut assignment.value, names, generics);
                 for value in &mut assignment.values {
-                    resolve_expression_types(value, names);
+                    resolve_expression_types(value, names, generics);
                 }
             }
         }
     }
     for output in &mut block.final_output_values {
-        resolve_expression_types(&mut output.value, names);
+        resolve_expression_types(&mut output.value, names, generics);
     }
 }
 
 fn resolve_expression_types(
     expression: &mut ScalarExpression,
     names: &BTreeMap<String, ScalarType>,
+    generics: &[ScalarGenericParameter],
 ) {
     match expression {
+        ScalarExpression::Call {
+            receiver,
+            type_arguments,
+            arguments,
+            ..
+        } => {
+            if receiver.as_deref() != Some("core") {
+                for argument in type_arguments {
+                    argument.ty = resolve_scoped_type(&argument.ty, names, generics);
+                }
+            }
+            for argument in arguments {
+                resolve_expression_types(argument, names, generics);
+            }
+        }
         ScalarExpression::If {
             condition,
             then_branch,
             else_branch,
             ..
         } => {
-            resolve_expression_types(condition, names);
-            resolve_block_types(then_branch, names);
-            resolve_block_types(else_branch, names);
+            resolve_expression_types(condition, names, generics);
+            resolve_block_types(then_branch, names, generics);
+            resolve_block_types(else_branch, names, generics);
         }
         ScalarExpression::UnitIf {
             condition,
             then_branch,
             ..
         } => {
-            resolve_expression_types(condition, names);
-            resolve_block_types(then_branch, names);
+            resolve_expression_types(condition, names, generics);
+            resolve_block_types(then_branch, names, generics);
         }
-        ScalarExpression::Block(block) => resolve_block_types(block, names),
+        ScalarExpression::Block(block) => resolve_block_types(block, names, generics),
+        _ => resolve_expression_type_operands(expression, &mut |operand| {
+            resolve_expression_types(operand, names, generics);
+        }),
+    }
+}
+
+fn resolve_expression_type_operands(
+    expression: &mut ScalarExpression,
+    resolve: &mut dyn FnMut(&mut ScalarExpression),
+) {
+    match expression {
+        ScalarExpression::Binary { left, right, .. } => {
+            resolve(left);
+            resolve(right);
+        }
+        ScalarExpression::Unary { operand, .. } => resolve(operand),
+        ScalarExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                resolve(&mut field.value);
+            }
+        }
+        ScalarExpression::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                resolve(element);
+            }
+        }
         _ => {}
     }
 }
 
 fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarType>) -> ScalarType {
+    resolve_scoped_type(ty, names, &[])
+}
+
+fn resolve_scoped_type(
+    ty: &ScalarType,
+    names: &BTreeMap<String, ScalarType>,
+    generics: &[ScalarGenericParameter],
+) -> ScalarType {
     match ty {
+        ScalarType::Named { name, .. }
+            if generics.iter().any(|parameter| parameter.name == *name) =>
+        {
+            ty.clone()
+        }
         ScalarType::Named { name, span } => names.get(name).cloned().map_or_else(
             || ScalarType::Named {
                 name: name.clone(),
@@ -184,11 +248,11 @@ fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarType>) -> Scalar
             |ty| ty,
         ),
         ScalarType::RawPointer(inner) => {
-            ScalarType::RawPointer(Box::new(resolve_type(inner, names)))
+            ScalarType::RawPointer(Box::new(resolve_scoped_type(inner, names, generics)))
         }
         ScalarType::CheckedReference { mutability, inner } => ScalarType::CheckedReference {
             mutability: *mutability,
-            inner: Box::new(resolve_type(inner, names)),
+            inner: Box::new(resolve_scoped_type(inner, names, generics)),
         },
         ScalarType::Array {
             element,
@@ -196,7 +260,7 @@ fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarType>) -> Scalar
             length_span,
             span,
         } => ScalarType::Array {
-            element: Box::new(resolve_type(element, names)),
+            element: Box::new(resolve_scoped_type(element, names, generics)),
             length: *length,
             length_span: *length_span,
             span: *span,
@@ -210,7 +274,7 @@ fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarType>) -> Scalar
                     .outputs
                     .iter()
                     .map(|output| ScalarOutput {
-                        ty: resolve_type(&output.ty, names),
+                        ty: resolve_scoped_type(&output.ty, names, generics),
                         span: output.span,
                     })
                     .collect(),
@@ -218,7 +282,7 @@ fn resolve_type(ty: &ScalarType, names: &BTreeMap<String, ScalarType>) -> Scalar
             },
             parameters: parameters
                 .iter()
-                .map(|parameter| resolve_type(parameter, names))
+                .map(|parameter| resolve_scoped_type(parameter, names, generics))
                 .collect(),
         },
         value => value.clone(),
@@ -787,7 +851,7 @@ pub(super) fn resolve_module_types_in_project(
     for item in &mut module.items {
         match item {
             ScalarItem::Binding(binding) => {
-                resolve_binding_types_project(binding, declarations, current_module);
+                resolve_binding_types_project(binding, declarations, current_module, &[]);
             }
             ScalarItem::Function(function) => {
                 resolve_callable_types_project(function, declarations, current_module);
@@ -802,7 +866,7 @@ pub(super) fn resolve_module_types_in_project(
                 }
             }
             ScalarItem::Executable(item) => {
-                resolve_item_types_project(item, declarations, current_module)
+                resolve_item_types_project(item, declarations, current_module, &[])
             }
             ScalarItem::Namespace(_) => {}
         }
@@ -843,23 +907,39 @@ fn resolve_callable_types_project(
             value.ty = output.ty.clone();
         }
     }
-    resolve_block_types_project(&mut function.body, declarations, current_module);
+    resolve_block_types_project(
+        &mut function.body,
+        declarations,
+        current_module,
+        &function.generic_parameters,
+    );
 }
 
 fn resolve_binding_types_project(
     binding: &mut ScalarBinding,
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
+    generics: &[ScalarGenericParameter],
 ) {
-    binding.declared_type =
-        resolve_type_in_project(&binding.declared_type, declarations, current_module);
+    binding.declared_type = resolve_scoped_type_in_project(
+        &binding.declared_type,
+        declarations,
+        current_module,
+        generics,
+    );
     for receiver in &mut binding.receivers {
-        receiver.ty = resolve_type_in_project(&receiver.ty, declarations, current_module);
+        receiver.ty =
+            resolve_scoped_type_in_project(&receiver.ty, declarations, current_module, generics);
     }
-    resolve_expression_types_project(&mut binding.value, declarations, current_module);
+    resolve_expression_types_project(&mut binding.value, declarations, current_module, generics);
     if binding.output_origin == ScalarBindingOutputOrigin::IndependentExpressions {
         for output in &mut binding.output_values {
-            resolve_expression_types_project(&mut output.value, declarations, current_module);
+            resolve_expression_types_project(
+                &mut output.value,
+                declarations,
+                current_module,
+                generics,
+            );
         }
     }
 }
@@ -868,27 +948,39 @@ fn resolve_item_types_project(
     item: &mut ScalarBlockItem,
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
+    generics: &[ScalarGenericParameter],
 ) {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            resolve_binding_types_project(binding, declarations, current_module);
+            resolve_binding_types_project(binding, declarations, current_module, generics);
         }
         ScalarBlockItem::Expression(expression) => {
-            resolve_expression_types_project(expression, declarations, current_module);
+            resolve_expression_types_project(expression, declarations, current_module, generics);
         }
         ScalarBlockItem::While(while_expression) => {
             resolve_expression_types_project(
                 &mut while_expression.condition,
                 declarations,
                 current_module,
+                generics,
             );
-            resolve_block_types_project(&mut while_expression.body, declarations, current_module);
+            resolve_block_types_project(
+                &mut while_expression.body,
+                declarations,
+                current_module,
+                generics,
+            );
         }
         ScalarBlockItem::Assignment(assignment) => {
             for value in &mut assignment.values {
-                resolve_expression_types_project(value, declarations, current_module);
+                resolve_expression_types_project(value, declarations, current_module, generics);
             }
-            resolve_expression_types_project(&mut assignment.value, declarations, current_module);
+            resolve_expression_types_project(
+                &mut assignment.value,
+                declarations,
+                current_module,
+                generics,
+            );
         }
     }
 }
@@ -897,12 +989,13 @@ fn resolve_block_types_project(
     block: &mut ScalarBlock,
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
+    generics: &[ScalarGenericParameter],
 ) {
     for item in &mut block.items {
-        resolve_item_types_project(item, declarations, current_module);
+        resolve_item_types_project(item, declarations, current_module, generics);
     }
     for output in &mut block.final_output_values {
-        resolve_expression_types_project(&mut output.value, declarations, current_module);
+        resolve_expression_types_project(&mut output.value, declarations, current_module, generics);
     }
 }
 
@@ -910,30 +1003,53 @@ fn resolve_expression_types_project(
     expression: &mut ScalarExpression,
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
+    generics: &[ScalarGenericParameter],
 ) {
     match expression {
+        ScalarExpression::Call {
+            receiver,
+            type_arguments,
+            arguments,
+            ..
+        } => {
+            if receiver.as_deref() != Some("core") {
+                for argument in type_arguments {
+                    argument.ty = resolve_scoped_type_in_project(
+                        &argument.ty,
+                        declarations,
+                        current_module,
+                        generics,
+                    );
+                }
+            }
+            for argument in arguments {
+                resolve_expression_types_project(argument, declarations, current_module, generics);
+            }
+        }
         ScalarExpression::If {
             condition,
             then_branch,
             else_branch,
             ..
         } => {
-            resolve_expression_types_project(condition, declarations, current_module);
-            resolve_block_types_project(then_branch, declarations, current_module);
-            resolve_block_types_project(else_branch, declarations, current_module);
+            resolve_expression_types_project(condition, declarations, current_module, generics);
+            resolve_block_types_project(then_branch, declarations, current_module, generics);
+            resolve_block_types_project(else_branch, declarations, current_module, generics);
         }
         ScalarExpression::UnitIf {
             condition,
             then_branch,
             ..
         } => {
-            resolve_expression_types_project(condition, declarations, current_module);
-            resolve_block_types_project(then_branch, declarations, current_module);
+            resolve_expression_types_project(condition, declarations, current_module, generics);
+            resolve_block_types_project(then_branch, declarations, current_module, generics);
         }
         ScalarExpression::Block(block) => {
-            resolve_block_types_project(block, declarations, current_module);
+            resolve_block_types_project(block, declarations, current_module, generics);
         }
-        _ => {}
+        _ => resolve_expression_type_operands(expression, &mut |operand| {
+            resolve_expression_types_project(operand, declarations, current_module, generics);
+        }),
     }
 }
 
@@ -942,7 +1058,21 @@ fn resolve_type_in_project(
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
 ) -> ScalarType {
+    resolve_scoped_type_in_project(ty, declarations, current_module, &[])
+}
+
+fn resolve_scoped_type_in_project(
+    ty: &ScalarType,
+    declarations: &ScalarDeclarationEnvironment,
+    current_module: usize,
+    generics: &[ScalarGenericParameter],
+) -> ScalarType {
     match ty {
+        ScalarType::Named { name, .. }
+            if generics.iter().any(|parameter| parameter.name == *name) =>
+        {
+            ty.clone()
+        }
         ScalarType::Named { name, span } => {
             if let Some(id) = declarations.local_types(current_module).get(name) {
                 return id.clone();
@@ -968,14 +1098,17 @@ fn resolve_type_in_project(
                 span: *span,
             },
         },
-        ScalarType::RawPointer(inner) => ScalarType::RawPointer(Box::new(resolve_type_in_project(
-            inner,
-            declarations,
-            current_module,
-        ))),
+        ScalarType::RawPointer(inner) => ScalarType::RawPointer(Box::new(
+            resolve_scoped_type_in_project(inner, declarations, current_module, generics),
+        )),
         ScalarType::CheckedReference { mutability, inner } => ScalarType::CheckedReference {
             mutability: *mutability,
-            inner: Box::new(resolve_type_in_project(inner, declarations, current_module)),
+            inner: Box::new(resolve_scoped_type_in_project(
+                inner,
+                declarations,
+                current_module,
+                generics,
+            )),
         },
         ScalarType::Array {
             element,
@@ -983,10 +1116,11 @@ fn resolve_type_in_project(
             length_span,
             span,
         } => ScalarType::Array {
-            element: Box::new(resolve_type_in_project(
+            element: Box::new(resolve_scoped_type_in_project(
                 element,
                 declarations,
                 current_module,
+                generics,
             )),
             length: *length,
             length_span: *length_span,
@@ -1001,7 +1135,12 @@ fn resolve_type_in_project(
                     .outputs
                     .iter()
                     .map(|output| ScalarOutput {
-                        ty: resolve_type_in_project(&output.ty, declarations, current_module),
+                        ty: resolve_scoped_type_in_project(
+                            &output.ty,
+                            declarations,
+                            current_module,
+                            generics,
+                        ),
                         span: output.span,
                     })
                     .collect(),
@@ -1009,7 +1148,14 @@ fn resolve_type_in_project(
             },
             parameters: parameters
                 .iter()
-                .map(|parameter| resolve_type_in_project(parameter, declarations, current_module))
+                .map(|parameter| {
+                    resolve_scoped_type_in_project(
+                        parameter,
+                        declarations,
+                        current_module,
+                        generics,
+                    )
+                })
                 .collect(),
         },
         value => value.clone(),

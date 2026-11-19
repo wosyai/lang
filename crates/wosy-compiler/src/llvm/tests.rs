@@ -3368,7 +3368,7 @@ fn lowers_ordinary_and_generic_overload_arms_with_ordered_outputs() {
     let validation = derive_scalar_program(
             &parse_source(
                 source.clone(),
-                "%%start\ncast = overload {\n    i32(i64) => fn(value) { 1 };\n    generic T;\n    T(T) => fn(value) { value };\n};\npair = overload {\n    generic T;\n    (T, T)(T) => fn(value) { value };\n};\ni64 wide = 1;\ni32 narrow = cast(wide);\nbool flag = true;\nbool copied = cast(flag);\ni64 first, i64 second = pair(wide);\n%%end"
+                "%%start\ncast = overload {\n    i32(i64) => fn(value) { 1 };\n    generic T;\n    T(T) => fn(value) { value };\n};\npair = overload {\n    generic T;\n    (T, T)(T) => fn(value) { value, value };\n};\ni64 wide = 1;\ni32 narrow = cast(wide);\nbool flag = true;\nbool copied = cast(flag);\ni64 first, i64 second = pair(wide);\n%%end"
                     .into(),
                 &[],
             )
@@ -3416,6 +3416,43 @@ fn lowers_ordinary_and_generic_overload_arms_with_ordered_outputs() {
         project_text.contains("call { i64, i64 } @wosy_generic__"),
         "{project_text}"
     );
+}
+
+#[test]
+fn emits_explicit_generic_overload_returns_in_both_routes_and_targets() {
+    let text = "%%start
+pair = overload {
+    generic T;
+    (bool, T)(T) => fn(input) { true, input };
+};
+i64 value = 17;
+bool flag, i64 number = pair(value);
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for (route, llvm) in [
+            ("single", emit_scalar_build_single_module_llvm(&build)),
+            ("project", emit_scalar_build_project_llvm(&build)),
+        ] {
+            let llvm = llvm
+                .unwrap_or_else(|error| panic!("{route} {layout:?}: {error}"))
+                .to_text();
+            assert!(
+                llvm.contains("define { i1, i64 } @wosy_generic__"),
+                "{llvm}"
+            );
+            assert!(llvm.contains("call { i1, i64 } @wosy_generic__"), "{llvm}");
+            assert!(llvm.contains("ret { i1, i64 }"), "{llvm}");
+            for position in 0..2 {
+                assert!(
+                    llvm.contains(&format!("extractvalue {{ i1, i64 }} %call, {position}")),
+                    "{llvm}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

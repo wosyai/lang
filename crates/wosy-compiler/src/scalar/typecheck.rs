@@ -850,75 +850,6 @@ impl TailConditionalTyping<'_> {
     }
 }
 
-pub(super) fn validate_overload_tail_conditionals(
-    function: &ScalarFunction,
-    declarations: &BTreeMap<String, ScalarType>,
-    declaration_names: &BTreeSet<String>,
-    folded_declarations: &BTreeMap<String, (String, ByteSpan)>,
-    typing: TailConditionalTyping<'_>,
-    diagnostics: &mut Vec<super::Diagnostic>,
-    overloads: &ScalarTypingView<'_>,
-    inference: &mut ScalarInferenceBuilder<'_>,
-) {
-    for arm in &function.overload_arms {
-        let ScalarType::Callable {
-            outputs,
-            parameters,
-        } = &arm.signature
-        else {
-            continue;
-        };
-        let Some(tail) = arm
-            .body
-            .tail_conditional()
-            .filter(|_| outputs.outputs.len() > 1)
-        else {
-            continue;
-        };
-        if arm.parameters.len() != parameters.len() {
-            diagnostics.push(typing.diagnostic(
-                "B0004",
-                "function parameter arity does not match its type",
-                arm.span,
-            ));
-        }
-        let mut scope = declarations.clone();
-        let mut visible_names = declaration_names.clone();
-        let mut folded_names = folded_declarations.clone();
-        typing.declare_parameters(
-            arm,
-            parameters,
-            &mut scope,
-            &mut visible_names,
-            &mut folded_names,
-            diagnostics,
-        );
-        check_final_output_prefix(
-            &arm.body,
-            &mut scope,
-            &mut visible_names,
-            &mut folded_names,
-            typing,
-            diagnostics,
-            arm.body.unsafe_context,
-            overloads,
-            inference,
-        );
-        validate_tail_conditional_return(
-            tail,
-            &outputs.outputs,
-            &scope,
-            &visible_names,
-            &folded_names,
-            typing,
-            diagnostics,
-            arm.body.unsafe_context,
-            overloads,
-            inference,
-        );
-    }
-}
-
 pub(super) fn validate_tail_conditional_return(
     tail: ScalarTailConditional<'_>,
     expected: &[ScalarOutput],
@@ -3335,6 +3266,7 @@ fn check_expression_type_in_module(
                     ));
                     return ScalarType::Error;
                 }
+                inference.record_member(expression, None);
                 return ScalarType::Enum(enum_id);
             }
             if let Some(receiver_type) = scope.get(receiver) {
@@ -3345,7 +3277,7 @@ fn check_expression_type_in_module(
                             if matches!(inner.as_ref(), ScalarType::Struct(_))
                     )
                 {
-                    return field_type_in_module(
+                    let Some(field) = member_field_in_module(
                         receiver_type,
                         name,
                         *name_span,
@@ -3353,7 +3285,14 @@ fn check_expression_type_in_module(
                         module,
                         modules,
                         diagnostics,
+                    ) else {
+                        return ScalarType::Error;
+                    };
+                    inference.record_member(
+                        expression,
+                        matches!(receiver_type, ScalarType::Struct(_)).then_some(&field.id),
                     );
+                    return field.ty.clone();
                 }
             }
             let Some(namespace) = module
@@ -3379,6 +3318,7 @@ fn check_expression_type_in_module(
                 ));
                 return ScalarType::Error;
             };
+            inference.record_member(expression, None);
             member.clone()
         }
         ScalarExpression::Integer { value, span } => {
@@ -4827,15 +4767,15 @@ fn utf8_type_from_context(
         .map(|structure| ScalarType::Struct(structure.id.clone()))
 }
 
-fn field_type_in_module(
+fn member_field_in_module<'a>(
     receiver: &ScalarType,
     name: &str,
     name_span: ByteSpan,
     span: ByteSpan,
     module: &ScalarModuleTyping<'_>,
-    modules: &[ScalarModuleTyping<'_>],
+    modules: &[ScalarModuleTyping<'a>],
     diagnostics: &mut Vec<super::Diagnostic>,
-) -> ScalarType {
+) -> Option<&'a ScalarStructField> {
     let structure_id = match receiver {
         ScalarType::Struct(id) => id,
         ScalarType::RawPointer(inner) => match inner.as_ref() {
@@ -4847,7 +4787,7 @@ fn field_type_in_module(
                     "value has no field",
                     span,
                 ));
-                return ScalarType::Error;
+                return None;
             }
         },
         _ => unreachable!("field receiver must be a struct or pointer to a struct"),
@@ -4863,7 +4803,7 @@ fn field_type_in_module(
             "value has no field",
             span,
         ));
-        return ScalarType::Error;
+        return None;
     };
     let Some(field) = structure.fields.iter().find(|field| field.name == name) else {
         diagnostics.push(module_diagnostic(
@@ -4872,9 +4812,9 @@ fn field_type_in_module(
             "value has no field",
             name_span,
         ));
-        return ScalarType::Error;
+        return None;
     };
-    field.ty.clone()
+    Some(field)
 }
 
 fn is_supported_checked_address_place(place: &ScalarPlace) -> bool {
@@ -6748,168 +6688,184 @@ pub(super) fn validate(
             }
             ScalarItem::Function(function) => {
                 let typing = TailConditionalTyping::Program(program);
-                if !function.overload_arms.is_empty() {
-                    validate_overload_tail_conditionals(
-                        function,
-                        &declarations,
-                        &declaration_names,
-                        &folded_declarations,
-                        typing,
-                        &mut diagnostics,
-                        overloads,
-                        inference,
-                    );
-                    continue;
-                }
-                let ScalarType::Callable {
-                    outputs,
-                    parameters,
-                } = &function.signature
-                else {
-                    continue;
+                let is_overload = !function.overload_arms.is_empty();
+                let bodies = if is_overload {
+                    function.overload_arms.as_slice()
+                } else {
+                    std::slice::from_ref(function)
                 };
-                let mut scope = declarations.clone();
-                let mut visible_names = declaration_names.clone();
-                let mut folded_names = folded_declarations.clone();
-                typing.declare_parameters(
-                    function,
-                    parameters,
-                    &mut scope,
-                    &mut visible_names,
-                    &mut folded_names,
-                    &mut diagnostics,
-                );
-                if outputs.outputs.len() > 1 && !function.body.final_output_values.is_empty() {
-                    let tail = function.body.tail_conditional();
-                    let unsafe_context = tail.is_some() && function.body.unsafe_context;
-                    check_final_output_prefix(
-                        &function.body,
+                for function in bodies {
+                    let ScalarType::Callable {
+                        outputs,
+                        parameters,
+                    } = &function.signature
+                    else {
+                        continue;
+                    };
+                    let multi_result_tail =
+                        outputs.outputs.len() > 1 && function.body.tail_conditional().is_some();
+                    inference
+                        .set_callable_assignment_output_capture(!is_overload || multi_result_tail);
+                    let arity_mismatch = function.parameters.len() != parameters.len();
+                    let inherited_overload_tail_order = is_overload && multi_result_tail;
+                    if arity_mismatch && inherited_overload_tail_order {
+                        diagnostics.push(diagnostic(
+                            program,
+                            "B0004",
+                            "function parameter arity does not match its type",
+                            function.span,
+                        ));
+                    }
+                    let mut scope = declarations.clone();
+                    let mut visible_names = declaration_names.clone();
+                    let mut folded_names = folded_declarations.clone();
+                    typing.declare_parameters(
+                        function,
+                        parameters,
                         &mut scope,
                         &mut visible_names,
                         &mut folded_names,
-                        typing,
                         &mut diagnostics,
-                        unsafe_context,
-                        overloads,
-                        inference,
                     );
-                    if let Some(tail) = tail {
-                        validate_tail_conditional_return(
-                            tail,
-                            &outputs.outputs,
-                            &scope,
-                            &visible_names,
-                            &folded_names,
+                    if outputs.outputs.len() > 1 && !function.body.final_output_values.is_empty() {
+                        let tail = function.body.tail_conditional();
+                        let unsafe_context = tail.is_some() && function.body.unsafe_context;
+                        check_final_output_prefix(
+                            &function.body,
+                            &mut scope,
+                            &mut visible_names,
+                            &mut folded_names,
                             typing,
                             &mut diagnostics,
                             unsafe_context,
                             overloads,
                             inference,
                         );
-                    } else if function.body.final_output_values.len() == 1
-                        && matches!(
-                            function
-                                .body
-                                .final_expressions()
-                                .next()
-                                .expect("final output")
-                                .0,
-                            ScalarExpression::Call { .. }
-                        )
-                    {
-                        let (expression, value) = function
-                            .body
-                            .final_expressions()
-                            .next()
-                            .expect("final output");
-                        typing.validate_sole_final_call(
-                            expression,
-                            value.span,
-                            outputs,
-                            &scope,
-                            &visible_names,
-                            &folded_names,
-                            &mut diagnostics,
-                            overloads,
-                            inference,
-                        );
-                    } else {
-                        if function.body.final_output_values.len() > 1
-                            && function.body.final_output_values.len() != outputs.outputs.len()
-                        {
-                            diagnostics.push(diagnostic(
-                                program,
-                                "B0004",
-                                "function output arity does not match its final output list",
-                                function.body.span,
-                            ));
-                        }
-                        for ((expression, value), output) in
-                            function.body.final_expressions().zip(&outputs.outputs)
-                        {
-                            let actual = expression_type_expected(
-                                expression,
-                                &output.ty,
+                        if let Some(tail) = tail {
+                            validate_tail_conditional_return(
+                                tail,
+                                &outputs.outputs,
                                 &scope,
                                 &visible_names,
                                 &folded_names,
-                                program,
+                                typing,
                                 &mut diagnostics,
-                                false,
+                                unsafe_context,
                                 overloads,
                                 inference,
                             );
-                            expect_type(program, &output.ty, &actual, value.span, &mut diagnostics);
+                        } else if function.body.final_output_values.len() == 1
+                            && matches!(
+                                function
+                                    .body
+                                    .final_expressions()
+                                    .next()
+                                    .expect("final output")
+                                    .0,
+                                ScalarExpression::Call { .. }
+                            )
+                        {
+                            let (expression, value) = function
+                                .body
+                                .final_expressions()
+                                .next()
+                                .expect("final output");
+                            typing.validate_sole_final_call(
+                                expression,
+                                value.span,
+                                outputs,
+                                &scope,
+                                &visible_names,
+                                &folded_names,
+                                &mut diagnostics,
+                                overloads,
+                                inference,
+                            );
+                        } else {
+                            if (is_overload || function.body.final_output_values.len() > 1)
+                                && function.body.final_output_values.len() != outputs.outputs.len()
+                            {
+                                diagnostics.push(diagnostic(
+                                    program,
+                                    "B0004",
+                                    "function output arity does not match its final output list",
+                                    function.body.span,
+                                ));
+                            }
+                            for ((expression, value), output) in
+                                function.body.final_expressions().zip(&outputs.outputs)
+                            {
+                                let actual = expression_type_expected(
+                                    expression,
+                                    &output.ty,
+                                    &scope,
+                                    &visible_names,
+                                    &folded_names,
+                                    program,
+                                    &mut diagnostics,
+                                    false,
+                                    overloads,
+                                    inference,
+                                );
+                                expect_type(
+                                    program,
+                                    &output.ty,
+                                    &actual,
+                                    value.span,
+                                    &mut diagnostics,
+                                );
+                            }
                         }
+                    } else if let Some(output) = outputs.outputs.first() {
+                        let actual = block_type_expected(
+                            &function.body,
+                            &output.ty,
+                            &scope,
+                            &visible_names,
+                            &folded_names,
+                            program,
+                            &mut diagnostics,
+                            false,
+                            overloads,
+                            inference,
+                        );
+                        expect_type(
+                            program,
+                            &output.ty,
+                            &actual,
+                            function.body.span,
+                            &mut diagnostics,
+                        );
+                    } else {
+                        let actual = block_type(
+                            &function.body,
+                            &scope,
+                            &visible_names,
+                            &folded_names,
+                            program,
+                            &mut diagnostics,
+                            false,
+                            overloads,
+                            inference,
+                        );
+                        expect_type(
+                            program,
+                            &ScalarType::Unit,
+                            &actual,
+                            function.body.span,
+                            &mut diagnostics,
+                        );
                     }
-                } else if let Some(output) = outputs.outputs.first() {
-                    let actual = block_type_expected(
-                        &function.body,
-                        &output.ty,
-                        &scope,
-                        &visible_names,
-                        &folded_names,
-                        program,
-                        &mut diagnostics,
-                        false,
-                        overloads,
-                        inference,
-                    );
-                    expect_type(
-                        program,
-                        &output.ty,
-                        &actual,
-                        function.body.span,
-                        &mut diagnostics,
-                    );
-                } else {
-                    let actual = block_type(
-                        &function.body,
-                        &scope,
-                        &visible_names,
-                        &folded_names,
-                        program,
-                        &mut diagnostics,
-                        false,
-                        overloads,
-                        inference,
-                    );
-                    expect_type(
-                        program,
-                        &ScalarType::Unit,
-                        &actual,
-                        function.body.span,
-                        &mut diagnostics,
-                    );
+                    if arity_mismatch && !inherited_overload_tail_order {
+                        diagnostics.push(diagnostic(
+                            program,
+                            "B0004",
+                            "function parameter arity does not match its type",
+                            function.span,
+                        ));
+                    }
                 }
-                if function.parameters.len() != parameters.len() {
-                    diagnostics.push(diagnostic(
-                        program,
-                        "B0004",
-                        "function parameter arity does not match its type",
-                        function.span,
-                    ));
-                }
+                inference.set_callable_assignment_output_capture(true);
             }
             ScalarItem::Executable(executable) => {
                 let mut visible_names = declaration_names.clone();
@@ -7810,6 +7766,7 @@ fn check_expression_type(
         {
             Some(enumeration) => {
                 if enum_tag.is_some() {
+                    inference.record_member(expression, None);
                     ScalarType::Enum(enumeration.id.clone())
                 } else {
                     diagnostics.push(diagnostic(
@@ -7821,14 +7778,19 @@ fn check_expression_type(
                     ScalarType::Error
                 }
             }
-            None => field_type(
-                scope.get(receiver),
-                name,
-                *name_span,
-                *span,
-                program,
-                diagnostics,
-            ),
+            None => {
+                let receiver_type = scope.get(receiver);
+                let Some(field) =
+                    member_field(receiver_type, name, *name_span, *span, program, diagnostics)
+                else {
+                    return ScalarType::Error;
+                };
+                inference.record_member(
+                    expression,
+                    matches!(receiver_type, Some(ScalarType::Struct(_))).then_some(&field.id),
+                );
+                field.ty.clone()
+            }
         },
         ScalarExpression::Integer { value, span } => {
             validate_integer_range_program(program, value, *span, diagnostics);
@@ -9262,17 +9224,17 @@ fn is_null_block(block: &ScalarBlock) -> bool {
     }
 }
 
-fn field_type(
+fn member_field<'a>(
     receiver: Option<&ScalarType>,
     name: &str,
     name_span: ByteSpan,
     span: ByteSpan,
-    program: &ScalarProgramTyping<'_>,
+    program: &ScalarProgramTyping<'a>,
     diagnostics: &mut Vec<super::Diagnostic>,
-) -> ScalarType {
+) -> Option<&'a ScalarStructField> {
     let Some(receiver) = receiver else {
         diagnostics.push(diagnostic(program, "B0001", "unknown name", span));
-        return ScalarType::Error;
+        return None;
     };
     let structure = match receiver {
         ScalarType::Struct(id) => program.structs.get(id.index),
@@ -9284,13 +9246,13 @@ fn field_type(
     };
     let Some(structure) = structure else {
         diagnostics.push(diagnostic(program, "B0001", "unknown field", name_span));
-        return ScalarType::Error;
+        return None;
     };
     let Some(field) = structure.fields.iter().find(|field| field.name == name) else {
         diagnostics.push(diagnostic(program, "B0001", "unknown field", name_span));
-        return ScalarType::Error;
+        return None;
     };
-    field.ty.clone()
+    Some(field)
 }
 
 fn validate_integer_range(

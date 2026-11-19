@@ -28,6 +28,8 @@ mod callable_boundary;
 
 mod plain_names;
 
+mod lexical_members;
+
 fn assert_project_reference_results(
     left: &ProjectReferenceResults,
     right: &ProjectReferenceResults,

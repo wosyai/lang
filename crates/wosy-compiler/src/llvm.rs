@@ -2500,6 +2500,23 @@ impl<'a> BlockEmission<'a> {
             _ => None,
         }
     }
+
+    fn explicit_ordered_outputs(
+        self,
+        expression_count: usize,
+    ) -> Result<Option<&'a crate::ScalarOutputSequence>, String> {
+        let (outputs, site) = match self {
+            Self::TailArm(outputs) => (outputs, "conditional arm"),
+            Self::Return(outputs) if expression_count > 1 && outputs.outputs.len() > 1 => {
+                (outputs, "callable return")
+            }
+            _ => return Ok(None),
+        };
+        if expression_count != outputs.outputs.len() {
+            return Err(format!("{site} has the wrong number of LLVM outputs"));
+        }
+        Ok(Some(outputs))
+    }
 }
 
 struct CanonicalTailIf<'syntax, 'signature> {
@@ -2704,7 +2721,7 @@ fn emit_final_outputs<'ctx, 'module>(
             },
         );
     }
-    if let BlockEmission::TailArm(outputs) = emission {
+    if let Some(outputs) = emission.explicit_ordered_outputs(block.final_output_values.len())? {
         return emit_ordered_final_outputs(context, state, block, outputs, None);
     }
     let canonical = state.has_prepared_calls();
@@ -2806,7 +2823,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
             },
         );
     }
-    if let BlockEmission::TailArm(outputs) = emission {
+    if let Some(outputs) = emission.explicit_ordered_outputs(block.final_output_values.len())? {
         return emit_ordered_final_outputs(context, state, block, outputs, Some((module, modules)));
     }
     let canonical = state.has_prepared_calls();
@@ -2881,9 +2898,6 @@ fn emit_ordered_final_outputs<'ctx, 'module>(
     outputs: &crate::ScalarOutputSequence,
     project: Option<(&ScalarModule, &[&ScalarModule])>,
 ) -> Result<EmitValue<'ctx>, String> {
-    if block.final_output_values.len() != outputs.outputs.len() {
-        return Err("conditional arm has the wrong number of LLVM outputs".into());
-    }
     let values = block
         .final_expressions()
         .zip(&outputs.outputs)

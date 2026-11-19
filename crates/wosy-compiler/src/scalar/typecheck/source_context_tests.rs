@@ -326,15 +326,16 @@ fn borrowed_standalone_typing_preserves_local_index_and_full_field_identity_pred
     let span = ByteSpan::new(5, 10);
     let mut diagnostics = Vec::new();
     assert_eq!(
-        field_type(
+        member_field(
             Some(&ScalarType::Struct(foreign.clone())),
             "value",
             span,
             span,
             &typing,
             &mut diagnostics
-        ),
-        ScalarType::I32
+        )
+        .map(|field| &field.ty),
+        Some(&ScalarType::I32)
     );
     assert!(diagnostics.is_empty());
     let place = ScalarPlace::Field {

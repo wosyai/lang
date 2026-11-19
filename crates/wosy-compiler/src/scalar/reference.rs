@@ -12,6 +12,7 @@ use super::control::{
     AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentReplacement,
     AssignmentSlot,
 };
+use super::inference::CheckedMember;
 use super::*;
 
 #[cfg(test)]
@@ -224,9 +225,13 @@ enum ReferenceAssignmentDestination {
 }
 
 #[derive(Clone, Copy)]
-enum CheckedReadSource {
+enum CheckedReadSource<'a> {
     Place(OccurrenceOrdinal),
     SyntheticMember,
+    PreparedMember {
+        binding: &'a ReferenceBindingId,
+        ty: &'a ScalarType,
+    },
 }
 
 struct ReferencePlaceRoot<'a> {
@@ -488,6 +493,49 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
     }
 
+    fn prepared_member_identity(
+        &self,
+        ordinal: OccurrenceOrdinal,
+        span: ByteSpan,
+    ) -> Result<Option<&'a PreparedMemberIdentity>, ReferenceAnalysisError> {
+        let MemberFacts::Prepared(members) = &self.call_sites.members else {
+            return Ok(None);
+        };
+        members.get(&ordinal).map(Some).ok_or_else(|| {
+            self.missing_context(span, ReferenceAnalysisErrorReason::MissingResolvedBinding)
+        })
+    }
+
+    fn checked_member_type(
+        &self,
+        ordinal: OccurrenceOrdinal,
+        span: ByteSpan,
+    ) -> Result<&'a ScalarType, ReferenceAnalysisError> {
+        self.call_sites
+            .structure
+            .checked_types
+            .expressions
+            .get(&ordinal)
+            .ok_or_else(|| {
+                self.missing_context(span, ReferenceAnalysisErrorReason::MissingResolvedBinding)
+            })
+    }
+
+    fn raw_member_field(
+        &self,
+        id: &ScalarStructId,
+        name: &str,
+        span: ByteSpan,
+    ) -> Result<&'a ScalarStructField, ReferenceAnalysisError> {
+        self.structs
+            .iter()
+            .find(|structure| structure.id == *id)
+            .and_then(|structure| structure.fields.iter().find(|field| field.name == name))
+            .ok_or_else(|| {
+                self.missing_context(span, ReferenceAnalysisErrorReason::MissingResolvedBinding)
+            })
+    }
+
     fn assignment_place(
         &self,
         place: &ScalarPlace,
@@ -527,9 +575,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
             ScalarPlace::Field { .. } | ScalarPlace::Index { .. } => unreachable!(),
         };
+        Ok(self.reference_place(place, binding, parent))
+    }
+
+    fn reference_place(
+        &self,
+        place: &ScalarPlace,
+        binding: ReferenceBindingId,
+        parent: Option<&ReferenceLoanId>,
+    ) -> ReferencePlaceId {
         let mut projections = Vec::new();
         collect_reference_projections(place, parent, &mut projections);
-        Ok(ReferencePlaceId {
+        ReferencePlaceId {
             source: self.source.clone(),
             function_span: self.function_span,
             declaration_span: binding.declaration_span,
@@ -537,7 +594,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             binding,
             projections,
             place: place.clone(),
-        })
+        }
     }
 
     fn required(
@@ -1101,54 +1158,42 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 name,
                 receiver_span,
                 ..
-            } if self
-                .names
-                .get(receiver)
-                .and_then(|binding| self.binding_types.get(binding))
-                .is_some_and(|ty| matches!(ty, ScalarType::Struct(_))) =>
-            {
-                let binding = self.binding(receiver, *receiver_span)?;
-                let ScalarType::Struct(id) = self.binding_types.get(&binding).ok_or_else(|| {
-                    self.missing_context(span, ReferenceAnalysisErrorReason::MissingResolvedBinding)
-                })?
-                else {
-                    unreachable!()
+            } => {
+                let member = match self.prepared_member_identity(ordinal, span)? {
+                    Some(PreparedMemberIdentity::Lexical { binding, field }) => {
+                        if !self.binding_types.contains_key(binding) {
+                            return Err(self.missing_context(
+                                span,
+                                ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                            ));
+                        }
+                        let ty = self.checked_member_type(ordinal, span)?;
+                        Some((field, CheckedReadSource::PreparedMember { binding, ty }))
+                    }
+                    Some(PreparedMemberIdentity::Other) => None,
+                    None => match self
+                        .names
+                        .get(receiver)
+                        .and_then(|binding| self.binding_types.get(binding))
+                    {
+                        Some(ScalarType::Struct(id)) => Some((
+                            &self.raw_member_field(id, name, span)?.id,
+                            CheckedReadSource::SyntheticMember,
+                        )),
+                        _ => None,
+                    },
                 };
-                let structure = self
-                    .structs
-                    .iter()
-                    .find(|structure| structure.id == *id)
-                    .ok_or_else(|| {
-                        self.missing_context(
-                            span,
-                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
-                        )
-                    })?;
-                let field = structure
-                    .fields
-                    .iter()
-                    .find(|field| field.name == *name)
-                    .ok_or_else(|| {
-                        self.missing_context(
-                            span,
-                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
-                        )
-                    })?;
-                let place = ScalarPlace::Field {
-                    base: Box::new(ScalarPlace::Name {
-                        name: receiver.clone(),
-                        span: *receiver_span,
-                    }),
-                    field: ScalarFieldReference::Resolved(field.id.clone()),
-                    span,
-                };
-                self.checked_place_read(
-                    &place,
-                    expression,
+                if let Some((field, source)) = member {
+                    let place = synthetic_member_place(receiver, *receiver_span, field, span);
+                    return self.checked_place_read(&place, expression, span, scope, source);
+                }
+                self.point(
+                    CfgPointKind::Evaluate(expression.clone()),
                     span,
                     scope,
-                    CheckedReadSource::SyntheticMember,
-                )
+                    BTreeSet::new(),
+                );
+                Ok(ReferenceValue::Other)
             }
             ScalarExpression::Name { name, .. } => {
                 let identity = self.prepared_name_identity(ordinal, span)?;
@@ -1428,7 +1473,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         &mut self,
         place: &ScalarPlace,
         scope: ReferenceScopeId,
-        source: CheckedReadSource,
+        source: CheckedReadSource<'_>,
     ) -> Result<(), ReferenceAnalysisError> {
         match source {
             CheckedReadSource::Place(ordinal) => self.place_expressions(place, scope, ordinal),
@@ -1441,6 +1486,22 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 };
                 self.place_name(name, *span, scope)
             }
+            CheckedReadSource::PreparedMember { binding, .. } => {
+                let ScalarPlace::Name { span, .. } = reference_root(place) else {
+                    unreachable!("synthetic member receiver")
+                };
+                if self.checked.contains(binding) {
+                    self.point(
+                        CfgPointKind::Read {
+                            binding: binding.clone(),
+                        },
+                        *span,
+                        scope,
+                        BTreeSet::new(),
+                    );
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1450,10 +1511,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
         expression: &ScalarExpression,
         span: ByteSpan,
         scope: ReferenceScopeId,
-        source: CheckedReadSource,
+        source: CheckedReadSource<'_>,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
-        if let ScalarPlace::Name { name, .. } = reference_root(place) {
-            if self.module_names.contains(name) && !self.names.contains_key(name) {
+        if !matches!(source, CheckedReadSource::PreparedMember { .. }) {
+            if matches!(reference_root(place), ScalarPlace::Name { name, .. }
+                if self.module_names.contains(name) && !self.names.contains_key(name))
+            {
                 self.point(
                     CfgPointKind::Evaluate(expression.clone()),
                     span,
@@ -1463,10 +1526,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 return Ok(ReferenceValue::Other);
             }
         }
-        let reads_checked_value = matches!(
-            self.indexed_move_type(place)?,
-            ScalarType::CheckedReference { .. }
-        );
+        let reads_checked_value = match source {
+            CheckedReadSource::PreparedMember { ty, .. } => {
+                matches!(ty, ScalarType::CheckedReference { .. })
+            }
+            _ => matches!(
+                self.indexed_move_type(place)?,
+                ScalarType::CheckedReference { .. }
+            ),
+        };
         let reads_checked_aggregate = if let ScalarPlace::Dereference { pointer, .. } =
             reference_root(place)
         {
@@ -1495,7 +1563,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         self.read_place_expressions(place, scope, source)?;
         let pointer_point = match source {
-            CheckedReadSource::SyntheticMember => None,
+            CheckedReadSource::SyntheticMember | CheckedReadSource::PreparedMember { .. } => None,
             CheckedReadSource::Place(ordinal) => {
                 let root = self.place_root(place, ordinal);
                 match root.place {
@@ -1512,10 +1580,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
             }
         };
-        let candidates = if pointer_point.is_none() {
-            vec![self.assignment_place(place, span)?]
-        } else {
-            Vec::new()
+        let candidates = match source {
+            CheckedReadSource::PreparedMember { binding, .. } => {
+                vec![self.reference_place(place, binding.clone(), None)]
+            }
+            _ if pointer_point.is_none() => vec![self.assignment_place(place, span)?],
+            _ => Vec::new(),
         };
         let event = CfgPointKind::ReadPlace {
             place: place.clone(),
@@ -1682,48 +1752,38 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 span,
                 ..
             } => {
-                let Some(binding) = self.names.get(receiver) else {
-                    return Ok(());
+                let (binding, field, ty) = match self.prepared_member_identity(ordinal, *span)? {
+                    Some(PreparedMemberIdentity::Lexical { binding, field }) => {
+                        if !self.binding_types.contains_key(binding) {
+                            return Err(self.missing_context(
+                                *span,
+                                ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                            ));
+                        }
+                        (binding, field, self.checked_member_type(ordinal, *span)?)
+                    }
+                    Some(PreparedMemberIdentity::Other) => return Ok(()),
+                    None => {
+                        let Some(binding) = self.names.get(receiver) else {
+                            return Ok(());
+                        };
+                        let Some(receiver_type) = self.binding_types.get(binding) else {
+                            return Err(self.missing_context(
+                                *span,
+                                ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                            ));
+                        };
+                        let ScalarType::Struct(id) = receiver_type else {
+                            return Ok(());
+                        };
+                        let field = self.raw_member_field(id, name, *span)?;
+                        (binding, &field.id, &field.ty)
+                    }
                 };
-                let Some(receiver_type) = self.binding_types.get(binding) else {
-                    return Err(self.missing_context(
-                        *span,
-                        ReferenceAnalysisErrorReason::MissingResolvedBinding,
-                    ));
-                };
-                let ScalarType::Struct(id) = receiver_type else {
-                    return Ok(());
-                };
-                let field = self
-                    .structs
-                    .iter()
-                    .find(|item| item.id == *id)
-                    .ok_or_else(|| {
-                        self.missing_context(
-                            *span,
-                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
-                        )
-                    })?
-                    .fields
-                    .iter()
-                    .find(|field| field.name == *name)
-                    .ok_or_else(|| {
-                        self.missing_context(
-                            *span,
-                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
-                        )
-                    })?;
                 (
                     binding,
-                    ScalarPlace::Field {
-                        base: Box::new(ScalarPlace::Name {
-                            name: receiver.clone(),
-                            span: *receiver_span,
-                        }),
-                        field: ScalarFieldReference::Resolved(field.id.clone()),
-                        span: *span,
-                    },
-                    field.ty.clone(),
+                    synthetic_member_place(receiver, *receiver_span, field, *span),
+                    ty.clone(),
                     *span,
                 )
             }
@@ -1844,17 +1904,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             return Ok(());
         }
         let binding = binding.clone();
-        let mut projections = Vec::new();
-        collect_reference_projections(&place, None, &mut projections);
-        let place = ReferencePlaceId {
-            source: self.source.clone(),
-            function_span: self.function_span,
-            declaration_span: binding.declaration_span,
-            block_span: binding.block_span,
-            binding: binding.clone(),
-            projections,
-            place,
-        };
+        let place = self.reference_place(&place, binding.clone(), None);
         self.point(
             if policy == CopyPolicy::Deferred {
                 CfgPointKind::DeferredMove {
@@ -3944,6 +3994,22 @@ fn transfer_reference_facts(
     unique
 }
 
+fn synthetic_member_place(
+    receiver: &str,
+    receiver_span: ByteSpan,
+    field: &ScalarStructFieldId,
+    span: ByteSpan,
+) -> ScalarPlace {
+    ScalarPlace::Field {
+        base: Box::new(ScalarPlace::Name {
+            name: receiver.to_owned(),
+            span: receiver_span,
+        }),
+        field: ScalarFieldReference::Resolved(field.clone()),
+        span,
+    }
+}
+
 fn reference_root(place: &ScalarPlace) -> &ScalarPlace {
     match place {
         ScalarPlace::Name { .. } | ScalarPlace::Dereference { .. } => place,
@@ -4377,6 +4443,21 @@ enum PlainNameFacts {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+enum PreparedMemberIdentity {
+    Lexical {
+        binding: ReferenceBindingId,
+        field: ScalarStructFieldId,
+    },
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum MemberFacts {
+    Raw,
+    Prepared(HashMap<OccurrenceOrdinal, PreparedMemberIdentity>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct FunctionCallSites {
     pub(super) boundary: CallableBoundary,
     pub(super) sites: Vec<ResolvedCallSite>,
@@ -4387,6 +4468,7 @@ pub(super) struct FunctionCallSites {
     pub(super) allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     plain_names: PlainNameFacts,
+    members: MemberFacts,
     query_allocation_outputs: HashMap<(BlockOrdinal, usize), BindingOutputs>,
     pub(super) structure: OccurrenceStructure,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
@@ -4583,6 +4665,7 @@ struct StructuralWalker<'a, 'typing> {
     occurrence_typing: &'typing mut PreparationOccurrenceTyping,
     checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     plain_names: PlainNameFacts,
+    members: MemberFacts,
     allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     initialization_call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
     structural_calls: Vec<OccurrenceOrdinal>,
@@ -4600,16 +4683,21 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         span: ByteSpan,
         occurrence_typing: &'typing mut PreparationOccurrenceTyping,
     ) -> Self {
-        let plain_names = if matches!(&mode, WalkMode::Callable(callable) if callable.prepared) {
-            PlainNameFacts::Prepared(HashMap::new())
+        let (plain_names, members) = if matches!(&mode, WalkMode::Callable(callable) if callable.prepared)
+        {
+            (
+                PlainNameFacts::Prepared(HashMap::new()),
+                MemberFacts::Prepared(HashMap::new()),
+            )
         } else {
-            PlainNameFacts::Raw
+            (PlainNameFacts::Raw, MemberFacts::Raw)
         };
         Self {
             mode,
             occurrence_typing,
             checked_call_signatures: HashMap::new(),
             plain_names,
+            members,
             allocation_length_call_targets: HashMap::new(),
             initialization_call_targets: HashMap::new(),
             structural_calls: Vec::new(),
@@ -4702,6 +4790,32 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                         }),
                     },
                 }
+            };
+            if let Some(identity) = identity {
+                identities.insert(ordinal, identity);
+            }
+        }
+        if let (ScalarExpression::Member { receiver, .. }, MemberFacts::Prepared(identities)) =
+            (expression, &mut self.members)
+        {
+            let resolver = match &self.mode {
+                WalkMode::Callable(callable) => callable.target_resolver,
+                WalkMode::CallableAllocationLength(resolver) => *resolver,
+                _ => unreachable!("member facts are owned by a prepared callable"),
+            };
+            let lexical = names.get(receiver).filter(|binding| {
+                !binding.introduced_by_assignment
+                    || !resolver.declarations.has_value(resolver.source, receiver)
+            });
+            let identity = match (self.occurrence_typing.take_member(expression), lexical) {
+                (Some(CheckedMember::DirectField(field)), Some(binding)) => {
+                    Some(PreparedMemberIdentity::Lexical {
+                        binding: binding.reference_id(resolver.source, resolver.function_span),
+                        field,
+                    })
+                }
+                (Some(_), _) => Some(PreparedMemberIdentity::Other),
+                (None, _) => None,
             };
             if let Some(identity) = identity {
                 identities.insert(ordinal, identity);
@@ -5861,6 +5975,7 @@ fn resolve_function_call_sites(
         allocation_length_call_targets: resolver.allocation_length_call_targets,
         checked_call_signatures: resolver.checked_call_signatures,
         plain_names: resolver.plain_names,
+        members: resolver.members,
         query_allocation_outputs: callable.query_allocation_outputs,
         structure: resolver.structure,
         assignments: resolver.assignments,

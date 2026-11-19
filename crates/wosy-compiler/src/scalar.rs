@@ -2368,8 +2368,7 @@ use typecheck::{
     expression_type_in_module_expected, is_integer_type, is_module_private_name, module_diagnostic,
     operator, unused_binding_spans, validate, validate_extern, validate_identifier_style,
     validate_module_generic_type, validate_module_type, validate_output_receivers_in_module,
-    validate_overload_tail_conditionals, validate_tail_conditional_return,
-    validate_unit_if_positions_in_module, TailConditionalTyping,
+    validate_tail_conditional_return, validate_unit_if_positions_in_module, TailConditionalTyping,
 };
 use typecheck::{split_module_typing, ScalarModuleTyping, ScalarProgramTyping};
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
@@ -2641,177 +2640,181 @@ fn typecheck_scalar_project_with_occurrences(
                         module,
                         modules: &modules,
                     };
-                    if !function.overload_arms.is_empty() {
-                        validate_overload_tail_conditionals(
-                            function,
-                            &declarations,
-                            &declaration_names,
-                            &folded_declarations,
-                            typing,
-                            &mut diagnostics,
-                            &overloads,
-                            &mut inference,
-                        );
-                        continue;
-                    }
-                    let ScalarType::Callable {
-                        outputs,
-                        parameters,
-                    } = &function.signature
-                    else {
-                        continue;
+                    let is_overload = !function.overload_arms.is_empty();
+                    let bodies = if is_overload {
+                        function.overload_arms.as_slice()
+                    } else {
+                        std::slice::from_ref(function)
                     };
-                    if function.parameters.len() != parameters.len() {
-                        diagnostics.push(module_diagnostic(
-                            module,
-                            "B0004",
-                            "function parameter arity does not match its type",
-                            function.span,
-                        ));
-                    }
-                    let mut scope = declarations.clone();
-                    let mut visible_names = declaration_names.clone();
-                    let mut folded_names = folded_declarations.clone();
-                    typing.declare_parameters(
-                        function,
-                        parameters,
-                        &mut scope,
-                        &mut visible_names,
-                        &mut folded_names,
-                        &mut diagnostics,
-                    );
-                    if outputs.outputs.len() > 1 && !function.body.final_output_values.is_empty() {
-                        let tail = function.body.tail_conditional();
-                        let unsafe_context = tail.is_some() && function.body.unsafe_context;
-                        check_final_output_prefix(
-                            &function.body,
+                    for function in bodies {
+                        let ScalarType::Callable {
+                            outputs,
+                            parameters,
+                        } = &function.signature
+                        else {
+                            continue;
+                        };
+                        let multi_result_tail =
+                            outputs.outputs.len() > 1 && function.body.tail_conditional().is_some();
+                        inference.set_callable_assignment_output_capture(
+                            !is_overload || multi_result_tail,
+                        );
+                        if function.parameters.len() != parameters.len() {
+                            diagnostics.push(module_diagnostic(
+                                module,
+                                "B0004",
+                                "function parameter arity does not match its type",
+                                function.span,
+                            ));
+                        }
+                        let mut scope = declarations.clone();
+                        let mut visible_names = declaration_names.clone();
+                        let mut folded_names = folded_declarations.clone();
+                        typing.declare_parameters(
+                            function,
+                            parameters,
                             &mut scope,
                             &mut visible_names,
                             &mut folded_names,
-                            typing,
                             &mut diagnostics,
-                            unsafe_context,
-                            &overloads,
-                            &mut inference,
                         );
-                        if let Some(tail) = tail {
-                            validate_tail_conditional_return(
-                                tail,
-                                &outputs.outputs,
-                                &scope,
-                                &visible_names,
-                                &folded_names,
+                        if outputs.outputs.len() > 1
+                            && !function.body.final_output_values.is_empty()
+                        {
+                            let tail = function.body.tail_conditional();
+                            let unsafe_context = tail.is_some() && function.body.unsafe_context;
+                            check_final_output_prefix(
+                                &function.body,
+                                &mut scope,
+                                &mut visible_names,
+                                &mut folded_names,
                                 typing,
                                 &mut diagnostics,
                                 unsafe_context,
                                 &overloads,
                                 &mut inference,
                             );
-                        } else if function.body.final_output_values.len() == 1
-                            && matches!(
-                                function
+                            if let Some(tail) = tail {
+                                validate_tail_conditional_return(
+                                    tail,
+                                    &outputs.outputs,
+                                    &scope,
+                                    &visible_names,
+                                    &folded_names,
+                                    typing,
+                                    &mut diagnostics,
+                                    unsafe_context,
+                                    &overloads,
+                                    &mut inference,
+                                );
+                            } else if function.body.final_output_values.len() == 1
+                                && matches!(
+                                    function
+                                        .body
+                                        .final_expressions()
+                                        .next()
+                                        .expect("final output")
+                                        .0,
+                                    ScalarExpression::Call { .. }
+                                )
+                            {
+                                let (expression, value) = function
                                     .body
                                     .final_expressions()
                                     .next()
-                                    .expect("final output")
-                                    .0,
-                                ScalarExpression::Call { .. }
-                            )
-                        {
-                            let (expression, value) = function
-                                .body
-                                .final_expressions()
-                                .next()
-                                .expect("final output");
-                            typing.validate_sole_final_call(
-                                expression,
-                                value.span,
-                                outputs,
-                                &scope,
-                                &visible_names,
-                                &folded_names,
-                                &mut diagnostics,
-                                &overloads,
-                                &mut inference,
-                            );
-                        } else {
-                            if function.body.final_output_values.len() > 1
-                                && function.body.final_output_values.len() != outputs.outputs.len()
-                            {
-                                diagnostics.push(module_diagnostic(
+                                    .expect("final output");
+                                typing.validate_sole_final_call(
+                                    expression,
+                                    value.span,
+                                    outputs,
+                                    &scope,
+                                    &visible_names,
+                                    &folded_names,
+                                    &mut diagnostics,
+                                    &overloads,
+                                    &mut inference,
+                                );
+                            } else {
+                                if (is_overload || function.body.final_output_values.len() > 1)
+                                    && function.body.final_output_values.len()
+                                        != outputs.outputs.len()
+                                {
+                                    diagnostics.push(module_diagnostic(
                                     module,
                                     "B0004",
                                     "function output arity does not match its final output list",
                                     function.body.span,
                                 ));
+                                }
+                                for ((expression, value), output) in
+                                    function.body.final_expressions().zip(&outputs.outputs)
+                                {
+                                    let actual = expression_type_in_module_expected(
+                                        expression,
+                                        Some(&output.ty),
+                                        &scope,
+                                        &visible_names,
+                                        &folded_names,
+                                        module,
+                                        &modules,
+                                        &mut diagnostics,
+                                        false,
+                                        &overloads,
+                                        &mut inference,
+                                    );
+                                    expect_module_type(
+                                        module,
+                                        &output.ty,
+                                        &actual,
+                                        value.span,
+                                        &mut diagnostics,
+                                    );
+                                }
                             }
-                            for ((expression, value), output) in
-                                function.body.final_expressions().zip(&outputs.outputs)
-                            {
-                                let actual = expression_type_in_module_expected(
-                                    expression,
-                                    Some(&output.ty),
-                                    &scope,
-                                    &visible_names,
-                                    &folded_names,
-                                    module,
-                                    &modules,
-                                    &mut diagnostics,
-                                    false,
-                                    &overloads,
-                                    &mut inference,
-                                );
-                                expect_module_type(
-                                    module,
-                                    &output.ty,
-                                    &actual,
-                                    value.span,
-                                    &mut diagnostics,
-                                );
-                            }
+                        } else if let Some(output) = outputs.outputs.first() {
+                            let actual = block_type_in_module_expected(
+                                &function.body,
+                                Some(&output.ty),
+                                &scope,
+                                &visible_names,
+                                &folded_names,
+                                module,
+                                &modules,
+                                &mut diagnostics,
+                                false,
+                                &overloads,
+                                &mut inference,
+                            );
+                            expect_module_type(
+                                module,
+                                &output.ty,
+                                &actual,
+                                function.body.span,
+                                &mut diagnostics,
+                            );
+                        } else {
+                            let actual = block_type_in_module(
+                                &function.body,
+                                &scope,
+                                &visible_names,
+                                &folded_names,
+                                module,
+                                &modules,
+                                &mut diagnostics,
+                                false,
+                                &overloads,
+                                &mut inference,
+                            );
+                            expect_module_type(
+                                module,
+                                &ScalarType::Unit,
+                                &actual,
+                                function.body.span,
+                                &mut diagnostics,
+                            );
                         }
-                    } else if let Some(output) = outputs.outputs.first() {
-                        let actual = block_type_in_module_expected(
-                            &function.body,
-                            Some(&output.ty),
-                            &scope,
-                            &visible_names,
-                            &folded_names,
-                            module,
-                            &modules,
-                            &mut diagnostics,
-                            false,
-                            &overloads,
-                            &mut inference,
-                        );
-                        expect_module_type(
-                            module,
-                            &output.ty,
-                            &actual,
-                            function.body.span,
-                            &mut diagnostics,
-                        );
-                    } else {
-                        let actual = block_type_in_module(
-                            &function.body,
-                            &scope,
-                            &visible_names,
-                            &folded_names,
-                            module,
-                            &modules,
-                            &mut diagnostics,
-                            false,
-                            &overloads,
-                            &mut inference,
-                        );
-                        expect_module_type(
-                            module,
-                            &ScalarType::Unit,
-                            &actual,
-                            function.body.span,
-                            &mut diagnostics,
-                        );
                     }
+                    inference.set_callable_assignment_output_capture(true);
                 }
                 ScalarItem::Executable(executable) => {
                     let mut scope = declarations.clone();
