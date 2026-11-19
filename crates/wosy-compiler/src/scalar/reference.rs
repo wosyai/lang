@@ -218,8 +218,9 @@ struct ReferenceConditionalArm {
     result: ReferenceBlockResult,
 }
 
-enum ReferenceAssignmentDestination {
-    Name,
+enum ReferenceAssignmentDestination<'a> {
+    RawName,
+    PreparedName(&'a DirectDestinationIdentity),
     EvaluationOnly,
     Through(CfgPointId),
     Resolved(ReferencePlaceId),
@@ -2035,9 +2036,20 @@ impl<'a> ReferenceFlowBuilder<'a> {
         target: &ScalarAssignmentTarget,
         scope: ReferenceScopeId,
         ordinal: OccurrenceOrdinal,
-    ) -> Result<ReferenceAssignmentDestination, ReferenceAnalysisError> {
-        if matches!(target.place, ScalarPlace::Name { .. }) {
-            return Ok(ReferenceAssignmentDestination::Name);
+    ) -> Result<ReferenceAssignmentDestination<'a>, ReferenceAnalysisError> {
+        if let ScalarPlace::Name { span, .. } = &target.place {
+            return match &self.call_sites.direct_destinations {
+                DirectDestinationFacts::Raw => Ok(ReferenceAssignmentDestination::RawName),
+                DirectDestinationFacts::Prepared(rows) => rows
+                    .get(&ordinal)
+                    .map(ReferenceAssignmentDestination::PreparedName)
+                    .ok_or_else(|| {
+                        self.missing_context(
+                            *span,
+                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                        )
+                    }),
+            };
         }
         let root = self.place_root(&target.place, ordinal);
         if let ScalarPlace::Name { name, span } = root.place {
@@ -2353,9 +2365,37 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         let position = slot.position;
                         let target = &assignment.targets[position];
                         if let ScalarPlace::Name { name, span } = &target.place {
-                            let id = if let Some(id) = self.names.get(name) {
-                                id.clone()
-                            } else if self.module_names.contains(name) {
+                            let lexical = match destination {
+                                ReferenceAssignmentDestination::PreparedName(identity) => {
+                                    match identity {
+                                        DirectDestinationIdentity::Existing(binding) => {
+                                            Some((binding.clone(), None))
+                                        }
+                                        DirectDestinationIdentity::Introduce { binding, name } => {
+                                            Some((binding.clone(), Some(name.as_str())))
+                                        }
+                                        DirectDestinationIdentity::Module(_) => None,
+                                    }
+                                }
+                                ReferenceAssignmentDestination::RawName => {
+                                    match self.names.get(name) {
+                                        Some(binding) => Some((binding.clone(), None)),
+                                        None if self.module_names.contains(name) => None,
+                                        None => Some((
+                                            ReferenceBindingId {
+                                                source: self.source.clone(),
+                                                function_span: self.function_span,
+                                                declaration_span: target.target_span,
+                                                block_span: block.span,
+                                                kind: ReferenceBindingKind::Declared,
+                                            },
+                                            Some(name.as_str()),
+                                        )),
+                                    }
+                                }
+                                _ => unreachable!("staged direct assignment destination"),
+                            };
+                            let Some((id, introduction)) = lexical else {
                                 if matches!(value, ReferenceValue::Checked(_)) {
                                     return Err(self.missing_context(
                                         *span,
@@ -2372,15 +2412,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     BTreeSet::new(),
                                 );
                                 continue;
-                            } else {
-                                let id = ReferenceBindingId {
-                                    source: self.source.clone(),
-                                    function_span: self.function_span,
-                                    declaration_span: target.target_span,
-                                    block_span: block.span,
-                                    kind: ReferenceBindingKind::Declared,
-                                };
-                                self.names.insert(name.clone(), id.clone());
+                            };
+                            if let Some(name) = introduction {
+                                self.names.insert(name.to_owned(), id.clone());
                                 let ty = output_types.get(position).ok_or_else(|| {
                                     self.missing_context(
                                         target.target_span,
@@ -2388,11 +2422,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     )
                                 })?;
                                 self.binding_types.insert(id.clone(), ty.clone());
-                                declared.push((name.clone(), id.clone(), None));
-                                id
-                            };
+                                declared.push((name.to_owned(), id.clone(), None));
+                            }
                             let target_place =
-                                self.assignment_place(&target.place, target.target_span)?;
+                                self.reference_place(&target.place, id.clone(), None);
                             let previous_origins =
                                 self.origins.get(&id).cloned().unwrap_or_default();
                             let previous_loans = previous_origins
@@ -2470,7 +2503,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 let target_place = match destination {
                                     ReferenceAssignmentDestination::EvaluationOnly => continue,
                                     ReferenceAssignmentDestination::Resolved(place) => place,
-                                    ReferenceAssignmentDestination::Name
+                                    ReferenceAssignmentDestination::RawName
+                                    | ReferenceAssignmentDestination::PreparedName(_)
                                     | ReferenceAssignmentDestination::Through(_) => {
                                         unreachable!("staged projected assignment destination")
                                     }
@@ -4462,6 +4496,7 @@ pub(super) struct OccurrenceMetadata {
     pub(super) role: OccurrenceRole,
     pub(super) span: ByteSpan,
     pub(super) requires_plain_name: bool,
+    pub(super) requires_direct_destination: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4525,6 +4560,22 @@ enum NamedPlaceRootFacts {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+enum DirectDestinationIdentity {
+    Existing(ReferenceBindingId),
+    Module(SourceSpan),
+    Introduce {
+        binding: ReferenceBindingId,
+        name: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum DirectDestinationFacts {
+    Raw,
+    Prepared(HashMap<OccurrenceOrdinal, DirectDestinationIdentity>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum PreparedMemberIdentity {
     Lexical {
         binding: ReferenceBindingId,
@@ -4551,6 +4602,7 @@ pub(super) struct FunctionCallSites {
     pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     plain_names: PlainNameFacts,
     named_place_roots: NamedPlaceRootFacts,
+    direct_destinations: DirectDestinationFacts,
     members: MemberFacts,
     query_allocation_outputs: HashMap<(BlockOrdinal, usize), BindingOutputs>,
     pub(super) structure: OccurrenceStructure,
@@ -4563,6 +4615,10 @@ pub(super) struct FunctionCallSites {
 impl FunctionCallSites {
     pub(super) fn has_prepared_plain_name(&self, ordinal: OccurrenceOrdinal) -> bool {
         matches!(&self.plain_names, PlainNameFacts::Prepared(rows) if rows.contains_key(&ordinal))
+    }
+
+    pub(super) fn has_prepared_direct_destination(&self, ordinal: OccurrenceOrdinal) -> bool {
+        matches!(&self.direct_destinations, DirectDestinationFacts::Prepared(rows) if rows.contains_key(&ordinal))
     }
 }
 
@@ -4761,6 +4817,7 @@ struct StructuralWalker<'a, 'typing> {
     checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     plain_names: PlainNameFacts,
     named_place_roots: NamedPlaceRootFacts,
+    direct_destinations: DirectDestinationFacts,
     members: MemberFacts,
     allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     initialization_call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
@@ -4792,6 +4849,12 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             ),
         };
         Self {
+            direct_destinations: match &mode {
+                WalkMode::Callable(callable) if callable.prepared => {
+                    DirectDestinationFacts::Prepared(HashMap::new())
+                }
+                _ => DirectDestinationFacts::Raw,
+            },
             mode,
             occurrence_typing,
             checked_call_signatures: HashMap::new(),
@@ -4822,6 +4885,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             role,
             span,
             requires_plain_name: false,
+            requires_direct_destination: false,
         });
         let node = match role {
             OccurrenceRole::Expression => OccurrenceNode::Expression(ordinal),
@@ -5751,6 +5815,53 @@ impl StructuralWalker<'_, '_> {
                         replacement,
                     });
                 }
+                if let DirectDestinationFacts::Prepared(rows) = &mut self.direct_destinations {
+                    let resolver = match &self.mode {
+                        WalkMode::Callable(callable) => callable.target_resolver,
+                        WalkMode::CallableAllocationLength(resolver) => *resolver,
+                        _ => unreachable!("direct destinations are owned by a prepared callable"),
+                    };
+                    let mut introduced = BTreeMap::new();
+                    for (target, slot) in assignment.targets.iter().zip(&slots) {
+                        let ScalarPlace::Name { name, .. } = &target.place else {
+                            continue;
+                        };
+                        self.occurrences[slot.destination.0].requires_direct_destination = true;
+                        let identity = if let Some(binding) =
+                            introduced.get(name).or_else(|| names.get(name))
+                        {
+                            DirectDestinationIdentity::Existing(
+                                binding.reference_id(resolver.source, resolver.function_span),
+                            )
+                        } else if let Some(span) =
+                            resolver.declarations.value_token(resolver.source, name)
+                        {
+                            DirectDestinationIdentity::Module(SourceSpan::new(
+                                resolver.source.clone(),
+                                span,
+                            ))
+                        } else {
+                            let binding = WalkBinding {
+                                declaration_span: target.target_span,
+                                block_span,
+                                introduced_by_assignment: true,
+                            };
+                            let id = binding.reference_id(resolver.source, resolver.function_span);
+                            introduced.insert(name.clone(), binding);
+                            DirectDestinationIdentity::Introduce {
+                                binding: id,
+                                name: name.clone(),
+                            }
+                        };
+                        assert!(rows.insert(slot.destination, identity).is_none());
+                    }
+                    if let ScalarExpression::Name { name, .. } = &assignment.value {
+                        if let Some(ty) = types.get(name).cloned() {
+                            types.extend(introduced.keys().map(|name| (name.clone(), ty.clone())));
+                        }
+                    }
+                    names.extend(introduced);
+                }
                 if let WalkMode::ModuleInitialization {
                     source,
                     declarations,
@@ -5794,10 +5905,12 @@ impl StructuralWalker<'_, '_> {
                         ),
                     )
                     .is_none());
-                if matches!(
-                    &self.mode,
-                    WalkMode::Callable(_) | WalkMode::CallableAllocationLength(_)
-                ) {
+                if matches!(&self.direct_destinations, DirectDestinationFacts::Raw)
+                    && matches!(
+                        &self.mode,
+                        WalkMode::Callable(_) | WalkMode::CallableAllocationLength(_)
+                    )
+                {
                     for target in &assignment.targets {
                         if let ScalarPlace::Name { name, .. } = &target.place {
                             if !names.contains_key(name) {
@@ -6132,6 +6245,7 @@ fn resolve_function_call_sites(
         checked_call_signatures: resolver.checked_call_signatures,
         plain_names: resolver.plain_names,
         named_place_roots: resolver.named_place_roots,
+        direct_destinations: resolver.direct_destinations,
         members: resolver.members,
         query_allocation_outputs: callable.query_allocation_outputs,
         structure: resolver.structure,

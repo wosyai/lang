@@ -20,6 +20,8 @@ mod assignment_outputs;
 
 mod assignment_destinations;
 
+mod direct_destinations;
+
 mod dereference_points;
 
 mod complete_results;

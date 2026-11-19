@@ -82,6 +82,13 @@ fn validate_region(
                 Reason::MissingCheckedExpressionResult { ordinal: index }
             }
             OccurrenceRole::Place
+                if metadata.requires_direct_destination
+                    && callable
+                        .is_some_and(|row| !row.has_prepared_direct_destination(ordinal)) =>
+            {
+                Reason::MissingResolvedBinding
+            }
+            OccurrenceRole::Place
                 if !structure.checked_types.places.contains_key(&ordinal)
                     && !structure.resolved_namespace_places.contains_key(&ordinal) =>
             {
