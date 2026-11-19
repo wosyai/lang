@@ -473,6 +473,21 @@ impl<'a> ReferenceFlowBuilder<'a> {
             })
     }
 
+    fn prepared_name_identity(
+        &self,
+        ordinal: OccurrenceOrdinal,
+        span: ByteSpan,
+    ) -> Result<Option<&PlainNameIdentity>, ReferenceAnalysisError> {
+        match &self.call_sites.plain_names {
+            PlainNameFacts::Raw => Ok(None),
+            PlainNameFacts::Prepared(identities) => {
+                identities.get(&ordinal).map(Some).ok_or_else(|| {
+                    self.missing_context(span, ReferenceAnalysisErrorReason::MissingResolvedBinding)
+                })
+            }
+        }
+    }
+
     fn assignment_place(
         &self,
         place: &ScalarPlace,
@@ -1135,19 +1150,26 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     CheckedReadSource::SyntheticMember,
                 )
             }
-            ScalarExpression::Name { name, .. } if name == "null" => {
-                let id = self.intern(ReferenceOrigin::Null { span });
-                let origins = BTreeSet::from([id]);
-                self.point(
-                    CfgPointKind::Evaluate(expression.clone()),
-                    span,
-                    scope,
-                    origins.clone(),
-                );
-                Ok(ReferenceValue::Checked(origins))
-            }
             ScalarExpression::Name { name, .. } => {
-                if self.module_names.contains(name) && !self.names.contains_key(name) {
+                let identity = self.prepared_name_identity(ordinal, span)?;
+                if matches!(identity, Some(PlainNameIdentity::Null))
+                    || (identity.is_none() && name == "null")
+                {
+                    let id = self.intern(ReferenceOrigin::Null { span });
+                    let origins = BTreeSet::from([id]);
+                    self.point(
+                        CfgPointKind::Evaluate(expression.clone()),
+                        span,
+                        scope,
+                        origins.clone(),
+                    );
+                    return Ok(ReferenceValue::Checked(origins));
+                }
+                if matches!(identity, Some(PlainNameIdentity::ModuleValue(_)))
+                    || (identity.is_none()
+                        && self.module_names.contains(name)
+                        && !self.names.contains_key(name))
+                {
                     self.point(
                         CfgPointKind::Evaluate(expression.clone()),
                         span,
@@ -1156,7 +1178,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     );
                     return Ok(ReferenceValue::Other);
                 }
-                let binding = self.binding(name, span)?;
+                let binding = match identity {
+                    Some(PlainNameIdentity::Lexical(binding)) => {
+                        if !self.binding_types.contains_key(binding) {
+                            return Err(self.missing_context(
+                                span,
+                                ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                            ));
+                        }
+                        binding.clone()
+                    }
+                    None => self.binding(name, span)?,
+                    _ => unreachable!("null and module name reads handled above"),
+                };
                 if self.checked.contains(&binding) {
                     if self.origins.contains_key(&binding) {
                         let origins = self.required(&binding, span)?;
@@ -1616,13 +1650,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
         scope: ReferenceScopeId,
         ordinal: OccurrenceOrdinal,
     ) -> Result<(), ReferenceAnalysisError> {
-        let (name, place, ty, span) = match value {
+        let (binding, place, ty, span) = match value {
             ScalarExpression::Name { name, span } => {
-                let Some(binding) = self.names.get(name) else {
+                let binding = match self.prepared_name_identity(ordinal, *span)? {
+                    Some(PlainNameIdentity::Lexical(binding)) => Some(binding),
+                    Some(PlainNameIdentity::Null | PlainNameIdentity::ModuleValue(_)) => None,
+                    None => self.names.get(name),
+                };
+                let Some(binding) = binding else {
                     return Ok(());
                 };
                 (
-                    name,
+                    binding,
                     ScalarPlace::Name {
                         name: name.clone(),
                         span: *span,
@@ -1675,7 +1714,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         )
                     })?;
                 (
-                    receiver,
+                    binding,
                     ScalarPlace::Field {
                         base: Box::new(ScalarPlace::Name {
                             name: receiver.clone(),
@@ -1804,11 +1843,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         if policy == CopyPolicy::Copy {
             return Ok(());
         }
-        let binding = self
-            .names
-            .get(name)
-            .expect("validated move binding")
-            .clone();
+        let binding = binding.clone();
         let mut projections = Vec::new();
         collect_reference_projections(&place, None, &mut projections);
         let place = ReferencePlaceId {
@@ -2007,9 +2042,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     };
                     let primary = &binding.value;
                     let primary_ordinal = outputs.primary;
-                    let value = if matches!(receiver.ty, ScalarType::RawPointer(_))
-                        && matches!(primary, ScalarExpression::Name { name, .. } if name == "null")
-                    {
+                    let raw_null = match primary {
+                        ScalarExpression::Name { name, span }
+                            if matches!(receiver.ty, ScalarType::RawPointer(_)) =>
+                        {
+                            match self.prepared_name_identity(primary_ordinal, *span)? {
+                                Some(identity) => matches!(identity, PlainNameIdentity::Null),
+                                None => name == "null",
+                            }
+                        }
+                        _ => false,
+                    };
+                    let value = if raw_null {
                         self.point(
                             CfgPointKind::Evaluate(primary.clone()),
                             expression_span(primary),
@@ -3991,6 +4035,7 @@ struct CallDeclarationHeaders<'a> {
     functions: HashMap<&'a str, (ByteSpan, CallFunctionKind)>,
     bindings: HashMap<&'a str, CallBindingHeader<'a>>,
     externs: HashMap<&'a str, HashMap<&'a str, ByteSpan>>,
+    value_tokens: HashMap<&'a str, ByteSpan>,
 }
 
 struct CallBindingHeader<'a> {
@@ -4026,6 +4071,9 @@ impl<'a> CallDeclarationIndex<'a> {
             for item in module.items {
                 match item {
                     ScalarItem::Function(function) => {
+                        headers
+                            .value_tokens
+                            .insert(&function.name, function.name_span);
                         let kind = if !function.overload_arms.is_empty() {
                             CallFunctionKind::Overload
                         } else if !function.generic_parameters.is_empty() {
@@ -4038,6 +4086,9 @@ impl<'a> CallDeclarationIndex<'a> {
                             .insert(&function.name, (function.name_span, kind));
                     }
                     ScalarItem::Binding(binding) => {
+                        headers
+                            .value_tokens
+                            .insert(&binding.name, binding.name_span);
                         headers.bindings.insert(
                             &binding.name,
                             CallBindingHeader {
@@ -4058,6 +4109,9 @@ impl<'a> CallDeclarationIndex<'a> {
                         }
                     }
                     ScalarItem::Extern(group) => {
+                        headers
+                            .value_tokens
+                            .insert(&group.binding, group.binding_span);
                         headers.externs.entry(&group.binding).or_insert_with(|| {
                             let mut members = HashMap::new();
                             for function in &group.functions {
@@ -4068,7 +4122,12 @@ impl<'a> CallDeclarationIndex<'a> {
                             members
                         });
                     }
-                    _ => {}
+                    ScalarItem::Namespace(namespace) => {
+                        headers
+                            .value_tokens
+                            .insert(&namespace.binding, namespace.binding_span);
+                    }
+                    ScalarItem::Executable(_) => {}
                 }
             }
             index.modules.entry(module.source).or_insert(headers);
@@ -4116,6 +4175,10 @@ impl<'a> CallDeclarationIndex<'a> {
     fn binding(&self, source: &SourceIdentity, name: &str) -> Option<(ByteSpan, &'a ScalarType)> {
         let binding = self.modules.get(source)?.bindings.get(name)?;
         Some((binding.span, binding.ty))
+    }
+
+    fn value_token(&self, source: &SourceIdentity, name: &str) -> Option<ByteSpan> {
+        self.modules.get(source)?.value_tokens.get(name).copied()
     }
 
     fn has_value(&self, source: &SourceIdentity, name: &str) -> bool {
@@ -4301,6 +4364,19 @@ pub(super) struct CallableBoundary {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+enum PlainNameIdentity {
+    Lexical(ReferenceBindingId),
+    ModuleValue(SourceSpan),
+    Null,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum PlainNameFacts {
+    Raw,
+    Prepared(HashMap<OccurrenceOrdinal, PlainNameIdentity>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct FunctionCallSites {
     pub(super) boundary: CallableBoundary,
     pub(super) sites: Vec<ResolvedCallSite>,
@@ -4310,6 +4386,7 @@ pub(super) struct FunctionCallSites {
     pub(super) allocation_length_calls: Vec<OccurrenceOrdinal>,
     pub(super) allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
+    plain_names: PlainNameFacts,
     query_allocation_outputs: HashMap<(BlockOrdinal, usize), BindingOutputs>,
     pub(super) structure: OccurrenceStructure,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
@@ -4458,7 +4535,7 @@ struct CallableTargetResolver<'a> {
 
 struct CallableWalk<'a> {
     target_resolver: CallableTargetResolver<'a>,
-    select_allocation_length_calls: bool,
+    prepared: bool,
     assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
     sites: Vec<ResolvedCallSite>,
     site_by_span: BTreeMap<CallSiteSpan, usize>,
@@ -4480,6 +4557,7 @@ enum WalkMode<'a> {
 struct WalkBinding {
     declaration_span: ByteSpan,
     block_span: ByteSpan,
+    introduced_by_assignment: bool,
 }
 
 impl WalkBinding {
@@ -4504,6 +4582,7 @@ struct StructuralWalker<'a, 'typing> {
     mode: WalkMode<'a>,
     occurrence_typing: &'typing mut PreparationOccurrenceTyping,
     checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
+    plain_names: PlainNameFacts,
     allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     initialization_call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
     structural_calls: Vec<OccurrenceOrdinal>,
@@ -4521,10 +4600,16 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         span: ByteSpan,
         occurrence_typing: &'typing mut PreparationOccurrenceTyping,
     ) -> Self {
+        let plain_names = if matches!(&mode, WalkMode::Callable(callable) if callable.prepared) {
+            PlainNameFacts::Prepared(HashMap::new())
+        } else {
+            PlainNameFacts::Raw
+        };
         Self {
             mode,
             occurrence_typing,
             checked_call_signatures: HashMap::new(),
+            plain_names,
             allocation_length_call_targets: HashMap::new(),
             initialization_call_targets: HashMap::new(),
             structural_calls: Vec::new(),
@@ -4586,6 +4671,41 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         if let Some(folded) = self.occurrence_typing.take_folded_expression(expression) {
             debug_assert_eq!(edge, OccurrenceEdge::UnaryOperand);
             self.structure.folded_expressions.insert(ordinal, folded);
+        }
+        if let (ScalarExpression::Name { name, .. }, PlainNameFacts::Prepared(identities)) =
+            (expression, &mut self.plain_names)
+        {
+            let resolver = match &self.mode {
+                WalkMode::Callable(callable) => callable.target_resolver,
+                WalkMode::CallableAllocationLength(resolver) => *resolver,
+                _ => unreachable!("plain name facts are owned by a prepared callable"),
+            };
+            let identity = if name == "null" {
+                Some(PlainNameIdentity::Null)
+            } else {
+                let module = || resolver.declarations.value_token(resolver.source, name);
+                match names.get(name) {
+                    Some(binding) if !binding.introduced_by_assignment => {
+                        Some(PlainNameIdentity::Lexical(
+                            binding.reference_id(resolver.source, resolver.function_span),
+                        ))
+                    }
+                    binding => match module() {
+                        Some(span) => Some(PlainNameIdentity::ModuleValue(SourceSpan::new(
+                            resolver.source.clone(),
+                            span,
+                        ))),
+                        None => binding.map(|binding| {
+                            PlainNameIdentity::Lexical(
+                                binding.reference_id(resolver.source, resolver.function_span),
+                            )
+                        }),
+                    },
+                }
+            };
+            if let Some(identity) = identity {
+                identities.insert(ordinal, identity);
+            }
         }
         self.expression_children(expression, names, types, ordinal)?;
         Ok(ordinal)
@@ -5094,7 +5214,7 @@ impl StructuralWalker<'_, '_> {
         scope: &WalkScope,
     ) -> Result<BindingInitialization, ReferenceAnalysisError> {
         let callable = if let WalkMode::Callable(callable) = &self.mode {
-            let length_mode = if callable.select_allocation_length_calls {
+            let length_mode = if callable.prepared {
                 WalkMode::CallableAllocationLength(callable.target_resolver)
             } else {
                 WalkMode::StructuralOnly
@@ -5227,6 +5347,7 @@ impl StructuralWalker<'_, '_> {
                     WalkBinding {
                         declaration_span: receiver.name_span,
                         block_span,
+                        introduced_by_assignment: false,
                     },
                 );
             }
@@ -5382,6 +5503,7 @@ impl StructuralWalker<'_, '_> {
                                             WalkBinding {
                                                 declaration_span: target.target_span,
                                                 block_span,
+                                                introduced_by_assignment: true,
                                             },
                                         );
                                     }
@@ -5425,6 +5547,7 @@ impl StructuralWalker<'_, '_> {
                                     WalkBinding {
                                         declaration_span: target.target_span,
                                         block_span,
+                                        introduced_by_assignment: true,
                                     },
                                 );
                             }
@@ -5619,7 +5742,7 @@ fn resolve_function_call_sites(
     function: &ScalarFunction,
     declarations: &CallDeclarationIndex<'_>,
     assignment_outputs: &HashMap<ResolvedAssignmentOutputId, ScalarType>,
-    select_allocation_length_calls: bool,
+    prepared: bool,
     occurrence_typing: &mut PreparationOccurrenceTyping,
 ) -> Result<FunctionCallSites, ReferenceAnalysisError> {
     let mut arms = Vec::new();
@@ -5629,7 +5752,7 @@ fn resolve_function_call_sites(
             arm,
             declarations,
             assignment_outputs,
-            select_allocation_length_calls,
+            prepared,
             occurrence_typing,
         )?);
     }
@@ -5639,7 +5762,7 @@ fn resolve_function_call_sites(
             function_span: function.span,
             declarations,
         },
-        select_allocation_length_calls,
+        prepared,
         assignment_outputs,
         sites: Vec::new(),
         site_by_span: BTreeMap::new(),
@@ -5679,6 +5802,7 @@ fn resolve_function_call_sites(
             WalkBinding {
                 declaration_span: slot.span,
                 block_span: function.body.span,
+                introduced_by_assignment: false,
             },
         );
     }
@@ -5736,6 +5860,7 @@ fn resolve_function_call_sites(
         allocation_length_calls: resolver.structural_calls,
         allocation_length_call_targets: resolver.allocation_length_call_targets,
         checked_call_signatures: resolver.checked_call_signatures,
+        plain_names: resolver.plain_names,
         query_allocation_outputs: callable.query_allocation_outputs,
         structure: resolver.structure,
         assignments: resolver.assignments,

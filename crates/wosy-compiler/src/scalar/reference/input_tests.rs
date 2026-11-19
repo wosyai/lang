@@ -26,6 +26,8 @@ mod complete_results;
 
 mod callable_boundary;
 
+mod plain_names;
+
 fn assert_project_reference_results(
     left: &ProjectReferenceResults,
     right: &ProjectReferenceResults,
