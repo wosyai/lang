@@ -339,6 +339,108 @@ fn assert_signature(
 }
 
 #[test]
+fn public_prepare_types_independent_secondary_binding_roots() {
+    let parsed = parsed(
+        "%%start
+generic T;
+T(T) echo = fn(value) { value };
+u8 first, i16 second, u32 third = 1, 1, echo<u32>(2);
+u32(u32) run = fn(input) {
+    u8 left, i16 middle, u32 right = 1, 1, echo<u32>(input);
+    input; left; middle; right
+};
+%%end",
+    );
+    let check = |structure: &OccurrenceStructure, item| {
+        let roots = [0, 1, 2].map(|output| {
+            child(
+                structure,
+                Parent::Block(structure.root),
+                Edge::BindingRoot { item, output },
+            )
+        });
+        assert!(roots.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let types = &structure.checked_types.expressions;
+        assert_eq!(
+            roots.map(|root| types.get(&root)),
+            [
+                Some(&ScalarType::U8),
+                Some(&ScalarType::I16),
+                Some(&ScalarType::U32),
+            ]
+        );
+        let argument = child(
+            structure,
+            Parent::Expression(roots[2]),
+            Edge::CallArgument(0),
+        );
+        assert_eq!(types[&argument], ScalarType::U32);
+        roots[2]
+    };
+    let u32s = &[ScalarType::U32];
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let project = prepare_extracted(&parsed, target_layout);
+        let initialization = project.initialization_region(0).unwrap();
+        let ModuleInitializationDetail::Occurrences(topology) = &initialization.detail else {
+            panic!("module initialization occurrences")
+        };
+        let call = check(&topology.structure, 1);
+        assert_signature(&topology.checked_call_signatures[&call], u32s, u32s, None);
+        let function = project.calls.function(0, 2);
+        let call = check(&function.structure, 0);
+        assert_signature(&function.checked_call_signatures[&call], u32s, u32s, None);
+
+        let program = PreparedProgram::new(
+            derive_scalar_declarations_from_cst(parsed.canonical_cst()),
+            target_layout,
+        )
+        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        let calls = program.calls.as_ref().unwrap();
+        let ModuleInitializationDetail::Occurrences(topology) = &calls.initialization.detail else {
+            panic!("module initialization occurrences")
+        };
+        let call = check(&topology.structure, 1);
+        assert_signature(&topology.checked_call_signatures[&call], u32s, u32s, None);
+        let function = calls.function(2);
+        let call = check(&function.structure, 0);
+        assert_signature(&function.checked_call_signatures[&call], u32s, u32s, None);
+    }
+}
+
+#[test]
+fn secondary_binding_enum_variant_preparation_probe() {
+    let parsed = parsed(
+        "%%start
+enum Status { ready; }
+u8 first, Status status = 1, Status::ready;
+Status() select = fn() {
+    u8 marker, Status selected = 1, if (true) { Status value = Status::ready; value } else { Status::ready };
+    marker; selected
+};
+%%end",
+    );
+    let mut failures = Vec::new();
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let declarations = derive_scalar_declarations_from_cst(parsed.canonical_cst());
+        let order = vec![declarations.source().clone()];
+        if let Err(failure) = crate::prepare_scalar_project(
+            vec![(declarations, Vec::new())],
+            order,
+            crate::ScalarPreparationInputs { target_layout },
+        ) {
+            failures.push(("project", target_layout, failure.diagnostics));
+        }
+        if let Err(failure) = PreparedProgram::new(
+            derive_scalar_declarations_from_cst(parsed.canonical_cst()),
+            target_layout,
+        ) {
+            failures.push(("standalone", target_layout, failure.diagnostics));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
 fn prepared_generic_calls_keep_concrete_signatures_at_module_body_and_length_edges() {
     let parsed = parsed(
         "%%start\ngeneric T;\nT(T) echo = fn(value) { value };\n\

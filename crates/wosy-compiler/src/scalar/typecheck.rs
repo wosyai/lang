@@ -587,6 +587,47 @@ pub(super) enum TailConditionalTyping<'a> {
 }
 
 impl TailConditionalTyping<'_> {
+    pub(super) fn validate_secondary_binding_initializers(
+        self,
+        binding: &ScalarBinding,
+        scope: &BTreeMap<String, ScalarType>,
+        visible_names: &BTreeSet<String>,
+        folded_names: &BTreeMap<String, (String, ByteSpan)>,
+        diagnostics: &mut Vec<super::Diagnostic>,
+        unsafe_context: bool,
+        overloads: &ScalarTypingView<'_>,
+        inference: &mut ScalarInferenceBuilder<'_>,
+    ) {
+        if binding.output_origin != ScalarBindingOutputOrigin::IndependentExpressions {
+            return;
+        }
+        for (position, receiver) in binding.receivers.iter().enumerate().skip(1) {
+            let ScalarBindingOutput::Evaluate(expression) = binding.output_source(position) else {
+                unreachable!("independent binding output evaluates its source")
+            };
+            let actual = self.expression_type(
+                expression,
+                Some(&receiver.ty),
+                scope,
+                visible_names,
+                folded_names,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            );
+            let span = expression_span(expression);
+            match self {
+                Self::Program(program) => {
+                    expect_type(program, &receiver.ty, &actual, span, diagnostics);
+                }
+                Self::Module { module, .. } => {
+                    expect_module_type(module, &receiver.ty, &actual, span, diagnostics);
+                }
+            }
+        }
+    }
+
     pub(super) fn declare_parameters(
         self,
         function: &ScalarFunction,
@@ -1123,6 +1164,17 @@ pub(super) fn block_item_type_in_module(
                 binding.span,
                 diagnostics,
             );
+            TailConditionalTyping::Module { module, modules }
+                .validate_secondary_binding_initializers(
+                    binding,
+                    scope,
+                    visible_names,
+                    folded_names,
+                    diagnostics,
+                    unsafe_context,
+                    overloads,
+                    inference,
+                );
             if declare_module_name(
                 module,
                 &binding.name,
@@ -6506,6 +6558,16 @@ pub(super) fn validate(
                     binding.span,
                     &mut diagnostics,
                 );
+                TailConditionalTyping::Program(program).validate_secondary_binding_initializers(
+                    binding,
+                    &declarations,
+                    &BTreeSet::new(),
+                    &BTreeMap::new(),
+                    &mut diagnostics,
+                    false,
+                    overloads,
+                    inference,
+                );
             }
             ScalarItem::Function(function) => {
                 let typing = TailConditionalTyping::Program(program);
@@ -7181,6 +7243,16 @@ fn block_item_type(
                 &actual,
                 binding.span,
                 diagnostics,
+            );
+            TailConditionalTyping::Program(program).validate_secondary_binding_initializers(
+                binding,
+                scope,
+                visible_names,
+                folded_names,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
             );
             if declare_program_name(
                 program,

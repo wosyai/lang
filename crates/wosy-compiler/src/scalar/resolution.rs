@@ -3,6 +3,18 @@ use super::typecheck::{
 };
 use super::*;
 
+fn secondary_binding_initializers_mut(
+    binding: &mut ScalarBinding,
+) -> impl Iterator<Item = &mut ScalarExpression> {
+    let outputs = match (binding.is_allocation, &binding.output_origin) {
+        (false, ScalarBindingOutputOrigin::IndependentExpressions) => {
+            binding.output_values.as_mut_slice()
+        }
+        _ => &mut [],
+    };
+    outputs.iter_mut().skip(1).map(|output| &mut output.value)
+}
+
 pub(super) fn resolve_program_types(
     program: &mut ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -46,6 +58,9 @@ pub(super) fn resolve_program_types(
                         span: output.span,
                     })
                     .collect();
+                for initializer in secondary_binding_initializers_mut(binding) {
+                    resolve_expression_types(initializer, &names);
+                }
             }
             ScalarItem::Function(function) => {
                 if function.generic_parameters.is_empty() {
@@ -86,6 +101,9 @@ fn resolve_item_types(item: &mut ScalarBlockItem, names: &BTreeMap<String, Scala
             for receiver in &mut binding.receivers {
                 receiver.ty = resolve_type(&receiver.ty, names);
             }
+            for initializer in secondary_binding_initializers_mut(binding) {
+                resolve_expression_types(initializer, names);
+            }
         }
         ScalarBlockItem::Expression(ScalarExpression::Block(block)) => {
             resolve_block_types(block, names)
@@ -106,6 +124,9 @@ fn resolve_block_types(block: &mut ScalarBlock, names: &BTreeMap<String, ScalarT
                     receiver.ty = resolve_type(&receiver.ty, names);
                 }
                 resolve_expression_types(&mut binding.value, names);
+                for initializer in secondary_binding_initializers_mut(binding) {
+                    resolve_expression_types(initializer, names);
+                }
             }
             ScalarBlockItem::While(while_expression) => {
                 resolve_expression_types(&mut while_expression.condition, names);
@@ -256,6 +277,17 @@ pub(super) fn resolve_program_places(
                     overloads,
                     owners,
                 );
+                for initializer in secondary_binding_initializers_mut(binding) {
+                    resolve_expression_places(
+                        initializer,
+                        &declarations,
+                        &context,
+                        &names,
+                        false,
+                        overloads,
+                        owners,
+                    );
+                }
             }
             ScalarItem::Function(function) => {
                 let mut scope = declarations.clone();
@@ -310,6 +342,17 @@ fn resolve_item_places(
                 overloads,
                 owners,
             );
+            for initializer in secondary_binding_initializers_mut(binding) {
+                resolve_expression_places(
+                    initializer,
+                    scope,
+                    program,
+                    names,
+                    unsafe_context,
+                    overloads,
+                    owners,
+                );
+            }
             scope.insert(binding.name.clone(), binding.declared_type.clone());
         }
         ScalarBlockItem::Expression(expression) => resolve_expression_places(
@@ -1025,6 +1068,20 @@ pub(super) fn resolve_module_places(
                     overloads,
                     owners,
                 );
+                for initializer in secondary_binding_initializers_mut(binding) {
+                    resolve_expression_module_places(
+                        initializer,
+                        &bindings,
+                        module,
+                        modules,
+                        &names,
+                        false,
+                        declarations,
+                        current_module,
+                        overloads,
+                        owners,
+                    );
+                }
             }
             ScalarItem::Function(function) => {
                 let mut scope = bindings.clone();
@@ -1092,6 +1149,20 @@ fn resolve_item_module_places(
                 overloads,
                 owners,
             );
+            for initializer in secondary_binding_initializers_mut(binding) {
+                resolve_expression_module_places(
+                    initializer,
+                    scope,
+                    module,
+                    modules,
+                    names,
+                    unsafe_context,
+                    declarations,
+                    current_module,
+                    overloads,
+                    owners,
+                );
+            }
             scope.insert(binding.name.clone(), binding.declared_type.clone());
         }
         ScalarBlockItem::Expression(expression) => resolve_expression_module_places(

@@ -2629,6 +2629,20 @@ fn typecheck_scalar_project_with_occurrences(
                         binding.span,
                         &mut diagnostics,
                     );
+                    TailConditionalTyping::Module {
+                        module,
+                        modules: &modules,
+                    }
+                    .validate_secondary_binding_initializers(
+                        binding,
+                        &declarations,
+                        &BTreeSet::new(),
+                        &BTreeMap::new(),
+                        &mut diagnostics,
+                        false,
+                        &overloads,
+                        &mut inference,
+                    );
                 }
                 ScalarItem::Function(function) => {
                     let typing = TailConditionalTyping::Module {
