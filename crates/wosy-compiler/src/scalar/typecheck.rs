@@ -3195,7 +3195,7 @@ fn check_expression_type_in_module(
                     *span,
                 ));
             }
-            ScalarType::RawPointer(Box::new(place_type_in_module(
+            let ty = check_place_type_in_module(
                 place,
                 scope,
                 module,
@@ -3203,7 +3203,10 @@ fn check_expression_type_in_module(
                 diagnostics,
                 overloads,
                 inference,
-            )))
+                true,
+            );
+            inference.record_place_type(place, &ty);
+            ScalarType::RawPointer(Box::new(ty))
         }
         ScalarExpression::CheckedAddress {
             mutability,
@@ -5187,9 +5190,15 @@ fn writable_path_type(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let ty = match place {
-        ScalarPlace::Name { .. } => {
-            check_place_type(place, scope, program, diagnostics, overloads, inference)
-        }
+        ScalarPlace::Name { .. } => check_place_type(
+            place,
+            scope,
+            program,
+            diagnostics,
+            overloads,
+            inference,
+            false,
+        ),
         ScalarPlace::Dereference { pointer, span } => match expression_type(
             pointer,
             scope,
@@ -5305,6 +5314,7 @@ fn writable_path_type_in_module(
             diagnostics,
             overloads,
             inference,
+            false,
         ),
         ScalarPlace::Dereference { pointer, span } => match expression_type_in_module(
             pointer,
@@ -5441,7 +5451,15 @@ pub(super) fn place_type(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    let ty = check_place_type(place, scope, program, diagnostics, overloads, inference);
+    let ty = check_place_type(
+        place,
+        scope,
+        program,
+        diagnostics,
+        overloads,
+        inference,
+        false,
+    );
     inference.record_place_type(place, &ty);
     ty
 }
@@ -5453,6 +5471,7 @@ fn check_place_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
+    raw_address: bool,
 ) -> ScalarType {
     match place {
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
@@ -5505,6 +5524,7 @@ fn check_place_type(
             inference,
         ) {
             ScalarType::RawPointer(inner) => *inner,
+            ScalarType::CheckedReference { inner, .. } if raw_address => *inner,
             _ => {
                 diagnostics.push(diagnostic(
                     program,
@@ -5577,6 +5597,7 @@ pub(super) fn place_type_in_module(
         diagnostics,
         overloads,
         inference,
+        false,
     );
     inference.record_place_type(place, &ty);
     ty
@@ -5590,6 +5611,7 @@ fn check_place_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
+    raw_address: bool,
 ) -> ScalarType {
     match place {
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
@@ -5609,6 +5631,7 @@ fn check_place_type_in_module(
             inference,
         ) {
             ScalarType::RawPointer(inner) => *inner,
+            ScalarType::CheckedReference { inner, .. } if raw_address => *inner,
             _ => {
                 diagnostics.push(module_diagnostic(
                     module,
@@ -7709,14 +7732,17 @@ fn check_expression_type(
                     *span,
                 ));
             }
-            ScalarType::RawPointer(Box::new(place_type(
+            let ty = check_place_type(
                 place,
                 scope,
                 program,
                 diagnostics,
                 overloads,
                 inference,
-            )))
+                true,
+            );
+            inference.record_place_type(place, &ty);
+            ScalarType::RawPointer(Box::new(ty))
         }
         ScalarExpression::CheckedAddress {
             mutability,

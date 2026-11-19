@@ -1226,11 +1226,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 ),
             ),
             ScalarExpression::RawAddress { place, .. } => {
-                self.place_expressions(
-                    place,
-                    scope,
-                    self.place_ordinal(parent, OccurrenceEdge::ExpressionPlace),
-                )?;
+                let place_ordinal = self.place_ordinal(parent, OccurrenceEdge::ExpressionPlace);
+                self.place_expressions(place, scope, place_ordinal)?;
+                self.check_raw_address_access(place, place_ordinal, span, scope)?;
                 self.point(
                     CfgPointKind::Evaluate(expression.clone()),
                     span,
@@ -1505,6 +1503,53 @@ impl<'a> ReferenceFlowBuilder<'a> {
         ordinal: OccurrenceOrdinal,
     ) -> Result<(), ReferenceAnalysisError> {
         self.place_expressions_with_binding(place, scope, ordinal, None)
+    }
+
+    fn check_raw_address_access(
+        &mut self,
+        place: &ScalarPlace,
+        ordinal: OccurrenceOrdinal,
+        span: ByteSpan,
+        scope: ReferenceScopeId,
+    ) -> Result<(), ReferenceAnalysisError> {
+        let ScalarPlace::Dereference { pointer, .. } = place else {
+            return Ok(());
+        };
+        if !matches!(self.call_sites.plain_names, PlainNameFacts::Prepared(_)) {
+            return Ok(());
+        }
+        let pointer_ordinal = self.expression_ordinal(
+            OccurrenceParent::Place(ordinal),
+            OccurrenceEdge::DereferencePointer,
+        );
+        let pointer_type = self
+            .call_sites
+            .structure
+            .checked_types
+            .expressions
+            .get(&pointer_ordinal)
+            .ok_or_else(|| {
+                self.missing_context(
+                    expression_span(pointer),
+                    ReferenceAnalysisErrorReason::MissingCheckedExpressionResult {
+                        ordinal: pointer_ordinal.0,
+                    },
+                )
+            })?;
+        if matches!(pointer_type, ScalarType::CheckedReference { .. }) {
+            self.point(
+                CfgPointKind::ReadPlace {
+                    place: place.clone(),
+                    pointer_point: Some(self.dereference_points[&ordinal]),
+                    candidates: Vec::new(),
+                    reads_origin: false,
+                },
+                span,
+                scope,
+                BTreeSet::new(),
+            );
+        }
+        Ok(())
     }
 
     fn place_expressions_with_binding(

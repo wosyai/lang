@@ -43,6 +43,199 @@ fn prepare_initializer_test(
 }
 
 #[test]
+fn raw_address_of_checked_dereference_preserves_the_referent() {
+    let text = "%%start
+unit(*?u8) read_into = fn(destination) { destination; };
+unit(*!u8) step = fn(view) { unsafe { read_into(&?*view); }; };
+unit(*?u8) raw = fn(view) { unsafe { read_into(&?*view); }; };
+unit() wrapper = fn { u8[1] scratch = [0]; step(&!scratch[0]); };
+%%end";
+    let mut rejected = Vec::new();
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let standalone = derive_scalar_program_with_layout(&parsed.result, layout);
+        if !standalone.diagnostics.is_empty() {
+            rejected.push(format!(
+                "{layout:?} standalone: {:?}",
+                standalone.diagnostics
+            ));
+        }
+        let prepared = prepare_scalar_project(
+            vec![(
+                derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                Vec::new(),
+            )],
+            vec![source.clone()],
+            ScalarPreparationInputs {
+                target_layout: layout,
+            },
+        );
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                rejected.push(format!("{layout:?} project: {:?}", error.diagnostics));
+                continue;
+            }
+        };
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let cfg = build.reference_cfg(0, 1, None).unwrap();
+        assert_eq!(cfg.facts.len(), 1, "{cfg:?}");
+        let [(pointer, candidates)] = cfg
+            .points
+            .iter()
+            .filter_map(|point| match &point.kind {
+                CfgPointKind::ReadPlace {
+                    pointer_point: Some(pointer),
+                    candidates,
+                    reads_origin: false,
+                    ..
+                } => Some((pointer, candidates)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("one checked access: {cfg:?}");
+        };
+        let CfgPointKind::Read { binding } = &cfg.points[pointer.0].kind else {
+            panic!("one pointer read: {cfg:?}");
+        };
+        let [candidate] = candidates.as_slice() else {
+            panic!("one checked referent: {cfg:?}");
+        };
+        assert_eq!(&candidate.binding, binding);
+        assert!(!cfg.points.iter().any(|point| matches!(
+            point.kind,
+            CfgPointKind::Borrow { .. }
+                | CfgPointKind::Move { .. }
+                | CfgPointKind::MoveThrough { .. }
+        )));
+        let raw_cfg = build.reference_cfg(0, 2, None).unwrap();
+        assert!(!raw_cfg
+            .points
+            .iter()
+            .any(|point| matches!(point.kind, CfgPointKind::ReadPlace { .. })));
+        let width = layout.pointer_size * 8;
+        for (project, partition) in [
+            (false, emit_scalar_build_single_module_llvm(&build)),
+            (true, emit_scalar_build_project_llvm(&build)),
+            (false, emit_scalar_llvm(&standalone)),
+        ] {
+            let ir = partition.unwrap().to_text();
+            let symbol = |name| self_tail_test_symbol(&source, project, name);
+            for (name, checked) in [("step", true), ("raw", false)] {
+                let body = self_tail_test_body(&ir, "void", &symbol(name));
+                assert_eq!(body.contains("icmp eq"), checked, "{body}");
+                assert!(body.contains(&format!("inttoptr i{width}")), "{body}");
+                assert!(
+                    body.contains(&format!("%address = ptrtoint ptr %deref to i{width}")),
+                    "{body}"
+                );
+                assert!(
+                    body.contains(&format!(
+                        "call void @{}(i{width} %address)",
+                        symbol("read_into")
+                    )),
+                    "{body}"
+                );
+                assert!(!body.contains("load i8, ptr"), "{body}");
+            }
+        }
+    }
+    assert!(rejected.is_empty(), "{rejected:#?}");
+}
+
+#[test]
+fn raw_address_of_checked_dereference_preserves_unsafe_and_invalidation_diagnostics() {
+    let outside = "%%start\nunit(*!u8) step = fn(view) { &?*view; };\n%%end";
+    let wrong = "%%start\nunit(u8) step = fn(view) { unsafe { &?*view; }; };\n%%end";
+    let expired = "%%start
+unit(u64) step = fn(count) {
+    u8[count] bytes;
+    *!u8 view = &!bytes[0];
+    unsafe { core.invalidate(&bytes); &?*view; };
+};
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (text, build_error, code, message, label) in [
+            (
+                outside,
+                false,
+                "B0012",
+                "raw address requires an unsafe block",
+                "&?*view",
+            ),
+            (wrong, false, "B0003", "cannot dereference value", "*view"),
+            (
+                expired,
+                true,
+                "B0003",
+                "missing checked-reference origin",
+                "view",
+            ),
+        ] {
+            let source = SourceIdentity::new(
+                "project".into(),
+                "package".into(),
+                "src/main.w".into(),
+                "r1".into(),
+            );
+            let parsed = parse_source(source.clone(), text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let standalone = derive_scalar_program_with_layout(&parsed.result, layout);
+            let project = prepare_scalar_project(
+                vec![(
+                    derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                    Vec::new(),
+                )],
+                vec![source.clone()],
+                ScalarPreparationInputs {
+                    target_layout: layout,
+                },
+            );
+            let project_diagnostics = if build_error {
+                let prepared = project.unwrap();
+                let build = analyze_scalar_build(&prepared);
+                assert!(emit_scalar_build_single_module_llvm(&build).is_err());
+                assert!(emit_scalar_build_project_llvm(&build).is_err());
+                build.diagnostics().to_vec()
+            } else {
+                project
+                    .err()
+                    .expect("preparation error")
+                    .into_ordered_diagnostics()
+            };
+            assert_eq!(project_diagnostics, standalone.diagnostics);
+            let start = text.rfind(label).unwrap() as u32;
+            let end = start + label.len() as u32;
+            if !build_error {
+                assert_eq!(project_diagnostics.len(), 1, "{project_diagnostics:?}");
+            }
+            assert_eq!(
+                project_diagnostics
+                    .iter()
+                    .filter(|diagnostic| {
+                        diagnostic.code == code
+                            && diagnostic.message == message
+                            && diagnostic.labels[0].span.source == source
+                            && diagnostic.labels[0].span.range == ByteSpan::new(start, end)
+                    })
+                    .count(),
+                1,
+                "{project_diagnostics:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn prepared_self_tail_stages_crossed_arguments_before_reusing_entry_slots() {
     let text = "%%start
 i32 phase = 0;
