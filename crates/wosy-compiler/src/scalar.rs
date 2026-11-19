@@ -2364,12 +2364,12 @@ use resolution::{
 mod typecheck;
 use typecheck::{
     block_item_type_in_module, block_type_in_module, block_type_in_module_expected,
-    call_output_sequence_in_module, check_final_output_prefix, declare_module_name,
-    expect_module_type, expression_span, expression_type_in_module_expected, is_integer_type,
-    is_module_private_name, module_diagnostic, operator, unused_binding_spans, validate,
-    validate_extern, validate_identifier_style, validate_module_generic_type, validate_module_type,
-    validate_output_receivers_in_module, validate_overload_tail_conditionals,
-    validate_tail_conditional_return, validate_unit_if_positions_in_module, TailConditionalTyping,
+    check_final_output_prefix, declare_module_name, expect_module_type, expression_span,
+    expression_type_in_module_expected, is_integer_type, is_module_private_name, module_diagnostic,
+    operator, unused_binding_spans, validate, validate_extern, validate_identifier_style,
+    validate_module_generic_type, validate_module_type, validate_output_receivers_in_module,
+    validate_overload_tail_conditionals, validate_tail_conditional_return,
+    validate_unit_if_positions_in_module, TailConditionalTyping,
 };
 use typecheck::{split_module_typing, ScalarModuleTyping, ScalarProgramTyping};
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
@@ -2723,42 +2723,17 @@ fn typecheck_scalar_project_with_occurrences(
                                 .final_expressions()
                                 .next()
                                 .expect("final output");
-                            if let Some(actual_outputs) = call_output_sequence_in_module(
-                                expression, &scope, module, &modules, &overloads,
-                            ) {
-                                expression_type_in_module_expected(
-                                    expression,
-                                    actual_outputs.outputs.first().map(|output| &output.ty),
-                                    &scope,
-                                    &visible_names,
-                                    &folded_names,
-                                    module,
-                                    &modules,
-                                    &mut diagnostics,
-                                    false,
-                                    &overloads,
-                                    &mut inference,
-                                );
-                                if actual_outputs.outputs.len() != outputs.outputs.len() {
-                                    diagnostics.push(module_diagnostic(
-                                        module,
-                                        "B0004",
-                                        "function output arity does not match its final output list",
-                                        value.span,
-                                    ));
-                                }
-                                for (actual, expected) in
-                                    actual_outputs.outputs.iter().zip(&outputs.outputs)
-                                {
-                                    expect_module_type(
-                                        module,
-                                        &expected.ty,
-                                        &actual.ty,
-                                        value.span,
-                                        &mut diagnostics,
-                                    );
-                                }
-                            }
+                            typing.validate_sole_final_call(
+                                expression,
+                                value.span,
+                                outputs,
+                                &scope,
+                                &visible_names,
+                                &folded_names,
+                                &mut diagnostics,
+                                &overloads,
+                                &mut inference,
+                            );
                         } else {
                             if function.body.final_output_values.len() > 1
                                 && function.body.final_output_values.len() != outputs.outputs.len()

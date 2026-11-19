@@ -228,7 +228,7 @@ fn contains_fixed_array(ty: &ScalarType) -> bool {
     }
 }
 
-pub(super) fn call_output_sequence_in_module(
+fn call_output_sequence_in_module(
     expression: &ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,
     module: &ScalarModuleTyping<'_>,
@@ -559,6 +559,86 @@ pub(super) enum TailConditionalTyping<'a> {
 }
 
 impl TailConditionalTyping<'_> {
+    pub(super) fn validate_sole_final_call(
+        self,
+        expression: &ScalarExpression,
+        span: ByteSpan,
+        outputs: &ScalarOutputSequence,
+        scope: &BTreeMap<String, ScalarType>,
+        visible_names: &BTreeSet<String>,
+        folded_names: &BTreeMap<String, (String, ByteSpan)>,
+        diagnostics: &mut Vec<super::Diagnostic>,
+        overloads: &ScalarTypingView<'_>,
+        inference: &mut ScalarInferenceBuilder<'_>,
+    ) {
+        let preliminary_outputs = match self {
+            Self::Program(program) => call_output_sequence(expression, scope, program, overloads),
+            Self::Module { module, modules } => {
+                call_output_sequence_in_module(expression, scope, module, modules, overloads)
+            }
+        };
+        let expected = match &preliminary_outputs {
+            Some(actual) => actual.outputs.first().map(|output| &output.ty),
+            None => Some(&outputs.outputs[0].ty),
+        };
+        let diagnostics_before_call = diagnostics.len();
+        let actual = match self {
+            Self::Program(_) => self.expression_type(
+                expression,
+                expected,
+                scope,
+                visible_names,
+                folded_names,
+                diagnostics,
+                false,
+                overloads,
+                inference,
+            ),
+            Self::Module { module, modules } => expression_type_in_module_expected(
+                expression,
+                expected,
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                false,
+                overloads,
+                inference,
+            ),
+        };
+        let actual_outputs = match &preliminary_outputs {
+            Some(actual) => actual,
+            None => {
+                if is_error_type(&actual) || diagnostics.len() != diagnostics_before_call {
+                    return;
+                }
+                let Some(checked) = inference.checked_call_outputs(expression) else {
+                    return;
+                };
+                checked
+            }
+        };
+        if actual_outputs.outputs.len() != outputs.outputs.len() {
+            diagnostics.push(self.diagnostic(
+                "B0004",
+                "function output arity does not match its final output list",
+                span,
+            ));
+        }
+        for (actual, expected) in actual_outputs.outputs.iter().zip(&outputs.outputs) {
+            match self {
+                Self::Program(program) => {
+                    expect_type(program, &expected.ty, &actual.ty, span, diagnostics);
+                }
+                Self::Module { module, .. } => {
+                    expect_module_type(module, &expected.ty, &actual.ty, span, diagnostics);
+                }
+            }
+        }
+    }
+
     pub(super) fn validate_secondary_binding_initializers(
         self,
         binding: &ScalarBinding,
@@ -6621,45 +6701,17 @@ pub(super) fn validate(
                             .final_expressions()
                             .next()
                             .expect("final output");
-                        if let Some(actual_outputs) =
-                            call_output_sequence(expression, &scope, program, overloads)
-                        {
-                            expression_type_expected(
-                                expression,
-                                &actual_outputs
-                                    .outputs
-                                    .first()
-                                    .map(|output| &output.ty)
-                                    .expect("multi-output final call has an output"),
-                                &scope,
-                                &visible_names,
-                                &folded_names,
-                                program,
-                                &mut diagnostics,
-                                false,
-                                overloads,
-                                inference,
-                            );
-                            if actual_outputs.outputs.len() != outputs.outputs.len() {
-                                diagnostics.push(diagnostic(
-                                    program,
-                                    "B0004",
-                                    "function output arity does not match its final output list",
-                                    value.span,
-                                ));
-                            }
-                            for (actual, expected) in
-                                actual_outputs.outputs.iter().zip(&outputs.outputs)
-                            {
-                                expect_type(
-                                    program,
-                                    &expected.ty,
-                                    &actual.ty,
-                                    value.span,
-                                    &mut diagnostics,
-                                );
-                            }
-                        }
+                        typing.validate_sole_final_call(
+                            expression,
+                            value.span,
+                            outputs,
+                            &scope,
+                            &visible_names,
+                            &folded_names,
+                            &mut diagnostics,
+                            overloads,
+                            inference,
+                        );
                     } else {
                         if function.body.final_output_values.len() > 1
                             && function.body.final_output_values.len() != outputs.outputs.len()

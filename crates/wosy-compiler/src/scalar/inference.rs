@@ -263,6 +263,16 @@ impl<'a> ScalarInferenceBuilder<'a> {
         );
     }
 
+    pub(super) fn checked_call_outputs(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Option<&ScalarOutputSequence> {
+        self.occurrences
+            .calls
+            .get(&std::ptr::from_ref(expression))
+            .map(|signature| &signature.outputs)
+    }
+
     pub(super) fn record_tail_conditional_outputs(
         &mut self,
         expression: &ScalarExpression,

@@ -1,6 +1,216 @@
 use super::*;
 
 #[test]
+fn sole_final_extern_call_rejects_explicit_type_arguments_on_both_routes() {
+    let call = "disk.read<i32>()";
+    let text = "%%start
+disk = extern wasm \"disk_abi\" { (i32, u64)() read; };
+(i32, u64)() run = fn { disk.read<i32>() };
+%%end";
+    let root = source();
+    let parsed = parse_source(root.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let cst = parsed.result.canonical_cst();
+    let start = text.find(call).unwrap() as u32;
+    let span = SourceSpan::new(
+        root.clone(),
+        ByteSpan::new(start, start + call.len() as u32),
+    );
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_from_cst_with_layout(cst, target_layout);
+        let Err(project) = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(cst), Vec::new())],
+            vec![root.clone()],
+            ScalarPreparationInputs { target_layout },
+        ) else {
+            panic!("{target_layout:?}: project accepted explicit extern type arguments");
+        };
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{target_layout:?}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.code, "B0004");
+            assert_eq!(
+                diagnostic.message,
+                "generic argument arity does not match callable declaration"
+            );
+            let [label] = diagnostic.labels.as_slice() else {
+                panic!("{diagnostic:?}");
+            };
+            assert_eq!(label.kind, crate::DiagnosticLabelKind::Primary);
+            assert_eq!(label.span, span);
+        }
+    }
+}
+
+#[test]
+fn sole_final_namespace_call_reports_missing_member_on_both_targets() {
+    let text = "%%start
+lib = namespace package \"library.w\";
+(i32, u64)() run = fn { lib.missing() };
+%%end";
+    let root = source();
+    let dependency = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "library.w".into(),
+        "r1".into(),
+    );
+    let parsed = parse_source(root.clone(), text.into(), &[]);
+    let imported = parse_source(
+        dependency.clone(),
+        "%%start\ni32 present = 1;\n%%end".into(),
+        &[],
+    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    assert!(
+        imported.diagnostics.is_empty(),
+        "{:?}",
+        imported.diagnostics
+    );
+    let start = text.find("missing").unwrap() as u32;
+    let span = SourceSpan::new(root.clone(), ByteSpan::new(start, start + 7));
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let namespace = declarations.namespaces().next().unwrap();
+        let binding = ScalarNamespaceBinding {
+            binding: namespace.binding.clone(),
+            target: dependency.clone(),
+            span: namespace.binding_span,
+        };
+        let Err(failure) = prepare_scalar_project(
+            vec![
+                (declarations, vec![binding]),
+                (
+                    derive_scalar_declarations_from_cst(imported.result.canonical_cst()),
+                    Vec::new(),
+                ),
+            ],
+            vec![dependency.clone(), root.clone()],
+            ScalarPreparationInputs { target_layout },
+        ) else {
+            panic!("{target_layout:?}: project accepted missing namespace member");
+        };
+        let [diagnostic] = failure.diagnostics.as_slice() else {
+            panic!("{target_layout:?}: {:?}", failure.diagnostics);
+        };
+        assert_eq!(diagnostic.code, "M0002");
+        assert_eq!(diagnostic.message, "unknown module member");
+        let [primary, secondary] = diagnostic.labels.as_slice() else {
+            panic!("{diagnostic:?}");
+        };
+        assert_eq!(primary.kind, crate::DiagnosticLabelKind::Primary);
+        assert_eq!(primary.span, span);
+        assert_eq!(secondary.kind, crate::DiagnosticLabelKind::Secondary);
+        assert_eq!(
+            secondary.span,
+            SourceSpan::new(dependency.clone(), ByteSpan::new(0, 0))
+        );
+    }
+}
+
+#[test]
+fn sole_final_contextual_overload_validates_selected_output_positions() {
+    let call = "choose(1)";
+    for (second_output, valid) in [("bool", true), ("u8", false)] {
+        let text = format!(
+            "%%start
+choose = overload {{
+    (i32, u8)(i32) => fn(value) {{ u8 byte = 1; value, byte }};
+    (i64, bool)(i64) => fn(value) {{ value, true }};
+}};
+(i64, {second_output})() run = fn {{ {call} }};
+%%end"
+        );
+        let root = source();
+        let start = text.find(call).unwrap() as u32;
+        let span = SourceSpan::new(
+            root.clone(),
+            ByteSpan::new(start, start + call.len() as u32),
+        );
+        let parsed = parse_source(root.clone(), text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let cst = parsed.result.canonical_cst();
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let single = derive_scalar_program_from_cst_with_layout(cst, target_layout);
+            let project = prepare_scalar_project(
+                vec![(derive_scalar_declarations_from_cst(cst), Vec::new())],
+                vec![root.clone()],
+                ScalarPreparationInputs { target_layout },
+            );
+            if valid {
+                assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+                assert!(project.is_ok(), "{:?}", project.err());
+            } else {
+                let Err(project) = project else {
+                    panic!("{target_layout:?}: project accepted mismatched second output");
+                };
+                for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                    let [diagnostic] = diagnostics.as_slice() else {
+                        panic!("{target_layout:?}: {diagnostics:?}");
+                    };
+                    assert_eq!(diagnostic.code, "B0003");
+                    assert_eq!(
+                        diagnostic.message,
+                        "expression type does not match expected type"
+                    );
+                    assert_eq!(diagnostic.labels[0].span, span);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sole_final_call_with_known_empty_outputs_reports_arity_on_both_routes() {
+    let call = "disk.discard()";
+    let text = "%%start
+disk = extern wasm \"disk_abi\" { unit() discard; };
+(i32, u64)() run = fn { disk.discard() };
+%%end";
+    let root = source();
+    let parsed = parse_source(root.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let declarations = || {
+        let mut declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let ScalarItem::Extern(extern_decl) = &mut declarations.items[0] else {
+            panic!("extern declaration");
+        };
+        let ScalarType::Callable { outputs, .. } = &mut extern_decl.functions[0].signature else {
+            panic!("extern callable");
+        };
+        outputs.outputs.clear();
+        declarations
+    };
+    let start = text.find(call).unwrap() as u32;
+    let span = SourceSpan::new(
+        root.clone(),
+        ByteSpan::new(start, start + call.len() as u32),
+    );
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = typecheck_scalar_program(declarations(), target_layout);
+        let Err(project) = prepare_scalar_project(
+            vec![(declarations(), Vec::new())],
+            vec![root.clone()],
+            ScalarPreparationInputs { target_layout },
+        ) else {
+            panic!("{target_layout:?}: project accepted empty final call outputs");
+        };
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{target_layout:?}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.code, "B0004");
+            assert_eq!(
+                diagnostic.message,
+                "function output arity does not match its final output list"
+            );
+            assert_eq!(diagnostic.labels[0].span, span);
+        }
+    }
+}
+
+#[test]
 fn raw_project_preparation_resolves_branch_local_aggregate_types() {
     let root = source();
     let dependency = SourceIdentity::new(
