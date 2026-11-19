@@ -18,6 +18,172 @@ fn child(structure: &OccurrenceStructure, parent: Parent, edge: Edge) -> Occurre
 }
 
 #[test]
+fn prepare_rejects_nested_extern_symbols_through_either_import_alias() {
+    let text = "%%start
+left = namespace package \"library.w\";
+right = namespace package \"library.w\";
+i32 first = left.read(1);
+i32 second = if (true) { right.read(2) } else { 0 };
+%%end";
+    let main = parsed(text);
+    let library_source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "library.w".into(),
+        "r1".into(),
+    );
+    let library = parse_source(
+        library_source.clone(),
+        "%%start
+left = extern wasm \"left_abi\" { i32() read; };
+right = extern wasm \"right_abi\" { i32(i32) read; };
+%%end"
+            .into(),
+        &[],
+    );
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let main_declarations = derive_scalar_declarations_from_cst(main.canonical_cst());
+        let namespaces = [0, 1]
+            .map(|item| {
+                let ScalarItem::Namespace(namespace) = &main_declarations.items[item] else {
+                    panic!("namespace declaration")
+                };
+                ScalarNamespaceBinding {
+                    binding: namespace.binding.clone(),
+                    target: library_source.clone(),
+                    span: namespace.binding_span,
+                }
+            })
+            .to_vec();
+        let scope = Scope::new();
+        let Err(failure) = crate::prepare_scalar_project(
+            vec![
+                (main_declarations, namespaces),
+                (
+                    derive_scalar_declarations_from_cst(library.result.canonical_cst()),
+                    Vec::new(),
+                ),
+            ],
+            vec![library_source.clone(), main.source.clone()],
+            crate::ScalarPreparationInputs { target_layout },
+        ) else {
+            panic!("{target_layout:?}: imported nested extern symbols passed preparation");
+        };
+        assert_eq!(scope.counts(), Counts::default());
+        assert_eq!(
+            failure.diagnostics.len(),
+            2,
+            "{target_layout:?}: {failure:?}"
+        );
+        for (alias, diagnostic) in ["left.", "right."].into_iter().zip(&failure.diagnostics) {
+            let start = (text.find(&format!("{alias}read")).unwrap() + alias.len()) as u32;
+            assert_eq!(diagnostic.code, "M0002");
+            assert_eq!(diagnostic.message, "unknown module member");
+            let [primary, secondary] = diagnostic.labels.as_slice() else {
+                panic!("namespace diagnostic labels: {diagnostic:?}");
+            };
+            assert_eq!(primary.kind, crate::DiagnosticLabelKind::Primary);
+            assert_eq!(
+                primary.span,
+                SourceSpan::new(main.source.clone(), ByteSpan::new(start, start + 4)),
+            );
+            assert_eq!(secondary.kind, crate::DiagnosticLabelKind::Secondary);
+            assert_eq!(
+                secondary.span,
+                SourceSpan::new(library_source.clone(), ByteSpan::new(0, 0)),
+            );
+        }
+    }
+}
+
+#[test]
+fn prepares_and_builds_local_extern_with_same_named_generic_on_both_targets() {
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (call, valid) in [("disk.read()", true), ("disk.read<i32>()", false)] {
+            let text = format!(
+                "%%start
+generic T;
+T(T) read = fn(value) {{ value }};
+disk = extern wasm \"disk_abi\" {{ (i32, u64)() read; }};
+(i32, u64)() run = fn {{
+    i32 first, u64 second = {call};
+    first, second
+}};
+%%end"
+            );
+            let parsed = parsed(&text);
+            let declarations = derive_scalar_declarations_from_cst(parsed.canonical_cst());
+            let start = text.find(call).unwrap() as u32;
+            let call_span = SourceSpan::new(
+                parsed.source.clone(),
+                ByteSpan::new(start, start + call.len() as u32),
+            );
+            let result = crate::prepare_scalar_project(
+                vec![(declarations, Vec::new())],
+                vec![parsed.source.clone()],
+                crate::ScalarPreparationInputs { target_layout },
+            );
+            if valid {
+                let prepared = result.unwrap_or_else(|failure| {
+                    panic!("{target_layout:?}: {:?}", failure.diagnostics)
+                });
+                let module = &prepared.project().modules[0];
+                let [ScalarItem::Function(_), ScalarItem::Extern(extern_decl), ScalarItem::Function(_)] =
+                    module.items.as_slice()
+                else {
+                    panic!("generic, extern, and caller declarations");
+                };
+                let caller = prepared.calls.function(0, 2);
+                let [site] = caller.sites.as_slice() else {
+                    panic!("one resolved call site");
+                };
+                assert_eq!(site.source_span, call_span);
+                assert_eq!(
+                    site.target,
+                    ResolvedCallTarget::ExternCallable {
+                        source: module.source.clone(),
+                        declaration_span: extern_decl.functions[0].name_span,
+                    },
+                );
+                let call = caller.call_occurrences[0].ordinal;
+                assert_signature(
+                    &caller.checked_call_signatures[&call],
+                    &[],
+                    &[ScalarType::I32, ScalarType::U64],
+                    None,
+                );
+                let build = crate::analyze_scalar_build(&prepared);
+                assert!(
+                    build.diagnostics().is_empty(),
+                    "{target_layout:?}: {:?}",
+                    build.diagnostics()
+                );
+                assert!(build.reference_cfg(0, 2, None).is_some());
+            } else {
+                let Err(failure) = result else {
+                    panic!("{target_layout:?}: explicit extern type argument passed preparation");
+                };
+                let [diagnostic] = failure.diagnostics.as_slice() else {
+                    panic!("{target_layout:?}: {:?}", failure.diagnostics);
+                };
+                assert_eq!(diagnostic.code, "B0004");
+                assert_eq!(
+                    diagnostic.message,
+                    "generic argument arity does not match callable declaration"
+                );
+                let [label] = diagnostic.labels.as_slice() else {
+                    panic!("one primary call label: {diagnostic:?}");
+                };
+                assert_eq!(label.kind, crate::DiagnosticLabelKind::Primary);
+                assert_eq!(label.span, call_span);
+            }
+        }
+    }
+}
+
+#[test]
 fn public_prepare_retains_checked_expression_and_place_types_by_occurrence() {
     let parsed = parsed(
         "%%start\nu16 initial = 1;\n\

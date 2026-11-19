@@ -404,60 +404,38 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                     modules,
                 );
             }
-            let target = receiver.as_ref().map_or(module, |binding| {
-                module
+            let qualified = if let Some(binding) = receiver.as_deref() {
+                if let Some(namespace) = module
                     .namespace_bindings
                     .iter()
-                    .find(|namespace| namespace.binding == *binding)
-                    .and_then(|namespace| {
-                        modules
-                            .iter()
-                            .find(|candidate| candidate.source == namespace.target)
-                            .copied()
-                    })
-                    .unwrap_or(module)
-            });
-            let qualified = receiver
-                .as_deref()
-                .filter(|binding| {
-                    target.items.iter().any(|item| {
-                        matches!(
-                            item,
-                            ScalarItem::Extern(extern_decl)
-                                if extern_decl.binding == *binding
-                                    && extern_decl.functions.iter().any(|function| function.name == *name)
-                        )
-                    })
-                })
-                .map_or_else(
-                    || project_function_name(&target.source, name),
-                    |binding| {
-                        let import_module = target
-                            .items
-                            .iter()
-                            .find_map(|item| match item {
-                                ScalarItem::Extern(extern_decl)
-                                    if extern_decl.binding == binding
-                                        && extern_decl.functions.iter().any(|function| function.name == *name) =>
-                                {
-                                    match &extern_decl.actual_module {
-                                        crate::scalar::ScalarExternModule::Valid(import_module) => {
-                                            Some(import_module.as_str())
-                                        }
-                                        crate::scalar::ScalarExternModule::Invalid { .. } => None,
-                                    }
-                                }
-                                _ => None,
-                            })
-                            .expect("validated extern module");
-                        project_extern_lookup_key(
-                            &target.source,
-                            binding,
-                            import_module,
-                            name,
-                        )
-                    },
-                );
+                    .find(|namespace| namespace.binding == binding)
+                {
+                    let target = modules
+                        .iter()
+                        .find(|candidate| candidate.source == namespace.target)
+                        .ok_or_else(|| format!("unknown LLVM namespace {binding}"))?;
+                    project_function_name(&target.source, name)
+                } else {
+                    let declaration = module
+                        .items
+                        .iter()
+                        .find_map(|item| match item {
+                            ScalarItem::Extern(declaration) if declaration.binding == binding => {
+                                Some(declaration)
+                            }
+                            _ => None,
+                        })
+                        .ok_or_else(|| format!("unknown LLVM extern binding {binding}"))?;
+                    let crate::scalar::ScalarExternModule::Valid(import_module) =
+                        &declaration.actual_module
+                    else {
+                        return Err(format!("invalid LLVM extern module for {binding}"));
+                    };
+                    project_extern_lookup_key(&module.source, binding, import_module, name)
+                }
+            } else {
+                project_function_name(&module.source, name)
+            };
             let lookup = overload_selection
                 .as_ref()
                 .map(|selection| selected_overload_lookup_key(&qualified, selection));

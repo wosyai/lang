@@ -193,6 +193,58 @@ fn late_extern_member_is_available_to_outputs_and_standalone_but_first_project_b
 }
 
 #[test]
+fn local_extern_output_lookup_ignores_same_named_generic_and_overload() {
+    for ordinary in [
+        "generic T;\nT(T) read = fn(value) { value };",
+        "read = overload { bool() => fn { true }; };",
+    ] {
+        let parsed = parse_source(
+            source(),
+            format!("%%start\n{ordinary}\ndisk = extern wasm \"helper\" {{ (i32, u64)() read; }};\n%%end"),
+            &[],
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let program = derive_scalar_program(&parsed.result);
+        assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+        let mut modules = [ScalarModule::from_program(program.program, Vec::new())];
+        let environment = ScalarOverloadEnvironment::project(&modules);
+        let view = environment.typing(0);
+        let (modules, items) = split_module_typing(&mut modules);
+        let outputs = |expression: &ScalarExpression| {
+            call_output_sequence_in_module(
+                expression,
+                modules[0].members,
+                &modules[0],
+                &modules,
+                &view,
+            )
+        };
+        let sequence = outputs(&call(Some("disk"), "read", Vec::new())).unwrap();
+        assert_eq!(
+            sequence
+                .outputs
+                .into_iter()
+                .map(|output| output.ty)
+                .collect::<Vec<_>>(),
+            [ScalarType::I32, ScalarType::U64],
+        );
+        let typed_call = call(Some("disk"), "read", vec![type_argument()]);
+        assert!(outputs(&typed_call).is_none());
+        assert_eq!(
+            module_type(&modules, &items, 0, &view, &typed_call),
+            (
+                ScalarType::Error,
+                vec![expected(
+                    modules[0].source,
+                    "B0004",
+                    "generic argument arity does not match callable declaration",
+                )],
+            ),
+        );
+    }
+}
+
+#[test]
 fn duplicate_extern_markers_keep_standalone_or_project_first_and_qualified_lexical_precedence() {
     for same_declaration in [false, true] {
         let mut program = program();
@@ -416,13 +468,14 @@ fn local_ordinal_and_first_import_source_choose_independent_generic_headers() {
 }
 
 #[test]
-fn imported_extern_name_presence_keeps_visibility_gate_and_includes_private_names() {
+fn imported_generic_visibility_and_outputs_follow_top_level_binding() {
     for visible in [false, true] {
         let mut target = program();
         let ScalarItem::Function(function) = &mut target.items[0] else {
             panic!("function")
         };
-        function.name = "_private".into();
+        let name = if visible { "read" } else { "_private" };
+        function.name = name.into();
         function.generic_parameters = vec![ScalarGenericParameter {
             name: "T".into(),
             span: ByteSpan::new(1, 2),
@@ -435,13 +488,8 @@ fn imported_extern_name_presence_keeps_visibility_gate_and_includes_private_name
             panic!("extern")
         };
         declaration.binding = "unrelated_binding".into();
-        declaration.functions[0].name = "_private".into();
-        let mut target = ScalarModule::from_program(target, Vec::new());
-        if visible {
-            target
-                .members
-                .insert("_private".into(), callable(ScalarType::I32));
-        }
+        declaration.functions[0].name = name.into();
+        let target = ScalarModule::from_program(target, Vec::new());
         let mut current_program = program();
         current_program.source = SourceIdentity::new(
             "other".into(),
@@ -461,23 +509,23 @@ fn imported_extern_name_presence_keeps_visibility_gate_and_includes_private_name
         let environment = ScalarOverloadEnvironment::project(&modules);
         let view = environment.typing(1);
         let (modules, items) = split_module_typing(&mut modules);
-        let expression = call(Some("peer"), "_private", vec![type_argument()]);
-        assert!(call_output_sequence_in_module(
+        let expression = call(Some("peer"), name, vec![type_argument()]);
+        let outputs = call_output_sequence_in_module(
             &expression,
             &modules[1].members,
             &modules[1],
             &modules,
-            &view
-        )
-        .is_none());
-        let diagnostic = if visible {
-            expected(
-                &modules[1].source,
-                "B0004",
-                "generic argument arity does not match callable declaration",
-            )
+            &view,
+        );
+        let actual = module_type(&modules, &items, 1, &view, &expression);
+        if visible {
+            let outputs = outputs.expect("public generic output");
+            assert_eq!(outputs.outputs.len(), 1);
+            assert_eq!(outputs.outputs[0].ty, ScalarType::I32);
+            assert_eq!(actual, (ScalarType::I32, Vec::new()));
         } else {
-            Diagnostic {
+            assert!(outputs.is_none());
+            let diagnostic = Diagnostic {
                 code: "M0002".into(),
                 severity: DiagnosticSeverity::Error,
                 message: "unknown module member".into(),
@@ -494,11 +542,8 @@ fn imported_extern_name_presence_keeps_visibility_gate_and_includes_private_name
                     },
                 ],
                 notes: Vec::new(),
-            }
-        };
-        assert_eq!(
-            module_type(&modules, &items, 1, &view, &expression),
-            (ScalarType::Error, vec![diagnostic])
-        );
+            };
+            assert_eq!(actual, (ScalarType::Error, vec![diagnostic]));
+        }
     }
 }

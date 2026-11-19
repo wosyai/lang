@@ -2055,15 +2055,7 @@ impl ScalarModule {
         let mut initialization_nodes = Vec::new();
         for (item_index, item) in items.iter().enumerate() {
             let (name, ty, span) = match item {
-                ScalarItem::Namespace(_) => continue,
-                ScalarItem::Extern(extern_decl) => {
-                    for function in &extern_decl.functions {
-                        if !is_module_private_name(&function.name) {
-                            members.insert(function.name.clone(), function.signature.clone());
-                        }
-                    }
-                    continue;
-                }
+                ScalarItem::Namespace(_) | ScalarItem::Extern(_) => continue,
                 ScalarItem::Binding(binding) => {
                     (&binding.name, &binding.declared_type, binding.span)
                 }

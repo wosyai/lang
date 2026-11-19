@@ -4684,7 +4684,7 @@ fn rejects_undeclared_extern_type_arguments_and_preserves_valid_calls() {
 }
 
 #[test]
-fn rejects_undeclared_project_extern_type_arguments_at_call_span() {
+fn rejects_unexported_project_extern_symbol_at_member_span() {
     let main_source = module_source("src/main.w");
     let library_source = module_source("src/library.w");
     let main_text = "%%start\nlibrary = namespace app \"src/library.w\";\nu64 first, bool second = library.read<u32>();\n%%end";
@@ -4714,17 +4714,69 @@ fn rejects_undeclared_project_extern_type_arguments_at_call_span() {
         validation.diagnostics
     );
     let diagnostic = &validation.diagnostics[0];
-    assert_eq!(diagnostic.code, "B0004");
-    assert_eq!(
-        diagnostic.message,
-        "generic argument arity does not match callable declaration"
-    );
+    assert_eq!(diagnostic.code, "M0002");
+    assert_eq!(diagnostic.message, "unknown module member");
     assert_eq!(diagnostic.labels[0].span.source, main_source);
-    let start = main_text.find("library.read<u32>()").expect("extern call") as u32;
+    let start = main_text.find("read<u32>()").expect("member token") as u32;
     assert_eq!(
         diagnostic.labels[0].span.range,
-        ByteSpan::new(start, start + 19)
+        ByteSpan::new(start, start + 4)
     );
+}
+
+#[test]
+fn rejects_wrong_type_argument_arity_at_project_local_extern_and_public_import_call_spans() {
+    let main_source = module_source("src/main.w");
+    let library_source = module_source("src/library.w");
+    let main_text = "%%start
+library = namespace app \"src/library.w\";
+disk = extern wasm \"helper\" { (u64, bool)() read; };
+u64 first, bool second = disk.read<u32>();
+u64 third, bool fourth = library.read<u64, u32>();
+%%end";
+    let main = module_from_text(main_source.clone(), main_text);
+    let library = module_from_text(
+        library_source.clone(),
+        "%%start\ngeneric T;\n(T, bool)(T) read = fn(value) { value, true };\n%%end",
+    );
+    let validation = validate_scalar_project(ScalarProject::new(
+        vec![
+            ScalarModule::from_program(
+                main,
+                vec![ScalarNamespaceBinding {
+                    binding: "library".into(),
+                    target: library_source.clone(),
+                    span: ByteSpan::new(8, 15),
+                }],
+            ),
+            ScalarModule::new(library_source, library.items, Vec::new()),
+        ],
+        vec![main_source.clone()],
+    ));
+    assert_eq!(
+        validation.diagnostics.len(),
+        2,
+        "{:?}",
+        validation.diagnostics
+    );
+    for (call, diagnostic) in ["disk.read<u32>()", "library.read<u64, u32>()"]
+        .into_iter()
+        .zip(&validation.diagnostics)
+    {
+        assert_eq!(diagnostic.code, "B0004");
+        assert_eq!(
+            diagnostic.message,
+            "generic argument arity does not match callable declaration"
+        );
+        let start = main_text.find(call).unwrap() as u32;
+        assert_eq!(
+            diagnostic.labels[0].span,
+            SourceSpan::new(
+                main_source.clone(),
+                ByteSpan::new(start, start + call.len() as u32)
+            ),
+        );
+    }
 }
 
 #[test]

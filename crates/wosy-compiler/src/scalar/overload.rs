@@ -57,7 +57,6 @@ struct ScalarOverloadModule {
 struct ScalarCallableHeaders {
     generics: BTreeMap<String, Vec<ScalarGenericParameter>>,
     externs: BTreeMap<String, BTreeMap<String, ScalarExternMemberHeader>>,
-    extern_names: BTreeSet<String>,
 }
 
 pub(super) struct ScalarExternMemberHeader {
@@ -71,7 +70,6 @@ impl ScalarCallableHeaders {
     fn new(items: &[ScalarItem]) -> Self {
         let mut generics = BTreeMap::new();
         let mut externs = BTreeMap::<String, BTreeMap<String, ScalarExternMemberHeader>>::new();
-        let mut extern_names = BTreeSet::new();
         for item in items {
             match item {
                 ScalarItem::Function(function) => {
@@ -98,9 +96,6 @@ impl ScalarCallableHeaders {
                         .get_mut(&declaration.binding)
                         .expect("indexed extern binding");
                     for function in &declaration.functions {
-                        if !extern_names.contains(&function.name) {
-                            extern_names.insert(copy_name(&function.name));
-                        }
                         if let Some(member) = members.get_mut(&function.name) {
                             member.any_unsafe |= function.unsafe_marker;
                         } else {
@@ -119,11 +114,7 @@ impl ScalarCallableHeaders {
                 _ => {}
             }
         }
-        let headers = Self {
-            generics,
-            externs,
-            extern_names,
-        };
+        let headers = Self { generics, externs };
         #[cfg(test)]
         observations::record_callables(&headers);
         headers
@@ -164,12 +155,6 @@ impl ScalarTypingView<'_> {
             .externs
             .get(binding?)?
             .get(name)
-    }
-    pub(super) fn has_extern_name(&self, name: &str) -> bool {
-        self.environment.modules[self.ordinal]
-            .callables
-            .extern_names
-            .contains(name)
     }
     pub(super) fn first(
         &self,
@@ -694,7 +679,6 @@ pub(super) mod observations {
         pub ordinary_parameters: usize,
         pub extern_bindings: usize,
         pub extern_members: usize,
-        pub extern_names: usize,
         pub headers: usize,
         pub arms: usize,
         pub generics: usize,
@@ -883,7 +867,6 @@ pub(super) mod observations {
             payload.ordinary_parameters += headers.generics.values().map(Vec::len).sum::<usize>();
             payload.extern_bindings += headers.externs.len();
             payload.extern_members += headers.externs.values().map(BTreeMap::len).sum::<usize>();
-            payload.extern_names += headers.extern_names.len();
         });
     }
     pub(super) fn record_name(bytes: usize) {
@@ -1095,10 +1078,6 @@ mod tests {
                     type_payload(&member.signature, &mut payload);
                 }
             }
-            payload.extern_names += module.callables.extern_names.len();
-            for name in &module.callables.extern_names {
-                name_payload(name, &mut payload);
-            }
             source_payload(&module.source, &mut payload);
             for (name, ty) in &module.scope {
                 name_payload(name, &mut payload);
@@ -1136,7 +1115,6 @@ mod tests {
         let mut generics = BTreeMap::new();
         let mut externs =
             BTreeMap::<&str, BTreeMap<&str, (&ScalarExternFunction, bool, bool)>>::new();
-        let mut names = BTreeSet::new();
         for item in items {
             match item {
                 ScalarItem::Function(function) => {
@@ -1148,7 +1126,6 @@ mod tests {
                     let first = !externs.contains_key(declaration.binding.as_str());
                     let members = externs.entry(declaration.binding.as_str()).or_default();
                     for function in &declaration.functions {
-                        names.insert(function.name.as_str());
                         if let Some(member) = members.get_mut(function.name.as_str()) {
                             member.2 |= function.unsafe_marker;
                         } else {
@@ -1177,15 +1154,6 @@ mod tests {
                 assert_eq!(member.any_unsafe, any_unsafe);
             }
         }
-        assert_eq!(
-            header
-                .callables
-                .extern_names
-                .iter()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>(),
-            names
-        );
         let declarations = items
             .iter()
             .enumerate()
@@ -1329,7 +1297,6 @@ mod tests {
         let private = view.extern_member(Some("empty"), "_private").unwrap();
         assert!(!private.first_declaration);
         assert!(private.unsafe_marker);
-        assert!(view.has_extern_name("_private"));
         assert!(view.extern_member(None, "fetch").is_none());
         assert_module_membership(&environment.modules[0], &source(0), &items);
         let counts = scope.counts();
@@ -1345,7 +1312,6 @@ mod tests {
         assert_eq!(counts.snapshot.ordinary_parameters, 2);
         assert_eq!(counts.snapshot.extern_bindings, 2);
         assert_eq!(counts.snapshot.extern_members, 2);
-        assert_eq!(counts.snapshot.extern_names, 2);
         assert_eq!(counts.projections, observations::Payload::default());
         assert_zero_recording_copies(&counts);
     }

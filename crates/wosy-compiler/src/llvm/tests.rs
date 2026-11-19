@@ -4569,6 +4569,78 @@ fn emits_ordered_multi_output_project_namespace_calls() {
 }
 
 #[test]
+fn emits_local_extern_and_public_import_with_the_same_symbol_on_both_targets() {
+    let source = |path: &str| {
+        SourceIdentity::new("project".into(), "package".into(), path.into(), "r1".into())
+    };
+    let root = source("src/main.w");
+    let library = source("src/library.w");
+    let declarations = |source: &SourceIdentity, text: &str| {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+    };
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let main = declarations(
+            &root,
+            "%%start
+disk = namespace package \"src/library.w\";
+peer = namespace package \"src/library.w\";
+i32 first = disk.read(7);
+i32 second = peer.read(8);
+%%end",
+        );
+        let namespaces = main
+            .namespaces()
+            .map(|namespace| ScalarNamespaceBinding {
+                binding: namespace.binding.clone(),
+                target: library.clone(),
+                span: namespace.span,
+            })
+            .collect();
+        let dependency = declarations(
+            &library,
+            "%%start
+i32(i32) read = fn(value) { disk.read() + value };
+disk = extern wasm \"disk_abi\" { i32() read; };
+%%end",
+        );
+        let prepared = prepare_scalar_project(
+            vec![(main, namespaces), (dependency, Vec::new())],
+            vec![root.clone(), library.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|invalid| panic!("{target_layout:?}: {:?}", invalid.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let partition = emit_scalar_build_project_llvm(&build).expect("project LLVM");
+        let text = partition.to_text();
+        let public = project_function_name(&library, "read");
+        for value in [7, 8] {
+            assert!(
+                text.contains(&format!("call i32 @{public}(i32 {value})")),
+                "{text}"
+            );
+        }
+        let [external] = partition.declarations.as_slice() else {
+            panic!("one extern declaration: {text}");
+        };
+        assert_eq!(external.attributes[0].wasm_import_module, "disk_abi");
+        assert_eq!(external.attributes[0].wasm_import_name, "read");
+        let call = format!("call i32 @{}()", external.name);
+        let public_body = text
+            .split_once(&format!("define i32 @{public}("))
+            .unwrap()
+            .1
+            .split_once("\n}")
+            .unwrap()
+            .0;
+        assert!(public_body.contains(&call), "{text}");
+        assert_eq!(text.matches(&call).count(), 1, "{text}");
+    }
+}
+
+#[test]
 fn emits_project_binding_store_and_function_load() {
     let source = SourceIdentity::new(
         "project".into(),

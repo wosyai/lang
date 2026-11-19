@@ -245,8 +245,8 @@ pub(super) fn call_output_sequence_in_module(
     else {
         return None;
     };
-    let (callable, target, member_visible, target_view) = match receiver {
-        None => (scope.get(name), module, true, *overloads),
+    let (callable, target, target_view) = match receiver {
+        None => (scope.get(name), module, *overloads),
         Some(binding) => {
             let namespace = module
                 .namespace_bindings
@@ -257,66 +257,38 @@ pub(super) fn call_output_sequence_in_module(
                     .iter()
                     .find(|candidate| candidate.source == &namespace.target)?;
                 (
-                    target.members.get(name),
+                    Some(target.members.get(name)?),
                     target,
-                    target.members.contains_key(name),
                     overloads.imported(&target.source),
                 )
             } else {
-                (
-                    overloads
-                        .extern_member(Some(binding), name)
-                        .map(|member| &member.signature),
-                    module,
-                    true,
-                    *overloads,
-                )
+                if !type_arguments.is_empty() {
+                    return None;
+                }
+                let member = overloads.extern_member(Some(binding), name)?;
+                let ScalarType::Callable { outputs, .. } = &member.signature else {
+                    return None;
+                };
+                return Some(outputs.clone());
             }
         }
     };
-    if member_visible {
-        if let Some(overload_header) = overloads.first(&target.source, name) {
-            let argument_types = arguments
-                .iter()
-                .map(|argument| overload_argument_type(argument, scope))
-                .collect::<Option<Vec<_>>>()?;
-            let ScalarType::Callable { outputs, .. } =
-                resolve_overload_candidate(overload_header, &argument_types, None)
-                    .ok()?
-                    .0
-            else {
-                return None;
-            };
-            return Some(outputs);
-        }
+    if let Some(overload_header) = overloads.first(&target.source, name) {
+        let argument_types = arguments
+            .iter()
+            .map(|argument| overload_argument_type(argument, scope))
+            .collect::<Option<Vec<_>>>()?;
+        let ScalarType::Callable { outputs, .. } =
+            resolve_overload_candidate(overload_header, &argument_types, None)
+                .ok()?
+                .0
+        else {
+            return None;
+        };
+        return Some(outputs);
     }
     let callable = callable?;
-    let extern_callable = match receiver {
-        None => false,
-        Some(binding) => {
-            if let Some(namespace) = module
-                .namespace_bindings
-                .iter()
-                .find(|namespace| namespace.binding == *binding)
-            {
-                modules
-                    .iter()
-                    .find(|candidate| candidate.source == &namespace.target)
-                    .is_some_and(|target| overloads.imported(&target.source).has_extern_name(name))
-            } else {
-                overloads.extern_member(Some(binding), name).is_some()
-            }
-        }
-    };
-    if extern_callable && !type_arguments.is_empty() {
-        return None;
-    }
-    let generic_parameters = if member_visible {
-        target_view.generics(name)
-    } else {
-        None
-    };
-    let callable = if let Some(parameters) = generic_parameters {
+    let callable = if let Some(parameters) = target_view.generics(name) {
         substitute_generic_callable(callable, parameters, type_arguments)?
     } else {
         callable.clone()
@@ -3718,7 +3690,7 @@ fn check_expression_type_in_module(
                             Some(callable),
                             target,
                             false,
-                            overloads.imported(&target.source).has_extern_name(name),
+                            false,
                             overloads.imported(&target.source),
                         )
                     } else {
@@ -3762,7 +3734,11 @@ fn check_expression_type_in_module(
                 ));
                 return ScalarType::Error;
             }
-            let generic_parameters = target_view.generics(name);
+            let generic_parameters = if extern_callable {
+                None
+            } else {
+                target_view.generics(name)
+            };
             let callable = if let Some(generic_parameters) = generic_parameters {
                 let Some(callable) =
                     substitute_generic_callable(&callable, generic_parameters, type_arguments)
