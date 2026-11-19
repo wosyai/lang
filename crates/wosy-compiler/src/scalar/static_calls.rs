@@ -177,6 +177,17 @@ impl PreparedScalarProject {
         arm_index: Option<usize>,
         body: &'a ScalarBlock,
     ) -> Result<control::CallableBodyCallNodes<'a>, String> {
+        self.bind_body_with_proof(module_ordinal, item_ordinal, arm_index, body, None)
+    }
+
+    fn bind_body_with_proof<'a>(
+        &'a self,
+        module_ordinal: usize,
+        item_ordinal: usize,
+        arm_index: Option<usize>,
+        body: &'a ScalarBlock,
+        checked_proof: Option<reference::self_tail::checked::CheckedForwardingProof>,
+    ) -> Result<control::CallableBodyCallNodes<'a>, String> {
         let module = self.project.modules.get(module_ordinal).ok_or_else(|| {
             format!("internal error: missing callable body module at ordinal {module_ordinal}")
         })?;
@@ -189,7 +200,7 @@ impl PreparedScalarProject {
                     module.source,
                 )
             })?;
-        control::CallableBodyCallNodes::bind(&module.source, body, calls)
+        control::CallableBodyCallNodes::bind(&module.source, body, calls, checked_proof)
     }
 
     #[cfg(test)]
@@ -243,15 +254,11 @@ impl<'a> ScalarBuildValidation<'a> {
         &self.diagnostics
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "proof consumer is a separate unit")
-    )]
     pub(crate) fn checked_self_tail_forwarding(
         &self,
         module: usize,
         item: usize,
-    ) -> Option<reference::OccurrenceOrdinal> {
+    ) -> Option<reference::self_tail::checked::CheckedForwardingProof> {
         if !self.diagnostics.is_empty() {
             return None;
         }
@@ -265,6 +272,22 @@ impl<'a> ScalarBuildValidation<'a> {
             self.prepared.calls.function_body(module, item, None)?,
             self.reference_cfg(module, item, None)?,
         )
+    }
+
+    pub(crate) fn bind_original_project_body<'b>(
+        &'b self,
+        module: usize,
+        item: usize,
+        function: &'b ScalarFunction,
+    ) -> Result<control::CallableBodyCallNodes<'b>, String> {
+        let proof = match &self.prepared.project.modules[module].items[item] {
+            ScalarItem::Function(original) if std::ptr::eq(original, function) => {
+                self.checked_self_tail_forwarding(module, item)
+            }
+            _ => None,
+        };
+        self.prepared
+            .bind_body_with_proof(module, item, None, &function.body, proof)
     }
 
     pub(crate) fn reference_cfg(

@@ -147,11 +147,14 @@ impl<'a> InitializerCallNodes<'a> {
             })
     }
 }
+use crate::scalar::reference::self_tail::checked::CheckedForwardingProof;
+use crate::scalar::{CfgPointId, ScalarReferenceCfg};
 
 pub(crate) struct CallableBodyCallNodes<'a> {
     source: &'a SourceIdentity,
     targets: HashMap<*const ScalarExpression, &'a ResolvedCallTarget>,
     self_tail_candidates: HashMap<*const ScalarExpression, &'a ScalarExpression>,
+    checked_self_tail: Option<(&'a ScalarExpression, CheckedForwardingProof)>,
     expression_types: HashMap<*const ScalarExpression, &'a ScalarType>,
     scalar_self_tail_types: bool,
     body: PhantomData<&'a ScalarBlock>,
@@ -162,6 +165,7 @@ impl<'a> CallableBodyCallNodes<'a> {
         source: &'a SourceIdentity,
         body: &'a ScalarBlock,
         calls: &'a FunctionCallSites,
+        checked_proof: Option<CheckedForwardingProof>,
     ) -> Result<Self, String> {
         let targets_by_ordinal: HashMap<_, _> = calls
             .call_occurrences
@@ -178,6 +182,7 @@ impl<'a> CallableBodyCallNodes<'a> {
             source,
             targets: HashMap::with_capacity(targets_by_ordinal.len()),
             self_tail_candidates: HashMap::with_capacity(calls.self_tail_candidates.len()),
+            checked_self_tail: None,
             expression_types: HashMap::new(),
             scalar_self_tail_types: !calls.self_tail_candidates.is_empty()
                 && super::super::reference::self_tail::scalar_body_types(calls),
@@ -203,6 +208,11 @@ impl<'a> CallableBodyCallNodes<'a> {
             })?;
             let node = std::ptr::from_ref(expression);
             nodes.targets.insert(node, target);
+            if let Some(proof) = checked_proof.filter(|proof| proof.recursive() == ordinal) {
+                if matches!(expression, ScalarExpression::Call { .. }) {
+                    nodes.checked_self_tail = Some((expression, proof));
+                }
+            }
             if calls
                 .self_tail_candidates
                 .binary_search_by_key(&ordinal.0, |candidate| candidate.0)
@@ -217,7 +227,8 @@ impl<'a> CallableBodyCallNodes<'a> {
             source,
             region: "callable body",
             bind_call: &mut bind_call,
-            bind_type: (!calls.self_tail_candidates.is_empty()).then_some(&mut bind_type as _),
+            bind_type: (checked_proof.is_some() || !calls.self_tail_candidates.is_empty())
+                .then_some(&mut bind_type as _),
         }
         .block_items(Parent::Block(calls.structure.root), body)?;
         if nodes.self_tail_candidates.len() != calls.self_tail_candidates.len() {
@@ -236,13 +247,30 @@ impl<'a> CallableBodyCallNodes<'a> {
         self.scalar_self_tail_types
     }
 
+    pub(crate) fn has_checked_self_tail(&self) -> bool {
+        self.checked_self_tail.is_some()
+    }
+
+    pub(crate) fn checked_primitive_outputs(
+        &self,
+        cfg: &ScalarReferenceCfg,
+    ) -> Option<[CfgPointId; 2]> {
+        self.checked_self_tail?.1.primitive_outputs(cfg)
+    }
+
     pub(crate) fn is_self_tail_candidate(&self, expression: &ScalarExpression) -> bool {
-        self.self_tail_candidates
-            .contains_key(&std::ptr::from_ref(expression))
+        self.checked_self_tail
+            .is_some_and(|(checked, _)| std::ptr::eq(checked, expression))
+            || self
+                .self_tail_candidates
+                .contains_key(&std::ptr::from_ref(expression))
     }
 
     pub(crate) fn self_tail_candidates(&self) -> impl Iterator<Item = &'a ScalarExpression> + '_ {
-        self.self_tail_candidates.values().copied()
+        self.self_tail_candidates
+            .values()
+            .copied()
+            .chain(self.checked_self_tail.map(|(node, _)| node))
     }
 
     pub(crate) fn expression_type(&self, expression: &ScalarExpression) -> Option<&'a ScalarType> {

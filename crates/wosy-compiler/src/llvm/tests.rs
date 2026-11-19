@@ -382,6 +382,174 @@ fn self_tail_test_body<'a>(ir: &'a str, ty: &str, symbol: &str) -> &'a str {
 }
 
 #[test]
+fn prepared_project_checked_forwarding_stages_the_complete_backedge() {
+    let text = "%%start
+i32(*!u8) step = fn(view) { if (*view == 10) { 1 } else { 0 } };
+i32(*!u8, i32) drive = fn(view, outcome) {
+    if (outcome == 0) { drive(view, step(view)) } else { outcome }
+};
+i32(*!u8, i32) ordinary = fn(view, outcome) {
+    if (outcome == 0) { step(view); ordinary(view, step(view)) } else { outcome }
+};
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        let symbol = |name| project_function_name(source, name);
+        let ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let drive = self_tail_test_body(&ir, "i32", &symbol("drive"));
+        let (entry, repeated) = drive
+            .split_once("self_tail.header:")
+            .unwrap_or_else(|| panic!("{drive}"));
+        let width = layout.pointer_size * 8;
+        assert!(
+            drive.starts_with(&format!("i{width} %view, i32 %outcome)")),
+            "{drive}"
+        );
+        assert!(
+            entry.contains(&format!("%view1 = alloca i{width}")),
+            "{drive}"
+        );
+        assert!(entry.contains("%outcome2 = alloca i32"), "{drive}");
+        assert_eq!(entry.matches("alloca ").count(), 2, "{drive}");
+        assert!(!repeated.contains("alloca "), "{drive}");
+        assert!(
+            !drive.contains(&format!("call i32 @{}(", symbol("drive"))),
+            "{drive}"
+        );
+        assert_eq!(
+            drive
+                .matches(&format!("call i32 @{}(", symbol("step")))
+                .count(),
+            1,
+            "{drive}"
+        );
+        let backedge = repeated.split_once("self_tail.then:").unwrap().1;
+        let mut lines = backedge.lines().skip(1);
+        let first = lines.next().unwrap().trim();
+        let second = lines.next().unwrap().trim();
+        let call = lines.next().unwrap().trim();
+        let (carried, first_load) = first.split_once(" = ").unwrap();
+        let (stepped, second_load) = second.split_once(" = ").unwrap();
+        let (outcome, step_call) = call.split_once(" = ").unwrap();
+        let load = format!("load i{width}, ptr %view1, align ");
+        assert_ne!(carried, stepped);
+        assert!(
+            first_load.starts_with(&load) && second_load.starts_with(&load),
+            "{drive}"
+        );
+        assert_eq!(
+            step_call,
+            format!("call i32 @{}(i{width} {stepped})", symbol("step"))
+        );
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .trim()
+                .starts_with(&format!("store i{width} {carried}, ptr %view1, align ")),
+            "{drive}"
+        );
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .trim()
+                .starts_with(&format!("store i32 {outcome}, ptr %outcome2, align ")),
+            "{drive}"
+        );
+        assert_eq!(lines.next().unwrap().trim(), "br label %self_tail.header");
+        let ordinary = self_tail_test_body(&ir, "i32", &symbol("ordinary"));
+        assert!(
+            ordinary.contains(&format!("call i32 @{}(", symbol("ordinary"))),
+            "{ordinary}"
+        );
+        assert!(!ordinary.contains("self_tail.header"), "{ordinary}");
+
+        let single = emit_scalar_build_single_module_llvm(&build)
+            .unwrap()
+            .to_text();
+        let drive = self_tail_test_body(&single, "i32", "drive");
+        assert!(drive.contains("call i32 @drive("), "{drive}");
+        assert!(!drive.contains("self_tail.header"), "{drive}");
+        let legacy = validate_scalar_project(prepared.project().clone());
+        let legacy = emit_scalar_project_llvm(&legacy).unwrap().to_text();
+        let drive = self_tail_test_body(&legacy, "i32", &symbol("drive"));
+        assert!(
+            drive.contains(&format!("call i32 @{}(", symbol("drive"))),
+            "{drive}"
+        );
+        assert!(!drive.contains("self_tail.header"), "{drive}");
+    }
+}
+
+#[test]
+fn checked_forwarding_reports_primitive_call_owner_gate_evidence() {
+    let text = "%%start
+i32(*!u8) step = fn(view) { if (*view == 10) { 1 } else { 0 } };
+i32(*!u8, i32) drive = fn(view, outcome) {
+    if (outcome == 0) { drive(view, step(view)) } else { outcome }
+};
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let ScalarItem::Function(function) = &prepared.project().modules[0].items[1] else {
+            panic!("driver")
+        };
+        assert!(build.checked_self_tail_forwarding(0, 1).is_some());
+        let nodes = build.bind_original_project_body(0, 1, function).unwrap();
+        assert!(nodes.has_checked_self_tail());
+        let cfg = build.reference_cfg(0, 1, None).unwrap();
+        let owners = super::checked_call_owners(cfg).unwrap();
+        let mut evidence = Vec::new();
+        for point in &cfg.points {
+            let CfgPointKind::Call { output, .. } = &point.kind else {
+                continue;
+            };
+            let span = point.source_span.range;
+            let owner = owners[&(span.start, span.end, *output)];
+            assert!(matches!(owner, super::CheckedCallOwner::Borrowed));
+            assert_eq!(
+                point.possible_origins,
+                Some([crate::scalar::ReferenceOriginId(0)].into())
+            );
+            evidence.push((point.id.0, span.start, span.end, *output));
+        }
+        assert_eq!(owners.len(), 2);
+        assert_eq!(evidence.len(), 2);
+        println!("{layout:?}: bound proof with two Borrowed call-owner entries {evidence:?}");
+        let owner_gate = |cfg: &_, owners: &_| {
+            super::self_tail::call_owners_allow_reuse(Some(&nodes), cfg, owners)
+        };
+        assert!(owner_gate(cfg, &owners));
+        let key = *owners.keys().next().unwrap();
+        let mut missing = owners.clone();
+        missing.remove(&key);
+        assert!(!owner_gate(cfg, &missing));
+        let mut extra = owners.clone();
+        extra.insert((0, 0, 0), super::CheckedCallOwner::Borrowed);
+        assert!(!owner_gate(cfg, &extra));
+        let mut inconsistent = owners.clone();
+        inconsistent.insert(key, super::CheckedCallOwner::Fresh);
+        assert!(!owner_gate(cfg, &inconsistent));
+        inconsistent.insert(key, super::CheckedCallOwner::Mixed);
+        assert!(!owner_gate(cfg, &inconsistent));
+        let mut missing_mapping = cfg.clone();
+        missing_mapping.primary_call_points.clear();
+        assert!(!owner_gate(&missing_mapping, &owners));
+        let ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let source = &prepared.project().modules[0].source;
+        let symbol = project_function_name(source, "drive");
+        let drive = self_tail_test_body(&ir, "i32", &symbol);
+        assert!(drive.contains("self_tail.header"), "{drive}");
+    }
+}
+
+#[test]
 fn prepared_self_tail_preserves_ordinary_edges_and_resource_cleanup() {
     let text = "%%start
 i32(i32) non_tail = fn(n) { if (n == 0) { n } else { non_tail(n - 1) + n } };
@@ -480,6 +648,7 @@ fn emit_initializer_test_input(
             &|_| Some(region),
             input,
             &|module, item, arm, _| build.reference_cfg(module, item, arm),
+            None,
         ),
     ]
 }
@@ -889,6 +1058,7 @@ fn prepared_initializer_namespace_member_uses_selected_storage_on_both_layouts()
                 },
                 input,
                 &|module, item, arm, _| build.reference_cfg(module, item, arm),
+                None,
             )
         };
         let region = prepared.initialization_region(0).unwrap();
@@ -981,6 +1151,7 @@ i32 nested = unsafe { echo(33) };
                 &|_| Some(region),
                 input,
                 &|module, item, arm, _| build.reference_cfg(module, item, arm),
+                None,
             )
             .unwrap()
             .to_text(),
@@ -2732,6 +2903,7 @@ select = overload {
                     Some(&function.reference_cfg)
                 }
             },
+            None,
         )
         .unwrap_err();
         assert!(
@@ -5975,6 +6147,7 @@ fn detached_project_llvm_initializes_interleaved_namespace_diamond_once() {
             },
             super::GenericInitializerInput::PreparedRows(&prepared),
             &|module, item, arm, _| build.reference_cfg(module, item, arm),
+            None,
         )
         .unwrap_err();
         assert_eq!(

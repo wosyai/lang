@@ -9,20 +9,53 @@ pub(super) fn eligible(
     function: &ScalarFunction,
     cfg: &ScalarReferenceCfg,
 ) -> bool {
-    state
-        .body_call_nodes
-        .is_some_and(|nodes| nodes.has_self_tail_candidates() && nodes.has_scalar_self_tail_types())
-        && state.return_owner_slots.is_empty()
+    state.body_call_nodes.is_some_and(|nodes| {
+        nodes.has_checked_self_tail()
+            || (nodes.has_self_tail_candidates() && nodes.has_scalar_self_tail_types())
+    }) && state.return_owner_slots.is_empty()
         && state.fresh_return_outputs.is_empty()
         && state.branch_return_outputs.is_empty()
-        && state.checked_call_owners.is_empty()
+        && call_owners_allow_reuse(state.body_call_nodes, cfg, &state.checked_call_owners)
         && state.joined_return_bindings.is_empty()
         && state.joined_assignment_owners.is_empty()
         && state.automatic_return_result_owners.is_empty()
         && state.invalidations.is_empty()
-        && scalar_cfg(cfg)
-        && scalar_block(&function.body, true)
+        && (state
+            .body_call_nodes
+            .is_some_and(CallableBodyCallNodes::has_checked_self_tail)
+            || (scalar_cfg(cfg) && scalar_block(&function.body, true)))
         && arguments_are_representable(context, state, value, function)
+}
+
+pub(super) fn call_owners_allow_reuse(
+    nodes: Option<&CallableBodyCallNodes<'_>>,
+    cfg: &ScalarReferenceCfg,
+    owners: &BTreeMap<(u32, u32, usize), CheckedCallOwner>,
+) -> bool {
+    let Some(nodes) = nodes.filter(|nodes| nodes.has_checked_self_tail()) else {
+        return owners.is_empty();
+    };
+    let Some(points) = nodes.checked_primitive_outputs(cfg) else {
+        return false;
+    };
+    let owner_key = |id: crate::scalar::CfgPointId| match &cfg.points[id.0].kind {
+        CfgPointKind::Call {
+            expression: ScalarExpression::Call { span, .. },
+            output: 0,
+            ..
+        } if cfg.points[id.0].kind == cfg.initial_points[id.0].kind => {
+            Some((span.start, span.end, 0))
+        }
+        _ => None,
+    };
+    let [Some(first), Some(second)] = points.map(owner_key) else {
+        return false;
+    };
+    owners.len() == 2
+        && first != second
+        && [first, second]
+            .iter()
+            .all(|key| matches!(owners.get(key), Some(CheckedCallOwner::Borrowed)))
 }
 
 fn arguments_are_representable(
@@ -35,7 +68,9 @@ fn arguments_are_representable(
         return false;
     };
     let nodes = state.body_call_nodes.expect("prepared call nodes");
-    abi_parameters_match(context, state.target_layout, value, parameters)
+    (!nodes.has_checked_self_tail()
+        || value.get_type().get_return_type() == Some(context.i32_type().into()))
+        && abi_parameters_match(context, state.target_layout, value, parameters)
         && nodes.self_tail_candidates().all(|call| {
             let ScalarExpression::Call { arguments, .. } = call else {
                 return false;

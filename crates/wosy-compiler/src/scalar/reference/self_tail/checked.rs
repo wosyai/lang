@@ -1,11 +1,31 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CheckedForwardingProof {
+    recursive: (OccurrenceOrdinal, CfgPointId),
+    step: (OccurrenceOrdinal, CfgPointId),
+}
+
+impl CheckedForwardingProof {
+    pub(in crate::scalar) fn recursive(self) -> OccurrenceOrdinal {
+        self.recursive.0
+    }
+
+    pub(crate) fn primitive_outputs(self, cfg: &ScalarReferenceCfg) -> Option<[CfgPointId; 2]> {
+        let [(recursive, self_point), (step, step_point)] = [self.recursive, self.step];
+        (self_point != step_point
+            && cfg.primary_call_point(recursive) == Some(self_point)
+            && cfg.primary_call_point(step) == Some(step_point))
+        .then_some([self_point, step_point])
+    }
+}
+
 pub(in crate::scalar) fn prove(
     source: &SourceIdentity,
     function: &ScalarFunction,
     calls: &FunctionCallSites,
     cfg: &ScalarReferenceCfg,
-) -> Option<OccurrenceOrdinal> {
+) -> Option<CheckedForwardingProof> {
     let [view, state] = calls.boundary.parameters.as_slice() else {
         return None;
     };
@@ -163,7 +183,10 @@ pub(in crate::scalar) fn prove(
     {
         return None;
     }
-    Some(recursive)
+    Some(CheckedForwardingProof {
+        recursive: (recursive, self_call),
+        step: (step, step_call),
+    })
 }
 
 fn incoming_origin(point: &ReferenceFlowPoint) -> bool {

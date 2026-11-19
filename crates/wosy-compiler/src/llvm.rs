@@ -620,6 +620,7 @@ pub fn emit_scalar_project_llvm(
         &|module| regions.get(module),
         GenericInitializerInput::RawItems,
         &|_, _, _, function| Some(&function.reference_cfg),
+        None,
     )
 }
 
@@ -635,6 +636,7 @@ pub fn emit_scalar_build_project_llvm(
         &|module| prepared.initialization_region(module),
         GenericInitializerInput::PreparedRows(prepared),
         &|module, item, arm, _| validation.reference_cfg(module, item, arm),
+        Some(validation),
     )
 }
 
@@ -648,6 +650,7 @@ fn emit_project_llvm<'a>(
         Option<usize>,
         &'a ScalarFunction,
     ) -> Option<&'a ScalarReferenceCfg>,
+    project_build: Option<&'a ScalarBuildValidation<'a>>,
 ) -> Result<LlvmPartition, String> {
     let ordered_modules = project
         .initialization_order
@@ -969,10 +972,10 @@ fn emit_project_llvm<'a>(
             cfg,
         );
     }
-    for (ordinal, source_module, function, cfg, name, item, arm) in definitions
+    for (ordinal, source_module, function, cfg, name, item, arm, original) in definitions
         .iter()
         .map(|(ordinal, module, function, cfg, name, item, arm)| {
-            (*ordinal, *module, *function, *cfg, name, *item, *arm)
+            (*ordinal, *module, *function, *cfg, name, *item, *arm, true)
         })
         .chain(
             project_specializations
@@ -987,11 +990,17 @@ fn emit_project_llvm<'a>(
                         name,
                         *item,
                         *arm,
+                        false,
                     )
                 }),
         )
     {
-        let nodes = generic_input.bind_body(ordinal, item, arm, &function.body)?;
+        let nodes = match project_build {
+            Some(build) if original && arm.is_none() => {
+                Some(build.bind_original_project_body(ordinal, item, function)?)
+            }
+            _ => generic_input.bind_body(ordinal, item, arm, &function.body)?,
+        };
         emit_project_function(
             &context,
             &builder,

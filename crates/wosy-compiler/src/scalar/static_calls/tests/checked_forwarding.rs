@@ -17,7 +17,9 @@ fn detached_checked_forwarding_admits_only_the_returned_occurrence() {
         let calls = prepared.function_calls(0, 1);
         assert!(calls.self_tail_candidates.is_empty());
         assert_eq!(
-            build.checked_self_tail_forwarding(0, 1),
+            build
+                .checked_self_tail_forwarding(0, 1)
+                .map(|proof| proof.recursive()),
             Some(reference::OccurrenceOrdinal(4))
         );
         assert_eq!(build.checked_self_tail_forwarding(0, 0), None);
@@ -64,7 +66,10 @@ fn detached_checked_forwarding_rejects_missing_or_inconsistent_build_evidence() 
         let cfg = build.reference_cfg(0, 1, None).unwrap();
         let prove =
             |cfg| reference::self_tail::checked::prove(&module.source, function, calls, cfg);
-        let ordinal = build.checked_self_tail_forwarding(0, 1).unwrap();
+        let ordinal = build
+            .checked_self_tail_forwarding(0, 1)
+            .unwrap()
+            .recursive();
         let self_call = cfg.primary_call_point(ordinal).unwrap();
         let CfgPointKind::Call {
             argument_points, ..

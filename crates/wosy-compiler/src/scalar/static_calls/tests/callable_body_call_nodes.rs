@@ -115,7 +115,7 @@ fn rejects_missing_body_call_rows_with_prepared_source_span_and_ordinal() {
                      missing: reference::OccurrenceOrdinal| {
             let span = calls.occurrences[missing.0].span;
             assert_eq!(
-                CallableBodyCallNodes::bind(&parsed.source, body, calls)
+                CallableBodyCallNodes::bind(&parsed.source, body, calls, None)
                     .err()
                     .expect("missing target must reject the entire binding"),
                 format!(
