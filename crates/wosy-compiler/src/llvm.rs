@@ -3097,11 +3097,13 @@ struct AssignmentValue<'ctx> {
     call_flag: Option<inkwell::values::IntValue<'ctx>>,
     joined_source: Option<JoinedAssignmentSource<'ctx>>,
     runtime_array_source: Option<PointerValue<'ctx>>,
+    same_array_rebind: bool,
 }
 
 struct RuntimeArrayAssignment<'ctx> {
     owns: bool,
     previous: Option<ownership::RuntimeArrayRelease<'ctx>>,
+    same_array_rebind: bool,
 }
 
 fn stage_runtime_array_assignments<'ctx>(
@@ -3170,6 +3172,19 @@ fn stage_runtime_array_assignments<'ctx>(
             staged.push(None);
             continue;
         }
+        if value.same_array_rebind {
+            if !matches!(destination, AssignmentDestination::Existing(_))
+                || state.runtime_array_allocations.get(name) != Some(&false)
+            {
+                return Err("proved runtime-array rebind has no existing pointer storage".into());
+            }
+            staged.push(Some(RuntimeArrayAssignment {
+                owns: false,
+                previous: None,
+                same_array_rebind: true,
+            }));
+            continue;
+        }
         let protected = retains_storage[position]
             || matches!(destination, AssignmentDestination::Existing(slot) if transferred.contains(slot));
         let previous = if protected {
@@ -3180,6 +3195,7 @@ fn stage_runtime_array_assignments<'ctx>(
         staged.push(Some(RuntimeArrayAssignment {
             owns: owns[position],
             previous,
+            same_array_rebind: false,
         }));
     }
     for (name, slot) in sources {
@@ -3381,6 +3397,7 @@ fn emit_assignment<'ctx, 'module>(
             call_flag,
             joined_source: _,
             runtime_array_source: _,
+            same_array_rebind: _,
         } = staged;
         let Some(destination) = install_assignment_destination(state, target, &ty, destination)
         else {
@@ -3501,6 +3518,7 @@ fn emit_project_assignment<'ctx, 'module>(
             call_flag,
             joined_source: _,
             runtime_array_source: _,
+            same_array_rebind: _,
         } = staged;
         let Some(destination) = install_assignment_destination(state, target, &ty, destination)
         else {
@@ -3702,6 +3720,9 @@ fn transition_runtime_array_assignment<'ctx, 'module>(
     let crate::ScalarPlace::Name { name, .. } = &target.place else {
         return Ok(());
     };
+    if staged.same_array_rebind {
+        return Ok(());
+    }
     if let Some(previous) = staged.previous {
         ownership::consume_runtime_array_release(context, state, previous)?;
     }
@@ -3977,6 +3998,10 @@ fn materialize_assignment_values<'ctx, 'module>(
     let mut position = 0;
     let mut values = Vec::new();
     for expression in expressions {
+        let same_array_rebind = state.aggregate.as_ref().is_some_and(|aggregate| {
+            state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
+                .is_some_and(|ordinal| aggregate.same_array_rebind(ordinal))
+        });
         let provenance = runtime_array_assignment_provenance(state, expression)?;
         let runtime_array_source = if provenance.result.owns() {
             provenance.source_name.as_ref().map(|name| {
@@ -4037,6 +4062,7 @@ fn materialize_assignment_values<'ctx, 'module>(
                     call_flag: None,
                     joined_source: None,
                     runtime_array_source: None,
+                    same_array_rebind: false,
                 });
                 position += 1;
                 continue;
@@ -4068,6 +4094,7 @@ fn materialize_assignment_values<'ctx, 'module>(
                 call_flag: call_flags.get(&output_position).copied(),
                 joined_source,
                 runtime_array_source,
+                same_array_rebind: same_array_rebind && output_position == 0,
             });
             position += 1;
         }

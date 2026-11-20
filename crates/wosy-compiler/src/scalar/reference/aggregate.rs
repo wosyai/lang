@@ -26,6 +26,10 @@ pub(super) struct AggregateFlowFacts {
     pub(super) input_moves: BTreeMap<CfgPointId, (OccurrenceOrdinal, BTreeMap<usize, ArgumentProvenance>)>,
     pub(super) temporary_arguments: BTreeSet<CfgPointId>,
     pub(super) formal_forward_shape: Option<(CfgPointId, CfgPointId)>,
+    pub(super) array_formal: Option<ReferenceBindingId>,
+    pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
+    pub(super) array_return_move: Option<CfgPointId>,
+    pub(super) array_installs: BTreeSet<CfgPointId>,
 }
 
 impl AggregateFlowFacts {
@@ -118,6 +122,26 @@ pub(super) enum ArgumentProvenance {
     Unmoved,
 }
 
+pub(super) fn same_runtime_array_type(left: &ScalarType, right: &ScalarType) -> bool {
+    match (left, right) {
+        (ScalarType::RuntimeArray { element: left, .. }, ScalarType::RuntimeArray { element: right, .. }) => {
+            scalar_type_identity(left) == scalar_type_identity(right)
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn array_roundtrip_signature(parameters: &[ScalarType], outputs: &ScalarOutputSequence) -> bool {
+    let Some((input @ ScalarType::RuntimeArray { .. }, rest)) = parameters.split_first() else {
+        return false;
+    };
+    let Some((output, tail)) = outputs.outputs.split_first() else { return false };
+    same_runtime_array_type(&output.ty, input)
+        && rest.iter().all(|ty| ordinary_value(ty) || matches!(ty, ScalarType::Enum(_))
+            || matches!(ty, ScalarType::CheckedReference { inner, .. } if ordinary_value(inner)))
+        && tail.iter().all(|out| ordinary_value(&out.ty) || matches!(out.ty, ScalarType::Enum(_)))
+}
+
 pub(super) fn ordinary_formal_outputs(outputs: &[RootOutputType]) -> bool {
     match outputs {
         [] => true,
@@ -146,6 +170,9 @@ pub(super) struct AggregateEdgeState {
     moved: BTreeSet<OwnerSource>,
     input_moves: BTreeMap<CfgPointId, InputOrigin>,
     pending_temporaries: BTreeMap<CfgPointId, ReferenceScopeId>,
+    array_formal_live: bool,
+    array_formal_pending: Option<CfgPointId>,
+    array_dependencies: BTreeSet<CfgPointId>,
 }
 
 impl AggregateEdgeState {
@@ -158,6 +185,10 @@ impl AggregateEdgeState {
 
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
+    pub(super) array_invalid: bool,
+    pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
+    pub(super) array_returns: BTreeSet<Option<BTreeSet<CfgPointId>>>,
+    pub(super) array_rebinds: BTreeMap<CfgPointId, (CfgPointId, ReferenceBindingId)>,
     pub(super) allocation_slots: BTreeMap<CfgPointId, (usize, usize)>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) returns: BTreeMap<CfgPointId, BTreeSet<Option<OwnerSource>>>,
@@ -208,7 +239,8 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        self.returning_leaf || !self.calls.is_empty() || !self.returns.is_empty() || !self.formals.is_empty() || !self.inputs.is_empty() || !self.raw_terminals.is_empty() || !self.read_formals.is_empty()
+        !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
+            || self.returning_leaf || !self.calls.is_empty() || !self.returns.is_empty() || !self.formals.is_empty() || !self.inputs.is_empty() || !self.raw_terminals.is_empty() || !self.read_formals.is_empty()
     }
 }
 
@@ -234,7 +266,10 @@ pub(super) fn returning_leaf_point(kind: &CfgPointKind) -> bool {
 
 impl AggregateFlowFacts {
     pub(super) fn entry_state(&self) -> AggregateEdgeState {
-        let mut state = AggregateEdgeState::default();
+        let mut state = AggregateEdgeState {
+            array_formal_live: self.array_formal.is_some(),
+            ..AggregateEdgeState::default()
+        };
         for (&slot, binding) in &self.formals {
             state.bindings.insert(binding.clone(), (
                 Some(Value::Aggregate { backing: OwnerSource::Formal(slot), field: None }),
@@ -253,7 +288,8 @@ impl AggregateFlowFacts {
     }
 
     pub(super) fn observes_values(&self) -> bool {
-        !self.views.is_empty() || !self.calls.is_empty() || !self.formals.is_empty() || !self.input_moves.is_empty() || !self.raw_formals.is_empty()
+        self.array_formal.is_some() || !self.array_calls.is_empty()
+            || !self.views.is_empty() || !self.calls.is_empty() || !self.formals.is_empty() || !self.input_moves.is_empty() || !self.raw_formals.is_empty()
     }
 
     pub(super) fn visit(
@@ -264,6 +300,49 @@ impl AggregateFlowFacts {
         sites: &FunctionCallSites,
     ) {
         let id = point.id;
+        if let CfgPointKind::Assign { target, rhs_point, .. } = &point.kind {
+            if self.array_installs.contains(&id) && target.projections.is_empty() && self.array_calls.get(rhs_point)
+                .is_some_and(|(_, _, binding)| *binding == target.binding)
+            {
+                result.array_rebinds.insert(id, (*rhs_point, target.binding.clone()));
+            }
+        }
+        if let Some(formal) = &self.array_formal {
+            match &point.kind {
+                CfgPointKind::Borrow { place, .. } if &place.binding == formal => {
+                    result.array_invalid = true;
+                }
+                CfgPointKind::Move { place, owner, .. } if owner == formal => {
+                    if state.array_formal_live && place.projections.is_empty() && &place.binding == formal {
+                        state.array_formal_live = false;
+                        state.array_formal_pending = Some(id);
+                    } else {
+                        result.array_invalid = true;
+                    }
+                }
+                CfgPointKind::Assign { target, rhs_point, .. }
+                    if &target.binding == formal && target.projections.is_empty() =>
+                {
+                    if self.array_installs.contains(&id) && self.array_calls.get(rhs_point)
+                        .is_some_and(|(_, moved, binding)| binding == formal && Some(*moved) == state.array_formal_pending)
+                    {
+                        state.array_formal_pending = None;
+                        state.array_formal_live = true;
+                        state.array_dependencies.insert(*rhs_point);
+                    } else {
+                        result.array_invalid = true;
+                    }
+                }
+                CfgPointKind::ReturnOutput { output: 0, .. } => {
+                    result.array_returns.insert(
+                        (state.array_formal_pending.is_some()
+                            && state.array_formal_pending == self.array_return_move)
+                            .then(|| state.array_dependencies.clone())
+                    );
+                }
+                _ => {}
+            }
+        }
         if !state.pending_temporaries.is_empty() {
             match &point.kind {
                 CfgPointKind::Call {
@@ -741,6 +820,7 @@ pub(crate) struct ClosedBody {
     pub(crate) releases: BTreeMap<CfgPointId, Vec<usize>>,
     pub(crate) input: Option<usize>,
     pub(crate) input_mixed: bool,
+    pub(crate) same_array_rebinds: BTreeSet<usize>,
     pub(crate) input_release: Option<CfgPointId>,
     pub(crate) input_calls: BTreeMap<usize, (usize, ClosedInput)>,
 }
@@ -966,8 +1046,37 @@ fn closed_aggregates<'a>(
     let mut modes = BTreeMap::<(BodyKey, usize), (bool, bool)>::new();
     let mut seed_targets = BTreeMap::<BodyKey, BTreeSet<(BodyKey, usize)>>::new();
     let mut input_users = BTreeMap::<(BodyKey, usize), Vec<(BodyKey, usize, ArgumentProvenance, &BTreeSet<Option<InputOrigin>>) >>::new();
+    let mut array_callsites = Vec::new();
+    let mut array_leaves = BTreeSet::new();
+    let mut array_neighbors = BTreeMap::<BodyKey, BTreeSet<BodyKey>>::new();
     for (&key, body) in &bodies {
         if let Some(facts) = body.facts {
+            if body.is_monomorphic && !facts.array_rebinds.is_empty() {
+                array_callsites.push((key, body.cfg, facts));
+            }
+            if body.is_monomorphic && !facts.array_invalid && !facts.array_returns.is_empty() {
+                let mut grounded = false;
+                let mut dependencies = BTreeSet::new();
+                let valid = facts.array_returns.iter().all(|path| {
+                    let Some(path) = path else { return false };
+                    let mut self_call = false;
+                    for &point in path {
+                        let Some(target) = target_body(&declarations, body.cfg, point) else { return false };
+                        self_call |= target == key;
+                        dependencies.insert(target);
+                    }
+                    grounded |= !self_call;
+                    true
+                });
+                if valid && grounded {
+                    if dependencies.is_empty() {
+                        array_leaves.insert(key);
+                    } else {
+                        dependencies.remove(&key);
+                        array_neighbors.insert(key, dependencies);
+                    }
+                }
+            }
             for (&(point, ordinal, slot, moved), origins) in &facts.inputs {
                 if let Some(target) = target_body(&declarations, body.cfg, point) {
                     let receiver = (target, slot);
@@ -1017,8 +1126,20 @@ fn closed_aggregates<'a>(
             }
         }
     }
+    let mut result = ClosedAggregates::default();
+    for (key, cfg, facts) in array_callsites {
+        for &(call, _) in facts.array_rebinds.values() {
+            let Some((ordinal, _, _)) = facts.array_calls.get(&call) else { continue };
+            let Some(callee) = target_body(&declarations, cfg, call) else { continue };
+            if array_leaves.contains(&callee)
+                || array_neighbors.get(&callee).is_some_and(|deps| deps.is_subset(&array_leaves))
+            {
+                result.bodies.entry(key).or_default().same_array_rebinds.insert(ordinal.0);
+            }
+        }
+    }
     if outgoing.is_empty() {
-        return Ok(ClosedAggregates::default());
+        return Ok(result);
     }
     let mut initializer_uses = Vec::new();
     let mut initializer_escapes = Vec::new();
@@ -1319,7 +1440,6 @@ fn closed_aggregates<'a>(
         }
     }
 
-    let mut result = ClosedAggregates::default();
     for (&key, body) in &bodies {
 
         if body
@@ -1382,11 +1502,9 @@ fn closed_aggregates<'a>(
         } else {
             None
         };
-        let mut plan = ClosedBody {
-            returning: return_route,
-            input_calls: input_calls.remove(&key).unwrap_or_default(),
-            ..ClosedBody::default()
-        };
+        let mut plan = result.bodies.remove(&key).unwrap_or_default();
+        plan.returning = return_route;
+        plan.input_calls = input_calls.remove(&key).unwrap_or_default();
         if let Some(&(slot, release, mixed)) = input_plans.get(&key) {
             plan.input = Some(slot);
             plan.input_mixed = mixed;
@@ -1445,7 +1563,9 @@ fn closed_aggregates<'a>(
                 facts.unsupported.first()
             ));
         }
-        if returning || !plan.calls.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty() {
+        if returning || !plan.calls.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()
+            || !plan.same_array_rebinds.is_empty()
+        {
             result.bodies.insert(key, plan);
         }
     }
