@@ -84,6 +84,7 @@ impl<'a> InitializerCallNodes<'a> {
             region: "initializer",
             bind_call: &mut bind_call,
             bind_type: None,
+            bind_named_place: None,
         };
         let root = Parent::Block(topology.structure.root);
         for step in &region.steps {
@@ -156,6 +157,7 @@ pub(crate) struct CallableBodyCallNodes<'a> {
     self_tail_candidates: HashMap<*const ScalarExpression, &'a ScalarExpression>,
     checked_self_tail: Option<(&'a ScalarExpression, CheckedForwardingProof)>,
     expression_types: HashMap<*const ScalarExpression, &'a ScalarType>,
+    named_place_roots: HashMap<*const ScalarPlace, &'a NamedPlaceRootIdentity>,
     scalar_self_tail_types: bool,
     body: PhantomData<&'a ScalarBlock>,
 }
@@ -184,6 +186,7 @@ impl<'a> CallableBodyCallNodes<'a> {
             self_tail_candidates: HashMap::with_capacity(calls.self_tail_candidates.len()),
             checked_self_tail: None,
             expression_types: HashMap::new(),
+            named_place_roots: HashMap::new(),
             scalar_self_tail_types: !calls.self_tail_candidates.is_empty()
                 && super::super::reference::self_tail::scalar_body_types(calls),
             body: PhantomData,
@@ -222,6 +225,13 @@ impl<'a> CallableBodyCallNodes<'a> {
             }
             Ok(())
         };
+        let mut bind_named_place = |ordinal, place: &'a ScalarPlace| {
+            if let Some(root) = calls.prepared_named_place_root(ordinal) {
+                nodes
+                    .named_place_roots
+                    .insert(std::ptr::from_ref(place), root);
+            }
+        };
         Binder {
             structure: &calls.structure,
             source,
@@ -229,6 +239,7 @@ impl<'a> CallableBodyCallNodes<'a> {
             bind_call: &mut bind_call,
             bind_type: (checked_proof.is_some() || !calls.self_tail_candidates.is_empty())
                 .then_some(&mut bind_type as _),
+            bind_named_place: Some(&mut bind_named_place),
         }
         .block_items(Parent::Block(calls.structure.root), body)?;
         if nodes.self_tail_candidates.len() != calls.self_tail_candidates.len() {
@@ -279,6 +290,16 @@ impl<'a> CallableBodyCallNodes<'a> {
             .copied()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn named_place_root(
+        &self,
+        place: &ScalarPlace,
+    ) -> Option<&'a NamedPlaceRootIdentity> {
+        self.named_place_roots
+            .get(&std::ptr::from_ref(place))
+            .copied()
+    }
+
     pub(crate) fn target(
         &self,
         expression: &ScalarExpression,
@@ -302,6 +323,7 @@ struct Binder<'a, 'bind> {
     region: &'static str,
     bind_call: &'bind mut dyn FnMut(OccurrenceOrdinal, &'a ScalarExpression) -> Result<(), String>,
     bind_type: Option<&'bind mut dyn FnMut(OccurrenceOrdinal, &'a ScalarExpression)>,
+    bind_named_place: Option<&'bind mut dyn FnMut(OccurrenceOrdinal, &'a ScalarPlace)>,
 }
 
 impl<'a> Binder<'a, '_> {
@@ -393,7 +415,12 @@ impl<'a> Binder<'a, '_> {
         };
         let parent = Parent::Place(ordinal);
         match place {
-            ScalarPlace::Name { .. } => Ok(()),
+            ScalarPlace::Name { .. } => {
+                if let Some(bind_named_place) = &mut self.bind_named_place {
+                    bind_named_place(ordinal, place);
+                }
+                Ok(())
+            }
             ScalarPlace::Field { base, .. } => self.place(parent, Edge::PlaceBase, base),
             ScalarPlace::Index { base, index, .. } => {
                 self.place(parent, Edge::PlaceBase, base)?;

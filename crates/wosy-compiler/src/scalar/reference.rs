@@ -4857,7 +4857,7 @@ enum PlainNameFacts {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum NamedPlaceRootIdentity {
+pub(crate) enum NamedPlaceRootIdentity {
     Lexical(ReferenceBindingId),
     ModuleValue(SourceSpan),
 }
@@ -4932,7 +4932,17 @@ impl FunctionCallSites {
     }
 
     pub(super) fn has_prepared_named_place_root(&self, ordinal: OccurrenceOrdinal) -> bool {
-        matches!(&self.named_place_roots, NamedPlaceRootFacts::Prepared(rows) if rows.contains_key(&ordinal))
+        self.prepared_named_place_root(ordinal).is_some()
+    }
+
+    pub(super) fn prepared_named_place_root(
+        &self,
+        ordinal: OccurrenceOrdinal,
+    ) -> Option<&NamedPlaceRootIdentity> {
+        match &self.named_place_roots {
+            NamedPlaceRootFacts::Prepared(rows) => rows.get(&ordinal),
+            NamedPlaceRootFacts::Raw => None,
+        }
     }
 }
 

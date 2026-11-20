@@ -9,6 +9,7 @@ use super::{
 use wosy_syntax::{ByteSpan, SourceIdentity, SourceSpan};
 
 mod initializer_call_nodes;
+pub(crate) use super::reference::NamedPlaceRootIdentity;
 pub(crate) use initializer_call_nodes::{
     BoundInitializerMember, CallableBodyCallNodes, InitializerCallNodes,
 };

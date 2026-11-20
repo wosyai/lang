@@ -22,6 +22,97 @@ fn address(function: &mut ScalarFunction) -> &mut ScalarExpression {
 }
 
 #[test]
+fn callable_named_place_root_projection_preserves_scoped_module_and_missing_facts() {
+    let text = "%%start
+u8[3] outside = [1, 2, 3];
+unit() probe = fn {
+    unsafe { u8[3] scratch; &?scratch[0]; };
+    unsafe { u8[3] scratch; &?scratch[0]; };
+    unsafe { &?outside[0]; };
+};
+%%end";
+    let source = source();
+    let parsed = parse_source(source.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let project = prepare_scalar_project(
+            vec![(
+                derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                Vec::new(),
+            )],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        let items = &project.project().modules[0].items;
+        let [ScalarItem::Binding(global), ScalarItem::Function(function)] = items.as_slice() else {
+            panic!("module binding and callable");
+        };
+        let block = |item| match &function.body.items[item] {
+            ScalarBlockItem::Expression(ScalarExpression::Block(block)) => block,
+            _ => panic!("unsafe block"),
+        };
+        let place = |item, address| {
+            let ScalarBlockItem::Expression(ScalarExpression::RawAddress { place, .. }) =
+                &block(item).items[address]
+            else {
+                panic!("raw address");
+            };
+            let ScalarPlace::Index { base, .. } = place else {
+                panic!("indexed place");
+            };
+            (place, base.as_ref())
+        };
+        let nodes = project
+            .bind_callable_body_call_nodes(0, 1, None, &function.body)
+            .unwrap();
+        let expected_local = |item| {
+            let block = block(item);
+            let ScalarBlockItem::LocalBinding(allocation) = &block.items[0] else {
+                panic!("scratch allocation");
+            };
+            assert!(allocation.is_allocation);
+            NamedPlaceRootIdentity::Lexical(ReferenceBindingId {
+                source: source.clone(),
+                function_span: function.span,
+                declaration_span: allocation.receivers[0].name_span,
+                block_span: block.span,
+                kind: ReferenceBindingKind::Declared,
+            })
+        };
+        let (indexed, first) = place(0, 1);
+        let (_, second) = place(1, 1);
+        let (_, module) = place(2, 0);
+        assert_ne!(expected_local(0), expected_local(1));
+        assert_eq!(nodes.named_place_root(first), Some(&expected_local(0)));
+        assert_eq!(nodes.named_place_root(second), Some(&expected_local(1)));
+        assert_eq!(
+            nodes.named_place_root(module),
+            Some(&NamedPlaceRootIdentity::ModuleValue(SourceSpan::new(
+                source.clone(),
+                global.receivers[0].name_span,
+            )))
+        );
+        assert_eq!(nodes.named_place_root(indexed), None);
+        assert_eq!(nodes.named_place_root(&first.clone()), None);
+
+        let mut row = project.function_calls(0, 1).clone();
+        let NamedPlaceRootFacts::Prepared(roots) = &mut row.named_place_roots else {
+            panic!("prepared place roots");
+        };
+        roots.retain(|_, identity| *identity != expected_local(0));
+        let missing = control::CallableBodyCallNodes::bind(&source, &function.body, &row, None)
+            .expect("a missing projection row is not a binding error");
+        assert_eq!(missing.named_place_root(first), None);
+        assert_eq!(missing.named_place_root(second), Some(&expected_local(1)));
+        assert_eq!(
+            missing.named_place_root(module),
+            nodes.named_place_root(module)
+        );
+    }
+}
+
+#[test]
 fn prepared_address_creation_uses_root_and_pointer_facts_on_both_routes_and_layouts() {
     let source = source();
     let parsed = parse_source(source.clone(), TEXT.into(), &[]);
