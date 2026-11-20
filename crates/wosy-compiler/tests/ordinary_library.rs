@@ -127,8 +127,6 @@ fn ordinary_library_calls_keep_their_typed_routes_without_test_models() {
         assert_eq!(direct_calls(&module, RELAY), [CAPTURE]);
         assert_eq!(direct_calls(&module, TRIAL), [RELAY, MEASURE]);
 
-        // The ordinary compiler must still reject an incompatible forwarded
-        // result; these assertions do not require or claim automatic cleanup.
         let Err(invalid) = prepare(INVALID_USER) else {
             panic!("{target_layout:?}: bool unexpectedly used as Reading");
         };
