@@ -1705,6 +1705,7 @@ fn insert_function_result_provenance(
     );
 }
 
+mod formatter_consumer_closure;
 mod formatter_proof;
 mod ownership;
 use ownership::{
