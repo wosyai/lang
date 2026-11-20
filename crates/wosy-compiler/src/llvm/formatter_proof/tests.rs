@@ -10,6 +10,8 @@ use wosy_syntax::{ByteSpan, SourceIdentity};
 pub(super) enum Withheld {
     LiteralField(Body, usize),
     Formal(Formal),
+    ConversionOperand(Body, CfgPointId),
+    ConversionResult(Body, CfgPointId),
 }
 
 thread_local! {
@@ -317,7 +319,7 @@ fn prove_withheld(
 }
 
 #[test]
-fn formatter_proof_real_u8() {
+fn formatter_proof_real_simple_producers() {
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         let source =
             |path: &str| SourceIdentity::new("p".into(), "std".into(), path.into(), "r1".into());
@@ -355,13 +357,141 @@ fn formatter_proof_real_u8() {
         .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
         let build = analyze_scalar_build(&prepared);
         assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
-        let items = &prepared.project().modules[0].items;
-        let find = |name| {
+        let module = &prepared.project().modules[0];
+        let items = &module.items;
+        let find = |name: &str| {
             items
                 .iter()
                 .position(|item| matches!(item, crate::ScalarItem::Function(f) if f.name == name))
                 .unwrap()
         };
+        let batch = ProofBatch::new(&build);
+        let initial = batch.work.get();
+        let field = &module
+            .structs
+            .iter()
+            .find(|structure| structure.name == "utf8")
+            .unwrap()
+            .fields
+            .iter()
+            .find(|field| field.name == "data")
+            .unwrap()
+            .id;
+        let call_site = |from: usize, to: usize| {
+            let ScalarItem::Function(target) = &items[to] else {
+                unreachable!()
+            };
+            let cfg = build.reference_cfg(0, from, None).unwrap();
+            let mut matches = cfg.points.iter().filter(|point| {
+                matches!(
+                    &point.kind,
+                    CfgPointKind::Call {
+                        output: 0,
+                        target: ResolvedCallTarget::ModuleCallable {
+                            source,
+                            declaration_span,
+                            concrete: ConcreteCallSelection::Declaration,
+                        },
+                        ..
+                    } if source == &module.source && declaration_span == &target.name_span
+                )
+            });
+            let site = matches.next().unwrap().id;
+            assert!(matches.next().is_none());
+            site
+        };
+        let compact = find("_format_compact_bytes");
+        let mut vertices = 0;
+        let mut arcs = 0;
+        for suffix in [
+            "bool", "char", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64",
+        ] {
+            let producer = find(&format!("_format_{suffix}"));
+            let proof = batch
+                .prove(0, producer)
+                .unwrap_or_else(|error| panic!("{target_layout:?} {suffix}: {error:?}"));
+            assert_eq!(proof.output, 0);
+            assert_eq!(&proof.field, field);
+            let cfg = build.reference_cfg(0, producer, None).unwrap();
+            assert_eq!(cfg.allocations, BTreeSet::from([proof.owner]));
+            vertices += cfg.points.len();
+            arcs += cfg
+                .points
+                .iter()
+                .map(|point| point.successors.len())
+                .sum::<usize>();
+            let expected = if matches!(suffix, "bool" | "char") {
+                Vec::new()
+            } else {
+                let digits = find(&format!("_format_digits_{suffix}"));
+                [
+                    (producer, digits),
+                    (digits, compact),
+                    (digits, digits),
+                    (compact, compact),
+                ]
+                .map(|(from, to)| ((0, from), call_site(from, to), (0, to, 0)))
+                .to_vec()
+            };
+            assert_eq!(
+                proof
+                    .edges
+                    .iter()
+                    .map(|edge| (edge.from, edge.site, edge.to))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{target_layout:?} {suffix}"
+            );
+        }
+        let work = batch.work.get();
+        assert_eq!(work.index_builds, 1);
+        assert_eq!(
+            (work.modules, work.items, work.structs),
+            (initial.modules, initial.items, initial.structs)
+        );
+        assert_eq!(work.definition_queries, 32);
+        assert_eq!(work.struct_queries, 10);
+        assert_eq!(work.helper_checks, 16);
+        assert_eq!(work.dominance_walks, 20);
+        assert_eq!(work.dominance_queries, 28);
+        assert!(work.points <= 2 * vertices);
+        assert!(work.arcs <= 2 * arcs);
+
+        let char_producer = find("_format_char");
+        let bitcast = build
+            .reference_cfg(0, char_producer, None)
+            .unwrap()
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    &point.kind,
+                    CfgPointKind::Call {
+                        output: 0,
+                        target: ResolvedCallTarget::Core(CoreOperationId::Bitcast),
+                        ..
+                    }
+                )
+            })
+            .unwrap()
+            .id;
+        for (evidence, reason) in [
+            (
+                Withheld::ConversionOperand((0, char_producer), bitcast),
+                "conversion operand type",
+            ),
+            (
+                Withheld::ConversionResult((0, char_producer), bitcast),
+                "conversion result type",
+            ),
+        ] {
+            let result = prove_withheld(&build, char_producer, evidence);
+            assert!(
+                matches!(result, Err(Unproved::Missing(body, message)) if body == (0, char_producer) && message == reason),
+                "{target_layout:?} {result:?}"
+            );
+        }
+
         let producer = find("_format_u8");
         let digits = find("_format_digits_u8");
         let compact = find("_format_compact_bytes");
@@ -410,6 +540,103 @@ fn formatter_proof_real_u8() {
             prove(&build, 0, items.len()),
             Err(Unproved::Missing(..))
         ));
+    }
+}
+
+#[test]
+fn formatter_proof_simple_recursive_effect_and_scalar_conversion_controls() {
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (effect, conversion, expected) in [
+            ("", "", "eligible"),
+            (
+                "unsafe { *?u8 p = &?buffer[0]; core.free(p); };",
+                "",
+                "helper effect",
+            ),
+            (
+                "",
+                "i32 signed = 7; u32 bits = core.bitcast<u32>(signed); bits;",
+                "unsupported cast",
+            ),
+        ] {
+            let source = SourceIdentity::new("p".into(), "p".into(), "case.w".into(), "r1".into());
+            let text = format!(
+                "%%start
+struct Packet {{ *?u8 address; u64 length; }}
+unit(u8[], bool) touch = fn(buffer, again) {{
+    if (again) {{ touch(buffer, false); }} else {{
+        buffer[0] = 7;
+        {effect}
+    }};
+}};
+Packet(bool) make = fn(again) {{
+    u8[3] scratch;
+    {conversion}
+    touch(scratch, again);
+    *?u8 data = null;
+    unsafe {{ data = &?scratch[0]; }};
+    Packet result = {{ .length = 1; .address = data; }};
+    result
+}};
+%%end"
+            );
+            let parsed = parse_source(source.clone(), text, &[]);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{expected}: {:?}",
+                parsed.diagnostics
+            );
+            let prepared = prepare_scalar_project(
+                vec![(
+                    derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                    Vec::new(),
+                )],
+                vec![source],
+                ScalarPreparationInputs { target_layout },
+            )
+            .unwrap_or_else(|error| panic!("{expected}: {:?}", error.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(
+                build.diagnostics().is_empty(),
+                "{expected}: {:?}",
+                build.diagnostics()
+            );
+            let find = |name| {
+                prepared.project().modules[0]
+                    .items
+                    .iter()
+                    .position(|item| matches!(item, ScalarItem::Function(f) if f.name == name))
+                    .unwrap()
+            };
+            let make = find("make");
+            let touch = find("touch");
+            let result = prove(&build, 0, make);
+            match expected {
+                "eligible" => {
+                    let proof = result.unwrap();
+                    assert_eq!(
+                        proof
+                            .edges
+                            .iter()
+                            .map(|edge| (edge.from.1, edge.to))
+                            .collect::<Vec<_>>(),
+                        [(make, (0, touch, 0)), (touch, (0, touch, 0))]
+                    );
+                }
+                "helper effect" => assert!(
+                    matches!(result, Err(Unproved::Unsupported(body, "release or indirect storage effect")) if body == (0, touch)),
+                    "{target_layout:?} {result:?}"
+                ),
+                "unsupported cast" => assert!(
+                    matches!(&result, Err(Unproved::Call(body, site, ResolvedCallTarget::Core(CoreOperationId::Bitcast), types))
+                        if *body == (0, make) && types.as_slice() == [Some(ScalarType::I32)]
+                            && matches!(&build.reference_cfg(0, make, None).unwrap().points[site.0].kind,
+                                CfgPointKind::Call { target: ResolvedCallTarget::Core(CoreOperationId::Bitcast), .. })),
+                    "{target_layout:?} {result:?}"
+                ),
+                _ => unreachable!(),
+            }
+        }
     }
 }
 

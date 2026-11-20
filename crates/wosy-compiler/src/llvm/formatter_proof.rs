@@ -342,16 +342,41 @@ fn bytes(ty: &ScalarType) -> bool {
     matches!(ty, ScalarType::RuntimeArray { element, .. } if **element == ScalarType::U8)
 }
 
-fn scalar(ty: &ScalarType) -> bool {
+fn simple_producer_input(ty: &ScalarType) -> bool {
     matches!(
         ty,
-        ScalarType::Unit
-            | ScalarType::Bool
+        ScalarType::Bool
+            | ScalarType::Char
+            | ScalarType::I8
+            | ScalarType::I16
             | ScalarType::I32
+            | ScalarType::I64
             | ScalarType::U8
             | ScalarType::U16
             | ScalarType::U32
             | ScalarType::U64
+    )
+}
+
+fn scalar(ty: &ScalarType) -> bool {
+    *ty == ScalarType::Unit || simple_producer_input(ty)
+}
+
+fn simple_scalar_conversion(op: &CoreOperationId, from: &ScalarType, to: &ScalarType) -> bool {
+    use ScalarType::*;
+
+    // Only conversions observed in the bounded producer/helper component.
+    // The operation and both types come from canonical prepared facts.
+    matches!(
+        (op, from, to),
+        (CoreOperationId::Bitcast, Char, U32)
+            | (CoreOperationId::IntExtend, I32, U64)
+            | (CoreOperationId::IntExtend, I8, U16)
+            | (
+                CoreOperationId::IntTrunc,
+                I16 | I32 | I64 | U16 | U32 | U64,
+                U8
+            )
     )
 }
 
@@ -560,7 +585,7 @@ fn prove_in_batch(batch: &ProofBatch<'_>, module: usize, item: usize) -> Result<
     let ScalarType::Struct(id) = &output.ty else {
         return Err(unsupported_trace);
     };
-    if parameters.as_slice() != [ScalarType::U8] {
+    if !matches!(parameters.as_slice(), [parameter] if simple_producer_input(parameter)) {
         return Err(unsupported_trace);
     }
     let structure = batch.structure(id).map_err(|failure| match failure {
@@ -909,14 +934,33 @@ impl Uses<'_, '_> {
                 self.expression(argument)?;
             }
         }
-        match (target, actual) {
-            (ResolvedCallTarget::Core(CoreOperationId::IntExtend), None)
-                if arguments
-                    .iter()
-                    .all(|a| view.nodes.checked_expression_type(a).is_some_and(scalar)) =>
-            {
-                Ok(())
+        if let (
+            ResolvedCallTarget::Core(
+                op @ (CoreOperationId::IntExtend
+                | CoreOperationId::IntTrunc
+                | CoreOperationId::Bitcast),
+            ),
+            None,
+            [argument],
+        ) = (target, actual, arguments)
+        {
+            let from = view.nodes.checked_expression_type(argument);
+            let to = view.nodes.checked_expression_type(value);
+            #[cfg(test)]
+            let from = from.filter(|_| {
+                !tests::is_withheld(tests::Withheld::ConversionOperand(view.body, site))
+            });
+            #[cfg(test)]
+            let to = to.filter(|_| {
+                !tests::is_withheld(tests::Withheld::ConversionResult(view.body, site))
+            });
+            let from = from.ok_or(self.missing("conversion operand type"))?;
+            let to = to.ok_or(self.missing("conversion result type"))?;
+            if simple_scalar_conversion(op, from, to) {
+                return Ok(());
             }
+        }
+        match (target, actual) {
             (
                 ResolvedCallTarget::ModuleCallable {
                     source,
