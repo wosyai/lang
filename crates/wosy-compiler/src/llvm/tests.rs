@@ -2895,7 +2895,7 @@ select = overload {
         let missing = super::emit_project_llvm(
             &legacy.project,
             &|module| prepared.initialization_region(module),
-            super::GenericInitializerInput::RawItems,
+            super::GenericInitializerInput::RawProject(&prepared),
             &|module, item, arm, function| {
                 if (module, item, arm) == (0, 1, Some(1)) {
                     build.reference_cfg(module, item, Some(overload.overload_arms.len()))
@@ -7446,6 +7446,154 @@ i32(i32) relay = fn(n) { first(n) };
                     project_function_name(&source, selected)
                 )));
             }
+        }
+    }
+}
+
+#[test]
+fn raw_call_selection_uses_checked_occurrences_instead_of_ast_mirrors() {
+    let text = "%%start
+pick = overload {
+    (i32, bool)(i64) => fn(n) { n; 1, true };
+    (bool, i32)(i64) => fn(n) { n; true, 2 };
+};
+i64(i64) pass = fn(n) { n };
+i64 input = pass(9);
+i32 value, bool flag = pick(input);
+%%end";
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let typed = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let project = |program: &crate::ScalarProgram| crate::ScalarProjectValidation {
+            project: ScalarProject::new(
+                vec![ScalarModule::from_program(program.clone(), Vec::new())],
+                vec![source.clone()],
+            ),
+            diagnostics: Vec::new(),
+        };
+        let standalone = emit_scalar_llvm(&typed).unwrap();
+        let project_result = emit_scalar_project_llvm(&project(&typed.program)).unwrap();
+        for replacement in [
+            None,
+            Some(crate::scalar::ScalarOverloadSelection {
+                arm_index: 1,
+                substitutions: BTreeMap::new(),
+            }),
+            Some(crate::scalar::ScalarOverloadSelection {
+                arm_index: 0,
+                substitutions: BTreeMap::from([("T".into(), crate::ScalarType::U8)]),
+            }),
+        ] {
+            let mut changed = crate::ScalarValidation {
+                program: typed.program.clone(),
+                diagnostics: Vec::new(),
+            };
+            let mut changed_calls = 0;
+            for item in &mut changed.program.items {
+                if let ScalarItem::Binding(binding) = item {
+                    if let crate::ScalarExpression::Call {
+                        overload_selection, ..
+                    } = &mut binding.value
+                    {
+                        *overload_selection = replacement.clone();
+                        changed_calls += 1;
+                    }
+                }
+            }
+            assert_eq!(changed_calls, 2);
+            let altered_project = project(&changed.program);
+            let decoded_single =
+                serde_json::from_slice(&serde_json::to_vec(&changed).unwrap()).unwrap();
+            let decoded_project =
+                serde_json::from_slice(&serde_json::to_vec(&altered_project).unwrap()).unwrap();
+            assert_eq!(emit_scalar_llvm(&changed).unwrap(), standalone);
+            assert_eq!(emit_scalar_llvm(&decoded_single).unwrap(), standalone);
+            assert_eq!(
+                emit_scalar_project_llvm(&altered_project).unwrap(),
+                project_result
+            );
+            assert_eq!(
+                emit_scalar_project_llvm(&decoded_project).unwrap(),
+                project_result
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_imported_overload_result_uses_bound_declaration_for_nested_conversion() {
+    let root = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let child = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/child.w".into(),
+        "r1".into(),
+    );
+    let root_text = "%%start
+library = namespace package \"src/child.w\";
+i8 initial = 1;
+i16 converted = core.int_extend<i16>(library.pick(initial));
+%%end";
+    let child_text = "%%start
+pick = overload {
+    i8(i8) => fn(value) { value };
+    i64(i64) => fn(value) { value };
+};
+%%end";
+    let declarations = |source: SourceIdentity, text: &str| {
+        let parsed = parse_source(source, text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+    };
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let root_declarations = declarations(root.clone(), root_text);
+        let namespace = root_declarations.namespaces().next().unwrap();
+        let bindings = vec![crate::ScalarNamespaceBinding {
+            binding: namespace.binding.clone(),
+            target: child.clone(),
+            span: namespace.span,
+        }];
+        let prepared = prepare_scalar_project(
+            vec![
+                (root_declarations, bindings),
+                (declarations(child.clone(), child_text), vec![]),
+            ],
+            vec![root.clone(), child.clone()],
+            ScalarPreparationInputs {
+                target_layout: layout,
+            },
+        )
+        .unwrap();
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let raw = validate_scalar_project(prepared.project().clone());
+        let raw = emit_scalar_project_llvm(&raw).unwrap();
+        let prepared_partition = emit_scalar_build_project_llvm(&build).unwrap();
+        let base = project_function_name(&child, "pick");
+        let indexed_arm = super::encoded_llvm_name("wosy_overload", [base.as_str(), "0"]);
+        let expected = super::generic_specialization_name(&indexed_arm, &[]);
+        for partition in [raw, prepared_partition] {
+            let text = partition.to_text();
+            assert_eq!(
+                text.matches(&format!("call i8 @{expected}(")).count(),
+                1,
+                "{text}"
+            );
+            assert!(text.contains("sext i8"), "{text}");
+            assert!(!text.contains("sext i64"), "{text}");
         }
     }
 }

@@ -109,6 +109,23 @@ impl ModuleInitializationRegion {
         }
     }
 
+    pub(crate) fn legacy_reservation_targets(
+        &self,
+    ) -> Result<impl Iterator<Item = (usize, bool, &ModuleInitializationCallTarget)>, String> {
+        let ModuleInitializationDetail::Occurrences(topology) = &self.detail else {
+            return Err(format!(
+                "internal error: missing initializer call topology for {:?}",
+                self.source
+            ));
+        };
+        Ok(topology
+            .legacy_reservations
+            .iter()
+            .map(|&(item, ordinal, unqualified)| {
+                (item, unqualified, &topology.call_targets[&ordinal])
+            }))
+    }
+
     pub(crate) fn call_targets(
         &self,
     ) -> Result<impl Iterator<Item = Result<&ModuleInitializationCallTarget, String>>, String> {
@@ -137,6 +154,7 @@ pub(super) struct ModuleInitializationTopology {
     pub(super) occurrences: Vec<OccurrenceMetadata>,
     pub(super) calls: Vec<OccurrenceOrdinal>,
     pub(super) call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
+    pub(super) legacy_reservations: Vec<(usize, OccurrenceOrdinal, bool)>,
     pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     pub(super) identities: InitializationIdentities,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
@@ -231,6 +249,7 @@ pub(super) struct CheckedCallSignature {
     pub(super) parameters: Vec<ScalarType>,
     pub(super) outputs: ScalarOutputSequence,
     pub(super) overload: Option<ScalarOverloadSelection>,
+    pub(super) overload_origin: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

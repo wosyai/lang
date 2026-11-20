@@ -80,10 +80,10 @@ fn actual_standalone_specialization_has_only_concrete_template_scratch_copies() 
         let parsed = parse_source(source(), GENERIC.into(), &[]);
         assert!(parsed.diagnostics.is_empty());
         let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
-        let typed = typecheck_scalar_program(declarations, target);
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, target);
         assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
         let mut program = typed.program;
-        let sites = resolve_program_call_sites(&program).unwrap();
+        let sites = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
         let public = derive_scalar_program_with_layout(&parsed.result, target);
         assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
         let scope = layout::observations::Scope::new();
@@ -152,10 +152,10 @@ fn actual_project_specialization_reuses_one_inventory_and_retains_imported_arm_p
         assert_eq!(stages.counts().copy_specialization, 2);
         drop(stages);
         drop(scope);
-        let typed = typecheck_scalar_project(raw);
+        let (typed, occurrences) = typecheck_scalar_project_with_occurrences(raw);
         assert!(typed.diagnostics.is_empty());
         let mut derived = typed.project;
-        let calls = resolve_project_call_sites(&derived.modules);
+        let calls = resolve_project_call_sites_with_occurrences(&derived.modules, occurrences);
         let scope = layout::observations::Scope::new();
         assert!(record_project_reference_origins(&mut derived.modules, &calls).is_empty());
         assert_eq!(scope.counts().struct_copies, 2);
@@ -196,6 +196,10 @@ fn actual_project_specialization_reuses_one_inventory_and_retains_imported_arm_p
 fn template_index_retains_first_source_even_when_its_module_is_empty() {
     let first = ScalarModule::new(source(), Vec::new(), Vec::new());
     let second = raw_module(source(), GENERIC, ScalarTargetLayout::WASM32);
+    let (second, occurrences) =
+        typecheck_scalar_project_with_occurrences(ScalarProject::new(vec![second], vec![source()]));
+    assert!(second.diagnostics.is_empty(), "{:?}", second.diagnostics);
+    let second = second.project.modules.into_iter().next().unwrap();
     let mut first_results = Vec::new();
     let mut calls = resolve_module_call_sites(
         &second.source,
@@ -203,8 +207,8 @@ fn template_index_retains_first_source_even_when_its_module_is_empty() {
         &second.namespace_bindings,
         &CallDeclarationIndex::new(&[CallResolutionModule::module(&second)]),
         second.resolved_assignment_outputs.as_map(),
-        false,
-        PreparationOccurrenceTyping::default(),
+        true,
+        occurrences.into_iter().next().unwrap(),
     )
     .unwrap();
     calls

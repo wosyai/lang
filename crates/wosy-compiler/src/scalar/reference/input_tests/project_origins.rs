@@ -499,6 +499,7 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
                         checked_call_signatures: HashMap::new(),
                         identities: InitializationIdentities::default(),
                         call_targets: HashMap::new(),
+                        legacy_reservations: Vec::new(),
                         assignments: HashMap::new(),
                         conditionals: HashMap::new(),
                         loops: HashMap::new(),

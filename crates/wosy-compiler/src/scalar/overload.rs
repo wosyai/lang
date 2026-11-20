@@ -9,6 +9,7 @@ pub(super) struct ScalarOverloadArmHeader {
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct ScalarOverloadHeader {
     pub arms: Vec<ScalarOverloadArmHeader>,
+    pub(super) origin: (usize, usize),
 }
 
 impl ScalarOverloadHeader {
@@ -16,6 +17,7 @@ impl ScalarOverloadHeader {
         #[cfg(test)]
         observations::record_header(function);
         Self {
+            origin: (0, 0),
             arms: function
                 .overload_arms
                 .iter()
@@ -204,7 +206,7 @@ impl ScalarOverloadEnvironment {
                 }
             })
             .collect();
-        let declarations = overload_declarations(items);
+        let declarations = overload_declarations(items, 0);
         let module = ScalarOverloadModule {
             callables: ScalarCallableHeaders::new(items),
             source: copy_source(source),
@@ -229,7 +231,7 @@ impl ScalarOverloadEnvironment {
             .iter()
             .enumerate()
             .map(|(ordinal, module)| {
-                let declarations = overload_declarations(&module.items);
+                let declarations = overload_declarations(&module.items, ordinal);
                 let header = ScalarOverloadModule {
                     callables: ScalarCallableHeaders::new(&module.items),
                     source: copy_source(&module.source),
@@ -341,7 +343,10 @@ fn first_overloads(
     first
 }
 
-fn overload_declarations(items: &[ScalarItem]) -> BTreeMap<usize, ScalarOverloadDeclaration> {
+fn overload_declarations(
+    items: &[ScalarItem],
+    module: usize,
+) -> BTreeMap<usize, ScalarOverloadDeclaration> {
     items
         .iter()
         .enumerate()
@@ -350,7 +355,10 @@ fn overload_declarations(items: &[ScalarItem]) -> BTreeMap<usize, ScalarOverload
                 position,
                 ScalarOverloadDeclaration {
                     name: copy_name(&function.name),
-                    header: ScalarOverloadHeader::from_function(function),
+                    header: ScalarOverloadHeader {
+                        origin: (module, position),
+                        ..ScalarOverloadHeader::from_function(function)
+                    },
                 },
             )),
             _ => None,

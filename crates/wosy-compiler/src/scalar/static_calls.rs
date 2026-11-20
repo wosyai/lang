@@ -6,9 +6,7 @@ pub(crate) struct PreparedProgram {
 }
 
 impl PreparedProgram {
-    pub(crate) fn rebuild_raw(
-        program: &ScalarProgram,
-    ) -> Result<(ScalarProgram, control::ModuleInitializationRegion), String> {
+    pub(crate) fn rebuild_raw(program: &ScalarProgram) -> Result<Self, String> {
         let mut prepared = Self::new(
             ScalarSourceDeclarations {
                 source: program.source.clone(),
@@ -24,7 +22,39 @@ impl PreparedProgram {
         if !results.install(&mut prepared.program).is_empty() {
             return Err("cannot emit LLVM for an invalid scalar program".into());
         }
-        Ok((prepared.program, prepared.calls.initialization))
+        Ok(prepared)
+    }
+
+    pub(crate) fn program(&self) -> &ScalarProgram {
+        &self.program
+    }
+
+    pub(crate) fn body_overload_reservations(
+        &self,
+        item: usize,
+    ) -> Option<impl Iterator<Item = &ResolvedCallTarget>> {
+        Some(
+            self.calls
+                .function_body(item, None)?
+                .overload_reservations(),
+        )
+    }
+
+    pub(crate) fn initialization_region(&self) -> &control::ModuleInitializationRegion {
+        &self.calls.initialization
+    }
+
+    pub(crate) fn bind_body<'a>(
+        &'a self,
+        item: usize,
+        arm: Option<usize>,
+        body: &'a ScalarBlock,
+    ) -> Result<control::CallableBodyCallNodes<'a>, String> {
+        let source = &self.program.source;
+        let calls = self.calls.function_body(item, arm).ok_or_else(|| {
+            format!("internal error: missing callable body call topology in {source:?} at item {item}, arm {arm:?}")
+        })?;
+        control::CallableBodyCallNodes::bind(source, body, calls, None)
     }
 
     #[cfg(test)]
@@ -182,6 +212,18 @@ impl PreparedScalarProject {
 
     pub fn project(&self) -> &ScalarProject {
         &self.project
+    }
+
+    pub(crate) fn body_overload_reservations(
+        &self,
+        module: usize,
+        item: usize,
+    ) -> Option<impl Iterator<Item = &ResolvedCallTarget>> {
+        Some(
+            self.calls
+                .function_body(module, item, None)?
+                .overload_reservations(),
+        )
     }
 
     pub(crate) fn initialization_region(

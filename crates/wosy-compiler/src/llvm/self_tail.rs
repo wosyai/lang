@@ -9,10 +9,12 @@ pub(super) fn eligible(
     function: &ScalarFunction,
     cfg: &ScalarReferenceCfg,
 ) -> bool {
-    state.body_call_nodes.is_some_and(|nodes| {
-        nodes.has_checked_self_tail()
-            || (nodes.has_self_tail_candidates() && nodes.has_scalar_self_tail_types())
-    }) && state.return_owner_slots.is_empty()
+    state.prepared_render
+        && state.body_call_nodes.is_some_and(|nodes| {
+            nodes.has_checked_self_tail()
+                || (nodes.has_self_tail_candidates() && nodes.has_scalar_self_tail_types())
+        })
+        && state.return_owner_slots.is_empty()
         && state.fresh_return_outputs.is_empty()
         && state.branch_return_outputs.is_empty()
         && call_owners_allow_reuse(state.body_call_nodes, cfg, &state.checked_call_owners)
