@@ -5011,6 +5011,19 @@ impl FunctionCallSites {
         }
     }
 
+    pub(super) fn prepared_lexical_member(
+        &self,
+        ordinal: OccurrenceOrdinal,
+    ) -> Option<(&ReferenceBindingId, &ScalarStructFieldId)> {
+        let MemberFacts::Prepared(rows) = &self.members else {
+            return None;
+        };
+        match rows.get(&ordinal)? {
+            PreparedMemberIdentity::Lexical { binding, field } => Some((binding, field)),
+            PreparedMemberIdentity::Other => None,
+        }
+    }
+
     pub(super) fn prepared_direct_destination(
         &self,
         ordinal: OccurrenceOrdinal,

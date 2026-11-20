@@ -156,6 +156,8 @@ struct CallableProofNodes<'a> {
     initializer_bindings: bool,
     expressions: HashMap<*const ScalarExpression, OccurrenceOrdinal>,
     places: HashMap<*const ScalarPlace, OccurrenceOrdinal>,
+    #[cfg(test)]
+    place_type_override: HashMap<OccurrenceOrdinal, Option<&'static ScalarType>>,
     bindings: HashMap<*const ScalarBinding, BlockPosition>,
     final_outputs: HashMap<*const ScalarExpression, usize>,
 }
@@ -817,6 +819,34 @@ impl<'a> CallableBodyCallNodes<'a> {
         self.proof_nodes.calls?.prepared_plain_name(ordinal)
     }
 
+    pub(crate) fn lexical_member(
+        &self,
+        value: &ScalarExpression,
+    ) -> Option<(
+        &'a crate::scalar::ReferenceBindingId,
+        &'a ScalarStructFieldId,
+    )> {
+        if !matches!(value, ScalarExpression::Member { .. }) {
+            return None;
+        }
+        let ordinal = *self
+            .proof_nodes
+            .expressions
+            .get(&std::ptr::from_ref(value))?;
+        self.proof_nodes.calls?.prepared_lexical_member(ordinal)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn withhold_lexical_member_occurrence(&mut self, value: &ScalarExpression) -> bool {
+        if self.lexical_member(value).is_none() {
+            return false;
+        }
+        self.proof_nodes
+            .expressions
+            .remove(&std::ptr::from_ref(value))
+            .is_some()
+    }
+
     pub(crate) fn direct_destination(
         &self,
         place: &ScalarPlace,
@@ -843,12 +873,26 @@ impl<'a> CallableBodyCallNodes<'a> {
 
     pub(crate) fn checked_place_type(&self, place: &ScalarPlace) -> Option<&'a ScalarType> {
         let ordinal = self.proof_nodes.places.get(&std::ptr::from_ref(place))?;
+        #[cfg(test)]
+        if let Some(ty) = self.proof_nodes.place_type_override.get(ordinal) {
+            return *ty;
+        }
         self.proof_nodes
             .calls?
             .structure
             .checked_types
             .places
             .get(ordinal)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn override_checked_place_type(
+        &mut self,
+        place: &ScalarPlace,
+        ty: Option<&'static ScalarType>,
+    ) {
+        let ordinal = self.proof_nodes.places[&std::ptr::from_ref(place)];
+        self.proof_nodes.place_type_override.insert(ordinal, ty);
     }
 
     pub(crate) fn final_output(&self, value: &ScalarExpression) -> Option<usize> {

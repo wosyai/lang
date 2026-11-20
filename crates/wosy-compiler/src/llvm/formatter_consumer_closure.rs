@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+mod print_finite;
+
 use std::collections::BTreeMap;
 
 use wosy_syntax::{ByteSpan, SourceIdentity, SourceSpan};
