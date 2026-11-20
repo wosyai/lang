@@ -19,6 +19,125 @@ fn namespace(binding: &str, source: &SourceIdentity) -> ScalarNamespaceBinding {
 }
 
 #[test]
+fn initializer_facts_binding_output_routes_preserve_actual_secondary_occurrences() {
+    let text = "%%start\nu8(u8) id = fn(value) { value };\n(u8, u8)(u8) duo = fn(value) { value, value };\nu8 left, u8 right = id(1) + 1, id(2);\nu8 first, u8 second = duo(3);\nid(second);\n%%end";
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("p".into(), "app".into(), "routes.w".into(), "r1".into());
+        let other = SourceIdentity::new("p".into(), "app".into(), "routes.w".into(), "r2".into());
+        let prepared = prepare_scalar_project(
+            vec![
+                (declarations(&source, text), Vec::new()),
+                (declarations(&other, text), Vec::new()),
+            ],
+            vec![source.clone(), other.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let modules = &prepared.project().modules;
+        let index = |source: &SourceIdentity| {
+            modules
+                .iter()
+                .position(|module| &module.source == source)
+                .unwrap()
+        };
+        let module = index(&source);
+        let items = &modules[module].items;
+        let binding = |name: &str| {
+            items
+                .iter()
+                .find_map(|item| match item {
+                    ScalarItem::Binding(binding) if binding.name == name => Some(binding),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let independent = binding("left");
+        let projected = binding("first");
+        let call = &independent.output_values[1].value;
+        let facts = prepared.initializer_facts(module).unwrap();
+        let evaluated = facts.binding_output(independent, 1, call).unwrap();
+        assert_eq!(evaluated.route, InitializerOutputRoute::EvaluateSecondary);
+        assert_eq!(evaluated.ty, &ScalarType::U8);
+        assert_eq!(
+            evaluated.destination,
+            SourceSpan::new(source.clone(), independent.receivers[1].name_span)
+        );
+        let projection = facts
+            .binding_output(projected, 1, &projected.value)
+            .unwrap();
+        assert_eq!(
+            projection.route,
+            InitializerOutputRoute::ProjectPrimary { output: 1 }
+        );
+        assert_eq!(
+            projection.destination,
+            SourceSpan::new(source.clone(), projected.receivers[1].name_span)
+        );
+        for (binding, wrong) in [(independent, &independent.value), (projected, call)] {
+            assert_eq!(
+                facts.binding_output(binding, 1, wrong).unwrap_err(),
+                InitializerFactsError::Noncanonical
+            );
+        }
+        assert_eq!(
+            prepared
+                .initializer_facts(index(&other))
+                .unwrap()
+                .binding_output(projected, 1, &projected.value)
+                .unwrap_err(),
+            InitializerFactsError::Noncanonical
+        );
+        let mut altered = prepared.initialization_region(module).unwrap().clone();
+        let ModuleInitializationDetail::Occurrences(topology) = &mut altered.detail else {
+            unreachable!()
+        };
+        let item = facts.root_binding_item(projected).unwrap();
+        let rows = &mut topology.structure.blocks[topology.structure.root.0].items;
+        let row = rows.iter_mut().find(|row| row.position == item).unwrap();
+        let BlockItemKind::Binding(binding_row) = &mut row.kind else {
+            unreachable!()
+        };
+        let BindingInitialization::Outputs(outputs) = &mut binding_row.initialization else {
+            unreachable!()
+        };
+        outputs.secondary[0] = BindingOutput::ProjectPrimary { output: 0 };
+        assert_eq!(
+            InitializerFacts::bind(&altered, items)
+                .unwrap()
+                .binding_output(projected, 1, &projected.value)
+                .unwrap_err(),
+            InitializerFactsError::Malformed("initializer output route")
+        );
+        let mut missing = prepared.initialization_region(module).unwrap().clone();
+        let ModuleInitializationDetail::Occurrences(topology) = &mut missing.detail else {
+            unreachable!()
+        };
+        let rows = &mut topology.structure.blocks[topology.structure.root.0].items;
+        let row = rows.iter().position(|row| row.position == item).unwrap();
+        let removed = rows.remove(row);
+        assert_eq!(
+            InitializerFacts::bind(&missing, items)
+                .unwrap()
+                .binding_output(projected, 1, &projected.value)
+                .unwrap_err(),
+            InitializerFactsError::Missing("initializer root item")
+        );
+        let ModuleInitializationDetail::Occurrences(topology) = &mut missing.detail else {
+            unreachable!()
+        };
+        let rows = &mut topology.structure.blocks[topology.structure.root.0].items;
+        rows.extend([removed.clone(), removed]);
+        assert_eq!(
+            InitializerFacts::bind(&missing, items)
+                .unwrap()
+                .binding_output(projected, 1, &projected.value)
+                .unwrap_err(),
+            InitializerFactsError::Malformed("initializer root item")
+        );
+    }
+}
+
+#[test]
 fn initializer_facts_project_exact_u128_format_and_print_storage() {
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         let source = |pkg: &str, path: &str| {
