@@ -1964,13 +1964,13 @@ pub struct ScalarBinding {
     pub span: ByteSpan,
 }
 
-enum ScalarBindingOutput<'a> {
+pub(crate) enum ScalarBindingOutput<'a> {
     Evaluate(&'a ScalarExpression),
     ProjectPrimary { output: usize },
 }
 
 impl ScalarBinding {
-    fn output_source(&self, position: usize) -> ScalarBindingOutput<'_> {
+    pub(crate) fn output_source(&self, position: usize) -> ScalarBindingOutput<'_> {
         if position == 0 {
             return ScalarBindingOutput::Evaluate(&self.value);
         }

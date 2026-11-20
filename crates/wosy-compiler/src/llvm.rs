@@ -24,8 +24,8 @@ use crate::scalar::layout::ScalarTargetLayouts;
 use crate::scalar::{
     CfgPointKind, CoreOperationId, InvalidationCandidate, InvalidationInputs, ReferenceBindingKind,
     ReferenceOrigin, ReleaseTarget, ResolvedCallTarget, ScalarAllocationIdentity,
-    ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState, ScalarBindingOutputOrigin,
-    ScalarFieldReference, ScalarOverloadSelection, ScalarReferenceCfg,
+    ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState, ScalarBindingOutput,
+    ScalarBindingOutputOrigin, ScalarFieldReference, ScalarOverloadSelection, ScalarReferenceCfg,
 };
 use crate::{
     BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarBuildValidation,
@@ -1331,16 +1331,14 @@ fn emit_binding_value<'ctx, 'module>(
             emit_expression(context, state, &binding.value)
         }
         ScalarBindingOutputOrigin::IndependentExpressions => {
-            let canonical = state.has_prepared_calls();
             let values = binding
                 .output_values
                 .iter()
                 .enumerate()
                 .map(|(position, output)| {
-                    let expression = if canonical && position == 0 {
-                        &binding.value
-                    } else {
-                        &output.value
+                    let ScalarBindingOutput::Evaluate(expression) = binding.output_source(position)
+                    else {
+                        unreachable!("independent binding output evaluates its source");
                     };
                     emit_typed_expression(context, state, expression, &output.ty)
                 })
@@ -1735,16 +1733,14 @@ fn emit_project_binding_value<'ctx, 'module>(
             emit_project_expression(context, state, &binding.value, module, modules)
         }
         ScalarBindingOutputOrigin::IndependentExpressions => {
-            let canonical = state.has_prepared_calls();
             let values = binding
                 .output_values
                 .iter()
                 .enumerate()
                 .map(|(position, output)| {
-                    let expression = if canonical && position == 0 {
-                        &binding.value
-                    } else {
-                        &output.value
+                    let ScalarBindingOutput::Evaluate(expression) = binding.output_source(position)
+                    else {
+                        unreachable!("independent binding output evaluates its source");
                     };
                     emit_project_typed_expression(
                         context, state, expression, &output.ty, module, modules,
