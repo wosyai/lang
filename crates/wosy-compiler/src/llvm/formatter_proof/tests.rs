@@ -15,6 +15,10 @@ pub(super) enum Withheld {
     TupleProjection(Body, CfgPointId),
     ReorderedTupleProjection(Body, CfgPointId),
     TupleArm(Body, CfgPointId),
+    SwappedTupleArmSlots(Body, CfgPointId),
+    FloatIndexedBinding(Body, CfgPointId),
+    FloatIndexedProjection(Body, CfgPointId),
+    FloatCarryReturnValue(Body, CfgPointId),
     PrimitiveFact(Body, CfgPointId),
     ContradictoryPrimitiveFact(Body, CfgPointId),
     ContradictorySignedMagnitude(Body, CfgPointId),
@@ -328,6 +332,7 @@ fn prove_withheld(
 #[test]
 fn formatter_proof_real_simple_producers() {
     let mut strict_wide_failures = Vec::new();
+    let mut strict_float_failures = Vec::new();
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         let source =
             |path: &str| SourceIdentity::new("p".into(), "std".into(), path.into(), "r1".into());
@@ -385,28 +390,36 @@ fn formatter_proof_real_simple_producers() {
             .find(|field| field.name == "data")
             .unwrap()
             .id;
-        let call_site = |from: usize, to: usize| {
+        let call_sites = |from: usize, to: usize| {
             let ScalarItem::Function(target) = &items[to] else {
                 unreachable!()
             };
             let cfg = build.reference_cfg(0, from, None).unwrap();
-            let mut matches = cfg.points.iter().filter(|point| {
-                matches!(
-                    &point.kind,
-                    CfgPointKind::Call {
-                        output: 0,
-                        target: ResolvedCallTarget::ModuleCallable {
-                            source,
-                            declaration_span,
-                            concrete: ConcreteCallSelection::Declaration,
-                        },
-                        ..
-                    } if source == &module.source && declaration_span == &target.name_span
-                )
-            });
-            let site = matches.next().unwrap().id;
-            assert!(matches.next().is_none());
-            site
+            cfg.points
+                .iter()
+                .filter(|point| {
+                    matches!(
+                        &point.kind,
+                        CfgPointKind::Call {
+                            output: 0,
+                            target: ResolvedCallTarget::ModuleCallable {
+                                source,
+                                declaration_span,
+                                concrete: ConcreteCallSelection::Declaration,
+                            },
+                            ..
+                        } if source == &module.source && declaration_span == &target.name_span
+                    )
+                })
+                .map(|point| point.id)
+                .collect::<Vec<_>>()
+        };
+        let call_site = |from, to| {
+            let sites = call_sites(from, to);
+            let [site] = sites.as_slice() else {
+                panic!("expected unique call site for {from}→{to}: {sites:?}");
+            };
+            *site
         };
         let compact = find("_format_compact_bytes");
         let mut vertices = 0;
@@ -834,11 +847,323 @@ fn formatter_proof_real_simple_producers() {
                 "{target_layout:?} typed signed-minimum magnitude: {rejected:?}"
             ));
         }
-        for unsupported in ["_format_f32", "_format_f64"] {
-            assert!(
-                prove(&build, 0, find(unsupported)).is_err(),
-                "{unsupported}"
+        let before_float = batch.work.get();
+        let down = find("_format_normalize_float_down");
+        let up = find("_format_normalize_float_up");
+        let repeated = |helper| {
+            let sites = call_sites(helper, helper);
+            let [first, second] = sites.as_slice() else {
+                panic!("expected two ordered normalizer self-edges: {sites:?}");
+            };
+            assert_ne!(first, second);
+            [*first, *second]
+        };
+        let mut vertices = 0;
+        let mut arcs = 0;
+        let mut carry_vertices = 0;
+        let mut carry_arcs = 0;
+        for suffix in ["f32", "f64"] {
+            let producer = find(&format!("_format_{suffix}"));
+            let digits = find(&format!("_format_digits_{suffix}"));
+            let carry = find(&format!("_format_carry_{suffix}"));
+            let carry_cfg = build.reference_cfg(0, carry, None).unwrap();
+            carry_vertices += carry_cfg.points.len();
+            carry_arcs += carry_cfg
+                .points
+                .iter()
+                .map(|point| point.successors.len())
+                .sum::<usize>();
+            let proof = batch
+                .prove(0, producer)
+                .unwrap_or_else(|error| panic!("{target_layout:?} {suffix}: {error:?}"));
+            let cfg = build.reference_cfg(0, producer, None).unwrap();
+            assert_eq!(cfg.allocations, BTreeSet::from([proof.owner]));
+            assert_eq!(&proof.field, field);
+            assert_eq!(proof.output, 0);
+            vertices += cfg.points.len();
+            arcs += cfg
+                .points
+                .iter()
+                .map(|point| point.successors.len())
+                .sum::<usize>();
+            let [d0, d1] = repeated(down);
+            let [u0, u1] = repeated(up);
+            let scalar_edge = |from, site, to| ((0, from), site, Dependency::ScalarOnly((0, to)));
+            let backing_edge = |from, to| {
+                (
+                    (0, from),
+                    call_site(from, to),
+                    Dependency::Backing((0, to, 0)),
+                )
+            };
+            let expected = [
+                scalar_edge(producer, call_site(producer, down), down),
+                scalar_edge(producer, call_site(producer, up), up),
+                backing_edge(producer, digits),
+                scalar_edge(down, d0, down),
+                scalar_edge(down, d1, down),
+                scalar_edge(up, u0, up),
+                scalar_edge(up, u1, up),
+                backing_edge(digits, digits),
+                backing_edge(digits, carry),
+                backing_edge(carry, carry),
+            ];
+            assert_eq!(
+                proof
+                    .edges
+                    .iter()
+                    .map(|edge| (edge.from, edge.site, edge.to))
+                    .collect::<Vec<_>>(),
+                expected
             );
+        }
+        let after_float = batch.work.get();
+        assert_eq!(
+            (
+                after_float.index_builds,
+                after_float.modules,
+                after_float.items,
+                after_float.structs
+            ),
+            (
+                before_float.index_builds,
+                before_float.modules,
+                before_float.items,
+                before_float.structs
+            )
+        );
+        assert_eq!(
+            after_float.definition_queries - before_float.definition_queries,
+            20
+        );
+        assert_eq!(after_float.helper_checks - before_float.helper_checks, 8);
+        assert_eq!(after_float.struct_queries - before_float.struct_queries, 2);
+        assert_eq!(
+            after_float.dominance_walks - before_float.dominance_walks,
+            4
+        );
+        assert_eq!(
+            after_float.dominance_queries - before_float.dominance_queries,
+            6
+        );
+        assert!(after_float.points - before_float.points <= 2 * vertices);
+        assert!(after_float.arcs - before_float.arcs <= 2 * arcs);
+        assert_eq!(
+            after_float.float_return_walks - before_float.float_return_walks,
+            2
+        );
+        assert!(
+            after_float.float_return_points - before_float.float_return_points <= carry_vertices
+        );
+        assert!(after_float.float_return_arcs - before_float.float_return_arcs <= carry_arcs);
+
+        let producer = find("_format_f32");
+        let float_body = (0, producer);
+        let cfg = build.reference_cfg(0, producer, None).unwrap();
+        let widen = cfg
+            .points
+            .iter()
+            .find(|point| {
+                matches!(
+                    &point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::Core(CoreOperationId::FloatExtend),
+                        output: 0,
+                        ..
+                    }
+                )
+            })
+            .unwrap()
+            .id;
+        for (fault, stage) in [
+            (
+                Withheld::ConversionOperand(float_body, widen),
+                "conversion operand type",
+            ),
+            (
+                Withheld::ConversionResult(float_body, widen),
+                "conversion result type",
+            ),
+        ] {
+            let rejected = prove_withheld(&build, producer, fault);
+            assert!(
+                matches!(rejected, Err(Unproved::Missing(body, reason)) if body == float_body && reason == stage),
+                "{target_layout:?} {stage}: {rejected:?}"
+            );
+        }
+        for helper in [down, up] {
+            let helper_body = (0, helper);
+            let cfg = build.reference_cfg(0, helper, None).unwrap();
+            let root_join = |output| {
+                cfg.points
+                    .iter()
+                    .find_map(|point| match point.kind {
+                        CfgPointKind::ReturnOutput {
+                            output: slot,
+                            value_point,
+                            checked: false,
+                        } if slot == output => Some(value_point),
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            let nested_join = |point: CfgPointId| {
+                let CfgPointKind::ConditionalOutput { else_point, .. } = cfg.points[point.0].kind
+                else {
+                    unreachable!("nested normalizer conditional");
+                };
+                else_point
+            };
+            // The third conditional in both normalizers ends in two direct typed leaves.
+            let nested = [0, 1].map(|slot| nested_join(nested_join(root_join(slot))));
+            let rejected =
+                prove_withheld(&build, producer, Withheld::TupleArm(helper_body, nested[1]));
+            assert!(
+                matches!(rejected, Err(Unproved::Missing(body, "tuple arm output")) if body == helper_body),
+                "{target_layout:?} nested slot absence: {rejected:?}"
+            );
+            let rejected = prove_withheld(
+                &build,
+                producer,
+                Withheld::SwappedTupleArmSlots(helper_body, nested[0]),
+            );
+            assert!(
+                matches!(rejected, Err(Unproved::Unsupported(body, "tuple arm/return slot identity")) if body == helper_body),
+                "{target_layout:?} nested slot swap: {rejected:?}"
+            );
+        }
+        for suffix in ["f32", "f64"] {
+            let producer = find(&format!("_format_{suffix}"));
+            let digits = find(&format!("_format_digits_{suffix}"));
+            let body = (0, digits);
+            let cfg = build.reference_cfg(body.0, body.1, None).unwrap();
+            let projections = cfg
+                .points
+                .iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::Call { output: 1, .. }))
+                .collect::<Vec<_>>();
+            let [projection] = projections.as_slice() else {
+                panic!("expected one digit-recursion projection: {projections:?}");
+            };
+            let rejected = prove_withheld(
+                &build,
+                producer,
+                Withheld::ReorderedTupleProjection(body, projection.id),
+            );
+            assert!(
+                matches!(rejected, Err(Unproved::Unsupported(at, "tuple projection identity")) if at == body),
+                "{target_layout:?} {suffix} duplicate digit result slot: {rejected:?}"
+            );
+            let body = (0, find(&format!("_format_carry_{suffix}")));
+            let view = View::new(&build, body).unwrap();
+            let mut finals = view.function.body.final_expressions();
+            let Some((
+                root @ ScalarExpression::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                },
+                _,
+            )) = finals.next()
+            else {
+                unreachable!("canonical scalar carry return");
+            };
+            assert!(finals.next().is_none());
+            let (else_value, _) = else_branch.final_expressions().next().unwrap();
+            assert_eq!(
+                view.nodes.checked_expression_type(root),
+                Some(&ScalarType::I32)
+            );
+            assert_eq!(
+                view.nodes.checked_expression_type(else_value),
+                Some(&ScalarType::I32)
+            );
+            let mut writes = then_branch.items.iter().filter_map(|item| {
+                let ScalarBlockItem::Expression(ScalarExpression::UnitIf { then_branch, .. }) =
+                    item
+                else {
+                    return None;
+                };
+                then_branch.items.iter().find_map(|item| {
+                    let ScalarBlockItem::Assignment(assignment) = item else {
+                        return None;
+                    };
+                    let ([target], [ScalarExpression::Name { name, .. }]) =
+                        (assignment.targets.as_slice(), assignment.values.as_slice())
+                    else {
+                        return None;
+                    };
+                    (name == "zero_digit" && matches!(target.place, ScalarPlace::Index { .. }))
+                        .then_some(&target.place)
+                })
+            });
+            let write = writes
+                .next()
+                .expect("first canonical carry store of zero_digit");
+            let frozen = view.nodes.frozen_install(view.facts, write).unwrap();
+            let CfgPointKind::Assign { target, .. } = &view.cfg.points[frozen.install.0].kind
+            else {
+                unreachable!("canonical carry store");
+            };
+            assert_eq!(&target.binding, view.formal(0).unwrap().0);
+            let returned = view
+                .cfg
+                .points
+                .iter()
+                .find(|point| {
+                    matches!(
+                        point.kind,
+                        CfgPointKind::ReturnOutput {
+                            output: 0,
+                            checked: false,
+                            ..
+                        }
+                    )
+                })
+                .unwrap()
+                .id;
+            for (fault, missing, stage) in [
+                (
+                    Withheld::PrimitiveFact(body, view.eval(root).unwrap()),
+                    true,
+                    "wide primitive expression type",
+                ),
+                (
+                    Withheld::ContradictoryPrimitiveFact(body, view.eval(else_value).unwrap()),
+                    false,
+                    "float carry result type",
+                ),
+                (
+                    Withheld::FloatIndexedBinding(body, frozen.install),
+                    false,
+                    "float indexed install identity",
+                ),
+                (
+                    Withheld::FloatIndexedProjection(body, frozen.install),
+                    false,
+                    "float indexed install identity",
+                ),
+                (
+                    Withheld::FloatCarryReturnValue(body, returned),
+                    false,
+                    "float carry return identity",
+                ),
+            ] {
+                let rejected = prove_withheld(&build, producer, fault);
+                let exact = match &rejected {
+                    Err(Unproved::Missing(at, reason)) => {
+                        missing && *at == body && *reason == stage
+                    }
+                    Err(Unproved::Unsupported(at, reason)) => {
+                        !missing && *at == body && *reason == stage
+                    }
+                    _ => false,
+                };
+                if !exact {
+                    strict_float_failures
+                        .push(format!("{target_layout:?} {suffix} {stage}: {rejected:?}"));
+                }
+            }
         }
         assert!(matches!(
             prove(&build, 0, items.len()),
@@ -846,6 +1171,163 @@ fn formatter_proof_real_simple_producers() {
         ));
     }
     assert!(strict_wide_failures.is_empty(), "{strict_wide_failures:#?}");
+    assert!(
+        strict_float_failures.is_empty(),
+        "{strict_float_failures:#?}"
+    );
+}
+
+#[test]
+fn formatter_proof_float_checks_transitive_effects_backing_and_conversion() {
+    let cases = [
+        (
+            "eligible",
+            "",
+            "scratch[round_position] = 7;",
+            "core.float_to_sint_trunc<i32>(value);",
+        ),
+        (
+            "release",
+            "u8[3] local; unsafe { *?u8 p = &?local[0]; core.free(p); };",
+            "scratch[round_position] = 7;",
+            "core.float_to_sint_trunc<i32>(value);",
+        ),
+        (
+            "replacement",
+            "",
+            "u8[3] replacement; replacement[0] = 7; scratch[round_position] = replacement[0];",
+            "core.float_to_sint_trunc<i32>(value);",
+        ),
+        (
+            "conversion",
+            "",
+            "scratch[round_position] = 7;",
+            "core.float_trunc<f32>(value);",
+        ),
+    ];
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (case, effect, write, conversion) in cases {
+            let source = SourceIdentity::new("p".into(), "p".into(), "float.w".into(), "r1".into());
+            let text = format!("%%start
+struct Packet {{ *?u8 address; u64 length; }}
+(f64, i32)(f64, i32, u64) leaf = fn(value, exponent, budget) {{
+    {effect}
+    if (budget == 0) {{ value, exponent }} else {{ value, exponent }}
+}};
+(f64, i32)(f64, i32, u64) bridge = fn(value, exponent, budget) {{
+    f64 next, i32 count = leaf(value, exponent, budget);
+    if (budget == 0) {{ next, count }} else {{ next, count }}
+}};
+i32(u8[], u64, u64, i32, bool) carry = fn(scratch, round_position, digit_start, exponent, rounding) {{
+    round_position;
+    digit_start;
+    rounding;
+    {write}
+    exponent
+}};
+Packet(f64) make = fn(value) {{
+    u8[3] scratch;
+    {conversion}
+    f64 scaled, i32 exponent = bridge(value, 0, 0);
+    scaled;
+    carry(scratch, 0, 0, exponent, false);
+    *?u8 data = null;
+    unsafe {{ data = &?scratch[0]; }};
+    Packet result = {{ .length = 1; .address = data; }};
+    result
+}};
+%%end");
+            let parsed = parse_source(source.clone(), text, &[]);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{case}: {:?}",
+                parsed.diagnostics
+            );
+            let prepared = prepare_scalar_project(
+                vec![(
+                    derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                    Vec::new(),
+                )],
+                vec![source],
+                ScalarPreparationInputs { target_layout },
+            )
+            .unwrap_or_else(|error| panic!("{case}: {:?}", error.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(
+                build.diagnostics().is_empty(),
+                "{case}: {:?}",
+                build.diagnostics()
+            );
+            let find = |name| {
+                prepared.project().modules[0]
+                    .items
+                    .iter()
+                    .position(|item| matches!(item, ScalarItem::Function(f) if f.name == name))
+                    .unwrap()
+            };
+            let make = (0, find("make"));
+            let leaf = (0, find("leaf"));
+            let bridge = (0, find("bridge"));
+            let carry = (0, find("carry"));
+            let result = prove(&build, make.0, make.1);
+            match case {
+                "eligible" => {
+                    assert_eq!(
+                        result
+                            .unwrap()
+                            .edges
+                            .iter()
+                            .map(|edge| (edge.from, edge.to))
+                            .collect::<Vec<_>>(),
+                        [
+                            (make, Dependency::ScalarOnly(bridge)),
+                            (make, Dependency::Backing((carry.0, carry.1, 0))),
+                            (bridge, Dependency::ScalarOnly(leaf))
+                        ]
+                    );
+                    let carry_view = View::new(&build, carry).unwrap();
+                    let ScalarBlockItem::Assignment(assignment) =
+                        &carry_view.function.body.items[3]
+                    else {
+                        unreachable!("canonical carry store");
+                    };
+                    let rhs = &assignment.values[0];
+                    let place = &assignment.targets[0].place;
+                    let frozen = carry_view
+                        .nodes
+                        .frozen_install(carry_view.facts, place)
+                        .unwrap();
+                    assert_eq!(carry_view.eval(rhs), Some(frozen.rhs));
+                    assert_eq!(
+                        carry_view.nodes.checked_expression_type(rhs),
+                        Some(&ScalarType::U8)
+                    );
+                    let rejected = prove_withheld(
+                        &build,
+                        make.1,
+                        Withheld::ContradictoryPrimitiveFact(carry, frozen.rhs),
+                    );
+                    assert!(
+                        matches!(rejected, Err(Unproved::Unsupported(body, "wide primitive assignment type")) if body == carry),
+                        "{target_layout:?} contradictory float carry store: {rejected:?}"
+                    );
+                }
+                "release" => assert!(
+                    matches!(result, Err(Unproved::Unsupported(body, "release or indirect storage effect")) if body == leaf),
+                    "{target_layout:?} {case}: {result:?}"
+                ),
+                "replacement" => assert!(
+                    matches!(result, Err(Unproved::Unsupported(body, "float backing helper allocation")) if body == carry),
+                    "{target_layout:?} {case}: {result:?}"
+                ),
+                "conversion" => assert!(
+                    matches!(result, Err(Unproved::Call(body, _, ResolvedCallTarget::Core(CoreOperationId::FloatTrunc), ..)) if body == make),
+                    "{target_layout:?} {case}: {result:?}"
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
 }
 
 #[test]
