@@ -641,12 +641,14 @@ fn emit_initializer_test_input(
             &module.layouts,
             module.target_layout,
             input,
+            &|reservations| build.aggregate(reservations),
             &|item, arm, _| build.reference_cfg(0, item, arm),
         ),
         super::emit_project_llvm(
             project,
             &|_| Some(region),
             input,
+            &|reservations| build.aggregate(reservations),
             &|module, item, arm, _| build.reference_cfg(module, item, arm),
             None,
         ),
@@ -1057,6 +1059,7 @@ fn prepared_initializer_namespace_member_uses_selected_storage_on_both_layouts()
                     }
                 },
                 input,
+                &|reservations| build.aggregate(reservations),
                 &|module, item, arm, _| build.reference_cfg(module, item, arm),
                 None,
             )
@@ -1142,6 +1145,7 @@ i32 nested = unsafe { echo(33) };
                 &module.layouts,
                 target_layout,
                 input,
+                &|reservations| build.aggregate(reservations),
                 &|item, arm, _| build.reference_cfg(0, item, arm),
             )
             .unwrap()
@@ -1150,6 +1154,7 @@ i32 nested = unsafe { echo(33) };
                 &project,
                 &|_| Some(region),
                 input,
+                &|reservations| build.aggregate(reservations),
                 &|module, item, arm, _| build.reference_cfg(module, item, arm),
                 None,
             )
@@ -2896,6 +2901,7 @@ select = overload {
             &legacy.project,
             &|module| prepared.initialization_region(module),
             super::GenericInitializerInput::RawProject(&prepared),
+            &|_| Ok(crate::scalar::ClosedAggregates::default()),
             &|module, item, arm, function| {
                 if (module, item, arm) == (0, 1, Some(1)) {
                     build.reference_cfg(module, item, Some(overload.overload_arms.len()))
@@ -6137,6 +6143,7 @@ fn detached_project_llvm_initializes_interleaved_namespace_diamond_once() {
                 }
             },
             super::GenericInitializerInput::PreparedRows(&prepared),
+            &|reservations| build.aggregate(reservations),
             &|module, item, arm, _| build.reference_cfg(module, item, arm),
             None,
         )

@@ -673,7 +673,7 @@ fn grouped_projected_writes_consume_saved_previous_origins_including_empty_sets(
             };
             let mut per_write = grouped.clone();
             per_write.points[6].kind = CfgPointKind::Join;
-            let errors = transfer_reference_facts(&mut grouped, &BTreeMap::new(), &[]);
+            let errors = transfer_reference_facts(&mut grouped, &BTreeMap::new(), &[], None);
             assert!(
                 errors.is_empty(),
                 "seeded={seeded} through={through}: {errors:?}"
@@ -706,7 +706,7 @@ fn grouped_projected_writes_consume_saved_previous_origins_including_empty_sets(
                 }
             );
             assert!(!previous_origins.contains(&ReferenceOriginId(1)));
-            let errors = transfer_reference_facts(&mut per_write, &BTreeMap::new(), &[]);
+            let errors = transfer_reference_facts(&mut per_write, &BTreeMap::new(), &[], None);
             assert!(errors.is_empty(), "{errors:?}");
             let (previous_origins, previous_loans) = match &per_write.points[8].kind {
                 CfgPointKind::Assign {

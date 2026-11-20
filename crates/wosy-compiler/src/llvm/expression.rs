@@ -213,6 +213,11 @@ pub(super) fn emit_expression<'ctx, 'module>(
             arguments,
             ..
         } => {
+            if let Some(value) =
+                aggregate_transfer::emit_call(context, state, expression, arguments, None)?
+            {
+                return Ok(value);
+            }
             let selected = state.prepared_call(expression)?;
             let (receiver, name) = match &selected {
                 Some(PreparedCall::Core(operation)) => {
@@ -417,6 +422,15 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             arguments,
             ..
         } => {
+            if let Some(value) = aggregate_transfer::emit_call(
+                context,
+                state,
+                expression,
+                arguments,
+                Some((module, modules)),
+            )? {
+                return Ok(value);
+            }
             let selected = state.prepared_call(expression)?;
             let (receiver, name) = match &selected {
                 Some(PreparedCall::Core(operation)) => {
@@ -2148,6 +2162,11 @@ fn emit_call_values<'ctx, 'module>(
         .functions
         .get(name)
         .ok_or_else(|| format!("unknown LLVM callable {name}"))?;
+    if function.get_linkage() == Linkage::Internal {
+        return Err(format!(
+            "closed aggregate callable {name} requires its bound transfer"
+        ));
+    }
     let mut arguments = values
         .into_iter()
         .map(|value| match value {
@@ -2171,6 +2190,25 @@ fn emit_call_values<'ctx, 'module>(
     } else {
         &BTreeSet::new()
     };
+    let owner_slots = stage_checked_return_sidecars(context, state, owner_outputs, &mut arguments)?;
+    let call = state
+        .builder
+        .build_call(function, &arguments, "call")
+        .map_err(builder_error)?;
+    publish_checked_return_sidecars(context, state, owner_slots)?;
+    let outputs = match state.signatures.get(name) {
+        Some(ScalarType::Callable { outputs, .. }) => outputs,
+        _ => return Err(format!("unknown LLVM callable signature {name}")),
+    };
+    ordinary_call_result(call.try_as_basic_value(), outputs)
+}
+
+pub(super) fn stage_checked_return_sidecars<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    owner_outputs: &BTreeSet<usize>,
+    arguments: &mut Vec<BasicMetadataValueEnum<'ctx>>,
+) -> Result<BTreeMap<usize, PointerValue<'ctx>>, String> {
     let mut owner_slots = BTreeMap::new();
     for output in owner_outputs {
         let slot = entry_alloca(
@@ -2181,10 +2219,14 @@ fn emit_call_values<'ctx, 'module>(
         arguments.push(slot.into());
         owner_slots.insert(*output, slot);
     }
-    let call = state
-        .builder
-        .build_call(function, &arguments, "call")
-        .map_err(builder_error)?;
+    Ok(owner_slots)
+}
+
+pub(super) fn publish_checked_return_sidecars<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    owner_slots: BTreeMap<usize, PointerValue<'ctx>>,
+) -> Result<(), String> {
     state.call_owner_flags = owner_slots
         .into_iter()
         .map(|(output, slot)| {
@@ -2199,11 +2241,14 @@ fn emit_call_values<'ctx, 'module>(
                 .map_err(builder_error)
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let outputs = match state.signatures.get(name) {
-        Some(ScalarType::Callable { outputs, .. }) => outputs,
-        _ => return Err(format!("unknown LLVM callable signature {name}")),
-    };
-    match (call.try_as_basic_value(), outputs.outputs.as_slice()) {
+    Ok(())
+}
+
+pub(super) fn ordinary_call_result<'ctx>(
+    value: ValueKind<'ctx>,
+    outputs: &crate::ScalarOutputSequence,
+) -> Result<EmitValue<'ctx>, String> {
+    match (value, outputs.outputs.as_slice()) {
         (ValueKind::Basic(value), [output]) => {
             if output.ty == ScalarType::Unit {
                 return Err("unit callable produced a value".to_owned());

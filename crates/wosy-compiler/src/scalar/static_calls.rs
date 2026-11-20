@@ -2,6 +2,7 @@ use super::*;
 
 pub(crate) struct PreparedProgram {
     program: ScalarProgram,
+    aggregate: reference::aggregate::InstalledAggregateFacts,
     calls: reference::ModuleCallSites,
 }
 
@@ -19,10 +20,16 @@ impl PreparedProgram {
         )
         .map_err(|_| "cannot emit LLVM for an invalid scalar program".to_owned())?;
         let results = prepared.analyze();
-        if !results.install(&mut prepared.program).is_empty() {
+        let (errors, aggregate) = results.install_retaining_aggregate(&mut prepared.program);
+        if !errors.is_empty() {
             return Err("cannot emit LLVM for an invalid scalar program".into());
         }
+        prepared.aggregate = aggregate;
         Ok(prepared)
+    }
+
+    pub(crate) fn aggregate(&self, reservations: &AggregateReservations) -> Result<ClosedAggregates, String> {
+        reference::aggregate::close_installed(reservations, &self.program, &self.calls, &self.aggregate)
     }
 
     pub(crate) fn program(&self) -> &ScalarProgram {
@@ -83,6 +90,7 @@ impl PreparedProgram {
         };
         Ok(Self {
             program: validation.program,
+            aggregate: reference::aggregate::InstalledAggregateFacts::default(),
             calls,
         })
     }
@@ -330,6 +338,11 @@ pub struct ScalarBuildValidation<'a> {
 }
 
 impl<'a> ScalarBuildValidation<'a> {
+    pub(crate) fn aggregate(&self, reservations: &AggregateReservations) -> Result<ClosedAggregates, String> {
+        self.results
+            .closed_aggregates(&self.prepared.project, &self.prepared.calls, reservations)
+    }
+
     pub fn prepared(&self) -> &'a PreparedScalarProject {
         self.prepared
     }

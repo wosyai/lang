@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::reference::{BlockOrdinal, OccurrenceMetadata, OccurrenceOrdinal, OccurrenceStructure};
 use super::{
@@ -157,6 +157,7 @@ pub(super) struct ModuleInitializationTopology {
     pub(super) legacy_reservations: Vec<(usize, OccurrenceOrdinal, bool)>,
     pub(super) checked_call_signatures: HashMap<OccurrenceOrdinal, CheckedCallSignature>,
     pub(super) identities: InitializationIdentities,
+    pub(super) callable_escapes: HashSet<SourceSpan>,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
     pub(super) loops: HashMap<(BlockOrdinal, usize), WhileRegion>,
@@ -216,7 +217,7 @@ pub(super) enum InitializationDestination {
 }
 
 impl ModuleInitializationTopology {
-    fn missing_call_target(&self, source: &SourceIdentity, ordinal: OccurrenceOrdinal) -> String {
+    pub(in crate::scalar) fn missing_call_target(&self, source: &SourceIdentity, ordinal: OccurrenceOrdinal) -> String {
         let span = self.occurrences[ordinal.0].span;
         format!(
             "internal error: missing initializer call target in {source:?} at {}..{} (occurrence {})",

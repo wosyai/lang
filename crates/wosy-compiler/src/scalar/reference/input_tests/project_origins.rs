@@ -500,6 +500,7 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
                         identities: InitializationIdentities::default(),
                         call_targets: HashMap::new(),
                         legacy_reservations: Vec::new(),
+                        callable_escapes: HashSet::new(),
                         assignments: HashMap::new(),
                         conditionals: HashMap::new(),
                         loops: HashMap::new(),

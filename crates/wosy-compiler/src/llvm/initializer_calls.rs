@@ -288,6 +288,35 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
         }))
     }
 
+    pub(super) fn direct_aggregate_symbol(
+        &self,
+        expression: &ScalarExpression,
+        initializer_target: Option<&ModuleInitializationCallTarget>,
+    ) -> Result<&str, String> {
+        let (source, range, concrete) = if let Some(target) = initializer_target {
+            let ModuleInitializationCallTarget::Direct { declaration, concrete } = target else {
+                return Err("missing closed initializer callable declaration".into());
+            };
+            (&declaration.source, declaration.range, concrete)
+        } else {
+            let nodes = self.body_call_nodes.ok_or_else(|| "missing closed aggregate body binding".to_owned())?;
+            let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete } =
+                nodes.target(expression)?
+            else {
+                return Err("missing closed aggregate callable declaration".into());
+            };
+            (source, *declaration_span, concrete)
+        };
+        let (_, base) = self.symbols().function_entry_at(source, range)?;
+        match concrete {
+            ConcreteCallSelection::Declaration => Ok(base.as_str()),
+            ConcreteCallSelection::Overload(selection) => self.call_targets
+                .get(&selected_overload_lookup_key(base, selection))
+                .map(String::as_str)
+                .ok_or_else(|| format!("missing closed aggregate selected definition {base}")),
+        }
+    }
+
     fn symbols(&self) -> &InitializerSymbols {
         self.initializer_symbols
             .expect("prepared LLVM symbol table")
