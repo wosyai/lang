@@ -1,11 +1,32 @@
 use super::*;
 
-pub(super) struct PreparedProgram {
+pub(crate) struct PreparedProgram {
     program: ScalarProgram,
     calls: reference::ModuleCallSites,
 }
 
 impl PreparedProgram {
+    pub(crate) fn rebuild_raw(
+        program: &ScalarProgram,
+    ) -> Result<(ScalarProgram, control::ModuleInitializationRegion), String> {
+        let mut prepared = Self::new(
+            ScalarSourceDeclarations {
+                source: program.source.clone(),
+                items: program.items.clone(),
+                structs: program.structs.clone(),
+                enums: program.enums.clone(),
+                diagnostics: Vec::new(),
+            },
+            program.target_layout,
+        )
+        .map_err(|_| "cannot emit LLVM for an invalid scalar program".to_owned())?;
+        let results = prepared.analyze();
+        if !results.install(&mut prepared.program).is_empty() {
+            return Err("cannot emit LLVM for an invalid scalar program".into());
+        }
+        Ok((prepared.program, prepared.calls.initialization))
+    }
+
     #[cfg(test)]
     pub(super) fn function_calls(&self, item: usize) -> &reference::FunctionCallSites {
         self.calls.function(item)
@@ -131,7 +152,7 @@ impl PreparedScalarProject {
         self.calls.function(module, item)
     }
 
-    pub(super) fn new(project: ScalarProject) -> Result<Self, ScalarProjectPreparationRejection> {
+    pub(crate) fn new(project: ScalarProject) -> Result<Self, ScalarProjectPreparationRejection> {
         let (validation, occurrence_typing) = typecheck_scalar_project_with_occurrences(project);
         if !validation.diagnostics.is_empty() {
             return Err(ScalarProjectPreparationRejection::extraction_or_typing(
