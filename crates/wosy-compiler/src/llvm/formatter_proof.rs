@@ -10,8 +10,9 @@ use crate::scalar::control::{
 };
 use crate::scalar::{
     BinaryOperator, CfgPointId, CfgPointKind, ConcreteCallSelection, CopyPolicy, CoreOperationId,
-    ReferenceBindingId, ResolvedCallTarget, ScalarBindingOutputOrigin, ScalarReferenceCfg,
-    ScalarStructFieldId, ScalarStructId, UnaryOperator,
+    ReferenceBindingId, ReferencePlaceId, ReferencePlaceProjection, ResolvedCallTarget,
+    ScalarBindingOutputOrigin, ScalarReferenceCfg, ScalarStructFieldId, ScalarStructId,
+    UnaryOperator,
 };
 use crate::{
     ScalarAssignment, ScalarBinding, ScalarBlock, ScalarBlockItem, ScalarBuildValidation,
@@ -106,6 +107,9 @@ struct Work {
     points: usize,
     arcs: usize,
     dominance_queries: usize,
+    float_return_walks: usize,
+    float_return_points: usize,
+    float_return_arcs: usize,
 }
 
 pub(super) struct ProofBatch<'a> {
@@ -373,27 +377,83 @@ enum Profile {
     Simple,
     WideSigned,
     WideUnsigned,
+    Float32,
+    Float64,
 }
 
 impl Profile {
     fn wide(self) -> Option<ScalarType> {
         match self {
-            Self::Simple => None,
+            Self::Simple | Self::Float32 | Self::Float64 => None,
             Self::WideSigned => Some(ScalarType::I128),
             Self::WideUnsigned => Some(ScalarType::U128),
         }
     }
 
+    fn float(self) -> bool {
+        matches!(self, Self::Float32 | Self::Float64)
+    }
+
+    fn strict(self) -> bool {
+        !matches!(self, Self::Simple)
+    }
+
     fn scalar(self, ty: &ScalarType) -> bool {
-        scalar(ty) || self.wide().as_ref() == Some(ty)
+        scalar(ty)
+            || self.wide().as_ref() == Some(ty)
+            || (self.float() && *ty == ScalarType::F64)
+            || matches!((self, ty), (Self::Float32, ScalarType::F32))
     }
 
     fn integer(self, ty: &ScalarType) -> bool {
-        self.scalar(ty) && !matches!(ty, ScalarType::Unit | ScalarType::Bool | ScalarType::Char)
+        self.scalar(ty)
+            && !matches!(
+                ty,
+                ScalarType::Unit
+                    | ScalarType::Bool
+                    | ScalarType::Char
+                    | ScalarType::F32
+                    | ScalarType::F64
+            )
     }
 
-    fn tuple(self) -> Option<[ScalarType; 2]> {
-        Some([self.wide()?, ScalarType::U8])
+    fn local_scalar(self, ty: &ScalarType) -> bool {
+        self.scalar(ty) && !(self.float() && *ty == ScalarType::F32)
+    }
+
+    fn tuple(self, backing: bool) -> Option<[ScalarType; 2]> {
+        if self.float() {
+            return Some([
+                if backing {
+                    ScalarType::U64
+                } else {
+                    ScalarType::F64
+                },
+                ScalarType::I32,
+            ]);
+        }
+        (!backing)
+            .then(|| self.wide().map(|width| [width, ScalarType::U8]))
+            .flatten()
+    }
+
+    fn conversion(self, op: &CoreOperationId, from: &ScalarType, to: &ScalarType) -> bool {
+        use ScalarType::*;
+
+        if self.float() {
+            return matches!(
+                (self, op, from, to),
+                (Self::Float32, CoreOperationId::FloatExtend, F32, F64)
+                    | (_, CoreOperationId::FloatToSintTrunc, F64, I32)
+                    | (_, CoreOperationId::SintToFloat, I32, F64)
+                    | (_, CoreOperationId::IntExtend, I32, U64)
+                    | (_, CoreOperationId::IntTrunc, I32, U8)
+            );
+        }
+        simple_scalar_conversion(op, from, to)
+            || (*op == CoreOperationId::IntExtend
+                && *from == ScalarType::I32
+                && self.wide().as_ref() == Some(to))
     }
 }
 
@@ -623,6 +683,8 @@ fn prove_in_batch(batch: &ProofBatch<'_>, module: usize, item: usize) -> Result<
     let profile = match parameters.as_slice() {
         [ScalarType::I128] => Profile::WideSigned,
         [ScalarType::U128] => Profile::WideUnsigned,
+        [ScalarType::F32] => Profile::Float32,
+        [ScalarType::F64] => Profile::Float64,
         [parameter] if simple_producer_input(parameter) => Profile::Simple,
         _ => return Err(unsupported_trace),
     };
@@ -695,7 +757,13 @@ fn prove_in_batch(batch: &ProofBatch<'_>, module: usize, item: usize) -> Result<
         };
         uses.check()?;
         if outputs.outputs.len() == 2 {
-            uses.tuple_return()?;
+            uses.tuple_return(
+                profile
+                    .tuple(owner.is_some())
+                    .ok_or(Unproved::Unsupported(body, "helper tuple schema"))?,
+            )?;
+        } else if profile.float() && owner.is_some() {
+            uses.float_carry_return()?;
         }
     }
     Ok(Proof {
@@ -716,6 +784,15 @@ struct Uses<'a, 'b> {
 }
 
 fn helper_outputs(profile: Profile, outputs: &[crate::ScalarOutput], scalar_only: bool) -> bool {
+    if profile.float() {
+        return match outputs {
+            [output] => !scalar_only && output.ty == ScalarType::I32,
+            [first, second] => profile
+                .tuple(!scalar_only)
+                .is_some_and(|types| first.ty == types[0] && second.ty == types[1]),
+            _ => false,
+        };
+    }
     match outputs {
         [] => !scalar_only,
         [output] => profile.scalar(&output.ty),
@@ -734,12 +811,15 @@ impl<'a, 'b> Uses<'a, 'b> {
         Unproved::Missing(self.view.body, message)
     }
 
-    fn tuple_call(&mut self, call: &ScalarExpression) -> Result<CfgPointId, Unproved> {
+    fn tuple_call(
+        &mut self,
+        call: &ScalarExpression,
+    ) -> Result<(CfgPointId, [ScalarType; 2]), Unproved> {
         let ScalarExpression::Call { arguments, .. } = call else {
             return Err(self.unsupported("tuple producer"));
         };
-        self.call(call, arguments, true)?;
-        self.view.eval(call).ok_or(self.missing("tuple producer"))
+        let (point, outputs) = self.call(call, arguments, true)?;
+        Ok((point, outputs.ok_or(self.missing("tuple producer schema"))?))
     }
 
     fn successor(&self, from: CfgPointId, to: CfgPointId) -> bool {
@@ -786,22 +866,19 @@ impl<'a, 'b> Uses<'a, 'b> {
     }
 
     fn tuple_binding(&mut self, binding: &ScalarBinding) -> Result<(), Unproved> {
-        let tuple = self
-            .profile
-            .tuple()
-            .ok_or(self.unsupported("tuple profile"))?;
         let [first, second] = binding.receivers.as_slice() else {
             return Err(self.unsupported("tuple binding arity"));
         };
         if binding.output_origin != ScalarBindingOutputOrigin::SingleExpression
-            || first.ty != tuple[0]
-            || second.ty != tuple[1]
             || first.allocation_length.is_some()
             || second.allocation_length.is_some()
         {
             return Err(self.unsupported("tuple binding slots"));
         }
-        let call = self.tuple_call(&binding.value)?;
+        let (call, tuple) = self.tuple_call(&binding.value)?;
+        if first.ty != tuple[0] || second.ty != tuple[1] {
+            return Err(self.unsupported("tuple binding slots"));
+        }
         let view = self.view;
         let mut defs = Vec::new();
         for (slot, receiver) in binding.receivers.iter().enumerate() {
@@ -833,14 +910,10 @@ impl<'a, 'b> Uses<'a, 'b> {
     }
 
     fn tuple_assignment(&mut self, assignment: &ScalarAssignment) -> Result<(), Unproved> {
-        let tuple = self
-            .profile
-            .tuple()
-            .ok_or(self.unsupported("tuple profile"))?;
         let [call] = assignment.values.as_slice() else {
             return Err(self.unsupported("tuple assignment arity"));
         };
-        let call = self.tuple_call(call)?;
+        let (call, tuple) = self.tuple_call(call)?;
         let view = self.view;
         let mut installs = Vec::new();
         for (slot, target) in assignment.targets.iter().enumerate() {
@@ -904,29 +977,15 @@ impl<'a, 'b> Uses<'a, 'b> {
         Ok(())
     }
 
-    fn tuple_return(&self) -> Result<(), Unproved> {
-        let tuple = self
-            .profile
-            .tuple()
-            .ok_or(self.unsupported("tuple profile"))?;
+    fn tuple_return(&self, tuple: [ScalarType; 2]) -> Result<(), Unproved> {
         let view = self.view;
         let mut expressions = view.function.body.final_expressions();
-        let Some((
-            value @ ScalarExpression::If {
-                then_branch,
-                else_branch,
-                ..
-            },
-            _,
-        )) = expressions.next()
-        else {
+        let Some((value @ ScalarExpression::If { .. }, _)) = expressions.next() else {
             return Err(self.unsupported("tuple return shape"));
         };
         if expressions.next().is_some() || view.nodes.final_output(value) != Some(0) {
             return Err(self.unsupported("tuple return shape"));
         }
-        let mut then_values = then_branch.final_expressions();
-        let mut else_values = else_branch.final_expressions();
         let mut returns = view.cfg.points.iter().filter_map(|point| match point.kind {
             CfgPointKind::ReturnOutput {
                 output,
@@ -935,68 +994,327 @@ impl<'a, 'b> Uses<'a, 'b> {
             } => Some((point, output, value_point, checked)),
             _ => None,
         });
-        let mut points = Vec::new();
-        for (slot, ty) in tuple.iter().enumerate() {
-            let (returned, output, join, checked) =
-                returns.next().ok_or(self.missing("tuple return slot"))?;
-            let [Some((then_value, then_slot)), Some((else_value, else_slot))] =
-                [then_values.next(), else_values.next()]
-            else {
-                return Err(self.missing("tuple arm slot"));
-            };
+        let [Some((ret0, 0, join0, false)), Some((ret1, 1, join1, false)), None] =
+            [returns.next(), returns.next(), returns.next()]
+        else {
+            return Err(self.unsupported("tuple return order"));
+        };
+        for (returned, join) in [(ret0, join0), (ret1, join1)] {
             let Some(join_point) = view.cfg.points.get(join.0) else {
                 return Err(self.missing("tuple join point"));
             };
-            let CfgPointKind::ConditionalOutput {
-                then_point,
-                else_point,
-            } = join_point.kind
-            else {
-                return Err(self.unsupported("tuple conditional output"));
-            };
-            #[cfg(test)]
-            if tests::is_withheld(tests::Withheld::TupleArm(self.view.body, join)) {
-                return Err(self.missing("tuple arm output"));
-            }
-            if checked
-                || output != slot
-                || then_slot.position != slot
-                || else_slot.position != slot
-                || then_point == else_point
-                || view.eval(then_value) != Some(then_point)
-                || view.eval(else_value) != Some(else_point)
-                || view.nodes.checked_expression_type(then_value) != Some(ty)
-                || view.nodes.checked_expression_type(else_value) != Some(ty)
-                || returned.scope != join_point.scope
-                || returned.source_span != join_point.source_span
+            if returned.scope != join_point.scope || returned.source_span != join_point.source_span
             {
                 return Err(self.unsupported("tuple arm/return slot identity"));
             }
-            points.push((join, returned.id));
         }
-        let [(join0, return0), (join1, return1)] = points.as_slice() else {
-            return Err(self.missing("tuple return slot"));
+        if !self.successor(join1, ret0.id) || !self.successor(ret0.id, ret1.id) {
+            return Err(self.unsupported("tuple return order"));
+        }
+        self.tuple_conditional(value, [join0, join1], &tuple, &ret0.source_span.source)
+    }
+
+    fn float_carry_return(&self) -> Result<(), Unproved> {
+        let view = self.view;
+        let owner = self.owner.ok_or(self.missing("float carry owner"))?;
+        let ScalarType::Callable { outputs, .. } = &view.function.signature else {
+            return Err(self.missing("float carry signature"));
+        };
+        if !matches!(outputs.outputs.as_slice(), [output] if output.ty == ScalarType::I32) {
+            return Err(self.unsupported("float carry signature"));
+        }
+        let mut expressions = view.function.body.final_expressions();
+        let (value, slot) = expressions
+            .next()
+            .ok_or(self.missing("float carry output"))?;
+        if expressions.next().is_some()
+            || slot.position != 0
+            || view.nodes.final_output(value) != Some(0)
+        {
+            return Err(self.unsupported("float carry output shape"));
+        }
+        if self.wide_primitive_type(value)? != &ScalarType::I32 {
+            return Err(self.unsupported("float carry result type"));
+        }
+        let root = view
+            .eval(value)
+            .ok_or(self.missing("float carry evaluation"))?;
+        let root_point = view
+            .cfg
+            .points
+            .get(root.0)
+            .ok_or(self.missing("float carry evaluation"))?;
+        let mut returns = view
+            .cfg
+            .points
+            .iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::ReturnOutput { .. }));
+        let returned = returns.next().ok_or(self.missing("float carry return"))?;
+        let CfgPointKind::ReturnOutput {
+            output,
+            value_point,
+            checked,
+        } = returned.kind
+        else {
+            return Err(self.unsupported("float carry return identity"));
+        };
+        #[cfg(test)]
+        let value_point = if tests::is_withheld(tests::Withheld::FloatCarryReturnValue(
+            view.body,
+            returned.id,
+        )) {
+            returned.id
+        } else {
+            value_point
         };
         if returns.next().is_some()
-            || then_values.next().is_some()
-            || else_values.next().is_some()
-            || !self.successor(*join0, *join1)
-            || !self.successor(*join1, *return0)
-            || !self.successor(*return0, *return1)
+            || output != 0
+            || value_point != root
+            || checked
+            || root_point.scope.0 != 0
+            || returned.scope != root_point.scope
+            || root_point.source_span != returned.source_span
+            || root_point.source_span.source != owner.source
+            || root_point.source_span.range != slot.span
+            || !self.successor(root, returned.id)
         {
-            return Err(self.unsupported("tuple return order"));
+            return Err(self.unsupported("float carry return identity"));
+        }
+        let mut required = vec![root, returned.id];
+        if let ScalarExpression::If {
+            condition,
+            then_branch,
+            else_branch,
+            span,
+        } = value
+        {
+            if !matches!(root_point.kind, CfgPointKind::Join)
+                || root_point.source_span.range != *span
+            {
+                return Err(self.unsupported("float carry join"));
+            }
+            let condition_id = view
+                .eval(condition)
+                .ok_or(self.missing("float carry condition"))?;
+            let condition_point = view
+                .cfg
+                .points
+                .get(condition_id.0)
+                .ok_or(self.missing("float carry condition"))?;
+            let [branch_id] = condition_point.successors.as_slice() else {
+                return Err(self.unsupported("float carry branch identity"));
+            };
+            let branch = view
+                .cfg
+                .points
+                .get(branch_id.0)
+                .ok_or(self.missing("float carry branch"))?;
+            let [then_entry, else_entry] = branch.successors.as_slice() else {
+                return Err(self.unsupported("float carry branch identity"));
+            };
+            let [Some(then_entry), Some(else_entry)] =
+                [then_entry, else_entry].map(|id| view.cfg.points.get(id.0))
+            else {
+                return Err(self.missing("float carry arm entry"));
+            };
+            if !matches!(&branch.kind, CfgPointKind::Branch { condition: actual } if actual == condition.as_ref())
+                || self.wide_primitive_type(condition)? != &ScalarType::Bool
+                || branch.source_span != condition_point.source_span
+                || branch.source_span.source != owner.source
+                || branch.scope != root_point.scope
+                || condition_point.scope != root_point.scope
+                || !self.successor(condition_id, *branch_id)
+                || then_entry.scope == else_entry.scope
+                || [then_entry.scope, else_entry.scope].contains(&root_point.scope)
+            {
+                return Err(self.unsupported("float carry branch identity"));
+            }
+            required.extend([condition_id, *branch_id, then_entry.id, else_entry.id]);
+            for (block, entry) in [(then_branch, then_entry), (else_branch, else_entry)] {
+                let mut values = block.final_expressions();
+                let (arm, slot) = values
+                    .next()
+                    .ok_or(self.missing("float carry arm result"))?;
+                if values.next().is_some()
+                    || slot.position != 0
+                    || !matches!(entry.kind, CfgPointKind::ScopeEnter)
+                    || entry.source_span.source != owner.source
+                    || entry.source_span.range != block.span
+                {
+                    return Err(self.unsupported("float carry arm identity"));
+                }
+                if self.wide_primitive_type(arm)? != &ScalarType::I32 {
+                    return Err(self.unsupported("float carry result type"));
+                }
+                let arm_id = view
+                    .eval(arm)
+                    .ok_or(self.missing("float carry arm result"))?;
+                let arm_point = view
+                    .cfg
+                    .points
+                    .get(arm_id.0)
+                    .ok_or(self.missing("float carry arm result"))?;
+                let [exit] = arm_point.successors.as_slice() else {
+                    return Err(self.unsupported("float carry arm identity"));
+                };
+                let exit_point = view
+                    .cfg
+                    .points
+                    .get(exit.0)
+                    .ok_or(self.missing("float carry arm exit"))?;
+                if arm_point.scope != entry.scope
+                    || exit_point.scope != entry.scope
+                    || !matches!(exit_point.kind, CfgPointKind::ScopeExit)
+                    || exit_point.source_span != entry.source_span
+                    || arm_point.source_span.source != owner.source
+                    || arm_point.source_span.range != slot.span
+                    || !self.successor(*exit, root)
+                {
+                    return Err(self.unsupported("float carry arm identity"));
+                }
+                required.extend([arm_id, *exit]);
+            }
+        }
+        if !matches!(
+            view.cfg.points.first().map(|point| &point.kind),
+            Some(CfgPointKind::Entry)
+        ) {
+            return Err(self.missing("float carry entry"));
+        }
+        // One independent entry reachability pass per scalar carry that passed the
+        // local identity checks. It is not an allocation dominance query.
+        #[cfg(test)]
+        let counters = std::cell::Cell::new(Work::default());
+        let reachable = walk(
+            view.cfg,
+            None,
+            #[cfg(test)]
+            &counters,
+        )
+        .ok_or(self.missing("float carry reachability"))?;
+        #[cfg(test)]
+        self.batch.work.update(|mut work| {
+            let counts = counters.get();
+            work.float_return_walks += counts.dominance_walks;
+            work.float_return_points += counts.points;
+            work.float_return_arcs += counts.arcs;
+            work
+        });
+        if required
+            .into_iter()
+            .any(|id| reachable.get(id.0) != Some(&true))
+        {
+            return Err(self.unsupported("float carry unreachable return"));
         }
         Ok(())
     }
 
-    fn wide_call_signature(
+    fn tuple_conditional(
+        &self,
+        value: &ScalarExpression,
+        joins: [CfgPointId; 2],
+        tuple: &[ScalarType; 2],
+        source: &SourceIdentity,
+    ) -> Result<(), Unproved> {
+        let ScalarExpression::If {
+            then_branch,
+            else_branch,
+            span,
+            ..
+        } = value
+        else {
+            return Err(self.unsupported("tuple conditional shape"));
+        };
+        let view = self.view;
+        let mut then_points = joins;
+        let mut else_points = joins;
+        let [Some(first), Some(second)] = joins.map(|id| view.cfg.points.get(id.0)) else {
+            return Err(self.missing("tuple join point"));
+        };
+        if first.scope != second.scope || !self.successor(joins[0], joins[1]) {
+            return Err(self.unsupported("tuple conditional order"));
+        }
+        for (slot, point) in [first, second].into_iter().enumerate() {
+            #[cfg(test)]
+            if tests::is_withheld(tests::Withheld::TupleArm(view.body, point.id)) {
+                return Err(self.missing("tuple arm output"));
+            }
+            let CfgPointKind::ConditionalOutput {
+                then_point,
+                else_point,
+            } = point.kind
+            else {
+                return Err(self.unsupported("tuple conditional output"));
+            };
+            if then_point == else_point
+                || &point.source_span.source != source
+                || point.source_span.range != *span
+            {
+                return Err(self.unsupported("tuple arm/return slot identity"));
+            }
+            then_points[slot] = then_point;
+            else_points[slot] = else_point;
+        }
+        #[cfg(test)]
+        if tests::is_withheld(tests::Withheld::SwappedTupleArmSlots(view.body, joins[0])) {
+            else_points.swap(0, 1);
+        }
+        self.tuple_arm(then_branch, then_points, tuple, source)?;
+        self.tuple_arm(else_branch, else_points, tuple, source)
+    }
+
+    fn tuple_arm(
+        &self,
+        block: &ScalarBlock,
+        points: [CfgPointId; 2],
+        tuple: &[ScalarType; 2],
+        source: &SourceIdentity,
+    ) -> Result<(), Unproved> {
+        let mut values = block.final_expressions();
+        let first = values.next();
+        let second = values.next();
+        if self.profile.float() {
+            if let (Some((value @ ScalarExpression::If { .. }, metadata)), None) = (first, second) {
+                if metadata.position != 0 {
+                    return Err(self.unsupported("tuple arm/return slot identity"));
+                }
+                return self.tuple_conditional(value, points, tuple, source);
+            }
+        }
+        let [Some(first), Some(second), None] = [first, second, values.next()] else {
+            return Err(self.missing("tuple arm slot"));
+        };
+        let view = self.view;
+        let [Some(point0), Some(point1)] = points.map(|id| view.cfg.points.get(id.0)) else {
+            return Err(self.missing("tuple arm output"));
+        };
+        if points[0] == points[1] || point0.scope != point1.scope {
+            return Err(self.unsupported("tuple arm/return slot identity"));
+        }
+        for (slot, ((value, metadata), point)) in [first, second]
+            .into_iter()
+            .zip([point0, point1])
+            .enumerate()
+        {
+            if metadata.position != slot
+                || view.eval(value) != Some(point.id)
+                || view.nodes.checked_expression_type(value) != Some(&tuple[slot])
+                || &point.source_span.source != source
+            {
+                return Err(self.unsupported("tuple arm/return slot identity"));
+            }
+        }
+        Ok(())
+    }
+
+    fn checked_call_signature(
         &self,
         callee: Body,
         arguments: &[ScalarExpression],
         backing: Option<usize>,
         tuple: bool,
         value: &ScalarExpression,
-    ) -> Result<(), Unproved> {
+    ) -> Result<Option<[ScalarType; 2]>, Unproved> {
         let view = self.view;
         let module = &self.batch.build.prepared().project().modules[callee.0];
         let ScalarItem::Function(function) = &module.items[callee.1] else {
@@ -1011,6 +1329,18 @@ impl<'a, 'b> Uses<'a, 'b> {
         };
         if parameters.len() != arguments.len() {
             return Err(self.unsupported("wide helper arity"));
+        }
+        if self.profile.float() {
+            use ScalarType::*;
+            let exact = match (backing, tuple, parameters.as_slice()) {
+                (None, true, [F64, I32, U64]) => true,
+                (Some(0), true, [buffer, U64, U64, U64, F64, I32]) => bytes(buffer),
+                (Some(0), false, [buffer, U64, U64, I32, Bool]) => bytes(buffer),
+                _ => false,
+            };
+            if !exact {
+                return Err(self.unsupported("float helper signature"));
+            }
         }
         for (slot, (argument, formal)) in arguments.iter().zip(parameters).enumerate() {
             let argument = view
@@ -1032,7 +1362,11 @@ impl<'a, 'b> Uses<'a, 'b> {
         {
             return Err(self.unsupported("wide helper output type"));
         }
-        Ok(())
+        Ok(if tuple {
+            self.profile.tuple(backing.is_some())
+        } else {
+            None
+        })
     }
 
     fn check(&mut self) -> Result<(), Unproved> {
@@ -1057,7 +1391,7 @@ impl<'a, 'b> Uses<'a, 'b> {
         for item in &block.items {
             match item {
                 ScalarBlockItem::LocalBinding(binding) => {
-                    if binding.receivers.len() == 2 && self.profile.wide().is_some() {
+                    if binding.receivers.len() == 2 && self.profile.strict() {
                         self.tuple_binding(binding)?;
                         continue;
                     }
@@ -1072,6 +1406,9 @@ impl<'a, 'b> Uses<'a, 'b> {
                         BindingDefinition::Allocation { .. } => {
                             if self.owner.is_none() {
                                 return Err(self.unsupported("scalar-only allocation"));
+                            }
+                            if self.profile.float() && self.trace.is_none() {
+                                return Err(self.unsupported("float backing helper allocation"));
                             }
                             if !bytes(&binding.declared_type)
                                 || binding.receivers.iter().any(|r| {
@@ -1102,9 +1439,9 @@ impl<'a, 'b> Uses<'a, 'b> {
                                 trace.descriptor == identity && trace.literal == value
                             }) {
                                 self.expression(&binding.value)?;
-                            } else if self.profile.scalar(&binding.declared_type) {
+                            } else if self.profile.local_scalar(&binding.declared_type) {
                                 self.expression(&binding.value)?;
-                                if self.profile.wide().is_some() {
+                                if self.profile.strict() {
                                     if view.eval(&binding.value) != Some(value) {
                                         return Err(self.missing("wide scalar binding value"));
                                     }
@@ -1151,9 +1488,33 @@ impl<'a, 'b> Uses<'a, 'b> {
                         if frozen.rhs != *rhs_point || view.eval(rhs) != Some(frozen.rhs) {
                             return Err(self.missing("frozen RHS"));
                         }
+                        #[cfg(test)]
+                        let target = if tests::is_withheld(tests::Withheld::FloatIndexedBinding(
+                            view.body,
+                            frozen.install,
+                        )) {
+                            let mut faulty = target.clone();
+                            faulty.binding =
+                                view.formal(3).expect("carry exponent formal").0.clone();
+                            std::borrow::Cow::Owned(faulty)
+                        } else if tests::is_withheld(tests::Withheld::FloatIndexedProjection(
+                            view.body,
+                            frozen.install,
+                        )) {
+                            let mut faulty = target.clone();
+                            faulty.projections.push(faulty.projections[0].clone());
+                            std::borrow::Cow::Owned(faulty)
+                        } else {
+                            std::borrow::Cow::Borrowed(target)
+                        };
+                        #[cfg(test)]
+                        let target = target.as_ref();
                         match place {
                             ScalarPlace::Index { .. } => {
                                 self.index(place)?;
+                                if self.profile.float() {
+                                    self.float_indexed_install(place, target, frozen.install)?;
+                                }
                                 self.wide_assignment_type(place, rhs)?;
                             }
                             ScalarPlace::Name { .. } => {
@@ -1182,7 +1543,7 @@ impl<'a, 'b> Uses<'a, 'b> {
                                     .nodes
                                     .checked_place_type(place)
                                     .ok_or(self.missing("destination type"))?;
-                                if !self.profile.scalar(ty) {
+                                if !self.profile.local_scalar(ty) {
                                     return Err(self.unsupported("address store"));
                                 }
                                 self.wide_assignment_type(place, rhs)?;
@@ -1203,7 +1564,7 @@ impl<'a, 'b> Uses<'a, 'b> {
         place: &ScalarPlace,
         rhs: &ScalarExpression,
     ) -> Result<(), Unproved> {
-        if self.profile.wide().is_some() {
+        if self.profile.strict() {
             let destination = self
                 .view
                 .nodes
@@ -1212,6 +1573,39 @@ impl<'a, 'b> Uses<'a, 'b> {
             if self.wide_primitive_type(rhs)? != destination {
                 return Err(self.unsupported("wide primitive assignment type"));
             }
+        }
+        Ok(())
+    }
+
+    fn float_indexed_install(
+        &self,
+        place: &ScalarPlace,
+        target: &ReferencePlaceId,
+        install: CfgPointId,
+    ) -> Result<(), Unproved> {
+        let owner = self
+            .owner
+            .ok_or(self.missing("float indexed install owner"))?;
+        let ScalarPlace::Index { base, index, .. } = place else {
+            return Err(self.unsupported("float indexed install identity"));
+        };
+        let view = self.view;
+        let install = view
+            .cfg
+            .points
+            .get(install.0)
+            .ok_or(self.missing("float indexed install"))?;
+        if !matches!(view.nodes.named_place_root(base), Some(NamedPlaceRootIdentity::Lexical(id)) if id == owner)
+            || &target.binding != owner
+            || target.source != owner.source
+            || target.function_span != owner.function_span
+            || target.declaration_span != owner.declaration_span
+            || target.block_span != owner.block_span
+            || install.source_span.source != owner.source
+            || !matches!(target.projections.as_slice(), [ReferencePlaceProjection::Index(actual)] if actual == index.as_ref())
+            || &target.place != place
+        {
+            return Err(self.unsupported("float indexed install identity"));
         }
         Ok(())
     }
@@ -1228,7 +1622,7 @@ impl<'a, 'b> Uses<'a, 'b> {
             .nodes
             .named_place_root(base)
             .ok_or(self.missing("byte place root"))?;
-        if !matches!(root, NamedPlaceRootIdentity::Lexical(binding) if binding == owner || view.cfg.allocations.contains(binding))
+        if !matches!(root, NamedPlaceRootIdentity::Lexical(binding) if binding == owner || (!self.profile.float() && view.cfg.allocations.contains(binding)))
             || view.nodes.checked_place_type(place) != Some(&ScalarType::U8)
             || view.nodes.checked_expression_type(index) != Some(&ScalarType::U64)
         {
@@ -1239,7 +1633,7 @@ impl<'a, 'b> Uses<'a, 'b> {
 
     fn expression(&mut self, value: &ScalarExpression) -> Result<(), Unproved> {
         let view = self.view;
-        let wide = self.profile.wide().is_some();
+        let wide = self.profile.strict();
         match value {
             ScalarExpression::Name { .. } => {
                 if self.trace.is_some_and(|trace| matches!(view.eval(value), Some(id) if id == trace.result_read || id == trace.field_read)) {
@@ -1266,6 +1660,11 @@ impl<'a, 'b> Uses<'a, 'b> {
             ScalarExpression::Boolean { .. } => {
                 if wide && self.wide_primitive_type(value)? != &ScalarType::Bool {
                     return Err(self.unsupported("wide boolean expression type"));
+                }
+            }
+            ScalarExpression::Float { .. } if self.profile.float() => {
+                if self.wide_primitive_type(value)? != &ScalarType::F64 {
+                    return Err(self.unsupported("float literal type"));
                 }
             }
             ScalarExpression::Binary {
@@ -1333,6 +1732,7 @@ impl<'a, 'b> Uses<'a, 'b> {
                 ..
             } => {
                 self.expression(condition)?;
+                self.float_condition(condition)?;
                 self.block(then_branch)?;
                 self.block(else_branch)?;
             }
@@ -1342,6 +1742,7 @@ impl<'a, 'b> Uses<'a, 'b> {
                 ..
             } => {
                 self.expression(condition)?;
+                self.float_condition(condition)?;
                 self.block(then_branch)?;
             }
             ScalarExpression::IndexedRead { place, .. } => self.index(place)?,
@@ -1361,8 +1762,17 @@ impl<'a, 'b> Uses<'a, 'b> {
                     self.expression(&field.value)?;
                 }
             }
-            ScalarExpression::Call { arguments, .. } => self.call(value, arguments, false)?,
+            ScalarExpression::Call { arguments, .. } => {
+                self.call(value, arguments, false)?;
+            }
             _ => return Err(self.unsupported("untracked expression or address escape")),
+        }
+        Ok(())
+    }
+
+    fn float_condition(&self, condition: &ScalarExpression) -> Result<(), Unproved> {
+        if self.profile.float() && self.wide_primitive_type(condition)? != &ScalarType::Bool {
+            return Err(self.unsupported("float branch condition type"));
         }
         Ok(())
     }
@@ -1410,6 +1820,13 @@ impl<'a, 'b> Uses<'a, 'b> {
 
         if left != right {
             return false;
+        }
+        if self.profile.float() && *left == ScalarType::F64 {
+            return match operator {
+                Subtract | Multiply | Divide => *result == ScalarType::F64,
+                Equal | Less | GreaterEqual => *result == ScalarType::Bool,
+                _ => false,
+            };
         }
         let integer = self.profile.integer(left);
         match operator {
@@ -1473,7 +1890,7 @@ impl<'a, 'b> Uses<'a, 'b> {
         value: &ScalarExpression,
         arguments: &[ScalarExpression],
         tuple: bool,
-    ) -> Result<(), Unproved> {
+    ) -> Result<(CfgPointId, Option<[ScalarType; 2]>), Unproved> {
         let view = self.view;
         let target = view
             .nodes
@@ -1522,7 +1939,10 @@ impl<'a, 'b> Uses<'a, 'b> {
             ResolvedCallTarget::Core(
                 op @ (CoreOperationId::IntExtend
                 | CoreOperationId::IntTrunc
-                | CoreOperationId::Bitcast),
+                | CoreOperationId::Bitcast
+                | CoreOperationId::FloatExtend
+                | CoreOperationId::FloatToSintTrunc
+                | CoreOperationId::SintToFloat),
             ),
             None,
             [argument],
@@ -1540,13 +1960,8 @@ impl<'a, 'b> Uses<'a, 'b> {
             });
             let from = from.ok_or(self.missing("conversion operand type"))?;
             let to = to.ok_or(self.missing("conversion result type"))?;
-            if !tuple
-                && (simple_scalar_conversion(op, from, to)
-                    || (*op == CoreOperationId::IntExtend
-                        && *from == ScalarType::I32
-                        && self.profile.wide().as_ref() == Some(to)))
-            {
-                return Ok(());
+            if !tuple && self.profile.conversion(op, from, to) {
+                return Ok((site, None));
             }
         }
         match (target, actual) {
@@ -1557,14 +1972,16 @@ impl<'a, 'b> Uses<'a, 'b> {
                     concrete: ConcreteCallSelection::Declaration,
                 },
                 backing,
-            ) if backing.is_some() || self.profile.wide().is_some() => {
+            ) if backing.is_some() || self.profile.strict() => {
                 let (m, i) = self
                     .batch
                     .definition(source, *declaration_span)
                     .map_err(|failure| Unproved::Definition(view.body, site, failure))?;
-                if self.profile.wide().is_some() {
-                    self.wide_call_signature((m, i), arguments, backing, tuple, value)?;
-                }
+                let outputs = if self.profile.strict() {
+                    self.checked_call_signature((m, i), arguments, backing, tuple, value)?
+                } else {
+                    None
+                };
                 self.edges.push(Edge {
                     from: view.body,
                     site,
@@ -1573,7 +1990,7 @@ impl<'a, 'b> Uses<'a, 'b> {
                         None => Dependency::ScalarOnly((m, i)),
                     },
                 });
-                Ok(())
+                Ok((site, outputs))
             }
             _ => Err(Unproved::Call(
                 view.body,
