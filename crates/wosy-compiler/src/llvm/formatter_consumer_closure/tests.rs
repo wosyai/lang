@@ -52,6 +52,222 @@ fn cfg_with(
     }
 }
 
+fn exercise_finite_print(
+    ledger: &Ledger<'_>,
+    print: &CallableBody<'_>,
+    open: &print_finite::PrintFiniteOpen,
+) {
+    use crate::scalar::{ReferencePlaceProjection, ScalarFieldReference};
+    let body = |cfg| CallableBody {
+        cfg,
+        ..ledger.body(print.entry.id.body, None).unwrap()
+    };
+    let root = &print.entry.function.body;
+    let ScalarBlockItem::LocalBinding(vector) = &root.items[6] else {
+        unreachable!()
+    };
+    let ScalarExpression::StructLiteral { fields, .. } = &vector.value else {
+        unreachable!()
+    };
+    let data = &fields[0].value;
+    assert!(print.nodes.lexical_member(&data.clone()).is_none());
+    let ScalarBlockItem::LocalBinding(complete) = &root.items[2] else {
+        unreachable!()
+    };
+    let ScalarExpression::Binary { left: length, .. } = &complete.value else {
+        unreachable!()
+    };
+    let mut missing_member = ledger.body(print.entry.id.body, None).unwrap();
+    assert!(missing_member
+        .nodes
+        .withhold_lexical_member_occurrence(length));
+    assert!(matches!(
+        ledger.print_finite_open(&missing_member),
+        Err(Rejected::Missing("print lexical member"))
+    ));
+    let data_point = print.eval(data).unwrap();
+    let wrong_member = cfg_with(print.cfg, |points| {
+        let CfgPointKind::ReadPlace { candidates, .. } = &mut points[data_point.0].kind else {
+            unreachable!()
+        };
+        let [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] =
+            candidates[0].projections.as_mut_slice()
+        else {
+            unreachable!()
+        };
+        field.index += 1;
+    });
+    assert!(matches!(
+        ledger.print_finite_open(&body(&wrong_member)),
+        Err(Rejected::Contradictory("print CFG point"))
+    ));
+    let reordered_branch = cfg_with(print.cfg, |points| {
+        points
+            .iter_mut()
+            .find(|point| matches!(point.kind, CfgPointKind::Branch { .. }))
+            .unwrap()
+            .successors
+            .swap(0, 1);
+    });
+    assert!(matches!(
+        ledger.print_finite_open(&body(&reordered_branch)),
+        Err(Rejected::Contradictory("print CFG order"))
+    ));
+    let wrong_wrapper_slots = cfg_with(print.cfg, |points| {
+        let CfgPointKind::Call {
+            argument_points, ..
+        } = &mut points
+            .iter_mut()
+            .find(|point| {
+                matches!(
+                    point.kind,
+                    CfgPointKind::Call {
+                        target: ResolvedCallTarget::ModuleCallable { .. },
+                        ..
+                    }
+                )
+            })
+            .unwrap()
+            .kind
+        else {
+            unreachable!()
+        };
+        argument_points.swap(1, 2);
+    });
+    assert!(matches!(
+        ledger.print_finite_open(&body(&wrong_wrapper_slots)),
+        Err(Rejected::Contradictory("print CFG point"))
+    ));
+    let changed_address = cfg_with(print.cfg, |points| {
+        let origins = points
+            .iter_mut()
+            .filter_map(|point| match &mut point.kind {
+                CfgPointKind::Evaluate(expression @ ScalarExpression::RawAddress { .. }) => {
+                    Some(expression)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [first, second]: [_; 2] = origins.try_into().unwrap();
+        std::mem::swap(first, second);
+    });
+    assert!(matches!(
+        ledger.print_finite_open(&body(&changed_address)),
+        Err(Rejected::Contradictory("print CFG point"))
+    ));
+    let wrong_return = cfg_with(print.cfg, |points| {
+        let CfgPointKind::ReturnOutput { output, .. } = &mut points
+            .iter_mut()
+            .find(|point| matches!(point.kind, CfgPointKind::ReturnOutput { output: 1, .. }))
+            .unwrap()
+            .kind
+        else {
+            unreachable!()
+        };
+        *output = 0;
+    });
+    assert!(matches!(
+        ledger.print_finite_open(&body(&wrong_return)),
+        Err(Rejected::Contradictory("print CFG point"))
+    ));
+
+    let wrapper = ledger.body(open.wrapper.body, None).unwrap();
+    let altered = cfg_with(wrapper.cfg, |points| {
+        let CfgPointKind::Call {
+            target: ResolvedCallTarget::ExternCallable { source, .. },
+            ..
+        } = &mut points
+            .iter_mut()
+            .find(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+            .unwrap()
+            .kind
+        else {
+            unreachable!()
+        };
+        source.revision.push_str("-untrusted");
+    });
+    let (parameters, _) = wrapper.entry.signature().unwrap();
+    let [ScalarType::I32, ScalarType::RawPointer(vec), ScalarType::RawPointer(written)] =
+        parameters
+    else {
+        unreachable!()
+    };
+    let wrap_body = |cfg| CallableBody {
+        cfg,
+        ..ledger.body(open.wrapper.body, None).unwrap()
+    };
+    assert!(matches!(
+        ledger.print_wrapper_open(&wrap_body(&altered), vec, written),
+        Err(Rejected::Contradictory("print CFG point"))
+    ));
+    let altered = cfg_with(wrapper.cfg, |points| {
+        let CfgPointKind::Call {
+            argument_points, ..
+        } = &mut points
+            .iter_mut()
+            .find(|point| matches!(point.kind, CfgPointKind::Call { .. }))
+            .unwrap()
+            .kind
+        else {
+            unreachable!()
+        };
+        argument_points.swap(0, 2);
+    });
+    assert!(matches!(
+        ledger.print_wrapper_open(&wrap_body(&altered), vec, written),
+        Err(Rejected::Contradictory("print CFG point"))
+    ));
+    let mut extra = cfg_with(wrapper.cfg, |_| {});
+    let mut discarded = extra.points.last().unwrap().clone();
+    discarded.id = CfgPointId(extra.points.len());
+    extra.points.push(discarded);
+    assert!(matches!(
+        ledger.print_wrapper_open(&wrap_body(&extra), vec, written),
+        Err(Rejected::Contradictory("print unclassified CFG effect"))
+    ));
+}
+
+fn rejected_assignment_fact_mutations(
+    ledger: &Ledger<'_>,
+    print: &CallableBody<'_>,
+) -> Vec<&'static str> {
+    let ScalarBlockItem::Expression(ScalarExpression::If { then_branch, .. }) =
+        &print.entry.function.body.items[10]
+    else {
+        unreachable!();
+    };
+    let ScalarBlockItem::Expression(ScalarExpression::Block(block)) = &then_branch.items[0] else {
+        unreachable!();
+    };
+    let [ScalarBlockItem::Assignment(assignment)] = block.items.as_slice() else {
+        unreachable!();
+    };
+    let place = &assignment.targets[0].place;
+    assert_eq!(
+        print.nodes.checked_place_type(place),
+        Some(&ScalarType::I32)
+    );
+    let mut failures = Vec::new();
+    for (cause, ty) in [("missing", None), ("wrong U64", Some(&ScalarType::U64))] {
+        let mut changed = ledger.body(print.entry.id.body, None).unwrap();
+        changed.nodes.override_checked_place_type(place, ty);
+        assert_eq!(changed.nodes.checked_place_type(place), ty);
+        if !matches!(
+            (cause, ledger.print_finite_open(&changed)),
+            (
+                "missing",
+                Err(Rejected::Missing("print assignment destination type"))
+            ) | (
+                "wrong U64",
+                Err(Rejected::Contradictory("print assignment destination type"))
+            )
+        ) {
+            failures.push(cause);
+        }
+    }
+    failures
+}
+
 #[test]
 fn formatter_consumer_closure_canonical_stdlib_forwarding_and_distinct_open_regions() {
     let app_text = r#"%%start
@@ -72,6 +288,7 @@ std.utf8 wrong_target = std.format(tiny);
 std.eprint(wrong_target);
 %%end"#;
     let mut accepted_mutations = Vec::new();
+    let mut accepted_assignment_mutations = Vec::new();
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         let source = |pkg: &str, path: &str| {
             SourceIdentity::new("p".into(), pkg.into(), path.into(), "r1".into())
@@ -107,6 +324,20 @@ std.eprint(wrong_target);
         };
         let (s, a, f) = (module(&std), module(&app), module(&fixture));
         let std_mod = &prepared.project().modules[s];
+        let print_body = ledger.body((s, function(std_mod, "print")), None).unwrap();
+        let print_open = ledger.print_finite_open(&print_body).unwrap();
+        assert_eq!(print_open.boundary.source.source, preview);
+        assert_eq!(print_open.target_layout, target_layout);
+        assert_eq!(print_open.boundary.module, "wasi_snapshot_preview1");
+        assert_eq!(print_open.boundary.member, "fd_write");
+        assert_eq!(print_open.boundary.parameters.len(), 4);
+        assert_eq!(print_open.boundary.output, ScalarType::I32);
+        exercise_finite_print(&ledger, &print_body, &print_open);
+        accepted_assignment_mutations.extend(
+            rejected_assignment_fact_mutations(&ledger, &print_body)
+                .into_iter()
+                .map(|cause| (target_layout, cause)),
+        );
         let app_mod = &prepared.project().modules[a];
         let at = |name| (a, function(app_mod, name));
         let pair = |module: usize, name: &str, distance: usize| {
@@ -454,6 +685,10 @@ std.eprint(wrong_target);
     assert!(
         accepted_mutations.is_empty(),
         "path mutations not rejected: {accepted_mutations:?}"
+    );
+    assert!(
+        accepted_assignment_mutations.is_empty(),
+        "print destination mutations not rejected: {accepted_assignment_mutations:?}"
     );
 }
 
