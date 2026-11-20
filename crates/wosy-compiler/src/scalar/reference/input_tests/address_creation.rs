@@ -6,6 +6,212 @@ unit(u8[2], u64) raw = fn(values, index) { unsafe { &?values[index]; }; };
 *u8(*u8) child = fn(pointer) { &*pointer };
 %%end";
 
+#[test]
+fn formatter_typed_facts_reordered_literal() {
+    let source = source();
+    let parsed = parse_source(source.clone(), "%%start\nstruct Record { u8 byte; u64 count; }\nRecord(u8, u64) make = fn(b, n) { Record result = { .count = n; .byte = b; }; result };\n%%end".into(), &[]);
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let project = prepare_scalar_project(
+            vec![(
+                derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                Vec::new(),
+            )],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        let module = &project.project().modules[0];
+        let (item, function) = module
+            .items
+            .iter()
+            .enumerate()
+            .find_map(|(item, row)| {
+                if let ScalarItem::Function(function) = row {
+                    Some((item, function))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let ScalarBlockItem::LocalBinding(binding) = &function.body.items[0] else {
+            panic!("binding")
+        };
+        let ScalarExpression::StructLiteral { fields, .. } = &binding.value else {
+            panic!("literal")
+        };
+        let nodes = project
+            .bind_callable_body_call_nodes(0, item, None, &function.body)
+            .unwrap();
+        let declared = &module.structs[0].fields;
+        assert_eq!(nodes.literal_field(&fields[0].value), Some(&declared[1].id));
+        assert_eq!(nodes.literal_field(&fields[1].value), Some(&declared[0].id));
+        assert_eq!(nodes.literal_field(&fields[0].value.clone()), None);
+
+        let mut row = project.function_calls(0, item).clone();
+        row.structure
+            .literal_fields
+            .retain(|_, id| id != &declared[1].id);
+        let missing =
+            control::CallableBodyCallNodes::bind(&source, &function.body, &row, None).unwrap();
+        assert_eq!(missing.literal_field(&fields[0].value), None);
+        assert_eq!(
+            missing.literal_field(&fields[1].value),
+            Some(&declared[0].id)
+        );
+    }
+}
+
+#[test]
+fn formatter_typed_facts_frozen_assignments_and_definitions() {
+    let text = "%%start
+u8 outside = 7;
+u8(u8) update = fn(input) {
+    u8 left = input;
+    u8 right = outside;
+    unsafe {
+        u8[3] scratch;
+        &?scratch[0];
+        left, right = right, left;
+    };
+    unsafe { u8[3] scratch; &?scratch[0]; };
+    left
+};
+%%end";
+    let source = source();
+    let parsed = parse_source(source.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let project = prepare_scalar_project(
+            vec![(
+                derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                Vec::new(),
+            )],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        let module = &project.project().modules[0];
+        let [ScalarItem::Binding(global), ScalarItem::Function(function)] = module.items.as_slice()
+        else {
+            panic!("fixture items")
+        };
+        let build = analyze_scalar_build(&project);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let facts = build.callable_point_facts(0, 1, None).unwrap();
+        let cfg = build.reference_cfg(0, 1, None).unwrap();
+        let nodes = project
+            .bind_callable_body_call_nodes(0, 1, None, &function.body)
+            .unwrap();
+        let [ScalarBlockItem::LocalBinding(left), ScalarBlockItem::LocalBinding(right), ScalarBlockItem::Expression(ScalarExpression::Block(first)), ScalarBlockItem::Expression(ScalarExpression::Block(second)), ScalarBlockItem::Expression(result)] =
+            function.body.items.as_slice()
+        else {
+            panic!("callable body")
+        };
+        let [ScalarBlockItem::LocalBinding(scratch), ScalarBlockItem::Expression(ScalarExpression::RawAddress { place, .. }), ScalarBlockItem::Assignment(swap)] =
+            first.items.as_slice()
+        else {
+            panic!("first block")
+        };
+        let [ScalarBlockItem::LocalBinding(other_scratch), ScalarBlockItem::Expression(ScalarExpression::RawAddress {
+            place: other_place, ..
+        })] = second.items.as_slice()
+        else {
+            panic!("second block")
+        };
+        let (input, ty) = nodes.formal(facts, 0).unwrap();
+        assert_eq!(*ty, ScalarType::U8);
+        assert_eq!(
+            nodes.plain_name(&left.value),
+            Some(&PlainNameIdentity::Lexical(input.clone()))
+        );
+        assert_eq!(
+            nodes.plain_name(&right.value),
+            Some(&PlainNameIdentity::ModuleValue(SourceSpan::new(
+                source.clone(),
+                global.name_span
+            )))
+        );
+        assert_eq!(nodes.final_output(result), Some(0));
+
+        let defined = |binding: &ScalarBinding| {
+            let BindingDefinition::Initialized { bind, value } =
+                nodes.binding_definition(facts, binding, 0).unwrap()
+            else {
+                panic!("initialized binding")
+            };
+            assert_eq!(nodes.evaluation_point(facts, &binding.value), Some(value));
+            let CfgPointKind::Bind { binding } = &cfg.points[bind.0].kind else {
+                panic!("bind event")
+            };
+            binding
+        };
+        let (left, right) = (defined(left), defined(right));
+        assert_eq!(
+            nodes.plain_name(result),
+            Some(&PlainNameIdentity::Lexical(left.clone()))
+        );
+        let mut snapshots = Vec::new();
+        let mut writes = Vec::new();
+        for (position, (destination, read)) in
+            [(left, right), (right, left)].into_iter().enumerate()
+        {
+            let place = &swap.targets[position].place;
+            assert_eq!(
+                nodes.direct_destination(place),
+                Some(&DirectDestinationIdentity::Existing(destination.clone()))
+            );
+            let install = nodes.frozen_install(facts, place).unwrap();
+            assert_eq!(
+                nodes.evaluation_point(facts, &swap.values[position]),
+                Some(install.rhs)
+            );
+            assert!(
+                matches!(&cfg.points[install.rhs.0].kind, CfgPointKind::Read { binding } if binding == read)
+            );
+            assert!(
+                matches!(&cfg.points[install.install.0].kind, CfgPointKind::Assign { target, rhs_point, .. } if &target.binding == destination && *rhs_point == install.rhs)
+            );
+            snapshots.push(install.rhs);
+            writes.push(install.install);
+        }
+        assert!(snapshots[0] < snapshots[1] && snapshots[1] < writes[0] && writes[0] < writes[1]);
+        assert!(cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::CaptureAssignmentPrevious { writes: captured } if *captured == writes)));
+
+        let allocation = |binding: &ScalarBinding, place: &ScalarPlace| {
+            let BindingDefinition::Allocation { bind } =
+                nodes.binding_definition(facts, binding, 0).unwrap()
+            else {
+                panic!("allocation binding")
+            };
+            let CfgPointKind::Bind { binding } = &cfg.points[bind.0].kind else {
+                panic!("allocation event")
+            };
+            let ScalarPlace::Index { base, index, .. } = place else {
+                panic!("indexed source")
+            };
+            assert!(cfg.allocations.contains(binding));
+            assert_eq!(
+                nodes.named_place_root(base),
+                Some(&NamedPlaceRootIdentity::Lexical(binding.clone()))
+            );
+            assert_eq!(nodes.checked_place_type(place), Some(&ScalarType::U8));
+            assert_eq!(nodes.checked_expression_type(index), Some(&ScalarType::U64));
+            binding
+        };
+        assert_ne!(
+            allocation(scratch, place),
+            allocation(other_scratch, other_place)
+        );
+
+        let plain = analyze_project_references(
+            &project.project().modules,
+            &resolve_project_call_sites(&project.project().modules),
+        );
+        assert!(plain.errors().is_empty(), "{:?}", plain.errors());
+        assert_eq!(plain.reference_cfg(0, 1, None), Some(cfg));
+    }
+}
+
 fn address(function: &mut ScalarFunction) -> &mut ScalarExpression {
     let ScalarBlockItem::Expression(expression) = &mut function.body.items[0] else {
         panic!("address expression")

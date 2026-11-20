@@ -299,6 +299,16 @@ impl<'a> ScalarBuildValidation<'a> {
         self.results
             .reference_cfg(module_ordinal, item_ordinal, arm_index)
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn callable_point_facts(
+        &self,
+        module: usize,
+        item: usize,
+        arm: Option<usize>,
+    ) -> Option<&control::CallablePointFacts> {
+        self.results.callable_point_facts(module, item, arm)
+    }
 }
 
 pub fn analyze_scalar_build(prepared: &PreparedScalarProject) -> ScalarBuildValidation<'_> {

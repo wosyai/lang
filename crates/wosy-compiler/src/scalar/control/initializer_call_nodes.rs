@@ -85,6 +85,7 @@ impl<'a> InitializerCallNodes<'a> {
             bind_call: &mut bind_call,
             bind_type: None,
             bind_named_place: None,
+            proof_nodes: None,
         };
         let root = Parent::Block(topology.structure.root);
         for step in &region.steps {
@@ -158,8 +159,18 @@ pub(crate) struct CallableBodyCallNodes<'a> {
     checked_self_tail: Option<(&'a ScalarExpression, CheckedForwardingProof)>,
     expression_types: HashMap<*const ScalarExpression, &'a ScalarType>,
     named_place_roots: HashMap<*const ScalarPlace, &'a NamedPlaceRootIdentity>,
+    proof_nodes: CallableProofNodes<'a>,
     scalar_self_tail_types: bool,
     body: PhantomData<&'a ScalarBlock>,
+}
+
+#[derive(Default)]
+struct CallableProofNodes<'a> {
+    calls: Option<&'a FunctionCallSites>,
+    expressions: HashMap<*const ScalarExpression, OccurrenceOrdinal>,
+    places: HashMap<*const ScalarPlace, OccurrenceOrdinal>,
+    bindings: HashMap<*const ScalarBinding, BlockPosition>,
+    final_outputs: HashMap<*const ScalarExpression, usize>,
 }
 
 impl<'a> CallableBodyCallNodes<'a> {
@@ -187,6 +198,10 @@ impl<'a> CallableBodyCallNodes<'a> {
             checked_self_tail: None,
             expression_types: HashMap::new(),
             named_place_roots: HashMap::new(),
+            proof_nodes: CallableProofNodes {
+                calls: Some(calls),
+                ..Default::default()
+            },
             scalar_self_tail_types: !calls.self_tail_candidates.is_empty()
                 && super::super::reference::self_tail::scalar_body_types(calls),
             body: PhantomData,
@@ -240,6 +255,7 @@ impl<'a> CallableBodyCallNodes<'a> {
             bind_type: (checked_proof.is_some() || !calls.self_tail_candidates.is_empty())
                 .then_some(&mut bind_type as _),
             bind_named_place: Some(&mut bind_named_place),
+            proof_nodes: Some(&mut nodes.proof_nodes),
         }
         .block_items(Parent::Block(calls.structure.root), body)?;
         if nodes.self_tail_candidates.len() != calls.self_tail_candidates.len() {
@@ -317,6 +333,122 @@ impl<'a> CallableBodyCallNodes<'a> {
     }
 }
 
+#[allow(dead_code)]
+impl<'a> CallableBodyCallNodes<'a> {
+    pub(crate) fn literal_field(
+        &self,
+        value: &ScalarExpression,
+    ) -> Option<&'a ScalarStructFieldId> {
+        let ordinal = self
+            .proof_nodes
+            .expressions
+            .get(&std::ptr::from_ref(value))?;
+        self.proof_nodes
+            .calls?
+            .structure
+            .literal_fields
+            .get(ordinal)
+    }
+
+    pub(crate) fn plain_name(&self, value: &ScalarExpression) -> Option<&'a PlainNameIdentity> {
+        let ordinal = *self
+            .proof_nodes
+            .expressions
+            .get(&std::ptr::from_ref(value))?;
+        self.proof_nodes.calls?.prepared_plain_name(ordinal)
+    }
+
+    pub(crate) fn direct_destination(
+        &self,
+        place: &ScalarPlace,
+    ) -> Option<&'a DirectDestinationIdentity> {
+        let ordinal = *self.proof_nodes.places.get(&std::ptr::from_ref(place))?;
+        self.proof_nodes.calls?.prepared_direct_destination(ordinal)
+    }
+
+    pub(crate) fn checked_expression_type(
+        &self,
+        value: &ScalarExpression,
+    ) -> Option<&'a ScalarType> {
+        let ordinal = self
+            .proof_nodes
+            .expressions
+            .get(&std::ptr::from_ref(value))?;
+        self.proof_nodes
+            .calls?
+            .structure
+            .checked_types
+            .expressions
+            .get(ordinal)
+    }
+
+    pub(crate) fn checked_place_type(&self, place: &ScalarPlace) -> Option<&'a ScalarType> {
+        let ordinal = self.proof_nodes.places.get(&std::ptr::from_ref(place))?;
+        self.proof_nodes
+            .calls?
+            .structure
+            .checked_types
+            .places
+            .get(ordinal)
+    }
+
+    pub(crate) fn final_output(&self, value: &ScalarExpression) -> Option<usize> {
+        self.proof_nodes
+            .final_outputs
+            .get(&std::ptr::from_ref(value))
+            .copied()
+    }
+
+    pub(crate) fn evaluation_point(
+        &self,
+        facts: &CallablePointFacts,
+        value: &ScalarExpression,
+    ) -> Option<CfgPointId> {
+        let ordinal = self
+            .proof_nodes
+            .expressions
+            .get(&std::ptr::from_ref(value))?;
+        facts.evaluations.get(ordinal).copied()
+    }
+
+    pub(crate) fn frozen_install(
+        &self,
+        facts: &CallablePointFacts,
+        place: &ScalarPlace,
+    ) -> Option<FrozenInstall> {
+        let ordinal = self.proof_nodes.places.get(&std::ptr::from_ref(place))?;
+        facts.installs.get(ordinal).copied()
+    }
+
+    pub(crate) fn binding_definition(
+        &self,
+        facts: &CallablePointFacts,
+        binding: &ScalarBinding,
+        receiver: usize,
+    ) -> Option<BindingDefinition> {
+        let position = self
+            .proof_nodes
+            .bindings
+            .get(&std::ptr::from_ref(binding))?;
+        facts
+            .definitions
+            .get(&(position.block, position.item, receiver))
+            .copied()
+    }
+
+    pub(crate) fn formal<'facts>(
+        &self,
+        facts: &'facts CallablePointFacts,
+        parameter: usize,
+    ) -> Option<(&'facts crate::scalar::ReferenceBindingId, &'a ScalarType)> {
+        let slot = self.proof_nodes.calls?.boundary.parameters.get(parameter)?;
+        if slot.ordinal != parameter {
+            return None;
+        }
+        Some((facts.formals.get(&parameter)?, &slot.ty))
+    }
+}
+
 struct Binder<'a, 'bind> {
     structure: &'a OccurrenceStructure,
     source: &'a SourceIdentity,
@@ -324,6 +456,7 @@ struct Binder<'a, 'bind> {
     bind_call: &'bind mut dyn FnMut(OccurrenceOrdinal, &'a ScalarExpression) -> Result<(), String>,
     bind_type: Option<&'bind mut dyn FnMut(OccurrenceOrdinal, &'a ScalarExpression)>,
     bind_named_place: Option<&'bind mut dyn FnMut(OccurrenceOrdinal, &'a ScalarPlace)>,
+    proof_nodes: Option<&'bind mut CallableProofNodes<'a>>,
 }
 
 impl<'a> Binder<'a, '_> {
@@ -343,6 +476,18 @@ impl<'a> Binder<'a, '_> {
         let Some(&Node::Expression(ordinal)) = self.structure.edges.get(&(parent, edge)) else {
             return Err(self.invalid_edge(parent, edge));
         };
+        if let Some(nodes) = &mut self.proof_nodes {
+            nodes
+                .expressions
+                .insert(std::ptr::from_ref(expression), ordinal);
+            if parent == Parent::Block(self.structure.root) {
+                if let Edge::FinalOutput { output, .. } = edge {
+                    nodes
+                        .final_outputs
+                        .insert(std::ptr::from_ref(expression), output);
+                }
+            }
+        }
         if let Some(bind_type) = &mut self.bind_type {
             bind_type(ordinal, expression);
         }
@@ -413,6 +558,9 @@ impl<'a> Binder<'a, '_> {
         let Some(&Node::Place(ordinal)) = self.structure.edges.get(&(parent, edge)) else {
             return Err(self.invalid_edge(parent, edge));
         };
+        if let Some(nodes) = &mut self.proof_nodes {
+            nodes.places.insert(std::ptr::from_ref(place), ordinal);
+        }
         let parent = Parent::Place(ordinal);
         match place {
             ScalarPlace::Name { .. } => {
@@ -452,6 +600,11 @@ impl<'a> Binder<'a, '_> {
         item: usize,
         binding: &'a ScalarBinding,
     ) -> Result<(), String> {
+        if let (Some(nodes), Parent::Block(block)) = (&mut self.proof_nodes, parent) {
+            nodes
+                .bindings
+                .insert(std::ptr::from_ref(binding), BlockPosition { block, item });
+        }
         if binding.is_allocation {
             for (position, receiver) in binding.receivers.iter().enumerate() {
                 if let Some(length) = &receiver.allocation_length {

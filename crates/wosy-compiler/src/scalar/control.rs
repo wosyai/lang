@@ -9,10 +9,37 @@ use super::{
 use wosy_syntax::{ByteSpan, SourceIdentity, SourceSpan};
 
 mod initializer_call_nodes;
-pub(crate) use super::reference::NamedPlaceRootIdentity;
+pub(crate) use super::reference::{
+    DirectDestinationIdentity, NamedPlaceRootIdentity, PlainNameIdentity,
+};
 pub(crate) use initializer_call_nodes::{
     BoundInitializerMember, CallableBodyCallNodes, InitializerCallNodes,
 };
+
+#[derive(Default)]
+pub(crate) struct CallablePointFacts {
+    pub(super) evaluations: HashMap<OccurrenceOrdinal, super::CfgPointId>,
+    pub(super) installs: HashMap<OccurrenceOrdinal, FrozenInstall>,
+    pub(super) definitions: HashMap<(BlockOrdinal, usize, usize), BindingDefinition>,
+    pub(super) formals: HashMap<usize, super::ReferenceBindingId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrozenInstall {
+    pub(crate) rhs: super::CfgPointId,
+    pub(crate) install: super::CfgPointId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindingDefinition {
+    Allocation {
+        bind: super::CfgPointId,
+    },
+    Initialized {
+        bind: super::CfgPointId,
+        value: super::CfgPointId,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModuleInitializationRegion {

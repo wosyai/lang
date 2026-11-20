@@ -4451,6 +4451,7 @@ fn check_expression_type_in_module_expected(
                 continue;
             };
             initialized.insert(field.name.clone());
+            let prior_diagnostics = diagnostics.len();
             let actual = expression_type_in_module_expected(
                 &field.value,
                 Some(&declared.ty),
@@ -4465,6 +4466,9 @@ fn check_expression_type_in_module_expected(
                 inference,
             );
             expect_module_type(module, &declared.ty, &actual, field.span, diagnostics);
+            if diagnostics.len() == prior_diagnostics && scalar_type_equal(&declared.ty, &actual) {
+                inference.record_literal_field(&field.value, &declared.id);
+            }
         }
         if initialized.len() != structure.fields.len() {
             diagnostics.push(module_diagnostic(

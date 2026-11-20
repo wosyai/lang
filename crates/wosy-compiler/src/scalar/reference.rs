@@ -12,7 +12,7 @@ use super::control::{
 };
 use super::control::{
     AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentReplacement,
-    AssignmentSlot,
+    AssignmentSlot, BindingDefinition, CallablePointFacts, FrozenInstall,
 };
 use super::inference::CheckedMember;
 use super::*;
@@ -188,6 +188,7 @@ fn derive_and_converge_program_references(
 
 pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
+    proof_points: CallablePointFacts,
     pub(super) source: SourceIdentity,
     pub(super) function_span: ByteSpan,
     pub(super) names: BTreeMap<String, ReferenceBindingId>,
@@ -262,6 +263,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
     ) -> Self {
         Self {
             capture_call_points: false,
+            proof_points: CallablePointFacts::default(),
             source: source.clone(),
             function_span: function.span,
             names: BTreeMap::new(),
@@ -928,6 +930,23 @@ impl<'a> ReferenceFlowBuilder<'a> {
     }
 
     fn expression_with_projected_origins(
+        &mut self,
+        expression: &ScalarExpression,
+        scope: ReferenceScopeId,
+        ordinal: OccurrenceOrdinal,
+        projected_origins: bool,
+    ) -> Result<ReferenceValue, ReferenceAnalysisError> {
+        let before = self.cursor;
+        let value = self.evaluate_expression(expression, scope, ordinal, projected_origins)?;
+        if self.capture_call_points && self.cursor != before {
+            if let Some(point) = self.cursor {
+                self.proof_points.evaluations.insert(ordinal, point);
+            }
+        }
+        Ok(value)
+    }
+
+    fn evaluate_expression(
         &mut self,
         expression: &ScalarExpression,
         scope: ReferenceScopeId,
@@ -2292,8 +2311,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
         call_producer: Option<CfgPointId>,
         receivers: &[BindingReceiverSlot],
         secondary: &[BindingOutput],
+        position: BlockPosition,
     ) -> Result<(), ReferenceAnalysisError> {
         for receiver in &receivers[1..] {
+            let before = self.cursor;
             match &secondary[receiver.position - 1] {
                 BindingOutput::Evaluate {
                     position: source,
@@ -2307,6 +2328,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     }
                 }
             }
+            let initializer = self.cursor.filter(|_| self.cursor != before);
             let id = ReferenceBindingId {
                 source: self.source.clone(),
                 function_span: self.function_span,
@@ -2328,8 +2350,40 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     BTreeSet::new(),
                 );
             }
+            self.record_binding_definition(position, receiver.position, false, initializer);
         }
         Ok(())
+    }
+
+    fn record_binding_definition(
+        &mut self,
+        position: BlockPosition,
+        receiver: usize,
+        allocation: bool,
+        initializer: Option<CfgPointId>,
+    ) {
+        if self.capture_call_points {
+            let bind = self.cursor.expect("existing binding definition point");
+            let definition = if allocation {
+                BindingDefinition::Allocation { bind }
+            } else if let Some(value) = initializer {
+                BindingDefinition::Initialized { bind, value }
+            } else {
+                return;
+            };
+            self.proof_points
+                .definitions
+                .insert((position.block, position.item, receiver), definition);
+        }
+    }
+
+    fn record_frozen_install(&mut self, destination: OccurrenceOrdinal, rhs: CfgPointId) {
+        if self.capture_call_points {
+            let install = self.cursor.expect("existing assignment install point");
+            self.proof_points
+                .installs
+                .insert(destination, FrozenInstall { rhs, install });
+        }
     }
 
     fn assignment_destination(
@@ -2461,6 +2515,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     };
                     let primary = &binding.value;
                     let primary_ordinal = outputs.primary;
+                    let position = BlockPosition {
+                        block: ordinal,
+                        item: item_index,
+                    };
                     let raw_null = match primary {
                         ScalarExpression::Name { name, span }
                             if matches!(receiver.ty, ScalarType::RawPointer(_)) =>
@@ -2472,6 +2530,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                         _ => false,
                     };
+                    let before = self.cursor;
                     let value = if raw_null {
                         self.point(
                             CfgPointKind::Evaluate(primary.clone()),
@@ -2491,6 +2550,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     } else {
                         None
                     };
+                    let initializer = self.cursor.filter(|_| self.cursor != before);
+                    if self.capture_call_points && raw_null {
+                        self.proof_points
+                            .evaluations
+                            .insert(primary_ordinal, initializer.expect("raw null evaluation"));
+                    }
                     self.move_value(primary, scope, primary_ordinal)?;
                     let id = ReferenceBindingId {
                         source: self.source.clone(),
@@ -2527,6 +2592,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 receiver.span,
                                 scope,
                             );
+                            self.record_binding_definition(
+                                position,
+                                0,
+                                binding.is_allocation,
+                                initializer,
+                            );
                             let old = self.names.insert(receiver.name.clone(), id.clone());
                             declared.push((receiver.name.clone(), id, old));
                             self.additional_receivers(
@@ -2537,6 +2608,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 call_producer,
                                 binding_region.receivers(),
                                 &outputs.secondary,
+                                position,
                             )?;
                             continue;
                         }
@@ -2564,6 +2636,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             BTreeSet::new(),
                         );
                     }
+                    self.record_binding_definition(position, 0, binding.is_allocation, initializer);
                     declared.push((receiver.name.clone(), id, old));
                     self.additional_receivers(
                         binding,
@@ -2573,6 +2646,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         call_producer,
                         binding_region.receivers(),
                         &outputs.secondary,
+                        position,
                     )?;
                 }
                 (
@@ -2712,6 +2786,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     scope,
                                     BTreeSet::new(),
                                 );
+                                self.record_frozen_install(slot.destination, rhs_point);
                                 continue;
                             };
                             if let Some(name) = introduction {
@@ -2839,6 +2914,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 }
                             }
                         }
+                        self.record_frozen_install(slot.destination, rhs_point);
                         if let Some(capture) = capture {
                             let install = self.cursor.expect("assignment install point");
                             let CfgPointKind::CaptureAssignmentPrevious { writes } =
@@ -4764,6 +4840,7 @@ pub(super) struct OccurrenceStructure {
     pub(super) blocks: Vec<BlockRegion>,
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
+    pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) resolved_namespace_places: HashMap<OccurrenceOrdinal, SourceIdentity>,
     pub(super) folded_expressions: HashMap<OccurrenceOrdinal, FoldedOccurrence>,
     pub(super) synthetic_expressions: HashMap<OccurrenceOrdinal, SyntheticOccurrence>,
@@ -4778,6 +4855,7 @@ impl OccurrenceStructure {
             blocks: vec![BlockRegion::new(span, Vec::new())],
             edges: HashMap::new(),
             checked_types: CheckedOccurrenceTypes::default(),
+            literal_fields: HashMap::new(),
             resolved_namespace_places: HashMap::new(),
             folded_expressions: HashMap::new(),
             synthetic_expressions: HashMap::new(),
@@ -4844,7 +4922,7 @@ pub(super) struct CallableBoundary {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum PlainNameIdentity {
+pub(crate) enum PlainNameIdentity {
     Lexical(ReferenceBindingId),
     ModuleValue(SourceSpan),
     Null,
@@ -4869,7 +4947,7 @@ enum NamedPlaceRootFacts {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum DirectDestinationIdentity {
+pub(crate) enum DirectDestinationIdentity {
     Existing(ReferenceBindingId),
     Module(SourceSpan),
     Introduce {
@@ -4923,6 +5001,26 @@ pub(super) struct FunctionCallSites {
 }
 
 impl FunctionCallSites {
+    pub(super) fn prepared_plain_name(
+        &self,
+        ordinal: OccurrenceOrdinal,
+    ) -> Option<&PlainNameIdentity> {
+        match &self.plain_names {
+            PlainNameFacts::Prepared(rows) => rows.get(&ordinal),
+            PlainNameFacts::Raw => None,
+        }
+    }
+
+    pub(super) fn prepared_direct_destination(
+        &self,
+        ordinal: OccurrenceOrdinal,
+    ) -> Option<&DirectDestinationIdentity> {
+        match &self.direct_destinations {
+            DirectDestinationFacts::Prepared(rows) => rows.get(&ordinal),
+            DirectDestinationFacts::Raw => None,
+        }
+    }
+
     pub(super) fn has_prepared_plain_name(&self, ordinal: OccurrenceOrdinal) -> bool {
         matches!(&self.plain_names, PlainNameFacts::Prepared(rows) if rows.contains_key(&ordinal))
     }
@@ -5798,13 +5896,16 @@ impl StructuralWalker<'_, '_> {
             }
             ScalarExpression::StructLiteral { fields, .. } => {
                 for (position, field) in fields.iter().enumerate() {
-                    self.expression(
+                    let ordinal = self.expression_at(
                         &field.value,
                         names,
                         types,
                         parent,
                         OccurrenceEdge::AggregateField(position),
                     )?;
+                    if let Some(id) = self.occurrence_typing.take_literal_field(&field.value) {
+                        self.structure.literal_fields.insert(ordinal, id);
+                    }
                 }
             }
             ScalarExpression::ArrayLiteral { elements, .. } => {
@@ -6809,6 +6910,28 @@ impl ProjectReferenceResults {
         item_ordinal: usize,
         arm_index: Option<usize>,
     ) -> Option<&ScalarReferenceCfg> {
+        Some(
+            &self
+                .function_result(module_ordinal, item_ordinal, arm_index)?
+                .cfg,
+        )
+    }
+
+    pub(super) fn callable_point_facts(
+        &self,
+        module: usize,
+        item: usize,
+        arm: Option<usize>,
+    ) -> Option<&CallablePointFacts> {
+        Some(&self.function_result(module, item, arm)?.proof_points)
+    }
+
+    fn function_result(
+        &self,
+        module_ordinal: usize,
+        item_ordinal: usize,
+        arm_index: Option<usize>,
+    ) -> Option<&FunctionReferenceResult> {
         let module = self
             .updates
             .binary_search_by_key(&module_ordinal, |(ordinal, _)| *ordinal)
@@ -6822,7 +6945,7 @@ impl ProjectReferenceResults {
             Some(arm) => result.arms.get(arm)?,
             None => result,
         };
-        Some(&body.cfg)
+        Some(body)
     }
 
     pub(super) fn install(self, modules: &mut [ScalarModule]) -> Vec<ReferenceAnalysisError> {
@@ -7330,6 +7453,7 @@ fn derive_function_specialized_copy_policies(
 
 struct FunctionReferenceResult {
     cfg: ScalarReferenceCfg,
+    proof_points: CallablePointFacts,
     arms: Vec<FunctionReferenceResult>,
 }
 
@@ -7395,10 +7519,14 @@ fn derive_function_reference_result(
     let mut builder =
         ReferenceFlowBuilder::new(source, function, module_names, call_sites, structs, enums);
     builder.capture_call_points = capture_call_points;
-    let (cfg, current_errors) =
+    let (cfg, current_errors, proof_points) =
         build_function_reference_cfg(builder, function, errors.len() == entry_errors);
     errors.extend(current_errors);
-    FunctionReferenceResult { cfg, arms }
+    FunctionReferenceResult {
+        cfg,
+        arms,
+        proof_points,
+    }
 }
 
 #[cfg(test)]
@@ -7413,14 +7541,20 @@ fn derive_function_reference_cfg(
 ) -> (ScalarReferenceCfg, Vec<ReferenceAnalysisError>) {
     let builder =
         ReferenceFlowBuilder::new(source, function, module_names, call_sites, structs, enums);
-    build_function_reference_cfg(builder, function, prior_children_succeeded)
+    let (cfg, errors, _) =
+        build_function_reference_cfg(builder, function, prior_children_succeeded);
+    (cfg, errors)
 }
 
 fn build_function_reference_cfg(
     mut builder: ReferenceFlowBuilder<'_>,
     function: &ScalarFunction,
     prior_children_succeeded: bool,
-) -> (ScalarReferenceCfg, Vec<ReferenceAnalysisError>) {
+) -> (
+    ScalarReferenceCfg,
+    Vec<ReferenceAnalysisError>,
+    CallablePointFacts,
+) {
     let mut errors = Vec::new();
     let call_sites = builder.call_sites;
     builder.point(
@@ -7445,6 +7579,12 @@ fn build_function_reference_cfg(
         let name = &slot.name;
         let span = &slot.span;
         let ty = &slot.ty;
+        if builder.capture_call_points {
+            builder
+                .proof_points
+                .formals
+                .insert(slot.ordinal, builder.names[name].clone());
+        }
         builder
             .binding_types
             .insert(builder.names[name].clone(), ty.clone());
@@ -7514,5 +7654,5 @@ fn build_function_reference_cfg(
         builder.cfg.initial_points = builder.cfg.points.clone();
         let _ = transfer_reference_facts(&mut builder.cfg, &BTreeMap::new(), &[]);
     }
-    (builder.cfg, errors)
+    (builder.cfg, errors, builder.proof_points)
 }
