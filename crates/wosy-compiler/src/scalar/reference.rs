@@ -4565,7 +4565,7 @@ struct CallDeclarationIndex<'a> {
 #[derive(Default)]
 struct CallDeclarationHeaders<'a> {
     namespaces: HashMap<&'a str, &'a SourceIdentity>,
-    functions: HashMap<&'a str, (ByteSpan, CallFunctionKind)>,
+    functions: HashMap<&'a str, (ByteSpan, CallFunctionKind, (usize, usize))>,
     bindings: HashMap<&'a str, CallBindingHeader<'a>>,
     externs: HashMap<&'a str, HashMap<&'a str, ByteSpan>>,
     value_tokens: HashMap<&'a str, ByteSpan>,
@@ -4585,7 +4585,12 @@ enum CallFunctionKind {
 }
 
 enum CallDeclaration<'a> {
-    Function(&'a SourceIdentity, ByteSpan, CallFunctionKind),
+    Function(
+        &'a SourceIdentity,
+        ByteSpan,
+        CallFunctionKind,
+        (usize, usize),
+    ),
     Binding(&'a SourceIdentity, ByteSpan),
     Extern(&'a SourceIdentity, ByteSpan),
 }
@@ -4593,7 +4598,7 @@ enum CallDeclaration<'a> {
 impl<'a> CallDeclarationIndex<'a> {
     fn new(modules: &[CallResolutionModule<'a>]) -> Self {
         let mut index = Self::default();
-        for module in modules {
+        for (module_ordinal, module) in modules.iter().enumerate() {
             let mut headers = CallDeclarationHeaders::default();
             for binding in module.namespace_bindings {
                 headers
@@ -4601,7 +4606,7 @@ impl<'a> CallDeclarationIndex<'a> {
                     .entry(&binding.binding)
                     .or_insert(&binding.target);
             }
-            for item in module.items {
+            for (item_ordinal, item) in module.items.iter().enumerate() {
                 match item {
                     ScalarItem::Function(function) => {
                         headers
@@ -4614,9 +4619,10 @@ impl<'a> CallDeclarationIndex<'a> {
                         } else {
                             CallFunctionKind::Ordinary
                         };
-                        headers
-                            .functions
-                            .insert(&function.name, (function.name_span, kind));
+                        headers.functions.insert(
+                            &function.name,
+                            (function.name_span, kind, (module_ordinal, item_ordinal)),
+                        );
                     }
                     ScalarItem::Binding(binding) => {
                         headers
@@ -4696,8 +4702,8 @@ impl<'a> CallDeclarationIndex<'a> {
                 }
             },
         };
-        if let Some(&(span, kind)) = headers.functions.get(name) {
-            return Some(CallDeclaration::Function(source, span, kind));
+        if let Some(&(span, kind, origin)) = headers.functions.get(name) {
+            return Some(CallDeclaration::Function(source, span, kind, origin));
         }
         let binding = headers.bindings.get(name)?;
         if !matches!(binding.ty, ScalarType::Callable { .. })
@@ -4769,6 +4775,18 @@ pub(super) struct ModuleCallSites {
 }
 
 impl ModuleCallSites {
+    pub(super) fn function_body(
+        &self,
+        item: usize,
+        arm: Option<usize>,
+    ) -> Option<&FunctionCallSites> {
+        let function = self.functions.get(&item)?;
+        match arm {
+            Some(arm) => function.arms.get(arm),
+            None => Some(function),
+        }
+    }
+
     pub(super) fn functions_in_item_order(&self) -> impl Iterator<Item = &FunctionCallSites> {
         self.functions.values()
     }
@@ -4984,6 +5002,7 @@ pub(super) struct FunctionCallSites {
     pub(super) arms: Vec<FunctionCallSites>,
     pub(super) occurrences: Vec<OccurrenceMetadata>,
     pub(super) call_occurrences: Vec<CallOccurrence>,
+    overload_reservation_sites: Vec<CallOccurrence>,
     pub(super) self_tail_candidates: Vec<OccurrenceOrdinal>,
     pub(super) allocation_length_calls: Vec<OccurrenceOrdinal>,
     pub(super) allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
@@ -5001,6 +5020,12 @@ pub(super) struct FunctionCallSites {
 }
 
 impl FunctionCallSites {
+    pub(super) fn overload_reservations(&self) -> impl Iterator<Item = &ResolvedCallTarget> {
+        self.overload_reservation_sites
+            .iter()
+            .map(|call| &self.sites[call.site].target)
+    }
+
     pub(super) fn prepared_plain_name(
         &self,
         ordinal: OccurrenceOrdinal,
@@ -5215,6 +5240,7 @@ struct CallableWalk<'a> {
     sites: Vec<ResolvedCallSite>,
     site_by_span: BTreeMap<CallSiteSpan, usize>,
     call_occurrences: Vec<CallOccurrence>,
+    overload_reservation_sites: Vec<CallOccurrence>,
     query_allocation_outputs: HashMap<(BlockOrdinal, usize), BindingOutputs>,
 }
 
@@ -5286,6 +5312,10 @@ struct StructuralWalker<'a, 'typing> {
     allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     initialization_call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
     initialization_identities: InitializationIdentities,
+    initialization_reservations: Vec<(usize, OccurrenceOrdinal, bool)>,
+    initialization_item: usize,
+    reserve_legacy_blocks: Vec<bool>,
+    reserve_legacy_occurrences: Vec<bool>,
     structural_calls: Vec<OccurrenceOrdinal>,
     occurrences: Vec<OccurrenceMetadata>,
     structure: OccurrenceStructure,
@@ -5329,6 +5359,10 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             allocation_length_call_targets: HashMap::new(),
             initialization_call_targets: HashMap::new(),
             initialization_identities: InitializationIdentities::default(),
+            initialization_reservations: Vec::new(),
+            initialization_item: 0,
+            reserve_legacy_blocks: vec![true],
+            reserve_legacy_occurrences: Vec::new(),
             structural_calls: Vec::new(),
             occurrences: Vec::new(),
             structure: OccurrenceStructure::new(span),
@@ -5339,6 +5373,24 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         }
     }
 
+    fn reserve_legacy(&self, parent: OccurrenceParent, edge: OccurrenceEdge) -> bool {
+        let admitted = match parent {
+            OccurrenceParent::Block(block) => self.reserve_legacy_blocks[block.0],
+            OccurrenceParent::Expression(expression) | OccurrenceParent::Place(expression) => {
+                self.reserve_legacy_occurrences[expression.0]
+            }
+        };
+        admitted
+            && !matches!(
+                edge,
+                OccurrenceEdge::BindingRoot { output: 1.., .. }
+                    | OccurrenceEdge::BindingAllocationLength { .. }
+                    | OccurrenceEdge::QueryAllocationPlaceholder { .. }
+                    | OccurrenceEdge::AssignmentRhs { output: 1.., .. }
+                    | OccurrenceEdge::AssignmentDestination { .. }
+            )
+    }
+
     fn record_occurrence(
         &mut self,
         role: OccurrenceRole,
@@ -5347,6 +5399,8 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         edge: OccurrenceEdge,
     ) -> OccurrenceOrdinal {
         let ordinal = OccurrenceOrdinal(self.occurrences.len());
+        self.reserve_legacy_occurrences
+            .push(self.reserve_legacy(parent, edge));
         self.occurrences.push(OccurrenceMetadata {
             role,
             span,
@@ -5389,6 +5443,12 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             parent,
             edge,
         );
+        if matches!(
+            expression,
+            ScalarExpression::RawAddress { .. } | ScalarExpression::CheckedAddress { .. }
+        ) {
+            self.reserve_legacy_occurrences[ordinal.0] = false;
+        }
         if let Some(ty) = self.occurrence_typing.take_expression_type(expression) {
             self.structure.checked_types.expressions.insert(ordinal, ty);
         }
@@ -5543,12 +5603,12 @@ impl CallableTargetResolver<'_> {
         expression: &ScalarExpression,
         names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
+        signature: Option<&CheckedCallSignature>,
     ) -> Result<ResolvedCallTarget, ReferenceAnalysisError> {
         let ScalarExpression::Call {
             receiver,
             receiver_span,
             name,
-            overload_selection,
             span,
             ..
         } = expression
@@ -5590,20 +5650,32 @@ impl CallableTargetResolver<'_> {
         } else {
             self.declarations
                 .callable(self.source, receiver.as_deref(), name)
-                .map(|declaration| match declaration {
-                    CallDeclaration::Function(source, declaration_span, _)
+                .and_then(|declaration| match declaration {
+                    CallDeclaration::Function(
+                        source,
+                        declaration_span,
+                        CallFunctionKind::Overload,
+                        origin,
+                    ) => Some(ResolvedCallTarget::ModuleCallable {
+                        source: source.clone(),
+                        declaration_span,
+                        concrete: ConcreteCallSelection::Overload(
+                            checked_overload_selection(signature, origin)?.clone(),
+                        ),
+                    }),
+                    CallDeclaration::Function(source, declaration_span, _, _)
                     | CallDeclaration::Binding(source, declaration_span) => {
-                        ResolvedCallTarget::ModuleCallable {
+                        Some(ResolvedCallTarget::ModuleCallable {
                             source: source.clone(),
                             declaration_span,
-                            concrete: concrete_selection(overload_selection),
-                        }
+                            concrete: ConcreteCallSelection::Declaration,
+                        })
                     }
                     CallDeclaration::Extern(source, declaration_span) => {
-                        ResolvedCallTarget::ExternCallable {
+                        Some(ResolvedCallTarget::ExternCallable {
                             source: source.clone(),
                             declaration_span,
-                        }
+                        })
                     }
                 })
         };
@@ -5618,10 +5690,14 @@ impl CallableWalk<'_> {
         expression: &ScalarExpression,
         names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
+        signature: Option<&CheckedCallSignature>,
+        reserve_legacy: bool,
     ) -> Result<(), ReferenceAnalysisError> {
         use std::collections::btree_map::Entry;
 
-        let target = self.target_resolver.resolve(expression, names, types)?;
+        let target = self
+            .target_resolver
+            .resolve(expression, names, types, signature)?;
         let span = expression_span(expression);
         let source = self.target_resolver.source;
         let site_index = match self.site_by_span.entry(CallSiteSpan(span)) {
@@ -5642,6 +5718,20 @@ impl CallableWalk<'_> {
                 index
             }
         };
+        if reserve_legacy
+            && matches!(
+                self.sites[site_index].target,
+                ResolvedCallTarget::ModuleCallable {
+                    concrete: ConcreteCallSelection::Overload(_),
+                    ..
+                }
+            )
+        {
+            self.overload_reservation_sites.push(CallOccurrence {
+                ordinal,
+                site: site_index,
+            });
+        }
         self.call_occurrences.push(CallOccurrence {
             ordinal,
             site: site_index,
@@ -5657,11 +5747,14 @@ fn missing_call_target(source: &SourceIdentity, span: ByteSpan) -> ReferenceAnal
     }
 }
 
-fn concrete_selection(selection: &Option<ScalarOverloadSelection>) -> ConcreteCallSelection {
-    match selection {
-        Some(selection) => ConcreteCallSelection::Overload(selection.clone()),
-        None => ConcreteCallSelection::Declaration,
-    }
+fn checked_overload_selection(
+    signature: Option<&CheckedCallSignature>,
+    origin: (usize, usize),
+) -> Option<&ScalarOverloadSelection> {
+    signature
+        .filter(|row| row.overload_origin == Some(origin))?
+        .overload
+        .as_ref()
 }
 
 fn initialization_call_target(
@@ -5712,7 +5805,7 @@ fn initialization_call_target(
             .callable(source, receiver.as_deref(), name)
             .ok_or_else(missing)?
         {
-            CallDeclaration::Function(source, span, kind) => {
+            CallDeclaration::Function(source, span, kind, origin) => {
                 let declaration = SourceSpan::new(source.clone(), span);
                 match kind {
                     CallFunctionKind::Generic => Target::Generic {
@@ -5729,8 +5822,8 @@ fn initialization_call_target(
                     CallFunctionKind::Overload => Target::Direct {
                         declaration,
                         concrete: ConcreteCallSelection::Overload(
-                            signature
-                                .and_then(|row| row.overload.clone())
+                            checked_overload_selection(signature, origin)
+                                .cloned()
                                 .ok_or_else(missing)?,
                         ),
                     },
@@ -5762,10 +5855,22 @@ impl StructuralWalker<'_, '_> {
                 }
                 match &mut self.mode {
                     WalkMode::Callable(callable) => {
-                        callable.register_call(ordinal, expression, names, types)?;
+                        callable.register_call(
+                            ordinal,
+                            expression,
+                            names,
+                            types,
+                            self.checked_call_signatures.get(&ordinal),
+                            self.reserve_legacy_occurrences[ordinal.0],
+                        )?;
                     }
                     WalkMode::CallableAllocationLength(resolver) => {
-                        let target = resolver.resolve(expression, names, types)?;
+                        let target = resolver.resolve(
+                            expression,
+                            names,
+                            types,
+                            self.checked_call_signatures.get(&ordinal),
+                        )?;
                         self.structural_calls.push(ordinal);
                         assert!(self
                             .allocation_length_call_targets
@@ -5784,6 +5889,24 @@ impl StructuralWalker<'_, '_> {
                             types,
                             self.checked_call_signatures.get(&ordinal),
                         )?;
+                        if self.reserve_legacy_occurrences[ordinal.0]
+                            && matches!(
+                                target,
+                                ModuleInitializationCallTarget::Generic { .. }
+                                    | ModuleInitializationCallTarget::Direct {
+                                        concrete: ConcreteCallSelection::Overload(_),
+                                        ..
+                                    }
+                            )
+                        {
+                            let unqualified =
+                                matches!(expression, ScalarExpression::Call { receiver: None, .. });
+                            self.initialization_reservations.push((
+                                self.initialization_item,
+                                ordinal,
+                                unqualified,
+                            ));
+                        }
                         self.structural_calls.push(ordinal);
                         assert!(self
                             .initialization_call_targets
@@ -6050,6 +6173,8 @@ impl StructuralWalker<'_, '_> {
         edge: OccurrenceEdge,
     ) -> Result<BlockOrdinal, ReferenceAnalysisError> {
         let ordinal = BlockOrdinal(self.structure.blocks.len());
+        self.reserve_legacy_blocks
+            .push(self.reserve_legacy(parent, edge));
         self.structure
             .blocks
             .push(BlockRegion::new(block.span, Vec::new()));
@@ -6608,6 +6733,7 @@ fn walk_module_initialization(
     let mut block_items = Vec::new();
     let mut extent: Option<ByteSpan> = None;
     for step in &region.steps {
+        walker.initialization_item = step.item;
         let position = BlockPosition {
             block: root,
             item: step.item,
@@ -6665,6 +6791,7 @@ fn walk_module_initialization(
         occurrences: walker.occurrences,
         calls: walker.structural_calls,
         call_targets: walker.initialization_call_targets,
+        legacy_reservations: walker.initialization_reservations,
         checked_call_signatures: walker.checked_call_signatures,
         identities: walker.initialization_identities,
         assignments: walker.assignments,
@@ -6721,6 +6848,7 @@ fn resolve_function_call_sites(
         sites: Vec::new(),
         site_by_span: BTreeMap::new(),
         call_occurrences: Vec::new(),
+        overload_reservation_sites: Vec::new(),
         query_allocation_outputs: HashMap::new(),
     };
     let mut resolver = StructuralWalker::new(
@@ -6811,6 +6939,7 @@ fn resolve_function_call_sites(
         arms,
         occurrences: resolver.occurrences,
         call_occurrences: callable.call_occurrences,
+        overload_reservation_sites: callable.overload_reservation_sites,
         self_tail_candidates: Vec::new(),
         allocation_length_calls: resolver.structural_calls,
         allocation_length_call_targets: resolver.allocation_length_call_targets,

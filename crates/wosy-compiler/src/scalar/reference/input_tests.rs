@@ -79,10 +79,11 @@ fn real_constructor_borrows_nonempty_inventories_and_prepared_call_rows_by_ident
     let parsed = parse_source(source(), TEXT.into(), &[]);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let extracted = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
-    let typed = typecheck_scalar_program(extracted, ScalarTargetLayout::WASM32);
+    let (typed, occurrences) =
+        typecheck_scalar_program_with_occurrences(extracted, ScalarTargetLayout::WASM32);
     assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
     let program = typed.program;
-    let call_sites = resolve_program_call_sites(&program).unwrap();
+    let call_sites = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
     let module_names = HashSet::from(["pick".to_owned(), "read".to_owned()]);
     let ScalarItem::Function(function) = &program.items[1] else {
         panic!("read")
@@ -114,10 +115,11 @@ fn actual_function_and_arm_consumers_copy_zero_aggregates_and_match_public_cfgs(
         let parsed = parse_source(source(), TEXT.into(), &[]);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let extracted = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
-        let typed = typecheck_scalar_program(extracted, target);
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(extracted, target);
         assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
         let mut program = typed.program;
-        let call_sites = resolve_program_call_sites(&program).unwrap();
+        let call_sites =
+            resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
         let module_names = HashSet::from(["pick".to_owned(), "read".to_owned()]);
         let public = derive_scalar_program_with_layout(&parsed.result, target);
         assert_eq!(public.diagnostics, typed.diagnostics);
@@ -168,11 +170,17 @@ fn immutable_producer_preserves_preexisting_cfg_and_entire_input_on_both_targets
     for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
         let parsed = parse_source(source(), TEXT.into(), &[]);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        let public = derive_scalar_program_with_layout(&parsed.result, target);
-        assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
-        let program = public.program;
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(
+            derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+            target,
+        );
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let mut program = typed.program;
+        let call_sites =
+            resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let results = analyze_program_references(&program, &call_sites);
+        assert!(results.install(&mut program).is_empty());
         let before = program.clone();
-        let call_sites = resolve_program_call_sites(&program).unwrap();
         let module_names = HashSet::from(["pick".to_owned(), "read".to_owned()]);
         for (index, item) in program.items.iter().enumerate() {
             let ScalarItem::Function(function) = item else {

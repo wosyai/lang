@@ -86,6 +86,7 @@ enum EmitValue<'ctx> {
 }
 
 struct EmitState<'ctx, 'module> {
+    prepared_render: bool,
     initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
     body_call_nodes: Option<&'module CallableBodyCallNodes<'module>>,
     initializer_symbols: Option<&'module InitializerSymbols>,
@@ -277,16 +278,16 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     if !validation.diagnostics.is_empty() {
         return Err("cannot emit LLVM for an invalid scalar program".into());
     }
-    let (program, initialization_region) =
-        crate::scalar::PreparedProgram::rebuild_raw(&validation.program)?;
+    let prepared = crate::scalar::PreparedProgram::rebuild_raw(&validation.program)?;
+    let program = prepared.program();
     emit_single_module_llvm(
         &program.source,
         &program.items,
-        &initialization_region,
+        prepared.initialization_region(),
         &program.structs,
         &program.layouts,
         program.target_layout,
-        GenericInitializerInput::RawItems,
+        GenericInitializerInput::RawStandalone(&prepared),
         &|_, _, function| Some(&function.reference_cfg),
     )
 }
@@ -337,12 +338,8 @@ fn emit_single_module_llvm<'a>(
         &'a ScalarFunction,
     ) -> Option<&'a ScalarReferenceCfg>,
 ) -> Result<LlvmPartition, String> {
-    let initializer_nodes = match generic_input {
-        GenericInitializerInput::RawItems => None,
-        GenericInitializerInput::PreparedRows(_) => {
-            Some(initialization_region.bind_call_nodes(items)?)
-        }
-    };
+    let prepared_render = generic_input.prepared_render();
+    let initializer_nodes = Some(initialization_region.bind_call_nodes(items)?);
     let require_cfg = |item_ordinal, arm_index, function: &'a ScalarFunction| {
         reference_cfg(item_ordinal, arm_index, function).ok_or_else(|| {
             let span = function.span;
@@ -390,7 +387,7 @@ fn emit_single_module_llvm<'a>(
     let mut initializer_symbols = InitializerSymbols::default();
     let mut definitions = Vec::new();
     for (item_ordinal, item) in items.iter().enumerate() {
-        if initializer_nodes.is_some() {
+        if prepared_render {
             if let ScalarItem::Binding(binding) = item {
                 initializer_symbols.callable_binding(source, binding);
             }
@@ -398,9 +395,7 @@ fn emit_single_module_llvm<'a>(
         let ScalarItem::Function(function) = item else {
             continue;
         };
-        if initializer_nodes.is_some() {
-            initializer_symbols.function(source, function, function.name.clone());
-        }
+        initializer_symbols.function(source, function, function.name.clone());
         if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
             continue;
         }
@@ -420,35 +415,32 @@ fn emit_single_module_llvm<'a>(
         definitions.push((function, cfg, function.name.as_str(), item_ordinal, None));
     }
     let ordinary_count = definitions.len();
-    let specializations = match generic_input {
-        GenericInitializerInput::RawItems => generic_specializations(items, str::to_owned)?,
-        GenericInitializerInput::PreparedRows(_) => prepared_generic_specializations(
-            std::iter::once((0, source, items, initialization_region)),
-            |_, name| name.to_owned(),
-        )?
-        .remove(&0)
-        .expect("single prepared module has a specialization set"),
-    };
+    let specializations = generic_specializations(
+        std::iter::once((0, source, items, initialization_region)),
+        |_, name| name.to_owned(),
+        prepared_render,
+    )?
+    .remove(&0)
+    .expect("single module has a specialization set");
     let mut prepared_overloads = prepared_initializer_overloads(
-        initializer_nodes.iter().map(|_| initialization_region),
+        initializer_nodes
+            .iter()
+            .filter(|_| prepared_render)
+            .map(|_| initialization_region),
         &initializer_symbols,
     )?;
-    collect_prepared_body_overload_selections(
+    collect_body_overload_reservations(
         generic_input,
         0,
         items,
+        initialization_region,
         &initializer_symbols,
         &mut prepared_overloads,
     )?;
     let overloads = selected_overload_specializations(
         items,
         str::to_owned,
-        selected_overload_selections(items, generic_input)
-            .into_iter()
-            .filter_map(|(receiver, name, selection)| {
-                receiver.is_none().then_some((name, selection))
-            })
-            .chain(prepared_overloads.remove(source).into_iter().flatten()),
+        prepared_overloads.remove(source).into_iter().flatten(),
     );
     for (
         lookup,
@@ -504,7 +496,7 @@ fn emit_single_module_llvm<'a>(
                     function_type(&context, &function.signature, target_layout)?.0,
                     None,
                 );
-                if initializer_nodes.is_some() {
+                if prepared_render {
                     initializer_symbols.external(
                         source,
                         function.name_span,
@@ -551,6 +543,7 @@ fn emit_single_module_llvm<'a>(
     for (function, cfg, name, item, arm) in definitions {
         let nodes = generic_input.bind_body(0, item, arm, &function.body)?;
         emit_function(
+            prepared_render,
             &context,
             &builder,
             &functions,
@@ -572,6 +565,7 @@ fn emit_single_module_llvm<'a>(
         )?;
     }
     emit_main(
+        prepared_render,
         &context,
         &builder,
         &functions,
@@ -630,7 +624,7 @@ fn emit_scalar_build_project_with_policy(
         prepared.project(),
         &|module| prepared.initialization_region(module),
         match policy {
-            EmissionPolicy::RawCompatibility => GenericInitializerInput::RawItems,
+            EmissionPolicy::RawCompatibility => GenericInitializerInput::RawProject(prepared),
             EmissionPolicy::Prepared => GenericInitializerInput::PreparedRows(prepared),
         },
         &|module, item, arm, _| validation.reference_cfg(module, item, arm),
@@ -680,16 +674,14 @@ fn emit_project_llvm<'a>(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let initializer_nodes = match generic_input {
-        GenericInitializerInput::RawItems => None,
-        GenericInitializerInput::PreparedRows(_) => Some(
-            modules
-                .iter()
-                .zip(&regions)
-                .map(|(module, region)| region.bind_call_nodes(&module.items))
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-    };
+    let prepared_render = generic_input.prepared_render();
+    let initializer_nodes = Some(
+        modules
+            .iter()
+            .zip(&regions)
+            .map(|(module, region)| region.bind_call_nodes(&module.items))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     let require_cfg = |module_ordinal, item_ordinal, arm_index, function: &'a ScalarFunction| {
         reference_cfg(module_ordinal, item_ordinal, arm_index, function).ok_or_else(|| {
             let source = &project.modules[module_ordinal].source;
@@ -729,7 +721,7 @@ fn emit_project_llvm<'a>(
     for &(module_ordinal, source_module) in &ordered_modules {
         for (item_ordinal, item) in source_module.items.iter().enumerate() {
             if let ScalarItem::Binding(binding) = item {
-                if initializer_nodes.is_some() {
+                if prepared_render {
                     initializer_symbols.callable_binding(&source_module.source, binding);
                 }
                 for (name, ty) in binding_receivers(binding).iter() {
@@ -746,9 +738,7 @@ fn emit_project_llvm<'a>(
             }
             if let ScalarItem::Function(function) = item {
                 let name = project_function_name(&source_module.source, &function.name);
-                if initializer_nodes.is_some() {
-                    initializer_symbols.function(&source_module.source, function, name.clone());
-                }
+                initializer_symbols.function(&source_module.source, function, name.clone());
                 if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
                     continue;
                 }
@@ -800,7 +790,7 @@ fn emit_project_llvm<'a>(
                         module_name,
                         &function.name,
                     );
-                    if initializer_nodes.is_some() {
+                    if prepared_render {
                         initializer_symbols.external(
                             &source_module.source,
                             function.name_span,
@@ -815,30 +805,21 @@ fn emit_project_llvm<'a>(
             }
         }
     }
-    let mut prepared_specializations = match generic_input {
-        GenericInitializerInput::RawItems => BTreeMap::new(),
-        GenericInitializerInput::PreparedRows(_) => prepared_generic_specializations(
-            ordered_modules
-                .iter()
-                .zip(&regions)
-                .map(|(&(ordinal, module), &region)| {
-                    (ordinal, &module.source, module.items.as_slice(), region)
-                }),
-            project_function_name,
-        )?,
-    };
+    let mut prepared_specializations = generic_specializations(
+        ordered_modules
+            .iter()
+            .zip(&regions)
+            .map(|(&(ordinal, module), &region)| {
+                (ordinal, &module.source, module.items.as_slice(), region)
+            }),
+        project_function_name,
+        prepared_render,
+    )?;
     let mut project_specializations = Vec::new();
     for &(module_ordinal, source_module) in &ordered_modules {
-        let specializations = match generic_input {
-            GenericInitializerInput::RawItems => {
-                generic_specializations(&source_module.items, |name| {
-                    project_function_name(&source_module.source, name)
-                })?
-            }
-            GenericInitializerInput::PreparedRows(_) => prepared_specializations
-                .remove(&module_ordinal)
-                .expect("prepared project module has a specialization set"),
-        };
+        let specializations = prepared_specializations
+            .remove(&module_ordinal)
+            .expect("project module has a specialization set");
         for (lookup, specialization) in specializations {
             let LlvmSpecialization {
                 function,
@@ -876,44 +857,28 @@ fn emit_project_llvm<'a>(
     let mut prepared_overloads = prepared_initializer_overloads(
         initializer_nodes
             .iter()
+            .filter(|_| prepared_render)
             .flat_map(|_| regions.iter().copied()),
         &initializer_symbols,
     )?;
-    for &(ordinal, source_module) in &ordered_modules {
-        collect_prepared_body_overload_selections(
+    for (&(ordinal, source_module), &region) in ordered_modules.iter().zip(&regions) {
+        collect_body_overload_reservations(
             generic_input,
             ordinal,
             &source_module.items,
+            region,
             &initializer_symbols,
             &mut prepared_overloads,
         )?;
     }
     for &(module_ordinal, source_module) in &ordered_modules {
-        let selections = modules.iter().flat_map(|calling_module| {
-            selected_overload_selections(&calling_module.items, generic_input)
-                .into_iter()
-                .filter_map(|(receiver, name, selection)| match receiver {
-                    None if calling_module.source == source_module.source => {
-                        Some((name, selection))
-                    }
-                    Some(binding)
-                        if project_namespace_target(calling_module, &modules, &binding)
-                            .is_ok_and(|target| target.source == source_module.source) =>
-                    {
-                        Some((name, selection))
-                    }
-                    _ => None,
-                })
-        });
         for (lookup, specialization) in selected_overload_specializations(
             &source_module.items,
             |name| project_function_name(&source_module.source, name),
-            selections.chain(
-                prepared_overloads
-                    .remove(&source_module.source)
-                    .into_iter()
-                    .flatten(),
-            ),
+            prepared_overloads
+                .remove(&source_module.source)
+                .into_iter()
+                .flatten(),
         ) {
             let LlvmSpecialization {
                 function,
@@ -1003,6 +968,7 @@ fn emit_project_llvm<'a>(
             _ => generic_input.bind_body(ordinal, item, arm, &function.body)?,
         };
         emit_project_function(
+            prepared_render,
             &context,
             &builder,
             &functions,
@@ -1025,6 +991,7 @@ fn emit_project_llvm<'a>(
         )?;
     }
     emit_project_main(
+        prepared_render,
         &context,
         &builder,
         &functions,
@@ -1655,24 +1622,12 @@ fn runtime_array_assignment_provenance(
             receiver,
             name,
             type_arguments,
-            overload_selection,
             ..
         } => {
             let qualified = receiver
                 .as_ref()
                 .map_or_else(|| name.clone(), |receiver| format!("{receiver}.{name}"));
-            let lookup = overload_selection
-                .as_ref()
-                .map(|selection| selected_overload_lookup_key(&qualified, selection));
-            let target = state
-                .call_targets
-                .get(lookup.as_ref().unwrap_or(&qualified))
-                .or_else(|| {
-                    state
-                        .call_targets
-                        .get(&specialization_lookup_key(&qualified, type_arguments))
-                })
-                .or_else(|| state.call_targets.get(&qualified));
+            let target = state.raw_call_symbol(expression, &qualified, type_arguments)?;
             RuntimeArrayAssignmentProvenance {
                 result: target
                     .and_then(|target| state.runtime_array_results.get(target))
@@ -1753,6 +1708,7 @@ fn emit_project_binding_value<'ctx, 'module>(
 }
 
 fn emit_function<'ctx, 'module>(
+    prepared_render: bool,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -1783,6 +1739,7 @@ fn emit_function<'ctx, 'module>(
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
+        prepared_render,
         initializer_nodes: None,
         body_call_nodes,
         initializer_symbols: Some(initializer_symbols),
@@ -1920,6 +1877,7 @@ fn emit_function<'ctx, 'module>(
 }
 
 fn emit_main<'ctx, 'module>(
+    prepared_render: bool,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -1943,6 +1901,7 @@ fn emit_main<'ctx, 'module>(
     let entry = context.append_basic_block(main, "entry");
     builder.position_at_end(entry);
     let mut state = EmitState {
+        prepared_render,
         initializer_nodes,
         body_call_nodes: None,
         initializer_symbols: Some(initializer_symbols),
@@ -2033,6 +1992,7 @@ fn emit_main<'ctx, 'module>(
 }
 
 fn emit_project_function<'ctx, 'module>(
+    prepared_render: bool,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -2064,6 +2024,7 @@ fn emit_project_function<'ctx, 'module>(
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
+        prepared_render,
         initializer_nodes: None,
         body_call_nodes,
         initializer_symbols: Some(initializer_symbols),
@@ -2225,6 +2186,7 @@ fn emit_project_function<'ctx, 'module>(
 }
 
 fn emit_project_main<'ctx, 'module>(
+    prepared_render: bool,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -2248,6 +2210,7 @@ fn emit_project_main<'ctx, 'module>(
     let entry = context.append_basic_block(main, "entry");
     builder.position_at_end(entry);
     let mut state = EmitState {
+        prepared_render,
         initializer_nodes: None,
         body_call_nodes: None,
         initializer_symbols: Some(initializer_symbols),
@@ -3716,7 +3679,6 @@ fn pointer_target_type<'ctx, 'module>(
             receiver,
             name,
             type_arguments,
-            overload_selection,
             ..
         } => {
             if let Some((inner, _)) = core_pointer_cast_dereference_type(expression) {
@@ -3749,18 +3711,10 @@ fn pointer_target_type<'ctx, 'module>(
                     project_function_name(&target.source, name)
                 },
             );
-            let lookup = overload_selection
-                .as_ref()
-                .map(|selection| selected_overload_lookup_key(&qualified, selection));
             state
-                .call_targets
-                .get(lookup.as_ref().unwrap_or(&qualified))
-                .or_else(|| {
-                    state
-                        .call_targets
-                        .get(&specialization_lookup_key(&qualified, type_arguments))
-                })
-                .or_else(|| state.call_targets.get(&qualified))
+                .raw_call_symbol(expression, &qualified, type_arguments)
+                .ok()
+                .flatten()
                 .and_then(|target| state.signatures.get(target))
                 .and_then(|signature| match signature {
                     ScalarType::Callable { outputs, .. } => outputs.outputs.first(),
@@ -3798,7 +3752,6 @@ fn dereference_requires_null_guard<'ctx, 'module>(
             receiver,
             name,
             type_arguments,
-            overload_selection,
             ..
         } => {
             if let Some((_, checked)) = core_pointer_cast_dereference_type(expression) {
@@ -3831,18 +3784,10 @@ fn dereference_requires_null_guard<'ctx, 'module>(
                     project_function_name(&target.source, name)
                 },
             );
-            let lookup = overload_selection
-                .as_ref()
-                .map(|selection| selected_overload_lookup_key(&qualified, selection));
             state
-                .call_targets
-                .get(lookup.as_ref().unwrap_or(&qualified))
-                .or_else(|| {
-                    state
-                        .call_targets
-                        .get(&specialization_lookup_key(&qualified, type_arguments))
-                })
-                .or_else(|| state.call_targets.get(&qualified))
+                .raw_call_symbol(expression, &qualified, type_arguments)
+                .ok()
+                .flatten()
                 .and_then(|target| state.signatures.get(target))
                 .and_then(|signature| match signature {
                     ScalarType::Callable { outputs, .. } => outputs.outputs.first(),
@@ -4348,11 +4293,37 @@ enum EmissionPolicy {
 
 #[derive(Clone, Copy)]
 enum GenericInitializerInput<'a> {
-    RawItems,
+    RawStandalone(&'a crate::scalar::PreparedProgram),
+    RawProject(&'a crate::PreparedScalarProject),
     PreparedRows(&'a crate::PreparedScalarProject),
 }
 
 impl GenericInitializerInput<'_> {
+    fn prepared_render(self) -> bool {
+        matches!(self, Self::PreparedRows(_))
+    }
+
+    fn visit_body_overloads(
+        self,
+        module: usize,
+        item: usize,
+        mut visitor: impl FnMut(&ResolvedCallTarget) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let missing = || {
+            format!("internal error: missing callable overload reservation rows (module {module}, item {item})")
+        };
+        match self {
+            Self::RawStandalone(prepared) => prepared
+                .body_overload_reservations(item)
+                .ok_or_else(missing)?
+                .try_for_each(&mut visitor),
+            Self::RawProject(prepared) | Self::PreparedRows(prepared) => prepared
+                .body_overload_reservations(module, item)
+                .ok_or_else(missing)?
+                .try_for_each(&mut visitor),
+        }
+    }
+
     fn bind_body<'a>(
         &'a self,
         module: usize,
@@ -4361,8 +4332,8 @@ impl GenericInitializerInput<'_> {
         body: &'a ScalarBlock,
     ) -> Result<Option<CallableBodyCallNodes<'a>>, String> {
         match self {
-            Self::RawItems => Ok(None),
-            Self::PreparedRows(prepared) => prepared
+            Self::RawStandalone(prepared) => prepared.bind_body(item, arm, body).map(Some),
+            Self::RawProject(prepared) | Self::PreparedRows(prepared) => prepared
                 .bind_callable_body_call_nodes(module, item, arm, body)
                 .map(Some),
         }
@@ -4371,11 +4342,11 @@ impl GenericInitializerInput<'_> {
 
 mod initializer_calls;
 use initializer_calls::{
-    collect_prepared_body_overload_selections, prepared_initializer_overloads, InitializerSymbols,
+    collect_body_overload_reservations, prepared_initializer_overloads, InitializerSymbols,
     PreparedCall,
 };
 
-fn prepared_generic_specializations<'a>(
+fn generic_specializations<'a>(
     modules: impl Iterator<
             Item = (
                 usize,
@@ -4385,6 +4356,7 @@ fn prepared_generic_specializations<'a>(
             ),
         > + Clone,
     symbol: impl Fn(&wosy_syntax::SourceIdentity, &str) -> String,
+    prepared_render: bool,
 ) -> Result<BTreeMap<usize, BTreeMap<String, LlvmSpecialization<'a>>>, String> {
     let mut templates = HashMap::new();
     let mut specializations = BTreeMap::new();
@@ -4402,13 +4374,13 @@ fn prepared_generic_specializations<'a>(
         }
     }
     for (_, _, _, region) in modules {
-        for target in region.call_targets()? {
+        let mut reserve = |target: &ModuleInitializationCallTarget| -> Result<(), String> {
             let ModuleInitializationCallTarget::Generic {
                 declaration,
                 type_arguments,
-            } = target?
+            } = target
             else {
-                continue;
+                return Ok(());
             };
             let &(module_ordinal, item_ordinal, function) = templates
                 .get(&(&declaration.source, declaration.range))
@@ -4425,53 +4397,22 @@ fn prepared_generic_specializations<'a>(
                 item_ordinal,
                 type_arguments,
                 &symbol(&declaration.source, &function.name),
-            )?;
-        }
-    }
-    Ok(specializations)
-}
-
-fn generic_specializations(
-    items: &[ScalarItem],
-    symbol: impl Fn(&str) -> String,
-) -> Result<BTreeMap<String, LlvmSpecialization<'_>>, String> {
-    let mut calls = Vec::new();
-    for item in items {
-        match item {
-            ScalarItem::Binding(binding) => collect_generic_calls(&binding.value, &mut calls),
-            ScalarItem::Executable(item) => collect_generic_calls_in_item(item, &mut calls),
-            ScalarItem::Namespace(_) | ScalarItem::Extern(_) | ScalarItem::Function(_) => {}
-        }
-    }
-    let mut specializations = BTreeMap::new();
-    for (name, arguments) in calls {
-        let Some((item_ordinal, function)) =
-            items
-                .iter()
-                .enumerate()
-                .find_map(|(index, item)| match item {
-                    ScalarItem::Function(function) if function.name == name => {
-                        Some((index, function))
-                    }
-                    _ => None,
-                })
-        else {
-            continue;
+            )
         };
-        if function.generic_parameters.is_empty() {
-            continue;
+        if prepared_render {
+            for target in region.call_targets()? {
+                reserve(target?)?;
+            }
+        } else {
+            for (_, unqualified, target) in region.legacy_reservation_targets()? {
+                if unqualified {
+                    reserve(target)?;
+                }
+            }
         }
-        insert_generic_specialization(
-            &mut specializations,
-            function,
-            item_ordinal,
-            &arguments,
-            &symbol(&name),
-        )?;
     }
     Ok(specializations)
 }
-
 fn insert_generic_specialization<'a>(
     specializations: &mut BTreeMap<String, LlvmSpecialization<'a>>,
     function: &'a ScalarFunction,
@@ -4571,172 +4512,6 @@ fn selected_overload_specializations(
     specializations
 }
 
-fn selected_overload_selections(
-    items: &[ScalarItem],
-    input: GenericInitializerInput<'_>,
-) -> Vec<(Option<String>, String, ScalarOverloadSelection)> {
-    if !matches!(input, GenericInitializerInput::RawItems) {
-        return Vec::new();
-    }
-    let mut search = OverloadSearch {
-        calls: Vec::new(),
-        prepared: false,
-    };
-    for item in items {
-        match item {
-            ScalarItem::Binding(binding) => collect_selected_overloads(&binding.value, &mut search),
-            ScalarItem::Function(function) => {
-                collect_selected_overloads_in_block(&function.body, &mut search)
-            }
-            ScalarItem::Executable(item) => collect_selected_overloads_in_item(item, &mut search),
-            _ => {}
-        }
-    }
-    search
-        .calls
-        .into_iter()
-        .filter_map(|expression| match expression {
-            ScalarExpression::Call {
-                receiver,
-                name,
-                overload_selection: Some(selection),
-                ..
-            } => Some((receiver.clone(), name.clone(), selection.clone())),
-            _ => None,
-        })
-        .collect()
-}
-
-struct OverloadSearch<'a> {
-    calls: Vec<&'a ScalarExpression>,
-    prepared: bool,
-}
-
-fn collect_selected_overloads<'a>(
-    expression: &'a ScalarExpression,
-    selections: &mut OverloadSearch<'a>,
-) {
-    match expression {
-        ScalarExpression::Call {
-            arguments,
-            overload_selection,
-            ..
-        } => {
-            if selections.prepared || overload_selection.is_some() {
-                selections.calls.push(expression);
-            }
-            for argument in arguments {
-                collect_selected_overloads(argument, selections);
-            }
-        }
-        ScalarExpression::Binary { left, right, .. } => {
-            collect_selected_overloads(left, selections);
-            collect_selected_overloads(right, selections);
-        }
-        ScalarExpression::Unary { operand, .. } => collect_selected_overloads(operand, selections),
-        ScalarExpression::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            collect_selected_overloads(condition, selections);
-            collect_selected_overloads_in_block(then_branch, selections);
-            collect_selected_overloads_in_block(else_branch, selections);
-        }
-        ScalarExpression::UnitIf {
-            condition,
-            then_branch,
-            ..
-        } => {
-            collect_selected_overloads(condition, selections);
-            collect_selected_overloads_in_block(then_branch, selections);
-        }
-        ScalarExpression::Block(block) => collect_selected_overloads_in_block(block, selections),
-        ScalarExpression::StructLiteral { fields, .. } => {
-            for field in fields {
-                collect_selected_overloads(&field.value, selections);
-            }
-        }
-        ScalarExpression::ArrayLiteral { elements, .. } => {
-            for element in elements {
-                collect_selected_overloads(element, selections);
-            }
-        }
-        ScalarExpression::Dereference { place, .. } => {
-            collect_selected_overloads_in_place(place, selections);
-        }
-        ScalarExpression::IndexedRead { place, .. } => {
-            collect_selected_overloads_in_place(place, selections);
-        }
-        ScalarExpression::RawAddress { .. }
-        | ScalarExpression::CheckedAddress { .. }
-        | ScalarExpression::Name { .. }
-        | ScalarExpression::Member { .. }
-        | ScalarExpression::Integer { .. }
-        | ScalarExpression::InvalidInteger { .. }
-        | ScalarExpression::Float { .. }
-        | ScalarExpression::InvalidFloat { .. }
-        | ScalarExpression::Boolean { .. }
-        | ScalarExpression::Char { .. }
-        | ScalarExpression::Utf8 { .. } => {}
-    }
-}
-
-fn collect_selected_overloads_in_place<'a>(
-    place: &'a crate::ScalarPlace,
-    selections: &mut OverloadSearch<'a>,
-) {
-    match place {
-        crate::ScalarPlace::Name { .. } => {}
-        crate::ScalarPlace::Dereference { pointer, .. } => {
-            collect_selected_overloads(pointer, selections)
-        }
-        crate::ScalarPlace::Field { base, .. } => {
-            collect_selected_overloads_in_place(base, selections)
-        }
-        crate::ScalarPlace::Index { base, index, .. } => {
-            collect_selected_overloads_in_place(base, selections);
-            collect_selected_overloads(index, selections);
-        }
-    }
-}
-
-fn collect_selected_overloads_in_block<'a>(
-    block: &'a ScalarBlock,
-    selections: &mut OverloadSearch<'a>,
-) {
-    for item in &block.items {
-        collect_selected_overloads_in_item(item, selections);
-    }
-}
-
-fn collect_selected_overloads_in_item<'a>(
-    item: &'a ScalarBlockItem,
-    selections: &mut OverloadSearch<'a>,
-) {
-    match item {
-        ScalarBlockItem::LocalBinding(binding) => {
-            collect_selected_overloads(&binding.value, selections)
-        }
-        ScalarBlockItem::Expression(expression) => {
-            collect_selected_overloads(expression, selections)
-        }
-        ScalarBlockItem::Assignment(assignment) => {
-            let primary = if selections.prepared {
-                &assignment.values[0]
-            } else {
-                &assignment.value
-            };
-            collect_selected_overloads(primary, selections)
-        }
-        ScalarBlockItem::While(while_expression) => {
-            collect_selected_overloads(&while_expression.condition, selections);
-            collect_selected_overloads_in_block(&while_expression.body, selections);
-        }
-    }
-}
-
 fn selected_overload_lookup_key(name: &str, selection: &ScalarOverloadSelection) -> String {
     let substitutions = selection
         .substitutions
@@ -4745,127 +4520,6 @@ fn selected_overload_lookup_key(name: &str, selection: &ScalarOverloadSelection)
         .collect::<Vec<_>>()
         .join(",");
     format!("{name}<arm:{},{}>", selection.arm_index, substitutions)
-}
-
-fn collect_generic_calls(
-    expression: &ScalarExpression,
-    calls: &mut Vec<(String, Vec<ScalarType>)>,
-) {
-    match expression {
-        ScalarExpression::Call {
-            receiver: None,
-            name,
-            type_arguments,
-            arguments,
-            ..
-        } => {
-            calls.push((
-                name.clone(),
-                type_arguments
-                    .iter()
-                    .map(|argument| argument.ty.clone())
-                    .collect(),
-            ));
-            for argument in arguments {
-                collect_generic_calls(argument, calls);
-            }
-        }
-        ScalarExpression::Call { arguments, .. } => {
-            for argument in arguments {
-                collect_generic_calls(argument, calls);
-            }
-        }
-        ScalarExpression::Binary { left, right, .. } => {
-            collect_generic_calls(left, calls);
-            collect_generic_calls(right, calls);
-        }
-        ScalarExpression::Unary { operand, .. } => collect_generic_calls(operand, calls),
-        ScalarExpression::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            collect_generic_calls(condition, calls);
-            collect_generic_calls_in_block(then_branch, calls);
-            collect_generic_calls_in_block(else_branch, calls);
-        }
-        ScalarExpression::UnitIf {
-            condition,
-            then_branch,
-            ..
-        } => {
-            collect_generic_calls(condition, calls);
-            collect_generic_calls_in_block(then_branch, calls);
-        }
-        ScalarExpression::Block(block) => collect_generic_calls_in_block(block, calls),
-        ScalarExpression::StructLiteral { fields, .. } => {
-            for field in fields {
-                collect_generic_calls(&field.value, calls);
-            }
-        }
-        ScalarExpression::ArrayLiteral { elements, .. } => {
-            for element in elements {
-                collect_generic_calls(element, calls);
-            }
-        }
-        ScalarExpression::Dereference { place, .. } => {
-            collect_generic_calls_in_place(place, calls);
-        }
-        ScalarExpression::IndexedRead { place, .. } => {
-            collect_generic_calls_in_place(place, calls);
-        }
-        ScalarExpression::Name { .. }
-        | ScalarExpression::Member { .. }
-        | ScalarExpression::Integer { .. }
-        | ScalarExpression::InvalidInteger { .. }
-        | ScalarExpression::Float { .. }
-        | ScalarExpression::InvalidFloat { .. }
-        | ScalarExpression::Boolean { .. }
-        | ScalarExpression::Char { .. }
-        | ScalarExpression::Utf8 { .. }
-        | ScalarExpression::RawAddress { .. }
-        | ScalarExpression::CheckedAddress { .. } => {}
-    }
-}
-
-fn collect_generic_calls_in_place(
-    place: &crate::ScalarPlace,
-    calls: &mut Vec<(String, Vec<ScalarType>)>,
-) {
-    match place {
-        crate::ScalarPlace::Name { .. } => {}
-        crate::ScalarPlace::Dereference { pointer, .. } => collect_generic_calls(pointer, calls),
-        crate::ScalarPlace::Field { base, .. } => collect_generic_calls_in_place(base, calls),
-        crate::ScalarPlace::Index { base, index, .. } => {
-            collect_generic_calls_in_place(base, calls);
-            collect_generic_calls(index, calls);
-        }
-    }
-}
-
-fn collect_generic_calls_in_block(block: &ScalarBlock, calls: &mut Vec<(String, Vec<ScalarType>)>) {
-    for item in &block.items {
-        collect_generic_calls_in_item(item, calls);
-    }
-    for output in &block.final_output_values {
-        collect_generic_calls(&output.value, calls);
-    }
-}
-
-fn collect_generic_calls_in_item(
-    item: &ScalarBlockItem,
-    calls: &mut Vec<(String, Vec<ScalarType>)>,
-) {
-    match item {
-        ScalarBlockItem::LocalBinding(binding) => collect_generic_calls(&binding.value, calls),
-        ScalarBlockItem::Expression(expression) => collect_generic_calls(expression, calls),
-        ScalarBlockItem::Assignment(assignment) => collect_generic_calls(&assignment.value, calls),
-        ScalarBlockItem::While(while_expression) => {
-            collect_generic_calls(&while_expression.condition, calls);
-            collect_generic_calls_in_block(&while_expression.body, calls);
-        }
-    }
 }
 
 fn substitute_generic_signature(function: &ScalarFunction, arguments: &[ScalarType]) -> ScalarType {

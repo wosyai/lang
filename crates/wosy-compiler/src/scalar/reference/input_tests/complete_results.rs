@@ -28,11 +28,11 @@ fn complete_program_analysis_borrows_input_and_matches_legacy_attachment_after_a
         ] {
             let parsed = parse_source(source(), text.into(), &[]);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-            let typed = typecheck_scalar_program(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), target);
+            let (typed, occurrences) = typecheck_scalar_program_with_occurrences(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), target);
             assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
             let program = typed.program;
             let before = program.clone();
-            let sites = resolve_program_call_sites(&program).unwrap();
+            let sites = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
             let scope = layout::observations::Scope::new();
             let stages = stage_observations::Scope::new();
             let results = analyze_program_references(&program, &sites);
@@ -117,11 +117,12 @@ fn complete_project_analysis_preserves_ordinals_specializations_and_ordered_part
             empty.target_layout = target;
             let modules = vec![empty, main, library];
             let order = modules.iter().map(|module| module.source.clone()).collect();
-            let typed = typecheck_scalar_project(ScalarProject::new(modules, order));
+            let (typed, occurrences) =
+                typecheck_scalar_project_with_occurrences(ScalarProject::new(modules, order));
             assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
             let modules = typed.project.modules;
             let before = modules.clone();
-            let calls = resolve_project_call_sites(&modules);
+            let calls = resolve_project_call_sites_with_occurrences(&modules, occurrences);
             let before_calls = calls.modules.clone();
             let scope = layout::observations::Scope::new();
             let stages = stage_observations::Scope::new();

@@ -4,7 +4,7 @@ use wosy_syntax::{ByteSpan, SourceIdentity, SourceSpan};
 
 #[derive(Default)]
 pub(super) struct InitializerSymbols {
-    functions: HashMap<SourceSpan, (String, String)>,
+    functions: HashMap<SourceIdentity, HashMap<ByteSpan, (String, String)>>,
     externs: HashMap<SourceSpan, String>,
     callable_bindings: std::collections::HashSet<SourceSpan>,
 }
@@ -16,10 +16,14 @@ impl InitializerSymbols {
         function: &ScalarFunction,
         symbol: String,
     ) {
-        self.functions.insert(
-            SourceSpan::new(source.clone(), function.name_span),
-            (function.name.clone(), symbol),
-        );
+        if let Some(functions) = self.functions.get_mut(source) {
+            functions.insert(function.name_span, (function.name.clone(), symbol));
+        } else {
+            self.functions.insert(
+                source.clone(),
+                HashMap::from([(function.name_span, (function.name.clone(), symbol))]),
+            );
+        }
     }
 
     pub(super) fn external(&mut self, source: &SourceIdentity, span: ByteSpan, symbol: &str) {
@@ -45,9 +49,23 @@ impl InitializerSymbols {
     }
 
     fn function_entry(&self, declaration: &SourceSpan) -> Result<&(String, String), String> {
-        self.functions.get(declaration).ok_or_else(|| {
-            format!("internal error: missing LLVM initializer declaration {declaration:?}")
-        })
+        self.function_entry_at(&declaration.source, declaration.range)
+    }
+
+    fn function_entry_at(
+        &self,
+        source: &SourceIdentity,
+        range: ByteSpan,
+    ) -> Result<&(String, String), String> {
+        self.functions
+            .get(source)
+            .and_then(|functions| functions.get(&range))
+            .ok_or_else(|| {
+                format!(
+                    "internal error: missing LLVM initializer declaration {:?}",
+                    SourceSpan::new(source.clone(), range)
+                )
+            })
     }
 }
 
@@ -74,45 +92,58 @@ pub(super) fn prepared_initializer_overloads<'a>(
     Ok(selections)
 }
 
-pub(super) fn collect_prepared_body_overload_selections(
+pub(super) fn collect_body_overload_reservations(
     input: GenericInitializerInput<'_>,
     module: usize,
     items: &[ScalarItem],
+    region: &ModuleInitializationRegion,
     symbols: &InitializerSymbols,
     selections: &mut HashMap<SourceIdentity, Vec<(String, ScalarOverloadSelection)>>,
 ) -> Result<(), String> {
-    if matches!(input, GenericInitializerInput::RawItems) {
-        return Ok(());
-    }
+    let mut initializer = if input.prepared_render() {
+        None
+    } else {
+        Some(region.legacy_reservation_targets()?.peekable())
+    };
+    let mut reserve = |declaration: &SourceSpan, selection: &ScalarOverloadSelection| {
+        let (name, _) = symbols.function_entry(declaration)?;
+        selections
+            .entry(declaration.source.clone())
+            .or_default()
+            .push((name.clone(), selection.clone()));
+        Ok::<_, String>(())
+    };
     for (item, declaration) in items.iter().enumerate() {
-        let ScalarItem::Function(function) = declaration else {
-            continue;
-        };
-        let mut search = OverloadSearch {
-            calls: Vec::new(),
-            prepared: true,
-        };
-        collect_selected_overloads_in_block(&function.body, &mut search);
-        if search.calls.is_empty() {
-            continue;
-        }
-        let nodes = input
-            .bind_body(module, item, None, &function.body)?
-            .expect("prepared body");
-        for call in search.calls {
-            if let ResolvedCallTarget::ModuleCallable {
-                source,
-                declaration_span,
-                concrete: ConcreteCallSelection::Overload(selection),
-            } = nodes.target(call)?
-            {
-                let (name, _) =
-                    symbols.function_entry(&SourceSpan::new(source.clone(), *declaration_span))?;
-                selections
-                    .entry(source.clone())
-                    .or_default()
-                    .push((name.clone(), selection.clone()));
+        if let Some(initializer) = &mut initializer {
+            while initializer.peek().is_some_and(|&(root, _, _)| root == item) {
+                if let Some((
+                    _,
+                    _,
+                    ModuleInitializationCallTarget::Direct {
+                        declaration,
+                        concrete: ConcreteCallSelection::Overload(selection),
+                    },
+                )) = initializer.next()
+                {
+                    reserve(declaration, selection)?;
+                }
             }
+        }
+        if matches!(declaration, ScalarItem::Function(_)) {
+            input.visit_body_overloads(module, item, |target| {
+                if let ResolvedCallTarget::ModuleCallable {
+                    source,
+                    declaration_span,
+                    concrete: ConcreteCallSelection::Overload(selection),
+                } = target
+                {
+                    reserve(
+                        &SourceSpan::new(source.clone(), *declaration_span),
+                        selection,
+                    )?;
+                }
+                Ok(())
+            })?;
         }
     }
     Ok(())
@@ -135,13 +166,16 @@ impl PreparedCall {
 
 impl<'ctx, 'module> EmitState<'ctx, 'module> {
     pub(super) fn has_prepared_calls(&self) -> bool {
-        self.initializer_nodes.is_some() || self.body_call_nodes.is_some()
+        self.prepared_render && (self.initializer_nodes.is_some() || self.body_call_nodes.is_some())
     }
 
     pub(super) fn prepared_call(
         &self,
         expression: &ScalarExpression,
     ) -> Result<Option<PreparedCall>, String> {
+        if !self.prepared_render {
+            return Ok(None);
+        }
         let selected = if let Some(nodes) = self.body_call_nodes {
             match nodes.target(expression)? {
                 ResolvedCallTarget::Core(operation) => PreparedCall::Core(*operation),
@@ -205,6 +239,53 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
             }
         }
         Ok(Some(selected))
+    }
+
+    fn bound_overload(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Result<Option<(&SourceIdentity, ByteSpan, &ScalarOverloadSelection)>, String> {
+        if let Some(nodes) = self.body_call_nodes {
+            return Ok(match nodes.target(expression)? {
+                ResolvedCallTarget::ModuleCallable {
+                    source,
+                    declaration_span,
+                    concrete: ConcreteCallSelection::Overload(selection),
+                } => Some((source, *declaration_span, selection)),
+                _ => None,
+            });
+        }
+        if let Some(nodes) = self.initializer_nodes {
+            return Ok(match nodes.target(expression)? {
+                ModuleInitializationCallTarget::Direct {
+                    declaration,
+                    concrete: ConcreteCallSelection::Overload(selection),
+                } => Some((&declaration.source, declaration.range, selection)),
+                _ => None,
+            });
+        }
+        Err("internal error: missing bound LLVM call context".into())
+    }
+
+    pub(super) fn raw_call_symbol(
+        &self,
+        expression: &ScalarExpression,
+        qualified: &str,
+        type_arguments: &[crate::scalar::ScalarTypeArgument],
+    ) -> Result<Option<&String>, String> {
+        if let Some((source, range, selection)) = self.bound_overload(expression)? {
+            let (_, base) = self.symbols().function_entry_at(source, range)?;
+            let key = selected_overload_lookup_key(base, selection);
+            return self
+                .call_targets
+                .get(&key)
+                .map(Some)
+                .ok_or_else(|| format!("unknown LLVM callable {qualified}"));
+        }
+        Ok(self.call_targets.get(qualified).or_else(|| {
+            self.call_targets
+                .get(&specialization_lookup_key(qualified, type_arguments))
+        }))
     }
 
     fn symbols(&self) -> &InitializerSymbols {

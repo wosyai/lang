@@ -327,7 +327,7 @@ impl<'a> ScalarInferenceBuilder<'a> {
         expression: &ScalarExpression,
         parameters: &[ScalarType],
         outputs: &ScalarOutputSequence,
-        overload: Option<ScalarOverloadSelection>,
+        overload: Option<(ScalarOverloadSelection, (usize, usize))>,
     ) {
         if self.suppress_checked_occurrences
             || matches!(expression, ScalarExpression::Call { receiver: Some(receiver), .. } if receiver == "core")
@@ -369,14 +369,18 @@ impl<'a> ScalarInferenceBuilder<'a> {
         expression: &ScalarExpression,
         parameters: Vec<ScalarType>,
         outputs: ScalarOutputSequence,
-        overload: Option<ScalarOverloadSelection>,
+        overload: Option<(ScalarOverloadSelection, (usize, usize))>,
     ) {
+        let (overload, overload_origin) = overload.map_or((None, None), |(selection, origin)| {
+            (Some(selection), Some(origin))
+        });
         self.occurrences.calls.insert(
             std::ptr::from_ref(expression),
             CheckedCallSignature {
                 parameters,
                 outputs,
                 overload,
+                overload_origin,
             },
         );
     }
@@ -941,5 +945,66 @@ mod tests {
             validation.project.modules[0].resolved_assignment_outputs,
             expected
         );
+    }
+
+    #[test]
+    fn checked_overload_origin_is_required_at_the_actual_call_occurrence() {
+        let text = "%%start
+pick = overload { i64(i64) => fn(value) { value }; };
+i64 input = 1;
+i64 chosen = pick(input);
+i64(i64) body = fn(n) { pick(n) };
+%%end";
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (initializer, missing) in
+                [(true, true), (true, false), (false, true), (false, false)]
+            {
+                let parsed = crate::parse_source(source.clone(), text.into(), &[]);
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                let (typed, mut occurrences) = typecheck_scalar_program_with_occurrences(
+                    derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                    layout,
+                );
+                assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+                let call = if initializer {
+                    let ScalarItem::Binding(binding) = &typed.program.items[2] else {
+                        panic!("initializer");
+                    };
+                    &binding.value
+                } else {
+                    let ScalarItem::Function(body) = &typed.program.items[3] else {
+                        panic!("body");
+                    };
+                    body.body.final_expressions().next().unwrap().0
+                };
+                let address = std::ptr::from_ref(call);
+                let row = occurrences.calls.get_mut(&address).unwrap();
+                assert_eq!(row.overload_origin, Some((0, 0)));
+                assert_eq!(row.overload.as_ref().unwrap().arm_index, 0);
+                if missing {
+                    occurrences.calls.remove(&address).unwrap();
+                } else {
+                    row.overload_origin = Some((0, 3));
+                }
+                let Err(error) = reference::resolve_program_call_sites_with_occurrences(
+                    &typed.program,
+                    occurrences,
+                ) else {
+                    panic!("missing or mismatched overload declaration must not resolve");
+                };
+                assert!(matches!(error,
+                    ReferenceAnalysisError::MissingContext {
+                        source_span,
+                        reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
+                    } if source_span.source == source && source_span.range == expression_span(call)
+                ));
+            }
+        }
     }
 }

@@ -8,6 +8,7 @@ fn prepared_initializer_member<'a>(
 ) -> Result<Option<BoundInitializerMember<'a>>, String> {
     state
         .initializer_nodes
+        .filter(|_| state.prepared_render)
         .map(|nodes| nodes.member(expression))
         .transpose()
 }
@@ -210,7 +211,6 @@ pub(super) fn emit_expression<'ctx, 'module>(
             span,
             type_arguments,
             arguments,
-            overload_selection,
             ..
         } => {
             let selected = state.prepared_call(expression)?;
@@ -281,7 +281,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                 name,
                 type_arguments,
                 arguments,
-                overload_selection.as_ref(),
+                expression,
             )
         }
         ScalarExpression::If {
@@ -415,7 +415,6 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             span,
             type_arguments,
             arguments,
-            overload_selection,
             ..
         } => {
             let selected = state.prepared_call(expression)?;
@@ -563,18 +562,8 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             } else {
                 project_function_name(&module.source, name)
             };
-            let lookup = overload_selection
-                .as_ref()
-                .map(|selection| selected_overload_lookup_key(&qualified, selection));
             let target = state
-                .call_targets
-                .get(lookup.as_ref().unwrap_or(&qualified))
-                .or_else(|| {
-                    state
-                        .call_targets
-                        .get(&specialization_lookup_key(&qualified, type_arguments))
-                })
-                .or_else(|| state.call_targets.get(&qualified))
+                .raw_call_symbol(expression, &qualified, type_arguments)?
                 .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?
                 .clone();
             let ScalarType::Callable { parameters, .. } = state
@@ -809,21 +798,12 @@ fn emit_call<'ctx, 'module>(
     name: &str,
     type_arguments: &[crate::scalar::ScalarTypeArgument],
     arguments: &[ScalarExpression],
-    overload_selection: Option<&ScalarOverloadSelection>,
+    expression: &ScalarExpression,
 ) -> Result<EmitValue<'ctx>, String> {
     let qualified =
         receiver.map_or_else(|| name.to_owned(), |receiver| format!("{receiver}.{name}"));
-    let lookup =
-        overload_selection.map(|selection| selected_overload_lookup_key(&qualified, selection));
     let target = state
-        .call_targets
-        .get(lookup.as_ref().unwrap_or(&qualified))
-        .or_else(|| {
-            state
-                .call_targets
-                .get(&specialization_lookup_key(&qualified, type_arguments))
-        })
-        .or_else(|| state.call_targets.get(&qualified))
+        .raw_call_symbol(expression, &qualified, type_arguments)?
         .ok_or_else(|| format!("unknown LLVM callable {qualified}"))?
         .clone();
     let ScalarType::Callable { parameters, .. } = state
@@ -1387,7 +1367,9 @@ fn bitcast_source_type(
     project_module: Option<&ScalarModule>,
 ) -> Result<ScalarType, String> {
     let ty = match expression {
-        ScalarExpression::Member { .. } if state.initializer_nodes.is_some() => {
+        ScalarExpression::Member { .. }
+            if state.prepared_render && state.initializer_nodes.is_some() =>
+        {
             prepared_initializer_member(state, expression)?.map(|member| member.ty.clone())
         }
         ScalarExpression::Name { name, .. } => state
@@ -1447,7 +1429,6 @@ fn bitcast_source_type(
             receiver,
             name,
             type_arguments,
-            overload_selection,
             ..
         } => {
             let qualified = receiver.as_ref().map_or_else(
@@ -1459,18 +1440,10 @@ fn bitcast_source_type(
                 },
                 |receiver| format!("{receiver}.{name}"),
             );
-            let lookup = overload_selection
-                .as_ref()
-                .map(|selection| selected_overload_lookup_key(&qualified, selection));
             state
-                .call_targets
-                .get(lookup.as_ref().unwrap_or(&qualified))
-                .or_else(|| {
-                    state
-                        .call_targets
-                        .get(&specialization_lookup_key(&qualified, type_arguments))
-                })
-                .or_else(|| state.call_targets.get(&qualified))
+                .raw_call_symbol(expression, &qualified, type_arguments)
+                .ok()
+                .flatten()
                 .and_then(|target| state.signatures.get(target))
                 .and_then(|signature| match signature {
                     ScalarType::Callable { outputs, .. } => outputs.outputs.first(),
@@ -1986,7 +1959,9 @@ fn integer_conversion_source_type(
     project_module: Option<&ScalarModule>,
 ) -> Result<ScalarType, String> {
     let ty = match expression {
-        ScalarExpression::Member { .. } if state.initializer_nodes.is_some() => {
+        ScalarExpression::Member { .. }
+            if state.prepared_render && state.initializer_nodes.is_some() =>
+        {
             prepared_initializer_member(state, expression)?.map(|member| member.ty.clone())
         }
         ScalarExpression::Name { name, .. } => state
@@ -2042,7 +2017,6 @@ fn integer_conversion_source_type(
             receiver,
             name,
             type_arguments,
-            overload_selection,
             ..
         } => {
             let qualified = receiver.as_ref().map_or_else(
@@ -2054,18 +2028,10 @@ fn integer_conversion_source_type(
                 },
                 |receiver| format!("{receiver}.{name}"),
             );
-            let lookup = overload_selection
-                .as_ref()
-                .map(|selection| selected_overload_lookup_key(&qualified, selection));
             state
-                .call_targets
-                .get(lookup.as_ref().unwrap_or(&qualified))
-                .or_else(|| {
-                    state
-                        .call_targets
-                        .get(&specialization_lookup_key(&qualified, type_arguments))
-                })
-                .or_else(|| state.call_targets.get(&qualified))
+                .raw_call_symbol(expression, &qualified, type_arguments)
+                .ok()
+                .flatten()
                 .and_then(|target| state.signatures.get(target))
                 .and_then(|signature| match signature {
                     ScalarType::Callable { outputs, .. } => outputs.outputs.first(),
@@ -2085,7 +2051,9 @@ fn float_conversion_source_type(
     project_module: Option<&ScalarModule>,
 ) -> Result<ScalarType, String> {
     let ty = match expression {
-        ScalarExpression::Member { .. } if state.initializer_nodes.is_some() => {
+        ScalarExpression::Member { .. }
+            if state.prepared_render && state.initializer_nodes.is_some() =>
+        {
             prepared_initializer_member(state, expression)?.map(|member| member.ty.clone())
         }
         ScalarExpression::Name { name, .. } => state
@@ -2142,7 +2110,6 @@ fn float_conversion_source_type(
             receiver,
             name,
             type_arguments,
-            overload_selection,
             ..
         } => {
             let qualified = receiver.as_ref().map_or_else(
@@ -2154,18 +2121,10 @@ fn float_conversion_source_type(
                 },
                 |receiver| format!("{receiver}.{name}"),
             );
-            let lookup = overload_selection
-                .as_ref()
-                .map(|selection| selected_overload_lookup_key(&qualified, selection));
             state
-                .call_targets
-                .get(lookup.as_ref().unwrap_or(&qualified))
-                .or_else(|| {
-                    state
-                        .call_targets
-                        .get(&specialization_lookup_key(&qualified, type_arguments))
-                })
-                .or_else(|| state.call_targets.get(&qualified))
+                .raw_call_symbol(expression, &qualified, type_arguments)
+                .ok()
+                .flatten()
                 .and_then(|target| state.signatures.get(target))
                 .and_then(|signature| match signature {
                     ScalarType::Callable { outputs, .. } => outputs.outputs.first(),
