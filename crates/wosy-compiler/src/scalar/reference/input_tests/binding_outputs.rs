@@ -233,3 +233,113 @@ fn typed_binding_receiver_slots_preserve_mixed_output_order_and_drive_reference_
         assert_eq!(actual, expected);
     }
 }
+
+#[test]
+fn raw_binding_outputs_use_canonical_primary_and_real_secondary() {
+    let text = "%%start\nu8(u8) first = fn(input) { input };\nu8(u8) second = fn(input) { input };\n(u8, u8, u8)(u8) triple = fn(input) { input, input, input };\nunit(u8) probe = fn(input) { u8 left, u8 right = first(input) + input, second(input) + input; left; right; u8 a, u8 b, u8 c = triple(input); a; b; c; };\n%%end";
+    fn rename(expression: &mut ScalarExpression, expected: &str, replacement: &str) {
+        let ScalarExpression::Binary { left, .. } = expression else {
+            panic!("binding output root");
+        };
+        let ScalarExpression::Call { name, .. } = left.as_mut() else {
+            panic!("binding output call");
+        };
+        assert_eq!(name, expected);
+        *name = replacement.into();
+    }
+
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let valid = derive_scalar_program_with_layout(&parsed.result, target);
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+        let project = |program: &ScalarProgram| ScalarProjectValidation {
+            project: ScalarProject::new(
+                vec![ScalarModule::from_program(program.clone(), Vec::new())],
+                vec![source()],
+            ),
+            diagnostics: Vec::new(),
+        };
+        let baseline_raw = crate::emit_scalar_llvm(&valid).unwrap();
+        let baseline_project = crate::emit_scalar_project_llvm(&project(&valid.program)).unwrap();
+
+        for (position, canonical, same) in [(0, false, true), (1, false, false), (0, true, false)] {
+            let mut changed = ScalarValidation {
+                program: valid.program.clone(),
+                diagnostics: Vec::new(),
+            };
+            let ScalarItem::Function(function) = &mut changed.program.items[3] else {
+                panic!("probe function");
+            };
+            let ScalarBlockItem::LocalBinding(binding) = &mut function.body.items[0] else {
+                panic!("independent binding");
+            };
+            let (expression, expected, replacement) = match (position, canonical) {
+                (0, true) => (&mut binding.value, "first", "second"),
+                (0, false) => (&mut binding.output_values[0].value, "first", "second"),
+                (1, false) => (&mut binding.output_values[1].value, "second", "first"),
+                _ => unreachable!(),
+            };
+            rename(expression, expected, replacement);
+
+            let changed_project = project(&changed.program);
+            let encoded_raw = serde_json::to_vec(&changed).unwrap();
+            let encoded_project = serde_json::to_vec(&changed_project).unwrap();
+            let decoded_raw = serde_json::from_slice(&encoded_raw).unwrap();
+            let decoded_project = serde_json::from_slice(&encoded_project).unwrap();
+            for (raw, project) in [
+                (&changed, &changed_project),
+                (&decoded_raw, &decoded_project),
+            ] {
+                let actual_raw = crate::emit_scalar_llvm(raw).unwrap();
+                let actual_project = crate::emit_scalar_project_llvm(project).unwrap();
+                assert_eq!(actual_raw == baseline_raw, same);
+                assert_eq!(actual_project == baseline_project, same);
+                let symbol = |name: &str| {
+                    name.bytes()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                };
+                for (name, count) in [
+                    (
+                        "first",
+                        if same {
+                            1
+                        } else {
+                            usize::from(position == 1) * 2
+                        },
+                    ),
+                    (
+                        "second",
+                        if same {
+                            1
+                        } else {
+                            usize::from(position == 0) * 2
+                        },
+                    ),
+                ] {
+                    let raw_symbol = format!("@{name}(");
+                    let project_symbol = format!("__{}(", symbol(name));
+                    assert_eq!(
+                        actual_raw
+                            .to_text()
+                            .lines()
+                            .filter(|line| line.contains("call i8") && line.contains(&raw_symbol))
+                            .count(),
+                        count
+                    );
+                    assert_eq!(
+                        actual_project
+                            .to_text()
+                            .lines()
+                            .filter(
+                                |line| line.contains("call i8") && line.contains(&project_symbol)
+                            )
+                            .count(),
+                        count
+                    );
+                }
+            }
+        }
+    }
+}
