@@ -180,6 +180,27 @@ impl PreparedScalarProject {
         self.bind_body_with_proof(module_ordinal, item_ordinal, arm_index, body, None)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn initializer_facts(
+        &self,
+        module_ordinal: usize,
+    ) -> Result<control::InitializerFacts<'_>, control::InitializerFactsError> {
+        use control::InitializerFactsError as Error;
+
+        let module = self
+            .project
+            .modules
+            .get(module_ordinal)
+            .ok_or(Error::Missing("initializer module"))?;
+        let region = self
+            .initialization_region(module_ordinal)
+            .ok_or(Error::Missing("initializer region"))?;
+        if region.source != module.source {
+            return Err(Error::Malformed("initializer region source"));
+        }
+        control::InitializerFacts::bind(region, &module.items)
+    }
+
     fn bind_body_with_proof<'a>(
         &'a self,
         module_ordinal: usize,

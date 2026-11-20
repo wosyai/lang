@@ -2,6 +2,7 @@ use std::marker::PhantomData;
 
 use super::super::reference::{
     FunctionCallSites, OccurrenceEdge as Edge, OccurrenceNode as Node, OccurrenceParent as Parent,
+    OccurrenceRole,
 };
 use super::super::typecheck::expression_span;
 use super::super::{
@@ -9,6 +10,9 @@ use super::super::{
     ScalarBlockItem, ScalarBlockItemRole, ScalarExpression, ScalarPlace,
 };
 use super::*;
+
+#[cfg(test)]
+mod initializer_facts_tests;
 
 pub(crate) struct InitializerCallNodes<'a> {
     source: &'a SourceIdentity,
@@ -78,7 +82,7 @@ impl<'a> InitializerCallNodes<'a> {
             nodes.targets.insert(std::ptr::from_ref(expression), target);
             Ok(())
         };
-        let mut binder = Binder {
+        Binder {
             structure: &topology.structure,
             source: &region.source,
             region: "initializer",
@@ -86,26 +90,8 @@ impl<'a> InitializerCallNodes<'a> {
             bind_type: None,
             bind_named_place: None,
             proof_nodes: None,
-        };
-        let root = Parent::Block(topology.structure.root);
-        for step in &region.steps {
-            match (&step.kind, &items[step.item]) {
-                (
-                    ModuleInitializationStepKind::NamespaceDispatch { .. },
-                    ScalarItem::Namespace(_),
-                ) => {}
-                (
-                    ModuleInitializationStepKind::BindingInitialization,
-                    ScalarItem::Binding(binding),
-                ) => {
-                    binder.binding(root, step.item, binding)?;
-                }
-                (ModuleInitializationStepKind::ExecutableItem, ScalarItem::Executable(item)) => {
-                    binder.item(root, step.item, item, ScalarBlockItemRole::Ordinary)?;
-                }
-                _ => unreachable!("initializer dispatch derives from the exact item slice"),
-            }
         }
+        .initializer_items(region, items)?;
         if nodes.targets.len() != topology.calls.len() {
             return Err(format!(
                 "internal error: initializer call topology does not match canonical items in {:?}",
@@ -171,6 +157,277 @@ struct CallableProofNodes<'a> {
     places: HashMap<*const ScalarPlace, OccurrenceOrdinal>,
     bindings: HashMap<*const ScalarBinding, BlockPosition>,
     final_outputs: HashMap<*const ScalarExpression, usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum InitializerFactsError {
+    Noncanonical,
+    Missing(&'static str),
+    Malformed(&'static str),
+    Unsupported(&'static str),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum QualifiedInitializerStorage {
+    Lexical {
+        declaration: SourceSpan,
+        block_span: ByteSpan,
+    },
+    Module(SourceSpan),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum InitializerDestinationFacts {
+    Existing(QualifiedInitializerStorage),
+    Introduce(QualifiedInitializerStorage),
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct CheckedInitializerCall<'a> {
+    pub(crate) declaration: &'a SourceSpan,
+    pub(crate) concrete: &'a ConcreteCallSelection,
+    pub(crate) parameters: &'a [ScalarType],
+    pub(crate) outputs: &'a [crate::ScalarOutput],
+}
+
+#[allow(dead_code)]
+pub(crate) struct InitializerFacts<'a> {
+    source: &'a SourceIdentity,
+    topology: &'a ModuleInitializationTopology,
+    nodes: CallableProofNodes<'a>,
+}
+
+#[allow(dead_code)]
+impl<'a> InitializerFacts<'a> {
+    pub(in crate::scalar) fn bind(
+        region: &'a ModuleInitializationRegion,
+        items: &'a [ScalarItem],
+    ) -> Result<Self, InitializerFactsError> {
+        use InitializerFactsError as Error;
+        let ModuleInitializationDetail::Occurrences(topology) = &region.detail else {
+            return Err(Error::Missing("initializer topology"));
+        };
+        let mut nodes = CallableProofNodes::default();
+        // Bind only canonical node identities. Accessors separately verify the
+        // presence and supported shape of the requested stored facts.
+        let mut no_calls = |_: OccurrenceOrdinal, _: &'a ScalarExpression| Ok(());
+        Binder {
+            structure: &topology.structure,
+            source: &region.source,
+            region: "initializer facts",
+            bind_call: &mut no_calls,
+            bind_type: None,
+            bind_named_place: None,
+            proof_nodes: Some(&mut nodes),
+        }
+        .initializer_items(region, items)
+        .map_err(|_| Error::Malformed("initializer topology"))?;
+        Ok(Self {
+            source: &region.source,
+            topology,
+            nodes,
+        })
+    }
+
+    fn expression(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Result<OccurrenceOrdinal, InitializerFactsError> {
+        let ordinal = self
+            .nodes
+            .expressions
+            .get(&std::ptr::from_ref(expression))
+            .copied()
+            .ok_or(InitializerFactsError::Noncanonical)?;
+        if self.metadata(ordinal)?.role != OccurrenceRole::Expression {
+            return Err(InitializerFactsError::Malformed(
+                "initializer expression occurrence",
+            ));
+        }
+        Ok(ordinal)
+    }
+
+    fn place(&self, place: &ScalarPlace) -> Result<OccurrenceOrdinal, InitializerFactsError> {
+        let ordinal = self
+            .nodes
+            .places
+            .get(&std::ptr::from_ref(place))
+            .copied()
+            .ok_or(InitializerFactsError::Noncanonical)?;
+        if self.metadata(ordinal)?.role != OccurrenceRole::Place {
+            return Err(InitializerFactsError::Malformed(
+                "initializer place occurrence",
+            ));
+        }
+        Ok(ordinal)
+    }
+
+    fn metadata(
+        &self,
+        ordinal: OccurrenceOrdinal,
+    ) -> Result<&OccurrenceMetadata, InitializerFactsError> {
+        self.topology
+            .occurrences
+            .get(ordinal.0)
+            .ok_or(InitializerFactsError::Malformed("initializer occurrence"))
+    }
+
+    pub(crate) fn checked_direct_call(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Result<CheckedInitializerCall<'a>, InitializerFactsError> {
+        use InitializerFactsError as Error;
+        let ordinal = self.expression(expression)?;
+        let ScalarExpression::Call { arguments, .. } = expression else {
+            return Err(Error::Unsupported("initializer call shape"));
+        };
+        let target = self
+            .topology
+            .call_targets
+            .get(&ordinal)
+            .ok_or(Error::Missing("initializer call target"))?;
+        let ModuleInitializationCallTarget::Direct {
+            declaration,
+            concrete,
+        } = target
+        else {
+            return Err(Error::Unsupported("initializer callable target"));
+        };
+        if matches!(concrete, ConcreteCallSelection::Overload(selected) if !selected.substitutions.is_empty())
+        {
+            return Err(Error::Unsupported("initializer call specialization"));
+        }
+        let signature = self
+            .topology
+            .checked_call_signatures
+            .get(&ordinal)
+            .ok_or(Error::Missing("initializer call signature"))?;
+        let consistent = match concrete {
+            ConcreteCallSelection::Declaration => signature.overload.is_none(),
+            ConcreteCallSelection::Overload(selected) => {
+                signature.overload.as_ref() == Some(selected)
+            }
+        };
+        if !consistent {
+            return Err(Error::Malformed("initializer call selection"));
+        }
+        if signature.parameters.len() != arguments.len() {
+            return Err(Error::Malformed("initializer call arity"));
+        }
+        Ok(CheckedInitializerCall {
+            declaration,
+            concrete,
+            parameters: &signature.parameters,
+            outputs: &signature.outputs.outputs,
+        })
+    }
+
+    pub(crate) fn checked_expression_type(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Result<&'a ScalarType, InitializerFactsError> {
+        let ordinal = self.expression(expression)?;
+        self.topology
+            .structure
+            .checked_types
+            .expressions
+            .get(&ordinal)
+            .ok_or(InitializerFactsError::Missing(
+                "initializer expression type",
+            ))
+    }
+
+    fn qualify(&self, storage: InitializationStorage) -> QualifiedInitializerStorage {
+        match storage {
+            InitializationStorage::Module(span) => {
+                QualifiedInitializerStorage::Module(SourceSpan::new(self.source.clone(), span))
+            }
+            InitializationStorage::Lexical(local) => QualifiedInitializerStorage::Lexical {
+                declaration: SourceSpan::new(self.source.clone(), local.declaration_span),
+                block_span: local.block_span,
+            },
+        }
+    }
+
+    pub(crate) fn plain_name(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Result<QualifiedInitializerStorage, InitializerFactsError> {
+        use InitializerFactsError as Error;
+        let ordinal = self.expression(expression)?;
+        if !matches!(expression, ScalarExpression::Name { .. })
+            || !self.metadata(ordinal)?.requires_plain_name
+        {
+            return Err(Error::Unsupported("initializer plain name shape"));
+        }
+        match self.topology.identities.names.get(&ordinal) {
+            Some(InitializationName::Storage(storage)) => Ok(self.qualify(*storage)),
+            Some(InitializationName::Null) => Err(Error::Unsupported("initializer null")),
+            None => Err(Error::Missing("initializer plain name")),
+        }
+    }
+
+    pub(crate) fn named_place_root(
+        &self,
+        place: &ScalarPlace,
+    ) -> Result<QualifiedInitializerStorage, InitializerFactsError> {
+        use InitializerFactsError as Error;
+        let ordinal = self.place(place)?;
+        if !matches!(place, ScalarPlace::Name { .. })
+            || !self.metadata(ordinal)?.requires_named_place_root
+            || self
+                .topology
+                .structure
+                .resolved_namespace_places
+                .contains_key(&ordinal)
+        {
+            return Err(Error::Unsupported("initializer named root shape"));
+        }
+        let storage = self
+            .topology
+            .identities
+            .roots
+            .get(&ordinal)
+            .ok_or(Error::Missing("initializer named root"))?;
+        Ok(self.qualify(*storage))
+    }
+
+    pub(crate) fn direct_assignment_destination(
+        &self,
+        place: &ScalarPlace,
+    ) -> Result<InitializerDestinationFacts, InitializerFactsError> {
+        use InitializerFactsError as Error;
+        let ordinal = self.place(place)?;
+        if !matches!(place, ScalarPlace::Name { .. })
+            || !self.metadata(ordinal)?.requires_direct_destination
+        {
+            return Err(Error::Unsupported(
+                "initializer assignment destination shape",
+            ));
+        }
+        let destination = self
+            .topology
+            .identities
+            .destinations
+            .get(&ordinal)
+            .ok_or(Error::Missing("initializer assignment destination"))?;
+        Ok(match *destination {
+            InitializationDestination::Existing(storage) => {
+                InitializerDestinationFacts::Existing(self.qualify(storage))
+            }
+            InitializationDestination::Introduce(local) => InitializerDestinationFacts::Introduce(
+                self.qualify(InitializationStorage::Lexical(local)),
+            ),
+            InitializationDestination::IntroduceModule(span) => {
+                InitializerDestinationFacts::Introduce(
+                    self.qualify(InitializationStorage::Module(span)),
+                )
+            }
+        })
+    }
 }
 
 impl<'a> CallableBodyCallNodes<'a> {
@@ -460,6 +717,31 @@ struct Binder<'a, 'bind> {
 }
 
 impl<'a> Binder<'a, '_> {
+    fn initializer_items(
+        &mut self,
+        region: &ModuleInitializationRegion,
+        items: &'a [ScalarItem],
+    ) -> Result<(), String> {
+        let root = Parent::Block(self.structure.root);
+        for step in &region.steps {
+            match (&step.kind, &items[step.item]) {
+                (
+                    ModuleInitializationStepKind::NamespaceDispatch { .. },
+                    ScalarItem::Namespace(_),
+                ) => {}
+                (
+                    ModuleInitializationStepKind::BindingInitialization,
+                    ScalarItem::Binding(binding),
+                ) => self.binding(root, step.item, binding)?,
+                (ModuleInitializationStepKind::ExecutableItem, ScalarItem::Executable(item)) => {
+                    self.item(root, step.item, item, ScalarBlockItemRole::Ordinary)?
+                }
+                _ => unreachable!("initializer dispatch derives from the exact item slice"),
+            }
+        }
+        Ok(())
+    }
+
     fn invalid_edge(&self, parent: Parent, edge: Edge) -> String {
         format!(
             "internal error: invalid {} structural edge {parent:?}/{edge:?} in {:?}",
@@ -601,9 +883,11 @@ impl<'a> Binder<'a, '_> {
         binding: &'a ScalarBinding,
     ) -> Result<(), String> {
         if let (Some(nodes), Parent::Block(block)) = (&mut self.proof_nodes, parent) {
-            nodes
-                .bindings
-                .insert(std::ptr::from_ref(binding), BlockPosition { block, item });
+            if nodes.calls.is_some() {
+                nodes
+                    .bindings
+                    .insert(std::ptr::from_ref(binding), BlockPosition { block, item });
+            }
         }
         if binding.is_allocation {
             for (position, receiver) in binding.receivers.iter().enumerate() {
