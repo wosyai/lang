@@ -61,6 +61,15 @@ unit(std.utf8) inspect32 = fn(text) { *f32 parsed = std.parse(text); parsed; };
 unit(std.utf8) inspect64 = fn(text) { *f64 parsed = std.parse(text); parsed; };
 unit(std.utf8) show = fn(text) { std.print(text); };
 u64() opaque = fn { core.int_extend<u64>(1) };
+u128 tiny = 1;
+std.utf8 previous = std.format(tiny);
+std.utf8 current = std.format(tiny);
+std.print(previous);
+std.utf8 interrupted = std.format(tiny);
+std.print("noise");
+std.print(interrupted);
+std.utf8 wrong_target = std.format(tiny);
+std.eprint(wrong_target);
 %%end"#;
     let mut accepted_mutations = Vec::new();
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
@@ -100,6 +109,98 @@ u64() opaque = fn { core.int_extend<u64>(1) };
         let std_mod = &prepared.project().modules[s];
         let app_mod = &prepared.project().modules[a];
         let at = |name| (a, function(app_mod, name));
+        let pair = |module: usize, name: &str, distance: usize| {
+            let items = &prepared.project().modules.get(module).unwrap().items;
+            let (i, binding) = items
+                .iter()
+                .enumerate()
+                .find_map(|(i, item)| match item {
+                    ScalarItem::Binding(binding) if binding.name == name => Some((i, binding)),
+                    _ => None,
+                })
+                .unwrap();
+            let ScalarItem::Executable(ScalarBlockItem::Expression(consumer)) =
+                &items[i + distance]
+            else {
+                panic!("fixture must contain adjacent direct consumer");
+            };
+            (binding, consumer)
+        };
+        let (prior, prior_consumer) = pair(f, "out0", 1);
+        let initializer_facts = prepared.initializer_facts(f).unwrap();
+        for name in ["out0", "out1", "out2", "out3"] {
+            let (binding, consumer) = pair(f, name, 1);
+            let open = ledger
+                .initializer_local_order_open(f, binding, &binding.value, consumer)
+                .unwrap();
+            assert_eq!(
+                open.receiver,
+                SourceSpan::new(fixture.clone(), binding.name_span)
+            );
+            assert_eq!(open.consumer.arm, None);
+            assert_eq!(open.consumer.body, (s, function(std_mod, "print")));
+            assert_eq!(open.producer.body, (s, function(std_mod, "format")));
+            assert_eq!(open.consumer_parameter, 0);
+            assert!(ledger
+                .initializer_local_order_open(f, binding, &binding.value, &consumer.clone(),)
+                .is_err());
+            assert!(initializer_facts
+                .binding_output(binding, 1, &binding.value)
+                .is_err());
+            if !std::ptr::eq(prior, binding) {
+                assert!(ledger
+                    .initializer_local_order_open(f, prior, &prior.value, consumer,)
+                    .is_err());
+            }
+        }
+        assert!(matches!(
+            ledger.initializer_local_order_open(a, prior, &prior.value, prior_consumer),
+            Err(Rejected::InitializerFact(
+                InitializerFactsError::Noncanonical
+            ))
+        ));
+        let app_order = |name, distance| {
+            let (binding, consumer) = pair(a, name, distance);
+            ledger.initializer_local_order_open(a, binding, &binding.value, consumer)
+        };
+        assert!(matches!(
+            app_order("current", 1),
+            Err(Rejected::Contradictory("initializer typed receiver read"))
+        ));
+        assert!(matches!(
+            app_order("interrupted", 2),
+            Err(Rejected::InitializerFact(
+                InitializerFactsError::Unsupported("initializer next direct call")
+            ))
+        ));
+        assert!(matches!(
+            app_order("wrong_target", 1),
+            Err(Rejected::Contradictory(
+                "initializer selected formatter/print slots"
+            ))
+        ));
+        let print = &std_mod.items[function(std_mod, "print")];
+        let ScalarItem::Function(print) = print else {
+            unreachable!()
+        };
+        let print_key = span_key(print.name_span);
+        let rows = ledger.declarations.get_mut(&source_key(&std)).unwrap();
+        let row = rows.remove(&print_key).unwrap();
+        assert!(matches!(
+            ledger.initializer_local_order_open(f, prior, &prior.value, prior_consumer),
+            Err(Rejected::Missing("declaration"))
+        ));
+        let rows = ledger.declarations.get_mut(&source_key(&std)).unwrap();
+        rows.insert(print_key, IndexEntry::Ambiguous);
+        assert!(matches!(
+            ledger.initializer_local_order_open(f, prior, &prior.value, prior_consumer),
+            Err(Rejected::AmbiguousDeclaration)
+        ));
+        ledger
+            .declarations
+            .get_mut(&source_key(&std))
+            .unwrap()
+            .insert(print_key, row);
         let wrapper = ledger.body(at("wrap"), None).unwrap();
         let call = final_call(&wrapper);
         assert!(matches!(

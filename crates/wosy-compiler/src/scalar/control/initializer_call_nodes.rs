@@ -153,6 +153,7 @@ pub(crate) struct CallableBodyCallNodes<'a> {
 #[derive(Default)]
 struct CallableProofNodes<'a> {
     calls: Option<&'a FunctionCallSites>,
+    initializer_bindings: bool,
     expressions: HashMap<*const ScalarExpression, OccurrenceOrdinal>,
     places: HashMap<*const ScalarPlace, OccurrenceOrdinal>,
     bindings: HashMap<*const ScalarBinding, BlockPosition>,
@@ -196,8 +197,24 @@ pub(crate) struct CheckedInitializerCall<'a> {
 #[allow(dead_code)]
 pub(crate) struct InitializerFacts<'a> {
     source: &'a SourceIdentity,
+    region: &'a ModuleInitializationRegion,
+    items: &'a [ScalarItem],
     topology: &'a ModuleInitializationTopology,
     nodes: CallableProofNodes<'a>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InitializerOutputRoute {
+    Primary,
+    EvaluateSecondary,
+    ProjectPrimary { output: usize },
+}
+
+#[derive(Debug)]
+pub(crate) struct InitializerBindingOutput<'a> {
+    pub(crate) destination: SourceSpan,
+    pub(crate) ty: &'a ScalarType,
+    pub(crate) route: InitializerOutputRoute,
 }
 
 #[allow(dead_code)]
@@ -210,7 +227,10 @@ impl<'a> InitializerFacts<'a> {
         let ModuleInitializationDetail::Occurrences(topology) = &region.detail else {
             return Err(Error::Missing("initializer topology"));
         };
-        let mut nodes = CallableProofNodes::default();
+        let mut nodes = CallableProofNodes {
+            initializer_bindings: true,
+            ..Default::default()
+        };
         // Bind only canonical node identities. Accessors separately verify the
         // presence and supported shape of the requested stored facts.
         let mut no_calls = |_: OccurrenceOrdinal, _: &'a ScalarExpression| Ok(());
@@ -227,9 +247,191 @@ impl<'a> InitializerFacts<'a> {
         .map_err(|_| Error::Malformed("initializer topology"))?;
         Ok(Self {
             source: &region.source,
+            region,
+            items,
             topology,
             nodes,
         })
+    }
+
+    fn root_binding_item(&self, binding: &ScalarBinding) -> Result<usize, InitializerFactsError> {
+        use InitializerFactsError as Error;
+        let position = self
+            .nodes
+            .bindings
+            .get(&std::ptr::from_ref(binding))
+            .ok_or(Error::Noncanonical)?;
+        if position.block != self.topology.structure.root
+            || !matches!(self.items.get(position.item), Some(ScalarItem::Binding(stored)) if std::ptr::eq(stored, binding))
+        {
+            return Err(Error::Unsupported("initializer root declaration"));
+        }
+        Ok(position.item)
+    }
+
+    fn root_kind(&self, item: usize) -> Result<&'a BlockItemKind, InitializerFactsError> {
+        use InitializerFactsError as Error;
+        let structure = &self.topology.structure;
+        let mut rows = structure
+            .blocks
+            .get(structure.root.0)
+            .ok_or(Error::Missing("initializer root block"))?
+            .items
+            .iter()
+            .filter(|row| row.position == item);
+        let row = rows.next().ok_or(Error::Missing("initializer root item"))?;
+        if rows.next().is_some() {
+            return Err(Error::Malformed("initializer root item"));
+        }
+        Ok(&row.kind)
+    }
+
+    fn root_edge(
+        &self,
+        edge: Edge,
+        expression: &ScalarExpression,
+    ) -> Result<(), InitializerFactsError> {
+        use InitializerFactsError as Error;
+        let ordinal = self.expression(expression)?;
+        let parent = Parent::Block(self.topology.structure.root);
+        if self.topology.structure.edges.get(&(parent, edge)) != Some(&Node::Expression(ordinal))
+            || self.metadata(ordinal)?.span != expression_span(expression)
+        {
+            return Err(Error::Malformed("initializer root expression"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn binding_output(
+        &self,
+        binding: &ScalarBinding,
+        output: usize,
+        call: &ScalarExpression,
+    ) -> Result<InitializerBindingOutput<'a>, InitializerFactsError> {
+        use InitializerFactsError as Error;
+        let item = self.root_binding_item(binding)?;
+        let BlockItemKind::Binding(region) = self.root_kind(item)? else {
+            return Err(Error::Malformed("initializer binding row"));
+        };
+        let BindingInitialization::Outputs(outputs) = &region.initialization else {
+            return Err(Error::Unsupported("initializer allocation binding"));
+        };
+        let arity = binding.receivers.len().max(1);
+        if region.receivers().len() != arity || outputs.secondary.len() != arity - 1 {
+            return Err(Error::Malformed("initializer receiver arity"));
+        }
+        let slot = region
+            .receivers()
+            .get(output)
+            .ok_or(Error::Missing("initializer receiver slot"))?;
+        let (name, span, ty) = if output == 0 {
+            (&binding.name, binding.name_span, &binding.declared_type)
+        } else {
+            let receiver = &binding.receivers[output];
+            (&receiver.name, receiver.name_span, &receiver.ty)
+        };
+        if slot.position != output || slot.name != *name || slot.span != span || slot.ty != *ty {
+            return Err(Error::Malformed("initializer receiver slot"));
+        }
+        let (evaluation, ordinal, route) = if output == 0 {
+            (0, outputs.primary, InitializerOutputRoute::Primary)
+        } else {
+            match outputs.secondary.get(output - 1) {
+                Some(BindingOutput::Evaluate {
+                    position,
+                    expression,
+                }) if *position == output => (
+                    output,
+                    *expression,
+                    InitializerOutputRoute::EvaluateSecondary,
+                ),
+                Some(BindingOutput::ProjectPrimary { output: stored }) if *stored == output => (
+                    0,
+                    outputs.primary,
+                    InitializerOutputRoute::ProjectPrimary { output },
+                ),
+                _ => return Err(Error::Malformed("initializer output route")),
+            }
+        };
+        if output > 0
+            && binding.output_origin == ScalarBindingOutputOrigin::IndependentExpressions
+            && binding.output_values.get(output).is_none()
+        {
+            return Err(Error::Malformed("initializer secondary expression"));
+        }
+        let ast = match (route, binding.output_source(output)) {
+            (
+                InitializerOutputRoute::Primary | InitializerOutputRoute::EvaluateSecondary,
+                ScalarBindingOutput::Evaluate(value),
+            ) => value,
+            (
+                InitializerOutputRoute::ProjectPrimary { output: route },
+                ScalarBindingOutput::ProjectPrimary { output: ast },
+            ) if route == ast => &binding.value,
+            _ => return Err(Error::Malformed("initializer output origin")),
+        };
+        if !std::ptr::eq(ast, call)
+            || self.expression(call)? != ordinal
+            || !matches!(call, ScalarExpression::Call { .. })
+        {
+            return Err(Error::Noncanonical);
+        }
+        self.root_edge(
+            Edge::BindingRoot {
+                item,
+                output: evaluation,
+            },
+            call,
+        )?;
+        Ok(InitializerBindingOutput {
+            destination: SourceSpan::new(self.source.clone(), slot.span),
+            ty: &slot.ty,
+            route,
+        })
+    }
+
+    pub(crate) fn immediately_dispatched_call(
+        &self,
+        binding: &ScalarBinding,
+        call: &ScalarExpression,
+    ) -> Result<(), InitializerFactsError> {
+        use InitializerFactsError as Error;
+        let item = self.root_binding_item(binding)?;
+        let mut rows = self
+            .region
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| step.item == item);
+        let (index, step) = rows
+            .next()
+            .ok_or(Error::Missing("initializer binding dispatch"))?;
+        if rows.next().is_some() || step.kind != ModuleInitializationStepKind::BindingInitialization
+        {
+            return Err(Error::Malformed("initializer binding dispatch"));
+        }
+        let next = self
+            .region
+            .steps
+            .get(index + 1)
+            .ok_or(Error::Missing("initializer next dispatch"))?;
+        if next.kind != ModuleInitializationStepKind::ExecutableItem
+            || !matches!(self.items.get(next.item), Some(ScalarItem::Executable(ScalarBlockItem::Expression(stored))) if std::ptr::eq(stored, call) && matches!(stored, ScalarExpression::Call { .. }))
+        {
+            return Err(Error::Unsupported("initializer next direct call"));
+        }
+        if self
+            .region
+            .steps
+            .iter()
+            .filter(|step| step.item == next.item)
+            .count()
+            != 1
+            || !matches!(self.root_kind(next.item)?, BlockItemKind::Evaluation { expression } if *expression == self.expression(call)?)
+        {
+            return Err(Error::Malformed("initializer call dispatch"));
+        }
+        self.root_edge(Edge::ExpressionItem { item: next.item }, call)
     }
 
     fn expression(
@@ -883,7 +1085,7 @@ impl<'a> Binder<'a, '_> {
         binding: &'a ScalarBinding,
     ) -> Result<(), String> {
         if let (Some(nodes), Parent::Block(block)) = (&mut self.proof_nodes, parent) {
-            if nodes.calls.is_some() {
+            if nodes.calls.is_some() || nodes.initializer_bindings {
                 nodes
                     .bindings
                     .insert(std::ptr::from_ref(binding), BlockPosition { block, item });

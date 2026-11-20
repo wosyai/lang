@@ -6,16 +6,17 @@ use wosy_syntax::{ByteSpan, SourceIdentity, SourceSpan};
 
 use super::formatter_proof::{Proof, ProofBatch, Unproved};
 use crate::scalar::control::{
-    CallableBodyCallNodes, CallablePointFacts, InitializerCallNodes,
-    ModuleInitializationCallTarget, PlainNameIdentity,
+    CallableBodyCallNodes, CallablePointFacts, InitializerCallNodes, InitializerFactsError,
+    InitializerOutputRoute, ModuleInitializationCallTarget, ModuleInitializationStepKind,
+    NamespaceTarget, PlainNameIdentity, QualifiedInitializerStorage,
 };
 use crate::scalar::{
     CfgPointId, CfgPointKind, ConcreteCallSelection, ReferenceScopeId, ResolvedCallTarget,
     ScalarOverloadSelection, ScalarReferenceCfg, ScalarReferenceMutability, ScalarStructId,
 };
 use crate::{
-    ScalarBlockItem, ScalarBuildValidation, ScalarExpression, ScalarFunction, ScalarItem,
-    ScalarType,
+    ScalarBinding, ScalarBlockItem, ScalarBuildValidation, ScalarExpression, ScalarFunction,
+    ScalarItem, ScalarType,
 };
 
 type Body = (usize, usize);
@@ -79,6 +80,7 @@ enum Rejected {
     UnsupportedTarget,
     Contradictory(&'static str),
     Producer(Unproved),
+    InitializerFact(InitializerFactsError),
 }
 
 struct Ledger<'a> {
@@ -117,6 +119,16 @@ struct CheckedConsumerOpen {
 struct InitializerTargetOnly {
     source: SourceSpan,
     target: EntryId,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InitializerLocalOrderOpen {
+    receiver: SourceSpan,
+    producer: EntryId,
+    producer_site: SourceSpan,
+    consumer: EntryId,
+    consumer_site: SourceSpan,
+    consumer_parameter: usize,
 }
 
 struct CallableBody<'a> {
@@ -321,6 +333,150 @@ impl<'a> Ledger<'a> {
         Ok(InitializerTargetOnly {
             source: SourceSpan::new(initializer.source.clone(), *span),
             target: entry.id,
+        })
+    }
+
+    fn initializer_local_order_open(
+        &self,
+        module: usize,
+        binding: &ScalarBinding,
+        producer: &ScalarExpression,
+        consumer: &ScalarExpression,
+    ) -> Result<InitializerLocalOrderOpen, Rejected> {
+        let facts = self
+            .build
+            .prepared()
+            .initializer_facts(module)
+            .map_err(Rejected::InitializerFact)?;
+        let installed = facts
+            .binding_output(binding, 0, producer)
+            .map_err(Rejected::InitializerFact)?;
+        if installed.route != InitializerOutputRoute::Primary
+            || binding.receivers.len() > 1
+            || !matches!(installed.ty, ScalarType::Struct(_))
+        {
+            return Err(Rejected::Contradictory("initializer formatter receiver"));
+        }
+        facts
+            .immediately_dispatched_call(binding, consumer)
+            .map_err(Rejected::InitializerFact)?;
+        let ScalarExpression::Call {
+            arguments: producer_arguments,
+            span: producer_span,
+            ..
+        } = producer
+        else {
+            return Err(Rejected::UnsupportedTarget);
+        };
+        let ScalarExpression::Call {
+            arguments,
+            span: consumer_span,
+            ..
+        } = consumer
+        else {
+            return Err(Rejected::UnsupportedTarget);
+        };
+        let ([producer_argument], [argument]) =
+            (producer_arguments.as_slice(), arguments.as_slice())
+        else {
+            return Err(Rejected::Contradictory("initializer argument arity"));
+        };
+        let producer_sig = facts
+            .checked_direct_call(producer)
+            .map_err(Rejected::InitializerFact)?;
+        let consumer_sig = facts
+            .checked_direct_call(consumer)
+            .map_err(Rejected::InitializerFact)?;
+        let producer_entry = self.lookup(
+            &producer_sig.declaration.source,
+            producer_sig.declaration.range,
+            producer_sig.concrete,
+        )?;
+        let consumer_entry = self.lookup(
+            &consumer_sig.declaration.source,
+            consumer_sig.declaration.range,
+            consumer_sig.concrete,
+        )?;
+        let (producer_parameters, producer_outputs) = producer_entry.signature()?;
+        let (consumer_parameters, consumer_outputs) = consumer_entry.signature()?;
+        let region = self
+            .build
+            .prepared()
+            .initialization_region(module)
+            .ok_or(Rejected::Missing("initializer region"))?;
+        let mut std_dispatches = region.steps.iter().filter_map(|step| match &step.kind {
+            ModuleInitializationStepKind::NamespaceDispatch {
+                binding, target, ..
+            } if binding == "std" => Some(target),
+            _ => None,
+        });
+        let Some(NamespaceTarget::Bound(std_source)) = std_dispatches.next() else {
+            return Err(Rejected::Missing("initializer std dispatch"));
+        };
+        if std_dispatches.next().is_some()
+            || std_source.package != "std"
+            || std_source != &consumer_entry.id.source
+        {
+            return Err(Rejected::Contradictory("initializer std dispatch"));
+        }
+        let std = &self.build.prepared().project().modules[producer_entry.id.body.0];
+        let Some(ScalarItem::Function(producer_group)) = std.items.get(producer_entry.id.body.1)
+        else {
+            return Err(Rejected::UnsupportedTarget);
+        };
+        if producer_group.name != "format"
+            || producer_entry.id.arm.is_none()
+            || consumer_entry.function.name != "print"
+            || consumer_entry.id.arm.is_some()
+            || producer_entry.id.source != consumer_entry.id.source
+            || producer_sig.parameters != producer_parameters
+            || producer_parameters != [ScalarType::U128]
+            || consumer_sig.parameters != consumer_parameters
+            || producer_outputs.as_slice() != [installed.ty]
+            || consumer_outputs.as_slice() != [&ScalarType::U64, &ScalarType::Bool]
+            || !producer_sig
+                .outputs
+                .iter()
+                .map(|output| &output.ty)
+                .eq(producer_outputs)
+            || !consumer_sig
+                .outputs
+                .iter()
+                .map(|output| &output.ty)
+                .eq(consumer_outputs)
+            || consumer_parameters != [installed.ty.clone()]
+        {
+            return Err(Rejected::Contradictory(
+                "initializer selected formatter/print slots",
+            ));
+        }
+        if facts
+            .checked_expression_type(producer)
+            .map_err(Rejected::InitializerFact)?
+            != installed.ty
+            || facts
+                .checked_expression_type(producer_argument)
+                .map_err(Rejected::InitializerFact)?
+                != &producer_parameters[0]
+            || facts
+                .checked_expression_type(argument)
+                .map_err(Rejected::InitializerFact)?
+                != installed.ty
+            || facts
+                .plain_name(argument)
+                .map_err(Rejected::InitializerFact)?
+                != QualifiedInitializerStorage::Module(installed.destination.clone())
+        {
+            return Err(Rejected::Contradictory("initializer typed receiver read"));
+        }
+        let source = &installed.destination.source;
+        Ok(InitializerLocalOrderOpen {
+            producer: producer_entry.id,
+            producer_site: SourceSpan::new(source.clone(), *producer_span),
+            consumer: consumer_entry.id,
+            consumer_site: SourceSpan::new(source.clone(), *consumer_span),
+            receiver: installed.destination,
+            consumer_parameter: 0,
         })
     }
 
