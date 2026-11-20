@@ -3579,6 +3579,7 @@ pub(crate) mod control;
 mod occurrence_obligations;
 mod reference;
 mod static_calls;
+pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{
     analyze_scalar_build, PreparedScalarProject, ScalarBuildValidation,
     ScalarProjectPreparationRejection,

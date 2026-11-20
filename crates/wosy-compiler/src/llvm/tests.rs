@@ -4399,7 +4399,7 @@ fn lowers_generic_overload_arms_through_project_namespaces() {
 }
 
 #[test]
-fn emits_empty_utf8_call_arguments_with_resolved_parameter_types() {
+fn rejects_source_invalid_utf8_rewrite_in_typed_call_arguments() {
     let source = SourceIdentity::new(
         "project".into(),
         "package".into(),
@@ -4434,18 +4434,9 @@ u64 reported = print(value);
         value: Vec::new(),
         span: wosy_syntax::ByteSpan::new(0, 0),
     };
-    let text = emit_scalar_llvm(&program)
-        .expect("empty UTF-8 call LLVM")
-        .to_text();
-
-    assert!(
-        text.contains("@wosy_utf8_literal_0 = private constant [0 x i8]"),
-        "{text}"
-    );
-    assert!(text.contains("store i64 0"), "{text}");
-    assert!(
-        text.contains("call i64 @print(ptr %utf8_literal)"),
-        "{text}"
+    assert_eq!(
+        emit_scalar_llvm(&program).expect_err("source-invalid typed rewrite must be rejected"),
+        "cannot emit LLVM for an invalid scalar program",
     );
 }
 

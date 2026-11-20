@@ -17,9 +17,8 @@ use inkwell::{FloatPredicate, IntPredicate};
 use serde::{Deserialize, Serialize};
 
 use crate::scalar::control::{
-    module_initialization_region, CallableBodyCallNodes, InitializerCallNodes,
-    ModuleInitializationCallTarget, ModuleInitializationRegion, ModuleInitializationStepKind,
-    NamespaceTarget,
+    CallableBodyCallNodes, InitializerCallNodes, ModuleInitializationCallTarget,
+    ModuleInitializationRegion, ModuleInitializationStepKind, NamespaceTarget,
 };
 use crate::scalar::layout::ScalarTargetLayouts;
 use crate::scalar::{
@@ -278,8 +277,8 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
     if !validation.diagnostics.is_empty() {
         return Err("cannot emit LLVM for an invalid scalar program".into());
     }
-    let program = &validation.program;
-    let initialization_region = module_initialization_region(&program.source, &program.items, &[]);
+    let (program, initialization_region) =
+        crate::scalar::PreparedProgram::rebuild_raw(&validation.program)?;
     emit_single_module_llvm(
         &program.source,
         &program.items,
@@ -607,25 +606,21 @@ pub fn emit_scalar_project_llvm(
     if !validation.diagnostics.is_empty() {
         return Err("cannot emit LLVM for an invalid scalar project".into());
     }
-    let regions = validation
-        .project
-        .modules
-        .iter()
-        .map(|module| {
-            module_initialization_region(&module.source, &module.items, &module.namespace_bindings)
-        })
-        .collect::<Vec<_>>();
-    emit_project_llvm(
-        &validation.project,
-        &|module| regions.get(module),
-        GenericInitializerInput::RawItems,
-        &|_, _, _, function| Some(&function.reference_cfg),
-        None,
-    )
+    let prepared = crate::PreparedScalarProject::new(validation.project.clone())
+        .map_err(|_| "cannot emit LLVM for an invalid scalar project".to_owned())?;
+    let build = crate::analyze_scalar_build(&prepared);
+    emit_scalar_build_project_with_policy(&build, EmissionPolicy::RawCompatibility)
 }
 
 pub fn emit_scalar_build_project_llvm(
     validation: &ScalarBuildValidation<'_>,
+) -> Result<LlvmPartition, String> {
+    emit_scalar_build_project_with_policy(validation, EmissionPolicy::Prepared)
+}
+
+fn emit_scalar_build_project_with_policy(
+    validation: &ScalarBuildValidation<'_>,
+    policy: EmissionPolicy,
 ) -> Result<LlvmPartition, String> {
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar project".into());
@@ -634,9 +629,15 @@ pub fn emit_scalar_build_project_llvm(
     emit_project_llvm(
         prepared.project(),
         &|module| prepared.initialization_region(module),
-        GenericInitializerInput::PreparedRows(prepared),
+        match policy {
+            EmissionPolicy::RawCompatibility => GenericInitializerInput::RawItems,
+            EmissionPolicy::Prepared => GenericInitializerInput::PreparedRows(prepared),
+        },
         &|module, item, arm, _| validation.reference_cfg(module, item, arm),
-        Some(validation),
+        match policy {
+            EmissionPolicy::RawCompatibility => None,
+            EmissionPolicy::Prepared => Some(validation),
+        },
     )
 }
 
@@ -4351,6 +4352,11 @@ struct LlvmSpecialization<'a> {
     template: &'a ScalarFunction,
     item_ordinal: usize,
     arm_index: Option<usize>,
+}
+
+enum EmissionPolicy {
+    RawCompatibility,
+    Prepared,
 }
 
 #[derive(Clone, Copy)]
