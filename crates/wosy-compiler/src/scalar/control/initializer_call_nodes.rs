@@ -232,8 +232,6 @@ impl<'a> InitializerFacts<'a> {
             initializer_bindings: true,
             ..Default::default()
         };
-        // Bind only canonical node identities. Accessors separately verify the
-        // presence and supported shape of the requested stored facts.
         let mut no_calls = |_: OccurrenceOrdinal, _: &'a ScalarExpression| Ok(());
         Binder {
             structure: &topology.structure,
