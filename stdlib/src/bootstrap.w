@@ -1294,15 +1294,192 @@ utf8(char) _format_char = fn(value) {
 	text
 };
 
+u64(u8[], u64, i8, bool, u64) _format_digits_i8 = fn(scratch, index, remaining, negative, capacity) {
+	i8 zero = 0;
+	if (remaining == zero) {
+		if (negative) {
+			u64 one = core.int_extend<u64>(1);
+			u8 minus = 45;
+			index = index - one;
+			scratch[index] = minus;
+		};
+		u64 length = capacity - index;
+		_format_compact_bytes(scratch, 0, index, capacity);
+		length
+	} else {
+		i8 ten = 10;
+		i8 digit_signed = remaining % ten;
+		if (negative) { digit_signed = zero - digit_signed; };
+		u16 wide_digit = core.int_extend<u16>(digit_signed);
+		u8 digit = core.int_trunc<u8>(wide_digit);
+		u64 one = core.int_extend<u64>(1);
+		u8 zero_digit = 48;
+		index = index - one;
+		scratch[index] = zero_digit + digit;
+		_format_digits_i8(scratch, index, remaining / ten, negative, capacity)
+	}
+};
+
+u64(u8[], u64, i16, bool, u64) _format_digits_i16 = fn(scratch, index, remaining, negative, capacity) {
+	i16 zero = 0;
+	if (remaining == zero) {
+		if (negative) {
+			u64 one = core.int_extend<u64>(1);
+			u8 minus = 45;
+			index = index - one;
+			scratch[index] = minus;
+		};
+		u64 length = capacity - index;
+		_format_compact_bytes(scratch, 0, index, capacity);
+		length
+	} else {
+		i16 ten = 10;
+		i16 digit_signed = remaining % ten;
+		if (negative) { digit_signed = zero - digit_signed; };
+		u8 digit = core.int_trunc<u8>(digit_signed);
+		u64 one = core.int_extend<u64>(1);
+		u8 zero_digit = 48;
+		index = index - one;
+		scratch[index] = zero_digit + digit;
+		_format_digits_i16(scratch, index, remaining / ten, negative, capacity)
+	}
+};
+
+u64(u8[], u64, i32, bool, u64) _format_digits_i32 = fn(scratch, index, remaining, negative, capacity) {
+	i32 zero = 0;
+	if (remaining == zero) {
+		if (negative) {
+			u64 one = core.int_extend<u64>(1);
+			u8 minus = 45;
+			index = index - one;
+			scratch[index] = minus;
+		};
+		u64 length = capacity - index;
+		_format_compact_bytes(scratch, 0, index, capacity);
+		length
+	} else {
+		i32 ten = 10;
+		i32 digit_signed = remaining % ten;
+		if (negative) { digit_signed = zero - digit_signed; };
+		u8 digit = core.int_trunc<u8>(digit_signed);
+		u64 one = core.int_extend<u64>(1);
+		u8 zero_digit = 48;
+		index = index - one;
+		scratch[index] = zero_digit + digit;
+		_format_digits_i32(scratch, index, remaining / ten, negative, capacity)
+	}
+};
+
+u64(u8[], u64, i64, bool, u64) _format_digits_i64 = fn(scratch, index, remaining, negative, capacity) {
+	i64 zero = 0;
+	if (remaining == zero) {
+		if (negative) {
+			u64 one = core.int_extend<u64>(1);
+			u8 minus = 45;
+			index = index - one;
+			scratch[index] = minus;
+		};
+		u64 length = capacity - index;
+		_format_compact_bytes(scratch, 0, index, capacity);
+		length
+	} else {
+		i64 ten = 10;
+		i64 digit_signed = remaining % ten;
+		if (negative) { digit_signed = zero - digit_signed; };
+		u8 digit = core.int_trunc<u8>(digit_signed);
+		u64 one = core.int_extend<u64>(1);
+		u8 zero_digit = 48;
+		index = index - one;
+		scratch[index] = zero_digit + digit;
+		_format_digits_i64(scratch, index, remaining / ten, negative, capacity)
+	}
+};
+
+u64(u8[], u64, u8, u64) _format_digits_u8 = fn(scratch, index, remaining, capacity) {
+	u8 zero = 0;
+	if (remaining == zero) {
+		u64 length = capacity - index;
+		_format_compact_bytes(scratch, 0, index, capacity);
+		length
+	} else {
+		u8 ten = 10;
+		u8 digit = remaining % ten;
+		u64 one = core.int_extend<u64>(1);
+		u8 zero_digit = 48;
+		index = index - one;
+		scratch[index] = zero_digit + digit;
+		_format_digits_u8(scratch, index, remaining / ten, capacity)
+	}
+};
+
+u64(u8[], u64, u16, u64) _format_digits_u16 = fn(scratch, index, remaining, capacity) {
+	u16 zero = 0;
+	if (remaining == zero) {
+		u64 length = capacity - index;
+		_format_compact_bytes(scratch, 0, index, capacity);
+		length
+	} else {
+		u16 ten = 10;
+		u16 digit_wide = remaining % ten;
+		u8 digit = core.int_trunc<u8>(digit_wide);
+		u64 one = core.int_extend<u64>(1);
+		u8 zero_digit = 48;
+		index = index - one;
+		scratch[index] = zero_digit + digit;
+		_format_digits_u16(scratch, index, remaining / ten, capacity)
+	}
+};
+
+u64(u8[], u64, u32, u64) _format_digits_u32 = fn(scratch, index, remaining, capacity) {
+	u32 zero = 0;
+	if (remaining == zero) {
+		u64 length = capacity - index;
+		_format_compact_bytes(scratch, 0, index, capacity);
+		length
+	} else {
+		u32 ten = 10;
+		u32 digit_wide = remaining % ten;
+		u8 digit = core.int_trunc<u8>(digit_wide);
+		u64 one = core.int_extend<u64>(1);
+		u8 zero_digit = 48;
+		index = index - one;
+		scratch[index] = zero_digit + digit;
+		_format_digits_u32(scratch, index, remaining / ten, capacity)
+	}
+};
+
+u64(u8[], u64, u64, u64) _format_digits_u64 = fn(scratch, index, remaining, capacity) {
+	u64 zero = 0;
+	if (remaining == zero) {
+		u64 length = capacity - index;
+		_format_compact_bytes(scratch, 0, index, capacity);
+		length
+	} else {
+		u64 ten = 10;
+		u64 digit_wide = remaining % ten;
+		u8 digit = core.int_trunc<u8>(digit_wide);
+		u64 one = core.int_extend<u64>(1);
+		u8 zero_digit = 48;
+		index = index - one;
+		scratch[index] = zero_digit + digit;
+		_format_digits_u64(scratch, index, remaining / ten, capacity)
+	}
+};
+
+unit(u8[], u64, u64, u64) _format_compact_bytes = fn(scratch, target, source, capacity) {
+	if (source < capacity) {
+		scratch[target] = scratch[source];
+		u64 one = core.int_extend<u64>(1);
+		_format_compact_bytes(scratch, target + one, source + one, capacity);
+	};
+};
+
 utf8(i8) _format_i8 = fn(value) {
 	u8[4] scratch;
 	u64 capacity = core.int_extend<u64>(4);
 	u64 one = core.int_extend<u64>(1);
-	u64 zero_count = core.int_extend<u64>(0);
 	i8 zero = 0;
-	i8 ten = 10;
 	u8 zero_digit = 48;
-	u8 minus = 45;
 	u64 index = capacity;
 	i8 remaining = value;
 	bool negative = remaining < zero;
@@ -1310,27 +1487,7 @@ utf8(i8) _format_i8 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	while (remaining != zero) {
-		i8 digit_signed = remaining % ten;
-		if (negative) { digit_signed = zero - digit_signed; };
-		u16 wide_digit = core.int_extend<u16>(digit_signed);
-		u8 digit = core.int_trunc<u8>(wide_digit);
-		index = index - one;
-		scratch[index] = zero_digit + digit;
-		remaining = remaining / ten;
-	}
-	if (negative) {
-		index = index - one;
-		scratch[index] = minus;
-	};
-	u64 length = capacity - index;
-	u64 target = zero_count;
-	u64 source = index;
-	while (source < capacity) {
-		scratch[target] = scratch[source];
-		target = target + one;
-		source = source + one;
-	}
+	u64 length = _format_digits_i8(scratch, index, remaining, negative, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1341,11 +1498,8 @@ utf8(i16) _format_i16 = fn(value) {
 	u8[6] scratch;
 	u64 capacity = core.int_extend<u64>(6);
 	u64 one = core.int_extend<u64>(1);
-	u64 zero_count = core.int_extend<u64>(0);
 	i16 zero = 0;
-	i16 ten = 10;
 	u8 zero_digit = 48;
-	u8 minus = 45;
 	u64 index = capacity;
 	i16 remaining = value;
 	bool negative = remaining < zero;
@@ -1353,26 +1507,7 @@ utf8(i16) _format_i16 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	while (remaining != zero) {
-		i16 digit_signed = remaining % ten;
-		if (negative) { digit_signed = zero - digit_signed; };
-		u8 digit = core.int_trunc<u8>(digit_signed);
-		index = index - one;
-		scratch[index] = zero_digit + digit;
-		remaining = remaining / ten;
-	}
-	if (negative) {
-		index = index - one;
-		scratch[index] = minus;
-	};
-	u64 length = capacity - index;
-	u64 target = zero_count;
-	u64 source = index;
-	while (source < capacity) {
-		scratch[target] = scratch[source];
-		target = target + one;
-		source = source + one;
-	}
+	u64 length = _format_digits_i16(scratch, index, remaining, negative, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1383,11 +1518,8 @@ utf8(i32) _format_i32 = fn(value) {
 	u8[11] scratch;
 	u64 capacity = core.int_extend<u64>(11);
 	u64 one = core.int_extend<u64>(1);
-	u64 zero_count = core.int_extend<u64>(0);
 	i32 zero = 0;
-	i32 ten = 10;
 	u8 zero_digit = 48;
-	u8 minus = 45;
 	u64 index = capacity;
 	i32 remaining = value;
 	bool negative = remaining < zero;
@@ -1395,26 +1527,7 @@ utf8(i32) _format_i32 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	while (remaining != zero) {
-		i32 digit_signed = remaining % ten;
-		if (negative) { digit_signed = zero - digit_signed; };
-		u8 digit = core.int_trunc<u8>(digit_signed);
-		index = index - one;
-		scratch[index] = zero_digit + digit;
-		remaining = remaining / ten;
-	}
-	if (negative) {
-		index = index - one;
-		scratch[index] = minus;
-	};
-	u64 length = capacity - index;
-	u64 target = zero_count;
-	u64 source = index;
-	while (source < capacity) {
-		scratch[target] = scratch[source];
-		target = target + one;
-		source = source + one;
-	}
+	u64 length = _format_digits_i32(scratch, index, remaining, negative, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1425,11 +1538,8 @@ utf8(i64) _format_i64 = fn(value) {
 	u8[20] scratch;
 	u64 capacity = core.int_extend<u64>(20);
 	u64 one = core.int_extend<u64>(1);
-	u64 zero_count = core.int_extend<u64>(0);
 	i64 zero = 0;
-	i64 ten = 10;
 	u8 zero_digit = 48;
-	u8 minus = 45;
 	u64 index = capacity;
 	i64 remaining = value;
 	bool negative = remaining < zero;
@@ -1437,30 +1547,54 @@ utf8(i64) _format_i64 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	while (remaining != zero) {
-		i64 digit_signed = remaining % ten;
-		if (negative) { digit_signed = zero - digit_signed; };
-		u8 digit = core.int_trunc<u8>(digit_signed);
-		index = index - one;
-		scratch[index] = zero_digit + digit;
-		remaining = remaining / ten;
-	}
-	if (negative) {
-		index = index - one;
-		scratch[index] = minus;
-	};
-	u64 length = capacity - index;
-	u64 target = zero_count;
-	u64 source = index;
-	while (source < capacity) {
-		scratch[target] = scratch[source];
-		target = target + one;
-		source = source + one;
-	}
+	u64 length = _format_digits_i64(scratch, index, remaining, negative, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
 	text
+};
+
+i128(i128, u64, u64) _format_scale_i128 = fn(scale, step, steps) {
+	if (step < steps) {
+		u64 one = core.int_extend<u64>(1);
+		i128 twice = scale + scale;
+		i128 fourth = twice + twice;
+		i128 eighth = fourth + fourth;
+		_format_scale_i128(eighth + twice, step + one, steps)
+	} else {
+		scale
+	}
+};
+
+(i128, u8)(i128, i128, u8) _format_subtract_i128 = fn(remaining, scale, digit) {
+	if (remaining >= scale) {
+		u8 one_digit = 1;
+		i128 rest, u8 next_digit = _format_subtract_i128(remaining - scale, scale, digit + one_digit);
+		rest, next_digit
+	} else {
+		remaining, digit
+	}
+};
+
+u64(u8[], u64, u64, u64, i128, bool, u64) _format_digits_i128 = fn(scratch, position, digits, last, remaining, started, emit) {
+	if (position < digits) {
+		u64 one = core.int_extend<u64>(1);
+		u64 zero_count = core.int_extend<u64>(0);
+		u8 zero_digit = 48;
+		i128 one_wide = core.int_extend<i128>(1);
+		u64 steps = last - position;
+		i128 scale = _format_scale_i128(one_wide, zero_count, steps);
+		u8 digit = zero_digit;
+		remaining, digit = _format_subtract_i128(remaining, scale, digit);
+		if (started || digit != zero_digit || position == last) {
+			scratch[emit] = digit;
+			emit = emit + one;
+			started = true;
+		};
+		_format_digits_i128(scratch, position + one, digits, last, remaining, started, emit)
+	} else {
+		emit
+	}
 };
 
 utf8(i128) _format_i128 = fn(value) {
@@ -1469,11 +1603,8 @@ utf8(i128) _format_i128 = fn(value) {
 	u64 one = core.int_extend<u64>(1);
 	u64 zero_count = core.int_extend<u64>(0);
 	u64 last = core.int_extend<u64>(38);
-	u8 zero_digit = 48;
-	u8 one_digit = 1;
 	u8 minus = 45;
 	i128 zero = core.int_extend<i128>(0);
-	i128 one_wide = core.int_extend<i128>(1);
 	i128 minimum = -170141183460469231731687303715884105728;
 	u64 emit = zero_count;
 	i128 remaining = value;
@@ -1483,31 +1614,7 @@ utf8(i128) _format_i128 = fn(value) {
 		emit = one;
 		if (value == minimum) { remaining = zero - (value + 1); } else { remaining = zero - value; };
 	};
-	bool started = false;
-	u64 position = zero_count;
-	while (position < digits) {
-		u64 steps = last - position;
-		i128 scale = one_wide;
-		u64 step = zero_count;
-		while (step < steps) {
-			i128 twice = scale + scale;
-			i128 fourth = twice + twice;
-			i128 eighth = fourth + fourth;
-			scale = eighth + twice;
-			step = step + one;
-		}
-		u8 digit = zero_digit;
-		while (remaining >= scale) {
-			remaining = remaining - scale;
-			digit = digit + one_digit;
-		}
-		if (started || digit != zero_digit || position == last) {
-			scratch[emit] = digit;
-			emit = emit + one;
-			started = true;
-		};
-		position = position + one;
-	}
+	emit = _format_digits_i128(scratch, zero_count, digits, last, remaining, false, emit);
 	if (value == minimum) {
 		scratch[emit - one] = 56;
 	};
@@ -1521,8 +1628,6 @@ utf8(u8) _format_u8 = fn(value) {
 	u8[3] scratch;
 	u64 capacity = core.int_extend<u64>(3);
 	u64 one = core.int_extend<u64>(1);
-	u64 zero = core.int_extend<u64>(0);
-	u8 ten = 10;
 	u8 zero_digit = 48;
 	u8 zero_value = 0;
 	u64 index = capacity;
@@ -1531,20 +1636,7 @@ utf8(u8) _format_u8 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	while (remaining != zero_value) {
-		u8 digit = remaining % ten;
-		index = index - one;
-		scratch[index] = zero_digit + digit;
-		remaining = remaining / ten;
-	}
-	u64 length = capacity - index;
-	u64 target = zero;
-	u64 source = index;
-	while (source < capacity) {
-		scratch[target] = scratch[source];
-		target = target + one;
-		source = source + one;
-	}
+	u64 length = _format_digits_u8(scratch, index, remaining, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1555,8 +1647,6 @@ utf8(u16) _format_u16 = fn(value) {
 	u8[5] scratch;
 	u64 capacity = core.int_extend<u64>(5);
 	u64 one = core.int_extend<u64>(1);
-	u64 zero = core.int_extend<u64>(0);
-	u16 ten = 10;
 	u8 zero_digit = 48;
 	u16 zero_value = 0;
 	u64 index = capacity;
@@ -1565,21 +1655,7 @@ utf8(u16) _format_u16 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	while (remaining != zero_value) {
-		u16 digit_wide = remaining % ten;
-		u8 digit = core.int_trunc<u8>(digit_wide);
-		index = index - one;
-		scratch[index] = zero_digit + digit;
-		remaining = remaining / ten;
-	}
-	u64 length = capacity - index;
-	u64 target = zero;
-	u64 source = index;
-	while (source < capacity) {
-		scratch[target] = scratch[source];
-		target = target + one;
-		source = source + one;
-	}
+	u64 length = _format_digits_u16(scratch, index, remaining, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1590,8 +1666,6 @@ utf8(u32) _format_u32 = fn(value) {
 	u8[10] scratch;
 	u64 capacity = core.int_extend<u64>(10);
 	u64 one = core.int_extend<u64>(1);
-	u64 zero = core.int_extend<u64>(0);
-	u32 ten = 10;
 	u8 zero_digit = 48;
 	u32 zero_value = 0;
 	u64 index = capacity;
@@ -1600,21 +1674,7 @@ utf8(u32) _format_u32 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	while (remaining != zero_value) {
-		u32 digit_wide = remaining % ten;
-		u8 digit = core.int_trunc<u8>(digit_wide);
-		index = index - one;
-		scratch[index] = zero_digit + digit;
-		remaining = remaining / ten;
-	}
-	u64 length = capacity - index;
-	u64 target = zero;
-	u64 source = index;
-	while (source < capacity) {
-		scratch[target] = scratch[source];
-		target = target + one;
-		source = source + one;
-	}
+	u64 length = _format_digits_u32(scratch, index, remaining, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1625,8 +1685,6 @@ utf8(u64) _format_u64 = fn(value) {
 	u8[20] scratch;
 	u64 capacity = core.int_extend<u64>(20);
 	u64 one = core.int_extend<u64>(1);
-	u64 zero = core.int_extend<u64>(0);
-	u64 ten = 10;
 	u8 zero_digit = 48;
 	u64 zero_value = 0;
 	u64 index = capacity;
@@ -1635,63 +1693,62 @@ utf8(u64) _format_u64 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	while (remaining != zero_value) {
-		u64 digit_wide = remaining % ten;
-		u8 digit = core.int_trunc<u8>(digit_wide);
-		index = index - one;
-		scratch[index] = zero_digit + digit;
-		remaining = remaining / ten;
-	}
-	u64 length = capacity - index;
-	u64 target = zero;
-	u64 source = index;
-	while (source < capacity) {
-		scratch[target] = scratch[source];
-		target = target + one;
-		source = source + one;
-	}
+	u64 length = _format_digits_u64(scratch, index, remaining, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
 	text
 };
 
-utf8(u128) _format_u128 = fn(value) {
-	u8[39] scratch;
-	u64 capacity = core.int_extend<u64>(39);
-	u64 one = core.int_extend<u64>(1);
-	u64 zero = core.int_extend<u64>(0);
-	u64 last = core.int_extend<u64>(38);
-	u8 zero_digit = 48;
-	u8 one_digit = 1;
-	u128 one_wide = core.int_extend<u128>(1);
-	u64 emit = zero;
-	u128 remaining = value;
-	bool started = false;
-	u64 position = zero;
-	while (position < capacity) {
+u128(u128, u64, u64) _format_scale_u128 = fn(scale, step, steps) {
+	if (step < steps) {
+		u64 one = core.int_extend<u64>(1);
+		u128 twice = scale + scale;
+		u128 fourth = twice + twice;
+		u128 eighth = fourth + fourth;
+		_format_scale_u128(eighth + twice, step + one, steps)
+	} else {
+		scale
+	}
+};
+
+(u128, u8)(u128, u128, u8) _format_subtract_u128 = fn(remaining, scale, digit) {
+	if (remaining >= scale) {
+		u8 one_digit = 1;
+		u128 rest, u8 next_digit = _format_subtract_u128(remaining - scale, scale, digit + one_digit);
+		rest, next_digit
+	} else {
+		remaining, digit
+	}
+};
+
+u64(u8[], u64, u64, u64, u128, bool, u64) _format_digits_u128 = fn(scratch, position, capacity, last, remaining, started, emit) {
+	if (position < capacity) {
+		u64 one = core.int_extend<u64>(1);
+		u64 zero = core.int_extend<u64>(0);
+		u8 zero_digit = 48;
+		u128 one_wide = core.int_extend<u128>(1);
 		u64 steps = last - position;
-		u128 scale = one_wide;
-		u64 step = zero;
-		while (step < steps) {
-			u128 twice = scale + scale;
-			u128 fourth = twice + twice;
-			u128 eighth = fourth + fourth;
-			scale = eighth + twice;
-			step = step + one;
-		}
+		u128 scale = _format_scale_u128(one_wide, zero, steps);
 		u8 digit = zero_digit;
-		while (remaining >= scale) {
-			remaining = remaining - scale;
-			digit = digit + one_digit;
-		}
+		remaining, digit = _format_subtract_u128(remaining, scale, digit);
 		if (started || digit != zero_digit || position == last) {
 			scratch[emit] = digit;
 			emit = emit + one;
 			started = true;
 		};
-		position = position + one;
+		_format_digits_u128(scratch, position + one, capacity, last, remaining, started, emit)
+	} else {
+		emit
 	}
+};
+
+utf8(u128) _format_u128 = fn(value) {
+	u8[39] scratch;
+	u64 capacity = core.int_extend<u64>(39);
+	u64 zero = core.int_extend<u64>(0);
+	u64 last = core.int_extend<u64>(38);
+	u64 emit = _format_digits_u128(scratch, zero, capacity, last, value, false, zero);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = emit; };
