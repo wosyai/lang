@@ -12,6 +12,12 @@ pub(super) enum Withheld {
     Formal(Formal),
     ConversionOperand(Body, CfgPointId),
     ConversionResult(Body, CfgPointId),
+    TupleProjection(Body, CfgPointId),
+    ReorderedTupleProjection(Body, CfgPointId),
+    TupleArm(Body, CfgPointId),
+    PrimitiveFact(Body, CfgPointId),
+    ContradictoryPrimitiveFact(Body, CfgPointId),
+    ContradictorySignedMagnitude(Body, CfgPointId),
 }
 
 thread_local! {
@@ -231,11 +237,12 @@ Packet(u8) second = fn(value) {
                     .iter()
                     .map(|(from, _, to)| (*from, *to))
                     .collect::<Vec<_>>();
-                let mut expected = vec![((m, producer), (m, digits, 0)); forward_count];
+                let mut expected =
+                    vec![((m, producer), Dependency::Backing((m, digits, 0))); forward_count];
                 expected.extend([
-                    ((m, digits), (m, compact, 0)),
-                    ((m, digits), (m, compact, 0)),
-                    ((m, digits), (m, digits, 0)),
+                    ((m, digits), Dependency::Backing((m, compact, 0))),
+                    ((m, digits), Dependency::Backing((m, compact, 0))),
+                    ((m, digits), Dependency::Backing((m, digits, 0))),
                 ]);
                 assert_eq!(routes, expected);
                 assert_eq!(
@@ -320,6 +327,7 @@ fn prove_withheld(
 
 #[test]
 fn formatter_proof_real_simple_producers() {
+    let mut strict_wide_failures = Vec::new();
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         let source =
             |path: &str| SourceIdentity::new("p".into(), "std".into(), path.into(), "r1".into());
@@ -430,7 +438,13 @@ fn formatter_proof_real_simple_producers() {
                     (digits, digits),
                     (compact, compact),
                 ]
-                .map(|(from, to)| ((0, from), call_site(from, to), (0, to, 0)))
+                .map(|(from, to)| {
+                    (
+                        (0, from),
+                        call_site(from, to),
+                        Dependency::Backing((0, to, 0)),
+                    )
+                })
                 .to_vec()
             };
             assert_eq!(
@@ -507,13 +521,13 @@ fn formatter_proof_real_simple_producers() {
             proof
                 .edges
                 .iter()
-                .map(|edge| (edge.from.1, edge.to.1, edge.to.2))
+                .map(|edge| (edge.from.1, edge.to))
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([
-                (producer, digits, 0),
-                (digits, digits, 0),
-                (digits, compact, 0),
-                (compact, compact, 0)
+                (producer, Dependency::Backing((0, digits, 0))),
+                (digits, Dependency::Backing((0, digits, 0))),
+                (digits, Dependency::Backing((0, compact, 0))),
+                (compact, Dependency::Backing((0, compact, 0)))
             ])
         );
         let without_field = prove_withheld(
@@ -530,7 +544,297 @@ fn formatter_proof_real_simple_producers() {
             matches!(without_formal, Err(Unproved::Missing((0, body), "helper formal")) if body == compact),
             "{target_layout:?}: {without_formal:?}"
         );
-        for unsupported in ["_format_u128", "_format_i128", "_format_f32", "_format_f64"] {
+        let before = batch.work.get();
+        let mut vertices = 0;
+        let mut arcs = 0;
+        for wide in ["i128", "u128"] {
+            let producer = find(&format!("_format_{wide}"));
+            let digits = find(&format!("_format_digits_{wide}"));
+            let scale = find(&format!("_format_scale_{wide}"));
+            let subtract = find(&format!("_format_subtract_{wide}"));
+            let proof = batch
+                .prove(0, producer)
+                .unwrap_or_else(|error| panic!("{target_layout:?} {wide}: {error:?}"));
+            assert_eq!(proof.output, 0);
+            assert_eq!(&proof.field, field);
+            let cfg = build.reference_cfg(0, producer, None).unwrap();
+            assert_eq!(cfg.allocations, BTreeSet::from([proof.owner]));
+            vertices += cfg.points.len();
+            arcs += cfg
+                .points
+                .iter()
+                .map(|point| point.successors.len())
+                .sum::<usize>();
+            let expected = [
+                (producer, digits, Dependency::Backing((0, digits, 0))),
+                (digits, scale, Dependency::ScalarOnly((0, scale))),
+                (digits, subtract, Dependency::ScalarOnly((0, subtract))),
+                (digits, digits, Dependency::Backing((0, digits, 0))),
+                (scale, scale, Dependency::ScalarOnly((0, scale))),
+                (subtract, subtract, Dependency::ScalarOnly((0, subtract))),
+            ]
+            .map(|(from, to, dependency)| ((0, from), call_site(from, to), dependency));
+            assert_eq!(
+                proof
+                    .edges
+                    .iter()
+                    .map(|edge| (edge.from, edge.site, edge.to))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        let after = batch.work.get();
+        assert_eq!(after.definition_queries - before.definition_queries, 12);
+        assert_eq!(after.struct_queries - before.struct_queries, 2);
+        assert_eq!(after.helper_checks - before.helper_checks, 6);
+        assert_eq!(after.dominance_walks - before.dominance_walks, 4);
+        assert_eq!(after.dominance_queries - before.dominance_queries, 6);
+        assert!(after.points - before.points <= 2 * vertices);
+        assert!(after.arcs - before.arcs <= 2 * arcs);
+        for wide in ["i128", "u128"] {
+            let producer = find(&format!("_format_{wide}"));
+            for helper in ["digits", "subtract"] {
+                let body = (0, find(&format!("_format_{helper}_{wide}")));
+                let cfg = build.reference_cfg(body.0, body.1, None).unwrap();
+                let projections: Vec<_> = cfg
+                    .points
+                    .iter()
+                    .filter_map(|p| {
+                        matches!(p.kind, CfgPointKind::Call { output: 1, .. }).then_some(p.id)
+                    })
+                    .collect();
+                assert_eq!(projections.len(), 1);
+                let rejected = prove_withheld(
+                    &build,
+                    producer,
+                    Withheld::TupleProjection(body, projections[0]),
+                );
+                assert!(
+                    matches!(rejected, Err(Unproved::Missing(at, "tuple projection")) if at == body),
+                    "{target_layout:?} {wide} {helper}: {rejected:?}"
+                );
+                let rejected = prove_withheld(
+                    &build,
+                    producer,
+                    Withheld::ReorderedTupleProjection(body, projections[0]),
+                );
+                assert!(
+                    matches!(rejected, Err(Unproved::Unsupported(at, "tuple projection identity")) if at == body),
+                    "{target_layout:?} {wide} {helper}: {rejected:?}"
+                );
+            }
+            let subtract = (0, find(&format!("_format_subtract_{wide}")));
+            let cfg = build.reference_cfg(subtract.0, subtract.1, None).unwrap();
+            let CfgPointKind::ReturnOutput {
+                value_point: second_arm,
+                ..
+            } = cfg
+                .points
+                .iter()
+                .find(|p| matches!(p.kind, CfgPointKind::ReturnOutput { output: 1, .. }))
+                .unwrap()
+                .kind
+            else {
+                unreachable!();
+            };
+            let rejected =
+                prove_withheld(&build, producer, Withheld::TupleArm(subtract, second_arm));
+            assert!(
+                matches!(rejected, Err(Unproved::Missing(at, "tuple arm output")) if at == subtract),
+                "{target_layout:?} {wide}: {rejected:?}"
+            );
+        }
+        for wide in ["i128", "u128"] {
+            let producer = find(&format!("_format_{wide}"));
+            for (body, binding_name) in [
+                (find(&format!("_format_digits_{wide}")), "zero_digit"),
+                (find(&format!("_format_scale_{wide}")), "twice"),
+                (producer, "minimum"),
+            ] {
+                if wide == "u128" && body == producer {
+                    continue;
+                }
+                let body = (0, body);
+                let view = View::new(&build, body).unwrap();
+                let initializer = if body.1 == producer {
+                    view.function.body.items.iter().find_map(|item| match item {
+                        ScalarBlockItem::LocalBinding(binding) if binding.name == binding_name => {
+                            Some(&binding.value)
+                        }
+                        _ => None,
+                    })
+                } else {
+                    view.function.body.items.iter().find_map(|item| match item {
+                        ScalarBlockItem::Expression(ScalarExpression::If {
+                            then_branch, ..
+                        }) => then_branch.items.iter().find_map(|item| match item {
+                            ScalarBlockItem::LocalBinding(binding)
+                                if binding.name == binding_name =>
+                            {
+                                Some(&binding.value)
+                            }
+                            _ => None,
+                        }),
+                        _ => None,
+                    })
+                }
+                .unwrap();
+                let point = view.eval(initializer).unwrap();
+                assert!(matches!(
+                    initializer,
+                    ScalarExpression::Integer { .. }
+                        | ScalarExpression::Binary { .. }
+                        | ScalarExpression::Unary { .. }
+                ));
+                let rejected =
+                    prove_withheld(&build, producer, Withheld::PrimitiveFact(body, point));
+                assert!(
+                    matches!(rejected, Err(Unproved::Missing(at, "wide primitive expression type")) if at == body),
+                    "{target_layout:?} {wide} {binding_name}: {rejected:?}"
+                );
+                if binding_name == "zero_digit" {
+                    let rejected = prove_withheld(
+                        &build,
+                        producer,
+                        Withheld::ContradictoryPrimitiveFact(body, point),
+                    );
+                    assert!(
+                        matches!(rejected, Err(Unproved::Unsupported(at, "wide primitive binding type")) if at == body),
+                        "{target_layout:?} {wide} {binding_name}: {rejected:?}"
+                    );
+                }
+            }
+        }
+        let producer = find("_format_i128");
+        let body = (0, producer);
+        let view = View::new(&build, body).unwrap();
+        let mut indexed_writes = view.function.body.items.iter().filter_map(|item| {
+            let ScalarBlockItem::Expression(ScalarExpression::UnitIf { then_branch, .. }) = item
+            else {
+                return None;
+            };
+            then_branch.items.iter().find_map(|item| {
+                let ScalarBlockItem::Assignment(assignment) = item else {
+                    return None;
+                };
+                let [rhs @ ScalarExpression::Integer { value, .. }] = assignment.values.as_slice()
+                else {
+                    return None;
+                };
+                let [target] = assignment.targets.as_slice() else {
+                    return None;
+                };
+                (matches!(target.place, ScalarPlace::Index { .. }) && *value == 56.into())
+                    .then_some((&target.place, rhs))
+            })
+        });
+        let (place, rhs) = indexed_writes.next().unwrap();
+        assert!(
+            indexed_writes.next().is_none(),
+            "unique signed minimum indexed write"
+        );
+        let frozen = view.nodes.frozen_install(view.facts, place).unwrap();
+        assert_eq!(view.eval(rhs), Some(frozen.rhs));
+        assert_eq!(
+            view.nodes.checked_expression_type(rhs),
+            Some(&ScalarType::U8)
+        );
+        assert_eq!(view.nodes.checked_place_type(place), Some(&ScalarType::U8));
+        let rejected = prove_withheld(
+            &build,
+            producer,
+            Withheld::ContradictoryPrimitiveFact(body, frozen.rhs),
+        );
+        if !matches!(rejected, Err(Unproved::Unsupported(at, "wide primitive assignment type")) if at == body)
+        {
+            strict_wide_failures.push(format!(
+                "{target_layout:?} signed minimum indexed RHS: {rejected:?}"
+            ));
+        }
+
+        let mut lexical_writes = view.function.body.items.iter().filter_map(|item| {
+            let ScalarBlockItem::Expression(ScalarExpression::UnitIf { then_branch, .. }) = item
+            else {
+                return None;
+            };
+            then_branch.items.iter().find_map(|item| {
+                let ScalarBlockItem::Assignment(assignment) = item else {
+                    return None;
+                };
+                let [rhs @ ScalarExpression::Name { name, .. }] = assignment.values.as_slice()
+                else {
+                    return None;
+                };
+                let [target] = assignment.targets.as_slice() else {
+                    return None;
+                };
+                (name == "one"
+                    && matches!(&target.place, ScalarPlace::Name { name, .. } if name == "emit"))
+                .then_some((&target.place, rhs))
+            })
+        });
+        let (place, rhs) = lexical_writes.next().unwrap();
+        assert!(
+            lexical_writes.next().is_none(),
+            "unique wide lexical emit write"
+        );
+        let frozen = view.nodes.frozen_install(view.facts, place).unwrap();
+        assert_eq!(view.eval(rhs), Some(frozen.rhs));
+        assert_eq!(
+            view.nodes.checked_expression_type(rhs),
+            Some(&ScalarType::U64)
+        );
+        assert_eq!(view.nodes.checked_place_type(place), Some(&ScalarType::U64));
+        let rejected = prove_withheld(
+            &build,
+            producer,
+            Withheld::ContradictoryPrimitiveFact(body, frozen.rhs),
+        );
+        if !matches!(rejected, Err(Unproved::Unsupported(at, "wide primitive assignment type")) if at == body)
+        {
+            strict_wide_failures.push(format!(
+                "{target_layout:?} wide lexical emit RHS: {rejected:?}"
+            ));
+        }
+
+        let mut minima = view
+            .function
+            .body
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ScalarBlockItem::LocalBinding(binding) if binding.name == "minimum" => {
+                    Some(&binding.value)
+                }
+                _ => None,
+            });
+        let minimum = minima.next().unwrap();
+        assert!(minima.next().is_none(), "unique signed minimum declaration");
+        let ScalarExpression::Unary {
+            operator: UnaryOperator::Negate,
+            operand,
+            ..
+        } = minimum
+        else {
+            unreachable!("canonical signed minimum");
+        };
+        assert_eq!(
+            view.nodes.checked_expression_type(minimum),
+            Some(&ScalarType::I128)
+        );
+        assert_eq!(view.nodes.checked_expression_type(operand), None);
+        let rejected = prove_withheld(
+            &build,
+            producer,
+            Withheld::ContradictorySignedMagnitude(body, view.eval(operand).unwrap()),
+        );
+        if !matches!(rejected, Err(Unproved::Unsupported(at, "wide folded minimum identity")) if at == body)
+        {
+            strict_wide_failures.push(format!(
+                "{target_layout:?} typed signed-minimum magnitude: {rejected:?}"
+            ));
+        }
+        for unsupported in ["_format_f32", "_format_f64"] {
             assert!(
                 prove(&build, 0, find(unsupported)).is_err(),
                 "{unsupported}"
@@ -540,6 +844,97 @@ fn formatter_proof_real_simple_producers() {
             prove(&build, 0, items.len()),
             Err(Unproved::Missing(..))
         ));
+    }
+    assert!(strict_wide_failures.is_empty(), "{strict_wide_failures:#?}");
+}
+
+#[test]
+fn formatter_proof_wide_checks_transitive_scalar_only_effects_and_result_types() {
+    let cases = [
+        ("eligible", "i128", "value"),
+        (
+            "effect",
+            "i128",
+            "u8[3] local; unsafe { *?u8 p = &?local[0]; core.free(p); }; value",
+        ),
+        ("wrong width", "u128", "value; 7"),
+        ("address", "*?u8", "value; unsafe { &?outside[0] }"),
+    ];
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (case, output, body) in cases {
+            let source = SourceIdentity::new("p".into(), "p".into(), "wide.w".into(), "r1".into());
+            let text = format!(
+                "%%start
+struct Packet {{ *?u8 address; u64 length; }}
+u8[3] outside = [1, 2, 3];
+{output}(i128) leaf = fn(value) {{ {body} }};
+i128(i128) bridge = fn(value) {{ leaf(value); value }};
+Packet(i128) make = fn(value) {{
+    bridge(value);
+    u8[3] scratch;
+    scratch[0] = 7;
+    *?u8 data = null;
+    unsafe {{ data = &?scratch[0]; }};
+    Packet result = {{ .length = 1; .address = data; }};
+    result
+}};
+%%end"
+            );
+            let parsed = parse_source(source.clone(), text, &[]);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{case}: {:?}",
+                parsed.diagnostics
+            );
+            let prepared = prepare_scalar_project(
+                vec![(
+                    derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+                    Vec::new(),
+                )],
+                vec![source],
+                ScalarPreparationInputs { target_layout },
+            )
+            .unwrap_or_else(|error| panic!("{case}: {:?}", error.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(
+                build.diagnostics().is_empty(),
+                "{case}: {:?}",
+                build.diagnostics()
+            );
+            let find = |name| {
+                prepared.project().modules[0]
+                    .items
+                    .iter()
+                    .position(|item| matches!(item, ScalarItem::Function(f) if f.name == name))
+                    .unwrap()
+            };
+            let make = find("make");
+            let bridge = find("bridge");
+            let leaf = find("leaf");
+            let result = prove(&build, 0, make);
+            match case {
+                "eligible" => assert_eq!(
+                    result
+                        .unwrap()
+                        .edges
+                        .iter()
+                        .map(|edge| (edge.from, edge.to))
+                        .collect::<Vec<_>>(),
+                    [
+                        ((0, make), Dependency::ScalarOnly((0, bridge))),
+                        ((0, bridge), Dependency::ScalarOnly((0, leaf)))
+                    ]
+                ),
+                "effect" => assert!(
+                    matches!(result, Err(Unproved::Unsupported(body, "release or indirect storage effect")) if body == (0, leaf)),
+                    "{target_layout:?}: {result:?}"
+                ),
+                _ => assert!(
+                    matches!(result, Err(Unproved::Unsupported(body, "wide helper output type")) if body == (0, bridge)),
+                    "{target_layout:?} {case}: {result:?}"
+                ),
+            }
+        }
     }
 }
 
@@ -620,7 +1015,10 @@ Packet(bool) make = fn(again) {{
                             .iter()
                             .map(|edge| (edge.from.1, edge.to))
                             .collect::<Vec<_>>(),
-                        [(make, (0, touch, 0)), (touch, (0, touch, 0))]
+                        [
+                            (make, Dependency::Backing((0, touch, 0))),
+                            (touch, Dependency::Backing((0, touch, 0)))
+                        ]
                     );
                 }
                 "helper effect" => assert!(
