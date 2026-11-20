@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use wosy_syntax::{ByteSpan, SourceIdentity};
 
 use crate::scalar::control::{
     BindingDefinition, CallableBodyCallNodes, CallablePointFacts, DirectDestinationIdentity,
@@ -9,10 +11,11 @@ use crate::scalar::control::{
 use crate::scalar::{
     CfgPointId, CfgPointKind, ConcreteCallSelection, CopyPolicy, CoreOperationId,
     ReferenceBindingId, ResolvedCallTarget, ScalarReferenceCfg, ScalarStructFieldId,
+    ScalarStructId,
 };
 use crate::{
     ScalarBlock, ScalarBlockItem, ScalarBuildValidation, ScalarExpression, ScalarFunction,
-    ScalarItem, ScalarPlace, ScalarType,
+    ScalarItem, ScalarPlace, ScalarStruct, ScalarType,
 };
 
 type Body = (usize, usize);
@@ -37,6 +40,7 @@ pub(super) struct Proof {
 pub(super) enum Unproved {
     Missing(Body, &'static str),
     Unsupported(Body, &'static str),
+    Definition(Body, CfgPointId, IndexFailure),
     Call(
         Body,
         CfgPointId,
@@ -45,8 +49,169 @@ pub(super) enum Unproved {
     ),
 }
 
-struct View<'a> {
+type SourceKey<'a> = (&'a str, &'a str, &'a str, &'a str);
+
+fn source_key(source: &SourceIdentity) -> SourceKey<'_> {
+    (
+        &source.project,
+        &source.package,
+        &source.path,
+        &source.revision,
+    )
+}
+
+fn span_key(span: ByteSpan) -> (u32, u32) {
+    (span.start, span.end)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IndexFailure {
+    Missing,
+    Ambiguous,
+}
+
+#[derive(Clone, Copy)]
+enum Indexed {
+    Unique((usize, usize)),
+    Ambiguous,
+}
+
+impl Indexed {
+    fn lookup(entry: Option<&Self>) -> Result<(usize, usize), IndexFailure> {
+        match entry {
+            Some(Self::Unique(location)) => Ok(*location),
+            Some(Self::Ambiguous) => Err(IndexFailure::Ambiguous),
+            None => Err(IndexFailure::Missing),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Work {
+    index_builds: usize,
+    modules: usize,
+    items: usize,
+    structs: usize,
+    definition_queries: usize,
+    struct_queries: usize,
+    helper_checks: usize,
+    dominance_walks: usize,
+    points: usize,
+    arcs: usize,
+    dominance_queries: usize,
+}
+
+pub(super) struct ProofBatch<'a> {
     build: &'a ScalarBuildValidation<'a>,
+    definitions: BTreeMap<SourceKey<'a>, BTreeMap<(u32, u32), Indexed>>,
+    structs: BTreeMap<SourceKey<'a>, BTreeMap<usize, Indexed>>,
+    #[cfg(test)]
+    work: std::cell::Cell<Work>,
+}
+
+impl<'a> ProofBatch<'a> {
+    pub(super) fn new(build: &'a ScalarBuildValidation<'a>) -> Self {
+        let mut batch = Self {
+            build,
+            definitions: BTreeMap::new(),
+            structs: BTreeMap::new(),
+            #[cfg(test)]
+            work: std::cell::Cell::new(Work {
+                index_builds: 1,
+                ..Work::default()
+            }),
+        };
+        for (m, module) in build.prepared().project().modules.iter().enumerate() {
+            #[cfg(test)]
+            batch.work.update(|mut work| {
+                work.modules += 1;
+                work
+            });
+            for (i, item) in module.items.iter().enumerate() {
+                #[cfg(test)]
+                batch.work.update(|mut work| {
+                    work.items += 1;
+                    work
+                });
+                if let ScalarItem::Function(function) = item {
+                    if function.generic_parameters.is_empty() && function.overload_arms.is_empty() {
+                        batch.insert_definition(&module.source, function.name_span, (m, i));
+                    }
+                }
+            }
+            for (i, structure) in module.structs.iter().enumerate() {
+                #[cfg(test)]
+                batch.work.update(|mut work| {
+                    work.structs += 1;
+                    work
+                });
+                batch.insert_struct(&structure.id, (m, i));
+            }
+        }
+        batch
+    }
+
+    fn insert_definition(&mut self, source: &'a SourceIdentity, span: ByteSpan, body: Body) {
+        self.definitions
+            .entry(source_key(source))
+            .or_default()
+            .entry(span_key(span))
+            .and_modify(|entry| *entry = Indexed::Ambiguous)
+            .or_insert(Indexed::Unique(body));
+    }
+
+    fn insert_struct(&mut self, id: &'a ScalarStructId, location: (usize, usize)) {
+        self.structs
+            .entry(source_key(&id.source))
+            .or_default()
+            .entry(id.index)
+            .and_modify(|entry| *entry = Indexed::Ambiguous)
+            .or_insert(Indexed::Unique(location));
+    }
+
+    fn definition(&self, source: &SourceIdentity, span: ByteSpan) -> Result<Body, IndexFailure> {
+        #[cfg(test)]
+        self.work.update(|mut work| {
+            work.definition_queries += 1;
+            work
+        });
+        Indexed::lookup(
+            self.definitions
+                .get(&source_key(source))
+                .and_then(|rows| rows.get(&span_key(span))),
+        )
+    }
+
+    fn structure(&self, id: &ScalarStructId) -> Result<&'a ScalarStruct, IndexFailure> {
+        #[cfg(test)]
+        self.work.update(|mut work| {
+            work.struct_queries += 1;
+            work
+        });
+        let (m, i) = Indexed::lookup(
+            self.structs
+                .get(&source_key(&id.source))
+                .and_then(|rows| rows.get(&id.index)),
+        )?;
+        Ok(&self.build.prepared().project().modules[m].structs[i])
+    }
+
+    fn dominates(&self, summary: &AllocationDominance, point: CfgPointId) -> bool {
+        #[cfg(test)]
+        self.work.update(|mut work| {
+            work.dominance_queries += 1;
+            work
+        });
+        summary.dominates(point)
+    }
+
+    pub(super) fn prove(&self, module: usize, item: usize) -> Result<Proof, Unproved> {
+        prove_in_batch(self, module, item)
+    }
+}
+
+struct View<'a> {
     body: Body,
     function: &'a ScalarFunction,
     nodes: CallableBodyCallNodes<'a>,
@@ -63,7 +228,6 @@ impl<'a> View<'a> {
             return None;
         };
         Some(Self {
-            build,
             body,
             function,
             nodes: build
@@ -193,7 +357,7 @@ fn scalar(ty: &ScalarType) -> bool {
 
 struct Trace<'a> {
     owner: &'a ReferenceBindingId,
-    allocation: CfgPointId,
+    dominance: AllocationDominance,
     field: ScalarStructFieldId,
     address: CfgPointId,
     literal: CfgPointId,
@@ -203,31 +367,12 @@ struct Trace<'a> {
     descriptor: &'a ReferenceBindingId,
 }
 
-fn trace<'a>(view: &'a View<'_>) -> Option<Trace<'a>> {
-    let ScalarType::Callable {
-        outputs,
-        parameters,
-    } = &view.function.signature
-    else {
-        return None;
-    };
-    if parameters.as_slice() != [ScalarType::U8] {
-        return None;
-    }
-    let [output] = outputs.outputs.as_slice() else {
-        return None;
-    };
-    let ScalarType::Struct(struct_id) = &output.ty else {
-        return None;
-    };
-    let structure = view
-        .build
-        .prepared()
-        .project()
-        .modules
-        .iter()
-        .flat_map(|m| &m.structs)
-        .find(|s| &s.id == struct_id)?;
+fn trace<'a>(
+    view: &'a View<'_>,
+    batch: &ProofBatch<'_>,
+    structure: &ScalarStruct,
+) -> Option<Trace<'a>> {
+    let struct_id = &structure.id;
     if structure.copy_policy != CopyPolicy::Move || structure.fields.len() != 2 {
         return None;
     }
@@ -276,8 +421,8 @@ fn trace<'a>(view: &'a View<'_>) -> Option<Trace<'a>> {
         };
         (bind == definition
             && view.eval(&binding.value) == Some(value)
-            && binding.declared_type == output.ty)
-            .then_some((value, fields))
+            && matches!(&binding.declared_type, ScalarType::Struct(id) if id == struct_id))
+        .then_some((value, fields))
     })?;
     let [first, second] = fields.as_slice() else {
         return None;
@@ -339,12 +484,18 @@ fn trace<'a>(view: &'a View<'_>) -> Option<Trace<'a>> {
         };
         (view.declaration(bind)? == owner && bytes(&binding.declared_type)).then_some(bind)
     })?;
-    if !dominates(view.cfg, allocation, address) || !dominates(view.cfg, allocation, result_read) {
+    let dominance = AllocationDominance::new(
+        view.cfg,
+        allocation,
+        #[cfg(test)]
+        &batch.work,
+    )?;
+    if !batch.dominates(&dominance, address) || !batch.dominates(&dominance, result_read) {
         return None;
     }
     Some(Trace {
         owner,
-        allocation,
+        dominance,
         field: field.id.clone(),
         address,
         literal,
@@ -385,14 +536,41 @@ pub(super) fn prove(
     module: usize,
     item: usize,
 ) -> Result<Proof, Unproved> {
+    ProofBatch::new(build).prove(module, item)
+}
+
+fn prove_in_batch(batch: &ProofBatch<'_>, module: usize, item: usize) -> Result<Proof, Unproved> {
+    let build = batch.build;
     let body = (module, item);
     if !build.diagnostics().is_empty() {
         return Err(Unproved::Missing(body, "validated body"));
     }
     let view = View::new(build, body).ok_or(Unproved::Missing(body, "producer body"))?;
-    let trace = trace(&view).ok_or(Unproved::Unsupported(body, "local allocation trace"))?;
+    let unsupported_trace = Unproved::Unsupported(body, "local allocation trace");
+    let ScalarType::Callable {
+        outputs,
+        parameters,
+    } = &view.function.signature
+    else {
+        return Err(unsupported_trace);
+    };
+    let [output] = outputs.outputs.as_slice() else {
+        return Err(unsupported_trace);
+    };
+    let ScalarType::Struct(id) = &output.ty else {
+        return Err(unsupported_trace);
+    };
+    if parameters.as_slice() != [ScalarType::U8] {
+        return Err(unsupported_trace);
+    }
+    let structure = batch.structure(id).map_err(|failure| match failure {
+        IndexFailure::Missing => Unproved::Missing(body, "result struct"),
+        IndexFailure::Ambiguous => Unproved::Unsupported(body, "ambiguous result struct"),
+    })?;
+    let trace = trace(&view, batch, structure).ok_or(unsupported_trace)?;
     let mut edges = Vec::new();
     Uses {
+        batch,
         view: &view,
         owner: trace.owner,
         trace: Some(&trace),
@@ -407,6 +585,11 @@ pub(super) fn prove(
         if !visited.insert((m, i, parameter)) {
             continue;
         }
+        #[cfg(test)]
+        batch.work.update(|mut work| {
+            work.helper_checks += 1;
+            work
+        });
         let body = (m, i);
         let helper = View::new(build, body).ok_or(Unproved::Missing(body, "helper body"))?;
         let (owner, ty) = helper
@@ -430,6 +613,7 @@ pub(super) fn prove(
             return Err(Unproved::Unsupported(body, "helper signature"));
         }
         Uses {
+            batch,
             view: &helper,
             owner,
             trace: None,
@@ -446,6 +630,7 @@ pub(super) fn prove(
 }
 
 struct Uses<'a, 'b> {
+    batch: &'a ProofBatch<'b>,
     view: &'a View<'b>,
     owner: &'a ReferenceBindingId,
     trace: Option<&'a Trace<'a>>,
@@ -716,7 +901,7 @@ impl Uses<'_, '_> {
                     return Err(self.unsupported("nonunique or untyped backing actual"));
                 }
                 if let Some(trace) = self.trace {
-                    if !dominates(view.cfg, trace.allocation, *point) {
+                    if !self.batch.dominates(&trace.dominance, *point) {
                         return Err(self.unsupported("backing definition at call"));
                     }
                 }
@@ -740,34 +925,10 @@ impl Uses<'_, '_> {
                 },
                 Some(parameter),
             ) => {
-                let mut targets =
-                    view.build
-                        .prepared()
-                        .project()
-                        .modules
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, m)| &m.source == source)
-                        .flat_map(|(m, module)| {
-                            module.items.iter().enumerate().filter_map(
-                                move |(i, item)| match item {
-                                    ScalarItem::Function(f)
-                                        if f.name_span == *declaration_span
-                                            && f.generic_parameters.is_empty()
-                                            && f.overload_arms.is_empty() =>
-                                    {
-                                        Some((m, i))
-                                    }
-                                    _ => None,
-                                },
-                            )
-                        });
-                let (m, i) = targets
-                    .next()
-                    .ok_or(self.missing("direct concrete helper"))?;
-                if targets.next().is_some() {
-                    return Err(self.unsupported("ambiguous helper"));
-                }
+                let (m, i) = self
+                    .batch
+                    .definition(source, *declaration_span)
+                    .map_err(|failure| Unproved::Definition(view.body, site, failure))?;
                 self.edges.push(Edge {
                     from: view.body,
                     site,
@@ -788,26 +949,82 @@ impl Uses<'_, '_> {
     }
 }
 
-fn dominates(cfg: &ScalarReferenceCfg, definition: CfgPointId, use_point: CfgPointId) -> bool {
-    let mut seen = BTreeSet::new();
-    let mut work = vec![CfgPointId(0)];
-    let mut reached_definition = false;
-    while let Some(id) = work.pop() {
-        if id == definition {
-            reached_definition = true;
-            continue;
-        }
-        if id == use_point {
-            return false;
-        }
-        if seen.insert(id) {
-            let Some(point) = cfg.points.get(id.0) else {
-                return false;
-            };
-            work.extend(&point.successors);
+struct AllocationDominance {
+    allocation: CfgPointId,
+    reachable: Vec<bool>,
+    bypass: Vec<bool>,
+}
+
+impl AllocationDominance {
+    fn new(
+        cfg: &ScalarReferenceCfg,
+        allocation: CfgPointId,
+        #[cfg(test)] work: &std::cell::Cell<Work>,
+    ) -> Option<Self> {
+        let reachable = walk(
+            cfg,
+            None,
+            #[cfg(test)]
+            work,
+        )?;
+        let bypass = walk(
+            cfg,
+            Some(allocation),
+            #[cfg(test)]
+            work,
+        )?;
+        Some(Self {
+            allocation,
+            reachable,
+            bypass,
+        })
+    }
+
+    fn dominates(&self, use_point: CfgPointId) -> bool {
+        self.reachable.get(self.allocation.0) == Some(&true)
+            && use_point != self.allocation
+            && self.reachable.get(use_point.0) == Some(&true)
+            && self.bypass.get(use_point.0) == Some(&false)
+    }
+}
+
+fn walk(
+    cfg: &ScalarReferenceCfg,
+    cut: Option<CfgPointId>,
+    #[cfg(test)] counters: &std::cell::Cell<Work>,
+) -> Option<Vec<bool>> {
+    #[cfg(test)]
+    counters.update(|mut work| {
+        work.dominance_walks += 1;
+        work
+    });
+    let mut reached = vec![false; cfg.points.len()];
+    let entry = CfgPointId(0);
+    if cut == Some(entry) {
+        return Some(reached);
+    }
+    *reached.first_mut()? = true;
+    let mut pending = vec![entry];
+    while let Some(id) = pending.pop() {
+        #[cfg(test)]
+        counters.update(|mut work| {
+            work.points += 1;
+            work
+        });
+        for &next in &cfg.points[id.0].successors {
+            #[cfg(test)]
+            counters.update(|mut work| {
+                work.arcs += 1;
+                work
+            });
+            let visited = reached.get_mut(next.0)?;
+            if !*visited && cut != Some(next) {
+                *visited = true;
+                pending.push(next);
+            }
         }
     }
-    reached_definition
+    Some(reached)
 }
 
 #[cfg(test)]
