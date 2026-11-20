@@ -1705,8 +1705,6 @@ fn insert_function_result_provenance(
     );
 }
 
-mod formatter_consumer_closure;
-mod formatter_proof;
 mod ownership;
 use ownership::{
     binding_receivers, checked_call_owners, dynamic_return_outputs, dynamic_return_owner,
