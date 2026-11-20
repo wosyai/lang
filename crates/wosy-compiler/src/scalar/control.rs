@@ -13,7 +13,8 @@ pub(crate) use super::reference::{
     DirectDestinationIdentity, NamedPlaceRootIdentity, PlainNameIdentity,
 };
 pub(crate) use initializer_call_nodes::{
-    BoundInitializerMember, CallableBodyCallNodes, InitializerCallNodes,
+    BoundInitializerMember, CallableBodyCallNodes, InitializerCallNodes, InitializerFacts,
+    InitializerFactsError,
 };
 
 #[derive(Default)]
