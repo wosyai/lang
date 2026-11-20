@@ -458,7 +458,7 @@ fn pointer(ty: &T) -> T {
 // Each protocol walk consumes every point once in the canonical construction
 // order. The frontier records independently required successors, including
 // both ordered branch successors and the shared merge.
-struct Trace<'a, 'b> {
+pub(super) struct Trace<'a, 'b> {
     body: &'b CallableBody<'a>,
     cursor: usize,
     tail: Option<CfgPointId>,
@@ -467,7 +467,7 @@ struct Trace<'a, 'b> {
 }
 
 impl<'a, 'b> Trace<'a, 'b> {
-    fn new(body: &'b CallableBody<'a>, block: &ScalarBlock) -> PResult<Self> {
+    pub(super) fn new(body: &'b CallableBody<'a>, block: &ScalarBlock) -> PResult<Self> {
         let mut trace = Self {
             body,
             cursor: 0,
@@ -553,7 +553,7 @@ impl<'a, 'b> Trace<'a, 'b> {
         Ok(id)
     }
 
-    fn evaluate(&mut self, expr: &E, ty: Option<&T>) -> PResult<CfgPointId> {
+    pub(super) fn evaluate(&mut self, expr: &E, ty: Option<&T>) -> PResult<CfgPointId> {
         self.value(
             expr,
             ty,
@@ -561,7 +561,7 @@ impl<'a, 'b> Trace<'a, 'b> {
         )
     }
 
-    fn integer(&mut self, expr: &E, ty: &T, expected: u64) -> PResult<CfgPointId> {
+    pub(super) fn integer(&mut self, expr: &E, ty: &T, expected: u64) -> PResult<CfgPointId> {
         need(
             matches!(expr, E::Integer { value, .. } if value == &expected.into()),
             "print integer",
@@ -577,7 +577,12 @@ impl<'a, 'b> Trace<'a, 'b> {
         self.evaluate(expr, Some(&T::Bool))
     }
 
-    fn read(&mut self, expr: &E, ty: &T, identity: &ReferenceBindingId) -> PResult<CfgPointId> {
+    pub(super) fn read(
+        &mut self,
+        expr: &E,
+        ty: &T,
+        identity: &ReferenceBindingId,
+    ) -> PResult<CfgPointId> {
         need(
             matches!(expr, E::Name { .. })
                 && matches!(self.body.nodes.plain_name(expr), Some(PlainNameIdentity::Lexical(id)) if id == identity),
@@ -634,7 +639,7 @@ impl<'a, 'b> Trace<'a, 'b> {
         self.evaluate(expr, Some(&pointer(ty)))
     }
 
-    fn call(
+    pub(super) fn call(
         &mut self,
         expr: &E,
         ty: &T,
@@ -704,7 +709,7 @@ impl<'a, 'b> Trace<'a, 'b> {
         self.evaluate(expr, Some(&T::Bool))
     }
 
-    fn bind(
+    pub(super) fn bind(
         &mut self,
         item: &I,
         ty: &T,
@@ -837,6 +842,19 @@ impl<'a, 'b> Trace<'a, 'b> {
         self.edges(branch, &[then_start, else_start])?;
         let join = self.point(Some(*span), |kind| matches!(kind, K::Join))?;
         self.edges(then_end, &[join])
+    }
+
+    pub(super) fn finish_unit(mut self, root: &ScalarBlock) -> PResult<()> {
+        need(
+            !root.unsafe_context && root.final_output_values.is_empty(),
+            "nested unit final outputs",
+        )?;
+        let exit = self.point(Some(root.span), |kind| matches!(kind, K::ScopeExit))?;
+        self.edges(exit, &[])?;
+        need(
+            self.cursor == self.body.cfg.points.len() && self.body.cfg.allocations.is_empty(),
+            "nested unclassified CFG effect",
+        )
     }
 
     fn finish(mut self, root: &ScalarBlock, outputs: &[(&E, CfgPointId)]) -> PResult<()> {
