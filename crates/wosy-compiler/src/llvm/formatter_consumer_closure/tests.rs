@@ -52,6 +52,76 @@ fn cfg_with(
     }
 }
 
+fn exercise_u8_nested_cfg_controls(
+    ledger: &Ledger<'_>,
+    caller: &CallableBody<'_>,
+    nested: &nested_caller::U8NestedCallerOpen<'_>,
+) {
+    let body = |cfg| CallableBody {
+        cfg,
+        ..ledger.body(caller.entry.id.body, None).unwrap()
+    };
+    let argument_is_not_output = cfg_with(caller.cfg, |points| {
+        let CfgPointKind::Call {
+            argument_points, ..
+        } = &mut points[nested.consuming.point.0].kind
+        else {
+            unreachable!()
+        };
+        argument_points[0] = nested.formatting.actuals[0].point;
+    });
+    assert!(matches!(
+        ledger.u8_nested_caller_open(&body(&argument_is_not_output)),
+        Err(Rejected::Contradictory("ordered actual slot"))
+    ));
+    let foreign_site = cfg_with(caller.cfg, |points| {
+        points[nested.formatting.point.0]
+            .source_span
+            .source
+            .revision
+            .push_str("-foreign");
+    });
+    assert!(matches!(
+        ledger.u8_nested_caller_open(&body(&foreign_site)),
+        Err(Rejected::Contradictory("body call identity"))
+    ));
+    let wrong_scope = cfg_with(caller.cfg, |points| {
+        points[nested.formatting.point.0].scope = ReferenceScopeId(1);
+    });
+    assert!(matches!(
+        ledger.u8_nested_caller_open(&body(&wrong_scope)),
+        Err(Rejected::Contradictory("print CFG point"))
+    ));
+    let reroute = cfg_with(caller.cfg, |points| {
+        points[nested.formatting.point.0].successors = vec![nested.markers[1].point];
+    });
+    assert!(matches!(
+        ledger.u8_nested_caller_open(&body(&reroute)),
+        Err(Rejected::Contradictory("print CFG order"))
+    ));
+    let swapped_marker_slots = cfg_with(caller.cfg, |points| {
+        let CfgPointKind::Call {
+            argument_points, ..
+        } = &mut points[nested.markers[1].point.0].kind
+        else {
+            unreachable!()
+        };
+        argument_points.swap(2, 3);
+    });
+    assert!(matches!(
+        ledger.u8_nested_caller_open(&body(&swapped_marker_slots)),
+        Err(Rejected::Contradictory("print CFG point"))
+    ));
+    let mut detached = cfg_with(caller.cfg, |_| {});
+    let mut event = detached.points[nested.markers[0].point.0].clone();
+    event.id = CfgPointId(detached.points.len());
+    detached.points.push(event);
+    assert!(matches!(
+        ledger.u8_nested_caller_open(&body(&detached)),
+        Err(Rejected::Contradictory("nested unclassified CFG effect"))
+    ));
+}
+
 fn exercise_finite_print(
     ledger: &Ledger<'_>,
     print: &CallableBody<'_>,
@@ -286,7 +356,44 @@ std.print("noise");
 std.print(interrupted);
 std.utf8 wrong_target = std.format(tiny);
 std.eprint(wrong_target);
+observer = extern wasm "fixture_discard" { unit(i32, i32, *?u8, *?u8) checkpoint; };
+unit() other_arm = fn {
+    observer.checkpoint(0, 0, null, null);
+    u16 source = 203;
+    std.print(std.format(source));
+    observer.checkpoint(1, 0, null, null);
+    observer.checkpoint(2, 0, null, null);
+};
+unit() reused_value = fn {
+    observer.checkpoint(0, 0, null, null);
+    u8 source = 203;
+    std.utf8 text = std.format(source);
+    std.print(text);
+    observer.checkpoint(1, 0, null, null);
+    observer.checkpoint(2, 0, null, null);
+};
+unit() alternate_print = fn {
+    observer.checkpoint(0, 0, null, null);
+    u8 source = 203;
+    std.eprint(std.format(source));
+    observer.checkpoint(1, 0, null, null);
+    observer.checkpoint(2, 0, null, null);
+};
 %%end"#;
+    let nested_observer_text = r#"%%start
+std = namespace std "bootstrap.w";
+observer = extern wasm "fixture_discard" { unit(i32, i32, *?u8, *?u8) checkpoint; };
+unit() run = fn {
+    observer.checkpoint(0, 0, null, null);
+    u8 source = 203;
+    std.print(std.format(source));
+    observer.checkpoint(1, 0, null, null);
+    observer.checkpoint(2, 0, null, null);
+};
+run();
+observer.checkpoint(6, 0, null, null);
+%%end
+"#;
     let mut accepted_mutations = Vec::new();
     let mut accepted_assignment_mutations = Vec::new();
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
@@ -297,14 +404,16 @@ std.eprint(wrong_target);
         let preview = source("std", "src/wasi/preview1.w");
         let app = source("app", "app.w");
         let fixture = source("app", "fixture.w");
+        let nested_fixture = source("production_discard", "src/main.w");
         let prepared = prepare_scalar_project(
             vec![
                 (declarations(&std, include_str!("../../../../../stdlib/src/bootstrap.w")), vec![namespace("preview1", &preview)]),
                 (declarations(&preview, include_str!("../../../../../stdlib/src/wasi/preview1.w")), Vec::new()),
                 (declarations(&app, app_text), vec![namespace("std", &std)]),
                 (declarations(&fixture, include_str!("../../../../../tests/fixtures/build/u128_libcall/project/src/format_u128.w")), vec![namespace("std", &std)]),
+                (declarations(&nested_fixture, nested_observer_text), vec![namespace("std", &std)]),
             ],
-            vec![std.clone(), preview.clone(), app.clone(), fixture.clone()],
+            vec![std.clone(), preview.clone(), app.clone(), fixture.clone(), nested_fixture.clone()],
             ScalarPreparationInputs { target_layout },
         ).unwrap_or_else(|e| panic!("{target_layout:?} prep: {:?}", e.diagnostics));
         let build = analyze_scalar_build(&prepared);
@@ -340,6 +449,33 @@ std.eprint(wrong_target);
         );
         let app_mod = &prepared.project().modules[a];
         let at = |name| (a, function(app_mod, name));
+        let n = module(&nested_fixture);
+        let run = ledger
+            .body((n, function(&prepared.project().modules[n], "run")), None)
+            .unwrap();
+        let nested = ledger.u8_nested_caller_open(&run).unwrap();
+        assert_eq!(nested.caller.source, nested_fixture);
+        assert_eq!(nested.print.target_layout, target_layout);
+        assert_eq!(
+            nested.markers.each_ref().map(|marker| marker.number),
+            [0, 1, 2]
+        );
+        assert_eq!(nested.markers[0].declaration.source.source, nested_fixture);
+        assert_eq!(nested.markers[0].declaration.member, "checkpoint");
+        assert_eq!(nested.consuming.actuals[0].point, nested.formatting.point);
+        assert_eq!(nested.formatting.target, nested.forwarded.entry);
+        assert!(matches!(&nested.forwarded.evidence,
+            Certificate::Forwarded { target, .. } if target == &nested.producer.entry));
+        exercise_u8_nested_cfg_controls(&ledger, &run, &nested);
+        for (candidate, cause) in [
+            ("other_arm", "nested selected U8 arm"),
+            ("reused_value", "nested caller exact root"),
+            ("alternate_print", "print selected entry"),
+        ] {
+            let candidate = ledger.body(at(candidate), None).unwrap();
+            assert!(matches!(ledger.u8_nested_caller_open(&candidate),
+                Err(Rejected::Contradictory(actual)) if actual == cause));
+        }
         let pair = |module: usize, name: &str, distance: usize| {
             let items = &prepared.project().modules.get(module).unwrap().items;
             let (i, binding) = items
@@ -488,6 +624,11 @@ std.eprint(wrong_target);
         );
 
         let other_build = analyze_scalar_build(&prepared);
+        let other_nested_ledger = Ledger::new(&other_build).unwrap();
+        assert!(matches!(
+            other_nested_ledger.u8_nested_caller_open(&run),
+            Err(Rejected::Contradictory("nested caller artifact provenance"))
+        ));
         let other_ledger = Ledger::new(&other_build).unwrap();
         let foreign_body = other_ledger.body(at("wrap"), None).unwrap();
         assert!(matches!(
