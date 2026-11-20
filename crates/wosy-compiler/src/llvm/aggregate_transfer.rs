@@ -64,6 +64,10 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
 }
 
 impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
+    pub(super) fn same_array_rebind(&self, ordinal: usize) -> bool {
+        self.plan.same_array_rebinds.contains(&ordinal)
+    }
+
     pub(super) fn new(
         plan: Option<&'plan ClosedBody>,
         definition: FunctionValue<'ctx>,

@@ -1092,6 +1092,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let mut argument_points = Vec::new();
                 let signature = calls.checked_call_signatures.get(&ordinal);
                 let mut aggregate_arguments = BTreeMap::new();
+                let mut array_argument = None;
                 let mut raw_arguments = Vec::new();
                 for (position, argument) in arguments.iter().enumerate() {
                     let ordinal =
@@ -1140,6 +1141,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let parameter = signature.and_then(|signature| signature.parameters.get(position));
                     if matches!(parameter, Some(ScalarType::RawPointer(_))) {
                         raw_arguments.push(position);
+                    }
+                    if position == 0 && matches!(parameter, Some(ScalarType::RuntimeArray { .. })) {
+                        array_argument = self.cursor.filter(|point| Some(*point) != read)
+                            .and_then(|point| match &self.cfg.points[point.0].kind {
+                                CfgPointKind::Move { place, ty, owner }
+                                    if place.projections.is_empty() && &place.binding == owner
+                                        && parameter.is_some_and(|parameter| aggregate::same_runtime_array_type(ty, parameter)) =>
+                                    Some((point, owner.clone())),
+                                _ => None,
+                            });
                     }
                     if matches!(parameter, Some(ScalarType::Struct(_))) {
                         let whole_move = self.cursor.filter(|moved| {
@@ -1293,7 +1304,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             }]
                         )
                     });
+                let array_call = array_argument.is_some() && matches!(&calls.named_place_roots, NamedPlaceRootFacts::Prepared(_))
+                    && matches!(&call, CfgPointKind::Call {
+                    target: ResolvedCallTarget::ModuleCallable { .. }, ..
+                }) && signature.is_some_and(|signature| {
+                    aggregate::array_roundtrip_signature(&signature.parameters, &signature.outputs)
+                });
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
+                if let Some((moved, binding)) = array_argument.filter(|_| array_call) {
+                    self.aggregate_facts.array_calls.insert(id, (ordinal, moved, binding));
+                }
                 if carries_struct_result {
                     self.aggregate_facts.calls.insert(id, ordinal);
                 }
@@ -1481,7 +1501,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     BTreeSet::new(),
                 );
                 if !self.aggregate_facts.allocations.is_empty() || !self.aggregate_facts.plain_literals.is_empty()
-                    || !self.aggregate_facts.formals.is_empty() || !self.aggregate_facts.raw_formals.is_empty() {
+                    || !self.aggregate_facts.formals.is_empty() || !self.aggregate_facts.raw_formals.is_empty()
+                    || self.aggregate_facts.array_formal.is_some() {
                     let root = self.place_root(place, place_ordinal);
                     if let ScalarPlace::Name { span, .. } = root.place {
                         if let Some(PreparedPlaceRoot::Lexical(binding)) =
@@ -1492,6 +1513,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             }
                             if !self.aggregate_facts.formals.is_empty() || !self.aggregate_facts.raw_formals.is_empty() {
                                 self.aggregate_facts.raw_addresses.insert(value, (binding.clone(), matches!(place, ScalarPlace::Name { .. })));
+                            }
+                            if self.aggregate_facts.array_formal.as_ref() == Some(binding) {
+                                self.aggregate_result.array_invalid = true;
                             }
                             if let Some(&base) = self.aggregate_facts.allocations.get(binding) {
                                 self.aggregate_facts.views.insert(value, base);
@@ -2949,6 +2973,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let value_point = self.cursor.expect("evaluated output expression");
                     self.move_value(expression, scope, ordinal)?;
                     if let BlockItemKind::FinalOutput(slot) = kind {
+                        if scope == ReferenceScopeId(0) && slot.output == 0
+                            && self.aggregate_facts.array_formal.is_some()
+                        {
+                            self.aggregate_facts.array_return_move = self.cursor.filter(|moved| *moved != value_point);
+                        }
                         let ty = if scope == ReferenceScopeId(0) {
                             &calls.boundary.root_outputs[slot.output].ty
                         } else {
@@ -3005,9 +3034,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     } else {
                         None
                     };
+                    let mut array_rebind = None;
+                    let mut simple_destinations = assignment.values.len() == 1
+                        && values.first().is_some_and(|(_, rhs)| self.aggregate_facts.array_calls.contains_key(rhs));
                     for ((slot, (value, rhs_point)), destination) in
                         group.installs().zip(values).zip(destinations)
                     {
+                        simple_destinations &= matches!(&destination, ReferenceAssignmentDestination::PreparedName(DirectDestinationIdentity::Existing(_)));
                         let position = slot.position;
                         let target = &assignment.targets[position];
                         if let ScalarPlace::Name { name, span } = &target.place {
@@ -3185,6 +3218,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 }
                             }
                         }
+                        let install = self.cursor.expect("assignment install point");
+                        if simple_destinations && position == 0 && self.aggregate_facts.array_calls.get(&rhs_point)
+                            .is_some_and(|(_, _, binding)| matches!(&self.cfg.points[install.0].kind,
+                                CfgPointKind::Assign { target, rhs_point: actual, .. }
+                                    if *actual == rhs_point && target.projections.is_empty() && target.binding == *binding))
+                        {
+                            array_rebind = Some(install);
+                        }
                         self.record_frozen_install(slot.destination, rhs_point);
                         if let Some(capture) = capture {
                             let install = self.cursor.expect("assignment install point");
@@ -3195,6 +3236,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             };
                             writes.push(install);
                         }
+                    }
+                    if let Some(install) = array_rebind.filter(|_| simple_destinations) {
+                        self.aggregate_facts.array_installs.insert(install);
                     }
                     let continuation = group.continuation();
                     assert_eq!(
@@ -8274,6 +8318,12 @@ fn build_function_reference_cfg(
         builder
             .binding_types
             .insert(builder.names[name].clone(), ty.clone());
+        if slot.ordinal == 0 && matches!(&call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(_))
+            && matches!(&function.signature, ScalarType::Callable { parameters, outputs }
+            if aggregate::array_roundtrip_signature(parameters, outputs))
+        {
+            builder.aggregate_facts.array_formal = Some(builder.names[name].clone());
+        }
         if let ScalarType::Struct(id) = ty {
             builder.aggregate_facts.formals.insert(slot.ordinal, builder.names[name].clone());
             if let Some(declaration) = builder.structs.iter().find(|structure| &structure.id == id) {
@@ -8378,6 +8428,11 @@ fn build_function_reference_cfg(
     if builder.independent_checked_query {
         aggregate.checked_successor_candidate = aggregate.formal_forward.map(|(_, point, _, _)| point);
     }
+    if !errors.is_empty() || !prior_children_succeeded {
+        aggregate.array_returns.clear();
+        aggregate.array_rebinds.clear();
+    }
+    aggregate.array_calls = builder.aggregate_facts.array_calls;
     aggregate.checked_result_origins = builder.checked_result_origins;
     aggregate.allocation_slots = builder.aggregate_facts.allocation_slots;
     aggregate.calls = builder.aggregate_facts.calls;

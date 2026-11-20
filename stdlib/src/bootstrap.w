@@ -100,7 +100,7 @@ ReadLineStatus(u64, u64, ReadLineStatus) _read_line_capacity_status = fn(length,
 	if (length >= maximum) { ReadLineStatus::limit_exceeded } else { status }
 };
 
-ReadLineStatus(u8[], u64, ReadLineStatus) _read_line_utf8_status = fn(bytes, length, status) {
+(u8[], u64, u8, u8, ReadLineStatus)(u8[], u64, ReadLineStatus, u64, u8, u8) _read_line_utf8_step = fn(bytes, index, result, remaining, next_minimum, next_maximum) {
 	u64 zero = core.int_extend<u64>(0);
 	u64 one = core.int_extend<u64>(1);
 	u8 continuation_minimum = 128;
@@ -113,37 +113,44 @@ ReadLineStatus(u8[], u64, ReadLineStatus) _read_line_utf8_status = fn(bytes, len
 	u8 ed = 237;
 	u8 f0 = 240;
 	u8 f4 = 244;
-	u64 index = zero;
-	u64 remaining = zero;
-	u8 next_minimum = continuation_minimum;
-	u8 next_maximum = continuation_maximum;
-	ReadLineStatus result = status;
-	while (index < length) {
-		u8 byte = bytes[index];
-		if (remaining != zero) {
-			if (byte < next_minimum || byte > next_maximum) { result = ReadLineStatus::invalid_utf8; };
-			remaining = remaining - one;
-			next_minimum = continuation_minimum;
-			next_maximum = continuation_maximum;
-		} else {
-			if (byte >= continuation_minimum && byte < two_byte_minimum) { result = ReadLineStatus::invalid_utf8; };
-			if (byte >= two_byte_minimum && byte < three_byte_minimum) { remaining = one; };
-			if (byte >= three_byte_minimum && byte < four_byte_minimum) {
-				remaining = core.int_extend<u64>(2);
-				if (byte == e0) { next_minimum = 160; };
-				if (byte == ed) { next_maximum = 159; };
-			};
-			if (byte >= four_byte_minimum && byte <= four_byte_limit) {
-				remaining = core.int_extend<u64>(3);
-				if (byte == f0) { next_minimum = 144; };
-				if (byte == f4) { next_maximum = 143; };
-			};
-			if (byte > four_byte_limit) { result = ReadLineStatus::invalid_utf8; };
+	u8 byte = bytes[index];
+	if (remaining != zero) {
+		if (byte < next_minimum || byte > next_maximum) { result = ReadLineStatus::invalid_utf8; };
+		remaining = remaining - one;
+		next_minimum = continuation_minimum;
+		next_maximum = continuation_maximum;
+	} else {
+		if (byte >= continuation_minimum && byte < two_byte_minimum) { result = ReadLineStatus::invalid_utf8; };
+		if (byte >= two_byte_minimum && byte < three_byte_minimum) { remaining = one; };
+		if (byte >= three_byte_minimum && byte < four_byte_minimum) {
+			remaining = core.int_extend<u64>(2);
+			if (byte == e0) { next_minimum = 160; };
+			if (byte == ed) { next_maximum = 159; };
 		};
-		index = index + one;
-	}
-	if (remaining != zero) { result = ReadLineStatus::invalid_utf8; };
-	result
+		if (byte >= four_byte_minimum && byte <= four_byte_limit) {
+			remaining = core.int_extend<u64>(3);
+			if (byte == f0) { next_minimum = 144; };
+			if (byte == f4) { next_maximum = 143; };
+		};
+		if (byte > four_byte_limit) { result = ReadLineStatus::invalid_utf8; };
+	};
+	bytes, remaining, next_minimum, next_maximum, result
+};
+
+(u8[], u64, u8, u8, ReadLineStatus)(u8[], u64, u64, u64, u8, u8, ReadLineStatus) _read_line_utf8_range = fn(bytes, low, high, remaining, minimum, maximum, status) {
+	u64 one = core.int_extend<u64>(1);
+	if (low < high) {
+		u64 count = high - low;
+		if (count == one) {
+			bytes, remaining, minimum, maximum, status = _read_line_utf8_step(bytes, low, status, remaining, minimum, maximum);
+		} else {
+			u64 two = core.int_extend<u64>(2);
+			u64 middle = low + count / two;
+			bytes, remaining, minimum, maximum, status = _read_line_utf8_range(bytes, low, middle, remaining, minimum, maximum, status);
+			bytes, remaining, minimum, maximum, status = _read_line_utf8_range(bytes, middle, high, remaining, minimum, maximum, status);
+		};
+	};
+	bytes, remaining, minimum, maximum, status
 };
 
 i32(*!u8) _read_line_discard_step = fn(view) {
@@ -171,35 +178,72 @@ ReadLineStatus() _read_line_discard = fn {
 	if (outcome == 2) { ReadLineStatus::io_error } else { ReadLineStatus::limit_exceeded }
 };
 
-(*utf8, ReadLineStatus)(u64, u8, bool) _read_line_allocated = fn(max_bytes, first, pending_cr) {
+(u8[], u64, bool, bool, ReadLineStatus)(u8[], *!u8, u64, u64, bool, bool, ReadLineStatus) _read_line_allocated_step = fn(bytes, view, max_bytes, length, pending_cr, reading, status) {
 	u64 zero = core.int_extend<u64>(0);
 	u64 one = core.int_extend<u64>(1);
 	u8 lf = 10;
 	u8 cr = 13;
+	u64 count = zero;
+	bool complete = false;
+	unsafe { count, complete = read_into(&?*view, one); };
+	if (!complete) { status = ReadLineStatus::io_error; reading = false; };
+	if (complete && count == zero) { reading = false; };
+	if (complete && count != zero && *view == lf) { pending_cr = false; reading = false; };
+	if (complete && count != zero && *view != lf && pending_cr) {
+		status = _read_line_capacity_status(length, max_bytes, status);
+		if (length < max_bytes) { bytes[length] = cr; length = length + one; };
+	};
+	if (complete && count != zero && *view != lf) { pending_cr = *view == cr; };
+	if (complete && count != zero && *view != lf && *view != cr) {
+		status = _read_line_capacity_status(length, max_bytes, status);
+		if (length < max_bytes) { bytes[length] = *view; length = length + one; };
+	};
+	if (status == ReadLineStatus::limit_exceeded) { reading = false; };
+	bytes, length, pending_cr, reading, status
+};
+
+(u8[], u64, bool, bool, ReadLineStatus)(u8[], *!u8, u64, u64, u64, bool, bool, ReadLineStatus) _read_line_allocated_range = fn(bytes, view, max_bytes, budget, length, pending_cr, reading, status) {
+	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
+	if (budget != zero && reading) {
+		if (budget == one) {
+			bytes, length, pending_cr, reading, status = _read_line_allocated_step(bytes, view, max_bytes, length, pending_cr, reading, status);
+		} else {
+			u64 two = core.int_extend<u64>(2);
+			u64 left = budget / two;
+			bytes, length, pending_cr, reading, status = _read_line_allocated_range(bytes, view, max_bytes, left, length, pending_cr, reading, status);
+			if (reading) {
+				bytes, length, pending_cr, reading, status = _read_line_allocated_range(bytes, view, max_bytes, budget - left, length, pending_cr, reading, status);
+			};
+		};
+	};
+	bytes, length, pending_cr, reading, status
+};
+
+(*utf8, ReadLineStatus)(u64, u8, bool) _read_line_allocated = fn(max_bytes, first, pending_cr) {
+	u64 zero = core.int_extend<u64>(0);
+	u64 one = core.int_extend<u64>(1);
 	u8[1] scratch = [0];
 	u8[max_bytes] bytes;
 	u64 length = zero;
 	bool reading = true;
 	ReadLineStatus status = ReadLineStatus::line;
 	if (!pending_cr) { bytes[length] = first; length = length + one; };
-	while (reading) {
-		u64 count = zero;
-		bool complete = false;
-		unsafe { count, complete = read_into(&?scratch[0], one); };
-		if (!complete) { status = ReadLineStatus::io_error; reading = false; };
-		if (complete && count == zero) { reading = false; };
-		if (complete && count != zero && scratch[0] == lf) { pending_cr = false; reading = false; };
-		if (complete && count != zero && scratch[0] != lf && pending_cr) {
-			status = _read_line_capacity_status(length, max_bytes, status);
-			if (length < max_bytes) { bytes[length] = cr; length = length + one; };
-		};
-		if (complete && count != zero && scratch[0] != lf) { pending_cr = scratch[0] == cr; };
-		if (complete && count != zero && scratch[0] != lf && scratch[0] != cr) {
-			status = _read_line_capacity_status(length, max_bytes, status);
-			if (length < max_bytes) { bytes[length] = scratch[0]; length = length + one; };
-		};
-	}
-	if (status == ReadLineStatus::line) { status = _read_line_utf8_status(bytes, length, status); };
+	u64 two = core.int_extend<u64>(2);
+	*!u8 view = &!scratch[0];
+	bytes, length, pending_cr, reading, status = _read_line_allocated_range(bytes, view, max_bytes, max_bytes + two, length, pending_cr, reading, status);
+	if (status == ReadLineStatus::limit_exceeded) {
+		i32 first_outcome = _read_line_discard_step(view);
+		i32 outcome = _read_line_discard_continue(view, first_outcome);
+		if (outcome == 2) { status = ReadLineStatus::io_error; };
+	};
+	if (status == ReadLineStatus::line) {
+		u64 remaining = zero;
+		u8 minimum = 128;
+		u8 maximum = 191;
+		bytes, remaining, minimum, maximum, status = _read_line_utf8_range(bytes, zero, length, remaining, minimum, maximum, status);
+		if (remaining != zero) { status = ReadLineStatus::invalid_utf8; };
+	};
 	if (status == ReadLineStatus::line) {
 		*?u8 data = null;
 		if (length != zero) { unsafe { data = &?bytes[0]; }; };
