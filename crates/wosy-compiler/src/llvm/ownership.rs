@@ -684,6 +684,9 @@ pub(super) fn transfer_runtime_array_return(
     ty: &ScalarType,
 ) {
     if !matches!(ty, ScalarType::RuntimeArray { .. }) {
+        if super::aggregate_transfer::holds_registered_return(state) {
+            return;
+        }
         let mut bindings = state.return_bindings.clone();
         bindings.extend(return_bindings(block));
         let mut visited = BTreeSet::new();

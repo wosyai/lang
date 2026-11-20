@@ -87,6 +87,8 @@ enum EmitValue<'ctx> {
 
 struct EmitState<'ctx, 'module> {
     prepared_render: bool,
+    aggregate: Option<aggregate_transfer::AggregateEmitter<'ctx, 'module>>,
+    initializer_aggregate: Option<aggregate_transfer::InitializerEmitter<'ctx, 'module>>,
     initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
     body_call_nodes: Option<&'module CallableBodyCallNodes<'module>>,
     initializer_symbols: Option<&'module InitializerSymbols>,
@@ -288,6 +290,7 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         &program.layouts,
         program.target_layout,
         GenericInitializerInput::RawStandalone(&prepared),
+        &|reservations| prepared.aggregate(reservations),
         &|_, _, function| Some(&function.reference_cfg),
     )
 }
@@ -320,6 +323,7 @@ pub fn emit_scalar_build_single_module_llvm(
         &module.layouts,
         module.target_layout,
         GenericInitializerInput::PreparedRows(prepared),
+        &|reservations| validation.aggregate(reservations),
         &|item, arm, _| validation.reference_cfg(0, item, arm),
     )
 }
@@ -332,6 +336,7 @@ fn emit_single_module_llvm<'a>(
     layouts: &ScalarTargetLayouts,
     target_layout: ScalarTargetLayout,
     generic_input: GenericInitializerInput<'a>,
+    close_aggregates: &dyn Fn(&crate::scalar::AggregateReservations) -> Result<crate::scalar::ClosedAggregates, String>,
     reference_cfg: &dyn Fn(
         usize,
         Option<usize>,
@@ -400,18 +405,6 @@ fn emit_single_module_llvm<'a>(
             continue;
         }
         let cfg = require_cfg(item_ordinal, None, function)?;
-        let value = module.add_function(
-            &function.name,
-            definition_function_type(&context, function, cfg, target_layout)?,
-            None,
-        );
-        for (index, name) in function.parameters.iter().enumerate() {
-            if let Some(parameter) = value.get_nth_param(index as u32) {
-                parameter.set_name(name);
-            }
-        }
-        functions.insert(function.name.clone(), value);
-        call_targets.insert(function.name.clone(), function.name.clone());
         definitions.push((function, cfg, function.name.as_str(), item_ordinal, None));
     }
     let ordinary_count = definitions.len();
@@ -442,6 +435,35 @@ fn emit_single_module_llvm<'a>(
         str::to_owned,
         prepared_overloads.remove(source).into_iter().flatten(),
     );
+    let mut reservations = crate::scalar::AggregateReservations::default();
+    reservations.modules.push(0);
+    for &(_, _, _, item, arm) in &definitions {
+        reservations.bodies.insert((0, item, arm), true);
+    }
+    for specialization in specializations.values().chain(overloads.values()) {
+        reservations.bodies.insert((0, specialization.item_ordinal, specialization.arm_index), matches!(specialization.function, Cow::Borrowed(_)));
+    }
+    let aggregates = close_aggregates(&reservations)?;
+    for &(function, cfg, _, item_ordinal, _) in &definitions {
+        let value = module.add_function(
+            &function.name,
+            aggregate_transfer::definition_type(
+                &context,
+                function,
+                cfg,
+                target_layout,
+                aggregates.body(0, item_ordinal, None),
+            )?,
+            aggregate_transfer::linkage(aggregates.body(0, item_ordinal, None)),
+        );
+        for (index, name) in function.parameters.iter().enumerate() {
+            if let Some(parameter) = value.get_nth_param(index as u32) {
+                parameter.set_name(name);
+            }
+        }
+        functions.insert(function.name.clone(), value);
+        call_targets.insert(function.name.clone(), function.name.clone());
+    }
     for (
         lookup,
         LlvmSpecialization {
@@ -456,8 +478,8 @@ fn emit_single_module_llvm<'a>(
         let cfg = require_cfg(*item_ordinal, *arm_index, template)?;
         let value = module.add_function(
             name,
-            definition_function_type(&context, function, cfg, target_layout)?,
-            None,
+            aggregate_transfer::definition_type(&context, function, cfg, target_layout, aggregates.body(0, *item_ordinal, *arm_index))?,
+            aggregate_transfer::linkage(aggregates.body(0, *item_ordinal, *arm_index)),
         );
         for (index, parameter) in function.parameters.iter().enumerate() {
             if let Some(argument) = value.get_nth_param(index as u32) {
@@ -544,6 +566,7 @@ fn emit_single_module_llvm<'a>(
         let nodes = generic_input.bind_body(0, item, arm, &function.body)?;
         emit_function(
             prepared_render,
+            aggregates.body(0, item, arm),
             &context,
             &builder,
             &functions,
@@ -566,6 +589,7 @@ fn emit_single_module_llvm<'a>(
     }
     emit_main(
         prepared_render,
+        aggregates.initializer(source),
         &context,
         &builder,
         &functions,
@@ -627,6 +651,7 @@ fn emit_scalar_build_project_with_policy(
             EmissionPolicy::RawCompatibility => GenericInitializerInput::RawProject(prepared),
             EmissionPolicy::Prepared => GenericInitializerInput::PreparedRows(prepared),
         },
+        &|reservations| validation.aggregate(reservations),
         &|module, item, arm, _| validation.reference_cfg(module, item, arm),
         match policy {
             EmissionPolicy::RawCompatibility => None,
@@ -639,6 +664,7 @@ fn emit_project_llvm<'a>(
     project: &'a ScalarProject,
     initialization_region: &dyn Fn(usize) -> Option<&'a ModuleInitializationRegion>,
     generic_input: GenericInitializerInput<'a>,
+    close_aggregates: &dyn Fn(&crate::scalar::AggregateReservations) -> Result<crate::scalar::ClosedAggregates, String>,
     reference_cfg: &dyn Fn(
         usize,
         usize,
@@ -717,6 +743,11 @@ fn emit_project_llvm<'a>(
     let mut externs = Vec::new();
     let mut call_targets = BTreeMap::new();
     let mut initializer_symbols = InitializerSymbols::default();
+    enum Declaration<'a> {
+        Ordinary(usize),
+        Extern(LlvmExternIdentity, String, &'a ScalarType),
+    }
+    let mut declarations = Vec::new();
     let mut definitions = Vec::new();
     for &(module_ordinal, source_module) in &ordered_modules {
         for (item_ordinal, item) in source_module.items.iter().enumerate() {
@@ -743,19 +774,7 @@ fn emit_project_llvm<'a>(
                     continue;
                 }
                 let cfg = require_cfg(module_ordinal, item_ordinal, None, function)?;
-                let value = module.add_function(
-                    &name,
-                    definition_function_type(&context, function, cfg, target_layout)?,
-                    None,
-                );
-                for (index, parameter) in function.parameters.iter().enumerate() {
-                    if let Some(argument) = value.get_nth_param(index as u32) {
-                        argument.set_name(parameter);
-                    }
-                }
-                functions.insert(name.clone(), value);
-                call_targets.insert(name.clone(), name.clone());
-                signatures.insert(name.clone(), function.signature.clone());
+                declarations.push(Declaration::Ordinary(definitions.len()));
                 definitions.push((
                     module_ordinal,
                     source_module,
@@ -779,11 +798,6 @@ fn emit_project_llvm<'a>(
                         &function.name,
                         &function.signature,
                     );
-                    let value = module.add_function(
-                        &identity.internal_name,
-                        function_type(&context, &function.signature, target_layout)?.0,
-                        None,
-                    );
                     let key = project_extern_lookup_key(
                         &source_module.source,
                         &extern_decl.binding,
@@ -797,10 +811,7 @@ fn emit_project_llvm<'a>(
                             &identity.internal_name,
                         );
                     }
-                    call_targets.insert(key, identity.internal_name.clone());
-                    signatures.insert(identity.internal_name.clone(), function.signature.clone());
-                    functions.insert(identity.internal_name.clone(), value);
-                    externs.push(identity);
+                    declarations.push(Declaration::Extern(identity, key, &function.signature));
                 }
             }
         }
@@ -815,6 +826,83 @@ fn emit_project_llvm<'a>(
         project_function_name,
         prepared_render,
     )?;
+    let mut project_overloads = Vec::new();
+    let mut prepared_overloads = prepared_initializer_overloads(
+        initializer_nodes
+            .iter()
+            .filter(|_| prepared_render)
+            .flat_map(|_| regions.iter().copied()),
+        &initializer_symbols,
+    )?;
+    for (&(ordinal, source_module), &region) in ordered_modules.iter().zip(&regions) {
+        collect_body_overload_reservations(
+            generic_input,
+            ordinal,
+            &source_module.items,
+            region,
+            &initializer_symbols,
+            &mut prepared_overloads,
+        )?;
+    }
+    let mut overload_reservations = BTreeMap::new();
+    for &(ordinal, source_module) in &ordered_modules {
+        overload_reservations.insert(ordinal, selected_overload_specializations(
+            &source_module.items,
+            |name| project_function_name(&source_module.source, name),
+            prepared_overloads
+                .remove(&source_module.source)
+                .into_iter()
+                .flatten(),
+        ));
+    }
+    let mut reservations = crate::scalar::AggregateReservations::default();
+    reservations.modules.extend(ordered_modules.iter().map(|&(ordinal, _)| ordinal));
+    for &(ordinal, _, _, _, _, item, arm) in &definitions {
+        reservations.bodies.insert((ordinal, item, arm), true);
+    }
+    for (&ordinal, rows) in prepared_specializations.iter().chain(&overload_reservations) {
+        for specialization in rows.values() {
+            reservations.bodies.insert((ordinal, specialization.item_ordinal, specialization.arm_index), matches!(specialization.function, Cow::Borrowed(_)));
+        }
+    }
+    let aggregates = close_aggregates(&reservations)?;
+    for declaration in declarations {
+        match declaration {
+            Declaration::Ordinary(index) => {
+                let (module_ordinal, _, function, cfg, ref name, item_ordinal, _) = definitions[index];
+                let value = module.add_function(
+                    &name,
+                    aggregate_transfer::definition_type(
+                        &context,
+                        function,
+                        cfg,
+                        target_layout,
+                        aggregates.body(module_ordinal, item_ordinal, None),
+                    )?,
+                    aggregate_transfer::linkage(aggregates.body(
+                        module_ordinal,
+                        item_ordinal,
+                        None,
+                    )),
+                );
+                for (index, parameter) in function.parameters.iter().enumerate() {
+                    if let Some(argument) = value.get_nth_param(index as u32) {
+                        argument.set_name(parameter);
+                    }
+                }
+                functions.insert(name.clone(), value);
+                call_targets.insert(name.clone(), name.clone());
+                signatures.insert(name.clone(), function.signature.clone());
+            }
+            Declaration::Extern(identity, key, signature) => {
+                let value = module.add_function(&identity.internal_name, function_type(&context, signature, target_layout)?.0, None);
+                call_targets.insert(key, identity.internal_name.clone());
+                signatures.insert(identity.internal_name.clone(), signature.clone());
+                functions.insert(identity.internal_name.clone(), value);
+                externs.push(identity);
+            }
+        }
+    }
     let mut project_specializations = Vec::new();
     for &(module_ordinal, source_module) in &ordered_modules {
         let specializations = prepared_specializations
@@ -853,33 +941,8 @@ fn emit_project_llvm<'a>(
             ));
         }
     }
-    let mut project_overloads = Vec::new();
-    let mut prepared_overloads = prepared_initializer_overloads(
-        initializer_nodes
-            .iter()
-            .filter(|_| prepared_render)
-            .flat_map(|_| regions.iter().copied()),
-        &initializer_symbols,
-    )?;
-    for (&(ordinal, source_module), &region) in ordered_modules.iter().zip(&regions) {
-        collect_body_overload_reservations(
-            generic_input,
-            ordinal,
-            &source_module.items,
-            region,
-            &initializer_symbols,
-            &mut prepared_overloads,
-        )?;
-    }
     for &(module_ordinal, source_module) in &ordered_modules {
-        for (lookup, specialization) in selected_overload_specializations(
-            &source_module.items,
-            |name| project_function_name(&source_module.source, name),
-            prepared_overloads
-                .remove(&source_module.source)
-                .into_iter()
-                .flatten(),
-        ) {
+        for (lookup, specialization) in overload_reservations.remove(&module_ordinal).expect("project module has an overload reservation set") {
             let LlvmSpecialization {
                 function,
                 name,
@@ -890,8 +953,8 @@ fn emit_project_llvm<'a>(
             let cfg = require_cfg(module_ordinal, item_ordinal, arm_index, template)?;
             let value = module.add_function(
                 &name,
-                definition_function_type(&context, &function, cfg, target_layout)?,
-                None,
+                aggregate_transfer::definition_type(&context, &function, cfg, target_layout, aggregates.body(module_ordinal, item_ordinal, arm_index))?,
+                aggregate_transfer::linkage(aggregates.body(module_ordinal, item_ordinal, arm_index)),
             );
             for (index, parameter) in function.parameters.iter().enumerate() {
                 if let Some(argument) = value.get_nth_param(index as u32) {
@@ -969,6 +1032,7 @@ fn emit_project_llvm<'a>(
         };
         emit_project_function(
             prepared_render,
+            aggregates.body(ordinal, item, arm),
             &context,
             &builder,
             &functions,
@@ -992,6 +1056,7 @@ fn emit_project_llvm<'a>(
     }
     emit_project_main(
         prepared_render,
+        &aggregates,
         &context,
         &builder,
         &functions,
@@ -1276,6 +1341,7 @@ fn definition_function_type<'ctx>(
     }
 }
 
+mod aggregate_transfer;
 mod memory;
 use memory::{
     aggregate_type, allocation_layout, basic_type, build_aggregate, builder_error,
@@ -1341,6 +1407,7 @@ fn store_binding_outputs<'ctx, 'module>(
         )?)?
         .into_int_value();
         let slot = emit_runtime_array_allocation(context, state, element, length)?;
+        aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
         if !state
             .mutable_runtime_allocations
             .contains(&(receiver.name_span.start, receiver.name_span.end))
@@ -1396,6 +1463,9 @@ fn store_binding_outputs<'ctx, 'module>(
         state
             .runtime_array_allocations
             .insert(receiver.name.clone(), false);
+        return Ok(());
+    }
+    if aggregate_transfer::store_received_binding(state, binding, &value)? {
         return Ok(());
     }
     let receivers = binding_receivers(binding);
@@ -1709,6 +1779,7 @@ fn emit_project_binding_value<'ctx, 'module>(
 
 fn emit_function<'ctx, 'module>(
     prepared_render: bool,
+    aggregate_plan: Option<&'module crate::scalar::ClosedBody>,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -1740,6 +1811,12 @@ fn emit_function<'ctx, 'module>(
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
         prepared_render,
+        aggregate: aggregate_transfer::AggregateEmitter::new(
+            aggregate_plan,
+            value,
+            function.parameters.len(),
+        )?,
+        initializer_aggregate: None,
         initializer_nodes: None,
         body_call_nodes,
         initializer_symbols: Some(initializer_symbols),
@@ -1833,12 +1910,12 @@ fn emit_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if self_tail::eligible(context, &state, value, function, reference_cfg) {
+    if !aggregate_plan.is_some_and(|plan| plan.input.is_some()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(context, &mut state, value, function, None);
     }
     let result = match function.body.items.as_slice() {
         [ScalarBlockItem::Expression(expression)]
-            if canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
+            if !aggregate_plan.is_some_and(|plan| plan.input.is_some()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
         {
             if outputs.outputs.len() == 1 {
                 emit_typed_expression(context, &mut state, expression, &outputs.outputs[0].ty)?
@@ -1873,11 +1950,17 @@ fn emit_function<'ctx, 'module>(
         }
     }
     release_automatic_return_result_owners(context, &mut state, &BTreeMap::new())?;
+    if let Some(returned) =
+        aggregate_transfer::finish_return(&mut state)?
+    {
+        return Ok(returned);
+    }
     emit_return(context, &mut state, result, outputs)
 }
 
 fn emit_main<'ctx, 'module>(
     prepared_render: bool,
+    initializer_plan: Option<&'module crate::scalar::ClosedInitializer>,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -1902,6 +1985,8 @@ fn emit_main<'ctx, 'module>(
     builder.position_at_end(entry);
     let mut state = EmitState {
         prepared_render,
+        aggregate: None,
+        initializer_aggregate: initializer_plan.map(aggregate_transfer::InitializerEmitter::new),
         initializer_nodes,
         body_call_nodes: None,
         initializer_symbols: Some(initializer_symbols),
@@ -1944,6 +2029,9 @@ fn emit_main<'ctx, 'module>(
     for step in &initialization_region.steps {
         match (&step.kind, &items[step.item]) {
             (ModuleInitializationStepKind::BindingInitialization, ScalarItem::Binding(binding)) => {
+                if aggregate_transfer::emit_initializer_binding(context, &mut state, binding, None)? {
+                    continue;
+                }
                 let value = emit_binding_value(context, &mut state, binding)?;
                 if binding.is_allocation {
                     store_binding_outputs(context, &mut state, binding, value)?;
@@ -1983,6 +2071,7 @@ fn emit_main<'ctx, 'module>(
             ),
         }
     }
+    aggregate_transfer::finish_initializer(&mut state)?;
     release_scope_runtime_array_owners(context, &mut state, &BTreeMap::new())?;
     release_automatic_return_result_owners(context, &mut state, &BTreeMap::new())?;
     builder
@@ -1993,6 +2082,7 @@ fn emit_main<'ctx, 'module>(
 
 fn emit_project_function<'ctx, 'module>(
     prepared_render: bool,
+    aggregate_plan: Option<&'module crate::scalar::ClosedBody>,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -2025,6 +2115,12 @@ fn emit_project_function<'ctx, 'module>(
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
         prepared_render,
+        aggregate: aggregate_transfer::AggregateEmitter::new(
+            aggregate_plan,
+            value,
+            function.parameters.len(),
+        )?,
+        initializer_aggregate: None,
         initializer_nodes: None,
         body_call_nodes,
         initializer_symbols: Some(initializer_symbols),
@@ -2118,7 +2214,7 @@ fn emit_project_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if self_tail::eligible(context, &state, value, function, reference_cfg) {
+    if !aggregate_plan.is_some_and(|plan| plan.input.is_some()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(
             context,
             &mut state,
@@ -2132,7 +2228,7 @@ fn emit_project_function<'ctx, 'module>(
     }
     let result = match function.body.items.as_slice() {
         [ScalarBlockItem::Expression(expression)]
-            if canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
+            if !aggregate_plan.is_some_and(|plan| plan.input.is_some()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
         {
             if outputs.outputs.len() == 1 {
                 emit_project_typed_expression(
@@ -2182,11 +2278,17 @@ fn emit_project_function<'ctx, 'module>(
         }
     }
     release_automatic_return_result_owners(context, &mut state, &BTreeMap::new())?;
+    if let Some(returned) =
+        aggregate_transfer::finish_return(&mut state)?
+    {
+        return Ok(returned);
+    }
     emit_return(context, &mut state, result, outputs)
 }
 
 fn emit_project_main<'ctx, 'module>(
     prepared_render: bool,
+    aggregates: &'module crate::scalar::ClosedAggregates,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -2211,6 +2313,8 @@ fn emit_project_main<'ctx, 'module>(
     builder.position_at_end(entry);
     let mut state = EmitState {
         prepared_render,
+        aggregate: None,
+        initializer_aggregate: None,
         initializer_nodes: None,
         body_call_nodes: None,
         initializer_symbols: Some(initializer_symbols),
@@ -2252,6 +2356,7 @@ fn emit_project_main<'ctx, 'module>(
     initialize_project_module(
         context,
         &mut state,
+        aggregates,
         0,
         modules,
         regions,
@@ -2270,6 +2375,7 @@ fn emit_project_main<'ctx, 'module>(
 fn initialize_project_module<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
+    aggregates: &'module crate::scalar::ClosedAggregates,
     position: usize,
     modules: &[&'module ScalarModule],
     regions: &[&ModuleInitializationRegion],
@@ -2285,6 +2391,9 @@ fn initialize_project_module<'ctx, 'module>(
     }
     initialized.push(module.source.clone());
 
+    aggregate_transfer::initializer_namespace_edge(state)?;
+    let previous_aggregate = std::mem::replace(&mut state.initializer_aggregate,
+        aggregates.initializer(&module.source).map(aggregate_transfer::InitializerEmitter::new));
     let previous_nodes = state.initializer_nodes;
     state.initializer_nodes = initializer_nodes.map(|nodes| &nodes[position]);
 
@@ -2330,6 +2439,7 @@ fn initialize_project_module<'ctx, 'module>(
                 initialize_project_module(
                     context,
                     state,
+                    aggregates,
                     position,
                     modules,
                     regions,
@@ -2340,6 +2450,9 @@ fn initialize_project_module<'ctx, 'module>(
                 state.globals = module_globals(module, globals);
             }
             (ModuleInitializationStepKind::BindingInitialization, ScalarItem::Binding(binding)) => {
+                if aggregate_transfer::emit_initializer_binding(context, state, binding, Some((module, modules)))? {
+                    continue;
+                }
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 if binding.is_allocation {
                     let receiver = binding
@@ -2418,6 +2531,8 @@ fn initialize_project_module<'ctx, 'module>(
         }
     }
 
+    aggregate_transfer::finish_initializer(state)?;
+    state.initializer_aggregate = previous_aggregate;
     state.initializer_nodes = previous_nodes;
     state.globals = current_globals;
     state.values = values;
@@ -2575,6 +2690,10 @@ fn emit_block_at<'ctx, 'module>(
         result = emit_final_outputs(context, state, block, emission)?;
     }
     result = finish_block_return(context, state, block, result, emission)?;
+    if let BlockEmission::Return(outputs) = emission {
+        aggregate_transfer::commit_return(context, state, &result, outputs)?;
+    }
+    aggregate_transfer::release_scope(context, state, block)?;
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
     state.storage = storage;
@@ -2651,6 +2770,10 @@ fn emit_project_block_at<'ctx, 'module>(
         result = emit_project_final_outputs(context, state, block, module, modules, emission)?;
     }
     result = finish_block_return(context, state, block, result, emission)?;
+    if let BlockEmission::Return(outputs) = emission {
+        aggregate_transfer::commit_return(context, state, &result, outputs)?;
+    }
+    aggregate_transfer::release_scope(context, state, block)?;
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
     state.storage = storage;

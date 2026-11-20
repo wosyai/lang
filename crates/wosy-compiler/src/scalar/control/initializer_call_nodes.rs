@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use super::super::reference::{
-    FunctionCallSites, OccurrenceEdge as Edge, OccurrenceNode as Node, OccurrenceParent as Parent,
+    BlockOrdinal, FunctionCallSites, OccurrenceEdge as Edge, OccurrenceNode as Node, OccurrenceParent as Parent,
     OccurrenceRole,
 };
 use super::super::typecheck::expression_span;
@@ -16,7 +16,7 @@ mod initializer_facts_tests;
 
 pub(crate) struct InitializerCallNodes<'a> {
     source: &'a SourceIdentity,
-    targets: HashMap<*const ScalarExpression, &'a ModuleInitializationCallTarget>,
+    targets: HashMap<*const ScalarExpression, (usize, &'a ModuleInitializationCallTarget)>,
     members: HashMap<*const ScalarExpression, BoundInitializerMember<'a>>,
     items: PhantomData<&'a [ScalarItem]>,
 }
@@ -79,7 +79,7 @@ impl<'a> InitializerCallNodes<'a> {
                 .call_targets
                 .get(&ordinal)
                 .ok_or_else(|| topology.missing_call_target(&region.source, ordinal))?;
-            nodes.targets.insert(std::ptr::from_ref(expression), target);
+            nodes.targets.insert(std::ptr::from_ref(expression), (ordinal.0, target));
             Ok(())
         };
         Binder {
@@ -105,6 +105,13 @@ impl<'a> InitializerCallNodes<'a> {
         &self,
         expression: &ScalarExpression,
     ) -> Result<&'a ModuleInitializationCallTarget, String> {
+        self.bound_call(expression).map(|(_, target)| target)
+    }
+
+    pub(crate) fn bound_call(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Result<(usize, &'a ModuleInitializationCallTarget), String> {
         self.targets
             .get(&std::ptr::from_ref(expression))
             .copied()
@@ -157,6 +164,7 @@ struct CallableProofNodes<'a> {
     expressions: HashMap<*const ScalarExpression, OccurrenceOrdinal>,
     places: HashMap<*const ScalarPlace, OccurrenceOrdinal>,
     bindings: HashMap<*const ScalarBinding, BlockPosition>,
+    blocks: HashMap<*const ScalarBlock, BlockOrdinal>,
     final_outputs: HashMap<*const ScalarExpression, usize>,
 }
 
@@ -632,6 +640,24 @@ impl<'a> InitializerFacts<'a> {
 }
 
 impl<'a> CallableBodyCallNodes<'a> {
+    pub(crate) fn block_ordinal(&self, block: &ScalarBlock) -> Option<usize> {
+        self.proof_nodes.blocks.get(&std::ptr::from_ref(block)).map(|ordinal| ordinal.0)
+    }
+
+    pub(crate) fn expression_ordinal(&self, expression: &ScalarExpression) -> Option<usize> {
+        self.proof_nodes
+            .expressions
+            .get(&std::ptr::from_ref(expression))
+            .map(|ordinal| ordinal.0)
+    }
+
+    pub(crate) fn binding_position(&self, binding: &ScalarBinding) -> Option<(usize, usize)> {
+        self.proof_nodes
+            .bindings
+            .get(&std::ptr::from_ref(binding))
+            .map(|position| (position.block.0, position.item))
+    }
+
     pub(in crate::scalar) fn bind(
         source: &'a SourceIdentity,
         body: &'a ScalarBlock,
@@ -1088,6 +1114,9 @@ impl<'a> Binder<'a, '_> {
     }
 
     fn block_items(&mut self, parent: Parent, block: &'a ScalarBlock) -> Result<(), String> {
+        if let (Some(nodes), Parent::Block(ordinal)) = (&mut self.proof_nodes, parent) {
+            nodes.blocks.insert(std::ptr::from_ref(block), ordinal);
+        }
         for (index, (item, role)) in block.items_with_output_roles().enumerate() {
             self.item(parent, index, item, role)?;
         }

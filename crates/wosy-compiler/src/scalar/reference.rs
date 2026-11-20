@@ -17,6 +17,7 @@ use super::control::{
 use super::inference::CheckedMember;
 use super::*;
 
+pub(crate) mod aggregate;
 pub(super) mod self_tail;
 
 #[cfg(test)]
@@ -134,6 +135,17 @@ pub(super) struct ProgramReferenceResults {
 }
 
 impl ProgramReferenceResults {
+    pub(super) fn install_retaining_aggregate(self, program: &mut ScalarProgram) -> (Vec<ReferenceAnalysisError>, aggregate::InstalledAggregateFacts) {
+        let mut facts = aggregate::InstalledAggregateFacts::default();
+        for (ordinal, result) in self.updates {
+            let ScalarItem::Function(function) = &mut program.items[ordinal] else {
+                unreachable!("function result ordinal");
+            };
+            result.install_body(function, ordinal, None, Some(&mut facts));
+        }
+        (self.errors, facts)
+    }
+
     pub(super) fn install(self, program: &mut ScalarProgram) -> Vec<ReferenceAnalysisError> {
         install_module_reference_results(&mut program.items, self.updates);
         self.errors
@@ -188,6 +200,13 @@ fn derive_and_converge_program_references(
 
 pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
+    aggregate_facts: aggregate::AggregateFlowFacts,
+    aggregate_result: aggregate::AggregateFlowResult,
+    returning_leaf_prefix: bool,
+    formal_forward_shape: Option<(Option<CfgPointId>, Option<CfgPointId>)>,
+    independent_checked_query: bool,
+    checked_scalar_storage: BTreeSet<ReferenceBindingId>,
+    checked_result_origins: BTreeSet<ReferenceOriginId>,
     proof_points: CallablePointFacts,
     pub(super) source: SourceIdentity,
     pub(super) function_span: ByteSpan,
@@ -263,6 +282,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
     ) -> Self {
         Self {
             capture_call_points: false,
+            aggregate_facts: aggregate::AggregateFlowFacts::default(),
+            aggregate_result: aggregate::AggregateFlowResult::default(),
+            returning_leaf_prefix: true,
+            formal_forward_shape: None,
+            independent_checked_query: aggregate::checked_scalar_output(&call_sites.boundary.root_outputs),
+            checked_scalar_storage: BTreeSet::new(),
+            checked_result_origins: BTreeSet::new(),
             proof_points: CallablePointFacts::default(),
             source: source.clone(),
             function_span: function.span,
@@ -436,7 +462,24 @@ impl<'a> ReferenceFlowBuilder<'a> {
         scope: ReferenceScopeId,
         possible_origins: Option<BTreeSet<ReferenceOriginId>>,
     ) -> CfgPointId {
+        self.returning_leaf_prefix = self.returning_leaf_prefix && aggregate::returning_leaf_point(&kind);
         let id = CfgPointId(self.cfg.points.len());
+        self.formal_forward_shape = self.formal_forward_shape.and_then(|(moved, call)| {
+            match &kind {
+                CfgPointKind::Move { place, .. }
+                    if moved.is_none() && call.is_none() && place.projections.is_empty() =>
+                    Some((Some(id), None)),
+                CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable { .. },
+                    argument_points, .. }
+                    if moved.is_some() && call.is_none() && argument_points.len() == 1 =>
+                    Some((moved, Some(id))),
+                CfgPointKind::ReturnOutput { output: 0, value_point, checked: true }
+                    if self.independent_checked_query && call == Some(*value_point) =>
+                    Some((moved, call)),
+                _ if aggregate::returning_leaf_point(&kind) => Some((moved, call)),
+                _ => None,
+            }
+        });
         if let Some(previous) = self.cursor {
             self.cfg.points[previous.0].successors.push(id);
         }
@@ -943,6 +986,29 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 self.proof_points.evaluations.insert(ordinal, point);
             }
         }
+        if matches!(
+            expression,
+            ScalarExpression::Member { .. }
+                | ScalarExpression::Dereference { .. }
+                | ScalarExpression::IndexedRead { .. }
+        ) && matches!(
+            self.call_sites
+                .structure
+                .checked_types
+                .expressions
+                .get(&ordinal),
+            Some(ScalarType::RawPointer(_) | ScalarType::Struct(_))
+        ) {
+            if let Some(point) = self.cursor.filter(|point| Some(*point) != before) {
+                if matches!(
+                    self.cfg.points[point.0].kind,
+                    CfgPointKind::ReadPlace { .. }
+                ) {
+                    let raw = matches!(self.call_sites.structure.checked_types.expressions.get(&ordinal), Some(ScalarType::RawPointer(_)));
+                    self.aggregate_facts.projected_reads.insert(point, raw);
+                }
+            }
+        }
         Ok(value)
     }
 
@@ -1024,6 +1090,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let mut checked_release_address = None;
                 let mut named_release_binding = None;
                 let mut argument_points = Vec::new();
+                let signature = calls.checked_call_signatures.get(&ordinal);
+                let mut aggregate_arguments = BTreeMap::new();
+                let mut raw_arguments = Vec::new();
                 for (position, argument) in arguments.iter().enumerate() {
                     let ordinal =
                         self.expression_ordinal(parent, OccurrenceEdge::CallArgument(position));
@@ -1066,7 +1135,30 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     {
                         address = self.cursor;
                     }
+                    let read = self.cursor;
                     self.move_value(argument, scope, ordinal)?;
+                    let parameter = signature.and_then(|signature| signature.parameters.get(position));
+                    if matches!(parameter, Some(ScalarType::RawPointer(_))) {
+                        raw_arguments.push(position);
+                    }
+                    if matches!(parameter, Some(ScalarType::Struct(_))) {
+                        let whole_move = self.cursor.filter(|moved| {
+                            Some(*moved) != read && matches!(&self.cfg.points[moved.0].kind,
+                                CfgPointKind::Move { place, .. } if place.projections.is_empty())
+                        });
+                        let input = if let Some(moved) = whole_move {
+                            aggregate::ArgumentProvenance::WholeMove(moved)
+                        } else if let Some(producer) = read.filter(|point| {
+                            matches!(argument, ScalarExpression::Call { .. })
+                                && self.aggregate_facts.calls.get(point) == Some(&ordinal)
+                        }) {
+                            self.aggregate_facts.temporary_arguments.insert(producer);
+                            aggregate::ArgumentProvenance::Immediate(producer)
+                        } else {
+                            aggregate::ArgumentProvenance::Unmoved
+                        };
+                        aggregate_arguments.insert(position, input);
+                    }
                 }
                 if let ResolvedCallTarget::Core(
                     operation @ (CoreOperationId::Invalidate | CoreOperationId::Rebind),
@@ -1162,13 +1254,61 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     },
                     _ => None,
                 };
+                let read_call = if self.aggregate_facts.tracks_read_sources() {
+                    match (&target, signature) {
+                        (ResolvedCallTarget::ModuleCallable { .. }, Some(_)) if !raw_arguments.is_empty() =>
+                            Some(aggregate::ReadCall::Direct),
+                        (ResolvedCallTarget::Core(CoreOperationId::Load), Some(signature))
+                            if raw_arguments.as_slice() == [0] && arguments.len() == 1
+                                && matches!(signature.outputs.outputs.as_slice(), [out] if aggregate::ordinary_value(&out.ty)) =>
+                            Some(aggregate::ReadCall::Load),
+                        (ResolvedCallTarget::Core(CoreOperationId::Offset), Some(signature))
+                            if raw_arguments.as_slice() == [0] && arguments.len() == 2
+                                && matches!(signature.parameters.as_slice(), [ScalarType::RawPointer(_), ScalarType::I64])
+                                && matches!(signature.outputs.outputs.as_slice(), [out] if out.ty == signature.parameters[0]) =>
+                            Some(aggregate::ReadCall::Offset),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if read_call.is_some() {
+                    self.aggregate_facts.read_consumers.extend(raw_arguments.iter().map(|&slot| argument_points[slot]));
+                }
                 let call = CfgPointKind::Call {
                     expression: expression.clone(),
                     output: 0,
                     target,
                     argument_points,
                 };
+                let carries_struct_result = calls
+                    .checked_call_signatures
+                    .get(&ordinal)
+                    .is_some_and(|signature| {
+                        matches!(
+                            signature.outputs.outputs.as_slice(),
+                            [ScalarOutput {
+                                ty: ScalarType::Struct(_),
+                                ..
+                            }]
+                        )
+                    });
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
+                if carries_struct_result {
+                    self.aggregate_facts.calls.insert(id, ordinal);
+                }
+                if !aggregate_arguments.is_empty() {
+                    for (&slot, &provenance) in &aggregate_arguments {
+                        self.aggregate_result.inputs.entry((id, ordinal.0, slot, provenance)).or_default();
+                    }
+                    self.aggregate_facts.input_moves.insert(id, (ordinal, aggregate_arguments));
+                }
+                if !raw_arguments.is_empty() {
+                    self.aggregate_facts.raw_calls.insert(id, (raw_arguments, calls.declared_unsafe_calls.contains(&ordinal.0)));
+                }
+                if let Some(read_call) = read_call {
+                    self.aggregate_facts.read_calls.insert(id, read_call);
+                }
                 if self.capture_call_points {
                     let previous = self.cfg.primary_call_points.insert(ordinal, id);
                     assert!(previous.is_none(), "duplicate CFG call for {ordinal:?}");
@@ -1186,8 +1326,23 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     self.expression(left, scope, region.left)?;
                     self.expression(right, scope, region.right)?;
                 } else {
-                    self.expression_child(left, scope, parent, OccurrenceEdge::BinaryLeft)?;
-                    self.expression_child(right, scope, parent, OccurrenceEdge::BinaryRight)?;
+                    let left_ordinal = self.expression_ordinal(parent, OccurrenceEdge::BinaryLeft);
+                    let right_ordinal = self.expression_ordinal(parent, OccurrenceEdge::BinaryRight);
+                    self.expression(left, scope, left_ordinal)?;
+                    let left_point = self.cursor.expect("evaluated left scalar operand");
+                    self.expression(right, scope, right_ordinal)?;
+                    if self.aggregate_facts.tracks_read_sources()
+                        && matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual)
+                    {
+                        let right_point = self.cursor.expect("evaluated right scalar operand");
+                        for (view, ordinal, null) in [(left_point, left_ordinal, right_point), (right_point, right_ordinal, left_point)] {
+                            if self.aggregate_facts.raw_nulls.contains(&null)
+                                && matches!(calls.structure.checked_types.expressions.get(&ordinal), Some(ScalarType::RawPointer(_)))
+                            {
+                                self.aggregate_facts.read_consumers.insert(view);
+                            }
+                        }
+                    }
                 }
                 self.point(
                     CfgPointKind::Evaluate(expression.clone()),
@@ -1208,33 +1363,101 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 Ok(ReferenceValue::Other)
             }
             ScalarExpression::ArrayLiteral { elements, .. } => {
+                let track_raw = !self.aggregate_facts.raw_formals.is_empty() || !self.aggregate_facts.formals.is_empty();
+                let mut operands = Vec::new();
                 for (position, element) in elements.iter().enumerate() {
                     let ordinal =
                         self.expression_ordinal(parent, OccurrenceEdge::AggregateElement(position));
+                    let before = self.cursor;
                     self.expression(element, scope, ordinal)?;
+                    if track_raw && matches!(calls.structure.checked_types.expressions.get(&ordinal),
+                        Some(ScalarType::RawPointer(_) | ScalarType::Struct(_))) {
+                        if let Some(point) = self.cursor.filter(|point| Some(*point) != before) {
+                            operands.push(point);
+                        }
+                    }
                     self.move_value(element, scope, ordinal)?;
                 }
-                self.point(
+                let point = self.point(
                     CfgPointKind::Evaluate(expression.clone()),
                     span,
                     scope,
                     BTreeSet::new(),
                 );
+                if !operands.is_empty() {
+                    self.aggregate_facts.opaque_container_inputs.insert(point, operands);
+                }
+                Ok(ReferenceValue::Other)
+            }
+            ScalarExpression::Utf8 { .. } => {
+                let id = self.point(CfgPointKind::Evaluate(expression.clone()), span, scope, BTreeSet::new());
+                if matches!(calls.structure.checked_types.expressions.get(&ordinal), Some(ScalarType::Struct(_))) {
+                    self.aggregate_facts.plain_literals.insert(id);
+                }
                 Ok(ReferenceValue::Other)
             }
             ScalarExpression::StructLiteral { fields, .. } => {
+                let mut inputs = Vec::new();
+                let structure_id = match calls.structure.checked_types.expressions.get(&ordinal) {
+                    Some(ScalarType::Struct(id)) => Some(id),
+                    _ => None,
+                };
+                let mut plain = structure_id.is_some();
+                let mut null_view = false;
+                let mut carrier = structure_id.is_some();
+                let mut raw_fields = 0;
                 for (position, field) in fields.iter().enumerate() {
                     let ordinal =
                         self.expression_ordinal(parent, OccurrenceEdge::AggregateField(position));
+                    let before = self.cursor;
                     self.expression(&field.value, scope, ordinal)?;
+                    let member = calls.structure.literal_fields.get(&ordinal);
+                    let member_type = calls.structure.checked_types.expressions.get(&ordinal);
+                    if carrier {
+                        carrier = member.is_some_and(|field| Some(&field.structure) == structure_id)
+                            && member_type.is_some_and(|ty| match ty {
+                                ScalarType::RawPointer(_) => { raw_fields += 1; true }
+                                ty => aggregate::ordinary_value(ty),
+                            });
+                    }
+                    if plain {
+                        plain = match (&field.value, member.filter(|field| Some(&field.structure) == structure_id).and(member_type)) {
+                            (ScalarExpression::Name { span, .. }, Some(ScalarType::RawPointer(_)))
+                                if matches!(self.prepared_name_identity(ordinal, *span)?, Some(PlainNameIdentity::Null)) => {
+                                null_view = true;
+                                true
+                            }
+                            (ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. } |
+                             ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }, Some(ty)) => aggregate::ordinary_value(ty),
+                            _ => false,
+                        };
+                    }
+                    if matches!(member_type, Some(ScalarType::RawPointer(_) | ScalarType::Struct(_))) {
+                        if member.is_some() {
+                            if let Some(point) = self.cursor.filter(|point| Some(*point) != before)
+                            {
+                                inputs.push((ordinal, point));
+                            }
+                        }
+                    }
                     self.move_value(&field.value, scope, ordinal)?;
                 }
-                self.point(
+                let literal = self.point(
                     CfgPointKind::Evaluate(expression.clone()),
                     span,
                     scope,
                     BTreeSet::new(),
                 );
+                if carrier && raw_fields == 1 {
+                    self.aggregate_facts.carrier_literals.insert(literal);
+                }
+                if plain && null_view {
+                    self.aggregate_facts.plain_literals.insert(literal);
+                } else if plain {
+                    self.aggregate_facts.scalar_cells.insert(literal);
+                } else if !inputs.is_empty() {
+                    self.aggregate_facts.literals.insert(literal, inputs);
+                }
                 Ok(ReferenceValue::Other)
             }
             ScalarExpression::Dereference { place, .. }
@@ -1251,12 +1474,31 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let place_ordinal = self.place_ordinal(parent, OccurrenceEdge::ExpressionPlace);
                 self.place_expressions(place, scope, place_ordinal)?;
                 self.check_raw_address_access(place, place_ordinal, span, scope)?;
-                self.point(
+                let value = self.point(
                     CfgPointKind::Evaluate(expression.clone()),
                     span,
                     scope,
                     BTreeSet::new(),
                 );
+                if !self.aggregate_facts.allocations.is_empty() || !self.aggregate_facts.plain_literals.is_empty()
+                    || !self.aggregate_facts.formals.is_empty() || !self.aggregate_facts.raw_formals.is_empty() {
+                    let root = self.place_root(place, place_ordinal);
+                    if let ScalarPlace::Name { span, .. } = root.place {
+                        if let Some(PreparedPlaceRoot::Lexical(binding)) =
+                            self.prepared_place_root(root.ordinal, *span)?
+                        {
+                            if !self.aggregate_facts.plain_literals.is_empty() {
+                                self.aggregate_facts.plain_aliases.insert(value, binding.clone());
+                            }
+                            if !self.aggregate_facts.formals.is_empty() || !self.aggregate_facts.raw_formals.is_empty() {
+                                self.aggregate_facts.raw_addresses.insert(value, (binding.clone(), matches!(place, ScalarPlace::Name { .. })));
+                            }
+                            if let Some(&base) = self.aggregate_facts.allocations.get(binding) {
+                                self.aggregate_facts.views.insert(value, base);
+                            }
+                        }
+                    }
+                }
                 Ok(ReferenceValue::Other)
             }
             ScalarExpression::Member {
@@ -1303,17 +1545,23 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
             ScalarExpression::Name { name, .. } => {
                 let identity = self.prepared_name_identity(ordinal, span)?;
-                if matches!(identity, Some(PlainNameIdentity::Null))
-                    || (identity.is_none() && name == "null")
+                let canonical_null = matches!(identity, Some(PlainNameIdentity::Null));
+                if canonical_null || (identity.is_none() && name == "null")
                 {
                     let id = self.intern(ReferenceOrigin::Null { span });
+                    if self.independent_checked_query && canonical_null {
+                        self.checked_result_origins.insert(id);
+                    }
                     let origins = BTreeSet::from([id]);
-                    self.point(
+                    let point = self.point(
                         CfgPointKind::Evaluate(expression.clone()),
                         span,
                         scope,
                         origins.clone(),
                     );
+                    if canonical_null && self.aggregate_facts.tracks_read_sources() {
+                        self.aggregate_facts.raw_nulls.insert(point);
+                    }
                     return Ok(ReferenceValue::Checked(origins));
                 }
                 if matches!(identity, Some(PlainNameIdentity::ModuleValue(_)))
@@ -1468,6 +1716,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         creation_span: span,
                         parent: parent_loan.map(Box::new),
                     };
+                    let local_result = self.independent_checked_query && parent.is_none()
+                        && *mutability == ScalarReferenceMutability::Shared
+                        && loan.origin_place.projections.is_empty()
+                        && matches!(place, ScalarPlace::Name { .. })
+                        && self.checked_scalar_storage.contains(&loan.origin_place.binding);
                     let fact = match parent {
                         Some(ReferenceOrigin::BorrowedFrom { parameter, .. }) => {
                             ReferenceOrigin::BorrowedFrom {
@@ -1493,6 +1746,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                     };
                     let id = self.intern(fact);
+                    if local_result {
+                        self.checked_result_origins.insert(id);
+                    }
                     origins.insert(id);
                     self.point(
                         CfgPointKind::Borrow {
@@ -2362,8 +2618,23 @@ impl<'a> ReferenceFlowBuilder<'a> {
         allocation: bool,
         initializer: Option<CfgPointId>,
     ) {
+        let bind = self.cursor.expect("existing binding definition point");
+        if let CfgPointKind::Bind { binding } = &self.cfg.points[bind.0].kind {
+            if let Some(ty) = self.binding_types.get(binding) {
+                if self.independent_checked_query && !allocation && initializer.is_some() && aggregate::ordinary_value(ty) {
+                    self.checked_scalar_storage.insert(binding.clone());
+                }
+                self.aggregate_facts.observe_binding(
+                    &self.cfg,
+                    bind,
+                    initializer,
+                    allocation,
+                    ty,
+                    position,
+                );
+            }
+        }
         if self.capture_call_points {
-            let bind = self.cursor.expect("existing binding definition point");
             let definition = if allocation {
                 BindingDefinition::Allocation { bind }
             } else if let Some(value) = initializer {
@@ -2997,6 +3268,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
         }
         self.point(CfgPointKind::ScopeExit, region.span, scope, BTreeSet::new());
+        if self.aggregate_facts.observes_values() {
+            self.aggregate_facts.scope_exits.insert(self.cursor.expect("scope exit"), ordinal);
+        }
         if scope == ReferenceScopeId(0) && region.final_outputs().next().is_some() {
             let return_span = ByteSpan::new(
                 region.final_outputs().next().expect("output").span.start,
@@ -3034,6 +3308,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
 
 #[derive(Clone, Default, PartialEq)]
 struct ReferenceEdgeState {
+    aggregate: Option<aggregate::AggregateEdgeState>,
     bindings: BTreeMap<ReferenceBindingId, BTreeSet<ReferenceOriginId>>,
     projected: Vec<ReferenceProjectedState>,
     uninitialized: HashSet<ReferenceBindingId>,
@@ -3292,6 +3567,11 @@ fn transfer_reference_facts(
     cfg: &mut ScalarReferenceCfg,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
     contracts: &[ConcreteReferenceOutputContract],
+    mut aggregate: Option<(
+        &aggregate::AggregateFlowFacts,
+        &FunctionCallSites,
+        &mut aggregate::AggregateFlowResult,
+    )>,
 ) -> Vec<ReferenceAnalysisError> {
     let original_points = cfg.points.clone();
     let grouped_installs = original_points
@@ -3340,6 +3620,7 @@ fn transfer_reference_facts(
     let mut observed = vec![None::<ReferenceFlowPoint>; cfg.points.len()];
     let mut incoming = vec![Vec::<ReferenceEdgeState>::new(); cfg.points.len()];
     incoming[0].push(ReferenceEdgeState {
+        aggregate: aggregate.as_ref().map(|(facts, _, _)| facts.entry_state()),
         point_values: vec![None; cfg.points.len()],
         ..ReferenceEdgeState::default()
     });
@@ -3356,6 +3637,11 @@ fn transfer_reference_facts(
                 continue;
             }
             visited[id.0].push(state.clone());
+            if let (Some((facts, sites, result)), Some(flow)) =
+                (&mut aggregate, &mut state.aggregate)
+            {
+                facts.visit(&original_points[id.0], flow, result, sites);
+            }
             let mut move_alternatives = Vec::new();
             cfg.points[id.0] = original_points[id.0].clone();
             let invalidation_address = match &cfg.points[id.0].kind {
@@ -4567,7 +4853,7 @@ struct CallDeclarationHeaders<'a> {
     namespaces: HashMap<&'a str, &'a SourceIdentity>,
     functions: HashMap<&'a str, (ByteSpan, CallFunctionKind, (usize, usize))>,
     bindings: HashMap<&'a str, CallBindingHeader<'a>>,
-    externs: HashMap<&'a str, HashMap<&'a str, ByteSpan>>,
+    externs: HashMap<&'a str, HashMap<&'a str, &'a ScalarExternFunction>>,
     value_tokens: HashMap<&'a str, ByteSpan>,
 }
 
@@ -4592,7 +4878,7 @@ enum CallDeclaration<'a> {
         (usize, usize),
     ),
     Binding(&'a SourceIdentity, ByteSpan),
-    Extern(&'a SourceIdentity, ByteSpan),
+    Extern(&'a SourceIdentity, &'a ScalarExternFunction),
 }
 
 impl<'a> CallDeclarationIndex<'a> {
@@ -4659,7 +4945,7 @@ impl<'a> CallDeclarationIndex<'a> {
                             for function in &group.functions {
                                 members
                                     .entry(function.name.as_str())
-                                    .or_insert(function.name_span);
+                                    .or_insert(function);
                             }
                             members
                         });
@@ -4852,6 +5138,33 @@ pub(super) enum OccurrenceNode {
     Block(BlockOrdinal),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ModuleStorageRole {
+    Read,
+    Argument { call: OccurrenceOrdinal, slot: usize },
+    Project,
+    Address,
+    Replace,
+    CallableReceiver,
+}
+
+impl ModuleStorageRole {
+    fn value(parent: OccurrenceParent, edge: OccurrenceEdge) -> Self {
+        match (parent, edge) {
+            (OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot)) =>
+                Self::Argument { call, slot },
+            _ => Self::Read,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ModuleStorageInstall {
+    pub(super) storage: SourceSpan,
+    pub(super) producer: OccurrenceOrdinal,
+    pub(super) consumer: Option<OccurrenceOrdinal>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct OccurrenceStructure {
     pub(super) root: BlockOrdinal,
@@ -4859,6 +5172,10 @@ pub(super) struct OccurrenceStructure {
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
+    pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
+    pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
+    pub(super) initializer_static_utf8: HashSet<OccurrenceOrdinal>,
+    pub(super) initializer_immediate: HashMap<OccurrenceOrdinal, OccurrenceOrdinal>,
     pub(super) resolved_namespace_places: HashMap<OccurrenceOrdinal, SourceIdentity>,
     pub(super) folded_expressions: HashMap<OccurrenceOrdinal, FoldedOccurrence>,
     pub(super) synthetic_expressions: HashMap<OccurrenceOrdinal, SyntheticOccurrence>,
@@ -4874,6 +5191,10 @@ impl OccurrenceStructure {
             edges: HashMap::new(),
             checked_types: CheckedOccurrenceTypes::default(),
             literal_fields: HashMap::new(),
+            module_storage_uses: HashMap::new(),
+            module_storage_installs: BTreeMap::new(),
+            initializer_static_utf8: HashSet::new(),
+            initializer_immediate: HashMap::new(),
             resolved_namespace_places: HashMap::new(),
             folded_expressions: HashMap::new(),
             synthetic_expressions: HashMap::new(),
@@ -5002,6 +5323,8 @@ pub(super) struct FunctionCallSites {
     pub(super) arms: Vec<FunctionCallSites>,
     pub(super) occurrences: Vec<OccurrenceMetadata>,
     pub(super) call_occurrences: Vec<CallOccurrence>,
+    declared_unsafe_calls: BTreeSet<usize>,
+    pub(super) callable_escapes: HashSet<SourceSpan>,
     overload_reservation_sites: Vec<CallOccurrence>,
     pub(super) self_tail_candidates: Vec<OccurrenceOrdinal>,
     pub(super) allocation_length_calls: Vec<OccurrenceOrdinal>,
@@ -5240,6 +5563,7 @@ struct CallableWalk<'a> {
     sites: Vec<ResolvedCallSite>,
     site_by_span: BTreeMap<CallSiteSpan, usize>,
     call_occurrences: Vec<CallOccurrence>,
+    declared_unsafe_calls: BTreeSet<usize>,
     overload_reservation_sites: Vec<CallOccurrence>,
     query_allocation_outputs: HashMap<(BlockOrdinal, usize), BindingOutputs>,
 }
@@ -5312,6 +5636,7 @@ struct StructuralWalker<'a, 'typing> {
     allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     initialization_call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
     initialization_identities: InitializationIdentities,
+    callable_escapes: HashSet<SourceSpan>,
     initialization_reservations: Vec<(usize, OccurrenceOrdinal, bool)>,
     initialization_item: usize,
     reserve_legacy_blocks: Vec<bool>,
@@ -5359,6 +5684,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             allocation_length_call_targets: HashMap::new(),
             initialization_call_targets: HashMap::new(),
             initialization_identities: InitializationIdentities::default(),
+            callable_escapes: HashSet::new(),
             initialization_reservations: Vec::new(),
             initialization_item: 0,
             reserve_legacy_blocks: vec![true],
@@ -5371,6 +5697,21 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             loops: HashMap::new(),
             short_circuits: HashMap::new(),
         }
+    }
+
+    fn storage_use(
+        structure: &mut OccurrenceStructure,
+        declarations: &CallDeclarationIndex<'_>,
+        source: &SourceIdentity,
+        name: &str,
+        ordinal: OccurrenceOrdinal,
+        role: ModuleStorageRole,
+    ) {
+        let Some((span, ScalarType::Struct(_))) = declarations.binding(source, name) else {
+            return;
+        };
+        structure.module_storage_uses.entry(SourceSpan::new(source.clone(), span))
+            .or_default().push((ordinal, role));
     }
 
     fn reserve_legacy(&self, parent: OccurrenceParent, edge: OccurrenceEdge) -> bool {
@@ -5449,8 +5790,21 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         ) {
             self.reserve_legacy_occurrences[ordinal.0] = false;
         }
+        let mut typed_callable = false;
         if let Some(ty) = self.occurrence_typing.take_expression_type(expression) {
+            typed_callable = matches!(&ty,
+                ScalarType::Callable { outputs, .. } if matches!(outputs.outputs.as_slice(),
+                    [ScalarOutput { ty: ScalarType::Struct(_), .. }]
+                )
+            );
             self.structure.checked_types.expressions.insert(ordinal, ty);
+        }
+        if matches!(&self.mode, WalkMode::ModuleInitialization { .. })
+            && matches!(expression, ScalarExpression::Utf8 { .. })
+            && matches!(edge, OccurrenceEdge::CallArgument(_))
+            && matches!(self.structure.checked_types.expressions.get(&ordinal), Some(ScalarType::Struct(_)))
+        {
+            self.structure.initializer_static_utf8.insert(ordinal);
         }
         if let Some(folded) = self.occurrence_typing.take_folded_expression(expression) {
             debug_assert_eq!(edge, OccurrenceEdge::UnaryOperand);
@@ -5489,6 +5843,13 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 }
             };
             if let Some(identity) = identity {
+                if let PlainNameIdentity::ModuleValue(target) = &identity {
+                    if typed_callable {
+                        self.callable_escapes.insert(target.clone());
+                    }
+                    Self::storage_use(&mut self.structure, resolver.declarations, &target.source,
+                        name, ordinal, ModuleStorageRole::value(parent, edge));
+                }
                 identities.insert(ordinal, identity);
             }
         }
@@ -5508,9 +5869,14 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     .map(InitializationName::Storage)
             };
             if let Some(identity) = identity {
-                self.initialization_identities
-                    .names
-                    .insert(ordinal, identity);
+                if let InitializationName::Storage(InitializationStorage::Module(span)) = identity {
+                    if typed_callable {
+                        self.callable_escapes.insert(SourceSpan::new((*source).clone(), span));
+                    }
+                    Self::storage_use(&mut self.structure, declarations, source, name, ordinal,
+                        ModuleStorageRole::value(parent, edge));
+                }
+                self.initialization_identities.names.insert(ordinal, identity);
             }
         }
         if let (ScalarExpression::Member { receiver, .. }, MemberFacts::Prepared(identities)) =
@@ -5525,7 +5891,26 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 !binding.introduced_by_assignment
                     || !resolver.declarations.has_value(resolver.source, receiver)
             });
-            let identity = match (self.occurrence_typing.take_member(expression), lexical) {
+            let selection = self.occurrence_typing.take_member(expression);
+            match &selection {
+                Some(CheckedMember::Module(target)) => {
+                    let ScalarExpression::Member { name, .. } = expression else {
+                        unreachable!("prepared member occurrence");
+                    };
+                    if typed_callable {
+                        if let Some(span) = resolver.declarations.value_token(target, name) {
+                            self.callable_escapes.insert(SourceSpan::new(target.clone(), span));
+                        }
+                    }
+                    Self::storage_use(&mut self.structure, resolver.declarations, target, name,
+                        ordinal, ModuleStorageRole::value(parent, edge));
+                }
+                Some(CheckedMember::DirectField(_) | CheckedMember::RawPointerField(_)) if lexical.is_none() =>
+                    Self::storage_use(&mut self.structure, resolver.declarations, resolver.source, receiver,
+                        ordinal, ModuleStorageRole::Project),
+                _ => {}
+            }
+            let identity = match (selection, lexical) {
                 (Some(CheckedMember::DirectField(field)), Some(binding)) => {
                     Some(PreparedMemberIdentity::Lexical {
                         binding: binding.reference_id(resolver.source, resolver.function_span),
@@ -5587,6 +5972,20 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 None => None,
             };
             if let Some(identity) = identity {
+                match &identity {
+                    InitializationMember::Module { declaration, .. } => Self::storage_use(
+                        &mut self.structure, declarations, &declaration.source, name, ordinal,
+                        ModuleStorageRole::value(parent, edge)),
+                    InitializationMember::Field { receiver: InitializationStorage::Module(_), .. } =>
+                        Self::storage_use(&mut self.structure, declarations, source, receiver, ordinal,
+                            ModuleStorageRole::Project),
+                    _ => {}
+                }
+                if typed_callable {
+                    if let InitializationMember::Module { declaration, .. } = &identity {
+                        self.callable_escapes.insert(declaration.clone());
+                    }
+                }
                 self.initialization_identities
                     .members
                     .insert(ordinal, identity);
@@ -5604,7 +6003,7 @@ impl CallableTargetResolver<'_> {
         names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
         signature: Option<&CheckedCallSignature>,
-    ) -> Result<ResolvedCallTarget, ReferenceAnalysisError> {
+    ) -> Result<(ResolvedCallTarget, bool), ReferenceAnalysisError> {
         let ScalarExpression::Call {
             receiver,
             receiver_span,
@@ -5616,6 +6015,7 @@ impl CallableTargetResolver<'_> {
             unreachable!("callable registration requires a call occurrence")
         };
         let missing = || missing_call_target(self.source, *span);
+        let mut declared_unsafe = false;
         let target = if receiver.as_deref() == Some("core") {
             CoreOperationId::from_name(name).map(ResolvedCallTarget::Core)
         } else if let Some(binding) = receiver.is_none().then(|| names.get(name)).flatten() {
@@ -5671,15 +6071,16 @@ impl CallableTargetResolver<'_> {
                             concrete: ConcreteCallSelection::Declaration,
                         })
                     }
-                    CallDeclaration::Extern(source, declaration_span) => {
+                    CallDeclaration::Extern(source, declaration) => {
+                        declared_unsafe = declaration.unsafe_marker;
                         Some(ResolvedCallTarget::ExternCallable {
                             source: source.clone(),
-                            declaration_span,
+                            declaration_span: declaration.name_span,
                         })
                     }
                 })
         };
-        target.ok_or_else(missing)
+        target.map(|target| (target, declared_unsafe)).ok_or_else(missing)
     }
 }
 
@@ -5695,9 +6096,12 @@ impl CallableWalk<'_> {
     ) -> Result<(), ReferenceAnalysisError> {
         use std::collections::btree_map::Entry;
 
-        let target = self
+        let (target, declared_unsafe) = self
             .target_resolver
             .resolve(expression, names, types, signature)?;
+        if declared_unsafe {
+            self.declared_unsafe_calls.insert(ordinal.0);
+        }
         let span = expression_span(expression);
         let source = self.target_resolver.source;
         let site_index = match self.site_by_span.entry(CallSiteSpan(span)) {
@@ -5832,8 +6236,8 @@ fn initialization_call_target(
             CallDeclaration::Binding(source, span) => {
                 Target::CallableBinding(SourceSpan::new(source.clone(), span))
             }
-            CallDeclaration::Extern(source, span) => {
-                Target::Extern(SourceSpan::new(source.clone(), span))
+            CallDeclaration::Extern(source, declaration) => {
+                Target::Extern(SourceSpan::new(source.clone(), declaration.name_span))
             }
         },
     )
@@ -5865,7 +6269,7 @@ impl StructuralWalker<'_, '_> {
                         )?;
                     }
                     WalkMode::CallableAllocationLength(resolver) => {
-                        let target = resolver.resolve(
+                        let (target, _) = resolver.resolve(
                             expression,
                             names,
                             types,
@@ -5906,6 +6310,10 @@ impl StructuralWalker<'_, '_> {
                                 ordinal,
                                 unqualified,
                             ));
+                        }
+                        if let ModuleInitializationCallTarget::CallableField { receiver, .. } = &target {
+                            self.structure.module_storage_uses.entry(receiver.clone()).or_default()
+                                .push((ordinal, ModuleStorageRole::CallableReceiver));
                         }
                         self.structural_calls.push(ordinal);
                         assert!(self
@@ -6028,7 +6436,12 @@ impl StructuralWalker<'_, '_> {
             | ScalarExpression::CheckedAddress { place, .. }
             | ScalarExpression::Dereference { place, .. }
             | ScalarExpression::IndexedRead { place, .. } => {
-                self.place_at(place, names, types, parent, OccurrenceEdge::ExpressionPlace)?;
+                let role = if matches!(expression, ScalarExpression::RawAddress { .. } | ScalarExpression::CheckedAddress { .. }) {
+                    ModuleStorageRole::Address
+                } else {
+                    ModuleStorageRole::Project
+                };
+                self.place_at(place, names, types, parent, OccurrenceEdge::ExpressionPlace, role)?;
             }
             ScalarExpression::StructLiteral { fields, .. } => {
                 for (position, field) in fields.iter().enumerate() {
@@ -6067,6 +6480,7 @@ impl StructuralWalker<'_, '_> {
         types: &BTreeMap<String, ScalarType>,
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
+        storage_role: ModuleStorageRole,
     ) -> Result<OccurrenceOrdinal, ReferenceAnalysisError> {
         let ordinal = self.record_occurrence(
             OccurrenceRole::Place,
@@ -6087,6 +6501,20 @@ impl StructuralWalker<'_, '_> {
         let parent = OccurrenceParent::Place(ordinal);
         match place {
             ScalarPlace::Name { name, .. } => {
+                if !self.structure.resolved_namespace_places.contains_key(&ordinal) {
+                    let context = match &self.mode {
+                        WalkMode::ModuleInitialization { source, declarations } => Some((*source, *declarations, false)),
+                        WalkMode::Callable(callable) => Some((callable.target_resolver.source,
+                            callable.target_resolver.declarations, true)),
+                        WalkMode::CallableAllocationLength(resolver) => Some((resolver.source, resolver.declarations, true)),
+                        WalkMode::StructuralOnly => None,
+                    };
+                    if let Some((source, declarations, callable)) = context {
+                        if names.get(name).is_none_or(|binding| callable && binding.introduced_by_assignment) {
+                            Self::storage_use(&mut self.structure, declarations, source, name, ordinal, storage_role);
+                        }
+                    }
+                }
                 if let WalkMode::ModuleInitialization {
                     source,
                     declarations,
@@ -6146,11 +6574,24 @@ impl StructuralWalker<'_, '_> {
                     }
                 }
             }
-            ScalarPlace::Field { base, .. } => {
-                self.place_at(base, names, types, parent, OccurrenceEdge::PlaceBase)?;
+            ScalarPlace::Field { base, field, .. } => {
+                let base = self.place_at(base, names, types, parent, OccurrenceEdge::PlaceBase, storage_role)?;
+                if let (Some(source), ScalarFieldReference::Unresolved { name, .. }) =
+                    (self.structure.resolved_namespace_places.get(&base).cloned(), field)
+                {
+                    let declarations = match &self.mode {
+                        WalkMode::ModuleInitialization { declarations, .. } => Some(*declarations),
+                        WalkMode::Callable(callable) => Some(callable.target_resolver.declarations),
+                        WalkMode::CallableAllocationLength(resolver) => Some(resolver.declarations),
+                        WalkMode::StructuralOnly => None,
+                    };
+                    if let Some(declarations) = declarations {
+                        Self::storage_use(&mut self.structure, declarations, &source, name, ordinal, storage_role);
+                    }
+                }
             }
             ScalarPlace::Index { base, index, .. } => {
-                self.place_at(base, names, types, parent, OccurrenceEdge::PlaceBase)?;
+                self.place_at(base, names, types, parent, OccurrenceEdge::PlaceBase, storage_role)?;
                 self.expression(index, names, types, parent, OccurrenceEdge::PlaceIndex)?;
             }
             ScalarPlace::Dereference { pointer, .. } => self.expression(
@@ -6471,6 +6912,7 @@ impl StructuralWalker<'_, '_> {
                             item: item_index,
                             destination,
                         },
+                        ModuleStorageRole::Replace,
                     )?;
                     let replacement = match &self.mode {
                         WalkMode::StructuralOnly | WalkMode::CallableAllocationLength(_) => {
@@ -6732,7 +7174,9 @@ fn walk_module_initialization(
     let root = walker.structure.root;
     let mut block_items = Vec::new();
     let mut extent: Option<ByteSpan> = None;
+    let mut last_install = None;
     for step in &region.steps {
+        let previous_install = last_install.take();
         walker.initialization_item = step.item;
         let position = BlockPosition {
             block: root,
@@ -6750,6 +7194,28 @@ fn walk_module_initialization(
                     binding.span,
                     &mut WalkScope::default(),
                 )?;
+                if let (WalkMode::ModuleInitialization { source, declarations },
+                    BindingInitialization::Outputs(outputs), [receiver]) =
+                    (&walker.mode, &binding_region.initialization, binding.receivers.as_slice())
+                {
+                    if outputs.secondary.is_empty() {
+                        if let Some(signature) = walker.checked_call_signatures.get(&outputs.primary) {
+                            if matches!(signature.outputs.outputs.as_slice(), [out] if out.ty == receiver.ty)
+                                && matches!(&receiver.ty, ScalarType::Struct(id)
+                                    if declarations.structs.get(id).is_some_and(|definition| definition.copy_policy == CopyPolicy::Move))
+                                && matches!(walker.initialization_call_targets.get(&outputs.primary),
+                                    Some(ModuleInitializationCallTarget::Direct { .. }))
+                            {
+                                walker.structure.module_storage_installs.insert(step.item, ModuleStorageInstall {
+                                    storage: SourceSpan::new((*source).clone(), receiver.name_span),
+                                    producer: outputs.primary,
+                                    consumer: None,
+                                });
+                                last_install = Some(step.item);
+                            }
+                        }
+                    }
+                }
                 block_items.push(BlockItem {
                     position: position.item,
                     kind: BlockItemKind::Binding(binding_region),
@@ -6763,13 +7229,44 @@ fn walk_module_initialization(
                     ScalarBlockItem::Assignment(assignment) => assignment.span,
                     ScalarBlockItem::While(while_expression) => while_expression.span,
                 };
-                block_items.push(walker.block_item(
+                let node = walker.block_item(
                     item,
                     ScalarBlockItemRole::Ordinary,
                     position,
                     span,
                     &mut WalkScope::default(),
-                )?);
+                )?;
+                if let (ScalarBlockItem::Expression(ScalarExpression::Call { arguments, .. }),
+                    BlockItemKind::Evaluation { expression: consumer }) = (item, &node.kind)
+                {
+                    if let ([ScalarExpression::Call { .. }], Some(&OccurrenceNode::Expression(producer))) =
+                        (arguments.as_slice(), walker.structure.edges.get(&(
+                            OccurrenceParent::Expression(*consumer), OccurrenceEdge::CallArgument(0))))
+                    {
+                        walker.structure.initializer_immediate.insert(*consumer, producer);
+                    }
+                }
+                if let (Some(previous), BlockItemKind::Evaluation { expression: consumer }) =
+                    (previous_install, &node.kind)
+                {
+                    let install = &walker.structure.module_storage_installs[&previous];
+                    if let (Some(ModuleInitializationCallTarget::Direct { .. }),
+                        Some(signature), Some(OccurrenceNode::Expression(argument))) =
+                        (walker.initialization_call_targets.get(consumer),
+                         walker.checked_call_signatures.get(consumer),
+                         walker.structure.edges.get(&(OccurrenceParent::Expression(*consumer), OccurrenceEdge::CallArgument(0))))
+                    {
+                        let exact = matches!(signature.parameters.as_slice(), [parameter]
+                            if walker.structure.checked_types.expressions.get(argument) == Some(parameter)
+                            && walker.checked_call_signatures[&install.producer].outputs.outputs[0].ty == *parameter);
+                        if exact && walker.structure.module_storage_uses.get(&install.storage).is_some_and(|uses|
+                            uses.last() == Some(&(*argument, ModuleStorageRole::Argument { call: *consumer, slot: 0 })))
+                        {
+                            walker.structure.module_storage_installs.get_mut(&previous).expect("adjacent owning module storage").consumer = Some(*consumer);
+                        }
+                    }
+                }
+                block_items.push(node);
                 span
             }
             _ => unreachable!("dispatch derives from this exact item slice"),
@@ -6794,6 +7291,7 @@ fn walk_module_initialization(
         legacy_reservations: walker.initialization_reservations,
         checked_call_signatures: walker.checked_call_signatures,
         identities: walker.initialization_identities,
+        callable_escapes: walker.callable_escapes,
         assignments: walker.assignments,
         conditionals: walker.conditionals,
         loops: walker.loops,
@@ -6848,6 +7346,7 @@ fn resolve_function_call_sites(
         sites: Vec::new(),
         site_by_span: BTreeMap::new(),
         call_occurrences: Vec::new(),
+        declared_unsafe_calls: BTreeSet::new(),
         overload_reservation_sites: Vec::new(),
         query_allocation_outputs: HashMap::new(),
     };
@@ -6939,6 +7438,8 @@ fn resolve_function_call_sites(
         arms,
         occurrences: resolver.occurrences,
         call_occurrences: callable.call_occurrences,
+        declared_unsafe_calls: callable.declared_unsafe_calls,
+        callable_escapes: resolver.callable_escapes,
         overload_reservation_sites: callable.overload_reservation_sites,
         self_tail_candidates: Vec::new(),
         allocation_length_calls: resolver.structural_calls,
@@ -7216,6 +7717,7 @@ struct ReferenceOutputContract {
     body: ReferenceCallableBody,
     output: usize,
     origins: Vec<ReferenceOrigin>,
+    independent_static: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7229,11 +7731,12 @@ struct ConcreteReferenceOutputContract {
 }
 
 fn collect_concrete_output_contracts(
-    result: &FunctionReferenceResult,
+    result: &mut FunctionReferenceResult,
     templates: &[ReferenceOutputContract],
     concrete: &mut Vec<ConcreteReferenceOutputContract>,
 ) {
-    for arm in &result.arms {
+    result.aggregate.checked_successor_contract = false;
+    for arm in &mut result.arms {
         collect_concrete_output_contracts(arm, templates, concrete);
     }
     for point in &result.cfg.initial_points {
@@ -7255,14 +7758,20 @@ fn collect_concrete_output_contracts(
             ConcreteCallSelection::Declaration => ReferenceCallableBody::Declaration,
             ConcreteCallSelection::Overload(arm) => ReferenceCallableBody::Overload(arm.arm_index),
         };
-        let Some(template) = templates.iter().find(|template| {
+        let mut matching = templates.iter().filter(|template| {
             template.source == *source
                 && template.declaration_span == *declaration_span
                 && template.body == body
                 && template.output == *output
-        }) else {
+        });
+        let Some(template) = matching.next() else {
             continue;
         };
+        if result.aggregate.checked_successor_candidate == Some(point.id) && *output == 0
+            && type_arguments.is_empty() && template.independent_static && matching.next().is_none()
+        {
+            result.aggregate.checked_successor_contract = true;
+        }
         let contract = ConcreteReferenceOutputContract {
             source: source.clone(),
             declaration_span: *declaration_span,
@@ -7283,22 +7792,35 @@ fn collect_concrete_output_contracts(
 fn collect_function_output_contracts(
     source: &SourceIdentity,
     function: &ScalarFunction,
-    result: &FunctionReferenceResult,
+    result: &mut FunctionReferenceResult,
     declaration_span: ByteSpan,
     body: ReferenceCallableBody,
     contracts: &mut Vec<ReferenceOutputContract>,
 ) {
+    let mut independent = !result.aggregate.checked_result_origins.is_empty();
+    let mut saw_checked = false;
+    let mut checked_successor_result = result.aggregate.checked_successor_contract;
+    let start = contracts.len();
     for point in &result.cfg.points {
-        let CfgPointKind::ReturnOutput { output, .. } = point.kind else {
-            continue;
-        };
-        let Some(origins) = &point.possible_origins else {
+        let CfgPointKind::ReturnOutput { output, value_point, .. } = point.kind else {
             continue;
         };
         if !matches!(&function.signature, ScalarType::Callable { outputs, .. } if matches!(outputs.outputs[output].ty, ScalarType::CheckedReference { .. }))
         {
             continue;
         }
+        if checked_successor_result {
+            checked_successor_result = !saw_checked && output == 0
+                && result.aggregate.checked_successor_candidate == Some(value_point)
+                && point.possible_origins.as_ref().is_some_and(|origins| !origins.is_empty()
+                    && result.cfg.points[value_point.0].possible_origins.as_ref() == Some(origins));
+        }
+        saw_checked = true;
+        let Some(origins) = &point.possible_origins else {
+            independent = false;
+            continue;
+        };
+        independent = independent && output == 0 && !origins.is_empty();
         contracts.push(ReferenceOutputContract {
             source: source.clone(),
             declaration_span,
@@ -7306,15 +7828,24 @@ fn collect_function_output_contracts(
             output,
             origins: origins
                 .iter()
-                .map(|id| result.cfg.facts[id.0].clone())
+                .map(|id| {
+                    independent = independent && result.aggregate.checked_result_origins.contains(id);
+                    result.cfg.facts[id.0].clone()
+                })
                 .collect(),
+            independent_static: false,
         });
+    }
+    result.aggregate.independent_checked_result = saw_checked && independent;
+    result.aggregate.checked_successor_result = saw_checked && checked_successor_result;
+    if result.aggregate.independent_checked_result && contracts.len() == start + 1 {
+        contracts[start].independent_static = true;
     }
     for (index, arm) in function.overload_arms.iter().enumerate() {
         collect_function_output_contracts(
             source,
             arm,
-            &result.arms[index],
+            &mut result.arms[index],
             declaration_span,
             ReferenceCallableBody::Overload(index),
             contracts,
@@ -7336,6 +7867,7 @@ fn transfer_function_output_contracts(
             &mut result.cfg,
             &BTreeMap::new(),
             contracts,
+            None,
         ));
     }
     errors
@@ -7349,8 +7881,8 @@ fn resolve_reference_output_contracts(
     let mut contracts = Vec::new();
     loop {
         let mut concrete = Vec::new();
-        for module in modules.iter() {
-            for (_, result) in module.results.iter() {
+        for module in modules.iter_mut() {
+            for (_, result) in module.results.iter_mut() {
                 collect_concrete_output_contracts(result, &contracts, &mut concrete);
             }
         }
@@ -7361,8 +7893,8 @@ fn resolve_reference_output_contracts(
             }
         }
         let mut next = Vec::new();
-        for module in modules.iter() {
-            for (index, result) in module.results.iter() {
+        for module in modules.iter_mut() {
+            for (index, result) in module.results.iter_mut() {
                 let ScalarItem::Function(function) = &module.items[*index] else {
                     unreachable!("function result ordinal")
                 };
@@ -7581,7 +8113,7 @@ fn derive_function_specialized_copy_policies(
         if !deferred.is_empty() {
             let mut concrete_cfg = template_result.cfg.clone();
             concrete_cfg.points = concrete_cfg.initial_points.clone();
-            let transferred = transfer_reference_facts(&mut concrete_cfg, &deferred, &[]);
+            let transferred = transfer_reference_facts(&mut concrete_cfg, &deferred, &[], None);
             errors.extend(transferred.into_iter().map(|error| {
                 ReferenceAnalysisError::MissingContext {
                     source_span: point.source_span.clone(),
@@ -7596,16 +8128,26 @@ fn derive_function_specialized_copy_policies(
 struct FunctionReferenceResult {
     cfg: ScalarReferenceCfg,
     proof_points: CallablePointFacts,
+    aggregate: aggregate::AggregateFlowResult,
     arms: Vec<FunctionReferenceResult>,
 }
 
 impl FunctionReferenceResult {
     fn install(self, function: &mut ScalarFunction) {
+        self.install_body(function, 0, None, None);
+    }
+
+    fn install_body(self, function: &mut ScalarFunction, item: usize, arm: Option<usize>, mut facts: Option<&mut aggregate::InstalledAggregateFacts>) {
         assert_eq!(self.arms.len(), function.overload_arms.len());
-        for (result, arm) in self.arms.into_iter().zip(&mut function.overload_arms) {
-            result.install(arm);
+        for (index, (result, arm)) in self.arms.into_iter().zip(&mut function.overload_arms).enumerate() {
+            result.install_body(arm, item, Some(index), facts.as_deref_mut());
         }
         function.reference_cfg = self.cfg;
+        if let Some(facts) = facts {
+            if self.aggregate.has_observations() {
+                facts.insert((item, arm), self.aggregate);
+            }
+        }
     }
 }
 
@@ -7661,13 +8203,14 @@ fn derive_function_reference_result(
     let mut builder =
         ReferenceFlowBuilder::new(source, function, module_names, call_sites, structs, enums);
     builder.capture_call_points = capture_call_points;
-    let (cfg, current_errors, proof_points) =
+    let (cfg, current_errors, proof_points, aggregate) =
         build_function_reference_cfg(builder, function, errors.len() == entry_errors);
     errors.extend(current_errors);
     FunctionReferenceResult {
         cfg,
         arms,
         proof_points,
+        aggregate,
     }
 }
 
@@ -7683,7 +8226,7 @@ fn derive_function_reference_cfg(
 ) -> (ScalarReferenceCfg, Vec<ReferenceAnalysisError>) {
     let builder =
         ReferenceFlowBuilder::new(source, function, module_names, call_sites, structs, enums);
-    let (cfg, errors, _) =
+    let (cfg, errors, _, _) =
         build_function_reference_cfg(builder, function, prior_children_succeeded);
     (cfg, errors)
 }
@@ -7696,6 +8239,7 @@ fn build_function_reference_cfg(
     ScalarReferenceCfg,
     Vec<ReferenceAnalysisError>,
     CallablePointFacts,
+    aggregate::AggregateFlowResult,
 ) {
     let mut errors = Vec::new();
     let call_sites = builder.call_sites;
@@ -7730,6 +8274,18 @@ fn build_function_reference_cfg(
         builder
             .binding_types
             .insert(builder.names[name].clone(), ty.clone());
+        if let ScalarType::Struct(id) = ty {
+            builder.aggregate_facts.formals.insert(slot.ordinal, builder.names[name].clone());
+            if let Some(declaration) = builder.structs.iter().find(|structure| &structure.id == id) {
+                let mut raw = declaration.fields.iter().filter(|field| matches!(field.ty, ScalarType::RawPointer(_)));
+                if let (Some(only), None) = (raw.next(), raw.next()) {
+                    builder.aggregate_facts.read_fields.insert(slot.ordinal, only.id.clone());
+                }
+            }
+        }
+        if matches!(ty, ScalarType::RawPointer(_)) {
+            builder.aggregate_facts.raw_formals.insert(slot.ordinal, builder.names[name].clone());
+        }
         if let ScalarType::CheckedReference { mutability, .. } = ty {
             let binding = builder.names[name].clone();
             let loan = ReferenceLoanId {
@@ -7765,6 +8321,12 @@ fn build_function_reference_cfg(
             );
         }
     }
+    if builder.aggregate_facts.formals.len() == 1 && builder.aggregate_facts.raw_formals.is_empty()
+        && (aggregate::ordinary_formal_outputs(&call_sites.boundary.root_outputs)
+            || builder.independent_checked_query)
+    {
+        builder.formal_forward_shape = Some((None, None));
+    }
     match builder.block(&function.body, call_sites.structure.root) {
         Err(error) => errors.push(error),
         Ok(result) => {
@@ -7792,9 +8354,34 @@ fn build_function_reference_cfg(
             }
         }
     }
+    let mut aggregate = std::mem::take(&mut builder.aggregate_result);
     if prior_children_succeeded && errors.is_empty() && !builder.cfg.points.is_empty() {
         builder.cfg.initial_points = builder.cfg.points.clone();
-        let _ = transfer_reference_facts(&mut builder.cfg, &BTreeMap::new(), &[]);
+        if let Some((Some(moved), Some(call))) = builder.formal_forward_shape {
+            let terminal = builder.cfg.points.last().map(|point| &point.kind);
+            if matches!(terminal, Some(CfgPointKind::Return))
+                || (call_sites.boundary.root_outputs.is_empty()
+                    && matches!(terminal, Some(CfgPointKind::ScopeExit)))
+            {
+                builder.aggregate_facts.formal_forward_shape = Some((moved, call));
+            }
+        }
+        let flow = builder.aggregate_facts.observes_values().then_some((
+            &builder.aggregate_facts,
+            call_sites,
+            &mut aggregate,
+        ));
+        let _ = transfer_reference_facts(&mut builder.cfg, &BTreeMap::new(), &[], flow);
     }
-    (builder.cfg, errors, builder.proof_points)
+    aggregate.returning_leaf = errors.is_empty() && prior_children_succeeded && builder.returning_leaf_prefix
+        && matches!(builder.cfg.points.last().map(|point| &point.kind), Some(CfgPointKind::Return));
+    if builder.independent_checked_query {
+        aggregate.checked_successor_candidate = aggregate.formal_forward.map(|(_, point, _, _)| point);
+    }
+    aggregate.checked_result_origins = builder.checked_result_origins;
+    aggregate.allocation_slots = builder.aggregate_facts.allocation_slots;
+    aggregate.calls = builder.aggregate_facts.calls;
+    aggregate.formals = builder.aggregate_facts.formals;
+    aggregate.read_formals = builder.aggregate_facts.raw_formals.into_keys().collect();
+    (builder.cfg, errors, builder.proof_points, aggregate)
 }
