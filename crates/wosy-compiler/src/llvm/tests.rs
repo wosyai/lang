@@ -7368,3 +7368,84 @@ unit(*?Grid) marker_address = fn(pointer) {
         "{text}"
     );
 }
+
+#[test]
+fn raw_final_output_ignores_redundant_expression_and_uses_actual_suffix() {
+    let text = "%%start
+i32(i32) first = fn(n) { n };
+i32(i32) second = fn(n) { n + 1 };
+i32(i32) relay = fn(n) { first(n) };
+%%end";
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let valid = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+        let project = |program: &crate::ScalarProgram| crate::ScalarProjectValidation {
+            project: ScalarProject::new(
+                vec![ScalarModule::from_program(program.clone(), Vec::new())],
+                vec![source.clone()],
+            ),
+            diagnostics: Vec::new(),
+        };
+        let standalone = emit_scalar_llvm(&valid).unwrap();
+        let project_partition = emit_scalar_project_llvm(&project(&valid.program)).unwrap();
+        for (actual_suffix, selected) in [(false, "first"), (true, "second")] {
+            let mut changed = crate::ScalarValidation {
+                program: valid.program.clone(),
+                diagnostics: Vec::new(),
+            };
+            let ScalarItem::Function(relay) = &mut changed.program.items[2] else {
+                panic!("relay");
+            };
+            let body = &mut relay.body;
+            let value = if actual_suffix {
+                let crate::ScalarBlockItem::Expression(expression) = body.items.last_mut().unwrap()
+                else {
+                    panic!("canonical suffix");
+                };
+                expression
+            } else {
+                &mut body.final_output_values[0].value
+            };
+            let crate::ScalarExpression::Call { name, .. } = value else {
+                panic!("final expression call");
+            };
+            assert_eq!(name, "first");
+            *name = "second".into();
+
+            let project_input = project(&changed.program);
+            let raw_decoded =
+                serde_json::from_slice(&serde_json::to_vec(&changed).unwrap()).unwrap();
+            let project_decoded =
+                serde_json::from_slice(&serde_json::to_vec(&project_input).unwrap()).unwrap();
+            for (raw, project) in [(&changed, &project_input), (&raw_decoded, &project_decoded)] {
+                let raw_output = emit_scalar_llvm(raw).unwrap();
+                let project_output = emit_scalar_project_llvm(project).unwrap();
+                assert_eq!(raw_output == standalone, !actual_suffix);
+                assert_eq!(project_output == project_partition, !actual_suffix);
+                let standalone_body =
+                    self_tail_test_body(&raw_output.to_text(), "i32", "relay").to_owned();
+                let project_body = self_tail_test_body(
+                    &project_output.to_text(),
+                    "i32",
+                    &project_function_name(&source, "relay"),
+                )
+                .to_owned();
+                assert_eq!(standalone_body.matches("call i32").count(), 1);
+                assert_eq!(project_body.matches("call i32").count(), 1);
+                assert!(standalone_body.contains(&format!("call i32 @{selected}(")));
+                assert!(project_body.contains(&format!(
+                    "call i32 @{}(",
+                    project_function_name(&source, selected)
+                )));
+            }
+        }
+    }
+}

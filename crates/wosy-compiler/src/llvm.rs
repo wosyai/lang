@@ -2707,14 +2707,7 @@ fn emit_project_block_at<'ctx, 'module>(
     Ok(result)
 }
 
-fn final_output_expression(
-    block: &ScalarBlock,
-    position: usize,
-    canonical: bool,
-) -> &ScalarExpression {
-    if !canonical {
-        return &block.final_output_values[position].value;
-    }
+fn final_output_expression(block: &ScalarBlock, position: usize) -> &ScalarExpression {
     let first_output = block.items.len() - block.final_output_values.len();
     let ScalarBlockItem::Expression(expression) = &block.items[first_output + position] else {
         unreachable!("canonical final output is an expression item")
@@ -2745,10 +2738,9 @@ fn emit_final_outputs<'ctx, 'module>(
     if let Some(outputs) = emission.explicit_ordered_outputs(block.final_output_values.len())? {
         return emit_ordered_final_outputs(context, state, block, outputs, None);
     }
-    let canonical = state.has_prepared_calls();
     if block.final_output_values.len() == 1 {
         let output = &block.final_output_values[0];
-        let expression = final_output_expression(block, 0, canonical);
+        let expression = final_output_expression(block, 0);
         if matches!(expression, ScalarExpression::Call { .. }) {
             transfer_runtime_array_return(state, block, expression, &output.ty);
             transfer_automatic_return_result(state, expression);
@@ -2788,7 +2780,7 @@ fn emit_final_outputs<'ctx, 'module>(
         .iter()
         .enumerate()
         .map(|(position, output)| {
-            let expression = final_output_expression(block, position, canonical);
+            let expression = final_output_expression(block, position);
             emit_typed_expression(context, state, expression, &output.ty)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2797,12 +2789,12 @@ fn emit_final_outputs<'ctx, 'module>(
         .contains_key(&(block.span.start, block.span.end))
     {
         for position in 0..block.final_output_values.len() {
-            let expression = final_output_expression(block, position, canonical);
+            let expression = final_output_expression(block, position);
             record_forwarded_return_owner(context, state, expression, position)?;
         }
     }
     for (position, output) in block.final_output_values.iter().enumerate() {
-        let expression = final_output_expression(block, position, canonical);
+        let expression = final_output_expression(block, position);
         transfer_runtime_array_return(state, block, expression, &output.ty);
         transfer_automatic_return_result(state, expression);
     }
@@ -2847,10 +2839,9 @@ fn emit_project_final_outputs<'ctx, 'module>(
     if let Some(outputs) = emission.explicit_ordered_outputs(block.final_output_values.len())? {
         return emit_ordered_final_outputs(context, state, block, outputs, Some((module, modules)));
     }
-    let canonical = state.has_prepared_calls();
     if block.final_output_values.len() == 1 {
         let output = &block.final_output_values[0];
-        let expression = final_output_expression(block, 0, canonical);
+        let expression = final_output_expression(block, 0);
         if matches!(expression, ScalarExpression::Call { .. }) {
             transfer_runtime_array_return(state, block, expression, &output.ty);
             transfer_automatic_return_result(state, expression);
@@ -2891,7 +2882,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
         .iter()
         .enumerate()
         .map(|(position, output)| {
-            let expression = final_output_expression(block, position, canonical);
+            let expression = final_output_expression(block, position);
             emit_project_typed_expression(context, state, expression, &output.ty, module, modules)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2900,12 +2891,12 @@ fn emit_project_final_outputs<'ctx, 'module>(
         .contains_key(&(block.span.start, block.span.end))
     {
         for position in 0..block.final_output_values.len() {
-            let expression = final_output_expression(block, position, canonical);
+            let expression = final_output_expression(block, position);
             record_forwarded_return_owner(context, state, expression, position)?;
         }
     }
     for (position, output) in block.final_output_values.iter().enumerate() {
-        let expression = final_output_expression(block, position, canonical);
+        let expression = final_output_expression(block, position);
         transfer_runtime_array_return(state, block, expression, &output.ty);
         transfer_automatic_return_result(state, expression);
     }
