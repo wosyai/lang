@@ -14,7 +14,7 @@ pub(crate) use super::reference::{
 };
 pub(crate) use initializer_call_nodes::{
     BoundInitializerMember, CallableBodyCallNodes, InitializerCallNodes, InitializerFacts,
-    InitializerFactsError, InitializerOutputRoute, QualifiedInitializerStorage,
+    InitializerFactsError,
 };
 
 #[derive(Default)]
