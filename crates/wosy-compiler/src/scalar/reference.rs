@@ -4306,7 +4306,7 @@ impl ScalarDescriptorReplay<'_> {
 fn transfer_reference_facts(
     cfg: &mut ScalarReferenceCfg,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
-    contracts: &[ConcreteReferenceOutputContract],
+    contracts: &HashMap<CfgPointId, &[ReferenceOrigin]>,
     mut aggregate: Option<(
         &aggregate::AggregateFlowFacts,
         &FunctionCallSites,
@@ -4374,7 +4374,6 @@ fn transfer_reference_facts(
     let aggregate_deadlines = aggregate.as_ref()
         .filter(|_| aggregate_expiry_allowed)
         .map(|(facts, _, _)| facts.value_deadlines(&last_use));
-    let mut call_contracts = BTreeMap::new();
     let mut observed = vec![None::<ReferenceFlowPoint>; cfg.points.len()];
     let mut incoming = vec![Vec::<ReferenceEdgeState>::new(); cfg.points.len()];
     incoming[0].push(ReferenceEdgeState {
@@ -4416,18 +4415,13 @@ fn transfer_reference_facts(
                 single_observation[id.0] = states.len() == 1;
             }
         }
-        let mut forward_visits = 0;
         for mut state in states {
-            let visits = if let Some((visited, _, _)) = &mut fallback {
+            if let Some((visited, _, _)) = &mut fallback {
                 if visited[id.0].contains(&state) {
                     continue;
                 }
                 visited[id.0].push(state.clone());
-                visited[id.0].len()
-            } else {
-                forward_visits += 1;
-                forward_visits
-            };
+            }
             if let (Some((facts, sites, result)), Some(flow)) =
                 (&mut aggregate, &mut state.aggregate)
             {
@@ -4484,42 +4478,12 @@ fn transfer_reference_facts(
                 }
                 _ => None,
             };
-            let call_origins = if let CfgPointKind::Call {
-                expression: ScalarExpression::Call { type_arguments, .. },
-                output,
-                target:
-                    ResolvedCallTarget::ModuleCallable {
-                        source,
-                        declaration_span,
-                        concrete,
-                    },
-                argument_points,
-                ..
-            } = &cfg.points[id.0].kind
+            let call_origins = if let CfgPointKind::Call { output, argument_points, .. } =
+                &cfg.points[id.0].kind
             {
-                let matches_contract = |contract: &ConcreteReferenceOutputContract| {
-                    contract.source == *source
-                        && contract.declaration_span == *declaration_span
-                        && contract.selection == *concrete
-                        && contract.output == *output
-                        && contract
-                            .type_arguments
-                            .iter()
-                            .eq(type_arguments.iter().map(|argument| &argument.ty))
-                };
-                let contract = match contracts {
-                    [] => None,
-                    [contract] => matches_contract(contract).then_some(contract),
-                    _ if visits == 1 => {
-                        contracts.iter().find(|contract| matches_contract(contract))
-                    }
-                    _ => *call_contracts.entry(id).or_insert_with(|| {
-                        contracts.iter().find(|contract| matches_contract(contract))
-                    }),
-                };
-                contract.map(|contract| {
+                contracts.get(&id).map(|&origins| {
                     let mut results = BTreeSet::new();
-                    for origin in &contract.origins {
+                    for origin in origins {
                         let actual = match origin {
                             ReferenceOrigin::BorrowedFrom { parameter, .. } => {
                                 if let Some(argument) = state.point_values.get(argument_points[*parameter]) {
@@ -8522,15 +8486,15 @@ struct ModuleReferenceView<'a> {
     results: &'a mut [(usize, FunctionReferenceResult)],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum ReferenceCallableBody {
     Declaration,
     Overload(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ReferenceOutputContract {
-    source: SourceIdentity,
+struct ReferenceOutputContract<'a> {
+    source: &'a SourceIdentity,
     declaration_span: ByteSpan,
     body: ReferenceCallableBody,
     output: usize,
@@ -8538,107 +8502,60 @@ struct ReferenceOutputContract {
     independent_static: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ConcreteReferenceOutputContract {
-    source: SourceIdentity,
-    declaration_span: ByteSpan,
-    selection: ConcreteCallSelection,
-    type_arguments: Vec<ScalarType>,
-    output: usize,
-    origins: Vec<ReferenceOrigin>,
+struct ReferenceOutputContractMatch {
+    first: usize,
+    unique: bool,
 }
+
+type ReferenceContractKey = (ByteSpan, ReferenceCallableBody, usize);
 
 #[derive(Default)]
-struct ReferenceContractReplay {
-    depends_on_module_calls: bool,
-    errors: Vec<ReferenceAnalysisError>,
+struct ReferenceOutputContracts<'a> {
+    rows: Vec<ReferenceOutputContract<'a>>,
+    by_source: HashMap<&'a SourceIdentity, HashMap<ReferenceContractKey, ReferenceOutputContractMatch>>,
 }
 
-fn collect_concrete_output_contracts(
-    result: &mut FunctionReferenceResult,
-    templates: &[ReferenceOutputContract],
-    concrete: &mut Vec<ConcreteReferenceOutputContract>,
-    replays: &mut Vec<ReferenceContractReplay>,
-    cursor: &mut usize,
-) {
-    result.aggregate.checked_successor_contract = false;
-    result.aggregate.raw_read_forward_contract = false;
-    for arm in &mut result.arms {
-        collect_concrete_output_contracts(arm, templates, concrete, replays, cursor);
+impl<'a> ReferenceOutputContracts<'a> {
+    fn new(rows: Vec<ReferenceOutputContract<'a>>) -> Self {
+        let mut by_source = HashMap::new();
+        for (index, row) in rows.iter().enumerate() {
+            by_source.entry(row.source).or_insert_with(HashMap::new)
+                .entry((row.declaration_span, row.body, row.output))
+                .and_modify(|found: &mut ReferenceOutputContractMatch| found.unique = false)
+                .or_insert(ReferenceOutputContractMatch { first: index, unique: true });
+        }
+        Self { rows, by_source }
     }
-    let index = *cursor;
-    *cursor += 1;
-    if index == replays.len() {
-        replays.push(ReferenceContractReplay::default());
-    } else if !replays[index].depends_on_module_calls {
-        return;
-    }
-    let replay = &mut replays[index];
-    for point in &result.cfg.initial_points {
-        let CfgPointKind::Call {
-            expression: ScalarExpression::Call { type_arguments, .. },
-            output,
-            target:
-                ResolvedCallTarget::ModuleCallable {
-                    source,
-                    declaration_span,
-                    concrete: selection,
-                },
-            ..
-        } = &point.kind
-        else {
-            continue;
-        };
-        replay.depends_on_module_calls = true;
+
+    fn find(
+        &self,
+        source: &SourceIdentity,
+        declaration_span: ByteSpan,
+        selection: &ConcreteCallSelection,
+        output: usize,
+    ) -> Option<(&ReferenceOutputContract<'a>, bool)> {
         let body = match selection {
             ConcreteCallSelection::Declaration => ReferenceCallableBody::Declaration,
             ConcreteCallSelection::Overload(arm) => ReferenceCallableBody::Overload(arm.arm_index),
         };
-        let mut matching = templates.iter().filter(|template| {
-            template.source == *source
-                && template.declaration_span == *declaration_span
-                && template.body == body
-                && template.output == *output
-        });
-        let Some(template) = matching.next() else {
-            continue;
-        };
-        let successor = result.aggregate.checked_successor_candidate == Some(point.id);
-        let raw_read_forward = result.aggregate.raw_read_forward_candidate == Some(point.id)
-            && match selection {
-                ConcreteCallSelection::Declaration => true,
-                ConcreteCallSelection::Overload(arm) => arm.substitutions.is_empty(),
-            };
-        if (successor || raw_read_forward) && *output == 0
-            && type_arguments.is_empty() && template.independent_static && matching.next().is_none()
-        {
-            result.aggregate.checked_successor_contract |= successor;
-            result.aggregate.raw_read_forward_contract |= raw_read_forward;
-        }
-        let contract = ConcreteReferenceOutputContract {
-            source: source.clone(),
-            declaration_span: *declaration_span,
-            selection: selection.clone(),
-            type_arguments: type_arguments
-                .iter()
-                .map(|argument| argument.ty.clone())
-                .collect(),
-            output: *output,
-            origins: template.origins.clone(),
-        };
-        if !concrete.contains(&contract) {
-            concrete.push(contract);
-        }
+        let found = self.by_source.get(source)?.get(&(declaration_span, body, output))?;
+        Some((&self.rows[found.first], found.unique))
     }
 }
 
-fn collect_function_output_contracts(
-    source: &SourceIdentity,
+#[derive(Default)]
+struct ReferenceContractReplay {
+    module_calls: Vec<CfgPointId>,
+    errors: Vec<ReferenceAnalysisError>,
+}
+
+fn collect_function_output_contracts<'a>(
+    source: &'a SourceIdentity,
     function: &ScalarFunction,
     result: &mut FunctionReferenceResult,
     declaration_span: ByteSpan,
     body: ReferenceCallableBody,
-    contracts: &mut Vec<ReferenceOutputContract>,
+    contracts: &mut Vec<ReferenceOutputContract<'a>>,
 ) {
     let mut independent = !result.aggregate.checked_result_origins.is_empty();
     let mut saw_checked = false;
@@ -8669,9 +8586,9 @@ fn collect_function_output_contracts(
         };
         independent = independent && output == 0 && !origins.is_empty();
         contracts.push(ReferenceOutputContract {
-            source: source.clone(),
+            source,
             declaration_span,
-            body: body.clone(),
+            body,
             output,
             origins: origins
                 .iter()
@@ -8701,17 +8618,64 @@ fn collect_function_output_contracts(
     }
 }
 
-fn transfer_function_output_contracts(
+fn transfer_function_output_contracts<'a>(
     result: &mut FunctionReferenceResult,
-    contracts: &[ConcreteReferenceOutputContract],
-    replays: &mut std::slice::IterMut<'_, ReferenceContractReplay>,
-    initial_round: bool,
+    previous: &ReferenceOutputContracts<'_>,
+    contracts: &'a ReferenceOutputContracts<'_>,
+    inputs: &mut HashMap<CfgPointId, &'a [ReferenceOrigin]>,
+    replays: &mut Vec<ReferenceContractReplay>,
+    cursor: &mut usize,
 ) {
     for arm in &mut result.arms {
-        transfer_function_output_contracts(arm, contracts, replays, initial_round);
+        transfer_function_output_contracts(arm, previous, contracts, inputs, replays, cursor);
     }
-    let replay = replays.next().expect("reference contract replay for body");
-    if !result.cfg.initial_points.is_empty() && (initial_round || replay.depends_on_module_calls) {
+    let index = *cursor;
+    *cursor += 1;
+    let initial = index == replays.len();
+    if initial {
+        replays.push(ReferenceContractReplay {
+            module_calls: result.cfg.initial_points.iter().filter_map(|point| {
+                matches!(&point.kind, CfgPointKind::Call {
+                    expression: ScalarExpression::Call { .. },
+                    target: ResolvedCallTarget::ModuleCallable { .. },
+                    ..
+                }).then_some(point.id)
+            }).collect(),
+            ..ReferenceContractReplay::default()
+        });
+    }
+    let replay = &mut replays[index];
+    let mut changed = initial;
+    inputs.clear();
+    result.aggregate.checked_successor_contract = false;
+    result.aggregate.raw_read_forward_contract = false;
+    for &id in &replay.module_calls {
+        let CfgPointKind::Call {
+            expression: ScalarExpression::Call { type_arguments, .. },
+            output,
+            target: ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete },
+            ..
+        } = &result.cfg.initial_points[id.0].kind else {
+            unreachable!("recorded module call point")
+        };
+        let current = contracts.find(source, *declaration_span, concrete, *output);
+        if !changed {
+            let prior = previous.find(source, *declaration_span, concrete, *output);
+            changed = current.map(|(row, _)| &row.origins) != prior.map(|(row, _)| &row.origins);
+        }
+        if let Some((row, unique)) = current {
+            inputs.insert(id, row.origins.as_slice());
+            if *output == 0 && type_arguments.is_empty() && row.independent_static && unique {
+                result.aggregate.checked_successor_contract |= result.aggregate.checked_successor_candidate == Some(id);
+                result.aggregate.raw_read_forward_contract |= result.aggregate.raw_read_forward_candidate == Some(id)
+                    && match concrete {
+                        ConcreteCallSelection::Declaration => true,
+                        ConcreteCallSelection::Overload(arm) => arm.substitutions.is_empty(),
+                    };
+            }
+        }
+    }
+    if !result.cfg.initial_points.is_empty() && changed {
         result.cfg.points = result.cfg.initial_points.clone();
         let candidate = match (&result.proof_points.scalar_descriptor_install, &result.proof_points.backing_descriptor_install) {
             (ScalarDescriptorCandidates::One(destination, marker), _) => Some((destination, marker)),
@@ -8730,7 +8694,7 @@ fn transfer_function_output_contracts(
         let transferred = transfer_reference_facts(
             &mut result.cfg,
             &BTreeMap::new(),
-            contracts,
+            inputs,
             None,
             descriptor.as_mut(),
         );
@@ -8781,27 +8745,20 @@ fn resolve_reference_output_contracts(
 ) -> Vec<ReferenceAnalysisError> {
     #[cfg(test)]
     stage_observations::record_output_contracts();
-    let mut contracts = Vec::new();
+    let mut previous = ReferenceOutputContracts::default();
+    let mut contracts = ReferenceOutputContracts::default();
     let mut replays = Vec::new();
     loop {
-        let initial_round = replays.is_empty();
-        let mut concrete = Vec::new();
+        let mut inputs = HashMap::new();
         let mut cursor = 0;
         for module in modules.iter_mut() {
             for (_, result) in module.results.iter_mut() {
-                collect_concrete_output_contracts(
-                    result, &contracts, &mut concrete, &mut replays, &mut cursor,
-                );
-            }
-        }
-        let mut replay_order = replays.iter_mut();
-        for module in modules.iter_mut() {
-            for (_, result) in module.results.iter_mut() {
                 transfer_function_output_contracts(
-                    result, &concrete, &mut replay_order, initial_round,
+                    result, &previous, &contracts, &mut inputs, &mut replays, &mut cursor,
                 );
             }
         }
+        drop(inputs);
         let mut next = Vec::new();
         for module in modules.iter_mut() {
             for (index, result) in module.results.iter_mut() {
@@ -8818,10 +8775,10 @@ fn resolve_reference_output_contracts(
                 );
             }
         }
-        if next == contracts {
+        if next == contracts.rows {
             return replays.into_iter().flat_map(|replay| replay.errors).collect();
         }
-        contracts = next;
+        previous = std::mem::replace(&mut contracts, ReferenceOutputContracts::new(next));
     }
 }
 
@@ -9023,7 +8980,7 @@ fn derive_function_specialized_copy_policies(
         if !deferred.is_empty() {
             let mut concrete_cfg = template_result.cfg.clone();
             concrete_cfg.points = concrete_cfg.initial_points.clone();
-            let transferred = transfer_reference_facts(&mut concrete_cfg, &deferred, &[], None, None);
+            let transferred = transfer_reference_facts(&mut concrete_cfg, &deferred, &HashMap::new(), None, None);
             errors.extend(transferred.into_iter().map(|error| {
                 ReferenceAnalysisError::MissingContext {
                     source_span: point.source_span.clone(),
@@ -9302,7 +9259,7 @@ fn build_function_reference_cfg(
             call_sites,
             &mut aggregate,
         ));
-        let provisional = transfer_reference_facts(&mut builder.cfg, &BTreeMap::new(), &[], flow, None);
+        let provisional = transfer_reference_facts(&mut builder.cfg, &BTreeMap::new(), &HashMap::new(), flow, None);
         if provisional.is_empty() {
             for &(end, _) in &builder.aggregate_facts.checked_producer_arms {
                 aggregate.checked_producer_backing.entry(end).or_insert(aggregate::CheckedProducerBacking::Unknown);
