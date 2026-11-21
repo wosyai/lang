@@ -4838,6 +4838,7 @@ fn transfer_reference_facts(
         .collect::<BTreeSet<_>>();
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
     let mut strictly_forward = true;
+    let mut known_field_owners = None::<HashSet<&ReferenceBindingId>>;
     let mut aggregate_expiry_allowed = aggregate.is_some();
     let pending = cfg.pending_named_reborrow;
     let mut local_definition = None;
@@ -4911,6 +4912,11 @@ fn transfer_reference_facts(
         aggregate_expiry_allowed = aggregate_expiry_allowed && strictly_forward
             && !matches!(&point.kind, CfgPointKind::MoveThrough { place, .. }
                 if !matches!(place, ScalarPlace::Dereference { .. }));
+        if let CfgPointKind::Borrow { place, loan } = &point.kind {
+            if loan.parent.is_none() && !place.projections.is_empty() && is_lexical_field_path(&place.projections) {
+                known_field_owners.get_or_insert_with(HashSet::new).insert(&place.binding);
+            }
+        }
         if let Some(pending) = pending.filter(|_| pending_allowed) {
             if let super::control::DeferredReborrowRoot::Local { owner, borrow } = &pending.root {
                 if matches!(&point.kind, CfgPointKind::Bind { binding } if binding == owner) {
@@ -5854,8 +5860,11 @@ fn transfer_reference_facts(
                 }
                 CfgPointKind::Assign { target, .. } => {
                     let target = available_place(target);
-                    if !target.projections.is_empty() || (pending_allowed
-                        && pending.is_some_and(|pending| deferred_local_owner_store(pending, point, original_points)))
+                    if !target.projections.is_empty()
+                        || (matches!(target.place, ScalarPlace::Name { .. }) && known_field_owners.as_ref()
+                            .is_some_and(|owners| owners.contains(&target.binding)))
+                        || (pending_allowed
+                            && pending.is_some_and(|pending| deferred_local_owner_store(pending, point, original_points)))
                     {
                         let origins = conflicting_live_loan(
                             original_points,

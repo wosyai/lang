@@ -12209,3 +12209,148 @@ u8(bool) inspect = fn(choose) {{
         }
     }
 }
+
+#[test]
+fn known_checked_loans_track_disjoint_fields_and_block_live_whole_owner_writes() {
+    for (field, early, late, failure) in [
+        ("left", "", "", Some("second")),
+        ("right", "", "", None),
+        ("right", "", "owner = { .left = 3; .right = 4; }; owner.left;", None),
+        ("right", "owner = { .left = 3; .right = 4; };", "", Some("owner")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *!u8 first = &!owner.left;
+    *!u8 second = &!owner.{field};
+    {early}
+    *first = 8;
+    *second = 9;
+    u8 a = *first;
+    u8 b = *second;
+    {late}
+    a; b;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let initial = text.find("&!owner.left").unwrap() as u32;
+        let sibling = (text.find("second = ").unwrap() + "second = ".len()) as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected typed callable") };
+            let cfg = &function.reference_cfg;
+            let expected_fields = [(initial, 0), (sibling, if field == "right" { 1 } else { 0 })];
+            for (address, field) in expected_fields {
+                let point = cfg.initial_points.iter().find(|point| point.source_span.range.start == address
+                    && matches!(point.kind, CfgPointKind::Borrow { .. }))
+                    .unwrap_or_else(|| panic!("direct typed borrow at {address}: {diagnostics:?}"));
+                let ReferenceOrigin::Fresh { loan, .. } = sole_fact(function, point) else { panic!("exact field allocation") };
+                assert!(matches!(loan.origin_place.projections.as_slice(),
+                    [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(resolved))]
+                        if loan.parent.is_none() && resolved.index == field));
+            }
+            if let Some(failure) = failure {
+                let requested = if failure == "second" { sibling } else { text.find("owner =").unwrap() as u32 };
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == requested)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == initial)
+                }), "{field}; {early}: {diagnostics:?}");
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{field}; {late}: {diagnostics:?}");
+            for (name, (loan_start, _)) in [("first = 8", expected_fields[0]), ("second = 9", expected_fields[1])] {
+                let store = text.find(name).unwrap() as u32;
+                let write = cfg.points.iter().find(|point| point.source_span.range.start == store
+                    && matches!(point.kind, CfgPointKind::AssignThrough { .. })).expect("exact checked field write");
+                assert!(matches!(&write.kind, CfgPointKind::AssignThrough { candidates, .. }
+                    if matches!(candidates.as_slice(), [candidate] if candidate.loan.creation_span.start == loan_start)));
+            }
+        }
+    }
+}
+
+#[test]
+fn known_shared_field_loans_block_only_a_write_to_their_actual_whole_owner() {
+    for (prefix, store, conflicts) in [
+        ("", "owner = { .left = 3; .right = 4; };", true),
+        ("Pair other = { .left = 1; .right = 2; };",
+            "other = { .left = 3; .right = 4; }; other.left;", false),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    {prefix}
+    *u8 left = &owner.left;
+    *u8 right = &owner.right;
+    {store}
+    u8 a = *left;
+    u8 b = *right;
+    a; b;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let loan = text.find("&owner.left").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected typed callable") };
+            let cfg = &function.reference_cfg;
+            let borrow = cfg.initial_points.iter().find(|point| point.source_span.range.start == loan
+                && matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
+                    if loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()))
+                .unwrap_or_else(|| panic!("known direct shared field loan: {diagnostics:?}"));
+            if conflicts {
+                let write = text.find("owner =").unwrap() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == write)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range)
+                }), "{store}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{store}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn known_field_loan_in_one_arm_does_not_affect_another_arms_same_spelling_owner() {
+    let text = r#"%%start
+struct copy Pair { u8 left; u8 right; }
+unit(bool) inspect = fn(choose) {
+    if (choose) {
+        Pair owner = { .left = 1; .right = 2; };
+        *u8 left = &owner.left;
+        u8 seen = *left;
+        seen;
+    } else {
+        Pair owner = { .left = 1; .right = 2; };
+        owner = { .left = 3; .right = 4; };
+        owner.left;
+    };
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected typed callable") };
+        let cfg = &function.reference_cfg;
+        let borrowed = cfg.initial_points.iter().find_map(|point| match &point.kind {
+            CfgPointKind::Borrow { place, loan } if loan.parent.is_none() && !place.projections.is_empty() =>
+                Some(&place.binding),
+            _ => None,
+        }).expect("borrowed owner");
+        let written = cfg.initial_points.iter().find_map(|point| match &point.kind {
+            CfgPointKind::Assign { target, .. } if target.projections.is_empty() => Some(&target.binding),
+            _ => None,
+        }).expect("other owner written");
+        assert_ne!(borrowed, written);
+    }
+}
