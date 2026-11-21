@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet};
 use num_bigint::BigInt;
 
 use super::{
-    checker_directive::{CheckedLiteralOutput, CheckerOperation},
+    checker_directive::{CheckedLiteralOutput, CheckerOperation, PreparedCheckerDirective},
     checker_flow::{
         check_integer_requirement_activity, check_integer_requirements_at_entry, exact_integer_call_argument,
-        exact_integer_return_at_entry, ActualCallResult, ExactIntegerArgument,
+        exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument,
         IntegerCheckFailure, IntegerInputs,
     },
     control::{CheckedCallSignature, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, NamespaceTarget},
@@ -22,7 +22,7 @@ use super::{
 use super::{
     checker_flow::{
         check_integer_requirements, check_integer_return_bound, check_integer_return_bound_where, check_integer_return_bound_with_shows,
-        proves_requirement_with_imported_root_local, CheckerPredicate, ImportedLocal, IntegerBranchProof,
+        proves_requirement_with_imported_root_local, ImportedLocal, IntegerBranchProof,
         IntegerComparison, IntegerReturn, ProofCoverage,
     },
     control::BlockItemKind,
@@ -367,6 +367,17 @@ fn walk_package_initialization(
         )) else {
             return Err(ProjectCheck::Unsupported);
         };
+        if let Some(directive) = structure.checker_directives.get(call) {
+            let Some(CheckerPredicate::Boolean(value)) = directive.predicate else {
+                return Err(ProjectCheck::Unsupported);
+            };
+            actual.had_obligations = true;
+            if directive.operation.rejects(value, !value) {
+                let span = topology.occurrences.get(call.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+                return Err(selected_failure(source, directive, span, IntegerInputs::closed(), Vec::new()));
+            }
+            continue;
+        }
         let Some(ModuleInitializationCallTarget::Direct {
             declaration,
             concrete: ConcreteCallSelection::Declaration,
@@ -613,14 +624,29 @@ fn project_failure(
     source: &SourceIdentity,
     failure: IntegerCheckFailure<'_>,
 ) -> ProjectCheck {
-    let directive = &body.structure.checker_directives[&failure.directive];
+    selected_failure(
+        source,
+        &body.structure.checker_directives[&failure.directive],
+        body.occurrences[failure.directive.0].span,
+        failure.state,
+        failure.axes.into_iter().cloned().collect(),
+    )
+}
+
+fn selected_failure(
+    source: &SourceIdentity,
+    directive: &PreparedCheckerDirective,
+    span: ByteSpan,
+    state: IntegerInputs,
+    axes: Vec<ReferenceBindingId>,
+) -> ProjectCheck {
     ProjectCheck::Failed {
         source: source.clone(),
         operation: directive.operation,
-        directive: body.occurrences[failure.directive.0].span,
+        directive: span,
         condition: directive.condition,
-        state: failure.state,
-        axes: failure.axes.into_iter().cloned().collect(),
+        state,
+        axes,
         output: directive.output.clone(),
     }
 }

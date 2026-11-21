@@ -13,6 +13,15 @@ pub(super) enum CheckerOperation {
     Narrow,
 }
 
+impl CheckerOperation {
+    pub(super) fn rejects(self, any_passing: bool, any_failing: bool) -> bool {
+        match self {
+            Self::Require => any_failing,
+            Self::Narrow => !any_passing,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct PreparedCheckerDirective {
     pub(super) operation: CheckerOperation,

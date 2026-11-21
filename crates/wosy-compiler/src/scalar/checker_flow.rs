@@ -3,7 +3,6 @@ use std::{borrow::Cow, collections::HashMap, rc::Rc};
 use num_bigint::BigInt;
 
 use super::{
-    checker_directive::CheckerOperation,
     control::{AssignmentReplacement, BindingInitialization, BindingRegion, BlockItemKind, BlockPosition, ConditionalRegion},
     reference::{BlockOrdinal, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, PlainNameIdentity},
     symbolic_integer::IntegerSet,
@@ -122,6 +121,10 @@ impl<'a> IntegerRoots<'a> {
 pub(super) struct IntegerInputs(Vec<IntegerRow>);
 
 impl IntegerInputs {
+    pub(super) fn closed() -> Self {
+        Self(vec![Vec::new()])
+    }
+
     fn singleton_at(&self, axis: usize) -> Option<&BigInt> {
         let (first, rest) = self.0.split_first()?;
         let value = first[axis].singleton_value()?;
@@ -681,23 +684,14 @@ fn walk_integer_block<'a>(
                 if let Some(directive) = structure.checker_directives.get(&expression) {
                     let (passing, failing, _) = path.split(roots, directive.predicate.as_ref()?)?;
                     roots.reached_obligation = true;
-                    match directive.operation {
-                        CheckerOperation::Require if !failing.is_unreachable() => {
-                            return Some(IntegerControl::Fail(IntegerCheckFailure {
-                                directive: expression,
-                                state: failing,
-                                axes: roots.axes.iter().map(|(binding, _)| *binding).collect(),
-                            }));
-                        }
-                        CheckerOperation::Narrow if passing.is_unreachable() => {
-                            return Some(IntegerControl::Fail(IntegerCheckFailure {
-                                directive: expression,
-                                state: failing,
-                                axes: roots.axes.iter().map(|(binding, _)| *binding).collect(),
-                            }));
-                        }
-                        CheckerOperation::Require | CheckerOperation::Narrow => path = passing,
+                    if directive.operation.rejects(!passing.is_unreachable(), !failing.is_unreachable()) {
+                        return Some(IntegerControl::Fail(IntegerCheckFailure {
+                            directive: expression,
+                            state: failing,
+                            axes: roots.axes.iter().map(|(binding, _)| *binding).collect(),
+                        }));
                     }
+                    path = passing;
                 } else if structure.checker_direct_targets.contains_key(&expression) {
                     let handle = handle_call.as_mut()?;
                     let argument = actual_nested_argument(calls, expression, roots, &path);

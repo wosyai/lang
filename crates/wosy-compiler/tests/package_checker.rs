@@ -81,7 +81,7 @@ fn internal_checker_keeps_pass_invalid_unsupported_and_no_checks_distinct() {
         check(&format!("unit() unused = fn {{ if (false) {{ core.require(false, {OUTPUT}); }}; }};")),
         ScalarCheckerOutcome::NoChecks,
     );
-    assert_eq!(check(&format!("core.require(true, {OUTPUT});")), ScalarCheckerOutcome::Unsupported);
+    assert_eq!(check(&format!("core.require(!(true), {OUTPUT});")), ScalarCheckerOutcome::Unsupported);
     let narrowed = check(&format!("unit(u8) selected = fn(value) {{ core.narrow(value > 7, {OUTPUT}); }}; selected(7);"));
     assert!(matches!(narrowed, ScalarCheckerOutcome::Failed(failure) if failure.operation == ScalarCheckerOperation::Narrow));
 }
@@ -201,4 +201,57 @@ fn main_flow_scope_still_checks_selected_namespace_dispatch() {
         observe(Some(&library), "root = namespace demo \"src/main.w\";", Some(&app)),
         ScalarCheckerOutcome::Invalid(_) | ScalarCheckerOutcome::Unsupported,
     ));
+}
+
+
+#[test]
+fn main_initializer_reaches_concrete_top_level_directives_in_source_order() {
+    for scope in [ScalarCheckerScope::default(), ScalarCheckerScope::MainFlowOnly] {
+        let passing = format!("core.require(true, {OUTPUT}); core.narrow(true, {OUTPUT});");
+        assert_eq!(check_scoped(&passing, scope), ScalarCheckerOutcome::Passed);
+        for (name, operation) in [
+            ("require", ScalarCheckerOperation::Require),
+            ("narrow", ScalarCheckerOperation::Narrow),
+        ] {
+            let first = r#"{ .stdout = "first"; .stderr = "authored"; .code = 23; .files = []; }"#;
+            let text = format!("{passing} core.{name}(false, {first}); core.require(false, {OUTPUT});");
+            let ScalarCheckerOutcome::Failed(failure) = check_scoped(&text, scope) else {
+                panic!("expected selected first concrete top-level directive");
+            };
+            assert_eq!(failure.operation, operation);
+            assert_eq!(&*failure.stdout, b"first");
+            assert_eq!(&*failure.stderr, b"authored");
+            assert_eq!(failure.code, 23.into());
+            let canonical = format!("%%start\n{text}\n%%end");
+            let at = |span: wosy_syntax::ByteSpan| &canonical[span.start as usize..span.end as usize];
+            assert_eq!(at(failure.condition), "false");
+            assert_eq!(at(failure.directive), format!("core.{name}(false, {first})"));
+        }
+    }
+}
+
+#[test]
+fn direct_initializer_failure_across_namespace_dispatch_keeps_its_own_source() {
+    let app = source();
+    let lib = SourceIdentity::new("local".into(), "demo".into(), "src/lib.w".into(), "phase4".into());
+    let app_text = format!("%%start\ncore.require(true, {OUTPUT}); lib = namespace demo \"src/lib.w\"; core.narrow(false, {OUTPUT});\n%%end");
+    let lib_text = format!("%%start\ncore.require(false, {OUTPUT});\n%%end");
+    let load = |source: &SourceIdentity, text: &str| {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+    };
+    let root = load(&app, &app_text);
+    let namespace = root.namespaces().into_iter().next().unwrap();
+    let binding = ScalarNamespaceBinding { binding: namespace.binding.clone(), target: lib.clone(), span: namespace.span };
+    let ScalarCheckerOutcome::Failed(failure) = check_scalar_package(
+        vec![(root, vec![binding]), (load(&lib, &lib_text), vec![])],
+        vec![app, lib.clone()],
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ScalarCheckerScope::MainFlowOnly,
+    ) else {
+        panic!("expected the earlier direct directive in dependency initializer");
+    };
+    assert_eq!(failure.source, lib);
+    assert_eq!(failure.operation, ScalarCheckerOperation::Require);
 }
