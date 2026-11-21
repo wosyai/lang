@@ -292,33 +292,29 @@ ReadLineStatus(u8) _read_line_zero_capacity = fn(first) {
 		null, ReadLineStatus::limit_exceeded
 	} else {
 		u8[1] scratch = [0];
+		*utf8 text = null;
+		ReadLineStatus status = ReadLineStatus::eof;
 		u64 count = zero;
 		bool complete = false;
 		unsafe { count, complete = read_into(&?scratch[0], one); };
-		if (!complete) {
-			null, ReadLineStatus::io_error
-		} else {
-			if (count == zero) {
-				null, ReadLineStatus::eof
-			} else {
-				u8 first = scratch[0];
-				if (first == 10) {
-					utf8 empty = { .data = null; .length = zero; };
-					&empty, ReadLineStatus::line
+		if (!complete) { status = ReadLineStatus::io_error; };
+		if (complete && count == zero) { status = ReadLineStatus::eof; };
+		if (complete && count != zero) {
+			u8 first = scratch[0];
+			if (first != 10) {
+				if (max_bytes == zero) {
+					status = _read_line_zero_capacity(first);
 				} else {
-					if (max_bytes == zero) {
-						ReadLineStatus status = _read_line_zero_capacity(first);
-						if (status == ReadLineStatus::line) {
-							utf8 empty = { .data = null; .length = zero; };
-							&empty, status
-						} else { null, status }
-					} else {
-						*utf8 text, ReadLineStatus status = _read_line_allocated(max_bytes, first, first == 13);
-						text, status
-					}
-				}
-			}
-		}
+					text, status = _read_line_allocated(max_bytes, first, first == 13);
+				};
+			};
+			if (first == 10 || (max_bytes == zero && status == ReadLineStatus::line)) {
+				utf8 empty = { .data = null; .length = zero; };
+				text = &empty;
+				status = ReadLineStatus::line;
+			};
+		};
+		text, status
 	}
 };
 
