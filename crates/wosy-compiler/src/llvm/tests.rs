@@ -4958,6 +4958,39 @@ fn emits_float_conversions_for_single_file_and_project() {
 }
 
 #[test]
+fn emits_float_conversions_of_width_inferred_arithmetic() {
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let text = "%%start
+i32(f32, f32) narrow = fn(a, b) { core.float_to_sint_trunc<i32>(a / b) };
+u64(f64, f64) wide = fn(a, b) { core.float_to_uint_trunc<u64>(a * b) };
+narrow(1.5, 2.0);
+wide(1.5, 2.0);
+%%end";
+    let program = derive_scalar_program(&parse_source(source.clone(), text.into(), &[]).result);
+    assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+    let single = emit_scalar_llvm(&program).unwrap().to_text();
+    let validation = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(program.program, Vec::new())],
+        vec![source],
+    ));
+    assert!(validation.diagnostics.is_empty(), "{:?}", validation.diagnostics);
+    let project = emit_scalar_project_llvm(&validation).unwrap().to_text();
+    for ir in [single, project] {
+        for operation in ["fdiv float", "fptosi float", "fmul double", "fptoui double"] {
+            assert!(ir.contains(operation), "{operation}: {ir}");
+        }
+        for operation in ["bitcast", "fptrunc", "fpext"] {
+            assert!(!ir.contains(operation), "{operation}: {ir}");
+        }
+    }
+}
+
+#[test]
 fn emits_bitcast_for_single_file_and_project() {
     let source = SourceIdentity::new(
         "project".into(),

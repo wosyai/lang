@@ -3103,6 +3103,13 @@ fn integer_conversion_source_context(
         .cloned()
 }
 
+fn required_binary_arithmetic_type<'a>(
+    expected: Option<&'a ScalarType>,
+    left: &ScalarType,
+) -> Option<&'a ScalarType> {
+    expected.or_else(|| (!is_float_type(left)).then_some(&ScalarType::I32))
+}
+
 fn float_conversion_source_context(
     operation: &str,
     expression: &ScalarExpression,
@@ -3560,9 +3567,12 @@ fn check_expression_type_in_module(
                 expect_module_type(module, &left_type, &right_type, *span, diagnostics);
                 left_type
             } else {
-                expect_module_type(module, &ScalarType::I32, &left_type, *span, diagnostics);
+                let required = required_binary_arithmetic_type(None, &left_type);
+                if let Some(required) = required {
+                    expect_module_type(module, required, &left_type, *span, diagnostics);
+                }
                 expect_module_type(module, &left_type, &right_type, *span, diagnostics);
-                ScalarType::I32
+                required.cloned().unwrap_or(left_type)
             }
         }
         ScalarExpression::Call {
@@ -4748,18 +4758,12 @@ fn check_expression_type_in_module_expected(
             expect_module_type(module, &left_type, &right_type, *span, diagnostics);
             return left_type;
         }
-        expect_module_type(
-            module,
-            arithmetic_context.unwrap_or(&ScalarType::I32),
-            &left_type,
-            *span,
-            diagnostics,
-        );
-        expect_module_type(module, &left_type, &right_type, *span, diagnostics);
-        if let Some(expected) = arithmetic_context {
-            return expected.clone();
+        let required = required_binary_arithmetic_type(arithmetic_context, &left_type);
+        if let Some(required) = required {
+            expect_module_type(module, required, &left_type, *span, diagnostics);
         }
-        return ScalarType::I32;
+        expect_module_type(module, &left_type, &right_type, *span, diagnostics);
+        return required.cloned().unwrap_or(left_type);
     }
     expression_type_in_module(
         expression,
@@ -7984,9 +7988,12 @@ fn check_expression_type(
                 expect_type(program, &left_type, &right_type, *span, diagnostics);
                 left_type
             } else {
-                expect_type(program, &ScalarType::I32, &left_type, *span, diagnostics);
+                let required = required_binary_arithmetic_type(None, &left_type);
+                if let Some(required) = required {
+                    expect_type(program, required, &left_type, *span, diagnostics);
+                }
                 expect_type(program, &left_type, &right_type, *span, diagnostics);
-                ScalarType::I32
+                required.cloned().unwrap_or(left_type)
             }
         }
         ScalarExpression::Call {
