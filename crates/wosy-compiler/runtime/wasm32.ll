@@ -1,7 +1,8 @@
 target triple = "wasm32-wasi"
 
-; Heap starts above the default 64 KiB stack-last region so the bump region never grows through live frames.
-@__wosy_core_heap_cursor = internal global i64 131072
+; wasm-ld places this symbol after static data and the reserved stack. Its address is the heap start.
+@__heap_base = external global i8
+@__wosy_core_heap_cursor = internal global i64 0
 @__wosy_core_free_head = internal global i32 0
 @__wosy_wasm_tail = internal global i32 0
 
@@ -177,7 +178,16 @@ reuse:
 extend:
   %tail = load i32, ptr @__wosy_wasm_tail, align 4
   %has_tail = icmp ne i32 %tail, 0
-  br i1 %has_tail, label %tail_kind, label %extend_place
+  br i1 %has_tail, label %tail_kind, label %extend_first
+
+extend_first:
+  %heap_base32 = ptrtoint ptr @__heap_base to i32
+  %heap_base = zext i32 %heap_base32 to i64
+  ; The block headers pack flags in the low three bits. Round in i64 so a base
+  ; near the wasm32 limit cannot wrap back into static data.
+  %heap_round = add i64 %heap_base, 7
+  %heap_start = and i64 %heap_round, -8
+  br label %extend_place
 
 tail_kind:
   %tail_ptr = inttoptr i32 %tail to ptr
@@ -198,9 +208,9 @@ extend_append:
   br label %extend_place
 
 extend_place:
-  %extension_start = phi i64 [ %cursor, %extend ], [ %tail64, %extend_free_tail ], [ %cursor, %extend_append ]
-  %extension_prev = phi i32 [ 0, %extend ], [ %tail_prev, %extend_free_tail ], [ %tail_span, %extend_append ]
-  %extension_unlink = phi i32 [ 0, %extend ], [ %tail, %extend_free_tail ], [ 0, %extend_append ]
+  %extension_start = phi i64 [ %heap_start, %extend_first ], [ %tail64, %extend_free_tail ], [ %cursor, %extend_append ]
+  %extension_prev = phi i32 [ 0, %extend_first ], [ %tail_prev, %extend_free_tail ], [ %tail_span, %extend_append ]
+  %extension_unlink = phi i32 [ 0, %extend_first ], [ %tail, %extend_free_tail ], [ 0, %extend_append ]
   %extension_minimum = add i64 %extension_start, 12
   %extension_adjusted = add i64 %extension_minimum, %alignment_minus_one
   %extension_pointer = and i64 %extension_adjusted, %inverse
