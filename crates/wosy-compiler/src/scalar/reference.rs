@@ -1430,9 +1430,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }) && signature.is_some_and(|signature| {
                     aggregate::array_roundtrip_signature(&signature.parameters, &signature.outputs)
                 });
+                let neutral_array_call = array_call && matches!(&call, CfgPointKind::Call {
+                    target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, ..
+                }) && signature.is_some_and(|signature|
+                    aggregate::neutral_array_signature(&signature.parameters, &signature.outputs));
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
                 if let Some((moved, binding)) = array_argument.filter(|_| array_call) {
                     self.aggregate_facts.array_calls.insert(id, (ordinal, moved, binding));
+                    if neutral_array_call {
+                        self.aggregate_facts.neutral_array_calls.insert(id);
+                    }
                 }
                 if carries_struct_result {
                     self.aggregate_facts.calls.insert(id, ordinal);
@@ -2764,7 +2771,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
             target: target.clone(),
             argument_points: argument_points.clone(),
         };
-        self.point_with_origins(kind, point.source_span.range, point.scope, None)
+        let projection = self.point_with_origins(kind, point.source_span.range, point.scope, None);
+        if self.aggregate_facts.neutral_array_calls.contains(&producer) {
+            self.aggregate_facts.neutral_array_projections.insert(projection, producer);
+        }
+        projection
     }
 
     fn additional_receivers(
@@ -2882,6 +2893,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
             if let Some(ty) = self.binding_types.get(binding) {
                 if self.independent_checked_query && !allocation && initializer.is_some() && aggregate::ordinary_value(ty) {
                     self.checked_scalar_storage.insert(binding.clone());
+                }
+                if (self.aggregate_facts.array_formal.is_some()
+                    || self.aggregate_facts.local_array_copy_allocation.is_some())
+                    && aggregate::array_neutral_scalar(ty)
+                {
+                    self.aggregate_facts.neutral_array_scalars.insert(binding.clone());
                 }
                 self.aggregate_facts.observe_binding(
                     &self.cfg,
@@ -9161,14 +9178,13 @@ fn build_function_reference_cfg(
             builder.aggregate_facts.array_formal = Some(builder.names[name].clone());
             builder.aggregate_result.array_neutral = matches!(&function.signature, ScalarType::Callable {
                 parameters, outputs
-            } if matches!(parameters.first(), Some(ScalarType::RuntimeArray { element, .. })
-                    if aggregate::ordinary_value(element))
-                && parameters[1..].iter().all(aggregate::ordinary_value)
-                && outputs.outputs.len() == 1)
-                && call_sites.call_occurrences.is_empty()
+            } if aggregate::neutral_array_signature(parameters, outputs))
                 && call_sites.allocation_length_call_targets.is_empty()
                 && call_sites.callable_escapes.is_empty()
                 && call_sites.structure.module_storage_uses.is_empty();
+        }
+        if builder.aggregate_facts.array_formal.is_some() && aggregate::array_neutral_scalar(ty) {
+            builder.aggregate_facts.neutral_array_scalars.insert(builder.names[name].clone());
         }
         if let ScalarType::Struct(id) = ty {
             builder.aggregate_facts.formals.insert(slot.ordinal, builder.names[name].clone());
