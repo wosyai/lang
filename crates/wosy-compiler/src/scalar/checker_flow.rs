@@ -1,6 +1,9 @@
 use num_bigint::BigInt;
 
 use super::{
+    checker_directive::CheckerOperation,
+    control::{BlockItemKind, ConditionalRegion},
+    reference::{BlockOrdinal, FunctionCallSites, OccurrenceOrdinal, PlainNameIdentity},
     symbolic_integer::IntegerSet,
     typecheck::is_integer_type,
     BinaryOperator, ReferenceBindingId, ScalarExpression, ScalarType,
@@ -98,4 +101,96 @@ impl IntegerPath {
     pub(super) fn is_unreachable(&self) -> bool {
         self.values.is_empty()
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct IntegerCheckFailure {
+    pub(super) directive: OccurrenceOrdinal,
+    pub(super) inputs: IntegerPath,
+}
+
+enum IntegerControl {
+    Continue(IntegerPath),
+    Fail(IntegerCheckFailure),
+}
+
+pub(super) fn check_integer_requirements(
+    calls: &FunctionCallSites,
+) -> Option<Result<(), IntegerCheckFailure>> {
+    let [parameter] = calls.boundary.parameters.as_slice() else {
+        return None;
+    };
+    let structure = &calls.structure;
+    let predicates = structure.checker_integer_branches.iter().chain(
+        structure.checker_directives.iter().filter_map(|(ordinal, directive)| {
+            Some((ordinal, directive.integer_predicate.as_ref()?))
+        }),
+    );
+    let (_, first) = predicates
+        .filter(|(_, predicate)| {
+            predicate.binding.declaration_span == parameter.span && predicate.ty == parameter.ty
+        })
+        .min_by_key(|(ordinal, _)| ordinal.0)?;
+    match walk_integer_block(calls, structure.root, first.root()?)? {
+        IntegerControl::Continue(_) => Some(Ok(())),
+        IntegerControl::Fail(failure) => Some(Err(failure)),
+    }
+}
+
+fn walk_integer_block(
+    calls: &FunctionCallSites,
+    block: BlockOrdinal,
+    mut path: IntegerPath,
+) -> Option<IntegerControl> {
+    let structure = &calls.structure;
+    for item in &structure.blocks.get(block.0)?.items {
+        if path.is_unreachable() {
+            break;
+        }
+        match item.kind {
+            BlockItemKind::Evaluation { expression } => {
+                if let Some(directive) = structure.checker_directives.get(&expression) {
+                    let (passing, failing) = path.split(directive.integer_predicate.as_ref()?)?;
+                    match directive.operation {
+                        CheckerOperation::Require if !failing.is_unreachable() => {
+                            return Some(IntegerControl::Fail(IntegerCheckFailure {
+                                directive: expression,
+                                inputs: failing,
+                            }));
+                        }
+                        CheckerOperation::Narrow if passing.is_unreachable() => {
+                            return Some(IntegerControl::Fail(IntegerCheckFailure {
+                                directive: expression,
+                                inputs: path,
+                            }));
+                        }
+                        CheckerOperation::Require | CheckerOperation::Narrow => path = passing,
+                    }
+                } else {
+                    let ConditionalRegion::Unit { condition, then_block, .. } =
+                        calls.conditionals.get(&expression)?
+                    else {
+                        return None;
+                    };
+                    let predicate = structure.checker_integer_branches.get(condition)?;
+                    let (yes, no) = path.split(predicate)?;
+                    match walk_integer_block(calls, *then_block, yes)? {
+                        IntegerControl::Continue(then_path) => path = then_path.join(no)?,
+                        failure @ IntegerControl::Fail(_) => return Some(failure),
+                    }
+                }
+            }
+            BlockItemKind::FinalOutput(slot) => {
+                let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(slot.expression)?
+                else {
+                    return None;
+                };
+                if *binding != path.binding {
+                    return None;
+                }
+            }
+            BlockItemKind::Binding(_) | BlockItemKind::Assignment { .. } => return None,
+        }
+    }
+    Some(IntegerControl::Continue(path))
 }

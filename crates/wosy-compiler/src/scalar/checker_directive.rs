@@ -408,6 +408,7 @@ mod tests {
     #[test]
     fn canonical_branch_refines_checker_requirement_without_leaking_past_join() {
         use crate::scalar::{
+            checker_flow::check_integer_requirements,
             control::ConditionalRegion,
             reference::{self, OccurrenceEdge, OccurrenceNode, OccurrenceParent},
             typecheck_scalar_project_in_mode,
@@ -473,10 +474,86 @@ mod tests {
         let (passing, failing) = joined.split(after_join.integer_predicate.as_ref().unwrap()).unwrap();
         assert!(!passing.is_unreachable());
         assert!(!failing.is_unreachable());
+        let expected_failing = failing;
 
         let type_range = directive_for(body.structure.root, 2);
         let (_, failing) = joined.split(type_range.integer_predicate.as_ref().unwrap()).unwrap();
         assert!(failing.is_unreachable());
+
+        let failure = check_integer_requirements(body).unwrap().unwrap_err();
+        assert_eq!(&body.structure.checker_directives[&failure.directive], after_join);
+        assert_eq!(failure.inputs, expected_failing);
+    }
+
+    fn check_source<T>(source: &str, inspect: impl FnOnce(&crate::scalar::reference::FunctionCallSites) -> T) -> T {
+        use crate::scalar::{reference, typecheck_scalar_project_in_mode};
+        let (checked, typing) = typecheck_scalar_project_in_mode(checker_project(source), true);
+        assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
+        let calls = reference::resolve_project_call_sites_with_occurrences(&checked.project.modules, typing);
+        assert_eq!(calls.lookup_errors().count(), 0);
+        inspect(calls.function(0, 0))
+    }
+
+    #[test]
+    fn narrowing_restricts_continuation_and_unreachable_checks_are_vacuous() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        check_source(
+            r#"
+            u8(u8) check_value = fn(value) {
+                core.narrow(value >= 11, { .stdout = ""; .stderr = "narrow"; .code = 1; .files = []; });
+                if (value < 11) {
+                    core.require(value >= 200, { .stdout = ""; .stderr = "unreachable"; .code = 1; .files = []; });
+                }
+                core.require(value >= 11, { .stdout = ""; .stderr = "reachable"; .code = 1; .files = []; });
+                value
+            };
+            "#,
+            |body| assert_eq!(check_integer_requirements(body), Some(Ok(()))),
+        );
+    }
+
+    #[test]
+    fn contradictory_narrowing_uses_its_entire_incoming_state() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        check_source(
+            r#"
+            u8(u8) check_value = fn(value) {
+                core.narrow(value >= 11, { .stdout = ""; .stderr = "first"; .code = 1; .files = []; });
+                core.narrow(value < 11, { .stdout = ""; .stderr = "contradiction"; .code = 1; .files = []; });
+                value
+            };
+            "#,
+            |body| {
+                let failure = check_integer_requirements(body).unwrap().unwrap_err();
+                let directives = &body.structure.checker_directives;
+                let failing_directive = &directives[&failure.directive];
+                assert_eq!(failing_directive.operation, CheckerOperation::Narrow);
+                let initial_directive = directives
+                    .iter()
+                    .min_by_key(|(ordinal, _)| ordinal.0)
+                    .unwrap().1;
+                assert_ne!(failing_directive, initial_directive);
+                let first = initial_directive.integer_predicate.as_ref().unwrap();
+                let (incoming, _) = first.root().unwrap().split(first).unwrap();
+                assert_eq!(failure.inputs, incoming);
+            },
+        );
+    }
+
+    #[test]
+    fn reachable_assignment_never_reuses_a_stale_range() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        check_source(
+            r#"
+            u8(u8) check_value = fn(value) {
+                core.narrow(value >= 11, { .stdout = ""; .stderr = "narrow"; .code = 1; .files = []; });
+                value = 5;
+                core.require(value >= 11, { .stdout = ""; .stderr = "changed"; .code = 1; .files = []; });
+                value
+            };
+            "#,
+            |body| assert_eq!(check_integer_requirements(body), None),
+        );
     }
 
 }
