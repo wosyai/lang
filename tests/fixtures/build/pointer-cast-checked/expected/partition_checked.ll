@@ -16,12 +16,12 @@ attributes #3 = { "wasm-import-module"="wasi_snapshot_preview1" "wasm-import-nam
 
 define void @wosy_fn__706f696e7465722d636173742d636865636b6564__7372632f6d61696e2e77__30613230343433643362333434356136663938666232656564353261383231383861373633306235653561316362333635373438353966343261316164333861__72756e() {
 entry:
-  %utf8_literal29 = alloca [16 x i8], align 1
-  %aggregate_destination25 = alloca [16 x i8], align 1
+  %utf8_literal29 = alloca [16 x i8], align 8
+  %aggregate_destination25 = alloca [16 x i8], align 8
   %second = alloca i8, align 1
   %assignment_value12 = alloca i8, align 1
-  %utf8_literal = alloca [16 x i8], align 1
-  %aggregate_destination = alloca [16 x i8], align 1
+  %utf8_literal = alloca [16 x i8], align 8
+  %aggregate_destination = alloca [16 x i8], align 8
   %first = alloca i8, align 1
   %shared = alloca i32, align 4
   %assignment_value = alloca i8, align 1
@@ -60,13 +60,13 @@ deref_null_continue8:                             ; preds = %deref_null_continue
   %place = load i8, ptr %deref9, align 1
   store i8 %place, ptr %first, align 1
   %first10 = load i8, ptr %first, align 1
-  %aggregate_original_base = call ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f3337__(i8 %first10, ptr %aggregate_destination)
-  %aggregate_input_call = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__7072696e74(ptr %aggregate_destination, ptr %aggregate_original_base)
+  %aggregate_original_base = call ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f3337__(i8 %first10, ptr %aggregate_destination)
+  %aggregate_input_call = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__7072696e74(ptr %aggregate_destination, ptr %aggregate_original_base)
   %data = getelementptr inbounds i8, ptr %utf8_literal, i8 0
   store i32 ptrtoint (ptr @wosy_utf8_literal_0 to i32), ptr %data, align 4
   %length = getelementptr inbounds i8, ptr %utf8_literal, i8 8
   store i64 1, ptr %length, align 4
-  %aggregate_input_call11 = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__7072696e74(ptr %utf8_literal, ptr null)
+  %aggregate_input_call11 = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__7072696e74(ptr %utf8_literal, ptr null)
   store i8 67, ptr %assignment_value12, align 1
   %assignment_value13 = load i8, ptr %assignment_value12, align 1
   %writer14 = load i32, ptr %writer, align 4
@@ -93,20 +93,20 @@ deref_null_continue22:                            ; preds = %deref_null_continue
   %place24 = load i8, ptr %deref23, align 1
   store i8 %place24, ptr %second, align 1
   %second26 = load i8, ptr %second, align 1
-  %aggregate_original_base27 = call ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f3337__(i8 %second26, ptr %aggregate_destination25)
-  %aggregate_input_call28 = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__7072696e74(ptr %aggregate_destination25, ptr %aggregate_original_base27)
+  %aggregate_original_base27 = call ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f3337__(i8 %second26, ptr %aggregate_destination25)
+  %aggregate_input_call28 = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__7072696e74(ptr %aggregate_destination25, ptr %aggregate_original_base27)
   %data30 = getelementptr inbounds i8, ptr %utf8_literal29, i8 0
   store i32 ptrtoint (ptr @wosy_utf8_literal_1 to i32), ptr %data30, align 4
   %length31 = getelementptr inbounds i8, ptr %utf8_literal29, i8 8
   store i64 1, ptr %length31, align 4
-  %aggregate_input_call32 = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__7072696e74(ptr %utf8_literal29, ptr null)
+  %aggregate_input_call32 = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__7072696e74(ptr %utf8_literal29, ptr null)
   %storage33 = load i32, ptr %storage, align 4
   %free_pointer = inttoptr i32 %storage33 to ptr
   call void @__wosy_core_free(ptr %free_pointer)
   ret void
 }
 
-define internal { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__7072696e74(ptr %text, ptr %0) {
+define internal { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__7072696e74(ptr %text, ptr %0) {
 entry:
   %assignment_value50 = alloca i1, align 1
   %assignment_value44 = alloca i64, align 8
@@ -118,17 +118,17 @@ entry:
   %assignment_value = alloca i32, align 4
   %count = alloca i32, align 4
   %result = alloca i32, align 4
-  %byte_count = alloca [4 x i8], align 1
-  %struct_literal10 = alloca [4 x i8], align 1
-  %iovec = alloca [8 x i8], align 1
-  %struct_literal = alloca [8 x i8], align 1
+  %byte_count = alloca [4 x i8], align 4
+  %struct_literal10 = alloca [4 x i8], align 4
+  %iovec = alloca [8 x i8], align 4
+  %struct_literal = alloca [8 x i8], align 4
   %success = alloca i32, align 4
   %maximum = alloca i64, align 8
   %maximum_u32 = alloca i32, align 4
   %complete = alloca i1, align 1
   %zero = alloca i64, align 8
   %reported = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %reported, align 4
@@ -250,7 +250,7 @@ aggregate.formal.end:                             ; preds = %aggregate.formal.re
   ret { i64, i1 } %output54
 }
 
-define { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__657072696e74(ptr %text) {
+define { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__657072696e74(ptr %text) {
 entry:
   %assignment_value50 = alloca i1, align 1
   %assignment_value44 = alloca i64, align 8
@@ -262,17 +262,17 @@ entry:
   %assignment_value = alloca i32, align 4
   %count = alloca i32, align 4
   %result = alloca i32, align 4
-  %byte_count = alloca [4 x i8], align 1
-  %struct_literal10 = alloca [4 x i8], align 1
-  %iovec = alloca [8 x i8], align 1
-  %struct_literal = alloca [8 x i8], align 1
+  %byte_count = alloca [4 x i8], align 4
+  %struct_literal10 = alloca [4 x i8], align 4
+  %iovec = alloca [8 x i8], align 4
+  %struct_literal = alloca [8 x i8], align 4
   %success = alloca i32, align 4
   %maximum = alloca i64, align 8
   %maximum_u32 = alloca i32, align 4
   %complete = alloca i1, align 1
   %zero = alloca i64, align 8
   %reported = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %reported, align 4
@@ -386,7 +386,7 @@ if.merge29:                                       ; preds = %if.else28, %if.then
   br label %if.merge
 }
 
-define { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__726561645f696e746f(i32 %destination, i64 %capacity) {
+define { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__726561645f696e746f(i32 %destination, i64 %capacity) {
 entry:
   %destination1 = alloca i32, align 4
   store i32 %destination, ptr %destination1, align 4
@@ -398,7 +398,7 @@ entry:
   ret { i64, i1 } %call
 }
 
-define void @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__65786974(i32 %code) {
+define void @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__65786974(i32 %code) {
 entry:
   %code1 = alloca i32, align 4
   store i32 %code, ptr %code1, align 4
@@ -407,7 +407,7 @@ entry:
   ret void
 }
 
-define void @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__736c6565705f6e73(i64 %nanoseconds) {
+define void @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__736c6565705f6e73(i64 %nanoseconds) {
 entry:
   %nanoseconds1 = alloca i64, align 8
   store i64 %nanoseconds, ptr %nanoseconds1, align 4
@@ -416,7 +416,7 @@ entry:
   ret void
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f656f665f737461747573(i1 %saw_input, i32 %status) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f656f665f737461747573(i1 %saw_input, i32 %status) {
 entry:
   %saw_input1 = alloca i1, align 1
   store i1 %saw_input, ptr %saw_input1, align 1
@@ -447,7 +447,7 @@ if.merge:                                         ; preds = %if.else, %if.then
   ret i32 %if
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f63617061636974795f737461747573(i64 %length, i64 %maximum, i32 %status) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f63617061636974795f737461747573(i64 %length, i64 %maximum, i32 %status) {
 entry:
   %length1 = alloca i64, align 8
   store i64 %length, ptr %length1, align 4
@@ -472,7 +472,7 @@ if.merge:                                         ; preds = %if.else, %if.then
   ret i32 %if
 }
 
-define { ptr, i64, i8, i8, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f757466385f73746570(ptr %bytes, i64 %index, i32 %result, i64 %remaining, i8 %next_minimum, i8 %next_maximum) {
+define { ptr, i64, i8, i8, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f757466385f73746570(ptr %bytes, i64 %index, i32 %result, i64 %remaining, i8 %next_minimum, i8 %next_maximum) {
 entry:
   %assignment_value111 = alloca i32, align 4
   %assignment_value104 = alloca i8, align 1
@@ -739,7 +739,7 @@ if.merge110:                                      ; preds = %if.then109, %if.mer
   br label %if.merge
 }
 
-define { ptr, i64, i8, i8, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f757466385f72616e6765(ptr %bytes, i64 %low, i64 %high, i64 %remaining, i8 %minimum, i8 %maximum, i32 %status) {
+define { ptr, i64, i8, i8, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f757466385f72616e6765(ptr %bytes, i64 %low, i64 %high, i64 %remaining, i8 %minimum, i8 %maximum, i32 %status) {
 entry:
   %assignment_value82 = alloca i32, align 4
   %assignment_value79 = alloca i8, align 1
@@ -810,7 +810,7 @@ if.then14:                                        ; preds = %if.then
   %remaining19 = load i64, ptr %remaining4, align 4
   %minimum20 = load i8, ptr %minimum5, align 1
   %maximum21 = load i8, ptr %maximum6, align 1
-  %call = call { ptr, i64, i8, i8, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f757466385f73746570(ptr %bytes16, i64 %low17, i32 %status18, i64 %remaining19, i8 %minimum20, i8 %maximum21)
+  %call = call { ptr, i64, i8, i8, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f757466385f73746570(ptr %bytes16, i64 %low17, i32 %status18, i64 %remaining19, i8 %minimum20, i8 %maximum21)
   %output = extractvalue { ptr, i64, i8, i8, i32 } %call, 0
   store ptr %output, ptr %assignment_value, align 8
   %assignment_value22 = load ptr, ptr %assignment_value, align 8
@@ -848,7 +848,7 @@ if.else:                                          ; preds = %if.then
   %minimum42 = load i8, ptr %minimum5, align 1
   %maximum43 = load i8, ptr %maximum6, align 1
   %status44 = load i32, ptr %status7, align 4
-  %call45 = call { ptr, i64, i8, i8, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f757466385f72616e6765(ptr %bytes38, i64 %low39, i64 %middle40, i64 %remaining41, i8 %minimum42, i8 %maximum43, i32 %status44)
+  %call45 = call { ptr, i64, i8, i8, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f757466385f72616e6765(ptr %bytes38, i64 %low39, i64 %middle40, i64 %remaining41, i8 %minimum42, i8 %maximum43, i32 %status44)
   %output46 = extractvalue { ptr, i64, i8, i8, i32 } %call45, 0
   store ptr %output46, ptr %assignment_value47, align 8
   %assignment_value48 = load ptr, ptr %assignment_value47, align 8
@@ -876,7 +876,7 @@ if.else:                                          ; preds = %if.then
   %minimum65 = load i8, ptr %minimum5, align 1
   %maximum66 = load i8, ptr %maximum6, align 1
   %status67 = load i32, ptr %status7, align 4
-  %call68 = call { ptr, i64, i8, i8, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f757466385f72616e6765(ptr %bytes61, i64 %middle62, i64 %high63, i64 %remaining64, i8 %minimum65, i8 %maximum66, i32 %status67)
+  %call68 = call { ptr, i64, i8, i8, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f757466385f72616e6765(ptr %bytes61, i64 %middle62, i64 %high63, i64 %remaining64, i8 %minimum65, i8 %maximum66, i32 %status67)
   %output69 = extractvalue { ptr, i64, i8, i8, i32 } %call68, 0
   store ptr %output69, ptr %assignment_value70, align 8
   %assignment_value71 = load ptr, ptr %assignment_value70, align 8
@@ -903,7 +903,7 @@ if.merge15:                                       ; preds = %if.else, %if.then14
   br label %if.merge
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f646973636172645f73746570(i32 %view) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f646973636172645f73746570(i32 %view) {
 entry:
   %assignment_value7 = alloca i1, align 1
   %assignment_value = alloca i64, align 8
@@ -930,7 +930,7 @@ deref_null_continue:                              ; preds = %entry
   %deref = inttoptr i32 %view3 to ptr
   %address = ptrtoint ptr %deref to i32
   %one4 = load i64, ptr %one, align 4
-  %call = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__726561645f696e746f(i32 %address, i64 %one4)
+  %call = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__726561645f696e746f(i32 %address, i64 %one4)
   %output = extractvalue { i64, i1 } %call, 0
   store i64 %output, ptr %assignment_value, align 4
   %assignment_value5 = load i64, ptr %assignment_value, align 4
@@ -989,7 +989,7 @@ if.merge23:                                       ; preds = %if.else22, %if.then
   br label %if.merge14
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f646973636172645f636f6e74696e7565(i32 %view, i32 %outcome) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f646973636172645f636f6e74696e7565(i32 %view, i32 %outcome) {
 entry:
   %view1 = alloca i32, align 4
   store i32 %view, ptr %view1, align 4
@@ -1005,7 +1005,7 @@ self_tail.header:                                 ; preds = %self_tail.then, %en
 self_tail.then:                                   ; preds = %self_tail.header
   %view4 = load i32, ptr %view1, align 4
   %view5 = load i32, ptr %view1, align 4
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f646973636172645f73746570(i32 %view5)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f646973636172645f73746570(i32 %view5)
   store i32 %view4, ptr %view1, align 4
   store i32 %call, ptr %outcome2, align 4
   br label %self_tail.header
@@ -1015,54 +1015,190 @@ self_tail.else:                                   ; preds = %self_tail.header
   ret i32 %outcome6
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f64697363617264() {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f7a65726f5f6361706163697479(i8 %first) {
 entry:
+  %assignment_value60 = alloca i32, align 4
   %outcome = alloca i32, align 4
-  %first = alloca i32, align 4
+  %first_outcome = alloca i32, align 4
+  %assignment_value46 = alloca i1, align 1
+  %assignment_value44 = alloca i32, align 4
+  %assignment_value25 = alloca i1, align 1
+  %assignment_value17 = alloca i1, align 1
+  %assignment_value15 = alloca i32, align 4
+  %assignment_value10 = alloca i1, align 1
+  %assignment_value = alloca i64, align 8
+  %complete = alloca i1, align 1
+  %count = alloca i64, align 8
+  %one = alloca i64, align 8
+  %zero = alloca i64, align 8
+  %discard = alloca i1, align 1
+  %status = alloca i32, align 4
   %view = alloca i32, align 4
   %scratch = alloca [1 x i8], align 1
   %array_literal = alloca [1 x i8], align 1
+  %first1 = alloca i8, align 1
+  store i8 %first, ptr %first1, align 1
   %array_element = getelementptr inbounds [1 x i8], ptr %array_literal, i32 0, i32 0
   store i8 0, ptr %array_element, align 1
   %struct_value = load [1 x i8], ptr %array_literal, align 1
   store [1 x i8] %struct_value, ptr %scratch, align 1
-  %array_element1 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
-  %address = ptrtoint ptr %array_element1 to i32
+  %array_element2 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %address = ptrtoint ptr %array_element2 to i32
   store i32 %address, ptr %view, align 4
-  %view2 = load i32, ptr %view, align 4
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f646973636172645f73746570(i32 %view2)
-  store i32 %call, ptr %first, align 4
-  %view3 = load i32, ptr %view, align 4
-  %first4 = load i32, ptr %first, align 4
-  %call5 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f646973636172645f636f6e74696e7565(i32 %view3, i32 %first4)
-  store i32 %call5, ptr %outcome, align 4
-  %outcome6 = load i32, ptr %outcome, align 4
-  %eq = icmp eq i32 %outcome6, 2
-  br i1 %eq, label %if.then, label %if.else
+  store i32 4, ptr %status, align 4
+  store i1 true, ptr %discard, align 1
+  %first3 = load i8, ptr %first1, align 1
+  %eq = icmp eq i8 %first3, 13
+  br i1 %eq, label %if.then, label %if.merge
 
 if.then:                                          ; preds = %entry
+  store i64 0, ptr %zero, align 4
+  store i64 1, ptr %one, align 4
+  %zero4 = load i64, ptr %zero, align 4
+  store i64 %zero4, ptr %count, align 4
+  store i1 false, ptr %complete, align 1
+  %view5 = load i32, ptr %view, align 4
+  %deref_is_null = icmp eq i32 %view5, 0
+  br i1 %deref_is_null, label %deref_null_panic, label %deref_null_continue
+
+if.merge:                                         ; preds = %if.merge43, %entry
+  %discard48 = load i1, ptr %discard, align 1
+  br i1 %discard48, label %if.then49, label %if.merge50
+
+deref_null_panic:                                 ; preds = %if.then
+  call void @__wosy_core_system_panic()
+  unreachable
+
+deref_null_continue:                              ; preds = %if.then
+  %deref = inttoptr i32 %view5 to ptr
+  %address6 = ptrtoint ptr %deref to i32
+  %one7 = load i64, ptr %one, align 4
+  %call = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__726561645f696e746f(i32 %address6, i64 %one7)
+  %output = extractvalue { i64, i1 } %call, 0
+  store i64 %output, ptr %assignment_value, align 4
+  %assignment_value8 = load i64, ptr %assignment_value, align 4
+  %output9 = extractvalue { i64, i1 } %call, 1
+  store i1 %output9, ptr %assignment_value10, align 1
+  %assignment_value11 = load i1, ptr %assignment_value10, align 1
+  store i64 %assignment_value8, ptr %count, align 4
+  store i1 %assignment_value11, ptr %complete, align 1
+  %complete12 = load i1, ptr %complete, align 1
+  %not = xor i1 %complete12, true
+  br i1 %not, label %if.then13, label %if.merge14
+
+if.then13:                                        ; preds = %deref_null_continue
+  store i32 2, ptr %assignment_value15, align 4
+  %assignment_value16 = load i32, ptr %assignment_value15, align 4
+  store i32 %assignment_value16, ptr %status, align 4
+  store i1 false, ptr %assignment_value17, align 1
+  %assignment_value18 = load i1, ptr %assignment_value17, align 1
+  store i1 %assignment_value18, ptr %discard, align 1
+  br label %if.merge14
+
+if.merge14:                                       ; preds = %if.then13, %deref_null_continue
+  %complete19 = load i1, ptr %complete, align 1
+  br i1 %complete19, label %short_circuit.rhs, label %short_circuit.merge
+
+short_circuit.rhs:                                ; preds = %if.merge14
+  %count20 = load i64, ptr %count, align 4
+  %zero21 = load i64, ptr %zero, align 4
+  %eq22 = icmp eq i64 %count20, %zero21
+  br label %short_circuit.merge
+
+short_circuit.merge:                              ; preds = %short_circuit.rhs, %if.merge14
+  %short_circuit = phi i1 [ false, %if.merge14 ], [ %eq22, %short_circuit.rhs ]
+  br i1 %short_circuit, label %if.then23, label %if.merge24
+
+if.then23:                                        ; preds = %short_circuit.merge
+  store i1 false, ptr %assignment_value25, align 1
+  %assignment_value26 = load i1, ptr %assignment_value25, align 1
+  store i1 %assignment_value26, ptr %discard, align 1
+  br label %if.merge24
+
+if.merge24:                                       ; preds = %if.then23, %short_circuit.merge
+  %complete27 = load i1, ptr %complete, align 1
+  br i1 %complete27, label %short_circuit.rhs28, label %short_circuit.merge29
+
+short_circuit.rhs28:                              ; preds = %if.merge24
+  %count30 = load i64, ptr %count, align 4
+  %zero31 = load i64, ptr %zero, align 4
+  %ne = icmp ne i64 %count30, %zero31
+  br label %short_circuit.merge29
+
+short_circuit.merge29:                            ; preds = %short_circuit.rhs28, %if.merge24
+  %short_circuit32 = phi i1 [ false, %if.merge24 ], [ %ne, %short_circuit.rhs28 ]
+  br i1 %short_circuit32, label %short_circuit.rhs33, label %short_circuit.merge34
+
+short_circuit.rhs33:                              ; preds = %short_circuit.merge29
+  %view35 = load i32, ptr %view, align 4
+  %deref_is_null36 = icmp eq i32 %view35, 0
+  br i1 %deref_is_null36, label %deref_null_panic37, label %deref_null_continue38
+
+short_circuit.merge34:                            ; preds = %deref_null_continue38, %short_circuit.merge29
+  %short_circuit41 = phi i1 [ false, %short_circuit.merge29 ], [ %eq40, %deref_null_continue38 ]
+  br i1 %short_circuit41, label %if.then42, label %if.merge43
+
+deref_null_panic37:                               ; preds = %short_circuit.rhs33
+  call void @__wosy_core_system_panic()
+  unreachable
+
+deref_null_continue38:                            ; preds = %short_circuit.rhs33
+  %deref39 = inttoptr i32 %view35 to ptr
+  %place = load i8, ptr %deref39, align 1
+  %eq40 = icmp eq i8 %place, 10
+  br label %short_circuit.merge34
+
+if.then42:                                        ; preds = %short_circuit.merge34
+  store i32 0, ptr %assignment_value44, align 4
+  %assignment_value45 = load i32, ptr %assignment_value44, align 4
+  store i32 %assignment_value45, ptr %status, align 4
+  store i1 false, ptr %assignment_value46, align 1
+  %assignment_value47 = load i1, ptr %assignment_value46, align 1
+  store i1 %assignment_value47, ptr %discard, align 1
+  br label %if.merge43
+
+if.merge43:                                       ; preds = %if.then42, %short_circuit.merge34
   br label %if.merge
 
-if.else:                                          ; preds = %entry
-  br label %if.merge
+if.then49:                                        ; preds = %if.merge
+  %view51 = load i32, ptr %view, align 4
+  %call52 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f646973636172645f73746570(i32 %view51)
+  store i32 %call52, ptr %first_outcome, align 4
+  %view53 = load i32, ptr %view, align 4
+  %first_outcome54 = load i32, ptr %first_outcome, align 4
+  %call55 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f646973636172645f636f6e74696e7565(i32 %view53, i32 %first_outcome54)
+  store i32 %call55, ptr %outcome, align 4
+  %outcome56 = load i32, ptr %outcome, align 4
+  %eq57 = icmp eq i32 %outcome56, 2
+  br i1 %eq57, label %if.then58, label %if.merge59
 
-if.merge:                                         ; preds = %if.else, %if.then
-  %if = phi i32 [ 2, %if.then ], [ 4, %if.else ]
-  ret i32 %if
+if.merge50:                                       ; preds = %if.merge59, %if.merge
+  %status62 = load i32, ptr %status, align 4
+  ret i32 %status62
+
+if.then58:                                        ; preds = %if.then49
+  store i32 2, ptr %assignment_value60, align 4
+  %assignment_value61 = load i32, ptr %assignment_value60, align 4
+  store i32 %assignment_value61, ptr %status, align 4
+  br label %if.merge59
+
+if.merge59:                                       ; preds = %if.then58, %if.then49
+  br label %if.merge50
 }
 
-define { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f616c6c6f63617465645f73746570(ptr %bytes, i32 %view, i64 %max_bytes, i64 %length, i1 %pending_cr, i1 %reading, i32 %status) {
+define { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f616c6c6f63617465645f73746570(ptr %bytes, i32 %view, i64 %max_bytes, i64 %length, i1 %pending_cr, i1 %reading, i32 %status) {
 entry:
-  %assignment_value184 = alloca i1, align 1
-  %assignment_value178 = alloca i64, align 8
-  %assignment_value170 = alloca i8, align 1
-  %assignment_value157 = alloca i32, align 4
-  %assignment_value120 = alloca i1, align 1
-  %assignment_value90 = alloca i64, align 8
-  %assignment_value84 = alloca i8, align 1
+  %assignment_value99 = alloca i1, align 1
+  %assignment_value93 = alloca i64, align 8
+  %assignment_value85 = alloca i8, align 1
   %assignment_value77 = alloca i32, align 4
-  %assignment_value47 = alloca i1, align 1
-  %assignment_value45 = alloca i1, align 1
+  %assignment_value67 = alloca i1, align 1
+  %assignment_value62 = alloca i64, align 8
+  %assignment_value56 = alloca i8, align 1
+  %assignment_value49 = alloca i32, align 4
+  %assignment_value40 = alloca i1, align 1
+  %assignment_value38 = alloca i1, align 1
+  %byte = alloca i8, align 1
   %assignment_value25 = alloca i1, align 1
   %assignment_value18 = alloca i1, align 1
   %assignment_value16 = alloca i32, align 4
@@ -1107,7 +1243,7 @@ deref_null_continue:                              ; preds = %entry
   %deref = inttoptr i32 %view9 to ptr
   %address = ptrtoint ptr %deref to i32
   %one10 = load i64, ptr %one, align 4
-  %call = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__726561645f696e746f(i32 %address, i64 %one10)
+  %call = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__726561645f696e746f(i32 %address, i64 %one10)
   %output = extractvalue { i64, i1 } %call, 0
   store i64 %output, ptr %assignment_value, align 4
   %assignment_value11 = load i64, ptr %assignment_value, align 4
@@ -1118,7 +1254,7 @@ deref_null_continue:                              ; preds = %entry
   store i1 %assignment_value14, ptr %complete, align 1
   %complete15 = load i1, ptr %complete, align 1
   %not = xor i1 %complete15, true
-  br i1 %not, label %if.then, label %if.merge
+  br i1 %not, label %if.then, label %if.else
 
 if.then:                                          ; preds = %deref_null_continue
   store i32 2, ptr %assignment_value16, align 4
@@ -1129,318 +1265,159 @@ if.then:                                          ; preds = %deref_null_continue
   store i1 %assignment_value19, ptr %reading6, align 1
   br label %if.merge
 
-if.merge:                                         ; preds = %if.then, %deref_null_continue
-  %complete20 = load i1, ptr %complete, align 1
-  br i1 %complete20, label %short_circuit.rhs, label %short_circuit.merge
+if.else:                                          ; preds = %deref_null_continue
+  %count20 = load i64, ptr %count, align 4
+  %zero21 = load i64, ptr %zero, align 4
+  %eq = icmp eq i64 %count20, %zero21
+  br i1 %eq, label %if.then22, label %if.else23
 
-short_circuit.rhs:                                ; preds = %if.merge
-  %count21 = load i64, ptr %count, align 4
-  %zero22 = load i64, ptr %zero, align 4
-  %eq = icmp eq i64 %count21, %zero22
-  br label %short_circuit.merge
+if.merge:                                         ; preds = %if.merge24, %if.then
+  %status95 = load i32, ptr %status7, align 4
+  %eq96 = icmp eq i32 %status95, 4
+  br i1 %eq96, label %if.then97, label %if.merge98
 
-short_circuit.merge:                              ; preds = %short_circuit.rhs, %if.merge
-  %short_circuit = phi i1 [ false, %if.merge ], [ %eq, %short_circuit.rhs ]
-  br i1 %short_circuit, label %if.then23, label %if.merge24
-
-if.then23:                                        ; preds = %short_circuit.merge
+if.then22:                                        ; preds = %if.else
   store i1 false, ptr %assignment_value25, align 1
   %assignment_value26 = load i1, ptr %assignment_value25, align 1
   store i1 %assignment_value26, ptr %reading6, align 1
   br label %if.merge24
 
-if.merge24:                                       ; preds = %if.then23, %short_circuit.merge
-  %complete27 = load i1, ptr %complete, align 1
-  br i1 %complete27, label %short_circuit.rhs28, label %short_circuit.merge29
+if.else23:                                        ; preds = %if.else
+  %view27 = load i32, ptr %view2, align 4
+  %deref_is_null28 = icmp eq i32 %view27, 0
+  br i1 %deref_is_null28, label %deref_null_panic29, label %deref_null_continue30
 
-short_circuit.rhs28:                              ; preds = %if.merge24
-  %count30 = load i64, ptr %count, align 4
-  %zero31 = load i64, ptr %zero, align 4
-  %ne = icmp ne i64 %count30, %zero31
-  br label %short_circuit.merge29
+if.merge24:                                       ; preds = %if.merge37, %if.then22
+  br label %if.merge
 
-short_circuit.merge29:                            ; preds = %short_circuit.rhs28, %if.merge24
-  %short_circuit32 = phi i1 [ false, %if.merge24 ], [ %ne, %short_circuit.rhs28 ]
-  br i1 %short_circuit32, label %short_circuit.rhs33, label %short_circuit.merge34
-
-short_circuit.rhs33:                              ; preds = %short_circuit.merge29
-  %view35 = load i32, ptr %view2, align 4
-  %deref_is_null36 = icmp eq i32 %view35, 0
-  br i1 %deref_is_null36, label %deref_null_panic37, label %deref_null_continue38
-
-short_circuit.merge34:                            ; preds = %deref_null_continue38, %short_circuit.merge29
-  %short_circuit42 = phi i1 [ false, %short_circuit.merge29 ], [ %eq41, %deref_null_continue38 ]
-  br i1 %short_circuit42, label %if.then43, label %if.merge44
-
-deref_null_panic37:                               ; preds = %short_circuit.rhs33
+deref_null_panic29:                               ; preds = %if.else23
   call void @__wosy_core_system_panic()
   unreachable
 
-deref_null_continue38:                            ; preds = %short_circuit.rhs33
-  %deref39 = inttoptr i32 %view35 to ptr
-  %place = load i8, ptr %deref39, align 1
-  %lf40 = load i8, ptr %lf, align 1
-  %eq41 = icmp eq i8 %place, %lf40
-  br label %short_circuit.merge34
+deref_null_continue30:                            ; preds = %if.else23
+  %deref31 = inttoptr i32 %view27 to ptr
+  %place = load i8, ptr %deref31, align 1
+  store i8 %place, ptr %byte, align 1
+  %byte32 = load i8, ptr %byte, align 1
+  %lf33 = load i8, ptr %lf, align 1
+  %eq34 = icmp eq i8 %byte32, %lf33
+  br i1 %eq34, label %if.then35, label %if.else36
 
-if.then43:                                        ; preds = %short_circuit.merge34
-  store i1 false, ptr %assignment_value45, align 1
-  %assignment_value46 = load i1, ptr %assignment_value45, align 1
-  store i1 %assignment_value46, ptr %pending_cr5, align 1
-  store i1 false, ptr %assignment_value47, align 1
-  %assignment_value48 = load i1, ptr %assignment_value47, align 1
-  store i1 %assignment_value48, ptr %reading6, align 1
+if.then35:                                        ; preds = %deref_null_continue30
+  store i1 false, ptr %assignment_value38, align 1
+  %assignment_value39 = load i1, ptr %assignment_value38, align 1
+  store i1 %assignment_value39, ptr %pending_cr5, align 1
+  store i1 false, ptr %assignment_value40, align 1
+  %assignment_value41 = load i1, ptr %assignment_value40, align 1
+  store i1 %assignment_value41, ptr %reading6, align 1
+  br label %if.merge37
+
+if.else36:                                        ; preds = %deref_null_continue30
+  %pending_cr42 = load i1, ptr %pending_cr5, align 1
+  br i1 %pending_cr42, label %if.then43, label %if.merge44
+
+if.merge37:                                       ; preds = %if.merge72, %if.then35
+  br label %if.merge24
+
+if.then43:                                        ; preds = %if.else36
+  %length45 = load i64, ptr %length4, align 4
+  %max_bytes46 = load i64, ptr %max_bytes3, align 4
+  %status47 = load i32, ptr %status7, align 4
+  %call48 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f63617061636974795f737461747573(i64 %length45, i64 %max_bytes46, i32 %status47)
+  store i32 %call48, ptr %assignment_value49, align 4
+  %assignment_value50 = load i32, ptr %assignment_value49, align 4
+  store i32 %assignment_value50, ptr %status7, align 4
+  %length51 = load i64, ptr %length4, align 4
+  %max_bytes52 = load i64, ptr %max_bytes3, align 4
+  %lt = icmp ult i64 %length51, %max_bytes52
+  br i1 %lt, label %if.then53, label %if.merge54
+
+if.merge44:                                       ; preds = %if.merge54, %if.else36
+  %byte64 = load i8, ptr %byte, align 1
+  %cr65 = load i8, ptr %cr, align 1
+  %eq66 = icmp eq i8 %byte64, %cr65
+  store i1 %eq66, ptr %assignment_value67, align 1
+  %assignment_value68 = load i1, ptr %assignment_value67, align 1
+  store i1 %assignment_value68, ptr %pending_cr5, align 1
+  %pending_cr69 = load i1, ptr %pending_cr5, align 1
+  %not70 = xor i1 %pending_cr69, true
+  br i1 %not70, label %if.then71, label %if.merge72
+
+if.then53:                                        ; preds = %if.then43
+  %cr55 = load i8, ptr %cr, align 1
+  store i8 %cr55, ptr %assignment_value56, align 1
+  %assignment_value57 = load i8, ptr %assignment_value56, align 1
+  %bytes58 = load ptr, ptr %bytes1, align 8
+  %length59 = load i64, ptr %length4, align 4
+  %array_element = getelementptr inbounds i8, ptr %bytes58, i64 %length59
+  store i8 %assignment_value57, ptr %array_element, align 1
+  %length60 = load i64, ptr %length4, align 4
+  %one61 = load i64, ptr %one, align 4
+  %add = add i64 %length60, %one61
+  store i64 %add, ptr %assignment_value62, align 4
+  %assignment_value63 = load i64, ptr %assignment_value62, align 4
+  store i64 %assignment_value63, ptr %length4, align 4
+  br label %if.merge54
+
+if.merge54:                                       ; preds = %if.then53, %if.then43
   br label %if.merge44
 
-if.merge44:                                       ; preds = %if.then43, %short_circuit.merge34
-  %complete49 = load i1, ptr %complete, align 1
-  br i1 %complete49, label %short_circuit.rhs50, label %short_circuit.merge51
-
-short_circuit.rhs50:                              ; preds = %if.merge44
-  %count52 = load i64, ptr %count, align 4
-  %zero53 = load i64, ptr %zero, align 4
-  %ne54 = icmp ne i64 %count52, %zero53
-  br label %short_circuit.merge51
-
-short_circuit.merge51:                            ; preds = %short_circuit.rhs50, %if.merge44
-  %short_circuit55 = phi i1 [ false, %if.merge44 ], [ %ne54, %short_circuit.rhs50 ]
-  br i1 %short_circuit55, label %short_circuit.rhs56, label %short_circuit.merge57
-
-short_circuit.rhs56:                              ; preds = %short_circuit.merge51
-  %view58 = load i32, ptr %view2, align 4
-  %deref_is_null59 = icmp eq i32 %view58, 0
-  br i1 %deref_is_null59, label %deref_null_panic60, label %deref_null_continue61
-
-short_circuit.merge57:                            ; preds = %deref_null_continue61, %short_circuit.merge51
-  %short_circuit66 = phi i1 [ false, %short_circuit.merge51 ], [ %ne65, %deref_null_continue61 ]
-  br i1 %short_circuit66, label %short_circuit.rhs67, label %short_circuit.merge68
-
-deref_null_panic60:                               ; preds = %short_circuit.rhs56
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue61:                            ; preds = %short_circuit.rhs56
-  %deref62 = inttoptr i32 %view58 to ptr
-  %place63 = load i8, ptr %deref62, align 1
-  %lf64 = load i8, ptr %lf, align 1
-  %ne65 = icmp ne i8 %place63, %lf64
-  br label %short_circuit.merge57
-
-short_circuit.rhs67:                              ; preds = %short_circuit.merge57
-  %pending_cr69 = load i1, ptr %pending_cr5, align 1
-  br label %short_circuit.merge68
-
-short_circuit.merge68:                            ; preds = %short_circuit.rhs67, %short_circuit.merge57
-  %short_circuit70 = phi i1 [ false, %short_circuit.merge57 ], [ %pending_cr69, %short_circuit.rhs67 ]
-  br i1 %short_circuit70, label %if.then71, label %if.merge72
-
-if.then71:                                        ; preds = %short_circuit.merge68
+if.then71:                                        ; preds = %if.merge44
   %length73 = load i64, ptr %length4, align 4
   %max_bytes74 = load i64, ptr %max_bytes3, align 4
   %status75 = load i32, ptr %status7, align 4
-  %call76 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f63617061636974795f737461747573(i64 %length73, i64 %max_bytes74, i32 %status75)
+  %call76 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f63617061636974795f737461747573(i64 %length73, i64 %max_bytes74, i32 %status75)
   store i32 %call76, ptr %assignment_value77, align 4
   %assignment_value78 = load i32, ptr %assignment_value77, align 4
   store i32 %assignment_value78, ptr %status7, align 4
   %length79 = load i64, ptr %length4, align 4
   %max_bytes80 = load i64, ptr %max_bytes3, align 4
-  %lt = icmp ult i64 %length79, %max_bytes80
-  br i1 %lt, label %if.then81, label %if.merge82
+  %lt81 = icmp ult i64 %length79, %max_bytes80
+  br i1 %lt81, label %if.then82, label %if.merge83
 
-if.merge72:                                       ; preds = %if.merge82, %short_circuit.merge68
-  %complete92 = load i1, ptr %complete, align 1
-  br i1 %complete92, label %short_circuit.rhs93, label %short_circuit.merge94
+if.merge72:                                       ; preds = %if.merge83, %if.merge44
+  br label %if.merge37
 
-if.then81:                                        ; preds = %if.then71
-  %cr83 = load i8, ptr %cr, align 1
-  store i8 %cr83, ptr %assignment_value84, align 1
-  %assignment_value85 = load i8, ptr %assignment_value84, align 1
-  %bytes86 = load ptr, ptr %bytes1, align 8
-  %length87 = load i64, ptr %length4, align 4
-  %array_element = getelementptr inbounds i8, ptr %bytes86, i64 %length87
-  store i8 %assignment_value85, ptr %array_element, align 1
+if.then82:                                        ; preds = %if.then71
+  %byte84 = load i8, ptr %byte, align 1
+  store i8 %byte84, ptr %assignment_value85, align 1
+  %assignment_value86 = load i8, ptr %assignment_value85, align 1
+  %bytes87 = load ptr, ptr %bytes1, align 8
   %length88 = load i64, ptr %length4, align 4
-  %one89 = load i64, ptr %one, align 4
-  %add = add i64 %length88, %one89
-  store i64 %add, ptr %assignment_value90, align 4
-  %assignment_value91 = load i64, ptr %assignment_value90, align 4
-  store i64 %assignment_value91, ptr %length4, align 4
-  br label %if.merge82
+  %array_element89 = getelementptr inbounds i8, ptr %bytes87, i64 %length88
+  store i8 %assignment_value86, ptr %array_element89, align 1
+  %length90 = load i64, ptr %length4, align 4
+  %one91 = load i64, ptr %one, align 4
+  %add92 = add i64 %length90, %one91
+  store i64 %add92, ptr %assignment_value93, align 4
+  %assignment_value94 = load i64, ptr %assignment_value93, align 4
+  store i64 %assignment_value94, ptr %length4, align 4
+  br label %if.merge83
 
-if.merge82:                                       ; preds = %if.then81, %if.then71
+if.merge83:                                       ; preds = %if.then82, %if.then71
   br label %if.merge72
 
-short_circuit.rhs93:                              ; preds = %if.merge72
-  %count95 = load i64, ptr %count, align 4
-  %zero96 = load i64, ptr %zero, align 4
-  %ne97 = icmp ne i64 %count95, %zero96
-  br label %short_circuit.merge94
+if.then97:                                        ; preds = %if.merge
+  store i1 false, ptr %assignment_value99, align 1
+  %assignment_value100 = load i1, ptr %assignment_value99, align 1
+  store i1 %assignment_value100, ptr %reading6, align 1
+  br label %if.merge98
 
-short_circuit.merge94:                            ; preds = %short_circuit.rhs93, %if.merge72
-  %short_circuit98 = phi i1 [ false, %if.merge72 ], [ %ne97, %short_circuit.rhs93 ]
-  br i1 %short_circuit98, label %short_circuit.rhs99, label %short_circuit.merge100
-
-short_circuit.rhs99:                              ; preds = %short_circuit.merge94
-  %view101 = load i32, ptr %view2, align 4
-  %deref_is_null102 = icmp eq i32 %view101, 0
-  br i1 %deref_is_null102, label %deref_null_panic103, label %deref_null_continue104
-
-short_circuit.merge100:                           ; preds = %deref_null_continue104, %short_circuit.merge94
-  %short_circuit109 = phi i1 [ false, %short_circuit.merge94 ], [ %ne108, %deref_null_continue104 ]
-  br i1 %short_circuit109, label %if.then110, label %if.merge111
-
-deref_null_panic103:                              ; preds = %short_circuit.rhs99
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue104:                           ; preds = %short_circuit.rhs99
-  %deref105 = inttoptr i32 %view101 to ptr
-  %place106 = load i8, ptr %deref105, align 1
-  %lf107 = load i8, ptr %lf, align 1
-  %ne108 = icmp ne i8 %place106, %lf107
-  br label %short_circuit.merge100
-
-if.then110:                                       ; preds = %short_circuit.merge100
-  %view112 = load i32, ptr %view2, align 4
-  %deref_is_null113 = icmp eq i32 %view112, 0
-  br i1 %deref_is_null113, label %deref_null_panic114, label %deref_null_continue115
-
-if.merge111:                                      ; preds = %deref_null_continue115, %short_circuit.merge100
-  %complete122 = load i1, ptr %complete, align 1
-  br i1 %complete122, label %short_circuit.rhs123, label %short_circuit.merge124
-
-deref_null_panic114:                              ; preds = %if.then110
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue115:                           ; preds = %if.then110
-  %deref116 = inttoptr i32 %view112 to ptr
-  %place117 = load i8, ptr %deref116, align 1
-  %cr118 = load i8, ptr %cr, align 1
-  %eq119 = icmp eq i8 %place117, %cr118
-  store i1 %eq119, ptr %assignment_value120, align 1
-  %assignment_value121 = load i1, ptr %assignment_value120, align 1
-  store i1 %assignment_value121, ptr %pending_cr5, align 1
-  br label %if.merge111
-
-short_circuit.rhs123:                             ; preds = %if.merge111
-  %count125 = load i64, ptr %count, align 4
-  %zero126 = load i64, ptr %zero, align 4
-  %ne127 = icmp ne i64 %count125, %zero126
-  br label %short_circuit.merge124
-
-short_circuit.merge124:                           ; preds = %short_circuit.rhs123, %if.merge111
-  %short_circuit128 = phi i1 [ false, %if.merge111 ], [ %ne127, %short_circuit.rhs123 ]
-  br i1 %short_circuit128, label %short_circuit.rhs129, label %short_circuit.merge130
-
-short_circuit.rhs129:                             ; preds = %short_circuit.merge124
-  %view131 = load i32, ptr %view2, align 4
-  %deref_is_null132 = icmp eq i32 %view131, 0
-  br i1 %deref_is_null132, label %deref_null_panic133, label %deref_null_continue134
-
-short_circuit.merge130:                           ; preds = %deref_null_continue134, %short_circuit.merge124
-  %short_circuit139 = phi i1 [ false, %short_circuit.merge124 ], [ %ne138, %deref_null_continue134 ]
-  br i1 %short_circuit139, label %short_circuit.rhs140, label %short_circuit.merge141
-
-deref_null_panic133:                              ; preds = %short_circuit.rhs129
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue134:                           ; preds = %short_circuit.rhs129
-  %deref135 = inttoptr i32 %view131 to ptr
-  %place136 = load i8, ptr %deref135, align 1
-  %lf137 = load i8, ptr %lf, align 1
-  %ne138 = icmp ne i8 %place136, %lf137
-  br label %short_circuit.merge130
-
-short_circuit.rhs140:                             ; preds = %short_circuit.merge130
-  %view142 = load i32, ptr %view2, align 4
-  %deref_is_null143 = icmp eq i32 %view142, 0
-  br i1 %deref_is_null143, label %deref_null_panic144, label %deref_null_continue145
-
-short_circuit.merge141:                           ; preds = %deref_null_continue145, %short_circuit.merge130
-  %short_circuit150 = phi i1 [ false, %short_circuit.merge130 ], [ %ne149, %deref_null_continue145 ]
-  br i1 %short_circuit150, label %if.then151, label %if.merge152
-
-deref_null_panic144:                              ; preds = %short_circuit.rhs140
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue145:                           ; preds = %short_circuit.rhs140
-  %deref146 = inttoptr i32 %view142 to ptr
-  %place147 = load i8, ptr %deref146, align 1
-  %cr148 = load i8, ptr %cr, align 1
-  %ne149 = icmp ne i8 %place147, %cr148
-  br label %short_circuit.merge141
-
-if.then151:                                       ; preds = %short_circuit.merge141
-  %length153 = load i64, ptr %length4, align 4
-  %max_bytes154 = load i64, ptr %max_bytes3, align 4
-  %status155 = load i32, ptr %status7, align 4
-  %call156 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f63617061636974795f737461747573(i64 %length153, i64 %max_bytes154, i32 %status155)
-  store i32 %call156, ptr %assignment_value157, align 4
-  %assignment_value158 = load i32, ptr %assignment_value157, align 4
-  store i32 %assignment_value158, ptr %status7, align 4
-  %length159 = load i64, ptr %length4, align 4
-  %max_bytes160 = load i64, ptr %max_bytes3, align 4
-  %lt161 = icmp ult i64 %length159, %max_bytes160
-  br i1 %lt161, label %if.then162, label %if.merge163
-
-if.merge152:                                      ; preds = %if.merge163, %short_circuit.merge141
-  %status180 = load i32, ptr %status7, align 4
-  %eq181 = icmp eq i32 %status180, 4
-  br i1 %eq181, label %if.then182, label %if.merge183
-
-if.then162:                                       ; preds = %if.then151
-  %view164 = load i32, ptr %view2, align 4
-  %deref_is_null165 = icmp eq i32 %view164, 0
-  br i1 %deref_is_null165, label %deref_null_panic166, label %deref_null_continue167
-
-if.merge163:                                      ; preds = %deref_null_continue167, %if.then151
-  br label %if.merge152
-
-deref_null_panic166:                              ; preds = %if.then162
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue167:                           ; preds = %if.then162
-  %deref168 = inttoptr i32 %view164 to ptr
-  %place169 = load i8, ptr %deref168, align 1
-  store i8 %place169, ptr %assignment_value170, align 1
-  %assignment_value171 = load i8, ptr %assignment_value170, align 1
-  %bytes172 = load ptr, ptr %bytes1, align 8
-  %length173 = load i64, ptr %length4, align 4
-  %array_element174 = getelementptr inbounds i8, ptr %bytes172, i64 %length173
-  store i8 %assignment_value171, ptr %array_element174, align 1
-  %length175 = load i64, ptr %length4, align 4
-  %one176 = load i64, ptr %one, align 4
-  %add177 = add i64 %length175, %one176
-  store i64 %add177, ptr %assignment_value178, align 4
-  %assignment_value179 = load i64, ptr %assignment_value178, align 4
-  store i64 %assignment_value179, ptr %length4, align 4
-  br label %if.merge163
-
-if.then182:                                       ; preds = %if.merge152
-  store i1 false, ptr %assignment_value184, align 1
-  %assignment_value185 = load i1, ptr %assignment_value184, align 1
-  store i1 %assignment_value185, ptr %reading6, align 1
-  br label %if.merge183
-
-if.merge183:                                      ; preds = %if.then182, %if.merge152
-  %bytes186 = load ptr, ptr %bytes1, align 8
-  %length187 = load i64, ptr %length4, align 4
-  %pending_cr188 = load i1, ptr %pending_cr5, align 1
-  %reading189 = load i1, ptr %reading6, align 1
-  %status190 = load i32, ptr %status7, align 4
-  %output191 = insertvalue { ptr, i64, i1, i1, i32 } zeroinitializer, ptr %bytes186, 0
-  %output192 = insertvalue { ptr, i64, i1, i1, i32 } %output191, i64 %length187, 1
-  %output193 = insertvalue { ptr, i64, i1, i1, i32 } %output192, i1 %pending_cr188, 2
-  %output194 = insertvalue { ptr, i64, i1, i1, i32 } %output193, i1 %reading189, 3
-  %output195 = insertvalue { ptr, i64, i1, i1, i32 } %output194, i32 %status190, 4
-  ret { ptr, i64, i1, i1, i32 } %output195
+if.merge98:                                       ; preds = %if.then97, %if.merge
+  %bytes101 = load ptr, ptr %bytes1, align 8
+  %length102 = load i64, ptr %length4, align 4
+  %pending_cr103 = load i1, ptr %pending_cr5, align 1
+  %reading104 = load i1, ptr %reading6, align 1
+  %status105 = load i32, ptr %status7, align 4
+  %output106 = insertvalue { ptr, i64, i1, i1, i32 } zeroinitializer, ptr %bytes101, 0
+  %output107 = insertvalue { ptr, i64, i1, i1, i32 } %output106, i64 %length102, 1
+  %output108 = insertvalue { ptr, i64, i1, i1, i32 } %output107, i1 %pending_cr103, 2
+  %output109 = insertvalue { ptr, i64, i1, i1, i32 } %output108, i1 %reading104, 3
+  %output110 = insertvalue { ptr, i64, i1, i1, i32 } %output109, i32 %status105, 4
+  ret { ptr, i64, i1, i1, i32 } %output110
 }
 
-define { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f616c6c6f63617465645f72616e6765(ptr %bytes, i32 %view, i64 %max_bytes, i64 %budget, i64 %length, i1 %pending_cr, i1 %reading, i32 %status) {
+define { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f616c6c6f63617465645f72616e6765(ptr %bytes, i32 %view, i64 %max_bytes, i64 %budget, i64 %length, i1 %pending_cr, i1 %reading, i32 %status) {
 entry:
   %assignment_value88 = alloca i32, align 4
   %assignment_value85 = alloca i1, align 1
@@ -1519,7 +1496,7 @@ if.then14:                                        ; preds = %if.then
   %pending_cr20 = load i1, ptr %pending_cr6, align 1
   %reading21 = load i1, ptr %reading7, align 1
   %status22 = load i32, ptr %status8, align 4
-  %call = call { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f616c6c6f63617465645f73746570(ptr %bytes16, i32 %view17, i64 %max_bytes18, i64 %length19, i1 %pending_cr20, i1 %reading21, i32 %status22)
+  %call = call { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f616c6c6f63617465645f73746570(ptr %bytes16, i32 %view17, i64 %max_bytes18, i64 %length19, i1 %pending_cr20, i1 %reading21, i32 %status22)
   %output = extractvalue { ptr, i64, i1, i1, i32 } %call, 0
   store ptr %output, ptr %assignment_value, align 8
   %assignment_value23 = load ptr, ptr %assignment_value, align 8
@@ -1556,7 +1533,7 @@ if.else:                                          ; preds = %if.then
   %pending_cr43 = load i1, ptr %pending_cr6, align 1
   %reading44 = load i1, ptr %reading7, align 1
   %status45 = load i32, ptr %status8, align 4
-  %call46 = call { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f616c6c6f63617465645f72616e6765(ptr %bytes38, i32 %view39, i64 %max_bytes40, i64 %left41, i64 %length42, i1 %pending_cr43, i1 %reading44, i32 %status45)
+  %call46 = call { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f616c6c6f63617465645f72616e6765(ptr %bytes38, i32 %view39, i64 %max_bytes40, i64 %left41, i64 %length42, i1 %pending_cr43, i1 %reading44, i32 %status45)
   %output47 = extractvalue { ptr, i64, i1, i1, i32 } %call46, 0
   store ptr %output47, ptr %assignment_value48, align 8
   %assignment_value49 = load ptr, ptr %assignment_value48, align 8
@@ -1594,7 +1571,7 @@ if.then63:                                        ; preds = %if.else
   %pending_cr71 = load i1, ptr %pending_cr6, align 1
   %reading72 = load i1, ptr %reading7, align 1
   %status73 = load i32, ptr %status8, align 4
-  %call74 = call { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f616c6c6f63617465645f72616e6765(ptr %bytes65, i32 %view66, i64 %max_bytes67, i64 %sub, i64 %length70, i1 %pending_cr71, i1 %reading72, i32 %status73)
+  %call74 = call { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f616c6c6f63617465645f72616e6765(ptr %bytes65, i32 %view66, i64 %max_bytes67, i64 %sub, i64 %length70, i1 %pending_cr71, i1 %reading72, i32 %status73)
   %output75 = extractvalue { ptr, i64, i1, i1, i32 } %call74, 0
   store ptr %output75, ptr %assignment_value76, align 8
   %assignment_value77 = load ptr, ptr %assignment_value76, align 8
@@ -1621,21 +1598,24 @@ if.merge64:                                       ; preds = %if.then63, %if.else
   br label %if.merge15
 }
 
-define { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f616c6c6f6361746564(i64 %max_bytes, i8 %first, i1 %pending_cr) {
+define { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f616c6c6f6361746564(i64 %max_bytes, i8 %first, i1 %pending_cr) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
-  %assignment_value100 = alloca i32, align 4
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
+  %assignment_value126 = alloca i32, align 4
   %data = alloca i32, align 4
-  %assignment_value86 = alloca i32, align 4
-  %assignment_value80 = alloca i32, align 4
-  %assignment_value77 = alloca i8, align 1
-  %assignment_value74 = alloca i8, align 1
-  %assignment_value71 = alloca i64, align 8
-  %assignment_value68 = alloca ptr, align 8
+  %assignment_value111 = alloca i32, align 4
+  %assignment_value105 = alloca i32, align 4
+  %assignment_value102 = alloca i8, align 1
+  %assignment_value99 = alloca i8, align 1
+  %assignment_value96 = alloca i64, align 8
+  %assignment_value93 = alloca ptr, align 8
   %maximum = alloca i8, align 1
   %minimum = alloca i8, align 1
   %remaining = alloca i64, align 8
+  %assignment_value77 = alloca i64, align 8
+  %assignment_value69 = alloca i8, align 1
+  %assignment_value63 = alloca i32, align 4
   %assignment_value52 = alloca i32, align 4
   %outcome = alloca i32, align 4
   %first_outcome = alloca i32, align 4
@@ -1671,8 +1651,7 @@ entry:
   %struct_value = load [1 x i8], ptr %array_literal, align 1
   store [1 x i8] %struct_value, ptr %scratch, align 1
   %max_bytes4 = load i64, ptr %max_bytes1, align 4
-  %allocation_size = mul i64 %max_bytes4, 1
-  %allocation = call ptr @__wosy_core_alloc(i64 %allocation_size, i64 1)
+  %allocation = call ptr @__wosy_core_alloc(i64 %max_bytes4, i64 1)
   %allocation_failed = icmp eq ptr %allocation, null
   br i1 %allocation_failed, label %allocation_panic, label %allocation_continue
 
@@ -1723,7 +1702,7 @@ if.merge:                                         ; preds = %if.then, %allocatio
   %pending_cr23 = load i1, ptr %pending_cr3, align 1
   %reading24 = load i1, ptr %reading, align 1
   %status25 = load i32, ptr %status, align 4
-  %call = call { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f616c6c6f63617465645f72616e6765(ptr %bytes16, i32 %view17, i64 %max_bytes18, i64 %add21, i64 %length22, i1 %pending_cr23, i1 %reading24, i32 %status25)
+  %call = call { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f616c6c6f63617465645f72616e6765(ptr %bytes16, i32 %view17, i64 %max_bytes18, i64 %add21, i64 %length22, i1 %pending_cr23, i1 %reading24, i32 %status25)
   %output = extractvalue { ptr, i64, i1, i1, i32 } %call, 0
   store ptr %output, ptr %assignment_value26, align 8
   %assignment_value27 = load ptr, ptr %assignment_value26, align 8
@@ -1750,11 +1729,11 @@ if.merge:                                         ; preds = %if.then, %allocatio
 
 if.then41:                                        ; preds = %if.merge
   %view43 = load i32, ptr %view, align 4
-  %call44 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f646973636172645f73746570(i32 %view43)
+  %call44 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f646973636172645f73746570(i32 %view43)
   store i32 %call44, ptr %first_outcome, align 4
   %view45 = load i32, ptr %view, align 4
   %first_outcome46 = load i32, ptr %first_outcome, align 4
-  %call47 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f646973636172645f636f6e74696e7565(i32 %view45, i32 %first_outcome46)
+  %call47 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f646973636172645f636f6e74696e7565(i32 %view45, i32 %first_outcome46)
   store i32 %call47, ptr %outcome, align 4
   %outcome48 = load i32, ptr %outcome, align 4
   %eq49 = icmp eq i32 %outcome48, 2
@@ -1763,7 +1742,7 @@ if.then41:                                        ; preds = %if.merge
 if.merge42:                                       ; preds = %if.merge51, %if.merge
   %status54 = load i32, ptr %status, align 4
   %eq55 = icmp eq i32 %status54, 0
-  br i1 %eq55, label %if.then56, label %if.merge57
+  br i1 %eq55, label %short_circuit.rhs, label %short_circuit.merge
 
 if.then50:                                        ; preds = %if.then41
   store i32 2, ptr %assignment_value52, align 4
@@ -1774,152 +1753,208 @@ if.then50:                                        ; preds = %if.then41
 if.merge51:                                       ; preds = %if.then50, %if.then41
   br label %if.merge42
 
-if.then56:                                        ; preds = %if.merge42
-  %zero58 = load i64, ptr %zero, align 4
-  store i64 %zero58, ptr %remaining, align 4
+short_circuit.rhs:                                ; preds = %if.merge42
+  %pending_cr56 = load i1, ptr %pending_cr3, align 1
+  br label %short_circuit.merge
+
+short_circuit.merge:                              ; preds = %short_circuit.rhs, %if.merge42
+  %short_circuit = phi i1 [ false, %if.merge42 ], [ %pending_cr56, %short_circuit.rhs ]
+  br i1 %short_circuit, label %if.then57, label %if.merge58
+
+if.then57:                                        ; preds = %short_circuit.merge
+  %length59 = load i64, ptr %length, align 4
+  %max_bytes60 = load i64, ptr %max_bytes1, align 4
+  %status61 = load i32, ptr %status, align 4
+  %call62 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f63617061636974795f737461747573(i64 %length59, i64 %max_bytes60, i32 %status61)
+  store i32 %call62, ptr %assignment_value63, align 4
+  %assignment_value64 = load i32, ptr %assignment_value63, align 4
+  store i32 %assignment_value64, ptr %status, align 4
+  %length65 = load i64, ptr %length, align 4
+  %max_bytes66 = load i64, ptr %max_bytes1, align 4
+  %lt = icmp ult i64 %length65, %max_bytes66
+  br i1 %lt, label %if.then67, label %if.merge68
+
+if.merge58:                                       ; preds = %if.merge68, %short_circuit.merge
+  %status79 = load i32, ptr %status, align 4
+  %eq80 = icmp eq i32 %status79, 0
+  br i1 %eq80, label %if.then81, label %if.merge82
+
+if.then67:                                        ; preds = %if.then57
+  store i8 13, ptr %assignment_value69, align 1
+  %assignment_value70 = load i8, ptr %assignment_value69, align 1
+  %bytes71 = load ptr, ptr %bytes_backing, align 8
+  %length72 = load i64, ptr %length, align 4
+  %array_element73 = getelementptr inbounds i8, ptr %bytes71, i64 %length72
+  store i8 %assignment_value70, ptr %array_element73, align 1
+  %length74 = load i64, ptr %length, align 4
+  %one75 = load i64, ptr %one, align 4
+  %add76 = add i64 %length74, %one75
+  store i64 %add76, ptr %assignment_value77, align 4
+  %assignment_value78 = load i64, ptr %assignment_value77, align 4
+  store i64 %assignment_value78, ptr %length, align 4
+  br label %if.merge68
+
+if.merge68:                                       ; preds = %if.then67, %if.then57
+  br label %if.merge58
+
+if.then81:                                        ; preds = %if.merge58
+  %zero83 = load i64, ptr %zero, align 4
+  store i64 %zero83, ptr %remaining, align 4
   store i8 -128, ptr %minimum, align 1
   store i8 -65, ptr %maximum, align 1
-  %bytes59 = load ptr, ptr %bytes_backing, align 8
-  %zero60 = load i64, ptr %zero, align 4
-  %length61 = load i64, ptr %length, align 4
-  %remaining62 = load i64, ptr %remaining, align 4
-  %minimum63 = load i8, ptr %minimum, align 1
-  %maximum64 = load i8, ptr %maximum, align 1
-  %status65 = load i32, ptr %status, align 4
-  %call66 = call { ptr, i64, i8, i8, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f757466385f72616e6765(ptr %bytes59, i64 %zero60, i64 %length61, i64 %remaining62, i8 %minimum63, i8 %maximum64, i32 %status65)
-  %output67 = extractvalue { ptr, i64, i8, i8, i32 } %call66, 0
-  store ptr %output67, ptr %assignment_value68, align 8
-  %assignment_value69 = load ptr, ptr %assignment_value68, align 8
-  %output70 = extractvalue { ptr, i64, i8, i8, i32 } %call66, 1
-  store i64 %output70, ptr %assignment_value71, align 4
-  %assignment_value72 = load i64, ptr %assignment_value71, align 4
-  %output73 = extractvalue { ptr, i64, i8, i8, i32 } %call66, 2
-  store i8 %output73, ptr %assignment_value74, align 1
-  %assignment_value75 = load i8, ptr %assignment_value74, align 1
-  %output76 = extractvalue { ptr, i64, i8, i8, i32 } %call66, 3
-  store i8 %output76, ptr %assignment_value77, align 1
-  %assignment_value78 = load i8, ptr %assignment_value77, align 1
-  %output79 = extractvalue { ptr, i64, i8, i8, i32 } %call66, 4
-  store i32 %output79, ptr %assignment_value80, align 4
-  %assignment_value81 = load i32, ptr %assignment_value80, align 4
-  store ptr %assignment_value69, ptr %bytes_backing, align 8
-  store i64 %assignment_value72, ptr %remaining, align 4
-  store i8 %assignment_value75, ptr %minimum, align 1
-  store i8 %assignment_value78, ptr %maximum, align 1
-  store i32 %assignment_value81, ptr %status, align 4
-  %remaining82 = load i64, ptr %remaining, align 4
-  %zero83 = load i64, ptr %zero, align 4
-  %ne = icmp ne i64 %remaining82, %zero83
-  br i1 %ne, label %if.then84, label %if.merge85
+  %bytes84 = load ptr, ptr %bytes_backing, align 8
+  %zero85 = load i64, ptr %zero, align 4
+  %length86 = load i64, ptr %length, align 4
+  %remaining87 = load i64, ptr %remaining, align 4
+  %minimum88 = load i8, ptr %minimum, align 1
+  %maximum89 = load i8, ptr %maximum, align 1
+  %status90 = load i32, ptr %status, align 4
+  %call91 = call { ptr, i64, i8, i8, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f757466385f72616e6765(ptr %bytes84, i64 %zero85, i64 %length86, i64 %remaining87, i8 %minimum88, i8 %maximum89, i32 %status90)
+  %output92 = extractvalue { ptr, i64, i8, i8, i32 } %call91, 0
+  store ptr %output92, ptr %assignment_value93, align 8
+  %assignment_value94 = load ptr, ptr %assignment_value93, align 8
+  %output95 = extractvalue { ptr, i64, i8, i8, i32 } %call91, 1
+  store i64 %output95, ptr %assignment_value96, align 4
+  %assignment_value97 = load i64, ptr %assignment_value96, align 4
+  %output98 = extractvalue { ptr, i64, i8, i8, i32 } %call91, 2
+  store i8 %output98, ptr %assignment_value99, align 1
+  %assignment_value100 = load i8, ptr %assignment_value99, align 1
+  %output101 = extractvalue { ptr, i64, i8, i8, i32 } %call91, 3
+  store i8 %output101, ptr %assignment_value102, align 1
+  %assignment_value103 = load i8, ptr %assignment_value102, align 1
+  %output104 = extractvalue { ptr, i64, i8, i8, i32 } %call91, 4
+  store i32 %output104, ptr %assignment_value105, align 4
+  %assignment_value106 = load i32, ptr %assignment_value105, align 4
+  store ptr %assignment_value94, ptr %bytes_backing, align 8
+  store i64 %assignment_value97, ptr %remaining, align 4
+  store i8 %assignment_value100, ptr %minimum, align 1
+  store i8 %assignment_value103, ptr %maximum, align 1
+  store i32 %assignment_value106, ptr %status, align 4
+  %remaining107 = load i64, ptr %remaining, align 4
+  %zero108 = load i64, ptr %zero, align 4
+  %ne = icmp ne i64 %remaining107, %zero108
+  br i1 %ne, label %if.then109, label %if.merge110
 
-if.merge57:                                       ; preds = %if.merge85, %if.merge42
-  %status88 = load i32, ptr %status, align 4
-  %eq89 = icmp eq i32 %status88, 0
-  br i1 %eq89, label %if.then90, label %if.else
+if.merge82:                                       ; preds = %if.merge110, %if.merge58
+  %status113 = load i32, ptr %status, align 4
+  %eq114 = icmp eq i32 %status113, 0
+  br i1 %eq114, label %if.then115, label %if.else
 
-if.then84:                                        ; preds = %if.then56
-  store i32 3, ptr %assignment_value86, align 4
-  %assignment_value87 = load i32, ptr %assignment_value86, align 4
-  store i32 %assignment_value87, ptr %status, align 4
-  br label %if.merge85
+if.then109:                                       ; preds = %if.then81
+  store i32 3, ptr %assignment_value111, align 4
+  %assignment_value112 = load i32, ptr %assignment_value111, align 4
+  store i32 %assignment_value112, ptr %status, align 4
+  br label %if.merge110
 
-if.merge85:                                       ; preds = %if.then84, %if.then56
-  br label %if.merge57
+if.merge110:                                      ; preds = %if.then109, %if.then81
+  br label %if.merge82
 
-if.then90:                                        ; preds = %if.merge57
+if.then115:                                       ; preds = %if.merge82
   store i32 0, ptr %data, align 4
-  %length92 = load i64, ptr %length, align 4
-  %zero93 = load i64, ptr %zero, align 4
-  %ne94 = icmp ne i64 %length92, %zero93
-  br i1 %ne94, label %if.then95, label %if.merge96
+  %length117 = load i64, ptr %length, align 4
+  %zero118 = load i64, ptr %zero, align 4
+  %ne119 = icmp ne i64 %length117, %zero118
+  br i1 %ne119, label %if.then120, label %if.else121
 
-if.else:                                          ; preds = %if.merge57
-  %status111 = load i32, ptr %status, align 4
-  %output112 = insertvalue { i32, i32 } zeroinitializer, i32 %status111, 1
-  br label %if.merge91
+if.else:                                          ; preds = %if.merge82
+  %status139 = load i32, ptr %status, align 4
+  %output140 = insertvalue { i32, i32 } zeroinitializer, i32 %status139, 1
+  %allocation_live = load i1, ptr %bytes_live, align 1
+  br i1 %allocation_live, label %release.live, label %release.next
 
-if.merge91:                                       ; preds = %if.else, %if.merge96
-  %if = phi { i32, i32 } [ %output110, %if.merge96 ], [ %output112, %if.else ]
+if.merge116:                                      ; preds = %release.next, %if.merge122
+  %if = phi { i32, i32 } [ %output138, %if.merge122 ], [ %output140, %release.next ]
   %return_output = extractvalue { i32, i32 } %if, 0
   %return_result_is_null = icmp eq i32 %return_output, 0
   br i1 %return_result_is_null, label %return_result_null_0, label %return_result_copy_1
 
-if.then95:                                        ; preds = %if.then90
-  %bytes97 = load ptr, ptr %bytes_backing, align 8
-  %array_element98 = getelementptr inbounds i8, ptr %bytes97, i64 0
-  %address99 = ptrtoint ptr %array_element98 to i32
-  store i32 %address99, ptr %assignment_value100, align 4
-  %assignment_value101 = load i32, ptr %assignment_value100, align 4
-  store i32 %assignment_value101, ptr %data, align 4
-  br label %if.merge96
+if.then120:                                       ; preds = %if.then115
+  %bytes123 = load ptr, ptr %bytes_backing, align 8
+  %array_element124 = getelementptr inbounds i8, ptr %bytes123, i64 0
+  %address125 = ptrtoint ptr %array_element124 to i32
+  store i32 %address125, ptr %assignment_value126, align 4
+  %assignment_value127 = load i32, ptr %assignment_value126, align 4
+  store i32 %assignment_value127, ptr %data, align 4
+  br label %if.merge122
 
-if.merge96:                                       ; preds = %if.then95, %if.then90
-  %data102 = load i32, ptr %data, align 4
-  %length103 = load i64, ptr %length, align 4
-  %data104 = getelementptr inbounds i8, ptr %struct_literal, i8 0
-  store i32 %data102, ptr %data104, align 4
-  %length105 = getelementptr inbounds i8, ptr %struct_literal, i8 8
-  store i64 %length103, ptr %length105, align 4
-  %struct_value106 = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value106, ptr %text, align 1
-  %address107 = ptrtoint ptr %text to i32
-  %status108 = load i32, ptr %status, align 4
-  %output109 = insertvalue { i32, i32 } zeroinitializer, i32 %address107, 0
-  %output110 = insertvalue { i32, i32 } %output109, i32 %status108, 1
-  br label %if.merge91
+if.else121:                                       ; preds = %if.then115
+  %bytes128 = load ptr, ptr %bytes_backing, align 8
+  %address129 = ptrtoint ptr %bytes128 to i32
+  %checked_release_backing = load ptr, ptr %bytes_backing, align 8
+  call void @__wosy_core_free(ptr %checked_release_backing)
+  store i1 false, ptr %bytes_live, align 1
+  br label %if.merge122
 
-return_result_null_0:                             ; preds = %if.merge91
+if.merge122:                                      ; preds = %if.else121, %if.then120
+  %data130 = load i32, ptr %data, align 4
+  %length131 = load i64, ptr %length, align 4
+  %data132 = getelementptr inbounds i8, ptr %struct_literal, i8 0
+  store i32 %data130, ptr %data132, align 4
+  %length133 = getelementptr inbounds i8, ptr %struct_literal, i8 8
+  store i64 %length131, ptr %length133, align 4
+  %struct_value134 = load [16 x i8], ptr %struct_literal, align 1
+  store [16 x i8] %struct_value134, ptr %text, align 1
+  %address135 = ptrtoint ptr %text to i32
+  %status136 = load i32, ptr %status, align 4
+  %output137 = insertvalue { i32, i32 } zeroinitializer, i32 %address135, 0
+  %output138 = insertvalue { i32, i32 } %output137, i32 %status136, 1
+  br label %if.merge116
+
+release.live:                                     ; preds = %if.else
+  call void @__wosy_core_free(ptr %allocation)
+  br label %release.next
+
+release.next:                                     ; preds = %release.live, %if.else
+  store i1 false, ptr %bytes_live, align 1
+  br label %if.merge116
+
+return_result_null_0:                             ; preds = %if.merge116
   br label %return_result_merge_2
 
-return_result_copy_1:                             ; preds = %if.merge91
-  %allocation113 = call ptr @__wosy_core_alloc(i64 16, i64 8)
-  %allocation_failed114 = icmp eq ptr %allocation113, null
-  br i1 %allocation_failed114, label %allocation_panic115, label %allocation_continue116
+return_result_copy_1:                             ; preds = %if.merge116
+  %allocation142 = call ptr @__wosy_core_alloc(i64 16, i64 8)
+  %allocation_failed143 = icmp eq ptr %allocation142, null
+  br i1 %allocation_failed143, label %allocation_panic141, label %allocation_continue144
 
-return_result_merge_2:                            ; preds = %allocation_continue116, %return_result_null_0
-  %return_result = phi i32 [ 0, %return_result_null_0 ], [ %return_result_address, %allocation_continue116 ]
-  %return_output117 = extractvalue { i32, i32 } %if, 1
-  %output118 = insertvalue { i32, i32 } zeroinitializer, i32 %return_result, 0
-  %output119 = insertvalue { i32, i32 } %output118, i32 %return_output117, 1
-  ret { i32, i32 } %output119
+return_result_merge_2:                            ; preds = %allocation_continue144, %return_result_null_0
+  %return_result = phi i32 [ 0, %return_result_null_0 ], [ %return_result_address, %allocation_continue144 ]
+  %return_output145 = extractvalue { i32, i32 } %if, 1
+  %output146 = insertvalue { i32, i32 } zeroinitializer, i32 %return_result, 0
+  %output147 = insertvalue { i32, i32 } %output146, i32 %return_output145, 1
+  ret { i32, i32 } %output147
 
-allocation_panic115:                              ; preds = %return_result_copy_1
+allocation_panic141:                              ; preds = %return_result_copy_1
   call void @__wosy_core_system_panic()
   unreachable
 
-allocation_continue116:                           ; preds = %return_result_copy_1
+allocation_continue144:                           ; preds = %return_result_copy_1
   %return_result_source = inttoptr i32 %return_output to ptr
   %return_result_value = load [16 x i8], ptr %return_result_source, align 1
-  store [16 x i8] %return_result_value, ptr %allocation113, align 1
-  %return_result_address = ptrtoint ptr %allocation113 to i32
+  store [16 x i8] %return_result_value, ptr %allocation142, align 1
+  %return_result_address = ptrtoint ptr %allocation142 to i32
   br label %return_result_merge_2
 }
 
-define { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__726561645f6c696e65(i64 %max_bytes, ptr %0) {
+define { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__726561645f6c696e65(i64 %max_bytes, ptr %0) {
 entry:
-  %assignment_value100 = alloca i32, align 4
-  %assignment_value97 = alloca i32, align 4
-  %assignment_value66 = alloca i32, align 4
-  %assignment_value42 = alloca i32, align 4
-  %assignment_value40 = alloca i32, align 4
-  %empty = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
-  %assignment_value22 = alloca i32, align 4
-  %assignment_value15 = alloca i32, align 4
+  %status80 = alloca i32, align 4
+  %text = alloca i32, align 4
+  %empty52 = alloca [16 x i8], align 8
+  %struct_literal48 = alloca [16 x i8], align 8
+  %status = alloca i32, align 4
+  %empty = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
+  %first = alloca i8, align 1
   %assignment_value10 = alloca i1, align 1
   %assignment_value = alloca i64, align 8
   %complete = alloca i1, align 1
   %count = alloca i64, align 8
-  %status = alloca i32, align 4
-  %text = alloca i32, align 4
   %scratch = alloca [1 x i8], align 1
   %array_literal = alloca [1 x i8], align 1
   %maximum_u32 = alloca i64, align 8
   %maximum_u32_value = alloca i32, align 4
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
-  %text_return_owner = alloca i1, align 1
-  store i1 false, ptr %text_return_owner, align 1
   %max_bytes1 = alloca i64, align 8
   store i64 %max_bytes, ptr %max_bytes1, align 4
   store i64 0, ptr %zero, align 4
@@ -1941,15 +1976,13 @@ if.else:                                          ; preds = %entry
   store i8 0, ptr %array_element, align 1
   %struct_value = load [1 x i8], ptr %array_literal, align 1
   store [1 x i8] %struct_value, ptr %scratch, align 1
-  store i32 0, ptr %text, align 4
-  store i32 1, ptr %status, align 4
   %zero5 = load i64, ptr %zero, align 4
   store i64 %zero5, ptr %count, align 4
   store i1 false, ptr %complete, align 1
   %array_element6 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
   %address = ptrtoint ptr %array_element6 to i32
   %one7 = load i64, ptr %one, align 4
-  %call = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__726561645f696e746f(i32 %address, i64 %one7)
+  %call = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__726561645f696e746f(i32 %address, i64 %one7)
   %output = extractvalue { i64, i1 } %call, 0
   store i64 %output, ptr %assignment_value, align 4
   %assignment_value8 = load i64, ptr %assignment_value, align 4
@@ -1960,238 +1993,179 @@ if.else:                                          ; preds = %entry
   store i1 %assignment_value11, ptr %complete, align 1
   %complete12 = load i1, ptr %complete, align 1
   %not = xor i1 %complete12, true
-  br i1 %not, label %if.then13, label %if.merge14
+  br i1 %not, label %if.then13, label %if.else14
 
-if.merge:                                         ; preds = %if.merge88, %if.then
-  %return_owner_0 = phi i1 [ false, %if.then ], [ %joined_return_owned, %if.merge88 ]
-  %if = phi { i32, i32 } [ { i32 0, i32 4 }, %if.then ], [ %output114, %if.merge88 ]
-  store i1 %return_owner_0, ptr %0, align 1
-  ret { i32, i32 } %if
+if.merge:                                         ; preds = %if.merge15, %if.then
+  %return_owner_093 = phi i1 [ false, %if.then ], [ %return_owner_091, %if.merge15 ]
+  %if94 = phi { i32, i32 } [ { i32 0, i32 4 }, %if.then ], [ %if92, %if.merge15 ]
+  store i1 %return_owner_093, ptr %0, align 1
+  ret { i32, i32 } %if94
 
 if.then13:                                        ; preds = %if.else
-  store i32 2, ptr %assignment_value15, align 4
-  %assignment_value16 = load i32, ptr %assignment_value15, align 4
-  store i32 %assignment_value16, ptr %status, align 4
-  br label %if.merge14
+  br label %if.merge15
 
-if.merge14:                                       ; preds = %if.then13, %if.else
-  %complete17 = load i1, ptr %complete, align 1
-  br i1 %complete17, label %short_circuit.rhs, label %short_circuit.merge
+if.else14:                                        ; preds = %if.else
+  %count16 = load i64, ptr %count, align 4
+  %zero17 = load i64, ptr %zero, align 4
+  %eq = icmp eq i64 %count16, %zero17
+  br i1 %eq, label %if.then18, label %if.else19
 
-short_circuit.rhs:                                ; preds = %if.merge14
-  %count18 = load i64, ptr %count, align 4
-  %zero19 = load i64, ptr %zero, align 4
-  %eq = icmp eq i64 %count18, %zero19
-  br label %short_circuit.merge
+if.merge15:                                       ; preds = %if.merge20, %if.then13
+  %return_owner_091 = phi i1 [ false, %if.then13 ], [ %return_owner_089, %if.merge20 ]
+  %if92 = phi { i32, i32 } [ { i32 0, i32 2 }, %if.then13 ], [ %if90, %if.merge20 ]
+  br label %if.merge
 
-short_circuit.merge:                              ; preds = %short_circuit.rhs, %if.merge14
-  %short_circuit = phi i1 [ false, %if.merge14 ], [ %eq, %short_circuit.rhs ]
-  br i1 %short_circuit, label %if.then20, label %if.merge21
+if.then18:                                        ; preds = %if.else14
+  br label %if.merge20
 
-if.then20:                                        ; preds = %short_circuit.merge
-  store i32 1, ptr %assignment_value22, align 4
-  %assignment_value23 = load i32, ptr %assignment_value22, align 4
-  store i32 %assignment_value23, ptr %status, align 4
-  br label %if.merge21
+if.else19:                                        ; preds = %if.else14
+  %array_element21 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %place = load i8, ptr %array_element21, align 1
+  store i8 %place, ptr %first, align 1
+  %first22 = load i8, ptr %first, align 1
+  %eq23 = icmp eq i8 %first22, 10
+  br i1 %eq23, label %if.then24, label %if.else25
 
-if.merge21:                                       ; preds = %if.then20, %short_circuit.merge
-  %complete24 = load i1, ptr %complete, align 1
-  br i1 %complete24, label %short_circuit.rhs25, label %short_circuit.merge26
+if.merge20:                                       ; preds = %if.merge26, %if.then18
+  %return_owner_089 = phi i1 [ false, %if.then18 ], [ %return_owner_087, %if.merge26 ]
+  %if90 = phi { i32, i32 } [ { i32 0, i32 1 }, %if.then18 ], [ %if88, %if.merge26 ]
+  br label %if.merge15
 
-short_circuit.rhs25:                              ; preds = %if.merge21
-  %count27 = load i64, ptr %count, align 4
-  %zero28 = load i64, ptr %zero, align 4
-  %ne = icmp ne i64 %count27, %zero28
-  br label %short_circuit.merge26
-
-short_circuit.merge26:                            ; preds = %short_circuit.rhs25, %if.merge21
-  %short_circuit29 = phi i1 [ false, %if.merge21 ], [ %ne, %short_circuit.rhs25 ]
-  br i1 %short_circuit29, label %short_circuit.rhs30, label %short_circuit.merge31
-
-short_circuit.rhs30:                              ; preds = %short_circuit.merge26
-  %array_element32 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
-  %place = load i8, ptr %array_element32, align 1
-  %eq33 = icmp eq i8 %place, 10
-  br label %short_circuit.merge31
-
-short_circuit.merge31:                            ; preds = %short_circuit.rhs30, %short_circuit.merge26
-  %short_circuit34 = phi i1 [ false, %short_circuit.merge26 ], [ %eq33, %short_circuit.rhs30 ]
-  br i1 %short_circuit34, label %if.then35, label %if.merge36
-
-if.then35:                                        ; preds = %short_circuit.merge31
-  %zero37 = load i64, ptr %zero, align 4
+if.then24:                                        ; preds = %if.else19
+  %zero27 = load i64, ptr %zero, align 4
   %data = getelementptr inbounds i8, ptr %struct_literal, i8 0
   store i32 0, ptr %data, align 4
   %length = getelementptr inbounds i8, ptr %struct_literal, i8 8
-  store i64 %zero37, ptr %length, align 4
-  %struct_value38 = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value38, ptr %empty, align 1
-  %address39 = ptrtoint ptr %empty to i32
-  store i32 %address39, ptr %assignment_value40, align 4
-  %assignment_value41 = load i32, ptr %assignment_value40, align 4
-  %joined_previous_owner = load i1, ptr %text_return_owner, align 1
-  %joined_previous_address = load i32, ptr %text, align 4
-  %return_result_is_null = icmp eq i32 %assignment_value41, 0
+  store i64 %zero27, ptr %length, align 4
+  %struct_value28 = load [16 x i8], ptr %struct_literal, align 1
+  store [16 x i8] %struct_value28, ptr %empty, align 1
+  %address29 = ptrtoint ptr %empty to i32
+  %output30 = insertvalue { i32, i32 } zeroinitializer, i32 %address29, 0
+  %output31 = insertvalue { i32, i32 } %output30, i32 0, 1
+  %return_output = extractvalue { i32, i32 } %output31, 0
+  %return_result_is_null = icmp eq i32 %return_output, 0
   br i1 %return_result_is_null, label %return_result_null_0, label %return_result_copy_1
 
-if.merge36:                                       ; preds = %joined_previous_release.next, %short_circuit.merge31
-  %complete44 = load i1, ptr %complete, align 1
-  br i1 %complete44, label %short_circuit.rhs45, label %short_circuit.merge46
+if.else25:                                        ; preds = %if.else19
+  %max_bytes35 = load i64, ptr %max_bytes1, align 4
+  %zero36 = load i64, ptr %zero, align 4
+  %eq37 = icmp eq i64 %max_bytes35, %zero36
+  br i1 %eq37, label %if.then38, label %if.else39
 
-return_result_null_0:                             ; preds = %if.then35
+if.merge26:                                       ; preds = %if.merge40, %return_result_merge_2
+  %return_owner_087 = phi i1 [ true, %return_result_merge_2 ], [ %return_owner_085, %if.merge40 ]
+  %if88 = phi { i32, i32 } [ %output34, %return_result_merge_2 ], [ %if86, %if.merge40 ]
+  br label %if.merge20
+
+return_result_null_0:                             ; preds = %if.then24
   br label %return_result_merge_2
 
-return_result_copy_1:                             ; preds = %if.then35
+return_result_copy_1:                             ; preds = %if.then24
   %allocation = call ptr @__wosy_core_alloc(i64 16, i64 8)
   %allocation_failed = icmp eq ptr %allocation, null
   br i1 %allocation_failed, label %allocation_panic, label %allocation_continue
 
 return_result_merge_2:                            ; preds = %allocation_continue, %return_result_null_0
   %return_result = phi i32 [ 0, %return_result_null_0 ], [ %return_result_address, %allocation_continue ]
-  %joined_owner_replaced = icmp ne i32 %joined_previous_address, %return_result
-  %joined_previous_live = icmp ne i32 %joined_previous_address, 0
-  %joined_previous_owned = and i1 %joined_previous_owner, %joined_owner_replaced
-  %joined_previous_release = and i1 %joined_previous_owned, %joined_previous_live
-  br i1 %joined_previous_release, label %joined_previous_release.live, label %joined_previous_release.next
+  %return_output32 = extractvalue { i32, i32 } %output31, 1
+  %output33 = insertvalue { i32, i32 } zeroinitializer, i32 %return_result, 0
+  %output34 = insertvalue { i32, i32 } %output33, i32 %return_output32, 1
+  br label %if.merge26
 
 allocation_panic:                                 ; preds = %return_result_copy_1
   call void @__wosy_core_system_panic()
   unreachable
 
 allocation_continue:                              ; preds = %return_result_copy_1
-  %return_result_source = inttoptr i32 %assignment_value41 to ptr
+  %return_result_source = inttoptr i32 %return_output to ptr
   %return_result_value = load [16 x i8], ptr %return_result_source, align 1
   store [16 x i8] %return_result_value, ptr %allocation, align 1
   %return_result_address = ptrtoint ptr %allocation to i32
   br label %return_result_merge_2
 
-joined_previous_release.live:                     ; preds = %return_result_merge_2
-  %joined_previous_pointer = inttoptr i32 %joined_previous_address to ptr
-  call void @__wosy_core_free(ptr %joined_previous_pointer)
-  br label %joined_previous_release.next
+if.then38:                                        ; preds = %if.else25
+  %first41 = load i8, ptr %first, align 1
+  %call42 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f7a65726f5f6361706163697479(i8 %first41)
+  store i32 %call42, ptr %status, align 4
+  %status43 = load i32, ptr %status, align 4
+  %eq44 = icmp eq i32 %status43, 0
+  br i1 %eq44, label %if.then45, label %if.else46
 
-joined_previous_release.next:                     ; preds = %joined_previous_release.live, %return_result_merge_2
-  store i1 true, ptr %text_return_owner, align 1
-  store i32 %return_result, ptr %text, align 4
-  store i32 0, ptr %assignment_value42, align 4
-  %assignment_value43 = load i32, ptr %assignment_value42, align 4
-  store i32 %assignment_value43, ptr %status, align 4
-  br label %if.merge36
+if.else39:                                        ; preds = %if.else25
+  %max_bytes73 = load i64, ptr %max_bytes1, align 4
+  %first74 = load i8, ptr %first, align 1
+  %first75 = load i8, ptr %first, align 1
+  %eq76 = icmp eq i8 %first75, 13
+  %call77 = call { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f616c6c6f6361746564(i64 %max_bytes73, i8 %first74, i1 %eq76)
+  %output78 = extractvalue { i32, i32 } %call77, 0
+  store i32 %output78, ptr %text, align 4
+  %output79 = extractvalue { i32, i32 } %call77, 1
+  store i32 %output79, ptr %status80, align 4
+  %text81 = load i32, ptr %text, align 4
+  %status82 = load i32, ptr %status80, align 4
+  %output83 = insertvalue { i32, i32 } zeroinitializer, i32 %text81, 0
+  %output84 = insertvalue { i32, i32 } %output83, i32 %status82, 1
+  br label %if.merge40
 
-short_circuit.rhs45:                              ; preds = %if.merge36
-  %count47 = load i64, ptr %count, align 4
-  %zero48 = load i64, ptr %zero, align 4
-  %ne49 = icmp ne i64 %count47, %zero48
-  br label %short_circuit.merge46
+if.merge40:                                       ; preds = %if.else39, %if.merge47
+  %return_owner_085 = phi i1 [ %return_owner_0, %if.merge47 ], [ true, %if.else39 ]
+  %if86 = phi { i32, i32 } [ %if, %if.merge47 ], [ %output84, %if.else39 ]
+  br label %if.merge26
 
-short_circuit.merge46:                            ; preds = %short_circuit.rhs45, %if.merge36
-  %short_circuit50 = phi i1 [ false, %if.merge36 ], [ %ne49, %short_circuit.rhs45 ]
-  br i1 %short_circuit50, label %short_circuit.rhs51, label %short_circuit.merge52
+if.then45:                                        ; preds = %if.then38
+  %zero49 = load i64, ptr %zero, align 4
+  %data50 = getelementptr inbounds i8, ptr %struct_literal48, i8 0
+  store i32 0, ptr %data50, align 4
+  %length51 = getelementptr inbounds i8, ptr %struct_literal48, i8 8
+  store i64 %zero49, ptr %length51, align 4
+  %struct_value53 = load [16 x i8], ptr %struct_literal48, align 1
+  store [16 x i8] %struct_value53, ptr %empty52, align 1
+  %address54 = ptrtoint ptr %empty52 to i32
+  %status55 = load i32, ptr %status, align 4
+  %output56 = insertvalue { i32, i32 } zeroinitializer, i32 %address54, 0
+  %output57 = insertvalue { i32, i32 } %output56, i32 %status55, 1
+  %return_output58 = extractvalue { i32, i32 } %output57, 0
+  %return_result_is_null59 = icmp eq i32 %return_output58, 0
+  br i1 %return_result_is_null59, label %return_result_null_3, label %return_result_copy_4
 
-short_circuit.rhs51:                              ; preds = %short_circuit.merge46
-  %array_element53 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
-  %place54 = load i8, ptr %array_element53, align 1
-  %ne55 = icmp ne i8 %place54, 10
-  br label %short_circuit.merge52
+if.else46:                                        ; preds = %if.then38
+  %status71 = load i32, ptr %status, align 4
+  %output72 = insertvalue { i32, i32 } zeroinitializer, i32 %status71, 1
+  br label %if.merge47
 
-short_circuit.merge52:                            ; preds = %short_circuit.rhs51, %short_circuit.merge46
-  %short_circuit56 = phi i1 [ false, %short_circuit.merge46 ], [ %ne55, %short_circuit.rhs51 ]
-  br i1 %short_circuit56, label %short_circuit.rhs57, label %short_circuit.merge58
+if.merge47:                                       ; preds = %if.else46, %return_result_merge_5
+  %return_owner_0 = phi i1 [ true, %return_result_merge_5 ], [ false, %if.else46 ]
+  %if = phi { i32, i32 } [ %output70, %return_result_merge_5 ], [ %output72, %if.else46 ]
+  br label %if.merge40
 
-short_circuit.rhs57:                              ; preds = %short_circuit.merge52
-  %max_bytes59 = load i64, ptr %max_bytes1, align 4
-  %zero60 = load i64, ptr %zero, align 4
-  %eq61 = icmp eq i64 %max_bytes59, %zero60
-  br label %short_circuit.merge58
+return_result_null_3:                             ; preds = %if.then45
+  br label %return_result_merge_5
 
-short_circuit.merge58:                            ; preds = %short_circuit.rhs57, %short_circuit.merge52
-  %short_circuit62 = phi i1 [ false, %short_circuit.merge52 ], [ %eq61, %short_circuit.rhs57 ]
-  br i1 %short_circuit62, label %if.then63, label %if.merge64
+return_result_copy_4:                             ; preds = %if.then45
+  %allocation61 = call ptr @__wosy_core_alloc(i64 16, i64 8)
+  %allocation_failed62 = icmp eq ptr %allocation61, null
+  br i1 %allocation_failed62, label %allocation_panic60, label %allocation_continue63
 
-if.then63:                                        ; preds = %short_circuit.merge58
-  %call65 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f64697363617264()
-  store i32 %call65, ptr %assignment_value66, align 4
-  %assignment_value67 = load i32, ptr %assignment_value66, align 4
-  store i32 %assignment_value67, ptr %status, align 4
-  br label %if.merge64
+return_result_merge_5:                            ; preds = %allocation_continue63, %return_result_null_3
+  %return_result67 = phi i32 [ 0, %return_result_null_3 ], [ %return_result_address66, %allocation_continue63 ]
+  %return_output68 = extractvalue { i32, i32 } %output57, 1
+  %output69 = insertvalue { i32, i32 } zeroinitializer, i32 %return_result67, 0
+  %output70 = insertvalue { i32, i32 } %output69, i32 %return_output68, 1
+  br label %if.merge47
 
-if.merge64:                                       ; preds = %if.then63, %short_circuit.merge58
-  %complete68 = load i1, ptr %complete, align 1
-  br i1 %complete68, label %short_circuit.rhs69, label %short_circuit.merge70
+allocation_panic60:                               ; preds = %return_result_copy_4
+  call void @__wosy_core_system_panic()
+  unreachable
 
-short_circuit.rhs69:                              ; preds = %if.merge64
-  %count71 = load i64, ptr %count, align 4
-  %zero72 = load i64, ptr %zero, align 4
-  %ne73 = icmp ne i64 %count71, %zero72
-  br label %short_circuit.merge70
-
-short_circuit.merge70:                            ; preds = %short_circuit.rhs69, %if.merge64
-  %short_circuit74 = phi i1 [ false, %if.merge64 ], [ %ne73, %short_circuit.rhs69 ]
-  br i1 %short_circuit74, label %short_circuit.rhs75, label %short_circuit.merge76
-
-short_circuit.rhs75:                              ; preds = %short_circuit.merge70
-  %array_element77 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
-  %place78 = load i8, ptr %array_element77, align 1
-  %ne79 = icmp ne i8 %place78, 10
-  br label %short_circuit.merge76
-
-short_circuit.merge76:                            ; preds = %short_circuit.rhs75, %short_circuit.merge70
-  %short_circuit80 = phi i1 [ false, %short_circuit.merge70 ], [ %ne79, %short_circuit.rhs75 ]
-  br i1 %short_circuit80, label %short_circuit.rhs81, label %short_circuit.merge82
-
-short_circuit.rhs81:                              ; preds = %short_circuit.merge76
-  %max_bytes83 = load i64, ptr %max_bytes1, align 4
-  %zero84 = load i64, ptr %zero, align 4
-  %ne85 = icmp ne i64 %max_bytes83, %zero84
-  br label %short_circuit.merge82
-
-short_circuit.merge82:                            ; preds = %short_circuit.rhs81, %short_circuit.merge76
-  %short_circuit86 = phi i1 [ false, %short_circuit.merge76 ], [ %ne85, %short_circuit.rhs81 ]
-  br i1 %short_circuit86, label %if.then87, label %if.merge88
-
-if.then87:                                        ; preds = %short_circuit.merge82
-  %max_bytes89 = load i64, ptr %max_bytes1, align 4
-  %array_element90 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
-  %place91 = load i8, ptr %array_element90, align 1
-  %array_element92 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
-  %place93 = load i8, ptr %array_element92, align 1
-  %eq94 = icmp eq i8 %place93, 13
-  %call95 = call { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f726561645f6c696e655f616c6c6f6361746564(i64 %max_bytes89, i8 %place91, i1 %eq94)
-  %output96 = extractvalue { i32, i32 } %call95, 0
-  store i32 %output96, ptr %assignment_value97, align 4
-  %assignment_value98 = load i32, ptr %assignment_value97, align 4
-  %output99 = extractvalue { i32, i32 } %call95, 1
-  store i32 %output99, ptr %assignment_value100, align 4
-  %assignment_value101 = load i32, ptr %assignment_value100, align 4
-  %joined_previous_owner102 = load i1, ptr %text_return_owner, align 1
-  %joined_previous_address103 = load i32, ptr %text, align 4
-  %joined_owner_replaced104 = icmp ne i32 %joined_previous_address103, %assignment_value98
-  %joined_previous_live105 = icmp ne i32 %joined_previous_address103, 0
-  %joined_previous_owned106 = and i1 %joined_previous_owner102, %joined_owner_replaced104
-  %joined_previous_release107 = and i1 %joined_previous_owned106, %joined_previous_live105
-  br i1 %joined_previous_release107, label %joined_previous_release.live108, label %joined_previous_release.next109
-
-if.merge88:                                       ; preds = %joined_previous_release.next109, %short_circuit.merge82
-  %text111 = load i32, ptr %text, align 4
-  %status112 = load i32, ptr %status, align 4
-  %output113 = insertvalue { i32, i32 } zeroinitializer, i32 %text111, 0
-  %output114 = insertvalue { i32, i32 } %output113, i32 %status112, 1
-  %joined_return_owned = load i1, ptr %text_return_owner, align 1
-  br label %if.merge
-
-joined_previous_release.live108:                  ; preds = %if.then87
-  %joined_previous_pointer110 = inttoptr i32 %joined_previous_address103 to ptr
-  call void @__wosy_core_free(ptr %joined_previous_pointer110)
-  br label %joined_previous_release.next109
-
-joined_previous_release.next109:                  ; preds = %joined_previous_release.live108, %if.then87
-  store i1 true, ptr %text_return_owner, align 1
-  store i32 %assignment_value98, ptr %text, align 4
-  store i32 %assignment_value101, ptr %status, align 4
-  br label %if.merge88
+allocation_continue63:                            ; preds = %return_result_copy_4
+  %return_result_source64 = inttoptr i32 %return_output58 to ptr
+  %return_result_value65 = load [16 x i8], ptr %return_result_source64, align 1
+  store [16 x i8] %return_result_value65, ptr %allocation61, align 1
+  %return_result_address66 = ptrtoint ptr %allocation61 to i32
+  br label %return_result_merge_5
 }
 
-define i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f64696769745f76616c7565(i8 %byte) {
+define i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f64696769745f76616c7565(i8 %byte) {
 entry:
   %assignment_value33 = alloca i8, align 1
   %assignment_value19 = alloca i8, align 1
@@ -2279,23 +2253,7 @@ if.merge29:                                       ; preds = %if.then28, %short_c
   ret i8 %value35
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f64696769745f76616c6964(i8 %byte, i8 %radix) {
-entry:
-  %value = alloca i8, align 1
-  %byte1 = alloca i8, align 1
-  store i8 %byte, ptr %byte1, align 1
-  %radix2 = alloca i8, align 1
-  store i8 %radix, ptr %radix2, align 1
-  %byte3 = load i8, ptr %byte1, align 1
-  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f64696769745f76616c7565(i8 %byte3)
-  store i8 %call, ptr %value, align 1
-  %value4 = load i8, ptr %value, align 1
-  %radix5 = load i8, ptr %radix2, align 1
-  %lt = icmp ult i8 %value4, %radix5
-  ret i1 %lt
-}
-
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f756e64657273636f7265(i8 %byte) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f756e64657273636f7265(i8 %byte) {
 entry:
   %byte1 = alloca i8, align 1
   store i8 %byte, ptr %byte1, align 1
@@ -2304,7 +2262,7 @@ entry:
   ret i1 %eq
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f7369676e(i8 %byte) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f7369676e(i8 %byte) {
 entry:
   %byte1 = alloca i8, align 1
   store i8 %byte, ptr %byte1, align 1
@@ -2313,7 +2271,7 @@ entry:
   ret i1 %eq
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f706c7573(i8 %byte) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f706c7573(i8 %byte) {
 entry:
   %byte1 = alloca i8, align 1
   store i8 %byte, ptr %byte1, align 1
@@ -2322,7 +2280,7 @@ entry:
   ret i1 %eq
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f7a65726f(i8 %byte) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f7a65726f(i8 %byte) {
 entry:
   %byte1 = alloca i8, align 1
   store i8 %byte, ptr %byte1, align 1
@@ -2331,7 +2289,7 @@ entry:
   ret i1 %eq
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f78(i8 %byte) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f78(i8 %byte) {
 entry:
   %byte1 = alloca i8, align 1
   store i8 %byte, ptr %byte1, align 1
@@ -2349,7 +2307,7 @@ short_circuit.merge:                              ; preds = %short_circuit.rhs, 
   ret i1 %short_circuit
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f62(i8 %byte) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f62(i8 %byte) {
 entry:
   %byte1 = alloca i8, align 1
   store i8 %byte, ptr %byte1, align 1
@@ -2367,7 +2325,7 @@ short_circuit.merge:                              ; preds = %short_circuit.rhs, 
   ret i1 %short_circuit
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f6f(i8 %byte) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f6f(i8 %byte) {
 entry:
   %byte1 = alloca i8, align 1
   store i8 %byte, ptr %byte1, align 1
@@ -2385,7 +2343,7 @@ short_circuit.merge:                              ; preds = %short_circuit.rhs, 
   ret i1 %short_circuit
 }
 
-define i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616469785f66726f6d5f707265666978(i8 %first, i8 %second) {
+define i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616469785f66726f6d5f707265666978(i8 %first, i8 %second) {
 entry:
   %assignment_value26 = alloca i8, align 1
   %assignment_value16 = alloca i8, align 1
@@ -2398,14 +2356,14 @@ entry:
   store i8 %second, ptr %second2, align 1
   store i8 10, ptr %radix, align 1
   %first3 = load i8, ptr %first1, align 1
-  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f7a65726f(i8 %first3)
+  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f7a65726f(i8 %first3)
   store i1 %call, ptr %leading, align 1
   %leading4 = load i1, ptr %leading, align 1
   br i1 %leading4, label %short_circuit.rhs, label %short_circuit.merge
 
 short_circuit.rhs:                                ; preds = %entry
   %second5 = load i8, ptr %second2, align 1
-  %call6 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f78(i8 %second5)
+  %call6 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f78(i8 %second5)
   br label %short_circuit.merge
 
 short_circuit.merge:                              ; preds = %short_circuit.rhs, %entry
@@ -2424,7 +2382,7 @@ if.merge:                                         ; preds = %if.then, %short_cir
 
 short_circuit.rhs9:                               ; preds = %if.merge
   %second11 = load i8, ptr %second2, align 1
-  %call12 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f62(i8 %second11)
+  %call12 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f62(i8 %second11)
   br label %short_circuit.merge10
 
 short_circuit.merge10:                            ; preds = %short_circuit.rhs9, %if.merge
@@ -2443,7 +2401,7 @@ if.merge15:                                       ; preds = %if.then14, %short_c
 
 short_circuit.rhs19:                              ; preds = %if.merge15
   %second21 = load i8, ptr %second2, align 1
-  %call22 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f6f(i8 %second21)
+  %call22 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f6f(i8 %second21)
   br label %short_circuit.merge20
 
 short_circuit.merge20:                            ; preds = %short_circuit.rhs19, %if.merge15
@@ -2461,30 +2419,27 @@ if.merge25:                                       ; preds = %if.then24, %short_c
   ret i8 %radix28
 }
 
-define { i128, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f696e7465676572(i32 %data, i64 %start, i64 %lo, i64 %hi, i8 %radix, i128 %maximum, i128 %result, i1 %valid, i1 %saw_digit, i1 %last_underscore) {
+define { i128, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f696e7465676572(i32 %data, i64 %start, i64 %lo, i64 %hi, i128 %radix, i128 %limit, i128 %remainder, i128 %result, i1 %valid, i1 %saw_digit, i1 %last_underscore) {
 entry:
-  %assignment_value138 = alloca i1, align 1
-  %assignment_value135 = alloca i1, align 1
-  %assignment_value132 = alloca i1, align 1
-  %assignment_value129 = alloca i128, align 8
+  %assignment_value145 = alloca i1, align 1
+  %assignment_value142 = alloca i1, align 1
+  %assignment_value139 = alloca i1, align 1
+  %assignment_value136 = alloca i128, align 8
+  %assignment_value118 = alloca i1, align 1
+  %assignment_value115 = alloca i1, align 1
   %assignment_value112 = alloca i1, align 1
-  %assignment_value109 = alloca i1, align 1
-  %assignment_value106 = alloca i1, align 1
-  %assignment_value103 = alloca i128, align 8
+  %assignment_value109 = alloca i128, align 8
   %mid = alloca i64, align 8
   %two = alloca i64, align 8
-  %assignment_value85 = alloca i1, align 1
+  %assignment_value91 = alloca i1, align 1
+  %assignment_value89 = alloca i1, align 1
   %assignment_value83 = alloca i1, align 1
-  %assignment_value77 = alloca i1, align 1
-  %assignment_value68 = alloca i1, align 1
-  %assignment_value57 = alloca i1, align 1
-  %assignment_value55 = alloca i1, align 1
-  %assignment_value53 = alloca i128, align 8
-  %assignment_value48 = alloca i1, align 1
-  %limit = alloca i128, align 8
-  %radix_wide = alloca i128, align 8
+  %assignment_value74 = alloca i1, align 1
+  %assignment_value63 = alloca i1, align 1
+  %assignment_value61 = alloca i1, align 1
+  %assignment_value59 = alloca i128, align 8
+  %assignment_value54 = alloca i1, align 1
   %digit_wide = alloca i128, align 8
-  %digit_ok = alloca i1, align 1
   %digit = alloca i8, align 1
   %underscore = alloca i1, align 1
   %assignment_value = alloca i8, align 1
@@ -2501,275 +2456,291 @@ entry:
   store i64 %lo, ptr %lo3, align 4
   %hi4 = alloca i64, align 8
   store i64 %hi, ptr %hi4, align 4
-  %radix5 = alloca i8, align 1
-  store i8 %radix, ptr %radix5, align 1
-  %maximum6 = alloca i128, align 8
-  store i128 %maximum, ptr %maximum6, align 4
-  %result7 = alloca i128, align 8
-  store i128 %result, ptr %result7, align 4
-  %valid8 = alloca i1, align 1
-  store i1 %valid, ptr %valid8, align 1
-  %saw_digit9 = alloca i1, align 1
-  store i1 %saw_digit, ptr %saw_digit9, align 1
-  %last_underscore10 = alloca i1, align 1
-  store i1 %last_underscore, ptr %last_underscore10, align 1
+  %radix5 = alloca i128, align 8
+  store i128 %radix, ptr %radix5, align 4
+  %limit6 = alloca i128, align 8
+  store i128 %limit, ptr %limit6, align 4
+  %remainder7 = alloca i128, align 8
+  store i128 %remainder, ptr %remainder7, align 4
+  %result8 = alloca i128, align 8
+  store i128 %result, ptr %result8, align 4
+  %valid9 = alloca i1, align 1
+  store i1 %valid, ptr %valid9, align 1
+  %saw_digit10 = alloca i1, align 1
+  store i1 %saw_digit, ptr %saw_digit10, align 1
+  %last_underscore11 = alloca i1, align 1
+  store i1 %last_underscore, ptr %last_underscore11, align 1
   store i64 1, ptr %one, align 4
-  %lo11 = load i64, ptr %lo3, align 4
-  %hi12 = load i64, ptr %hi4, align 4
-  %lt = icmp ult i64 %lo11, %hi12
+  %lo12 = load i64, ptr %lo3, align 4
+  %hi13 = load i64, ptr %hi4, align 4
+  %lt = icmp ult i64 %lo12, %hi13
   br i1 %lt, label %short_circuit.rhs, label %short_circuit.merge
 
 short_circuit.rhs:                                ; preds = %entry
-  %valid13 = load i1, ptr %valid8, align 1
+  %valid14 = load i1, ptr %valid9, align 1
   br label %short_circuit.merge
 
 short_circuit.merge:                              ; preds = %short_circuit.rhs, %entry
-  %short_circuit = phi i1 [ false, %entry ], [ %valid13, %short_circuit.rhs ]
+  %short_circuit = phi i1 [ false, %entry ], [ %valid14, %short_circuit.rhs ]
   br i1 %short_circuit, label %if.then, label %if.merge
 
 if.then:                                          ; preds = %short_circuit.merge
-  %hi14 = load i64, ptr %hi4, align 4
-  %lo15 = load i64, ptr %lo3, align 4
-  %sub = sub i64 %hi14, %lo15
+  %hi15 = load i64, ptr %hi4, align 4
+  %lo16 = load i64, ptr %lo3, align 4
+  %sub = sub i64 %hi15, %lo16
   store i64 %sub, ptr %length, align 4
-  %length16 = load i64, ptr %length, align 4
-  %one17 = load i64, ptr %one, align 4
-  %eq = icmp eq i64 %length16, %one17
-  br i1 %eq, label %if.then18, label %if.else
+  %length17 = load i64, ptr %length, align 4
+  %one18 = load i64, ptr %one, align 4
+  %eq = icmp eq i64 %length17, %one18
+  br i1 %eq, label %if.then19, label %if.else
 
-if.merge:                                         ; preds = %if.merge19, %short_circuit.merge
-  %result140 = load i128, ptr %result7, align 4
-  %valid141 = load i1, ptr %valid8, align 1
-  %saw_digit142 = load i1, ptr %saw_digit9, align 1
-  %last_underscore143 = load i1, ptr %last_underscore10, align 1
-  %output144 = insertvalue { i128, i1, i1, i1 } zeroinitializer, i128 %result140, 0
-  %output145 = insertvalue { i128, i1, i1, i1 } %output144, i1 %valid141, 1
-  %output146 = insertvalue { i128, i1, i1, i1 } %output145, i1 %saw_digit142, 2
-  %output147 = insertvalue { i128, i1, i1, i1 } %output146, i1 %last_underscore143, 3
-  ret { i128, i1, i1, i1 } %output147
+if.merge:                                         ; preds = %if.merge20, %short_circuit.merge
+  %result147 = load i128, ptr %result8, align 4
+  %valid148 = load i1, ptr %valid9, align 1
+  %saw_digit149 = load i1, ptr %saw_digit10, align 1
+  %last_underscore150 = load i1, ptr %last_underscore11, align 1
+  %output151 = insertvalue { i128, i1, i1, i1 } zeroinitializer, i128 %result147, 0
+  %output152 = insertvalue { i128, i1, i1, i1 } %output151, i1 %valid148, 1
+  %output153 = insertvalue { i128, i1, i1, i1 } %output152, i1 %saw_digit149, 2
+  %output154 = insertvalue { i128, i1, i1, i1 } %output153, i1 %last_underscore150, 3
+  ret { i128, i1, i1, i1 } %output154
 
-if.then18:                                        ; preds = %if.then
-  %lo20 = load i64, ptr %lo3, align 4
-  %int_extend = zext i64 %lo20 to i128
+if.then19:                                        ; preds = %if.then
+  %lo21 = load i64, ptr %lo3, align 4
+  %int_extend = zext i64 %lo21 to i128
   store i128 %int_extend, ptr %wide_index, align 4
-  %wide_index21 = load i128, ptr %wide_index, align 4
-  %int_trunc = trunc i128 %wide_index21 to i64
+  %wide_index22 = load i128, ptr %wide_index, align 4
+  %int_trunc = trunc i128 %wide_index22 to i64
   store i64 %int_trunc, ptr %position, align 4
   store i8 0, ptr %byte, align 1
-  %data22 = load i32, ptr %data1, align 4
-  %position23 = load i64, ptr %position, align 4
-  %offset_base = inttoptr i32 %data22 to ptr
-  %offset = getelementptr inbounds i8, ptr %offset_base, i64 %position23
+  %data23 = load i32, ptr %data1, align 4
+  %position24 = load i64, ptr %position, align 4
+  %offset_base = inttoptr i32 %data23 to ptr
+  %offset = getelementptr inbounds i8, ptr %offset_base, i64 %position24
   %offset_address = ptrtoint ptr %offset to i32
   %load_base = inttoptr i32 %offset_address to ptr
   %load = load i8, ptr %load_base, align 1
   store i8 %load, ptr %assignment_value, align 1
-  %assignment_value24 = load i8, ptr %assignment_value, align 1
-  store i8 %assignment_value24, ptr %byte, align 1
-  %byte25 = load i8, ptr %byte, align 1
-  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f756e64657273636f7265(i8 %byte25)
-  store i1 %call, ptr %underscore, align 1
+  %assignment_value25 = load i8, ptr %assignment_value, align 1
+  store i8 %assignment_value25, ptr %byte, align 1
   %byte26 = load i8, ptr %byte, align 1
-  %call27 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f64696769745f76616c7565(i8 %byte26)
-  store i8 %call27, ptr %digit, align 1
-  %byte28 = load i8, ptr %byte, align 1
-  %radix29 = load i8, ptr %radix5, align 1
-  %call30 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f64696769745f76616c6964(i8 %byte28, i8 %radix29)
-  store i1 %call30, ptr %digit_ok, align 1
-  %digit_ok31 = load i1, ptr %digit_ok, align 1
-  br i1 %digit_ok31, label %if.then32, label %if.else33
+  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f756e64657273636f7265(i8 %byte26)
+  store i1 %call, ptr %underscore, align 1
+  %byte27 = load i8, ptr %byte, align 1
+  %call28 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f64696769745f76616c7565(i8 %byte27)
+  store i8 %call28, ptr %digit, align 1
+  %digit29 = load i8, ptr %digit, align 1
+  %int_extend30 = zext i8 %digit29 to i128
+  store i128 %int_extend30, ptr %digit_wide, align 4
+  %digit_wide31 = load i128, ptr %digit_wide, align 4
+  %radix32 = load i128, ptr %radix5, align 4
+  %lt33 = icmp ult i128 %digit_wide31, %radix32
+  br i1 %lt33, label %if.then34, label %if.else35
 
 if.else:                                          ; preds = %if.then
   store i64 2, ptr %two, align 4
-  %lo87 = load i64, ptr %lo3, align 4
-  %length88 = load i64, ptr %length, align 4
-  %two89 = load i64, ptr %two, align 4
-  %div90 = udiv i64 %length88, %two89
-  %add91 = add i64 %lo87, %div90
-  store i64 %add91, ptr %mid, align 4
-  %data92 = load i32, ptr %data1, align 4
-  %start93 = load i64, ptr %start2, align 4
-  %lo94 = load i64, ptr %lo3, align 4
-  %mid95 = load i64, ptr %mid, align 4
-  %radix96 = load i8, ptr %radix5, align 1
-  %maximum97 = load i128, ptr %maximum6, align 4
-  %result98 = load i128, ptr %result7, align 4
-  %valid99 = load i1, ptr %valid8, align 1
-  %saw_digit100 = load i1, ptr %saw_digit9, align 1
-  %last_underscore101 = load i1, ptr %last_underscore10, align 1
-  %call102 = call { i128, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f696e7465676572(i32 %data92, i64 %start93, i64 %lo94, i64 %mid95, i8 %radix96, i128 %maximum97, i128 %result98, i1 %valid99, i1 %saw_digit100, i1 %last_underscore101)
-  %output = extractvalue { i128, i1, i1, i1 } %call102, 0
-  store i128 %output, ptr %assignment_value103, align 4
-  %assignment_value104 = load i128, ptr %assignment_value103, align 4
-  %output105 = extractvalue { i128, i1, i1, i1 } %call102, 1
-  store i1 %output105, ptr %assignment_value106, align 1
-  %assignment_value107 = load i1, ptr %assignment_value106, align 1
-  %output108 = extractvalue { i128, i1, i1, i1 } %call102, 2
-  store i1 %output108, ptr %assignment_value109, align 1
-  %assignment_value110 = load i1, ptr %assignment_value109, align 1
-  %output111 = extractvalue { i128, i1, i1, i1 } %call102, 3
+  %lo93 = load i64, ptr %lo3, align 4
+  %length94 = load i64, ptr %length, align 4
+  %two95 = load i64, ptr %two, align 4
+  %div = udiv i64 %length94, %two95
+  %add96 = add i64 %lo93, %div
+  store i64 %add96, ptr %mid, align 4
+  %data97 = load i32, ptr %data1, align 4
+  %start98 = load i64, ptr %start2, align 4
+  %lo99 = load i64, ptr %lo3, align 4
+  %mid100 = load i64, ptr %mid, align 4
+  %radix101 = load i128, ptr %radix5, align 4
+  %limit102 = load i128, ptr %limit6, align 4
+  %remainder103 = load i128, ptr %remainder7, align 4
+  %result104 = load i128, ptr %result8, align 4
+  %valid105 = load i1, ptr %valid9, align 1
+  %saw_digit106 = load i1, ptr %saw_digit10, align 1
+  %last_underscore107 = load i1, ptr %last_underscore11, align 1
+  %call108 = call { i128, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f696e7465676572(i32 %data97, i64 %start98, i64 %lo99, i64 %mid100, i128 %radix101, i128 %limit102, i128 %remainder103, i128 %result104, i1 %valid105, i1 %saw_digit106, i1 %last_underscore107)
+  %output = extractvalue { i128, i1, i1, i1 } %call108, 0
+  store i128 %output, ptr %assignment_value109, align 4
+  %assignment_value110 = load i128, ptr %assignment_value109, align 4
+  %output111 = extractvalue { i128, i1, i1, i1 } %call108, 1
   store i1 %output111, ptr %assignment_value112, align 1
   %assignment_value113 = load i1, ptr %assignment_value112, align 1
-  store i128 %assignment_value104, ptr %result7, align 4
-  store i1 %assignment_value107, ptr %valid8, align 1
-  store i1 %assignment_value110, ptr %saw_digit9, align 1
-  store i1 %assignment_value113, ptr %last_underscore10, align 1
-  %valid114 = load i1, ptr %valid8, align 1
-  br i1 %valid114, label %if.then115, label %if.merge116
+  %output114 = extractvalue { i128, i1, i1, i1 } %call108, 2
+  store i1 %output114, ptr %assignment_value115, align 1
+  %assignment_value116 = load i1, ptr %assignment_value115, align 1
+  %output117 = extractvalue { i128, i1, i1, i1 } %call108, 3
+  store i1 %output117, ptr %assignment_value118, align 1
+  %assignment_value119 = load i1, ptr %assignment_value118, align 1
+  store i128 %assignment_value110, ptr %result8, align 4
+  store i1 %assignment_value113, ptr %valid9, align 1
+  store i1 %assignment_value116, ptr %saw_digit10, align 1
+  store i1 %assignment_value119, ptr %last_underscore11, align 1
+  %valid120 = load i1, ptr %valid9, align 1
+  br i1 %valid120, label %if.then121, label %if.merge122
 
-if.merge19:                                       ; preds = %if.merge116, %if.merge34
+if.merge20:                                       ; preds = %if.merge122, %if.merge36
   br label %if.merge
 
-if.then32:                                        ; preds = %if.then18
-  %digit35 = load i8, ptr %digit, align 1
-  %int_extend36 = zext i8 %digit35 to i128
-  store i128 %int_extend36, ptr %digit_wide, align 4
-  %radix37 = load i8, ptr %radix5, align 1
-  %int_extend38 = zext i8 %radix37 to i128
-  store i128 %int_extend38, ptr %radix_wide, align 4
-  %maximum39 = load i128, ptr %maximum6, align 4
-  %digit_wide40 = load i128, ptr %digit_wide, align 4
-  %sub41 = sub i128 %maximum39, %digit_wide40
-  %radix_wide42 = load i128, ptr %radix_wide, align 4
-  %div = udiv i128 %sub41, %radix_wide42
-  store i128 %div, ptr %limit, align 4
-  %result43 = load i128, ptr %result7, align 4
-  %limit44 = load i128, ptr %limit, align 4
-  %gt = icmp ugt i128 %result43, %limit44
-  br i1 %gt, label %if.then45, label %if.else46
+if.then34:                                        ; preds = %if.then19
+  %result37 = load i128, ptr %result8, align 4
+  %limit38 = load i128, ptr %limit6, align 4
+  %gt = icmp ugt i128 %result37, %limit38
+  br i1 %gt, label %short_circuit.merge40, label %short_circuit.rhs39
 
-if.else33:                                        ; preds = %if.then18
-  %underscore59 = load i1, ptr %underscore, align 1
-  br i1 %underscore59, label %short_circuit.rhs60, label %short_circuit.merge61
+if.else35:                                        ; preds = %if.then19
+  %underscore65 = load i1, ptr %underscore, align 1
+  br i1 %underscore65, label %short_circuit.rhs66, label %short_circuit.merge67
 
-if.merge34:                                       ; preds = %if.merge82, %if.merge47
-  br label %if.merge19
+if.merge36:                                       ; preds = %if.merge88, %if.merge53
+  br label %if.merge20
 
-if.then45:                                        ; preds = %if.then32
-  store i1 false, ptr %assignment_value48, align 1
-  %assignment_value49 = load i1, ptr %assignment_value48, align 1
-  store i1 %assignment_value49, ptr %valid8, align 1
-  br label %if.merge47
+short_circuit.rhs39:                              ; preds = %if.then34
+  %result41 = load i128, ptr %result8, align 4
+  %limit42 = load i128, ptr %limit6, align 4
+  %eq43 = icmp eq i128 %result41, %limit42
+  br i1 %eq43, label %short_circuit.rhs44, label %short_circuit.merge45
 
-if.else46:                                        ; preds = %if.then32
-  %result50 = load i128, ptr %result7, align 4
-  %radix_wide51 = load i128, ptr %radix_wide, align 4
-  %mul = mul i128 %result50, %radix_wide51
-  %digit_wide52 = load i128, ptr %digit_wide, align 4
-  %add = add i128 %mul, %digit_wide52
-  store i128 %add, ptr %assignment_value53, align 4
-  %assignment_value54 = load i128, ptr %assignment_value53, align 4
-  store i128 %assignment_value54, ptr %result7, align 4
-  br label %if.merge47
+short_circuit.merge40:                            ; preds = %short_circuit.merge45, %if.then34
+  %short_circuit50 = phi i1 [ true, %if.then34 ], [ %short_circuit49, %short_circuit.merge45 ]
+  br i1 %short_circuit50, label %if.then51, label %if.else52
 
-if.merge47:                                       ; preds = %if.else46, %if.then45
-  store i1 false, ptr %assignment_value55, align 1
-  %assignment_value56 = load i1, ptr %assignment_value55, align 1
-  store i1 %assignment_value56, ptr %last_underscore10, align 1
-  store i1 true, ptr %assignment_value57, align 1
-  %assignment_value58 = load i1, ptr %assignment_value57, align 1
-  store i1 %assignment_value58, ptr %saw_digit9, align 1
-  br label %if.merge34
+short_circuit.rhs44:                              ; preds = %short_circuit.rhs39
+  %digit_wide46 = load i128, ptr %digit_wide, align 4
+  %remainder47 = load i128, ptr %remainder7, align 4
+  %gt48 = icmp ugt i128 %digit_wide46, %remainder47
+  br label %short_circuit.merge45
 
-short_circuit.rhs60:                              ; preds = %if.else33
-  %lo62 = load i64, ptr %lo3, align 4
-  %start63 = load i64, ptr %start2, align 4
-  %eq64 = icmp eq i64 %lo62, %start63
-  br label %short_circuit.merge61
+short_circuit.merge45:                            ; preds = %short_circuit.rhs44, %short_circuit.rhs39
+  %short_circuit49 = phi i1 [ false, %short_circuit.rhs39 ], [ %gt48, %short_circuit.rhs44 ]
+  br label %short_circuit.merge40
 
-short_circuit.merge61:                            ; preds = %short_circuit.rhs60, %if.else33
-  %short_circuit65 = phi i1 [ false, %if.else33 ], [ %eq64, %short_circuit.rhs60 ]
-  br i1 %short_circuit65, label %if.then66, label %if.merge67
+if.then51:                                        ; preds = %short_circuit.merge40
+  store i1 false, ptr %assignment_value54, align 1
+  %assignment_value55 = load i1, ptr %assignment_value54, align 1
+  store i1 %assignment_value55, ptr %valid9, align 1
+  br label %if.merge53
 
-if.then66:                                        ; preds = %short_circuit.merge61
-  store i1 false, ptr %assignment_value68, align 1
-  %assignment_value69 = load i1, ptr %assignment_value68, align 1
-  store i1 %assignment_value69, ptr %valid8, align 1
-  br label %if.merge67
+if.else52:                                        ; preds = %short_circuit.merge40
+  %result56 = load i128, ptr %result8, align 4
+  %radix57 = load i128, ptr %radix5, align 4
+  %mul = mul i128 %result56, %radix57
+  %digit_wide58 = load i128, ptr %digit_wide, align 4
+  %add = add i128 %mul, %digit_wide58
+  store i128 %add, ptr %assignment_value59, align 4
+  %assignment_value60 = load i128, ptr %assignment_value59, align 4
+  store i128 %assignment_value60, ptr %result8, align 4
+  br label %if.merge53
 
-if.merge67:                                       ; preds = %if.then66, %short_circuit.merge61
-  %underscore70 = load i1, ptr %underscore, align 1
-  br i1 %underscore70, label %short_circuit.rhs71, label %short_circuit.merge72
+if.merge53:                                       ; preds = %if.else52, %if.then51
+  store i1 false, ptr %assignment_value61, align 1
+  %assignment_value62 = load i1, ptr %assignment_value61, align 1
+  store i1 %assignment_value62, ptr %last_underscore11, align 1
+  store i1 true, ptr %assignment_value63, align 1
+  %assignment_value64 = load i1, ptr %assignment_value63, align 1
+  store i1 %assignment_value64, ptr %saw_digit10, align 1
+  br label %if.merge36
 
-short_circuit.rhs71:                              ; preds = %if.merge67
-  %last_underscore73 = load i1, ptr %last_underscore10, align 1
-  br label %short_circuit.merge72
+short_circuit.rhs66:                              ; preds = %if.else35
+  %lo68 = load i64, ptr %lo3, align 4
+  %start69 = load i64, ptr %start2, align 4
+  %eq70 = icmp eq i64 %lo68, %start69
+  br label %short_circuit.merge67
 
-short_circuit.merge72:                            ; preds = %short_circuit.rhs71, %if.merge67
-  %short_circuit74 = phi i1 [ false, %if.merge67 ], [ %last_underscore73, %short_circuit.rhs71 ]
-  br i1 %short_circuit74, label %if.then75, label %if.merge76
+short_circuit.merge67:                            ; preds = %short_circuit.rhs66, %if.else35
+  %short_circuit71 = phi i1 [ false, %if.else35 ], [ %eq70, %short_circuit.rhs66 ]
+  br i1 %short_circuit71, label %if.then72, label %if.merge73
 
-if.then75:                                        ; preds = %short_circuit.merge72
-  store i1 false, ptr %assignment_value77, align 1
-  %assignment_value78 = load i1, ptr %assignment_value77, align 1
-  store i1 %assignment_value78, ptr %valid8, align 1
-  br label %if.merge76
+if.then72:                                        ; preds = %short_circuit.merge67
+  store i1 false, ptr %assignment_value74, align 1
+  %assignment_value75 = load i1, ptr %assignment_value74, align 1
+  store i1 %assignment_value75, ptr %valid9, align 1
+  br label %if.merge73
 
-if.merge76:                                       ; preds = %if.then75, %short_circuit.merge72
-  %underscore79 = load i1, ptr %underscore, align 1
-  br i1 %underscore79, label %if.then80, label %if.else81
+if.merge73:                                       ; preds = %if.then72, %short_circuit.merge67
+  %underscore76 = load i1, ptr %underscore, align 1
+  br i1 %underscore76, label %short_circuit.rhs77, label %short_circuit.merge78
 
-if.then80:                                        ; preds = %if.merge76
-  store i1 true, ptr %assignment_value83, align 1
+short_circuit.rhs77:                              ; preds = %if.merge73
+  %last_underscore79 = load i1, ptr %last_underscore11, align 1
+  br label %short_circuit.merge78
+
+short_circuit.merge78:                            ; preds = %short_circuit.rhs77, %if.merge73
+  %short_circuit80 = phi i1 [ false, %if.merge73 ], [ %last_underscore79, %short_circuit.rhs77 ]
+  br i1 %short_circuit80, label %if.then81, label %if.merge82
+
+if.then81:                                        ; preds = %short_circuit.merge78
+  store i1 false, ptr %assignment_value83, align 1
   %assignment_value84 = load i1, ptr %assignment_value83, align 1
-  store i1 %assignment_value84, ptr %last_underscore10, align 1
+  store i1 %assignment_value84, ptr %valid9, align 1
   br label %if.merge82
 
-if.else81:                                        ; preds = %if.merge76
-  store i1 false, ptr %assignment_value85, align 1
-  %assignment_value86 = load i1, ptr %assignment_value85, align 1
-  store i1 %assignment_value86, ptr %valid8, align 1
-  br label %if.merge82
+if.merge82:                                       ; preds = %if.then81, %short_circuit.merge78
+  %underscore85 = load i1, ptr %underscore, align 1
+  br i1 %underscore85, label %if.then86, label %if.else87
 
-if.merge82:                                       ; preds = %if.else81, %if.then80
-  br label %if.merge34
+if.then86:                                        ; preds = %if.merge82
+  store i1 true, ptr %assignment_value89, align 1
+  %assignment_value90 = load i1, ptr %assignment_value89, align 1
+  store i1 %assignment_value90, ptr %last_underscore11, align 1
+  br label %if.merge88
 
-if.then115:                                       ; preds = %if.else
-  %data117 = load i32, ptr %data1, align 4
-  %start118 = load i64, ptr %start2, align 4
-  %mid119 = load i64, ptr %mid, align 4
-  %hi120 = load i64, ptr %hi4, align 4
-  %radix121 = load i8, ptr %radix5, align 1
-  %maximum122 = load i128, ptr %maximum6, align 4
-  %result123 = load i128, ptr %result7, align 4
-  %valid124 = load i1, ptr %valid8, align 1
-  %saw_digit125 = load i1, ptr %saw_digit9, align 1
-  %last_underscore126 = load i1, ptr %last_underscore10, align 1
-  %call127 = call { i128, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f696e7465676572(i32 %data117, i64 %start118, i64 %mid119, i64 %hi120, i8 %radix121, i128 %maximum122, i128 %result123, i1 %valid124, i1 %saw_digit125, i1 %last_underscore126)
-  %output128 = extractvalue { i128, i1, i1, i1 } %call127, 0
-  store i128 %output128, ptr %assignment_value129, align 4
-  %assignment_value130 = load i128, ptr %assignment_value129, align 4
-  %output131 = extractvalue { i128, i1, i1, i1 } %call127, 1
-  store i1 %output131, ptr %assignment_value132, align 1
-  %assignment_value133 = load i1, ptr %assignment_value132, align 1
-  %output134 = extractvalue { i128, i1, i1, i1 } %call127, 2
-  store i1 %output134, ptr %assignment_value135, align 1
-  %assignment_value136 = load i1, ptr %assignment_value135, align 1
-  %output137 = extractvalue { i128, i1, i1, i1 } %call127, 3
-  store i1 %output137, ptr %assignment_value138, align 1
-  %assignment_value139 = load i1, ptr %assignment_value138, align 1
-  store i128 %assignment_value130, ptr %result7, align 4
-  store i1 %assignment_value133, ptr %valid8, align 1
-  store i1 %assignment_value136, ptr %saw_digit9, align 1
-  store i1 %assignment_value139, ptr %last_underscore10, align 1
-  br label %if.merge116
+if.else87:                                        ; preds = %if.merge82
+  store i1 false, ptr %assignment_value91, align 1
+  %assignment_value92 = load i1, ptr %assignment_value91, align 1
+  store i1 %assignment_value92, ptr %valid9, align 1
+  br label %if.merge88
 
-if.merge116:                                      ; preds = %if.then115, %if.else
-  br label %if.merge19
+if.merge88:                                       ; preds = %if.else87, %if.then86
+  br label %if.merge36
+
+if.then121:                                       ; preds = %if.else
+  %data123 = load i32, ptr %data1, align 4
+  %start124 = load i64, ptr %start2, align 4
+  %mid125 = load i64, ptr %mid, align 4
+  %hi126 = load i64, ptr %hi4, align 4
+  %radix127 = load i128, ptr %radix5, align 4
+  %limit128 = load i128, ptr %limit6, align 4
+  %remainder129 = load i128, ptr %remainder7, align 4
+  %result130 = load i128, ptr %result8, align 4
+  %valid131 = load i1, ptr %valid9, align 1
+  %saw_digit132 = load i1, ptr %saw_digit10, align 1
+  %last_underscore133 = load i1, ptr %last_underscore11, align 1
+  %call134 = call { i128, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f696e7465676572(i32 %data123, i64 %start124, i64 %mid125, i64 %hi126, i128 %radix127, i128 %limit128, i128 %remainder129, i128 %result130, i1 %valid131, i1 %saw_digit132, i1 %last_underscore133)
+  %output135 = extractvalue { i128, i1, i1, i1 } %call134, 0
+  store i128 %output135, ptr %assignment_value136, align 4
+  %assignment_value137 = load i128, ptr %assignment_value136, align 4
+  %output138 = extractvalue { i128, i1, i1, i1 } %call134, 1
+  store i1 %output138, ptr %assignment_value139, align 1
+  %assignment_value140 = load i1, ptr %assignment_value139, align 1
+  %output141 = extractvalue { i128, i1, i1, i1 } %call134, 2
+  store i1 %output141, ptr %assignment_value142, align 1
+  %assignment_value143 = load i1, ptr %assignment_value142, align 1
+  %output144 = extractvalue { i128, i1, i1, i1 } %call134, 3
+  store i1 %output144, ptr %assignment_value145, align 1
+  %assignment_value146 = load i1, ptr %assignment_value145, align 1
+  store i128 %assignment_value137, ptr %result8, align 4
+  store i1 %assignment_value140, ptr %valid9, align 1
+  store i1 %assignment_value143, ptr %saw_digit10, align 1
+  store i1 %assignment_value146, ptr %last_underscore11, align 1
+  br label %if.merge122
+
+if.merge122:                                      ; preds = %if.then121, %if.else
+  br label %if.merge20
 }
 
-define { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f616363756d756c6174655f75313238(i32 %data, i64 %start, i64 %end, i8 %radix) {
+define { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f616363756d756c6174655f75313238(i32 %data, i64 %start, i64 %end, i8 %radix) {
 entry:
-  %assignment_value31 = alloca i1, align 1
-  %assignment_value26 = alloca i1, align 1
-  %assignment_value23 = alloca i1, align 1
-  %assignment_value20 = alloca i1, align 1
-  %assignment_value17 = alloca i1, align 1
+  %assignment_value38 = alloca i1, align 1
+  %assignment_value33 = alloca i1, align 1
+  %assignment_value30 = alloca i1, align 1
+  %assignment_value27 = alloca i1, align 1
+  %assignment_value24 = alloca i1, align 1
   %assignment_value = alloca i128, align 8
   %last_underscore = alloca i1, align 1
   %saw_digit = alloca i1, align 1
   %valid = alloca i1, align 1
   %result = alloca i128, align 8
+  %remainder = alloca i128, align 8
+  %limit = alloca i128, align 8
+  %radix_wide = alloca i128, align 8
   %maximum = alloca i128, align 8
   %data1 = alloca i32, align 4
   store i32 %data, ptr %data1, align 4
@@ -2780,77 +2751,94 @@ entry:
   %radix4 = alloca i8, align 1
   store i8 %radix, ptr %radix4, align 1
   store i128 -1, ptr %maximum, align 4
+  %radix5 = load i8, ptr %radix4, align 1
+  %int_extend = zext i8 %radix5 to i128
+  store i128 %int_extend, ptr %radix_wide, align 4
+  %maximum6 = load i128, ptr %maximum, align 4
+  %radix_wide7 = load i128, ptr %radix_wide, align 4
+  %div = udiv i128 %maximum6, %radix_wide7
+  store i128 %div, ptr %limit, align 4
+  %maximum8 = load i128, ptr %maximum, align 4
+  %limit9 = load i128, ptr %limit, align 4
+  %radix_wide10 = load i128, ptr %radix_wide, align 4
+  %mul = mul i128 %limit9, %radix_wide10
+  %sub = sub i128 %maximum8, %mul
+  store i128 %sub, ptr %remainder, align 4
   store i128 0, ptr %result, align 4
   store i1 true, ptr %valid, align 1
   store i1 false, ptr %saw_digit, align 1
   store i1 false, ptr %last_underscore, align 1
-  %data5 = load i32, ptr %data1, align 4
-  %start6 = load i64, ptr %start2, align 4
-  %start7 = load i64, ptr %start2, align 4
-  %end8 = load i64, ptr %end3, align 4
-  %radix9 = load i8, ptr %radix4, align 1
-  %maximum10 = load i128, ptr %maximum, align 4
-  %result11 = load i128, ptr %result, align 4
-  %valid12 = load i1, ptr %valid, align 1
-  %saw_digit13 = load i1, ptr %saw_digit, align 1
-  %last_underscore14 = load i1, ptr %last_underscore, align 1
-  %call = call { i128, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f696e7465676572(i32 %data5, i64 %start6, i64 %start7, i64 %end8, i8 %radix9, i128 %maximum10, i128 %result11, i1 %valid12, i1 %saw_digit13, i1 %last_underscore14)
+  %data11 = load i32, ptr %data1, align 4
+  %start12 = load i64, ptr %start2, align 4
+  %start13 = load i64, ptr %start2, align 4
+  %end14 = load i64, ptr %end3, align 4
+  %radix_wide15 = load i128, ptr %radix_wide, align 4
+  %limit16 = load i128, ptr %limit, align 4
+  %remainder17 = load i128, ptr %remainder, align 4
+  %result18 = load i128, ptr %result, align 4
+  %valid19 = load i1, ptr %valid, align 1
+  %saw_digit20 = load i1, ptr %saw_digit, align 1
+  %last_underscore21 = load i1, ptr %last_underscore, align 1
+  %call = call { i128, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f696e7465676572(i32 %data11, i64 %start12, i64 %start13, i64 %end14, i128 %radix_wide15, i128 %limit16, i128 %remainder17, i128 %result18, i1 %valid19, i1 %saw_digit20, i1 %last_underscore21)
   %output = extractvalue { i128, i1, i1, i1 } %call, 0
   store i128 %output, ptr %assignment_value, align 4
-  %assignment_value15 = load i128, ptr %assignment_value, align 4
-  %output16 = extractvalue { i128, i1, i1, i1 } %call, 1
-  store i1 %output16, ptr %assignment_value17, align 1
-  %assignment_value18 = load i1, ptr %assignment_value17, align 1
-  %output19 = extractvalue { i128, i1, i1, i1 } %call, 2
-  store i1 %output19, ptr %assignment_value20, align 1
-  %assignment_value21 = load i1, ptr %assignment_value20, align 1
-  %output22 = extractvalue { i128, i1, i1, i1 } %call, 3
-  store i1 %output22, ptr %assignment_value23, align 1
-  %assignment_value24 = load i1, ptr %assignment_value23, align 1
-  store i128 %assignment_value15, ptr %result, align 4
-  store i1 %assignment_value18, ptr %valid, align 1
-  store i1 %assignment_value21, ptr %saw_digit, align 1
-  store i1 %assignment_value24, ptr %last_underscore, align 1
-  %saw_digit25 = load i1, ptr %saw_digit, align 1
-  %not = xor i1 %saw_digit25, true
+  %assignment_value22 = load i128, ptr %assignment_value, align 4
+  %output23 = extractvalue { i128, i1, i1, i1 } %call, 1
+  store i1 %output23, ptr %assignment_value24, align 1
+  %assignment_value25 = load i1, ptr %assignment_value24, align 1
+  %output26 = extractvalue { i128, i1, i1, i1 } %call, 2
+  store i1 %output26, ptr %assignment_value27, align 1
+  %assignment_value28 = load i1, ptr %assignment_value27, align 1
+  %output29 = extractvalue { i128, i1, i1, i1 } %call, 3
+  store i1 %output29, ptr %assignment_value30, align 1
+  %assignment_value31 = load i1, ptr %assignment_value30, align 1
+  store i128 %assignment_value22, ptr %result, align 4
+  store i1 %assignment_value25, ptr %valid, align 1
+  store i1 %assignment_value28, ptr %saw_digit, align 1
+  store i1 %assignment_value31, ptr %last_underscore, align 1
+  %saw_digit32 = load i1, ptr %saw_digit, align 1
+  %not = xor i1 %saw_digit32, true
   br i1 %not, label %if.then, label %if.merge
 
 if.then:                                          ; preds = %entry
-  store i1 false, ptr %assignment_value26, align 1
-  %assignment_value27 = load i1, ptr %assignment_value26, align 1
-  store i1 %assignment_value27, ptr %valid, align 1
+  store i1 false, ptr %assignment_value33, align 1
+  %assignment_value34 = load i1, ptr %assignment_value33, align 1
+  store i1 %assignment_value34, ptr %valid, align 1
   br label %if.merge
 
 if.merge:                                         ; preds = %if.then, %entry
-  %last_underscore28 = load i1, ptr %last_underscore, align 1
-  br i1 %last_underscore28, label %if.then29, label %if.merge30
+  %last_underscore35 = load i1, ptr %last_underscore, align 1
+  br i1 %last_underscore35, label %if.then36, label %if.merge37
 
-if.then29:                                        ; preds = %if.merge
-  store i1 false, ptr %assignment_value31, align 1
-  %assignment_value32 = load i1, ptr %assignment_value31, align 1
-  store i1 %assignment_value32, ptr %valid, align 1
-  br label %if.merge30
+if.then36:                                        ; preds = %if.merge
+  store i1 false, ptr %assignment_value38, align 1
+  %assignment_value39 = load i1, ptr %assignment_value38, align 1
+  store i1 %assignment_value39, ptr %valid, align 1
+  br label %if.merge37
 
-if.merge30:                                       ; preds = %if.then29, %if.merge
-  %result33 = load i128, ptr %result, align 4
-  %valid34 = load i1, ptr %valid, align 1
-  %output35 = insertvalue { i128, i1 } zeroinitializer, i128 %result33, 0
-  %output36 = insertvalue { i128, i1 } %output35, i1 %valid34, 1
-  ret { i128, i1 } %output36
+if.merge37:                                       ; preds = %if.then36, %if.merge
+  %result40 = load i128, ptr %result, align 4
+  %valid41 = load i1, ptr %valid, align 1
+  %output42 = insertvalue { i128, i1 } zeroinitializer, i128 %result40, 0
+  %output43 = insertvalue { i128, i1 } %output42, i1 %valid41, 1
+  ret { i128, i1 } %output43
 }
 
-define { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f616363756d756c6174655f693132385f6e6567(i32 %data, i64 %start, i64 %end, i8 %radix) {
+define { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f616363756d756c6174655f693132385f6e6567(i32 %data, i64 %start, i64 %end, i8 %radix) {
 entry:
-  %assignment_value31 = alloca i1, align 1
-  %assignment_value26 = alloca i1, align 1
-  %assignment_value23 = alloca i1, align 1
-  %assignment_value20 = alloca i1, align 1
-  %assignment_value17 = alloca i1, align 1
+  %assignment_value38 = alloca i1, align 1
+  %assignment_value33 = alloca i1, align 1
+  %assignment_value30 = alloca i1, align 1
+  %assignment_value27 = alloca i1, align 1
+  %assignment_value24 = alloca i1, align 1
   %assignment_value = alloca i128, align 8
   %last_underscore = alloca i1, align 1
   %saw_digit = alloca i1, align 1
   %valid = alloca i1, align 1
   %result = alloca i128, align 8
+  %remainder = alloca i128, align 8
+  %limit = alloca i128, align 8
+  %radix_wide = alloca i128, align 8
   %maximum = alloca i128, align 8
   %data1 = alloca i32, align 4
   store i32 %data, ptr %data1, align 4
@@ -2861,66 +2849,80 @@ entry:
   %radix4 = alloca i8, align 1
   store i8 %radix, ptr %radix4, align 1
   store i128 -170141183460469231731687303715884105728, ptr %maximum, align 4
+  %radix5 = load i8, ptr %radix4, align 1
+  %int_extend = zext i8 %radix5 to i128
+  store i128 %int_extend, ptr %radix_wide, align 4
+  %maximum6 = load i128, ptr %maximum, align 4
+  %radix_wide7 = load i128, ptr %radix_wide, align 4
+  %div = udiv i128 %maximum6, %radix_wide7
+  store i128 %div, ptr %limit, align 4
+  %maximum8 = load i128, ptr %maximum, align 4
+  %limit9 = load i128, ptr %limit, align 4
+  %radix_wide10 = load i128, ptr %radix_wide, align 4
+  %mul = mul i128 %limit9, %radix_wide10
+  %sub = sub i128 %maximum8, %mul
+  store i128 %sub, ptr %remainder, align 4
   store i128 0, ptr %result, align 4
   store i1 true, ptr %valid, align 1
   store i1 false, ptr %saw_digit, align 1
   store i1 false, ptr %last_underscore, align 1
-  %data5 = load i32, ptr %data1, align 4
-  %start6 = load i64, ptr %start2, align 4
-  %start7 = load i64, ptr %start2, align 4
-  %end8 = load i64, ptr %end3, align 4
-  %radix9 = load i8, ptr %radix4, align 1
-  %maximum10 = load i128, ptr %maximum, align 4
-  %result11 = load i128, ptr %result, align 4
-  %valid12 = load i1, ptr %valid, align 1
-  %saw_digit13 = load i1, ptr %saw_digit, align 1
-  %last_underscore14 = load i1, ptr %last_underscore, align 1
-  %call = call { i128, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f696e7465676572(i32 %data5, i64 %start6, i64 %start7, i64 %end8, i8 %radix9, i128 %maximum10, i128 %result11, i1 %valid12, i1 %saw_digit13, i1 %last_underscore14)
+  %data11 = load i32, ptr %data1, align 4
+  %start12 = load i64, ptr %start2, align 4
+  %start13 = load i64, ptr %start2, align 4
+  %end14 = load i64, ptr %end3, align 4
+  %radix_wide15 = load i128, ptr %radix_wide, align 4
+  %limit16 = load i128, ptr %limit, align 4
+  %remainder17 = load i128, ptr %remainder, align 4
+  %result18 = load i128, ptr %result, align 4
+  %valid19 = load i1, ptr %valid, align 1
+  %saw_digit20 = load i1, ptr %saw_digit, align 1
+  %last_underscore21 = load i1, ptr %last_underscore, align 1
+  %call = call { i128, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f696e7465676572(i32 %data11, i64 %start12, i64 %start13, i64 %end14, i128 %radix_wide15, i128 %limit16, i128 %remainder17, i128 %result18, i1 %valid19, i1 %saw_digit20, i1 %last_underscore21)
   %output = extractvalue { i128, i1, i1, i1 } %call, 0
   store i128 %output, ptr %assignment_value, align 4
-  %assignment_value15 = load i128, ptr %assignment_value, align 4
-  %output16 = extractvalue { i128, i1, i1, i1 } %call, 1
-  store i1 %output16, ptr %assignment_value17, align 1
-  %assignment_value18 = load i1, ptr %assignment_value17, align 1
-  %output19 = extractvalue { i128, i1, i1, i1 } %call, 2
-  store i1 %output19, ptr %assignment_value20, align 1
-  %assignment_value21 = load i1, ptr %assignment_value20, align 1
-  %output22 = extractvalue { i128, i1, i1, i1 } %call, 3
-  store i1 %output22, ptr %assignment_value23, align 1
-  %assignment_value24 = load i1, ptr %assignment_value23, align 1
-  store i128 %assignment_value15, ptr %result, align 4
-  store i1 %assignment_value18, ptr %valid, align 1
-  store i1 %assignment_value21, ptr %saw_digit, align 1
-  store i1 %assignment_value24, ptr %last_underscore, align 1
-  %saw_digit25 = load i1, ptr %saw_digit, align 1
-  %not = xor i1 %saw_digit25, true
+  %assignment_value22 = load i128, ptr %assignment_value, align 4
+  %output23 = extractvalue { i128, i1, i1, i1 } %call, 1
+  store i1 %output23, ptr %assignment_value24, align 1
+  %assignment_value25 = load i1, ptr %assignment_value24, align 1
+  %output26 = extractvalue { i128, i1, i1, i1 } %call, 2
+  store i1 %output26, ptr %assignment_value27, align 1
+  %assignment_value28 = load i1, ptr %assignment_value27, align 1
+  %output29 = extractvalue { i128, i1, i1, i1 } %call, 3
+  store i1 %output29, ptr %assignment_value30, align 1
+  %assignment_value31 = load i1, ptr %assignment_value30, align 1
+  store i128 %assignment_value22, ptr %result, align 4
+  store i1 %assignment_value25, ptr %valid, align 1
+  store i1 %assignment_value28, ptr %saw_digit, align 1
+  store i1 %assignment_value31, ptr %last_underscore, align 1
+  %saw_digit32 = load i1, ptr %saw_digit, align 1
+  %not = xor i1 %saw_digit32, true
   br i1 %not, label %if.then, label %if.merge
 
 if.then:                                          ; preds = %entry
-  store i1 false, ptr %assignment_value26, align 1
-  %assignment_value27 = load i1, ptr %assignment_value26, align 1
-  store i1 %assignment_value27, ptr %valid, align 1
+  store i1 false, ptr %assignment_value33, align 1
+  %assignment_value34 = load i1, ptr %assignment_value33, align 1
+  store i1 %assignment_value34, ptr %valid, align 1
   br label %if.merge
 
 if.merge:                                         ; preds = %if.then, %entry
-  %last_underscore28 = load i1, ptr %last_underscore, align 1
-  br i1 %last_underscore28, label %if.then29, label %if.merge30
+  %last_underscore35 = load i1, ptr %last_underscore, align 1
+  br i1 %last_underscore35, label %if.then36, label %if.merge37
 
-if.then29:                                        ; preds = %if.merge
-  store i1 false, ptr %assignment_value31, align 1
-  %assignment_value32 = load i1, ptr %assignment_value31, align 1
-  store i1 %assignment_value32, ptr %valid, align 1
-  br label %if.merge30
+if.then36:                                        ; preds = %if.merge
+  store i1 false, ptr %assignment_value38, align 1
+  %assignment_value39 = load i1, ptr %assignment_value38, align 1
+  store i1 %assignment_value39, ptr %valid, align 1
+  br label %if.merge37
 
-if.merge30:                                       ; preds = %if.then29, %if.merge
-  %result33 = load i128, ptr %result, align 4
-  %valid34 = load i1, ptr %valid, align 1
-  %output35 = insertvalue { i128, i1 } zeroinitializer, i128 %result33, 0
-  %output36 = insertvalue { i128, i1 } %output35, i1 %valid34, 1
-  ret { i128, i1 } %output36
+if.merge37:                                       ; preds = %if.then36, %if.merge
+  %result40 = load i128, ptr %result, align 4
+  %valid41 = load i1, ptr %valid, align 1
+  %output42 = insertvalue { i128, i1 } zeroinitializer, i128 %result40, 0
+  %output43 = insertvalue { i128, i1 } %output42, i1 %valid41, 1
+  ret { i128, i1 } %output43
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f7538(i128 %value) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f7538(i128 %value) {
 entry:
   %limit = alloca i128, align 8
   %bound = alloca i8, align 1
@@ -2936,7 +2938,7 @@ entry:
   ret i1 %le
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f753136(i128 %value) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f753136(i128 %value) {
 entry:
   %limit = alloca i128, align 8
   %bound = alloca i16, align 2
@@ -2952,7 +2954,7 @@ entry:
   ret i1 %le
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f753332(i128 %value) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f753332(i128 %value) {
 entry:
   %limit = alloca i128, align 8
   %bound = alloca i32, align 4
@@ -2968,7 +2970,7 @@ entry:
   ret i1 %le
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f753634(i128 %value) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f753634(i128 %value) {
 entry:
   %limit = alloca i128, align 8
   %bound = alloca i64, align 8
@@ -2984,7 +2986,7 @@ entry:
   ret i1 %le
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f75313238(i128 %value) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f75313238(i128 %value) {
 entry:
   %zero = alloca i128, align 8
   %value1 = alloca i128, align 8
@@ -2996,7 +2998,7 @@ entry:
   ret i1 %ge
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f6938(i128 %magnitude, i1 %negative) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f6938(i128 %magnitude, i1 %negative) {
 entry:
   %assignment_value19 = alloca i1, align 1
   %assignment_value = alloca i1, align 1
@@ -3063,7 +3065,7 @@ if.merge18:                                       ; preds = %if.then17, %short_c
   ret i1 %fits21
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f693136(i128 %magnitude, i1 %negative) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f693136(i128 %magnitude, i1 %negative) {
 entry:
   %assignment_value19 = alloca i1, align 1
   %assignment_value = alloca i1, align 1
@@ -3130,7 +3132,7 @@ if.merge18:                                       ; preds = %if.then17, %short_c
   ret i1 %fits21
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f693332(i128 %magnitude, i1 %negative) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f693332(i128 %magnitude, i1 %negative) {
 entry:
   %assignment_value19 = alloca i1, align 1
   %assignment_value = alloca i1, align 1
@@ -3197,7 +3199,7 @@ if.merge18:                                       ; preds = %if.then17, %short_c
   ret i1 %fits21
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f693634(i128 %magnitude, i1 %negative) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f693634(i128 %magnitude, i1 %negative) {
 entry:
   %assignment_value19 = alloca i1, align 1
   %assignment_value = alloca i1, align 1
@@ -3264,7 +3266,7 @@ if.merge18:                                       ; preds = %if.then17, %short_c
   ret i1 %fits21
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f69313238(i128 %magnitude, i1 %negative) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f69313238(i128 %magnitude, i1 %negative) {
 entry:
   %assignment_value16 = alloca i1, align 1
   %assignment_value = alloca i1, align 1
@@ -3323,7 +3325,7 @@ if.merge15:                                       ; preds = %if.then14, %short_c
   ret i1 %fits18
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f7538(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f7538(ptr %text) {
 entry:
   %assignment_value65 = alloca i32, align 4
   %assignment_value63 = alloca i8, align 1
@@ -3349,7 +3351,7 @@ entry:
   %two = alloca i64, align 8
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %zero, align 4
@@ -3433,7 +3435,7 @@ if.then17:                                        ; preds = %if.else
   store i8 %assignment_value32, ptr %second, align 1
   %first33 = load i8, ptr %first, align 1
   %second34 = load i8, ptr %second, align 1
-  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616469785f66726f6d5f707265666978(i8 %first33, i8 %second34)
+  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616469785f66726f6d5f707265666978(i8 %first33, i8 %second34)
   store i8 %call, ptr %detected, align 1
   %detected35 = load i8, ptr %detected, align 1
   store i8 %detected35, ptr %assignment_value36, align 1
@@ -3450,13 +3452,13 @@ if.merge18:                                       ; preds = %if.merge40, %if.els
   %length47 = getelementptr inbounds i8, ptr %text1, i8 8
   %place48 = load i64, ptr %length47, align 4
   %radix49 = load i8, ptr %radix, align 1
-  %call50 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f616363756d756c6174655f75313238(i32 %place45, i64 %start46, i64 %place48, i8 %radix49)
+  %call50 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f616363756d756c6174655f75313238(i32 %place45, i64 %start46, i64 %place48, i8 %radix49)
   %output = extractvalue { i128, i1 } %call50, 0
   store i128 %output, ptr %magnitude, align 4
   %output51 = extractvalue { i128, i1 } %call50, 1
   store i1 %output51, ptr %valid, align 1
   %magnitude52 = load i128, ptr %magnitude, align 4
-  %call53 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f7538(i128 %magnitude52)
+  %call53 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f7538(i128 %magnitude52)
   store i1 %call53, ptr %fits, align 1
   %valid54 = load i1, ptr %valid, align 1
   br i1 %valid54, label %short_circuit.rhs55, label %short_circuit.merge56
@@ -3518,7 +3520,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f753136(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753136(ptr %text) {
 entry:
   %assignment_value65 = alloca i32, align 4
   %assignment_value63 = alloca i16, align 2
@@ -3544,7 +3546,7 @@ entry:
   %two = alloca i64, align 8
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %zero, align 4
@@ -3628,7 +3630,7 @@ if.then17:                                        ; preds = %if.else
   store i8 %assignment_value32, ptr %second, align 1
   %first33 = load i8, ptr %first, align 1
   %second34 = load i8, ptr %second, align 1
-  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616469785f66726f6d5f707265666978(i8 %first33, i8 %second34)
+  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616469785f66726f6d5f707265666978(i8 %first33, i8 %second34)
   store i8 %call, ptr %detected, align 1
   %detected35 = load i8, ptr %detected, align 1
   store i8 %detected35, ptr %assignment_value36, align 1
@@ -3645,13 +3647,13 @@ if.merge18:                                       ; preds = %if.merge40, %if.els
   %length47 = getelementptr inbounds i8, ptr %text1, i8 8
   %place48 = load i64, ptr %length47, align 4
   %radix49 = load i8, ptr %radix, align 1
-  %call50 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f616363756d756c6174655f75313238(i32 %place45, i64 %start46, i64 %place48, i8 %radix49)
+  %call50 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f616363756d756c6174655f75313238(i32 %place45, i64 %start46, i64 %place48, i8 %radix49)
   %output = extractvalue { i128, i1 } %call50, 0
   store i128 %output, ptr %magnitude, align 4
   %output51 = extractvalue { i128, i1 } %call50, 1
   store i1 %output51, ptr %valid, align 1
   %magnitude52 = load i128, ptr %magnitude, align 4
-  %call53 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f753136(i128 %magnitude52)
+  %call53 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f753136(i128 %magnitude52)
   store i1 %call53, ptr %fits, align 1
   %valid54 = load i1, ptr %valid, align 1
   br i1 %valid54, label %short_circuit.rhs55, label %short_circuit.merge56
@@ -3713,7 +3715,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f753332(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753332(ptr %text) {
 entry:
   %assignment_value65 = alloca i32, align 4
   %assignment_value63 = alloca i32, align 4
@@ -3739,7 +3741,7 @@ entry:
   %two = alloca i64, align 8
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %zero, align 4
@@ -3823,7 +3825,7 @@ if.then17:                                        ; preds = %if.else
   store i8 %assignment_value32, ptr %second, align 1
   %first33 = load i8, ptr %first, align 1
   %second34 = load i8, ptr %second, align 1
-  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616469785f66726f6d5f707265666978(i8 %first33, i8 %second34)
+  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616469785f66726f6d5f707265666978(i8 %first33, i8 %second34)
   store i8 %call, ptr %detected, align 1
   %detected35 = load i8, ptr %detected, align 1
   store i8 %detected35, ptr %assignment_value36, align 1
@@ -3840,13 +3842,13 @@ if.merge18:                                       ; preds = %if.merge40, %if.els
   %length47 = getelementptr inbounds i8, ptr %text1, i8 8
   %place48 = load i64, ptr %length47, align 4
   %radix49 = load i8, ptr %radix, align 1
-  %call50 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f616363756d756c6174655f75313238(i32 %place45, i64 %start46, i64 %place48, i8 %radix49)
+  %call50 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f616363756d756c6174655f75313238(i32 %place45, i64 %start46, i64 %place48, i8 %radix49)
   %output = extractvalue { i128, i1 } %call50, 0
   store i128 %output, ptr %magnitude, align 4
   %output51 = extractvalue { i128, i1 } %call50, 1
   store i1 %output51, ptr %valid, align 1
   %magnitude52 = load i128, ptr %magnitude, align 4
-  %call53 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f753332(i128 %magnitude52)
+  %call53 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f753332(i128 %magnitude52)
   store i1 %call53, ptr %fits, align 1
   %valid54 = load i1, ptr %valid, align 1
   br i1 %valid54, label %short_circuit.rhs55, label %short_circuit.merge56
@@ -3908,7 +3910,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f753634(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753634(ptr %text) {
 entry:
   %assignment_value66 = alloca i32, align 4
   %assignment_value64 = alloca i64, align 8
@@ -3934,7 +3936,7 @@ entry:
   %two = alloca i64, align 8
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %zero, align 4
@@ -4019,7 +4021,7 @@ if.then18:                                        ; preds = %if.else
   store i8 %assignment_value33, ptr %second, align 1
   %first34 = load i8, ptr %first, align 1
   %second35 = load i8, ptr %second, align 1
-  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616469785f66726f6d5f707265666978(i8 %first34, i8 %second35)
+  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616469785f66726f6d5f707265666978(i8 %first34, i8 %second35)
   store i8 %call, ptr %detected, align 1
   %detected36 = load i8, ptr %detected, align 1
   store i8 %detected36, ptr %assignment_value37, align 1
@@ -4036,13 +4038,13 @@ if.merge19:                                       ; preds = %if.merge41, %if.els
   %length48 = getelementptr inbounds i8, ptr %text1, i8 8
   %place49 = load i64, ptr %length48, align 4
   %radix50 = load i8, ptr %radix, align 1
-  %call51 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f616363756d756c6174655f75313238(i32 %place46, i64 %start47, i64 %place49, i8 %radix50)
+  %call51 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f616363756d756c6174655f75313238(i32 %place46, i64 %start47, i64 %place49, i8 %radix50)
   %output = extractvalue { i128, i1 } %call51, 0
   store i128 %output, ptr %magnitude, align 4
   %output52 = extractvalue { i128, i1 } %call51, 1
   store i1 %output52, ptr %valid, align 1
   %magnitude53 = load i128, ptr %magnitude, align 4
-  %call54 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f753634(i128 %magnitude53)
+  %call54 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f753634(i128 %magnitude53)
   store i1 %call54, ptr %fits, align 1
   %valid55 = load i1, ptr %valid, align 1
   br i1 %valid55, label %short_circuit.rhs56, label %short_circuit.merge57
@@ -4104,7 +4106,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f75313238(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f75313238(ptr %text) {
 entry:
   %assignment_value64 = alloca i32, align 4
   %assignment_value62 = alloca i128, align 8
@@ -4130,7 +4132,7 @@ entry:
   %two = alloca i64, align 8
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %zero, align 4
@@ -4214,7 +4216,7 @@ if.then17:                                        ; preds = %if.else
   store i8 %assignment_value32, ptr %second, align 1
   %first33 = load i8, ptr %first, align 1
   %second34 = load i8, ptr %second, align 1
-  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616469785f66726f6d5f707265666978(i8 %first33, i8 %second34)
+  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616469785f66726f6d5f707265666978(i8 %first33, i8 %second34)
   store i8 %call, ptr %detected, align 1
   %detected35 = load i8, ptr %detected, align 1
   store i8 %detected35, ptr %assignment_value36, align 1
@@ -4231,13 +4233,13 @@ if.merge18:                                       ; preds = %if.merge40, %if.els
   %length47 = getelementptr inbounds i8, ptr %text1, i8 8
   %place48 = load i64, ptr %length47, align 4
   %radix49 = load i8, ptr %radix, align 1
-  %call50 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f616363756d756c6174655f75313238(i32 %place45, i64 %start46, i64 %place48, i8 %radix49)
+  %call50 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f616363756d756c6174655f75313238(i32 %place45, i64 %start46, i64 %place48, i8 %radix49)
   %output = extractvalue { i128, i1 } %call50, 0
   store i128 %output, ptr %magnitude, align 4
   %output51 = extractvalue { i128, i1 } %call50, 1
   store i1 %output51, ptr %valid, align 1
   %magnitude52 = load i128, ptr %magnitude, align 4
-  %call53 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f75313238(i128 %magnitude52)
+  %call53 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f75313238(i128 %magnitude52)
   store i1 %call53, ptr %fits, align 1
   %valid54 = load i1, ptr %valid, align 1
   br i1 %valid54, label %short_circuit.rhs55, label %short_circuit.merge56
@@ -4298,7 +4300,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f6938(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f6938(ptr %text) {
 entry:
   %assignment_value108 = alloca i32, align 4
   %assignment_value106 = alloca i8, align 1
@@ -4336,7 +4338,7 @@ entry:
   %two = alloca i64, align 8
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %zero, align 4
@@ -4393,7 +4395,7 @@ if.else:                                          ; preds = %short_circuit.merge
   %assignment_value15 = load i8, ptr %assignment_value14, align 1
   store i8 %assignment_value15, ptr %first, align 1
   %first16 = load i8, ptr %first, align 1
-  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f7369676e(i8 %first16)
+  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f7369676e(i8 %first16)
   br i1 %call, label %if.then17, label %if.merge18
 
 if.merge:                                         ; preds = %if.merge92, %if.then
@@ -4465,7 +4467,7 @@ if.then29:                                        ; preds = %if.merge18
   store i8 %assignment_value60, ptr %prefix_second, align 1
   %prefix_first61 = load i8, ptr %prefix_first, align 1
   %prefix_second62 = load i8, ptr %prefix_second, align 1
-  %call63 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616469785f66726f6d5f707265666978(i8 %prefix_first61, i8 %prefix_second62)
+  %call63 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616469785f66726f6d5f707265666978(i8 %prefix_first61, i8 %prefix_second62)
   store i8 %call63, ptr %detected, align 1
   %detected64 = load i8, ptr %detected, align 1
   store i8 %detected64, ptr %assignment_value65, align 1
@@ -4482,14 +4484,14 @@ if.merge30:                                       ; preds = %if.merge69, %if.mer
   %length78 = getelementptr inbounds i8, ptr %text1, i8 8
   %place79 = load i64, ptr %length78, align 4
   %radix80 = load i8, ptr %radix, align 1
-  %call81 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f616363756d756c6174655f693132385f6e6567(i32 %place76, i64 %start77, i64 %place79, i8 %radix80)
+  %call81 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f616363756d756c6174655f693132385f6e6567(i32 %place76, i64 %start77, i64 %place79, i8 %radix80)
   %output = extractvalue { i128, i1 } %call81, 0
   store i128 %output, ptr %magnitude, align 4
   %output82 = extractvalue { i128, i1 } %call81, 1
   store i1 %output82, ptr %valid, align 1
   %magnitude83 = load i128, ptr %magnitude, align 4
   %negative84 = load i1, ptr %negative, align 1
-  %call85 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f6938(i128 %magnitude83, i1 %negative84)
+  %call85 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f6938(i128 %magnitude83, i1 %negative84)
   store i1 %call85, ptr %fits, align 1
   %valid86 = load i1, ptr %valid, align 1
   br i1 %valid86, label %short_circuit.rhs87, label %short_circuit.merge88
@@ -4572,7 +4574,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f693136(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693136(ptr %text) {
 entry:
   %assignment_value108 = alloca i32, align 4
   %assignment_value106 = alloca i16, align 2
@@ -4610,7 +4612,7 @@ entry:
   %two = alloca i64, align 8
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %zero, align 4
@@ -4667,7 +4669,7 @@ if.else:                                          ; preds = %short_circuit.merge
   %assignment_value15 = load i8, ptr %assignment_value14, align 1
   store i8 %assignment_value15, ptr %first, align 1
   %first16 = load i8, ptr %first, align 1
-  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f7369676e(i8 %first16)
+  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f7369676e(i8 %first16)
   br i1 %call, label %if.then17, label %if.merge18
 
 if.merge:                                         ; preds = %if.merge92, %if.then
@@ -4739,7 +4741,7 @@ if.then29:                                        ; preds = %if.merge18
   store i8 %assignment_value60, ptr %prefix_second, align 1
   %prefix_first61 = load i8, ptr %prefix_first, align 1
   %prefix_second62 = load i8, ptr %prefix_second, align 1
-  %call63 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616469785f66726f6d5f707265666978(i8 %prefix_first61, i8 %prefix_second62)
+  %call63 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616469785f66726f6d5f707265666978(i8 %prefix_first61, i8 %prefix_second62)
   store i8 %call63, ptr %detected, align 1
   %detected64 = load i8, ptr %detected, align 1
   store i8 %detected64, ptr %assignment_value65, align 1
@@ -4756,14 +4758,14 @@ if.merge30:                                       ; preds = %if.merge69, %if.mer
   %length78 = getelementptr inbounds i8, ptr %text1, i8 8
   %place79 = load i64, ptr %length78, align 4
   %radix80 = load i8, ptr %radix, align 1
-  %call81 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f616363756d756c6174655f693132385f6e6567(i32 %place76, i64 %start77, i64 %place79, i8 %radix80)
+  %call81 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f616363756d756c6174655f693132385f6e6567(i32 %place76, i64 %start77, i64 %place79, i8 %radix80)
   %output = extractvalue { i128, i1 } %call81, 0
   store i128 %output, ptr %magnitude, align 4
   %output82 = extractvalue { i128, i1 } %call81, 1
   store i1 %output82, ptr %valid, align 1
   %magnitude83 = load i128, ptr %magnitude, align 4
   %negative84 = load i1, ptr %negative, align 1
-  %call85 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f693136(i128 %magnitude83, i1 %negative84)
+  %call85 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f693136(i128 %magnitude83, i1 %negative84)
   store i1 %call85, ptr %fits, align 1
   %valid86 = load i1, ptr %valid, align 1
   br i1 %valid86, label %short_circuit.rhs87, label %short_circuit.merge88
@@ -4846,7 +4848,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f693332(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693332(ptr %text) {
 entry:
   %assignment_value108 = alloca i32, align 4
   %assignment_value106 = alloca i32, align 4
@@ -4884,7 +4886,7 @@ entry:
   %two = alloca i64, align 8
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %zero, align 4
@@ -4941,7 +4943,7 @@ if.else:                                          ; preds = %short_circuit.merge
   %assignment_value15 = load i8, ptr %assignment_value14, align 1
   store i8 %assignment_value15, ptr %first, align 1
   %first16 = load i8, ptr %first, align 1
-  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f7369676e(i8 %first16)
+  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f7369676e(i8 %first16)
   br i1 %call, label %if.then17, label %if.merge18
 
 if.merge:                                         ; preds = %if.merge92, %if.then
@@ -5013,7 +5015,7 @@ if.then29:                                        ; preds = %if.merge18
   store i8 %assignment_value60, ptr %prefix_second, align 1
   %prefix_first61 = load i8, ptr %prefix_first, align 1
   %prefix_second62 = load i8, ptr %prefix_second, align 1
-  %call63 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616469785f66726f6d5f707265666978(i8 %prefix_first61, i8 %prefix_second62)
+  %call63 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616469785f66726f6d5f707265666978(i8 %prefix_first61, i8 %prefix_second62)
   store i8 %call63, ptr %detected, align 1
   %detected64 = load i8, ptr %detected, align 1
   store i8 %detected64, ptr %assignment_value65, align 1
@@ -5030,14 +5032,14 @@ if.merge30:                                       ; preds = %if.merge69, %if.mer
   %length78 = getelementptr inbounds i8, ptr %text1, i8 8
   %place79 = load i64, ptr %length78, align 4
   %radix80 = load i8, ptr %radix, align 1
-  %call81 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f616363756d756c6174655f693132385f6e6567(i32 %place76, i64 %start77, i64 %place79, i8 %radix80)
+  %call81 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f616363756d756c6174655f693132385f6e6567(i32 %place76, i64 %start77, i64 %place79, i8 %radix80)
   %output = extractvalue { i128, i1 } %call81, 0
   store i128 %output, ptr %magnitude, align 4
   %output82 = extractvalue { i128, i1 } %call81, 1
   store i1 %output82, ptr %valid, align 1
   %magnitude83 = load i128, ptr %magnitude, align 4
   %negative84 = load i1, ptr %negative, align 1
-  %call85 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f693332(i128 %magnitude83, i1 %negative84)
+  %call85 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f693332(i128 %magnitude83, i1 %negative84)
   store i1 %call85, ptr %fits, align 1
   %valid86 = load i1, ptr %valid, align 1
   br i1 %valid86, label %short_circuit.rhs87, label %short_circuit.merge88
@@ -5120,7 +5122,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f693634(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693634(ptr %text) {
 entry:
   %assignment_value108 = alloca i32, align 4
   %assignment_value106 = alloca i64, align 8
@@ -5158,7 +5160,7 @@ entry:
   %two = alloca i64, align 8
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %zero, align 4
@@ -5215,7 +5217,7 @@ if.else:                                          ; preds = %short_circuit.merge
   %assignment_value15 = load i8, ptr %assignment_value14, align 1
   store i8 %assignment_value15, ptr %first, align 1
   %first16 = load i8, ptr %first, align 1
-  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f7369676e(i8 %first16)
+  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f7369676e(i8 %first16)
   br i1 %call, label %if.then17, label %if.merge18
 
 if.merge:                                         ; preds = %if.merge92, %if.then
@@ -5287,7 +5289,7 @@ if.then29:                                        ; preds = %if.merge18
   store i8 %assignment_value60, ptr %prefix_second, align 1
   %prefix_first61 = load i8, ptr %prefix_first, align 1
   %prefix_second62 = load i8, ptr %prefix_second, align 1
-  %call63 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616469785f66726f6d5f707265666978(i8 %prefix_first61, i8 %prefix_second62)
+  %call63 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616469785f66726f6d5f707265666978(i8 %prefix_first61, i8 %prefix_second62)
   store i8 %call63, ptr %detected, align 1
   %detected64 = load i8, ptr %detected, align 1
   store i8 %detected64, ptr %assignment_value65, align 1
@@ -5304,14 +5306,14 @@ if.merge30:                                       ; preds = %if.merge69, %if.mer
   %length78 = getelementptr inbounds i8, ptr %text1, i8 8
   %place79 = load i64, ptr %length78, align 4
   %radix80 = load i8, ptr %radix, align 1
-  %call81 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f616363756d756c6174655f693132385f6e6567(i32 %place76, i64 %start77, i64 %place79, i8 %radix80)
+  %call81 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f616363756d756c6174655f693132385f6e6567(i32 %place76, i64 %start77, i64 %place79, i8 %radix80)
   %output = extractvalue { i128, i1 } %call81, 0
   store i128 %output, ptr %magnitude, align 4
   %output82 = extractvalue { i128, i1 } %call81, 1
   store i1 %output82, ptr %valid, align 1
   %magnitude83 = load i128, ptr %magnitude, align 4
   %negative84 = load i1, ptr %negative, align 1
-  %call85 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f693634(i128 %magnitude83, i1 %negative84)
+  %call85 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f693634(i128 %magnitude83, i1 %negative84)
   store i1 %call85, ptr %fits, align 1
   %valid86 = load i1, ptr %valid, align 1
   br i1 %valid86, label %short_circuit.rhs87, label %short_circuit.merge88
@@ -5394,7 +5396,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69313238(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69313238(ptr %text) {
 entry:
   %assignment_value123 = alloca i32, align 4
   %assignment_value121 = alloca i128, align 8
@@ -5439,7 +5441,7 @@ entry:
   %two = alloca i64, align 8
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %zero, align 4
@@ -5498,7 +5500,7 @@ if.else:                                          ; preds = %short_circuit.merge
   %assignment_value15 = load i8, ptr %assignment_value14, align 1
   store i8 %assignment_value15, ptr %first, align 1
   %first16 = load i8, ptr %first, align 1
-  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f7369676e(i8 %first16)
+  %call = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f7369676e(i8 %first16)
   br i1 %call, label %if.then17, label %if.merge18
 
 if.merge:                                         ; preds = %if.merge92, %if.then
@@ -5570,7 +5572,7 @@ if.then29:                                        ; preds = %if.merge18
   store i8 %assignment_value60, ptr %prefix_second, align 1
   %prefix_first61 = load i8, ptr %prefix_first, align 1
   %prefix_second62 = load i8, ptr %prefix_second, align 1
-  %call63 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616469785f66726f6d5f707265666978(i8 %prefix_first61, i8 %prefix_second62)
+  %call63 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616469785f66726f6d5f707265666978(i8 %prefix_first61, i8 %prefix_second62)
   store i8 %call63, ptr %detected, align 1
   %detected64 = load i8, ptr %detected, align 1
   store i8 %detected64, ptr %assignment_value65, align 1
@@ -5587,14 +5589,14 @@ if.merge30:                                       ; preds = %if.merge69, %if.mer
   %length78 = getelementptr inbounds i8, ptr %text1, i8 8
   %place79 = load i64, ptr %length78, align 4
   %radix80 = load i8, ptr %radix, align 1
-  %call81 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f616363756d756c6174655f693132385f6e6567(i32 %place76, i64 %start77, i64 %place79, i8 %radix80)
+  %call81 = call { i128, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f616363756d756c6174655f693132385f6e6567(i32 %place76, i64 %start77, i64 %place79, i8 %radix80)
   %output = extractvalue { i128, i1 } %call81, 0
   store i128 %output, ptr %magnitude, align 4
   %output82 = extractvalue { i128, i1 } %call81, 1
   store i1 %output82, ptr %valid, align 1
   %magnitude83 = load i128, ptr %magnitude, align 4
   %negative84 = load i1, ptr %negative, align 1
-  %call85 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f636865636b5f69313238(i128 %magnitude83, i1 %negative84)
+  %call85 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f636865636b5f69313238(i128 %magnitude83, i1 %negative84)
   store i1 %call85, ptr %fits, align 1
   %valid86 = load i1, ptr %valid, align 1
   br i1 %valid86, label %short_circuit.rhs87, label %short_circuit.merge88
@@ -5699,7 +5701,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f666c6f61745f62797465(i32 %data, i64 %index) {
+define i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f666c6f61745f62797465(i32 %data, i64 %index) {
 entry:
   %assignment_value = alloca i8, align 1
   %byte = alloca i8, align 1
@@ -5730,7 +5732,7 @@ entry:
   ret i8 %byte8
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f646f74(i8 %byte) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f646f74(i8 %byte) {
 entry:
   %byte1 = alloca i8, align 1
   store i8 %byte, ptr %byte1, align 1
@@ -5739,7 +5741,7 @@ entry:
   ret i1 %eq
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f65(i8 %byte) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f65(i8 %byte) {
 entry:
   %byte1 = alloca i8, align 1
   store i8 %byte, ptr %byte1, align 1
@@ -5757,7 +5759,7 @@ short_circuit.merge:                              ; preds = %short_circuit.rhs, 
   ret i1 %short_circuit
 }
 
-define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f64696769743130(i8 %byte) {
+define i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f64696769743130(i8 %byte) {
 entry:
   %byte1 = alloca i8, align 1
   store i8 %byte, ptr %byte1, align 1
@@ -5775,7 +5777,7 @@ short_circuit.merge:                              ; preds = %short_circuit.rhs, 
   ret i1 %short_circuit
 }
 
-define { i64, double, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f666c6f61745f696e7465676572(i32 %data, i64 %pos, i64 %end, double %mant, i32 %extra_scale, i1 %valid, i1 %saw_int, i1 %last_underscore, i1 %int_done) {
+define { i64, double, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f666c6f61745f696e7465676572(i32 %data, i64 %pos, i64 %end, double %mant, i32 %extra_scale, i1 %valid, i1 %saw_int, i1 %last_underscore, i1 %int_done) {
 entry:
   %assignment_value161 = alloca i1, align 1
   %assignment_value159 = alloca i64, align 8
@@ -5905,7 +5907,7 @@ if.then21:                                        ; preds = %if.then
   %saw_int32 = load i1, ptr %saw_int7, align 1
   %last_underscore33 = load i1, ptr %last_underscore8, align 1
   %int_done34 = load i1, ptr %int_done9, align 1
-  %call = call { i64, double, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f666c6f61745f696e7465676572(i32 %data26, i64 %pos27, i64 %mid28, double %mant29, i32 %extra_scale30, i1 %valid31, i1 %saw_int32, i1 %last_underscore33, i1 %int_done34)
+  %call = call { i64, double, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f666c6f61745f696e7465676572(i32 %data26, i64 %pos27, i64 %mid28, double %mant29, i32 %extra_scale30, i1 %valid31, i1 %saw_int32, i1 %last_underscore33, i1 %int_done34)
   %output = extractvalue { i64, double, i32, i1, i1, i1, i1 } %call, 0
   store i64 %output, ptr %assignment_value, align 4
   %assignment_value35 = load i64, ptr %assignment_value, align 4
@@ -5940,13 +5942,13 @@ if.then21:                                        ; preds = %if.then
 if.else:                                          ; preds = %if.then
   %data93 = load i32, ptr %data1, align 4
   %pos94 = load i64, ptr %pos2, align 4
-  %call95 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f666c6f61745f62797465(i32 %data93, i64 %pos94)
+  %call95 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f666c6f61745f62797465(i32 %data93, i64 %pos94)
   store i8 %call95, ptr %byte, align 1
   %byte96 = load i8, ptr %byte, align 1
-  %call97 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f64696769743130(i8 %byte96)
+  %call97 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f64696769743130(i8 %byte96)
   store i1 %call97, ptr %digit, align 1
   %byte98 = load i8, ptr %byte, align 1
-  %call99 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f756e64657273636f7265(i8 %byte98)
+  %call99 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f756e64657273636f7265(i8 %byte98)
   store i1 %call99, ptr %underscore, align 1
   %digit100 = load i1, ptr %digit, align 1
   br i1 %digit100, label %if.then101, label %if.else102
@@ -5973,7 +5975,7 @@ if.then60:                                        ; preds = %short_circuit.merge
   %saw_int68 = load i1, ptr %saw_int7, align 1
   %last_underscore69 = load i1, ptr %last_underscore8, align 1
   %int_done70 = load i1, ptr %int_done9, align 1
-  %call71 = call { i64, double, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f666c6f61745f696e7465676572(i32 %data62, i64 %pos63, i64 %end64, double %mant65, i32 %extra_scale66, i1 %valid67, i1 %saw_int68, i1 %last_underscore69, i1 %int_done70)
+  %call71 = call { i64, double, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f666c6f61745f696e7465676572(i32 %data62, i64 %pos63, i64 %end64, double %mant65, i32 %extra_scale66, i1 %valid67, i1 %saw_int68, i1 %last_underscore69, i1 %int_done70)
   %output72 = extractvalue { i64, double, i32, i1, i1, i1, i1 } %call71, 0
   store i64 %output72, ptr %assignment_value73, align 4
   %assignment_value74 = load i64, ptr %assignment_value73, align 4
@@ -6111,7 +6113,7 @@ if.merge151:                                      ; preds = %if.then150, %if.mer
   br label %if.merge142
 }
 
-define { i64, double, i32, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f666c6f61745f6672616374696f6e(i32 %data, i64 %pos, i64 %end, double %mant, i32 %extra_scale, i32 %frac_count, i1 %valid, i1 %frac_started, i1 %frac_trail, i1 %frac_done) {
+define { i64, double, i32, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f666c6f61745f6672616374696f6e(i32 %data, i64 %pos, i64 %end, double %mant, i32 %extra_scale, i32 %frac_count, i1 %valid, i1 %frac_started, i1 %frac_trail, i1 %frac_done) {
 entry:
   %assignment_value180 = alloca i1, align 1
   %assignment_value178 = alloca i64, align 8
@@ -6251,7 +6253,7 @@ if.then22:                                        ; preds = %if.then
   %frac_started34 = load i1, ptr %frac_started8, align 1
   %frac_trail35 = load i1, ptr %frac_trail9, align 1
   %frac_done36 = load i1, ptr %frac_done10, align 1
-  %call = call { i64, double, i32, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f666c6f61745f6672616374696f6e(i32 %data27, i64 %pos28, i64 %mid29, double %mant30, i32 %extra_scale31, i32 %frac_count32, i1 %valid33, i1 %frac_started34, i1 %frac_trail35, i1 %frac_done36)
+  %call = call { i64, double, i32, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f666c6f61745f6672616374696f6e(i32 %data27, i64 %pos28, i64 %mid29, double %mant30, i32 %extra_scale31, i32 %frac_count32, i1 %valid33, i1 %frac_started34, i1 %frac_trail35, i1 %frac_done36)
   %output = extractvalue { i64, double, i32, i32, i1, i1, i1, i1 } %call, 0
   store i64 %output, ptr %assignment_value, align 4
   %assignment_value37 = load i64, ptr %assignment_value, align 4
@@ -6290,13 +6292,13 @@ if.then22:                                        ; preds = %if.then
 if.else:                                          ; preds = %if.then
   %data102 = load i32, ptr %data1, align 4
   %pos103 = load i64, ptr %pos2, align 4
-  %call104 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f666c6f61745f62797465(i32 %data102, i64 %pos103)
+  %call104 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f666c6f61745f62797465(i32 %data102, i64 %pos103)
   store i8 %call104, ptr %byte, align 1
   %byte105 = load i8, ptr %byte, align 1
-  %call106 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f64696769743130(i8 %byte105)
+  %call106 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f64696769743130(i8 %byte105)
   store i1 %call106, ptr %digit, align 1
   %byte107 = load i8, ptr %byte, align 1
-  %call108 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f756e64657273636f7265(i8 %byte107)
+  %call108 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f756e64657273636f7265(i8 %byte107)
   store i1 %call108, ptr %underscore, align 1
   %digit109 = load i1, ptr %digit, align 1
   br i1 %digit109, label %if.then110, label %if.else111
@@ -6324,7 +6326,7 @@ if.then65:                                        ; preds = %short_circuit.merge
   %frac_started74 = load i1, ptr %frac_started8, align 1
   %frac_trail75 = load i1, ptr %frac_trail9, align 1
   %frac_done76 = load i1, ptr %frac_done10, align 1
-  %call77 = call { i64, double, i32, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f666c6f61745f6672616374696f6e(i32 %data67, i64 %pos68, i64 %end69, double %mant70, i32 %extra_scale71, i32 %frac_count72, i1 %valid73, i1 %frac_started74, i1 %frac_trail75, i1 %frac_done76)
+  %call77 = call { i64, double, i32, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f666c6f61745f6672616374696f6e(i32 %data67, i64 %pos68, i64 %end69, double %mant70, i32 %extra_scale71, i32 %frac_count72, i1 %valid73, i1 %frac_started74, i1 %frac_trail75, i1 %frac_done76)
   %output78 = extractvalue { i64, double, i32, i32, i1, i1, i1, i1 } %call77, 0
   store i64 %output78, ptr %assignment_value79, align 4
   %assignment_value80 = load i64, ptr %assignment_value79, align 4
@@ -6481,7 +6483,7 @@ if.merge170:                                      ; preds = %if.then169, %if.mer
   br label %if.merge161
 }
 
-define { i64, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f666c6f61745f6578706f6e656e74(i32 %data, i64 %pos, i64 %end, i32 %exp_value, i1 %valid, i1 %exp_started, i1 %exp_trail, i1 %exp_done) {
+define { i64, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f666c6f61745f6578706f6e656e74(i32 %data, i64 %pos, i64 %end, i32 %exp_value, i1 %valid, i1 %exp_started, i1 %exp_trail, i1 %exp_done) {
 entry:
   %assignment_value141 = alloca i1, align 1
   %assignment_value139 = alloca i64, align 8
@@ -6599,7 +6601,7 @@ if.then20:                                        ; preds = %if.then
   %exp_started30 = load i1, ptr %exp_started6, align 1
   %exp_trail31 = load i1, ptr %exp_trail7, align 1
   %exp_done32 = load i1, ptr %exp_done8, align 1
-  %call = call { i64, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f666c6f61745f6578706f6e656e74(i32 %data25, i64 %pos26, i64 %mid27, i32 %exp_value28, i1 %valid29, i1 %exp_started30, i1 %exp_trail31, i1 %exp_done32)
+  %call = call { i64, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f666c6f61745f6578706f6e656e74(i32 %data25, i64 %pos26, i64 %mid27, i32 %exp_value28, i1 %valid29, i1 %exp_started30, i1 %exp_trail31, i1 %exp_done32)
   %output = extractvalue { i64, i32, i1, i1, i1, i1 } %call, 0
   store i64 %output, ptr %assignment_value, align 4
   %assignment_value33 = load i64, ptr %assignment_value, align 4
@@ -6630,13 +6632,13 @@ if.then20:                                        ; preds = %if.then
 if.else:                                          ; preds = %if.then
   %data84 = load i32, ptr %data1, align 4
   %pos85 = load i64, ptr %pos2, align 4
-  %call86 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f666c6f61745f62797465(i32 %data84, i64 %pos85)
+  %call86 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f666c6f61745f62797465(i32 %data84, i64 %pos85)
   store i8 %call86, ptr %byte, align 1
   %byte87 = load i8, ptr %byte, align 1
-  %call88 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f64696769743130(i8 %byte87)
+  %call88 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f64696769743130(i8 %byte87)
   store i1 %call88, ptr %digit, align 1
   %byte89 = load i8, ptr %byte, align 1
-  %call90 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f756e64657273636f7265(i8 %byte89)
+  %call90 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f756e64657273636f7265(i8 %byte89)
   store i1 %call90, ptr %underscore, align 1
   %digit91 = load i1, ptr %digit, align 1
   br i1 %digit91, label %if.then92, label %if.else93
@@ -6662,7 +6664,7 @@ if.then55:                                        ; preds = %short_circuit.merge
   %exp_started62 = load i1, ptr %exp_started6, align 1
   %exp_trail63 = load i1, ptr %exp_trail7, align 1
   %exp_done64 = load i1, ptr %exp_done8, align 1
-  %call65 = call { i64, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f666c6f61745f6578706f6e656e74(i32 %data57, i64 %pos58, i64 %end59, i32 %exp_value60, i1 %valid61, i1 %exp_started62, i1 %exp_trail63, i1 %exp_done64)
+  %call65 = call { i64, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f666c6f61745f6578706f6e656e74(i32 %data57, i64 %pos58, i64 %end59, i32 %exp_value60, i1 %valid61, i1 %exp_started62, i1 %exp_trail63, i1 %exp_done64)
   %output66 = extractvalue { i64, i32, i1, i1, i1, i1 } %call65, 0
   store i64 %output66, ptr %assignment_value67, align 4
   %assignment_value68 = load i64, ptr %assignment_value67, align 4
@@ -6781,7 +6783,7 @@ if.merge131:                                      ; preds = %if.then130, %if.mer
   br label %if.merge122
 }
 
-define double @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f7363616c655f666c6f61745f7570(double %scaled, i32 %steps) {
+define double @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f7363616c655f666c6f61745f7570(double %scaled, i32 %steps) {
 entry:
   %assignment_value19 = alloca double, align 8
   %assignment_value13 = alloca double, align 8
@@ -6821,7 +6823,7 @@ if.else:                                          ; preds = %if.then
   store i32 %div, ptr %half, align 4
   %scaled11 = load double, ptr %scaled1, align 8
   %half12 = load i32, ptr %half, align 4
-  %call = call double @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f7363616c655f666c6f61745f7570(double %scaled11, i32 %half12)
+  %call = call double @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f7363616c655f666c6f61745f7570(double %scaled11, i32 %half12)
   store double %call, ptr %assignment_value13, align 8
   %assignment_value14 = load double, ptr %assignment_value13, align 8
   store double %assignment_value14, ptr %scaled1, align 8
@@ -6829,7 +6831,7 @@ if.else:                                          ; preds = %if.then
   %steps16 = load i32, ptr %steps2, align 4
   %half17 = load i32, ptr %half, align 4
   %sub = sub i32 %steps16, %half17
-  %call18 = call double @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f7363616c655f666c6f61745f7570(double %scaled15, i32 %sub)
+  %call18 = call double @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f7363616c655f666c6f61745f7570(double %scaled15, i32 %sub)
   store double %call18, ptr %assignment_value19, align 8
   %assignment_value20 = load double, ptr %assignment_value19, align 8
   store double %assignment_value20, ptr %scaled1, align 8
@@ -6839,7 +6841,7 @@ if.merge6:                                        ; preds = %if.else, %if.then5
   br label %if.merge
 }
 
-define double @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f7363616c655f666c6f61745f646f776e(double %scaled, i32 %steps) {
+define double @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f7363616c655f666c6f61745f646f776e(double %scaled, i32 %steps) {
 entry:
   %assignment_value20 = alloca double, align 8
   %assignment_value14 = alloca double, align 8
@@ -6879,7 +6881,7 @@ if.else:                                          ; preds = %if.then
   store i32 %div11, ptr %half, align 4
   %scaled12 = load double, ptr %scaled1, align 8
   %half13 = load i32, ptr %half, align 4
-  %call = call double @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f7363616c655f666c6f61745f646f776e(double %scaled12, i32 %half13)
+  %call = call double @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f7363616c655f666c6f61745f646f776e(double %scaled12, i32 %half13)
   store double %call, ptr %assignment_value14, align 8
   %assignment_value15 = load double, ptr %assignment_value14, align 8
   store double %assignment_value15, ptr %scaled1, align 8
@@ -6887,7 +6889,7 @@ if.else:                                          ; preds = %if.then
   %steps17 = load i32, ptr %steps2, align 4
   %half18 = load i32, ptr %half, align 4
   %sub = sub i32 %steps17, %half18
-  %call19 = call double @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f7363616c655f666c6f61745f646f776e(double %scaled16, i32 %sub)
+  %call19 = call double @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f7363616c655f666c6f61745f646f776e(double %scaled16, i32 %sub)
   store double %call19, ptr %assignment_value20, align 8
   %assignment_value21 = load double, ptr %assignment_value20, align 8
   store double %assignment_value21, ptr %scaled1, align 8
@@ -6897,7 +6899,7 @@ if.merge6:                                        ; preds = %if.else, %if.then5
   br label %if.merge
 }
 
-define { double, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f666c6f61745f663634(i32 %data, i64 %start, i64 %end) {
+define { double, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f666c6f61745f663634(i32 %data, i64 %start, i64 %end) {
 entry:
   %assignment_value298 = alloca i1, align 1
   %assignment_value288 = alloca i1, align 1
@@ -7006,7 +7008,7 @@ entry:
   %saw_int15 = load i1, ptr %saw_int, align 1
   %last_underscore16 = load i1, ptr %last_underscore, align 1
   %int_done17 = load i1, ptr %int_done, align 1
-  %call = call { i64, double, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f666c6f61745f696e7465676572(i32 %data9, i64 %pos10, i64 %end11, double %mant12, i32 %extra_scale13, i1 %valid14, i1 %saw_int15, i1 %last_underscore16, i1 %int_done17)
+  %call = call { i64, double, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f666c6f61745f696e7465676572(i32 %data9, i64 %pos10, i64 %end11, double %mant12, i32 %extra_scale13, i1 %valid14, i1 %saw_int15, i1 %last_underscore16, i1 %int_done17)
   %output = extractvalue { i64, double, i32, i1, i1, i1, i1 } %call, 0
   store i64 %output, ptr %assignment_value, align 4
   %assignment_value18 = load i64, ptr %assignment_value, align 4
@@ -7078,10 +7080,10 @@ short_circuit.merge:                              ; preds = %short_circuit.rhs, 
 if.then50:                                        ; preds = %short_circuit.merge
   %data52 = load i32, ptr %data1, align 4
   %pos53 = load i64, ptr %pos, align 4
-  %call54 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f666c6f61745f62797465(i32 %data52, i64 %pos53)
+  %call54 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f666c6f61745f62797465(i32 %data52, i64 %pos53)
   store i8 %call54, ptr %byte, align 1
   %byte55 = load i8, ptr %byte, align 1
-  %call56 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f646f74(i8 %byte55)
+  %call56 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f646f74(i8 %byte55)
   br i1 %call56, label %if.then57, label %if.merge58
 
 if.merge51:                                       ; preds = %if.merge58, %short_circuit.merge
@@ -7125,7 +7127,7 @@ if.then70:                                        ; preds = %short_circuit.merge
   %frac_started79 = load i1, ptr %frac_started, align 1
   %frac_trail80 = load i1, ptr %frac_trail, align 1
   %frac_done81 = load i1, ptr %frac_done, align 1
-  %call82 = call { i64, double, i32, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f666c6f61745f6672616374696f6e(i32 %data72, i64 %pos73, i64 %end74, double %mant75, i32 %extra_scale76, i32 %frac_count77, i1 %valid78, i1 %frac_started79, i1 %frac_trail80, i1 %frac_done81)
+  %call82 = call { i64, double, i32, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f666c6f61745f6672616374696f6e(i32 %data72, i64 %pos73, i64 %end74, double %mant75, i32 %extra_scale76, i32 %frac_count77, i1 %valid78, i1 %frac_started79, i1 %frac_trail80, i1 %frac_done81)
   %output83 = extractvalue { i64, double, i32, i32, i1, i1, i1, i1 } %call82, 0
   store i64 %output83, ptr %assignment_value84, align 4
   %assignment_value85 = load i64, ptr %assignment_value84, align 4
@@ -7188,10 +7190,10 @@ short_circuit.merge114:                           ; preds = %short_circuit.rhs11
 if.then119:                                       ; preds = %short_circuit.merge114
   %data121 = load i32, ptr %data1, align 4
   %pos122 = load i64, ptr %pos, align 4
-  %call123 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f666c6f61745f62797465(i32 %data121, i64 %pos122)
+  %call123 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f666c6f61745f62797465(i32 %data121, i64 %pos122)
   store i8 %call123, ptr %byte124, align 1
   %byte125 = load i8, ptr %byte124, align 1
-  %call126 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f65(i8 %byte125)
+  %call126 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f65(i8 %byte125)
   br i1 %call126, label %if.then127, label %if.merge128
 
 if.merge120:                                      ; preds = %if.merge128, %short_circuit.merge114
@@ -7236,10 +7238,10 @@ if.merge142:                                      ; preds = %if.merge207, %short
 if.then146:                                       ; preds = %if.then141
   %data148 = load i32, ptr %data1, align 4
   %pos149 = load i64, ptr %pos, align 4
-  %call150 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f666c6f61745f62797465(i32 %data148, i64 %pos149)
+  %call150 = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f666c6f61745f62797465(i32 %data148, i64 %pos149)
   store i8 %call150, ptr %byte151, align 1
   %byte152 = load i8, ptr %byte151, align 1
-  %call153 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f7369676e(i8 %byte152)
+  %call153 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f7369676e(i8 %byte152)
   br i1 %call153, label %if.then154, label %if.else
 
 if.merge147:                                      ; preds = %if.merge155, %if.then141
@@ -7254,7 +7256,7 @@ if.merge147:                                      ; preds = %if.merge155, %if.th
   %exp_started177 = load i1, ptr %exp_started, align 1
   %exp_trail178 = load i1, ptr %exp_trail, align 1
   %exp_done179 = load i1, ptr %exp_done, align 1
-  %call180 = call { i64, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f72616e67655f666c6f61745f6578706f6e656e74(i32 %data172, i64 %pos173, i64 %end174, i32 %exp_value175, i1 %valid176, i1 %exp_started177, i1 %exp_trail178, i1 %exp_done179)
+  %call180 = call { i64, i32, i1, i1, i1, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f72616e67655f666c6f61745f6578706f6e656e74(i32 %data172, i64 %pos173, i64 %end174, i32 %exp_value175, i1 %valid176, i1 %exp_started177, i1 %exp_trail178, i1 %exp_done179)
   %output181 = extractvalue { i64, i32, i1, i1, i1, i1 } %call180, 0
   store i64 %output181, ptr %assignment_value182, align 4
   %assignment_value183 = load i64, ptr %assignment_value182, align 4
@@ -7297,7 +7299,7 @@ if.then154:                                       ; preds = %if.then146
 
 if.else:                                          ; preds = %if.then146
   %byte163 = load i8, ptr %byte151, align 1
-  %call164 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f706c7573(i8 %byte163)
+  %call164 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f706c7573(i8 %byte163)
   br i1 %call164, label %if.then165, label %if.merge166
 
 if.merge155:                                      ; preds = %if.merge166, %if.then154
@@ -7432,7 +7434,7 @@ if.merge257:                                      ; preds = %if.then256, %if.els
 if.then266:                                       ; preds = %if.merge257
   %scaled269 = load double, ptr %scaled, align 8
   %steps270 = load i32, ptr %steps, align 4
-  %call271 = call double @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f7363616c655f666c6f61745f7570(double %scaled269, i32 %steps270)
+  %call271 = call double @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f7363616c655f666c6f61745f7570(double %scaled269, i32 %steps270)
   store double %call271, ptr %assignment_value272, align 8
   %assignment_value273 = load double, ptr %assignment_value272, align 8
   store double %assignment_value273, ptr %scaled, align 8
@@ -7441,7 +7443,7 @@ if.then266:                                       ; preds = %if.merge257
 if.else267:                                       ; preds = %if.merge257
   %scaled274 = load double, ptr %scaled, align 8
   %steps275 = load i32, ptr %steps, align 4
-  %call276 = call double @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f7363616c655f666c6f61745f646f776e(double %scaled274, i32 %steps275)
+  %call276 = call double @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f7363616c655f666c6f61745f646f776e(double %scaled274, i32 %steps275)
   store double %call276, ptr %assignment_value277, align 8
   %assignment_value278 = load double, ptr %assignment_value277, align 8
   store double %assignment_value278, ptr %scaled, align 8
@@ -7494,7 +7496,7 @@ if.merge297:                                      ; preds = %if.then296, %short_
   ret { double, i1 } %output303
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f663332(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f663332(ptr %text) {
 entry:
   %assignment_value54 = alloca i32, align 4
   %out = alloca float, align 4
@@ -7520,7 +7522,7 @@ entry:
   %f64_max = alloca double, align 8
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %zero, align 4
@@ -7553,16 +7555,16 @@ if.else:                                          ; preds = %short_circuit.merge
   %data6 = getelementptr inbounds i8, ptr %text1, i8 0
   %place7 = load i32, ptr %data6, align 4
   %zero8 = load i64, ptr %zero, align 4
-  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f666c6f61745f62797465(i32 %place7, i64 %zero8)
+  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f666c6f61745f62797465(i32 %place7, i64 %zero8)
   store i8 %call, ptr %first, align 1
   %first9 = load i8, ptr %first, align 1
-  %call10 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f706c7573(i8 %first9)
+  %call10 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f706c7573(i8 %first9)
   store i1 %call10, ptr %rejected, align 1
   %zero11 = load i64, ptr %zero, align 4
   store i64 %zero11, ptr %pos, align 4
   store i1 false, ptr %negative, align 1
   %first12 = load i8, ptr %first, align 1
-  %call13 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f7369676e(i8 %first12)
+  %call13 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f7369676e(i8 %first12)
   br i1 %call13, label %if.then14, label %if.merge15
 
 if.merge:                                         ; preds = %if.merge23, %if.then
@@ -7591,7 +7593,7 @@ if.then22:                                        ; preds = %if.merge15
   %pos26 = load i64, ptr %pos, align 4
   %length27 = getelementptr inbounds i8, ptr %text1, i8 8
   %place28 = load i64, ptr %length27, align 4
-  %call29 = call { double, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f666c6f61745f663634(i32 %place25, i64 %pos26, i64 %place28)
+  %call29 = call { double, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f666c6f61745f663634(i32 %place25, i64 %pos26, i64 %place28)
   %output = extractvalue { double, i1 } %call29, 0
   store double %output, ptr %magnitude, align 8
   %output30 = extractvalue { double, i1 } %call29, 1
@@ -7679,7 +7681,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f663634(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f663634(ptr %text) {
 entry:
   %assignment_value45 = alloca i32, align 4
   %out = alloca double, align 8
@@ -7700,7 +7702,7 @@ entry:
   %zero_value = alloca double, align 8
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
   store i64 0, ptr %zero, align 4
@@ -7734,16 +7736,16 @@ if.else:                                          ; preds = %short_circuit.merge
   %data6 = getelementptr inbounds i8, ptr %text1, i8 0
   %place7 = load i32, ptr %data6, align 4
   %zero8 = load i64, ptr %zero, align 4
-  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f666c6f61745f62797465(i32 %place7, i64 %zero8)
+  %call = call i8 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f666c6f61745f62797465(i32 %place7, i64 %zero8)
   store i8 %call, ptr %first, align 1
   %first9 = load i8, ptr %first, align 1
-  %call10 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f706c7573(i8 %first9)
+  %call10 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f706c7573(i8 %first9)
   store i1 %call10, ptr %rejected, align 1
   %zero11 = load i64, ptr %zero, align 4
   store i64 %zero11, ptr %pos, align 4
   store i1 false, ptr %negative, align 1
   %first12 = load i8, ptr %first, align 1
-  %call13 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69735f7369676e(i8 %first12)
+  %call13 = call i1 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69735f7369676e(i8 %first12)
   br i1 %call13, label %if.then14, label %if.merge15
 
 if.merge:                                         ; preds = %if.merge23, %if.then
@@ -7772,7 +7774,7 @@ if.then22:                                        ; preds = %if.merge15
   %pos26 = load i64, ptr %pos, align 4
   %length27 = getelementptr inbounds i8, ptr %text1, i8 8
   %place28 = load i64, ptr %length27, align 4
-  %call29 = call { double, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f666c6f61745f663634(i32 %place25, i64 %pos26, i64 %place28)
+  %call29 = call { double, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f666c6f61745f663634(i32 %place25, i64 %pos26, i64 %place28)
   %output = extractvalue { double, i1 } %call29, 0
   store double %output, ptr %magnitude, align 8
   %output30 = extractvalue { double, i1 } %call29, 1
@@ -7838,10 +7840,10 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f626f6f6c(i1 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f626f6f6c(i1 %value, ptr %0) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
   %assignment_value31 = alloca i32, align 4
   %data = alloca i32, align 4
   %assignment_value28 = alloca i64, align 8
@@ -7932,10 +7934,10 @@ if.merge:                                         ; preds = %if.then, %allocatio
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f63686172(i32 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f63686172(i32 %value, ptr %0) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
   %assignment_value137 = alloca i32, align 4
   %data = alloca i32, align 4
   %assignment_value132 = alloca i8, align 1
@@ -8200,7 +8202,7 @@ if.merge92:                                       ; preds = %if.then91, %if.merg
   ret ptr %allocation
 }
 
-define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f6938(ptr %scratch, i64 %index, i8 %remaining, i1 %negative, i64 %capacity) {
+define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f6938(ptr %scratch, i64 %index, i8 %remaining, i1 %negative, i64 %capacity) {
 entry:
   %assignment_value46 = alloca i8, align 1
   %assignment_value42 = alloca i64, align 8
@@ -8276,7 +8278,7 @@ if.merge10:                                       ; preds = %if.then9, %if.then
   %scratch22 = load ptr, ptr %scratch1, align 8
   %index23 = load i64, ptr %index2, align 4
   %capacity24 = load i64, ptr %capacity5, align 4
-  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch22, i64 0, i64 %index23, i64 %capacity24)
+  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch22, i64 0, i64 %index23, i64 %capacity24)
   %length25 = load i64, ptr %length, align 4
   br label %if.merge
 
@@ -8320,11 +8322,11 @@ if.merge30:                                       ; preds = %if.then29, %if.else
   %div = sdiv i8 %remaining53, %ten54
   %negative55 = load i1, ptr %negative4, align 1
   %capacity56 = load i64, ptr %capacity5, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f6938(ptr %scratch51, i64 %index52, i8 %div, i1 %negative55, i64 %capacity56)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f6938(ptr %scratch51, i64 %index52, i8 %div, i1 %negative55, i64 %capacity56)
   br label %if.merge
 }
 
-define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f693136(ptr %scratch, i64 %index, i16 %remaining, i1 %negative, i64 %capacity) {
+define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f693136(ptr %scratch, i64 %index, i16 %remaining, i1 %negative, i64 %capacity) {
 entry:
   %assignment_value45 = alloca i8, align 1
   %assignment_value41 = alloca i64, align 8
@@ -8399,7 +8401,7 @@ if.merge10:                                       ; preds = %if.then9, %if.then
   %scratch22 = load ptr, ptr %scratch1, align 8
   %index23 = load i64, ptr %index2, align 4
   %capacity24 = load i64, ptr %capacity5, align 4
-  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch22, i64 0, i64 %index23, i64 %capacity24)
+  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch22, i64 0, i64 %index23, i64 %capacity24)
   %length25 = load i64, ptr %length, align 4
   br label %if.merge
 
@@ -8440,11 +8442,11 @@ if.merge30:                                       ; preds = %if.then29, %if.else
   %div = sdiv i16 %remaining52, %ten53
   %negative54 = load i1, ptr %negative4, align 1
   %capacity55 = load i64, ptr %capacity5, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f693136(ptr %scratch50, i64 %index51, i16 %div, i1 %negative54, i64 %capacity55)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f693136(ptr %scratch50, i64 %index51, i16 %div, i1 %negative54, i64 %capacity55)
   br label %if.merge
 }
 
-define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f693332(ptr %scratch, i64 %index, i32 %remaining, i1 %negative, i64 %capacity) {
+define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f693332(ptr %scratch, i64 %index, i32 %remaining, i1 %negative, i64 %capacity) {
 entry:
   %assignment_value45 = alloca i8, align 1
   %assignment_value41 = alloca i64, align 8
@@ -8519,7 +8521,7 @@ if.merge10:                                       ; preds = %if.then9, %if.then
   %scratch22 = load ptr, ptr %scratch1, align 8
   %index23 = load i64, ptr %index2, align 4
   %capacity24 = load i64, ptr %capacity5, align 4
-  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch22, i64 0, i64 %index23, i64 %capacity24)
+  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch22, i64 0, i64 %index23, i64 %capacity24)
   %length25 = load i64, ptr %length, align 4
   br label %if.merge
 
@@ -8560,11 +8562,11 @@ if.merge30:                                       ; preds = %if.then29, %if.else
   %div = sdiv i32 %remaining52, %ten53
   %negative54 = load i1, ptr %negative4, align 1
   %capacity55 = load i64, ptr %capacity5, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f693332(ptr %scratch50, i64 %index51, i32 %div, i1 %negative54, i64 %capacity55)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f693332(ptr %scratch50, i64 %index51, i32 %div, i1 %negative54, i64 %capacity55)
   br label %if.merge
 }
 
-define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f693634(ptr %scratch, i64 %index, i64 %remaining, i1 %negative, i64 %capacity) {
+define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f693634(ptr %scratch, i64 %index, i64 %remaining, i1 %negative, i64 %capacity) {
 entry:
   %assignment_value45 = alloca i8, align 1
   %assignment_value41 = alloca i64, align 8
@@ -8639,7 +8641,7 @@ if.merge10:                                       ; preds = %if.then9, %if.then
   %scratch22 = load ptr, ptr %scratch1, align 8
   %index23 = load i64, ptr %index2, align 4
   %capacity24 = load i64, ptr %capacity5, align 4
-  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch22, i64 0, i64 %index23, i64 %capacity24)
+  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch22, i64 0, i64 %index23, i64 %capacity24)
   %length25 = load i64, ptr %length, align 4
   br label %if.merge
 
@@ -8680,11 +8682,11 @@ if.merge30:                                       ; preds = %if.then29, %if.else
   %div = sdiv i64 %remaining52, %ten53
   %negative54 = load i1, ptr %negative4, align 1
   %capacity55 = load i64, ptr %capacity5, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f693634(ptr %scratch50, i64 %index51, i64 %div, i1 %negative54, i64 %capacity55)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f693634(ptr %scratch50, i64 %index51, i64 %div, i1 %negative54, i64 %capacity55)
   br label %if.merge
 }
 
-define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f7538(ptr %scratch, i64 %index, i8 %remaining, i64 %capacity) {
+define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f7538(ptr %scratch, i64 %index, i8 %remaining, i64 %capacity) {
 entry:
   %assignment_value21 = alloca i8, align 1
   %assignment_value = alloca i64, align 8
@@ -8716,7 +8718,7 @@ if.then:                                          ; preds = %entry
   %scratch9 = load ptr, ptr %scratch1, align 8
   %index10 = load i64, ptr %index2, align 4
   %capacity11 = load i64, ptr %capacity4, align 4
-  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch9, i64 0, i64 %index10, i64 %capacity11)
+  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch9, i64 0, i64 %index10, i64 %capacity11)
   %length12 = load i64, ptr %length, align 4
   br label %if.merge
 
@@ -8749,7 +8751,7 @@ if.else:                                          ; preds = %entry
   %ten28 = load i8, ptr %ten, align 1
   %div = udiv i8 %remaining27, %ten28
   %capacity29 = load i64, ptr %capacity4, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f7538(ptr %scratch25, i64 %index26, i8 %div, i64 %capacity29)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f7538(ptr %scratch25, i64 %index26, i8 %div, i64 %capacity29)
   br label %if.merge
 
 if.merge:                                         ; preds = %if.else, %if.then
@@ -8757,7 +8759,7 @@ if.merge:                                         ; preds = %if.else, %if.then
   ret i64 %if
 }
 
-define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f753136(ptr %scratch, i64 %index, i16 %remaining, i64 %capacity) {
+define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f753136(ptr %scratch, i64 %index, i16 %remaining, i64 %capacity) {
 entry:
   %assignment_value22 = alloca i8, align 1
   %assignment_value = alloca i64, align 8
@@ -8790,7 +8792,7 @@ if.then:                                          ; preds = %entry
   %scratch9 = load ptr, ptr %scratch1, align 8
   %index10 = load i64, ptr %index2, align 4
   %capacity11 = load i64, ptr %capacity4, align 4
-  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch9, i64 0, i64 %index10, i64 %capacity11)
+  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch9, i64 0, i64 %index10, i64 %capacity11)
   %length12 = load i64, ptr %length, align 4
   br label %if.merge
 
@@ -8826,7 +8828,7 @@ if.else:                                          ; preds = %entry
   %ten29 = load i16, ptr %ten, align 2
   %div = udiv i16 %remaining28, %ten29
   %capacity30 = load i64, ptr %capacity4, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f753136(ptr %scratch26, i64 %index27, i16 %div, i64 %capacity30)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f753136(ptr %scratch26, i64 %index27, i16 %div, i64 %capacity30)
   br label %if.merge
 
 if.merge:                                         ; preds = %if.else, %if.then
@@ -8834,7 +8836,7 @@ if.merge:                                         ; preds = %if.else, %if.then
   ret i64 %if
 }
 
-define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f753332(ptr %scratch, i64 %index, i32 %remaining, i64 %capacity) {
+define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f753332(ptr %scratch, i64 %index, i32 %remaining, i64 %capacity) {
 entry:
   %assignment_value22 = alloca i8, align 1
   %assignment_value = alloca i64, align 8
@@ -8867,7 +8869,7 @@ if.then:                                          ; preds = %entry
   %scratch9 = load ptr, ptr %scratch1, align 8
   %index10 = load i64, ptr %index2, align 4
   %capacity11 = load i64, ptr %capacity4, align 4
-  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch9, i64 0, i64 %index10, i64 %capacity11)
+  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch9, i64 0, i64 %index10, i64 %capacity11)
   %length12 = load i64, ptr %length, align 4
   br label %if.merge
 
@@ -8903,7 +8905,7 @@ if.else:                                          ; preds = %entry
   %ten29 = load i32, ptr %ten, align 4
   %div = udiv i32 %remaining28, %ten29
   %capacity30 = load i64, ptr %capacity4, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f753332(ptr %scratch26, i64 %index27, i32 %div, i64 %capacity30)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f753332(ptr %scratch26, i64 %index27, i32 %div, i64 %capacity30)
   br label %if.merge
 
 if.merge:                                         ; preds = %if.else, %if.then
@@ -8911,7 +8913,7 @@ if.merge:                                         ; preds = %if.else, %if.then
   ret i64 %if
 }
 
-define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f753634(ptr %scratch, i64 %index, i64 %remaining, i64 %capacity) {
+define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f753634(ptr %scratch, i64 %index, i64 %remaining, i64 %capacity) {
 entry:
   %assignment_value22 = alloca i8, align 1
   %assignment_value = alloca i64, align 8
@@ -8944,7 +8946,7 @@ if.then:                                          ; preds = %entry
   %scratch9 = load ptr, ptr %scratch1, align 8
   %index10 = load i64, ptr %index2, align 4
   %capacity11 = load i64, ptr %capacity4, align 4
-  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch9, i64 0, i64 %index10, i64 %capacity11)
+  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch9, i64 0, i64 %index10, i64 %capacity11)
   %length12 = load i64, ptr %length, align 4
   br label %if.merge
 
@@ -8980,7 +8982,7 @@ if.else:                                          ; preds = %entry
   %ten29 = load i64, ptr %ten, align 4
   %div = udiv i64 %remaining28, %ten29
   %capacity30 = load i64, ptr %capacity4, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f753634(ptr %scratch26, i64 %index27, i64 %div, i64 %capacity30)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f753634(ptr %scratch26, i64 %index27, i64 %div, i64 %capacity30)
   br label %if.merge
 
 if.merge:                                         ; preds = %if.else, %if.then
@@ -8988,7 +8990,7 @@ if.merge:                                         ; preds = %if.else, %if.then
   ret i64 %if
 }
 
-define void @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch, i64 %target, i64 %source, i64 %capacity) {
+define void @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch, i64 %target, i64 %source, i64 %capacity) {
 entry:
   %one = alloca i64, align 8
   %assignment_value = alloca i8, align 1
@@ -9025,17 +9027,17 @@ if.then:                                          ; preds = %entry
   %one17 = load i64, ptr %one, align 4
   %add18 = add i64 %source16, %one17
   %capacity19 = load i64, ptr %capacity4, align 4
-  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch13, i64 %add, i64 %add18, i64 %capacity19)
+  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch13, i64 %add, i64 %add18, i64 %capacity19)
   br label %if.merge
 
 if.merge:                                         ; preds = %if.then, %entry
   ret void
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6938(i8 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6938(i8 %value, ptr %0) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
   %assignment_value20 = alloca i32, align 4
   %data = alloca i32, align 4
   %length = alloca i64, align 8
@@ -9096,7 +9098,7 @@ if.merge:                                         ; preds = %if.then, %allocatio
   %remaining16 = load i8, ptr %remaining, align 1
   %negative17 = load i1, ptr %negative, align 1
   %capacity18 = load i64, ptr %capacity, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f6938(ptr %allocation, i64 %index15, i8 %remaining16, i1 %negative17, i64 %capacity18)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f6938(ptr %allocation, i64 %index15, i8 %remaining16, i1 %negative17, i64 %capacity18)
   store i64 %call, ptr %length, align 4
   store i32 0, ptr %data, align 4
   %array_element19 = getelementptr inbounds i8, ptr %allocation, i64 0
@@ -9117,10 +9119,10 @@ if.merge:                                         ; preds = %if.then, %allocatio
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f693136(i16 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f693136(i16 %value, ptr %0) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
   %assignment_value20 = alloca i32, align 4
   %data = alloca i32, align 4
   %length = alloca i64, align 8
@@ -9181,7 +9183,7 @@ if.merge:                                         ; preds = %if.then, %allocatio
   %remaining16 = load i16, ptr %remaining, align 2
   %negative17 = load i1, ptr %negative, align 1
   %capacity18 = load i64, ptr %capacity, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f693136(ptr %allocation, i64 %index15, i16 %remaining16, i1 %negative17, i64 %capacity18)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f693136(ptr %allocation, i64 %index15, i16 %remaining16, i1 %negative17, i64 %capacity18)
   store i64 %call, ptr %length, align 4
   store i32 0, ptr %data, align 4
   %array_element19 = getelementptr inbounds i8, ptr %allocation, i64 0
@@ -9202,10 +9204,10 @@ if.merge:                                         ; preds = %if.then, %allocatio
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f693332(i32 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f693332(i32 %value, ptr %0) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
   %assignment_value20 = alloca i32, align 4
   %data = alloca i32, align 4
   %length = alloca i64, align 8
@@ -9266,7 +9268,7 @@ if.merge:                                         ; preds = %if.then, %allocatio
   %remaining16 = load i32, ptr %remaining, align 4
   %negative17 = load i1, ptr %negative, align 1
   %capacity18 = load i64, ptr %capacity, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f693332(ptr %allocation, i64 %index15, i32 %remaining16, i1 %negative17, i64 %capacity18)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f693332(ptr %allocation, i64 %index15, i32 %remaining16, i1 %negative17, i64 %capacity18)
   store i64 %call, ptr %length, align 4
   store i32 0, ptr %data, align 4
   %array_element19 = getelementptr inbounds i8, ptr %allocation, i64 0
@@ -9287,10 +9289,10 @@ if.merge:                                         ; preds = %if.then, %allocatio
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f693634(i64 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f693634(i64 %value, ptr %0) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
   %assignment_value20 = alloca i32, align 4
   %data = alloca i32, align 4
   %length = alloca i64, align 8
@@ -9351,7 +9353,7 @@ if.merge:                                         ; preds = %if.then, %allocatio
   %remaining16 = load i64, ptr %remaining, align 4
   %negative17 = load i1, ptr %negative, align 1
   %capacity18 = load i64, ptr %capacity, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f693634(ptr %allocation, i64 %index15, i64 %remaining16, i1 %negative17, i64 %capacity18)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f693634(ptr %allocation, i64 %index15, i64 %remaining16, i1 %negative17, i64 %capacity18)
   store i64 %call, ptr %length, align 4
   store i32 0, ptr %data, align 4
   %array_element19 = getelementptr inbounds i8, ptr %allocation, i64 0
@@ -9372,251 +9374,18 @@ if.merge:                                         ; preds = %if.then, %allocatio
   ret ptr %allocation
 }
 
-define i128 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f7363616c655f69313238(i128 %scale, i64 %step, i64 %steps) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f69313238(i128 %value, ptr %0) {
 entry:
-  %eighth = alloca i128, align 8
-  %fourth = alloca i128, align 8
-  %twice = alloca i128, align 8
-  %one = alloca i64, align 8
-  %scale1 = alloca i128, align 8
-  store i128 %scale, ptr %scale1, align 4
-  %step2 = alloca i64, align 8
-  store i64 %step, ptr %step2, align 4
-  %steps3 = alloca i64, align 8
-  store i64 %steps, ptr %steps3, align 4
-  %step4 = load i64, ptr %step2, align 4
-  %steps5 = load i64, ptr %steps3, align 4
-  %lt = icmp ult i64 %step4, %steps5
-  br i1 %lt, label %if.then, label %if.else
-
-if.then:                                          ; preds = %entry
-  store i64 1, ptr %one, align 4
-  %scale6 = load i128, ptr %scale1, align 4
-  %scale7 = load i128, ptr %scale1, align 4
-  %add = add i128 %scale6, %scale7
-  store i128 %add, ptr %twice, align 4
-  %twice8 = load i128, ptr %twice, align 4
-  %twice9 = load i128, ptr %twice, align 4
-  %add10 = add i128 %twice8, %twice9
-  store i128 %add10, ptr %fourth, align 4
-  %fourth11 = load i128, ptr %fourth, align 4
-  %fourth12 = load i128, ptr %fourth, align 4
-  %add13 = add i128 %fourth11, %fourth12
-  store i128 %add13, ptr %eighth, align 4
-  %eighth14 = load i128, ptr %eighth, align 4
-  %twice15 = load i128, ptr %twice, align 4
-  %add16 = add i128 %eighth14, %twice15
-  %step17 = load i64, ptr %step2, align 4
-  %one18 = load i64, ptr %one, align 4
-  %add19 = add i64 %step17, %one18
-  %steps20 = load i64, ptr %steps3, align 4
-  %call = call i128 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f7363616c655f69313238(i128 %add16, i64 %add19, i64 %steps20)
-  br label %if.merge
-
-if.else:                                          ; preds = %entry
-  %scale21 = load i128, ptr %scale1, align 4
-  br label %if.merge
-
-if.merge:                                         ; preds = %if.else, %if.then
-  %if = phi i128 [ %call, %if.then ], [ %scale21, %if.else ]
-  ret i128 %if
-}
-
-define { i128, i8 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f73756274726163745f69313238(i128 %remaining, i128 %scale, i8 %digit) {
-entry:
-  %next_digit = alloca i8, align 1
-  %rest = alloca i128, align 8
-  %one_digit = alloca i8, align 1
-  %remaining1 = alloca i128, align 8
-  store i128 %remaining, ptr %remaining1, align 4
-  %scale2 = alloca i128, align 8
-  store i128 %scale, ptr %scale2, align 4
-  %digit3 = alloca i8, align 1
-  store i8 %digit, ptr %digit3, align 1
-  %remaining4 = load i128, ptr %remaining1, align 4
-  %scale5 = load i128, ptr %scale2, align 4
-  %ge = icmp sge i128 %remaining4, %scale5
-  br i1 %ge, label %if.then, label %if.else
-
-if.then:                                          ; preds = %entry
-  store i8 1, ptr %one_digit, align 1
-  %remaining6 = load i128, ptr %remaining1, align 4
-  %scale7 = load i128, ptr %scale2, align 4
-  %sub = sub i128 %remaining6, %scale7
-  %scale8 = load i128, ptr %scale2, align 4
-  %digit9 = load i8, ptr %digit3, align 1
-  %one_digit10 = load i8, ptr %one_digit, align 1
-  %add = add i8 %digit9, %one_digit10
-  %call = call { i128, i8 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f73756274726163745f69313238(i128 %sub, i128 %scale8, i8 %add)
-  %output = extractvalue { i128, i8 } %call, 0
-  store i128 %output, ptr %rest, align 4
-  %output11 = extractvalue { i128, i8 } %call, 1
-  store i8 %output11, ptr %next_digit, align 1
-  %rest12 = load i128, ptr %rest, align 4
-  %next_digit13 = load i8, ptr %next_digit, align 1
-  %output14 = insertvalue { i128, i8 } zeroinitializer, i128 %rest12, 0
-  %output15 = insertvalue { i128, i8 } %output14, i8 %next_digit13, 1
-  br label %if.merge
-
-if.else:                                          ; preds = %entry
-  %remaining16 = load i128, ptr %remaining1, align 4
-  %digit17 = load i8, ptr %digit3, align 1
-  %output18 = insertvalue { i128, i8 } zeroinitializer, i128 %remaining16, 0
-  %output19 = insertvalue { i128, i8 } %output18, i8 %digit17, 1
-  br label %if.merge
-
-if.merge:                                         ; preds = %if.else, %if.then
-  %if = phi { i128, i8 } [ %output15, %if.then ], [ %output19, %if.else ]
-  ret { i128, i8 } %if
-}
-
-define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f69313238(ptr %scratch, i64 %position, i64 %digits, i64 %last, i128 %remaining, i1 %started, i64 %emit) {
-entry:
-  %assignment_value43 = alloca i1, align 1
-  %assignment_value41 = alloca i64, align 8
-  %assignment_value35 = alloca i8, align 1
-  %assignment_value22 = alloca i8, align 1
-  %assignment_value = alloca i128, align 8
-  %digit = alloca i8, align 1
-  %scale = alloca i128, align 8
-  %steps = alloca i64, align 8
-  %one_wide = alloca i128, align 8
-  %zero_digit = alloca i8, align 1
-  %zero_count = alloca i64, align 8
-  %one = alloca i64, align 8
-  %scratch1 = alloca ptr, align 8
-  store ptr %scratch, ptr %scratch1, align 8
-  %position2 = alloca i64, align 8
-  store i64 %position, ptr %position2, align 4
-  %digits3 = alloca i64, align 8
-  store i64 %digits, ptr %digits3, align 4
-  %last4 = alloca i64, align 8
-  store i64 %last, ptr %last4, align 4
-  %remaining5 = alloca i128, align 8
-  store i128 %remaining, ptr %remaining5, align 4
-  %started6 = alloca i1, align 1
-  store i1 %started, ptr %started6, align 1
-  %emit7 = alloca i64, align 8
-  store i64 %emit, ptr %emit7, align 4
-  %position8 = load i64, ptr %position2, align 4
-  %digits9 = load i64, ptr %digits3, align 4
-  %lt = icmp ult i64 %position8, %digits9
-  br i1 %lt, label %if.then, label %if.else
-
-if.then:                                          ; preds = %entry
-  store i64 1, ptr %one, align 4
-  store i64 0, ptr %zero_count, align 4
-  store i8 48, ptr %zero_digit, align 1
-  store i128 1, ptr %one_wide, align 4
-  %last10 = load i64, ptr %last4, align 4
-  %position11 = load i64, ptr %position2, align 4
-  %sub = sub i64 %last10, %position11
-  store i64 %sub, ptr %steps, align 4
-  %one_wide12 = load i128, ptr %one_wide, align 4
-  %zero_count13 = load i64, ptr %zero_count, align 4
-  %steps14 = load i64, ptr %steps, align 4
-  %call = call i128 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f7363616c655f69313238(i128 %one_wide12, i64 %zero_count13, i64 %steps14)
-  store i128 %call, ptr %scale, align 4
-  %zero_digit15 = load i8, ptr %zero_digit, align 1
-  store i8 %zero_digit15, ptr %digit, align 1
-  %remaining16 = load i128, ptr %remaining5, align 4
-  %scale17 = load i128, ptr %scale, align 4
-  %digit18 = load i8, ptr %digit, align 1
-  %call19 = call { i128, i8 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f73756274726163745f69313238(i128 %remaining16, i128 %scale17, i8 %digit18)
-  %output = extractvalue { i128, i8 } %call19, 0
-  store i128 %output, ptr %assignment_value, align 4
-  %assignment_value20 = load i128, ptr %assignment_value, align 4
-  %output21 = extractvalue { i128, i8 } %call19, 1
-  store i8 %output21, ptr %assignment_value22, align 1
-  %assignment_value23 = load i8, ptr %assignment_value22, align 1
-  store i128 %assignment_value20, ptr %remaining5, align 4
-  store i8 %assignment_value23, ptr %digit, align 1
-  %started24 = load i1, ptr %started6, align 1
-  br i1 %started24, label %short_circuit.merge, label %short_circuit.rhs
-
-if.else:                                          ; preds = %entry
-  %emit55 = load i64, ptr %emit7, align 4
-  br label %if.merge
-
-if.merge:                                         ; preds = %if.else, %if.merge33
-  %if = phi i64 [ %call54, %if.merge33 ], [ %emit55, %if.else ]
-  ret i64 %if
-
-short_circuit.rhs:                                ; preds = %if.then
-  %digit25 = load i8, ptr %digit, align 1
-  %zero_digit26 = load i8, ptr %zero_digit, align 1
-  %ne = icmp ne i8 %digit25, %zero_digit26
-  br label %short_circuit.merge
-
-short_circuit.merge:                              ; preds = %short_circuit.rhs, %if.then
-  %short_circuit = phi i1 [ true, %if.then ], [ %ne, %short_circuit.rhs ]
-  br i1 %short_circuit, label %short_circuit.merge28, label %short_circuit.rhs27
-
-short_circuit.rhs27:                              ; preds = %short_circuit.merge
-  %position29 = load i64, ptr %position2, align 4
-  %last30 = load i64, ptr %last4, align 4
-  %eq = icmp eq i64 %position29, %last30
-  br label %short_circuit.merge28
-
-short_circuit.merge28:                            ; preds = %short_circuit.rhs27, %short_circuit.merge
-  %short_circuit31 = phi i1 [ true, %short_circuit.merge ], [ %eq, %short_circuit.rhs27 ]
-  br i1 %short_circuit31, label %if.then32, label %if.merge33
-
-if.then32:                                        ; preds = %short_circuit.merge28
-  %digit34 = load i8, ptr %digit, align 1
-  store i8 %digit34, ptr %assignment_value35, align 1
-  %assignment_value36 = load i8, ptr %assignment_value35, align 1
-  %scratch37 = load ptr, ptr %scratch1, align 8
-  %emit38 = load i64, ptr %emit7, align 4
-  %array_element = getelementptr inbounds i8, ptr %scratch37, i64 %emit38
-  store i8 %assignment_value36, ptr %array_element, align 1
-  %emit39 = load i64, ptr %emit7, align 4
-  %one40 = load i64, ptr %one, align 4
-  %add = add i64 %emit39, %one40
-  store i64 %add, ptr %assignment_value41, align 4
-  %assignment_value42 = load i64, ptr %assignment_value41, align 4
-  store i64 %assignment_value42, ptr %emit7, align 4
-  store i1 true, ptr %assignment_value43, align 1
-  %assignment_value44 = load i1, ptr %assignment_value43, align 1
-  store i1 %assignment_value44, ptr %started6, align 1
-  br label %if.merge33
-
-if.merge33:                                       ; preds = %if.then32, %short_circuit.merge28
-  %scratch45 = load ptr, ptr %scratch1, align 8
-  %position46 = load i64, ptr %position2, align 4
-  %one47 = load i64, ptr %one, align 4
-  %add48 = add i64 %position46, %one47
-  %digits49 = load i64, ptr %digits3, align 4
-  %last50 = load i64, ptr %last4, align 4
-  %remaining51 = load i128, ptr %remaining5, align 4
-  %started52 = load i1, ptr %started6, align 1
-  %emit53 = load i64, ptr %emit7, align 4
-  %call54 = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f69313238(ptr %scratch45, i64 %add48, i64 %digits49, i64 %last50, i128 %remaining51, i1 %started52, i64 %emit53)
-  br label %if.merge
-}
-
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f69313238(i128 %value, ptr %0) {
-entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
-  %assignment_value44 = alloca i32, align 4
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
+  %assignment_value = alloca i32, align 4
   %data = alloca i32, align 4
-  %assignment_value37 = alloca i8, align 1
-  %assignment_value30 = alloca i64, align 8
-  %assignment_value23 = alloca i128, align 8
-  %assignment_value18 = alloca i128, align 8
-  %assignment_value10 = alloca i64, align 8
-  %assignment_value = alloca i8, align 1
+  %length = alloca i64, align 8
+  %magnitude = alloca i128, align 8
+  %before_last = alloca i128, align 8
   %negative = alloca i1, align 1
-  %remaining = alloca i128, align 8
-  %emit = alloca i64, align 8
-  %minimum = alloca i128, align 8
   %zero = alloca i128, align 8
-  %minus = alloca i8, align 1
-  %last = alloca i64, align 8
-  %zero_count = alloca i64, align 8
-  %one = alloca i64, align 8
-  %digits = alloca i64, align 8
+  %capacity = alloca i64, align 8
   %value1 = alloca i128, align 8
   store i128 %value, ptr %value1, align 4
   %allocation = call ptr @__wosy_core_alloc(i64 40, i64 1)
@@ -9628,110 +9397,60 @@ allocation_panic:                                 ; preds = %entry
   unreachable
 
 allocation_continue:                              ; preds = %entry
-  store i64 39, ptr %digits, align 4
-  store i64 1, ptr %one, align 4
-  store i64 0, ptr %zero_count, align 4
-  store i64 38, ptr %last, align 4
-  store i8 45, ptr %minus, align 1
+  store i64 40, ptr %capacity, align 4
   store i128 0, ptr %zero, align 4
-  store i128 -170141183460469231731687303715884105728, ptr %minimum, align 4
-  %zero_count2 = load i64, ptr %zero_count, align 4
-  store i64 %zero_count2, ptr %emit, align 4
-  %value3 = load i128, ptr %value1, align 4
-  store i128 %value3, ptr %remaining, align 4
-  %value4 = load i128, ptr %value1, align 4
-  %zero5 = load i128, ptr %zero, align 4
-  %lt = icmp slt i128 %value4, %zero5
+  %value2 = load i128, ptr %value1, align 4
+  %zero3 = load i128, ptr %zero, align 4
+  %lt = icmp slt i128 %value2, %zero3
   store i1 %lt, ptr %negative, align 1
-  %negative6 = load i1, ptr %negative, align 1
-  br i1 %negative6, label %if.then, label %if.merge
+  %negative4 = load i1, ptr %negative, align 1
+  br i1 %negative4, label %if.then, label %if.else
 
 if.then:                                          ; preds = %allocation_continue
-  %minus7 = load i8, ptr %minus, align 1
-  store i8 %minus7, ptr %assignment_value, align 1
-  %assignment_value8 = load i8, ptr %assignment_value, align 1
-  %array_element = getelementptr inbounds i8, ptr %allocation, i64 0
-  store i8 %assignment_value8, ptr %array_element, align 1
-  %one9 = load i64, ptr %one, align 4
-  store i64 %one9, ptr %assignment_value10, align 4
-  %assignment_value11 = load i64, ptr %assignment_value10, align 4
-  store i64 %assignment_value11, ptr %emit, align 4
-  %value12 = load i128, ptr %value1, align 4
-  %minimum13 = load i128, ptr %minimum, align 4
-  %eq = icmp eq i128 %value12, %minimum13
-  br i1 %eq, label %if.then14, label %if.else
-
-if.merge:                                         ; preds = %if.merge15, %allocation_continue
-  %zero_count25 = load i64, ptr %zero_count, align 4
-  %digits26 = load i64, ptr %digits, align 4
-  %last27 = load i64, ptr %last, align 4
-  %remaining28 = load i128, ptr %remaining, align 4
-  %emit29 = load i64, ptr %emit, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f69313238(ptr %allocation, i64 %zero_count25, i64 %digits26, i64 %last27, i128 %remaining28, i1 false, i64 %emit29)
-  store i64 %call, ptr %assignment_value30, align 4
-  %assignment_value31 = load i64, ptr %assignment_value30, align 4
-  store i64 %assignment_value31, ptr %emit, align 4
-  %value32 = load i128, ptr %value1, align 4
-  %minimum33 = load i128, ptr %minimum, align 4
-  %eq34 = icmp eq i128 %value32, %minimum33
-  br i1 %eq34, label %if.then35, label %if.merge36
-
-if.then14:                                        ; preds = %if.then
-  %zero16 = load i128, ptr %zero, align 4
-  %value17 = load i128, ptr %value1, align 4
-  %add = add i128 %value17, 1
-  %sub = sub i128 %zero16, %add
-  store i128 %sub, ptr %assignment_value18, align 4
-  %assignment_value19 = load i128, ptr %assignment_value18, align 4
-  store i128 %assignment_value19, ptr %remaining, align 4
-  br label %if.merge15
-
-if.else:                                          ; preds = %if.then
-  %zero20 = load i128, ptr %zero, align 4
-  %value21 = load i128, ptr %value1, align 4
-  %sub22 = sub i128 %zero20, %value21
-  store i128 %sub22, ptr %assignment_value23, align 4
-  %assignment_value24 = load i128, ptr %assignment_value23, align 4
-  store i128 %assignment_value24, ptr %remaining, align 4
-  br label %if.merge15
-
-if.merge15:                                       ; preds = %if.else, %if.then14
+  %zero5 = load i128, ptr %zero, align 4
+  %value6 = load i128, ptr %value1, align 4
+  %add = add i128 %value6, 1
+  %sub = sub i128 %zero5, %add
+  store i128 %sub, ptr %before_last, align 4
+  %before_last7 = load i128, ptr %before_last, align 4
+  %add8 = add i128 %before_last7, 1
   br label %if.merge
 
-if.then35:                                        ; preds = %if.merge
-  store i8 56, ptr %assignment_value37, align 1
-  %assignment_value38 = load i8, ptr %assignment_value37, align 1
-  %emit39 = load i64, ptr %emit, align 4
-  %one40 = load i64, ptr %one, align 4
-  %sub41 = sub i64 %emit39, %one40
-  %array_element42 = getelementptr inbounds i8, ptr %allocation, i64 %sub41
-  store i8 %assignment_value38, ptr %array_element42, align 1
-  br label %if.merge36
+if.else:                                          ; preds = %allocation_continue
+  %value9 = load i128, ptr %value1, align 4
+  br label %if.merge
 
-if.merge36:                                       ; preds = %if.then35, %if.merge
+if.merge:                                         ; preds = %if.else, %if.then
+  %if = phi i128 [ %add8, %if.then ], [ %value9, %if.else ]
+  store i128 %if, ptr %magnitude, align 4
+  %magnitude10 = load i128, ptr %magnitude, align 4
+  %negative11 = load i1, ptr %negative, align 1
+  %capacity12 = load i64, ptr %capacity, align 4
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f776964655f646563696d616c(ptr %allocation, i128 %magnitude10, i1 %negative11, i64 %capacity12)
+  store i64 %call, ptr %length, align 4
   store i32 0, ptr %data, align 4
-  %array_element43 = getelementptr inbounds i8, ptr %allocation, i64 0
-  %address = ptrtoint ptr %array_element43 to i32
-  store i32 %address, ptr %assignment_value44, align 4
-  %assignment_value45 = load i32, ptr %assignment_value44, align 4
-  store i32 %assignment_value45, ptr %data, align 4
-  %data46 = load i32, ptr %data, align 4
-  %emit47 = load i64, ptr %emit, align 4
-  %data48 = getelementptr inbounds i8, ptr %struct_literal, i8 0
-  store i32 %data46, ptr %data48, align 4
-  %length = getelementptr inbounds i8, ptr %struct_literal, i8 8
-  store i64 %emit47, ptr %length, align 4
+  %array_element = getelementptr inbounds i8, ptr %allocation, i64 0
+  %address = ptrtoint ptr %array_element to i32
+  store i32 %address, ptr %assignment_value, align 4
+  %assignment_value13 = load i32, ptr %assignment_value, align 4
+  store i32 %assignment_value13, ptr %data, align 4
+  %data14 = load i32, ptr %data, align 4
+  %length15 = load i64, ptr %length, align 4
+  %data16 = getelementptr inbounds i8, ptr %struct_literal, i8 0
+  store i32 %data14, ptr %data16, align 4
+  %length17 = getelementptr inbounds i8, ptr %struct_literal, i8 8
+  store i64 %length15, ptr %length17, align 4
   %struct_value = load [16 x i8], ptr %struct_literal, align 1
   store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value49 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value49, ptr %0, align 1
+  %struct_value18 = load [16 x i8], ptr %text, align 1
+  store [16 x i8] %struct_value18, ptr %0, align 1
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f7538(i8 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f7538(i8 %value, ptr %0) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
   %assignment_value17 = alloca i32, align 4
   %data = alloca i32, align 4
   %length = alloca i64, align 8
@@ -9786,7 +9505,7 @@ if.merge:                                         ; preds = %if.then, %allocatio
   %index13 = load i64, ptr %index, align 4
   %remaining14 = load i8, ptr %remaining, align 1
   %capacity15 = load i64, ptr %capacity, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f7538(ptr %allocation, i64 %index13, i8 %remaining14, i64 %capacity15)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f7538(ptr %allocation, i64 %index13, i8 %remaining14, i64 %capacity15)
   store i64 %call, ptr %length, align 4
   store i32 0, ptr %data, align 4
   %array_element16 = getelementptr inbounds i8, ptr %allocation, i64 0
@@ -9807,10 +9526,10 @@ if.merge:                                         ; preds = %if.then, %allocatio
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f753136(i16 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f753136(i16 %value, ptr %0) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
   %assignment_value17 = alloca i32, align 4
   %data = alloca i32, align 4
   %length = alloca i64, align 8
@@ -9865,7 +9584,7 @@ if.merge:                                         ; preds = %if.then, %allocatio
   %index13 = load i64, ptr %index, align 4
   %remaining14 = load i16, ptr %remaining, align 2
   %capacity15 = load i64, ptr %capacity, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f753136(ptr %allocation, i64 %index13, i16 %remaining14, i64 %capacity15)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f753136(ptr %allocation, i64 %index13, i16 %remaining14, i64 %capacity15)
   store i64 %call, ptr %length, align 4
   store i32 0, ptr %data, align 4
   %array_element16 = getelementptr inbounds i8, ptr %allocation, i64 0
@@ -9886,10 +9605,10 @@ if.merge:                                         ; preds = %if.then, %allocatio
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f753332(i32 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f753332(i32 %value, ptr %0) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
   %assignment_value17 = alloca i32, align 4
   %data = alloca i32, align 4
   %length = alloca i64, align 8
@@ -9944,7 +9663,7 @@ if.merge:                                         ; preds = %if.then, %allocatio
   %index13 = load i64, ptr %index, align 4
   %remaining14 = load i32, ptr %remaining, align 4
   %capacity15 = load i64, ptr %capacity, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f753332(ptr %allocation, i64 %index13, i32 %remaining14, i64 %capacity15)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f753332(ptr %allocation, i64 %index13, i32 %remaining14, i64 %capacity15)
   store i64 %call, ptr %length, align 4
   store i32 0, ptr %data, align 4
   %array_element16 = getelementptr inbounds i8, ptr %allocation, i64 0
@@ -9965,10 +9684,10 @@ if.merge:                                         ; preds = %if.then, %allocatio
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f753634(i64 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f753634(i64 %value, ptr %0) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
   %assignment_value17 = alloca i32, align 4
   %data = alloca i32, align 4
   %length = alloca i64, align 8
@@ -10023,7 +9742,7 @@ if.merge:                                         ; preds = %if.then, %allocatio
   %index13 = load i64, ptr %index, align 4
   %remaining14 = load i64, ptr %remaining, align 4
   %capacity15 = load i64, ptr %capacity, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f753634(ptr %allocation, i64 %index13, i64 %remaining14, i64 %capacity15)
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f753634(ptr %allocation, i64 %index13, i64 %remaining14, i64 %capacity15)
   store i64 %call, ptr %length, align 4
   store i32 0, ptr %data, align 4
   %array_element16 = getelementptr inbounds i8, ptr %allocation, i64 0
@@ -10044,57 +9763,7 @@ if.merge:                                         ; preds = %if.then, %allocatio
   ret ptr %allocation
 }
 
-define i128 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f7363616c655f75313238(i128 %scale, i64 %step, i64 %steps) {
-entry:
-  %eighth = alloca i128, align 8
-  %fourth = alloca i128, align 8
-  %twice = alloca i128, align 8
-  %one = alloca i64, align 8
-  %scale1 = alloca i128, align 8
-  store i128 %scale, ptr %scale1, align 4
-  %step2 = alloca i64, align 8
-  store i64 %step, ptr %step2, align 4
-  %steps3 = alloca i64, align 8
-  store i64 %steps, ptr %steps3, align 4
-  %step4 = load i64, ptr %step2, align 4
-  %steps5 = load i64, ptr %steps3, align 4
-  %lt = icmp ult i64 %step4, %steps5
-  br i1 %lt, label %if.then, label %if.else
-
-if.then:                                          ; preds = %entry
-  store i64 1, ptr %one, align 4
-  %scale6 = load i128, ptr %scale1, align 4
-  %scale7 = load i128, ptr %scale1, align 4
-  %add = add i128 %scale6, %scale7
-  store i128 %add, ptr %twice, align 4
-  %twice8 = load i128, ptr %twice, align 4
-  %twice9 = load i128, ptr %twice, align 4
-  %add10 = add i128 %twice8, %twice9
-  store i128 %add10, ptr %fourth, align 4
-  %fourth11 = load i128, ptr %fourth, align 4
-  %fourth12 = load i128, ptr %fourth, align 4
-  %add13 = add i128 %fourth11, %fourth12
-  store i128 %add13, ptr %eighth, align 4
-  %eighth14 = load i128, ptr %eighth, align 4
-  %twice15 = load i128, ptr %twice, align 4
-  %add16 = add i128 %eighth14, %twice15
-  %step17 = load i64, ptr %step2, align 4
-  %one18 = load i64, ptr %one, align 4
-  %add19 = add i64 %step17, %one18
-  %steps20 = load i64, ptr %steps3, align 4
-  %call = call i128 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f7363616c655f75313238(i128 %add16, i64 %add19, i64 %steps20)
-  br label %if.merge
-
-if.else:                                          ; preds = %entry
-  %scale21 = load i128, ptr %scale1, align 4
-  br label %if.merge
-
-if.merge:                                         ; preds = %if.else, %if.then
-  %if = phi i128 [ %call, %if.then ], [ %scale21, %if.else ]
-  ret i128 %if
-}
-
-define { i128, i8 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f73756274726163745f75313238(i128 %remaining, i128 %scale, i8 %digit) {
+define { i128, i8 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f73756274726163745f75313238(i128 %remaining, i128 %scale, i8 %digit) {
 entry:
   %next_digit = alloca i8, align 1
   %rest = alloca i128, align 8
@@ -10119,7 +9788,7 @@ if.then:                                          ; preds = %entry
   %digit9 = load i8, ptr %digit3, align 1
   %one_digit10 = load i8, ptr %one_digit, align 1
   %add = add i8 %digit9, %one_digit10
-  %call = call { i128, i8 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f73756274726163745f75313238(i128 %sub, i128 %scale8, i8 %add)
+  %call = call { i128, i8 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f73756274726163745f75313238(i128 %sub, i128 %scale8, i8 %add)
   %output = extractvalue { i128, i8 } %call, 0
   store i128 %output, ptr %rest, align 4
   %output11 = extractvalue { i128, i8 } %call, 1
@@ -10142,140 +9811,314 @@ if.merge:                                         ; preds = %if.else, %if.then
   ret { i128, i8 } %if
 }
 
-define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f75313238(ptr %scratch, i64 %position, i64 %capacity, i64 %last, i128 %remaining, i1 %started, i64 %emit) {
+define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f646563696d616c5f6368756e6b73(ptr %scratch, i64 %index, i64 %remaining, i64 %upper, i64 %width, i8 %leading, i1 %has_upper, i1 %negative, i64 %capacity) {
 entry:
-  %assignment_value43 = alloca i1, align 1
-  %assignment_value41 = alloca i64, align 8
-  %assignment_value35 = alloca i8, align 1
-  %assignment_value22 = alloca i8, align 1
-  %assignment_value = alloca i128, align 8
+  %length = alloca i64, align 8
+  %assignment_value94 = alloca i8, align 1
+  %assignment_value92 = alloca i64, align 8
+  %assignment_value81 = alloca i8, align 1
+  %assignment_value76 = alloca i64, align 8
+  %padded = alloca i64, align 8
+  %assignment_value39 = alloca i64, align 8
+  %assignment_value27 = alloca i8, align 1
+  %assignment_value = alloca i64, align 8
   %digit = alloca i8, align 1
-  %scale = alloca i128, align 8
-  %steps = alloca i64, align 8
-  %one_wide = alloca i128, align 8
+  %remainder = alloca i64, align 8
+  %quotient = alloca i64, align 8
+  %ten = alloca i64, align 8
   %zero_digit = alloca i8, align 1
-  %zero = alloca i64, align 8
   %one = alloca i64, align 8
+  %zero = alloca i64, align 8
   %scratch1 = alloca ptr, align 8
   store ptr %scratch, ptr %scratch1, align 8
-  %position2 = alloca i64, align 8
-  store i64 %position, ptr %position2, align 4
-  %capacity3 = alloca i64, align 8
-  store i64 %capacity, ptr %capacity3, align 4
-  %last4 = alloca i64, align 8
-  store i64 %last, ptr %last4, align 4
-  %remaining5 = alloca i128, align 8
-  store i128 %remaining, ptr %remaining5, align 4
-  %started6 = alloca i1, align 1
-  store i1 %started, ptr %started6, align 1
-  %emit7 = alloca i64, align 8
-  store i64 %emit, ptr %emit7, align 4
-  %position8 = load i64, ptr %position2, align 4
-  %capacity9 = load i64, ptr %capacity3, align 4
-  %lt = icmp ult i64 %position8, %capacity9
-  br i1 %lt, label %if.then, label %if.else
-
-if.then:                                          ; preds = %entry
-  store i64 1, ptr %one, align 4
+  %index2 = alloca i64, align 8
+  store i64 %index, ptr %index2, align 4
+  %remaining3 = alloca i64, align 8
+  store i64 %remaining, ptr %remaining3, align 4
+  %upper4 = alloca i64, align 8
+  store i64 %upper, ptr %upper4, align 4
+  %width5 = alloca i64, align 8
+  store i64 %width, ptr %width5, align 4
+  %leading6 = alloca i8, align 1
+  store i8 %leading, ptr %leading6, align 1
+  %has_upper7 = alloca i1, align 1
+  store i1 %has_upper, ptr %has_upper7, align 1
+  %negative8 = alloca i1, align 1
+  store i1 %negative, ptr %negative8, align 1
+  %capacity9 = alloca i64, align 8
+  store i64 %capacity, ptr %capacity9, align 4
   store i64 0, ptr %zero, align 4
+  store i64 1, ptr %one, align 4
   store i8 48, ptr %zero_digit, align 1
-  store i128 1, ptr %one_wide, align 4
-  %last10 = load i64, ptr %last4, align 4
-  %position11 = load i64, ptr %position2, align 4
-  %sub = sub i64 %last10, %position11
-  store i64 %sub, ptr %steps, align 4
-  %one_wide12 = load i128, ptr %one_wide, align 4
+  %remaining10 = load i64, ptr %remaining3, align 4
+  %zero11 = load i64, ptr %zero, align 4
+  %ne = icmp ne i64 %remaining10, %zero11
+  br i1 %ne, label %short_circuit.merge, label %short_circuit.rhs
+
+short_circuit.rhs:                                ; preds = %entry
+  %width12 = load i64, ptr %width5, align 4
   %zero13 = load i64, ptr %zero, align 4
-  %steps14 = load i64, ptr %steps, align 4
-  %call = call i128 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f7363616c655f75313238(i128 %one_wide12, i64 %zero13, i64 %steps14)
-  store i128 %call, ptr %scale, align 4
-  %zero_digit15 = load i8, ptr %zero_digit, align 1
-  store i8 %zero_digit15, ptr %digit, align 1
-  %remaining16 = load i128, ptr %remaining5, align 4
-  %scale17 = load i128, ptr %scale, align 4
-  %digit18 = load i8, ptr %digit, align 1
-  %call19 = call { i128, i8 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f73756274726163745f75313238(i128 %remaining16, i128 %scale17, i8 %digit18)
-  %output = extractvalue { i128, i8 } %call19, 0
-  store i128 %output, ptr %assignment_value, align 4
-  %assignment_value20 = load i128, ptr %assignment_value, align 4
-  %output21 = extractvalue { i128, i8 } %call19, 1
-  store i8 %output21, ptr %assignment_value22, align 1
-  %assignment_value23 = load i8, ptr %assignment_value22, align 1
-  store i128 %assignment_value20, ptr %remaining5, align 4
-  store i8 %assignment_value23, ptr %digit, align 1
-  %started24 = load i1, ptr %started6, align 1
-  br i1 %started24, label %short_circuit.merge, label %short_circuit.rhs
-
-if.else:                                          ; preds = %entry
-  %emit55 = load i64, ptr %emit7, align 4
-  br label %if.merge
-
-if.merge:                                         ; preds = %if.else, %if.merge33
-  %if = phi i64 [ %call54, %if.merge33 ], [ %emit55, %if.else ]
-  ret i64 %if
-
-short_circuit.rhs:                                ; preds = %if.then
-  %digit25 = load i8, ptr %digit, align 1
-  %zero_digit26 = load i8, ptr %zero_digit, align 1
-  %ne = icmp ne i8 %digit25, %zero_digit26
+  %ne14 = icmp ne i64 %width12, %zero13
   br label %short_circuit.merge
 
-short_circuit.merge:                              ; preds = %short_circuit.rhs, %if.then
-  %short_circuit = phi i1 [ true, %if.then ], [ %ne, %short_circuit.rhs ]
-  br i1 %short_circuit, label %short_circuit.merge28, label %short_circuit.rhs27
+short_circuit.merge:                              ; preds = %short_circuit.rhs, %entry
+  %short_circuit = phi i1 [ true, %entry ], [ %ne14, %short_circuit.rhs ]
+  br i1 %short_circuit, label %if.then, label %if.else
 
-short_circuit.rhs27:                              ; preds = %short_circuit.merge
-  %position29 = load i64, ptr %position2, align 4
-  %last30 = load i64, ptr %last4, align 4
-  %eq = icmp eq i64 %position29, %last30
-  br label %short_circuit.merge28
+if.then:                                          ; preds = %short_circuit.merge
+  store i64 10, ptr %ten, align 4
+  %remaining15 = load i64, ptr %remaining3, align 4
+  %ten16 = load i64, ptr %ten, align 4
+  %div = udiv i64 %remaining15, %ten16
+  store i64 %div, ptr %quotient, align 4
+  %remaining17 = load i64, ptr %remaining3, align 4
+  %quotient18 = load i64, ptr %quotient, align 4
+  %ten19 = load i64, ptr %ten, align 4
+  %mul = mul i64 %quotient18, %ten19
+  %sub = sub i64 %remaining17, %mul
+  store i64 %sub, ptr %remainder, align 4
+  %remainder20 = load i64, ptr %remainder, align 4
+  %int_trunc = trunc i64 %remainder20 to i8
+  store i8 %int_trunc, ptr %digit, align 1
+  %index21 = load i64, ptr %index2, align 4
+  %one22 = load i64, ptr %one, align 4
+  %sub23 = sub i64 %index21, %one22
+  store i64 %sub23, ptr %assignment_value, align 4
+  %assignment_value24 = load i64, ptr %assignment_value, align 4
+  store i64 %assignment_value24, ptr %index2, align 4
+  %zero_digit25 = load i8, ptr %zero_digit, align 1
+  %digit26 = load i8, ptr %digit, align 1
+  %add = add i8 %zero_digit25, %digit26
+  store i8 %add, ptr %assignment_value27, align 1
+  %assignment_value28 = load i8, ptr %assignment_value27, align 1
+  %scratch29 = load ptr, ptr %scratch1, align 8
+  %index30 = load i64, ptr %index2, align 4
+  %array_element = getelementptr inbounds i8, ptr %scratch29, i64 %index30
+  store i8 %assignment_value28, ptr %array_element, align 1
+  %width31 = load i64, ptr %width5, align 4
+  %zero32 = load i64, ptr %zero, align 4
+  %ne33 = icmp ne i64 %width31, %zero32
+  br i1 %ne33, label %if.then34, label %if.merge35
 
-short_circuit.merge28:                            ; preds = %short_circuit.rhs27, %short_circuit.merge
-  %short_circuit31 = phi i1 [ true, %short_circuit.merge ], [ %eq, %short_circuit.rhs27 ]
-  br i1 %short_circuit31, label %if.then32, label %if.merge33
+if.else:                                          ; preds = %short_circuit.merge
+  %has_upper50 = load i1, ptr %has_upper7, align 1
+  br i1 %has_upper50, label %if.then51, label %if.else52
 
-if.then32:                                        ; preds = %short_circuit.merge28
-  %digit34 = load i8, ptr %digit, align 1
-  store i8 %digit34, ptr %assignment_value35, align 1
-  %assignment_value36 = load i8, ptr %assignment_value35, align 1
-  %scratch37 = load ptr, ptr %scratch1, align 8
-  %emit38 = load i64, ptr %emit7, align 4
-  %array_element = getelementptr inbounds i8, ptr %scratch37, i64 %emit38
-  store i8 %assignment_value36, ptr %array_element, align 1
-  %emit39 = load i64, ptr %emit7, align 4
-  %one40 = load i64, ptr %one, align 4
-  %add = add i64 %emit39, %one40
-  store i64 %add, ptr %assignment_value41, align 4
-  %assignment_value42 = load i64, ptr %assignment_value41, align 4
-  store i64 %assignment_value42, ptr %emit7, align 4
-  store i1 true, ptr %assignment_value43, align 1
-  %assignment_value44 = load i1, ptr %assignment_value43, align 1
-  store i1 %assignment_value44, ptr %started6, align 1
-  br label %if.merge33
+if.merge:                                         ; preds = %if.merge53, %if.merge35
+  %if108 = phi i64 [ %call, %if.merge35 ], [ %if107, %if.merge53 ]
+  ret i64 %if108
 
-if.merge33:                                       ; preds = %if.then32, %short_circuit.merge28
-  %scratch45 = load ptr, ptr %scratch1, align 8
-  %position46 = load i64, ptr %position2, align 4
-  %one47 = load i64, ptr %one, align 4
-  %add48 = add i64 %position46, %one47
-  %capacity49 = load i64, ptr %capacity3, align 4
-  %last50 = load i64, ptr %last4, align 4
-  %remaining51 = load i128, ptr %remaining5, align 4
-  %started52 = load i1, ptr %started6, align 1
-  %emit53 = load i64, ptr %emit7, align 4
-  %call54 = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f75313238(ptr %scratch45, i64 %add48, i64 %capacity49, i64 %last50, i128 %remaining51, i1 %started52, i64 %emit53)
+if.then34:                                        ; preds = %if.then
+  %width36 = load i64, ptr %width5, align 4
+  %one37 = load i64, ptr %one, align 4
+  %sub38 = sub i64 %width36, %one37
+  store i64 %sub38, ptr %assignment_value39, align 4
+  %assignment_value40 = load i64, ptr %assignment_value39, align 4
+  store i64 %assignment_value40, ptr %width5, align 4
+  br label %if.merge35
+
+if.merge35:                                       ; preds = %if.then34, %if.then
+  %scratch41 = load ptr, ptr %scratch1, align 8
+  %index42 = load i64, ptr %index2, align 4
+  %quotient43 = load i64, ptr %quotient, align 4
+  %upper44 = load i64, ptr %upper4, align 4
+  %width45 = load i64, ptr %width5, align 4
+  %leading46 = load i8, ptr %leading6, align 1
+  %has_upper47 = load i1, ptr %has_upper7, align 1
+  %negative48 = load i1, ptr %negative8, align 1
+  %capacity49 = load i64, ptr %capacity9, align 4
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f646563696d616c5f6368756e6b73(ptr %scratch41, i64 %index42, i64 %quotient43, i64 %upper44, i64 %width45, i8 %leading46, i1 %has_upper47, i1 %negative48, i64 %capacity49)
   br label %if.merge
+
+if.then51:                                        ; preds = %if.else
+  %leading54 = load i8, ptr %leading6, align 1
+  %ne55 = icmp ne i8 %leading54, 0
+  br i1 %ne55, label %if.then56, label %if.else57
+
+if.else52:                                        ; preds = %if.else
+  %leading69 = load i8, ptr %leading6, align 1
+  %ne70 = icmp ne i8 %leading69, 0
+  br i1 %ne70, label %if.then71, label %if.merge72
+
+if.merge53:                                       ; preds = %if.merge88, %if.merge58
+  %if107 = phi i64 [ %call68, %if.merge58 ], [ %length106, %if.merge88 ]
+  br label %if.merge
+
+if.then56:                                        ; preds = %if.then51
+  br label %if.merge58
+
+if.else57:                                        ; preds = %if.then51
+  %zero59 = load i64, ptr %zero, align 4
+  br label %if.merge58
+
+if.merge58:                                       ; preds = %if.else57, %if.then56
+  %if = phi i64 [ 19, %if.then56 ], [ %zero59, %if.else57 ]
+  store i64 %if, ptr %padded, align 4
+  %scratch60 = load ptr, ptr %scratch1, align 8
+  %index61 = load i64, ptr %index2, align 4
+  %upper62 = load i64, ptr %upper4, align 4
+  %zero63 = load i64, ptr %zero, align 4
+  %padded64 = load i64, ptr %padded, align 4
+  %leading65 = load i8, ptr %leading6, align 1
+  %negative66 = load i1, ptr %negative8, align 1
+  %capacity67 = load i64, ptr %capacity9, align 4
+  %call68 = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f646563696d616c5f6368756e6b73(ptr %scratch60, i64 %index61, i64 %upper62, i64 %zero63, i64 %padded64, i8 %leading65, i1 false, i1 %negative66, i64 %capacity67)
+  br label %if.merge53
+
+if.then71:                                        ; preds = %if.else52
+  %index73 = load i64, ptr %index2, align 4
+  %one74 = load i64, ptr %one, align 4
+  %sub75 = sub i64 %index73, %one74
+  store i64 %sub75, ptr %assignment_value76, align 4
+  %assignment_value77 = load i64, ptr %assignment_value76, align 4
+  store i64 %assignment_value77, ptr %index2, align 4
+  %zero_digit78 = load i8, ptr %zero_digit, align 1
+  %leading79 = load i8, ptr %leading6, align 1
+  %add80 = add i8 %zero_digit78, %leading79
+  store i8 %add80, ptr %assignment_value81, align 1
+  %assignment_value82 = load i8, ptr %assignment_value81, align 1
+  %scratch83 = load ptr, ptr %scratch1, align 8
+  %index84 = load i64, ptr %index2, align 4
+  %array_element85 = getelementptr inbounds i8, ptr %scratch83, i64 %index84
+  store i8 %assignment_value82, ptr %array_element85, align 1
+  br label %if.merge72
+
+if.merge72:                                       ; preds = %if.then71, %if.else52
+  %negative86 = load i1, ptr %negative8, align 1
+  br i1 %negative86, label %if.then87, label %if.merge88
+
+if.then87:                                        ; preds = %if.merge72
+  %index89 = load i64, ptr %index2, align 4
+  %one90 = load i64, ptr %one, align 4
+  %sub91 = sub i64 %index89, %one90
+  store i64 %sub91, ptr %assignment_value92, align 4
+  %assignment_value93 = load i64, ptr %assignment_value92, align 4
+  store i64 %assignment_value93, ptr %index2, align 4
+  store i8 45, ptr %assignment_value94, align 1
+  %assignment_value95 = load i8, ptr %assignment_value94, align 1
+  %scratch96 = load ptr, ptr %scratch1, align 8
+  %index97 = load i64, ptr %index2, align 4
+  %array_element98 = getelementptr inbounds i8, ptr %scratch96, i64 %index97
+  store i8 %assignment_value95, ptr %array_element98, align 1
+  br label %if.merge88
+
+if.merge88:                                       ; preds = %if.then87, %if.merge72
+  %capacity99 = load i64, ptr %capacity9, align 4
+  %index100 = load i64, ptr %index2, align 4
+  %sub101 = sub i64 %capacity99, %index100
+  store i64 %sub101, ptr %length, align 4
+  %scratch102 = load ptr, ptr %scratch1, align 8
+  %zero103 = load i64, ptr %zero, align 4
+  %index104 = load i64, ptr %index2, align 4
+  %capacity105 = load i64, ptr %capacity9, align 4
+  call void @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f636f6d706163745f6279746573(ptr %scratch102, i64 %zero103, i64 %index104, i64 %capacity105)
+  %length106 = load i64, ptr %length, align 4
+  br label %if.merge53
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f75313238(i128 %value, ptr %0) {
+define i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f776964655f646563696d616c(ptr %scratch, i128 %value, i1 %negative, i64 %capacity) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
+  %assignment_value31 = alloca i64, align 8
+  %assignment_value27 = alloca i64, align 8
+  %assignment_value25 = alloca i64, align 8
+  %assignment_value21 = alloca i8, align 1
+  %assignment_value18 = alloca i128, align 8
+  %assignment_value = alloca i64, align 8
+  %remainder = alloca i128, align 8
+  %quotient = alloca i128, align 8
+  %has_upper = alloca i1, align 1
+  %leading = alloca i8, align 1
+  %width = alloca i64, align 8
+  %upper = alloca i64, align 8
+  %remaining = alloca i64, align 8
+  %chunk_base = alloca i128, align 8
+  %scratch1 = alloca ptr, align 8
+  store ptr %scratch, ptr %scratch1, align 8
+  %value2 = alloca i128, align 8
+  store i128 %value, ptr %value2, align 4
+  %negative3 = alloca i1, align 1
+  store i1 %negative, ptr %negative3, align 1
+  %capacity4 = alloca i64, align 8
+  store i64 %capacity, ptr %capacity4, align 4
+  store i128 10000000000000000000, ptr %chunk_base, align 4
+  store i64 0, ptr %remaining, align 4
+  store i64 0, ptr %upper, align 4
+  store i64 1, ptr %width, align 4
+  store i8 0, ptr %leading, align 1
+  %value5 = load i128, ptr %value2, align 4
+  %chunk_base6 = load i128, ptr %chunk_base, align 4
+  %ge = icmp uge i128 %value5, %chunk_base6
+  store i1 %ge, ptr %has_upper, align 1
+  %has_upper7 = load i1, ptr %has_upper, align 1
+  br i1 %has_upper7, label %if.then, label %if.else
+
+if.then:                                          ; preds = %entry
+  %value8 = load i128, ptr %value2, align 4
+  %chunk_base9 = load i128, ptr %chunk_base, align 4
+  %div = udiv i128 %value8, %chunk_base9
+  store i128 %div, ptr %quotient, align 4
+  %value10 = load i128, ptr %value2, align 4
+  %quotient11 = load i128, ptr %quotient, align 4
+  %chunk_base12 = load i128, ptr %chunk_base, align 4
+  %mul = mul i128 %quotient11, %chunk_base12
+  %sub = sub i128 %value10, %mul
+  store i128 %sub, ptr %remainder, align 4
+  %remainder13 = load i128, ptr %remainder, align 4
+  %int_trunc = trunc i128 %remainder13 to i64
+  store i64 %int_trunc, ptr %assignment_value, align 4
+  %assignment_value14 = load i64, ptr %assignment_value, align 4
+  store i64 %assignment_value14, ptr %remaining, align 4
+  %quotient15 = load i128, ptr %quotient, align 4
+  %chunk_base16 = load i128, ptr %chunk_base, align 4
+  %leading17 = load i8, ptr %leading, align 1
+  %call = call { i128, i8 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f73756274726163745f75313238(i128 %quotient15, i128 %chunk_base16, i8 %leading17)
+  %output = extractvalue { i128, i8 } %call, 0
+  store i128 %output, ptr %assignment_value18, align 4
+  %assignment_value19 = load i128, ptr %assignment_value18, align 4
+  %output20 = extractvalue { i128, i8 } %call, 1
+  store i8 %output20, ptr %assignment_value21, align 1
+  %assignment_value22 = load i8, ptr %assignment_value21, align 1
+  store i128 %assignment_value19, ptr %quotient, align 4
+  store i8 %assignment_value22, ptr %leading, align 1
+  %quotient23 = load i128, ptr %quotient, align 4
+  %int_trunc24 = trunc i128 %quotient23 to i64
+  store i64 %int_trunc24, ptr %assignment_value25, align 4
+  %assignment_value26 = load i64, ptr %assignment_value25, align 4
+  store i64 %assignment_value26, ptr %upper, align 4
+  store i64 19, ptr %assignment_value27, align 4
+  %assignment_value28 = load i64, ptr %assignment_value27, align 4
+  store i64 %assignment_value28, ptr %width, align 4
+  br label %if.merge
+
+if.else:                                          ; preds = %entry
+  %value29 = load i128, ptr %value2, align 4
+  %int_trunc30 = trunc i128 %value29 to i64
+  store i64 %int_trunc30, ptr %assignment_value31, align 4
+  %assignment_value32 = load i64, ptr %assignment_value31, align 4
+  store i64 %assignment_value32, ptr %remaining, align 4
+  br label %if.merge
+
+if.merge:                                         ; preds = %if.else, %if.then
+  %scratch33 = load ptr, ptr %scratch1, align 8
+  %capacity34 = load i64, ptr %capacity4, align 4
+  %remaining35 = load i64, ptr %remaining, align 4
+  %upper36 = load i64, ptr %upper, align 4
+  %width37 = load i64, ptr %width, align 4
+  %leading38 = load i8, ptr %leading, align 1
+  %has_upper39 = load i1, ptr %has_upper, align 1
+  %negative40 = load i1, ptr %negative3, align 1
+  %capacity41 = load i64, ptr %capacity4, align 4
+  %call42 = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f646563696d616c5f6368756e6b73(ptr %scratch33, i64 %capacity34, i64 %remaining35, i64 %upper36, i64 %width37, i8 %leading38, i1 %has_upper39, i1 %negative40, i64 %capacity41)
+  ret i64 %call42
+}
+
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f75313238(i128 %value, ptr %0) {
+entry:
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
   %assignment_value = alloca i32, align 4
   %data = alloca i32, align 4
-  %emit = alloca i64, align 8
-  %last = alloca i64, align 8
-  %zero = alloca i64, align 8
+  %length = alloca i64, align 8
   %capacity = alloca i64, align 8
   %value1 = alloca i128, align 8
   store i128 %value, ptr %value1, align 4
@@ -10289,35 +10132,30 @@ allocation_panic:                                 ; preds = %entry
 
 allocation_continue:                              ; preds = %entry
   store i64 39, ptr %capacity, align 4
-  store i64 0, ptr %zero, align 4
-  store i64 38, ptr %last, align 4
-  %zero2 = load i64, ptr %zero, align 4
+  %value2 = load i128, ptr %value1, align 4
   %capacity3 = load i64, ptr %capacity, align 4
-  %last4 = load i64, ptr %last, align 4
-  %value5 = load i128, ptr %value1, align 4
-  %zero6 = load i64, ptr %zero, align 4
-  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f75313238(ptr %allocation, i64 %zero2, i64 %capacity3, i64 %last4, i128 %value5, i1 false, i64 %zero6)
-  store i64 %call, ptr %emit, align 4
+  %call = call i64 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f776964655f646563696d616c(ptr %allocation, i128 %value2, i1 false, i64 %capacity3)
+  store i64 %call, ptr %length, align 4
   store i32 0, ptr %data, align 4
   %array_element = getelementptr inbounds i8, ptr %allocation, i64 0
   %address = ptrtoint ptr %array_element to i32
   store i32 %address, ptr %assignment_value, align 4
-  %assignment_value7 = load i32, ptr %assignment_value, align 4
-  store i32 %assignment_value7, ptr %data, align 4
-  %data8 = load i32, ptr %data, align 4
-  %emit9 = load i64, ptr %emit, align 4
-  %data10 = getelementptr inbounds i8, ptr %struct_literal, i8 0
-  store i32 %data8, ptr %data10, align 4
-  %length = getelementptr inbounds i8, ptr %struct_literal, i8 8
-  store i64 %emit9, ptr %length, align 4
+  %assignment_value4 = load i32, ptr %assignment_value, align 4
+  store i32 %assignment_value4, ptr %data, align 4
+  %data5 = load i32, ptr %data, align 4
+  %length6 = load i64, ptr %length, align 4
+  %data7 = getelementptr inbounds i8, ptr %struct_literal, i8 0
+  store i32 %data5, ptr %data7, align 4
+  %length8 = getelementptr inbounds i8, ptr %struct_literal, i8 8
+  store i64 %length6, ptr %length8, align 4
   %struct_value = load [16 x i8], ptr %struct_literal, align 1
   store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value11 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value11, ptr %0, align 1
+  %struct_value9 = load [16 x i8], ptr %text, align 1
+  store [16 x i8] %struct_value9, ptr %0, align 1
   ret ptr %allocation
 }
 
-define { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6e6f726d616c697a655f666c6f61745f646f776e(double %scaled, i32 %exponent, i64 %budget) {
+define { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6e6f726d616c697a655f666c6f61745f646f776e(double %scaled, i32 %exponent, i64 %budget) {
 entry:
   %right_exponent = alloca i32, align 4
   %right = alloca double, align 8
@@ -10392,7 +10230,7 @@ if.else15:                                        ; preds = %if.else
   %scaled26 = load double, ptr %scaled1, align 8
   %exponent27 = load i32, ptr %exponent2, align 4
   %half28 = load i64, ptr %half, align 4
-  %call = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6e6f726d616c697a655f666c6f61745f646f776e(double %scaled26, i32 %exponent27, i64 %half28)
+  %call = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6e6f726d616c697a655f666c6f61745f646f776e(double %scaled26, i32 %exponent27, i64 %half28)
   %output29 = extractvalue { double, i32 } %call, 0
   store double %output29, ptr %left, align 8
   %output30 = extractvalue { double, i32 } %call, 1
@@ -10412,7 +10250,7 @@ if.then34:                                        ; preds = %if.else15
   %budget39 = load i64, ptr %budget3, align 4
   %half40 = load i64, ptr %half, align 4
   %sub = sub i64 %budget39, %half40
-  %call41 = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6e6f726d616c697a655f666c6f61745f646f776e(double %left37, i32 %left_exponent38, i64 %sub)
+  %call41 = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6e6f726d616c697a655f666c6f61745f646f776e(double %left37, i32 %left_exponent38, i64 %sub)
   %output42 = extractvalue { double, i32 } %call41, 0
   store double %output42, ptr %right, align 8
   %output43 = extractvalue { double, i32 } %call41, 1
@@ -10435,7 +10273,7 @@ if.merge36:                                       ; preds = %if.else35, %if.then
   br label %if.merge16
 }
 
-define { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6e6f726d616c697a655f666c6f61745f7570(double %scaled, i32 %exponent, i64 %budget) {
+define { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6e6f726d616c697a655f666c6f61745f7570(double %scaled, i32 %exponent, i64 %budget) {
 entry:
   %right_exponent = alloca i32, align 4
   %right = alloca double, align 8
@@ -10512,7 +10350,7 @@ if.else15:                                        ; preds = %if.else
   %scaled25 = load double, ptr %scaled1, align 8
   %exponent26 = load i32, ptr %exponent2, align 4
   %half27 = load i64, ptr %half, align 4
-  %call = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6e6f726d616c697a655f666c6f61745f7570(double %scaled25, i32 %exponent26, i64 %half27)
+  %call = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6e6f726d616c697a655f666c6f61745f7570(double %scaled25, i32 %exponent26, i64 %half27)
   %output28 = extractvalue { double, i32 } %call, 0
   store double %output28, ptr %left, align 8
   %output29 = extractvalue { double, i32 } %call, 1
@@ -10532,7 +10370,7 @@ if.then33:                                        ; preds = %if.else15
   %budget38 = load i64, ptr %budget3, align 4
   %half39 = load i64, ptr %half, align 4
   %sub40 = sub i64 %budget38, %half39
-  %call41 = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6e6f726d616c697a655f666c6f61745f7570(double %left36, i32 %left_exponent37, i64 %sub40)
+  %call41 = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6e6f726d616c697a655f666c6f61745f7570(double %left36, i32 %left_exponent37, i64 %sub40)
   %output42 = extractvalue { double, i32 } %call41, 0
   store double %output42, ptr %right, align 8
   %output43 = extractvalue { double, i32 } %call41, 1
@@ -10555,7 +10393,7 @@ if.merge35:                                       ; preds = %if.else34, %if.then
   br label %if.merge16
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f63617272795f663332(ptr %scratch, i64 %round_position, i64 %digit_start, i32 %exponent, i1 %rounding) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f63617272795f663332(ptr %scratch, i64 %round_position, i64 %digit_start, i32 %exponent, i1 %rounding) {
 entry:
   %assignment_value107 = alloca i32, align 4
   %assignment_value99 = alloca i8, align 1
@@ -10757,7 +10595,7 @@ if.merge74:                                       ; preds = %if.then73, %if.merg
   %digit_start86 = load i64, ptr %digit_start3, align 4
   %exponent87 = load i32, ptr %exponent4, align 4
   %rounding88 = load i1, ptr %rounding5, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f63617272795f663332(ptr %scratch84, i64 %round_position85, i64 %digit_start86, i32 %exponent87, i1 %rounding88)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f63617272795f663332(ptr %scratch84, i64 %round_position85, i64 %digit_start86, i32 %exponent87, i1 %rounding88)
   br label %if.merge
 
 if.then96:                                        ; preds = %if.else
@@ -10783,7 +10621,7 @@ if.merge97:                                       ; preds = %if.then96, %if.else
   br label %if.merge
 }
 
-define { i64, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f663332(ptr %scratch, i64 %digit_start, i64 %emit, i64 %produced, double %scaled, i32 %exponent) {
+define { i64, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f663332(ptr %scratch, i64 %digit_start, i64 %emit, i64 %produced, double %scaled, i32 %exponent) {
 entry:
   %assignment_value69 = alloca i32, align 4
   %five_value = alloca double, align 8
@@ -10905,7 +10743,7 @@ if.merge24:                                       ; preds = %if.then23, %if.then
   %add50 = add i64 %produced48, %one49
   %scaled51 = load double, ptr %scaled5, align 8
   %exponent52 = load i32, ptr %exponent6, align 4
-  %call = call { i64, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f663332(ptr %scratch45, i64 %digit_start46, i64 %emit47, i64 %add50, double %scaled51, i32 %exponent52)
+  %call = call { i64, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f663332(ptr %scratch45, i64 %digit_start46, i64 %emit47, i64 %add50, double %scaled51, i32 %exponent52)
   %output = extractvalue { i64, i32 } %call, 0
   store i64 %output, ptr %result_emit, align 4
   %output53 = extractvalue { i64, i32 } %call, 1
@@ -10923,7 +10761,7 @@ if.then60:                                        ; preds = %if.else
   %sub65 = sub i64 %emit63, %one64
   %digit_start66 = load i64, ptr %digit_start2, align 4
   %exponent67 = load i32, ptr %exponent6, align 4
-  %call68 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f63617272795f663332(ptr %scratch62, i64 %sub65, i64 %digit_start66, i32 %exponent67, i1 true)
+  %call68 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f63617272795f663332(ptr %scratch62, i64 %sub65, i64 %digit_start66, i32 %exponent67, i1 true)
   store i32 %call68, ptr %assignment_value69, align 4
   %assignment_value70 = load i32, ptr %assignment_value69, align 4
   store i32 %assignment_value70, ptr %exponent6, align 4
@@ -10937,10 +10775,10 @@ if.merge61:                                       ; preds = %if.then60, %if.else
   br label %if.merge
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f663332(float %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f663332(float %value, ptr %0) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
   %assignment_value180 = alloca i32, align 4
   %data = alloca i32, align 4
   %assignment_value177 = alloca i64, align 8
@@ -11074,7 +10912,7 @@ if.else:                                          ; preds = %if.merge13
   %magnitude50 = load double, ptr %magnitude, align 8
   %zero_count51 = load i32, ptr %zero_count, align 4
   %budget52 = load i64, ptr %budget, align 4
-  %call = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6e6f726d616c697a655f666c6f61745f646f776e(double %magnitude50, i32 %zero_count51, i64 %budget52)
+  %call = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6e6f726d616c697a655f666c6f61745f646f776e(double %magnitude50, i32 %zero_count51, i64 %budget52)
   %output = extractvalue { double, i32 } %call, 0
   store double %output, ptr %down, align 8
   %output53 = extractvalue { double, i32 } %call, 1
@@ -11082,7 +10920,7 @@ if.else:                                          ; preds = %if.merge13
   %down54 = load double, ptr %down, align 8
   %down_exponent55 = load i32, ptr %down_exponent, align 4
   %budget56 = load i64, ptr %budget, align 4
-  %call57 = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6e6f726d616c697a655f666c6f61745f7570(double %down54, i32 %down_exponent55, i64 %budget56)
+  %call57 = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6e6f726d616c697a655f666c6f61745f7570(double %down54, i32 %down_exponent55, i64 %budget56)
   %output58 = extractvalue { double, i32 } %call57, 0
   store double %output58, ptr %scaled, align 8
   %output59 = extractvalue { double, i32 } %call57, 1
@@ -11092,7 +10930,7 @@ if.else:                                          ; preds = %if.merge13
   %zero62 = load i64, ptr %zero, align 4
   %scaled63 = load double, ptr %scaled, align 8
   %normalized_exponent64 = load i32, ptr %normalized_exponent, align 4
-  %call65 = call { i64, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f663332(ptr %allocation, i64 %emit60, i64 %emit61, i64 %zero62, double %scaled63, i32 %normalized_exponent64)
+  %call65 = call { i64, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f663332(ptr %allocation, i64 %emit60, i64 %emit61, i64 %zero62, double %scaled63, i32 %normalized_exponent64)
   %output66 = extractvalue { i64, i32 } %call65, 0
   store i64 %output66, ptr %digit_emit, align 4
   %output67 = extractvalue { i64, i32 } %call65, 1
@@ -11308,7 +11146,7 @@ if.merge150:                                      ; preds = %if.then149, %if.mer
   br label %if.merge23
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f63617272795f663634(ptr %scratch, i64 %round_position, i64 %digit_start, i32 %exponent, i1 %rounding) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f63617272795f663634(ptr %scratch, i64 %round_position, i64 %digit_start, i32 %exponent, i1 %rounding) {
 entry:
   %assignment_value107 = alloca i32, align 4
   %assignment_value99 = alloca i8, align 1
@@ -11510,7 +11348,7 @@ if.merge74:                                       ; preds = %if.then73, %if.merg
   %digit_start86 = load i64, ptr %digit_start3, align 4
   %exponent87 = load i32, ptr %exponent4, align 4
   %rounding88 = load i1, ptr %rounding5, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f63617272795f663634(ptr %scratch84, i64 %round_position85, i64 %digit_start86, i32 %exponent87, i1 %rounding88)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f63617272795f663634(ptr %scratch84, i64 %round_position85, i64 %digit_start86, i32 %exponent87, i1 %rounding88)
   br label %if.merge
 
 if.then96:                                        ; preds = %if.else
@@ -11536,7 +11374,7 @@ if.merge97:                                       ; preds = %if.then96, %if.else
   br label %if.merge
 }
 
-define { i64, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f663634(ptr %scratch, i64 %digit_start, i64 %emit, i64 %produced, double %scaled, i32 %exponent) {
+define { i64, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f663634(ptr %scratch, i64 %digit_start, i64 %emit, i64 %produced, double %scaled, i32 %exponent) {
 entry:
   %assignment_value69 = alloca i32, align 4
   %five_value = alloca double, align 8
@@ -11658,7 +11496,7 @@ if.merge24:                                       ; preds = %if.then23, %if.then
   %add50 = add i64 %produced48, %one49
   %scaled51 = load double, ptr %scaled5, align 8
   %exponent52 = load i32, ptr %exponent6, align 4
-  %call = call { i64, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f663634(ptr %scratch45, i64 %digit_start46, i64 %emit47, i64 %add50, double %scaled51, i32 %exponent52)
+  %call = call { i64, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f663634(ptr %scratch45, i64 %digit_start46, i64 %emit47, i64 %add50, double %scaled51, i32 %exponent52)
   %output = extractvalue { i64, i32 } %call, 0
   store i64 %output, ptr %result_emit, align 4
   %output53 = extractvalue { i64, i32 } %call, 1
@@ -11676,7 +11514,7 @@ if.then60:                                        ; preds = %if.else
   %sub65 = sub i64 %emit63, %one64
   %digit_start66 = load i64, ptr %digit_start2, align 4
   %exponent67 = load i32, ptr %exponent6, align 4
-  %call68 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f63617272795f663634(ptr %scratch62, i64 %sub65, i64 %digit_start66, i32 %exponent67, i1 true)
+  %call68 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f63617272795f663634(ptr %scratch62, i64 %sub65, i64 %digit_start66, i32 %exponent67, i1 true)
   store i32 %call68, ptr %assignment_value69, align 4
   %assignment_value70 = load i32, ptr %assignment_value69, align 4
   store i32 %assignment_value70, ptr %exponent6, align 4
@@ -11690,10 +11528,10 @@ if.merge61:                                       ; preds = %if.then60, %if.else
   br label %if.merge
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f663634(double %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f663634(double %value, ptr %0) {
 entry:
-  %text = alloca [16 x i8], align 1
-  %struct_literal = alloca [16 x i8], align 1
+  %text = alloca [16 x i8], align 8
+  %struct_literal = alloca [16 x i8], align 8
   %assignment_value179 = alloca i32, align 4
   %data = alloca i32, align 4
   %assignment_value176 = alloca i64, align 8
@@ -11823,7 +11661,7 @@ if.else:                                          ; preds = %if.merge12
   %magnitude49 = load double, ptr %magnitude, align 8
   %zero_count50 = load i32, ptr %zero_count, align 4
   %budget51 = load i64, ptr %budget, align 4
-  %call = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6e6f726d616c697a655f666c6f61745f646f776e(double %magnitude49, i32 %zero_count50, i64 %budget51)
+  %call = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6e6f726d616c697a655f666c6f61745f646f776e(double %magnitude49, i32 %zero_count50, i64 %budget51)
   %output = extractvalue { double, i32 } %call, 0
   store double %output, ptr %down, align 8
   %output52 = extractvalue { double, i32 } %call, 1
@@ -11831,7 +11669,7 @@ if.else:                                          ; preds = %if.merge12
   %down53 = load double, ptr %down, align 8
   %down_exponent54 = load i32, ptr %down_exponent, align 4
   %budget55 = load i64, ptr %budget, align 4
-  %call56 = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6e6f726d616c697a655f666c6f61745f7570(double %down53, i32 %down_exponent54, i64 %budget55)
+  %call56 = call { double, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6e6f726d616c697a655f666c6f61745f7570(double %down53, i32 %down_exponent54, i64 %budget55)
   %output57 = extractvalue { double, i32 } %call56, 0
   store double %output57, ptr %scaled, align 8
   %output58 = extractvalue { double, i32 } %call56, 1
@@ -11841,7 +11679,7 @@ if.else:                                          ; preds = %if.merge12
   %zero61 = load i64, ptr %zero, align 4
   %scaled62 = load double, ptr %scaled, align 8
   %normalized_exponent63 = load i32, ptr %normalized_exponent, align 4
-  %call64 = call { i64, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6469676974735f663634(ptr %allocation, i64 %emit59, i64 %emit60, i64 %zero61, double %scaled62, i32 %normalized_exponent63)
+  %call64 = call { i64, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6469676974735f663634(ptr %allocation, i64 %emit59, i64 %emit60, i64 %zero61, double %scaled62, i32 %normalized_exponent63)
   %output65 = extractvalue { i64, i32 } %call64, 0
   store i64 %output65, ptr %digit_emit, align 4
   %output66 = extractvalue { i64, i32 } %call64, 1
@@ -12070,10 +11908,10 @@ entry:
   %complete = alloca i1, align 1
   %reported = alloca i64, align 8
   %_result = alloca i32, align 4
-  %_byte_count = alloca [4 x i8], align 1
-  %struct_literal5 = alloca [4 x i8], align 1
-  %_iovec = alloca [8 x i8], align 1
-  %struct_literal = alloca [8 x i8], align 1
+  %_byte_count = alloca [4 x i8], align 4
+  %struct_literal5 = alloca [4 x i8], align 4
+  %_iovec = alloca [8 x i8], align 4
+  %struct_literal = alloca [8 x i8], align 4
   %destination1 = alloca i32, align 4
   store i32 %destination, ptr %destination1, align 4
   %capacity2 = alloca i64, align 8
@@ -12245,12 +12083,12 @@ entry:
 
 define void @wosy_fn__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__736c6565705f6e73(i64 %nanoseconds) {
 entry:
-  %fired = alloca [4 x i8], align 1
-  %struct_literal21 = alloca [4 x i8], align 1
-  %event = alloca [32 x i8], align 1
-  %struct_literal3 = alloca [32 x i8], align 1
-  %sub = alloca [48 x i8], align 1
-  %struct_literal = alloca [48 x i8], align 1
+  %fired = alloca [4 x i8], align 4
+  %struct_literal21 = alloca [4 x i8], align 4
+  %event = alloca [32 x i8], align 8
+  %struct_literal3 = alloca [32 x i8], align 8
+  %sub = alloca [48 x i8], align 8
+  %struct_literal = alloca [48 x i8], align 8
   %nanoseconds1 = alloca i64, align 8
   store i64 %nanoseconds, ptr %nanoseconds1, align 4
   %nanoseconds2 = load i64, ptr %nanoseconds1, align 4
@@ -12347,237 +12185,237 @@ entry:
   ret void
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f3330__(i1 %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f3330__(i1 %value, ptr %0) {
 entry:
   %value1 = alloca i1, align 1
   store i1 %value, ptr %value1, align 1
   %value2 = load i1, ptr %value1, align 1
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f626f6f6c(i1 %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f626f6f6c(i1 %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f3331__(i32 %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f3331__(i32 %value, ptr %0) {
 entry:
   %value1 = alloca i32, align 4
   store i32 %value, ptr %value1, align 4
   %value2 = load i32, ptr %value1, align 4
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f63686172(i32 %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f63686172(i32 %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f33313330__(i64 %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f33313330__(i64 %value, ptr %0) {
 entry:
   %value1 = alloca i64, align 8
   store i64 %value, ptr %value1, align 4
   %value2 = load i64, ptr %value1, align 4
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f753634(i64 %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f753634(i64 %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f33313331__(i128 %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f33313331__(i128 %value, ptr %0) {
 entry:
   %value1 = alloca i128, align 8
   store i128 %value, ptr %value1, align 4
   %value2 = load i128, ptr %value1, align 4
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f75313238(i128 %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f75313238(i128 %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f33313332__(float %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f33313332__(float %value, ptr %0) {
 entry:
   %value1 = alloca float, align 4
   store float %value, ptr %value1, align 4
   %value2 = load float, ptr %value1, align 4
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f663332(float %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f663332(float %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f33313333__(double %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f33313333__(double %value, ptr %0) {
 entry:
   %value1 = alloca double, align 8
   store double %value, ptr %value1, align 8
   %value2 = load double, ptr %value1, align 8
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f663634(double %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f663634(double %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f3332__(i8 %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f3332__(i8 %value, ptr %0) {
 entry:
   %value1 = alloca i8, align 1
   store i8 %value, ptr %value1, align 1
   %value2 = load i8, ptr %value1, align 1
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f6938(i8 %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6938(i8 %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f3333__(i16 %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f3333__(i16 %value, ptr %0) {
 entry:
   %value1 = alloca i16, align 2
   store i16 %value, ptr %value1, align 2
   %value2 = load i16, ptr %value1, align 2
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f693136(i16 %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f693136(i16 %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f3334__(i32 %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f3334__(i32 %value, ptr %0) {
 entry:
   %value1 = alloca i32, align 4
   store i32 %value, ptr %value1, align 4
   %value2 = load i32, ptr %value1, align 4
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f693332(i32 %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f693332(i32 %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f3335__(i64 %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f3335__(i64 %value, ptr %0) {
 entry:
   %value1 = alloca i64, align 8
   store i64 %value, ptr %value1, align 4
   %value2 = load i64, ptr %value1, align 4
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f693634(i64 %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f693634(i64 %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f3336__(i128 %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f3336__(i128 %value, ptr %0) {
 entry:
   %value1 = alloca i128, align 8
   store i128 %value, ptr %value1, align 4
   %value2 = load i128, ptr %value1, align 4
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f69313238(i128 %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f69313238(i128 %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f3337__(i8 %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f3337__(i8 %value, ptr %0) {
 entry:
   %value1 = alloca i8, align 1
   store i8 %value, ptr %value1, align 1
   %value2 = load i8, ptr %value1, align 1
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f7538(i8 %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f7538(i8 %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f3338__(i16 %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f3338__(i16 %value, ptr %0) {
 entry:
   %value1 = alloca i16, align 2
   store i16 %value, ptr %value1, align 2
   %value2 = load i16, ptr %value1, align 2
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f753136(i16 %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f753136(i16 %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333336333633353336333633363333333333363333333733363331333333353336333133333334333633333336333533333335333633323336333533333338333633363336333533333335333333383333333733363335333633313336333333363336333333373336333633333335333333383336333633363331333633333333333633333337333633313336333433333334333333313333333833333334333633333336333233363335333333353336333533333331333633323333333533333331333333313333333833333339333633353333333733333339333633343336333433363335333333393336333333363333333333303333333533333332356635663336333633363636333733323336363433363331333733345f5f3339__(i32 %value, ptr %0) {
+define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333330333633343333333733333338333333343333333433333337333633343336333233333332333633343336333233333331333333363336333333333337333633353333333233363332333333353336333133333333333633333336333333333335333633363333333033333333333333363333333633363331333633363333333833333332333633353333333033333338333333373333333933363331333333383333333933333333333633343333333033333338333633343333333533363335333333393333333333363334333633333333333833333337333333333333333933363334333333353333333233363331333333303333333733363331356635663336333633363636333733323336363433363331333733345f5f3339__(i32 %value, ptr %0) {
 entry:
   %value1 = alloca i32, align 4
   store i32 %value, ptr %value1, align 4
   %value2 = load i32, ptr %value1, align 4
-  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f666f726d61745f753332(i32 %value2, ptr %0)
+  %aggregate_original_base = call ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f753332(i32 %value2, ptr %0)
   ret ptr %aggregate_original_base
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333363336333533363336333633333333333633333337333633313333333533363331333333343336333333363335333333353336333233363335333333383336333633363335333333353333333833333337333633353336333133363333333633363333333733363336333333353333333833363336333633313336333333333336333333373336333133363334333333343333333133333338333333343336333333363332333633353333333533363335333333313336333233333335333333313333333133333338333333393336333533333337333333393336333433363334333633353333333933363333333633333333333033333335333333323566356633373330333633313337333233373333333633355f5f3330__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3330__(ptr %text) {
 entry:
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f7538(ptr %text1)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f7538(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333363336333533363336333633333333333633333337333633313333333533363331333333343336333333363335333333353336333233363335333333383336333633363335333333353333333833333337333633353336333133363333333633363333333733363336333333353333333833363336333633313336333333333336333333373336333133363334333333343333333133333338333333343336333333363332333633353333333533363335333333313336333233333335333333313333333133333338333333393336333533333337333333393336333433363334333633353333333933363333333633333333333033333335333333323566356633373330333633313337333233373333333633355f5f3331__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3331__(ptr %text) {
 entry:
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f753136(ptr %text1)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753136(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333363336333533363336333633333333333633333337333633313333333533363331333333343336333333363335333333353336333233363335333333383336333633363335333333353333333833333337333633353336333133363333333633363333333733363336333333353333333833363336333633313336333333333336333333373336333133363334333333343333333133333338333333343336333333363332333633353333333533363335333333313336333233333335333333313333333133333338333333393336333533333337333333393336333433363334333633353333333933363333333633333333333033333335333333323566356633373330333633313337333233373333333633355f5f33313330__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f33313330__(ptr %text) {
 entry:
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f663332(ptr %text1)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f663332(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333363336333533363336333633333333333633333337333633313333333533363331333333343336333333363335333333353336333233363335333333383336333633363335333333353333333833333337333633353336333133363333333633363333333733363336333333353333333833363336333633313336333333333336333333373336333133363334333333343333333133333338333333343336333333363332333633353333333533363335333333313336333233333335333333313333333133333338333333393336333533333337333333393336333433363334333633353333333933363333333633333333333033333335333333323566356633373330333633313337333233373333333633355f5f33313331__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f33313331__(ptr %text) {
 entry:
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f663634(ptr %text1)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f663634(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333363336333533363336333633333333333633333337333633313333333533363331333333343336333333363335333333353336333233363335333333383336333633363335333333353333333833333337333633353336333133363333333633363333333733363336333333353333333833363336333633313336333333333336333333373336333133363334333333343333333133333338333333343336333333363332333633353333333533363335333333313336333233333335333333313333333133333338333333393336333533333337333333393336333433363334333633353333333933363333333633333333333033333335333333323566356633373330333633313337333233373333333633355f5f3332__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3332__(ptr %text) {
 entry:
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f753332(ptr %text1)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753332(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333363336333533363336333633333333333633333337333633313333333533363331333333343336333333363335333333353336333233363335333333383336333633363335333333353333333833333337333633353336333133363333333633363333333733363336333333353333333833363336333633313336333333333336333333373336333133363334333333343333333133333338333333343336333333363332333633353333333533363335333333313336333233333335333333313333333133333338333333393336333533333337333333393336333433363334333633353333333933363333333633333333333033333335333333323566356633373330333633313337333233373333333633355f5f3333__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3333__(ptr %text) {
 entry:
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f753634(ptr %text1)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753634(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333363336333533363336333633333333333633333337333633313333333533363331333333343336333333363335333333353336333233363335333333383336333633363335333333353333333833333337333633353336333133363333333633363333333733363336333333353333333833363336333633313336333333333336333333373336333133363334333333343333333133333338333333343336333333363332333633353333333533363335333333313336333233333335333333313333333133333338333333393336333533333337333333393336333433363334333633353333333933363333333633333333333033333335333333323566356633373330333633313337333233373333333633355f5f3334__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3334__(ptr %text) {
 entry:
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f75313238(ptr %text1)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f75313238(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333363336333533363336333633333333333633333337333633313333333533363331333333343336333333363335333333353336333233363335333333383336333633363335333333353333333833333337333633353336333133363333333633363333333733363336333333353333333833363336333633313336333333333336333333373336333133363334333333343333333133333338333333343336333333363332333633353333333533363335333333313336333233333335333333313333333133333338333333393336333533333337333333393336333433363334333633353333333933363333333633333333333033333335333333323566356633373330333633313337333233373333333633355f5f3335__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3335__(ptr %text) {
 entry:
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f6938(ptr %text1)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f6938(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333363336333533363336333633333333333633333337333633313333333533363331333333343336333333363335333333353336333233363335333333383336333633363335333333353333333833333337333633353336333133363333333633363333333733363336333333353333333833363336333633313336333333333336333333373336333133363334333333343333333133333338333333343336333333363332333633353333333533363335333333313336333233333335333333313333333133333338333333393336333533333337333333393336333433363334333633353333333933363333333633333333333033333335333333323566356633373330333633313337333233373333333633355f5f3336__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3336__(ptr %text) {
 entry:
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f693136(ptr %text1)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693136(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333363336333533363336333633333333333633333337333633313333333533363331333333343336333333363335333333353336333233363335333333383336333633363335333333353333333833333337333633353336333133363333333633363333333733363336333333353333333833363336333633313336333333333336333333373336333133363334333333343333333133333338333333343336333333363332333633353333333533363335333333313336333233333335333333313333333133333338333333393336333533333337333333393336333433363334333633353333333933363333333633333333333033333335333333323566356633373330333633313337333233373333333633355f5f3337__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3337__(ptr %text) {
 entry:
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f693332(ptr %text1)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693332(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333363336333533363336333633333333333633333337333633313333333533363331333333343336333333363335333333353336333233363335333333383336333633363335333333353333333833333337333633353336333133363333333633363333333733363336333333353333333833363336333633313336333333333336333333373336333133363334333333343333333133333338333333343336333333363332333633353333333533363335333333313336333233333335333333313333333133333338333333393336333533333337333333393336333433363334333633353333333933363333333633333333333033333335333333323566356633373330333633313337333233373333333633355f5f3338__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3338__(ptr %text) {
 entry:
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f693634(ptr %text1)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693634(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333363336333533363336333633333333333633333337333633313333333533363331333333343336333333363335333333353336333233363335333333383336333633363335333333353333333833333337333633353336333133363333333633363333333733363336333333353333333833363336333633313336333333333336333333373336333133363334333333343333333133333338333333343336333333363332333633353333333533363335333333313336333233333335333333313333333133333338333333393336333533333337333333393336333433363334333633353333333933363333333633333333333033333335333333323566356633373330333633313337333233373333333633355f5f3339__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3339__(ptr %text) {
 entry:
-  %text1 = alloca [16 x i8], align 1
+  %text1 = alloca [16 x i8], align 8
   %struct_value = load [16 x i8], ptr %text, align 1
   store [16 x i8] %struct_value, ptr %text1, align 1
-  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__36656663363761356134636535626538666535383765616366376635386661633637616434313834636265356531623531313839653739646465396363303532__5f70617273655f69313238(ptr %text1)
+  %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69313238(ptr %text1)
   ret i32 %call
 }
 
@@ -12856,21 +12694,3 @@ declare ptr @__wosy_core_alloc.130(i64, i64)
 declare void @__wosy_core_free.131(ptr)
 
 declare void @__wosy_core_system_panic.132()
-
-declare ptr @__wosy_core_alloc.133(i64, i64)
-
-declare void @__wosy_core_free.134(ptr)
-
-declare void @__wosy_core_system_panic.135()
-
-declare ptr @__wosy_core_alloc.136(i64, i64)
-
-declare void @__wosy_core_free.137(ptr)
-
-declare void @__wosy_core_system_panic.138()
-
-declare ptr @__wosy_core_alloc.139(i64, i64)
-
-declare void @__wosy_core_free.140(ptr)
-
-declare void @__wosy_core_system_panic.141()
