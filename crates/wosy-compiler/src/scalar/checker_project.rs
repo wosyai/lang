@@ -5,30 +5,29 @@ use num_bigint::BigInt;
 use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
-        check_integer_requirement_activity, check_integer_requirements_at_entry, check_integer_return_bound, concrete_integer_literal, exact_integer_call_argument,
+        check_integer_requirement_activity, check_integer_requirements_at_entry, check_integer_return_bound, check_integer_return_bound_where, concrete_integer_literal, exact_integer_call_argument,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument,
-        IntegerCheckFailure, IntegerComparison, IntegerInputs,
+        IntegerCheckFailure, IntegerComparison, IntegerInputs, ProofCoverage,
     },
     control::{BindingInitialization, BlockItemKind, CheckedCallSignature, ConditionalRegion, InitializationName, InitializationStorage, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, ModuleInitializationTopology, NamespaceTarget},
     derive_block, derive_expression, project_from_declarations,
     reference::{CheckerTargetQuery, FunctionCallSites, OccurrenceOrdinal, OccurrenceStructure, ProjectCallSiteResults, ResolvedCheckerTarget},
     static_calls::prepare_project_occurrences,
-    typecheck::{integer_literal_fits_type, is_integer_type},
+    typecheck::{integer_literal_fits_type, is_integer_type, typecheck_proof_where},
     typecheck_scalar_project_in_mode, ByteSpan, ConcreteCallSelection, ReferenceBindingId, ResolvedCallTarget,
     BinaryOperator, ScalarExpression, ScalarFunction, ScalarItem, ScalarModule, ScalarNamespaceBinding, ScalarPreparationInputs,
-    ScalarProject, ScalarSourceDeclarations, ScalarType,
+    ScalarProject, ScalarSourceDeclarations, ScalarTargetLayout, ScalarType, UnaryOperator,
 };
 #[cfg(test)]
 use super::{
     checker_flow::{
-        check_integer_requirements, check_integer_return_bound_where, check_integer_return_bound_with_shows,
+        check_integer_requirements, check_integer_return_bound_with_shows,
         proves_requirement_with_imported_root_local, ImportedLocal, IntegerBranchProof,
-        IntegerReturn, ProofCoverage,
+        IntegerReturn,
     },
     reference::DirectDestinationIdentity,
     symbolic_integer::{IntegerRelation, IntegerSet},
-    typecheck::typecheck_proof_where,
-    ScalarBlock, ScalarBlockItem, ScalarTargetLayout, UnaryOperator,
+    ScalarBlock, ScalarBlockItem,
 };
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
@@ -130,7 +129,6 @@ enum ProjectCheck {
     Unsupported,
     #[cfg(test)]
     NoChecks,
-    #[cfg(test)]
     NoApplicableInputs,
     Proved,
     Refuted,
@@ -884,6 +882,11 @@ impl PreparedProofModule {
         let target = child(proof.node, SyntaxKind::ProofTarget)?;
         let inputs = identifiers(&child(&target, SyntaxKind::Parameters)?).collect::<Vec<_>>();
         let layout = project.modules[module].target_layout;
+        if inputs.len() != body.boundary.parameters.len()
+            || inputs.iter().collect::<HashSet<_>>().len() != inputs.len()
+        {
+            return Err(ProjectCheck::InvalidProof);
+        }
         let _ = typed_proof_where(proof.node, &self.source, layout, &inputs, body)?;
         Ok(())
     }
@@ -953,6 +956,7 @@ impl PreparedProofModule {
 pub enum ScalarModuleProofOutcome {
     Proved,
     Refuted,
+    NoApplicableInputs,
     Invalid(Vec<Diagnostic>),
     Unsupported,
 }
@@ -971,6 +975,7 @@ pub fn check_scalar_module_proof(
     match result {
         Ok(ProjectCheck::Proved) => ScalarModuleProofOutcome::Proved,
         Ok(ProjectCheck::Refuted) => ScalarModuleProofOutcome::Refuted,
+        Ok(ProjectCheck::NoApplicableInputs) => ScalarModuleProofOutcome::NoApplicableInputs,
         Err(ProjectCheck::Invalid(diagnostics)) => ScalarModuleProofOutcome::Invalid(diagnostics),
         Err(ProjectCheck::InvalidProof) => ScalarModuleProofOutcome::Invalid(Vec::new()),
         _ => ScalarModuleProofOutcome::Unsupported,
@@ -990,21 +995,27 @@ impl PreparedProofModule {
         {
             return Err(ProjectCheck::Unsupported);
         }
-        if proof.node.children().any(|node| node.kind() == SyntaxKind::ProofWhere)
-            || !derive_block(&child(proof.node, SyntaxKind::Block)?).items.is_empty()
-        {
+        if !derive_block(&child(proof.node, SyntaxKind::Block)?).items.is_empty() {
             return Err(ProjectCheck::Unsupported);
         }
-        let TypedProofPostcondition { target, body, operator, bound, .. } =
+        let TypedProofPostcondition { target, body, input_names, operator, bound, .. } =
             typed_proof_postcondition(&self.prepared, proof.function, proof.node)?;
         if !body.structure.checker_directives.is_empty() || !body.call_occurrences.is_empty()
             || !body.allocation_length_calls.is_empty() || !body.assignments.is_empty()
         {
             return Err(ProjectCheck::Unsupported);
         }
-        match check_integer_return_bound(body, &operator, &bound) {
-            Some(Ok(true)) => Ok(ProjectCheck::Proved),
-            Some(Ok(false)) => Ok(ProjectCheck::Refuted),
+        let filter = prepare_proof_entry_filter(proof.node, &self.source, target.target_layout, &input_names, body)?;
+        let checked = if let Some(filter) = filter.as_deref() {
+            check_integer_return_bound_where(body, &operator, &bound, filter)
+        } else {
+            check_integer_return_bound(body, &operator, &bound)
+                .map(|result| result.map(ProofCoverage::Applicable))
+        };
+        match checked {
+            Some(Ok(ProofCoverage::Applicable(true))) => Ok(ProjectCheck::Proved),
+            Some(Ok(ProofCoverage::Applicable(false))) => Ok(ProjectCheck::Refuted),
+            Some(Ok(ProofCoverage::NoApplicableInputs)) => Ok(ProjectCheck::NoApplicableInputs),
             Some(Err(failure)) => Err(project_failure(body, &target.source, failure)),
             None => Err(ProjectCheck::Unsupported),
         }
@@ -1076,7 +1087,6 @@ struct TypedProofPostcondition<'a> {
     body: &'a FunctionCallSites,
     #[cfg(test)]
     result_type: &'a ScalarType,
-    #[cfg(test)]
     input_names: Vec<String>,
     #[cfg(test)]
     output: String,
@@ -1135,7 +1145,6 @@ fn typed_proof_postcondition<'a>(
         body,
         #[cfg(test)]
         result_type: &result.ty,
-        #[cfg(test)]
         input_names,
         #[cfg(test)]
         output: output.clone(),
@@ -1156,12 +1165,11 @@ fn check_selected_proof(
     let TypedProofPostcondition { target, body, result_type, input_names, output, operator, bound } =
         typed_proof_postcondition(prepared, (module, item, function), declaration)?;
 
-    let where_clause = typed_proof_where(declaration, proof_source, target.target_layout, &input_names, body)
+    let filter = prepare_proof_entry_filter(declaration, proof_source, target.target_layout, &input_names, body)
         .map_err(|error| match error {
             ProjectCheck::Invalid(_) => ProjectCheck::InvalidProof,
             error => error,
         })?;
-    let filter = where_clause.as_ref().map(|expression| proof_entry_filters(expression, &input_names, body)).transpose()?;
     let checked = if !steps.items.is_empty() {
         let proof = proof_show_branch(&steps, &input_names, &output, result_type, body)?;
         check_integer_return_bound_with_shows(body, &operator, &bound, filter.as_deref(), &proof)
@@ -1373,7 +1381,6 @@ fn apply_verified_return_bound(
     })
 }
 
-#[cfg(test)]
 fn pure_proof_input_expression(expression: &ScalarExpression) -> bool {
     match expression {
         ScalarExpression::Name { name, .. } => name != "null",
@@ -1387,7 +1394,6 @@ fn pure_proof_input_expression(expression: &ScalarExpression) -> bool {
     }
 }
 
-#[cfg(test)]
 fn typed_proof_where(
     declaration: &CstNode,
     source: &SourceIdentity,
@@ -1398,11 +1404,6 @@ fn typed_proof_where(
     let Some(clause) = declaration.children().find(|node| node.kind() == SyntaxKind::ProofWhere) else {
         return Ok(None);
     };
-    if input_names.len() != body.boundary.parameters.len()
-        || input_names.iter().collect::<HashSet<_>>().len() != input_names.len()
-    {
-        return Err(ProjectCheck::InvalidProof);
-    }
     let expression = derive_expression(&child(&clause, SyntaxKind::Expression)?);
     if !pure_proof_input_expression(&expression) {
         return Err(ProjectCheck::Unsupported);
@@ -1412,7 +1413,17 @@ fn typed_proof_where(
     Ok(Some(expression))
 }
 
-#[cfg(test)]
+fn prepare_proof_entry_filter(
+    declaration: &CstNode,
+    source: &SourceIdentity,
+    layout: ScalarTargetLayout,
+    inputs: &[String],
+    body: &FunctionCallSites,
+) -> Result<Option<Vec<CheckerPredicate>>, ProjectCheck> {
+    typed_proof_where(declaration, source, layout, inputs, body)?
+        .as_ref().map(|expression| proof_entry_filters(expression, inputs, body)).transpose()
+}
+
 fn proof_entry_filters(
     expression: &ScalarExpression,
     inputs: &[String],
@@ -1428,14 +1439,13 @@ fn proof_entry_filters(
                 pending.push((right, false));
                 pending.push((left, false));
             }
-            _ => filters.push(proof_input_condition(expression, inputs, body, negated)?),
+            _ => filters.push(proof_input_condition::<false>(expression, inputs, body, negated)?),
         }
     }
     Ok(filters)
 }
 
-#[cfg(test)]
-fn proof_input_condition(
+fn proof_input_condition<const VERIFY_LITERAL_FIT: bool>(
     expression: &ScalarExpression,
     inputs: &[String],
     body: &FunctionCallSites,
@@ -1459,11 +1469,13 @@ fn proof_input_condition(
     let index = inputs.iter().position(|input| input == condition.name)
         .ok_or(ProjectCheck::InvalidProof)?;
     let ty = &body.boundary.parameters[index].ty;
-    if !is_integer_type(ty) {
-        return Err(ProjectCheck::Unsupported);
-    }
-    if !integer_literal_fits_type(condition.bound.as_ref(), ty) {
-        return Err(ProjectCheck::InvalidProof);
+    if VERIFY_LITERAL_FIT {
+        if !is_integer_type(ty) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        if !integer_literal_fits_type(condition.bound.as_ref(), ty) {
+            return Err(ProjectCheck::InvalidProof);
+        }
     }
     let bindings = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
     let predicate = condition.typed(ty, ty, bindings[index].clone())
@@ -1494,7 +1506,7 @@ fn proof_show_branch<'a>(
     }) {
         return Err(ProjectCheck::Unsupported);
     }
-    let guard = proof_input_condition(condition, inputs, body, false)?;
+    let guard = proof_input_condition::<true>(condition, inputs, body, false)?;
     Ok(IntegerBranchProof {
         guard,
         then_claim: proof_show_claim(then_branch, inputs, output, ty, body, bindings)?,
@@ -2179,7 +2191,7 @@ mod tests {
         let file = source("src/main.w", "actual-cycle");
         let text = "%%start\nunit() cycle = fn { cycle(); };\ncycle();\n%%end";
         let prepared = prepare_proof_target(&file, text).unwrap();
-        assert_eq!(check_package_roots(&prepared), Err(ProjectCheck::Unsupported));
+        assert_eq!(check_package_initialization(&prepared).map(drop), Err(ProjectCheck::Unsupported));
     }
 
     #[test]
@@ -2219,7 +2231,7 @@ mod tests {
         for (depth, expected) in [(MAX_ACTUAL_CALL_DEPTH, Ok(())), (MAX_ACTUAL_CALL_DEPTH + 1, Err(ProjectCheck::Unsupported))] {
             let source = source("src/main.w", &format!("depth-{depth}"));
             let prepared = prepare_proof_target(&source, &chain(depth)).unwrap();
-            assert_eq!(check_package_roots(&prepared), expected);
+            assert_eq!(check_package_initialization(&prepared).map(drop), expected);
         }
     }
 

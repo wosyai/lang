@@ -421,7 +421,7 @@ fn explicit_proof_module_checks_unused_pure_callable_over_arbitrary_inputs() {
     };
     assert_eq!(proof("bounded", &declarations), ScalarModuleProofOutcome::Proved);
     assert_eq!(proof("too_small", &declarations), ScalarModuleProofOutcome::Refuted);
-    assert_eq!(proof("restricted", &declarations), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(proof("restricted", &declarations), ScalarModuleProofOutcome::Proved);
     assert_eq!(
         proof("bounded", &format!("{declarations}\nu8 real = identity(7);")),
         ScalarModuleProofOutcome::Unsupported,
@@ -473,4 +473,59 @@ fn explicit_proof_module_resolves_named_callable_through_checked_namespace() {
     );
     assert_eq!(proof("all_paths"), ScalarModuleProofOutcome::Proved);
     assert_eq!(proof("one_path"), ScalarModuleProofOutcome::Refuted);
+}
+
+#[test]
+fn explicit_unused_module_proof_where_filters_typed_entry_only() {
+    let identity = source();
+    let proof = |guard: &str, claim: &str| check_scalar_module_proof(
+        identity.clone(),
+        "bounded",
+        vec![ScalarProofModuleInput {
+            source: identity.clone(),
+            text: format!(
+                "%%start\ni8(i8) identity = fn(value) {{ value }};\nproof bounded for identity(input) -> (out) where ({guard}) ensures ({claim}) {{}}\n%%end",
+            ),
+            namespaces: Vec::new(),
+        }],
+        vec![identity.clone()],
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    );
+    assert_eq!(
+        proof("input <= -5 && ! (input < -128)", "out <= -5"),
+        ScalarModuleProofOutcome::Proved,
+    );
+    assert_eq!(proof("input <= -5", "out < -5"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(
+        proof("input <= -5 && input > -5", "out == 0"),
+        ScalarModuleProofOutcome::NoApplicableInputs,
+    );
+    assert_eq!(proof("false", "out <= 0"), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(
+        proof("input == -128 || input == 0", "out <= 0"),
+        ScalarModuleProofOutcome::Unsupported,
+    );
+    assert!(matches!(proof("out <= 0", "out <= 0"), ScalarModuleProofOutcome::Invalid(diagnostics) if !diagnostics.is_empty()));
+}
+
+#[test]
+fn reached_initializer_cycles_and_depth_fail_closed_when_there_are_obligations() {
+    assert_eq!(
+        check("unit() cycle = fn { cycle(); }; cycle();"),
+        ScalarCheckerOutcome::NoChecks,
+    );
+    assert_eq!(
+        check(&format!("unit() cycle = fn {{ core.require(true, {OUTPUT}); cycle(); }}; cycle();")),
+        ScalarCheckerOutcome::Unsupported,
+    );
+    let chain = |count| {
+        let mut text = format!("unit() f0 = fn {{ core.require(true, {OUTPUT}); }};");
+        for index in 1..count {
+            text.push_str(&format!("\nunit() f{index} = fn {{ f{}(); }};", index - 1));
+        }
+        text.push_str(&format!("\nf{}();", count - 1));
+        text
+    };
+    assert_eq!(check(&chain(64)), ScalarCheckerOutcome::Passed);
+    assert_eq!(check(&chain(65)), ScalarCheckerOutcome::Unsupported);
 }

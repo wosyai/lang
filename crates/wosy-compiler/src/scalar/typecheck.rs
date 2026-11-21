@@ -4300,7 +4300,7 @@ fn check_expression_type_in_module(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-checker"))]
 pub(super) fn typecheck_proof_where(
     source: &SourceIdentity,
     target_layout: ScalarTargetLayout,

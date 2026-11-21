@@ -548,14 +548,13 @@ pub(super) fn check_integer_return_bound<'a>(
     }
 }
 
-#[cfg(test)]
 pub(super) fn check_integer_return_bound_where<'a>(
     calls: &'a FunctionCallSites,
     operator: &BinaryOperator,
     bound: &BigInt,
     entry_filter: &[CheckerPredicate],
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
-    check_integer_return_bound_in_scope(calls, operator, bound, Some(entry_filter), None)
+    check_integer_return_bound_in_scope(calls, operator, bound, Some(entry_filter), #[cfg(test)] None)
 }
 
 #[cfg(test)]
