@@ -1,3 +1,5 @@
+use std::{collections::HashMap, rc::Rc};
+
 use num_bigint::BigInt;
 
 use super::{
@@ -64,71 +66,95 @@ impl<'a> IntegerComparison<'a> {
     }
 }
 
-impl IntegerPredicate {
-    pub(super) fn root(&self) -> Option<IntegerPath> {
-        Some(IntegerPath {
-            binding: self.binding.clone(),
-            ty: self.ty.clone(),
-            values: IntegerSet::from_type(&self.ty)?,
+type IntegerRow = Vec<Rc<IntegerSet>>;
+type IntegerRoots<'a> = HashMap<&'a ReferenceBindingId, (usize, &'a ScalarType)>;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct IntegerInputs(Vec<IntegerRow>);
+
+impl IntegerInputs {
+    fn split(
+        self,
+        roots: &IntegerRoots<'_>,
+        predicate: &IntegerPredicate,
+    ) -> Option<(Self, Self)> {
+        let &(index, ty) = roots.get(&predicate.binding)?;
+        if ty != &predicate.ty {
+            return None;
+        }
+        let mut passing = Self::default();
+        let mut failing = Self::default();
+        for mut row in self.0 {
+            let (yes, no) = row[index].split(&predicate.operator, &predicate.bound)?;
+            if yes.is_empty() {
+                failing.0.push(row);
+            } else if no.is_empty() {
+                passing.0.push(row);
+            } else {
+                let mut alternate = row.clone();
+                row[index] = Rc::new(yes);
+                alternate[index] = Rc::new(no);
+                passing.0.push(row);
+                failing.0.push(alternate);
+            }
+        }
+        Some((passing, failing))
+    }
+
+    fn join(mut self, other: Self) -> Self {
+        self.0.extend(other.0);
+        self
+    }
+
+    fn is_unreachable(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(super) fn includes(&self, coordinates: &[u128]) -> bool {
+        self.0.iter().any(|row| {
+            row.len() == coordinates.len()
+                && row.iter().zip(coordinates).all(|(axis, value)| {
+                    axis.split(&BinaryOperator::Equal, &BigInt::from(*value))
+                        .is_some_and(|(matching, _)| !matching.is_empty())
+                })
         })
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct IntegerPath {
-    binding: ReferenceBindingId,
-    ty: ScalarType,
-    values: IntegerSet,
-}
-
-impl IntegerPath {
-    pub(super) fn split(&self, predicate: &IntegerPredicate) -> Option<(Self, Self)> {
-        if self.binding != predicate.binding || self.ty != predicate.ty {
-            return None;
-        }
-        let (yes, no) = self.values.split(&predicate.operator, &predicate.bound)?;
-        let path = |values| Self { binding: self.binding.clone(), ty: self.ty.clone(), values };
-        Some((path(yes), path(no)))
-    }
-
-    pub(super) fn join(self, other: Self) -> Option<Self> {
-        if self.binding != other.binding || self.ty != other.ty {
-            return None;
-        }
-        Some(Self { values: self.values.join(other.values), ..self })
-    }
-
-    pub(super) fn is_unreachable(&self) -> bool {
-        self.values.is_empty()
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct IntegerCheckFailure {
     pub(super) directive: OccurrenceOrdinal,
-    pub(super) inputs: IntegerPath,
+    pub(super) inputs: IntegerInputs,
 }
 
 enum IntegerControl {
-    Continue(IntegerPath),
+    Continue(IntegerInputs),
     Fail(IntegerCheckFailure),
 }
 
 pub(super) fn check_integer_requirements(
     calls: &FunctionCallSites,
 ) -> Option<Result<(), IntegerCheckFailure>> {
-    let [parameter] = calls.boundary.parameters.as_slice() else {
+    let boundary = &calls.boundary;
+    if boundary.parameters.is_empty()
+        || boundary.parameters.len() != boundary.checker_parameter_bindings.len()
+    {
         return None;
-    };
-    let [binding] = calls.boundary.checker_parameter_bindings.as_slice() else {
-        return None;
-    };
-    let root = IntegerPath {
-        binding: binding.clone(),
-        ty: parameter.ty.clone(),
-        values: IntegerSet::from_type(&parameter.ty)?,
-    };
-    match walk_integer_block(calls, calls.structure.root, root)? {
+    }
+    let roots: IntegerRoots<'_> = boundary
+        .checker_parameter_bindings
+        .iter()
+        .zip(&boundary.parameters)
+        .enumerate()
+        .map(|(index, (binding, parameter))| (binding, (index, &parameter.ty)))
+        .collect();
+    let root = boundary
+        .parameters
+        .iter()
+        .map(|parameter| IntegerSet::from_type(&parameter.ty).map(Rc::new))
+        .collect::<Option<IntegerRow>>()?;
+    let root = IntegerInputs(vec![root]);
+    match walk_integer_block(calls, &roots, calls.structure.root, root)? {
         IntegerControl::Continue(_) => Some(Ok(())),
         IntegerControl::Fail(failure) => Some(Err(failure)),
     }
@@ -136,8 +162,9 @@ pub(super) fn check_integer_requirements(
 
 fn walk_integer_block(
     calls: &FunctionCallSites,
+    roots: &IntegerRoots<'_>,
     block: BlockOrdinal,
-    mut path: IntegerPath,
+    mut path: IntegerInputs,
 ) -> Option<IntegerControl> {
     let structure = &calls.structure;
     for item in &structure.blocks.get(block.0)?.items {
@@ -147,7 +174,7 @@ fn walk_integer_block(
         match item.kind {
             BlockItemKind::Evaluation { expression } => {
                 if let Some(directive) = structure.checker_directives.get(&expression) {
-                    let (passing, failing) = path.split(directive.integer_predicate.as_ref()?)?;
+                    let (passing, failing) = path.split(roots, directive.integer_predicate.as_ref()?)?;
                     match directive.operation {
                         CheckerOperation::Require if !failing.is_unreachable() => {
                             return Some(IntegerControl::Fail(IntegerCheckFailure {
@@ -158,7 +185,7 @@ fn walk_integer_block(
                         CheckerOperation::Narrow if passing.is_unreachable() => {
                             return Some(IntegerControl::Fail(IntegerCheckFailure {
                                 directive: expression,
-                                inputs: path,
+                                inputs: failing,
                             }));
                         }
                         CheckerOperation::Require | CheckerOperation::Narrow => path = passing,
@@ -170,9 +197,9 @@ fn walk_integer_block(
                         return None;
                     };
                     let predicate = structure.checker_integer_branches.get(condition)?;
-                    let (yes, no) = path.split(predicate)?;
-                    match walk_integer_block(calls, *then_block, yes)? {
-                        IntegerControl::Continue(then_path) => path = then_path.join(no)?,
+                    let (yes, no) = path.split(roots, predicate)?;
+                    match walk_integer_block(calls, roots, *then_block, yes)? {
+                        IntegerControl::Continue(then_path) => path = then_path.join(no),
                         failure @ IntegerControl::Fail(_) => return Some(failure),
                     }
                 }
@@ -182,7 +209,7 @@ fn walk_integer_block(
                 else {
                     return None;
                 };
-                if *binding != path.binding {
+                if !roots.contains_key(binding) {
                     return None;
                 }
             }

@@ -445,10 +445,6 @@ mod tests {
             panic!("expected unit branch topology")
         };
         let branch = &body.structure.checker_integer_branches[condition_ordinal];
-        assert_eq!(
-            body.boundary.checker_parameter_bindings.as_slice(),
-            std::slice::from_ref(&branch.binding),
-        );
         let directive_for = |block, item| {
             let OccurrenceNode::Expression(ordinal) = body.structure.edges
                 [&(OccurrenceParent::Block(block), OccurrenceEdge::ExpressionItem { item })]
@@ -462,31 +458,19 @@ mod tests {
             panic!("expected canonical directive")
         };
         let syntax = CheckerDirective::from_expression(canonical).unwrap().unwrap();
+        assert_eq!(
+            branch.binding,
+            branch_directive.integer_predicate.as_ref().unwrap().binding,
+        );
         assert_eq!(branch_directive.condition, expression_span(syntax.condition));
         assert_eq!(branch_directive.output, syntax.output.explicit_literal().unwrap());
 
-        let (then_path, else_path) = branch.root().unwrap().split(branch).unwrap();
-        assert!(!then_path.is_unreachable());
-        assert!(!else_path.is_unreachable());
-        let predicate = branch_directive.integer_predicate.as_ref().unwrap();
-        let (passing, failing) = then_path.split(predicate).unwrap();
-        assert!(!passing.is_unreachable());
-        assert!(failing.is_unreachable());
-
-        let joined = then_path.join(else_path).unwrap();
         let after_join = directive_for(body.structure.root, 1);
-        let (passing, failing) = joined.split(after_join.integer_predicate.as_ref().unwrap()).unwrap();
-        assert!(!passing.is_unreachable());
-        assert!(!failing.is_unreachable());
-        let expected_failing = failing;
-
-        let type_range = directive_for(body.structure.root, 2);
-        let (_, failing) = joined.split(type_range.integer_predicate.as_ref().unwrap()).unwrap();
-        assert!(failing.is_unreachable());
-
         let failure = check_integer_requirements(body).unwrap().unwrap_err();
         assert_eq!(&body.structure.checker_directives[&failure.directive], after_join);
-        assert_eq!(failure.inputs, expected_failing);
+        for value in 0..=255 {
+            assert_eq!(failure.inputs.includes(&[value]), value <= 10);
+        }
     }
 
     fn check_source<T>(source: &str, inspect: impl FnOnce(&crate::scalar::reference::FunctionCallSites) -> T) -> T {
@@ -537,9 +521,9 @@ mod tests {
                     .min_by_key(|(ordinal, _)| ordinal.0)
                     .unwrap().1;
                 assert_ne!(failing_directive, initial_directive);
-                let first = initial_directive.integer_predicate.as_ref().unwrap();
-                let (incoming, _) = first.root().unwrap().split(first).unwrap();
-                assert_eq!(failure.inputs, incoming);
+                for value in 0..=255 {
+                    assert_eq!(failure.inputs.includes(&[value]), value >= 11);
+                }
             },
         );
     }
@@ -558,6 +542,37 @@ mod tests {
             "#,
             |body| assert_eq!(check_integer_requirements(body), None),
         );
+    }
+
+    #[test]
+    fn joins_preserve_exact_relations_between_distinct_integer_parameters() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        let prefix = r#"
+            u8(u8, u8) check_pair = fn(x, y) {
+                if (x > 0) {
+                    core.narrow(y > 0, { .stdout = ""; .stderr = "narrow"; .code = 1; .files = []; });
+                }
+        "#;
+        let guarded = r#"
+                if (x > 0) {
+                    core.require(y > 0, { .stdout = ""; .stderr = "guarded"; .code = 1; .files = []; });
+                }
+        "#;
+        let unconditional = r#"
+                core.require(y > 0, { .stdout = ""; .stderr = "unconditional"; .code = 1; .files = []; });
+        "#;
+        let suffix = "x };";
+        check_source(&[prefix, guarded, suffix].concat(), |body| {
+            let bindings = &body.boundary.checker_parameter_bindings;
+            assert_ne!(bindings[0], bindings[1]);
+            assert_eq!(check_integer_requirements(body), Some(Ok(())));
+        });
+        check_source(&[prefix, guarded, unconditional, suffix].concat(), |body| {
+            let failure = check_integer_requirements(body).unwrap().unwrap_err();
+            assert!(failure.inputs.includes(&[0, 0]));
+            assert!(!failure.inputs.includes(&[1, 0]));
+            assert!(!failure.inputs.includes(&[0, 1]));
+        });
     }
 
 }
