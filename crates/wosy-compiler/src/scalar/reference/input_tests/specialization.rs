@@ -75,7 +75,7 @@ fn assert_policies(
 }
 
 #[test]
-fn actual_standalone_specialization_has_only_concrete_template_scratch_copies() {
+fn actual_standalone_specialization_does_not_copy_full_cfgs() {
     for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
         let parsed = parse_source(source(), GENERIC.into(), &[]);
         assert!(parsed.diagnostics.is_empty());
@@ -94,7 +94,7 @@ fn actual_standalone_specialization_has_only_concrete_template_scratch_copies() 
         assert_eq!(copies.program_copies, 0);
         assert_eq!(copies.module_constructions, 0);
         assert_eq!(copies.module_copies, 0);
-        assert_eq!(copies.cfg_copies, 2);
+        assert_eq!(copies.cfg_copies, 0);
         assert_eq!(stages.counts().copy_specialization, 1);
         drop(stages);
         drop(scope);
@@ -147,7 +147,7 @@ fn actual_project_specialization_reuses_one_inventory_and_retains_imported_arm_p
         assert_eq!(scope.counts().program_copies, 0);
         assert_eq!(scope.counts().module_copies, 0);
         assert_eq!(scope.counts().module_constructions, 0);
-        assert_eq!(scope.counts().cfg_copies, 2);
+        assert_eq!(scope.counts().cfg_copies, 0);
         assert_eq!(scope.counts().struct_copies, 2);
         assert_eq!(stages.counts().copy_specialization, 2);
         drop(stages);
@@ -160,7 +160,7 @@ fn actual_project_specialization_reuses_one_inventory_and_retains_imported_arm_p
         assert!(record_project_reference_origins(&mut derived.modules, &calls).is_empty());
         assert_eq!(scope.counts().struct_copies, 2);
         assert_eq!(scope.counts().module_copies, 0);
-        assert_eq!(scope.counts().cfg_copies, 2);
+        assert_eq!(scope.counts().cfg_copies, 0);
         drop(scope);
         assert_eq!(derived, public.project);
         let ScalarItem::Function(template) = &derived.modules[1].items[0] else {

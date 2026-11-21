@@ -20,11 +20,11 @@ fn assert_module_results(results: &[(usize, FunctionReferenceResult)], items: &[
 #[test]
 fn complete_program_analysis_borrows_input_and_matches_legacy_attachment_after_all_stages() {
     for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
-        for (text, succeeds, scratch_copies) in [
-            (TEXT, true, 0),
-            ("%%start\n*u8(*u8) forward = fn(input) { input };\n*u8(*u8) relay = fn(input) { forward(input) };\n%%end", true, 0),
-            ("%%start\nforward = overload { generic T; T(T) => fn(input) { input }; };\nu8(u8) caller = fn(input) { u8 first = forward(input); forward(first) };\n%%end", true, 2),
-            ("%%start\nstruct Payload { u8 value; }\nPayload(Payload) consume = fn(value) { next = value; next; next };\n%%end", false, 0),
+        for (text, succeeds) in [
+            (TEXT, true),
+            ("%%start\n*u8(*u8) forward = fn(input) { input };\n*u8(*u8) relay = fn(input) { forward(input) };\n%%end", true),
+            ("%%start\nforward = overload { generic T; T(T) => fn(input) { input }; };\nu8(u8) caller = fn(input) { u8 first = forward(input); forward(first) };\n%%end", true),
+            ("%%start\nstruct Payload { u8 value; }\nPayload(Payload) consume = fn(value) { next = value; next; next };\n%%end", false),
         ] {
             let parsed = parse_source(source(), text.into(), &[]);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -41,7 +41,7 @@ fn complete_program_analysis_borrows_input_and_matches_legacy_attachment_after_a
             assert_eq!(counts.program_copies, 0);
             assert_eq!(counts.module_copies, 0);
             assert_eq!(counts.module_constructions, 0);
-            assert_eq!(counts.cfg_copies, scratch_copies);
+            assert_eq!(counts.cfg_copies, 0);
             assert_eq!(stage_counts, stage_observations::Counts { call_sites: 0, reference_origins: 1, output_contracts: 1, copy_specialization: usize::from(succeeds) });
             drop(stages);
             drop(scope);
@@ -132,7 +132,7 @@ fn complete_project_analysis_preserves_ordinals_specializations_and_ordered_part
             assert_eq!(counts.program_copies, 0);
             assert_eq!(counts.module_copies, 0);
             assert_eq!(counts.module_constructions, 0);
-            assert_eq!(counts.cfg_copies, if failing { 0 } else { 1 });
+            assert_eq!(counts.cfg_copies, 0);
             assert_eq!(
                 stage_counts,
                 stage_observations::Counts {
