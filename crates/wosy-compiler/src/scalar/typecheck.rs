@@ -3103,6 +3103,93 @@ fn integer_conversion_source_context(
         .cloned()
 }
 
+fn is_float_arithmetic_operator(operator: &BinaryOperator) -> bool {
+    matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply
+        | BinaryOperator::Divide | BinaryOperator::Remainder)
+}
+
+// Leaves and obvious non-float shapes need no cache access. Check both
+// children shallowly before following a composite, so ordinary arithmetic
+// spines with a named or integer operand have no recursive shape walk.
+fn float_literal_leaf(expression: &ScalarExpression) -> Option<bool> {
+    match expression {
+        ScalarExpression::Float { .. } => Some(true),
+        ScalarExpression::Unary { operator: UnaryOperator::Negate, .. } => None,
+        ScalarExpression::Binary { operator, .. } if is_float_arithmetic_operator(operator) => None,
+        _ => Some(false),
+    }
+}
+
+fn is_float_literal_arithmetic(
+    expression: &ScalarExpression,
+    inference: &mut ScalarInferenceBuilder<'_>,
+) -> bool {
+    if let Some(shape) = float_literal_leaf(expression) {
+        return shape;
+    }
+    match expression {
+        ScalarExpression::Unary { operand, .. } => {
+            if let Some(shape) = float_literal_leaf(operand) {
+                return shape;
+            }
+            inference.memoized_float_literal_shape(expression, |inference| {
+                is_float_literal_arithmetic(operand, inference)
+            })
+        }
+        ScalarExpression::Binary { left, right, .. } => {
+            match (float_literal_leaf(left), float_literal_leaf(right)) {
+                (Some(false), _) | (_, Some(false)) => return false,
+                (Some(true), Some(true)) => return true,
+                _ => {}
+            }
+            inference.memoized_float_literal_shape(expression, |inference| {
+                is_float_literal_arithmetic(left, inference)
+                    && is_float_literal_arithmetic(right, inference)
+            })
+        }
+        _ => unreachable!("only composite float literal candidates reach the shape walk"),
+    }
+}
+
+fn float_literal_arithmetic_operands(
+    operator: &BinaryOperator,
+    left: &ScalarExpression,
+    right: &ScalarExpression,
+    inference: &mut ScalarInferenceBuilder<'_>,
+) -> (bool, bool) {
+    if !is_float_arithmetic_operator(operator) {
+        return (false, false);
+    }
+    (
+        is_float_literal_arithmetic(left, inference),
+        is_float_literal_arithmetic(right, inference),
+    )
+}
+
+// The sibling fixes the width: contextual literals do not choose a numeric
+// type or convert a typed operand. Check each operand only once.
+fn infer_float_literal_arithmetic(
+    literal_operands: (bool, bool),
+    left: &ScalarExpression,
+    right: &ScalarExpression,
+    mut check: impl FnMut(&ScalarExpression, Option<&ScalarType>) -> ScalarType,
+) -> Option<Result<ScalarType, ()>> {
+    let (literal, sibling) = match literal_operands {
+        (true, false) => (left, right),
+        (false, true) => (right, left),
+        (true, true) => return Some(Err(())),
+        (false, false) => return None,
+    };
+    let ty = check(sibling, None);
+    Some(if is_error_type(&ty) {
+        Ok(ty)
+    } else if is_float_type(&ty) {
+        Ok(check(literal, Some(&ty)))
+    } else {
+        Err(())
+    })
+}
+
 fn required_binary_arithmetic_type<'a>(
     expected: Option<&'a ScalarType>,
     left: &ScalarType,
@@ -3450,7 +3537,9 @@ fn check_expression_type_in_module(
                     operand_type
                 }
                 UnaryOperator::Negate => {
-                    expect_module_integer(module, &operand_type, *span, diagnostics);
+                    if !is_float_type(&operand_type) {
+                        expect_module_integer(module, &operand_type, *span, diagnostics);
+                    }
                     operand_type
                 }
             }
@@ -3461,6 +3550,19 @@ fn check_expression_type_in_module(
             right,
             span,
         } => {
+            let literal_operands = float_literal_arithmetic_operands(operator, left, right, inference);
+            if let Some(inferred) = infer_float_literal_arithmetic(literal_operands, left, right, |operand, expected| {
+                expression_type_in_module_expected(
+                    operand, expected, scope, visible_names, folded_names, module, modules, diagnostics, unsafe_context, overloads, inference,
+                )
+            }) {
+                return inferred.unwrap_or_else(|()| {
+                    diagnostics.push(module_diagnostic(
+                        module, "B0003", "floating-point arithmetic requires a matching f32 or f64 context", *span,
+                    ));
+                    ScalarType::Error
+                });
+            }
             let comparison = matches!(
                 operator,
                 BinaryOperator::Equal
@@ -4282,6 +4384,23 @@ fn check_expression_type_in_module_expected(
         span,
     } = expression
     {
+        if let Some(expected) = expected.filter(|ty| is_float_type(ty)) {
+            let actual = expression_type_in_module_expected(
+                operand,
+                Some(expected),
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            );
+            expect_module_type(module, expected, &actual, *span, diagnostics);
+            return actual;
+        }
         if let ScalarExpression::Integer { value, .. } = operand.as_ref() {
             if let Some(
                 expected @ (ScalarType::I8
@@ -4618,6 +4737,14 @@ fn check_expression_type_in_module_expected(
                     | ScalarType::F64
             )
         });
+        if arithmetic_context.is_none()
+            && float_literal_arithmetic_operands(operator, left, right, inference) != (false, false)
+        {
+            return expression_type_in_module(
+                expression, scope, visible_names, folded_names, module, modules, diagnostics,
+                unsafe_context, overloads, inference,
+            );
+        }
         let bool_context = ScalarType::Bool;
         let (left_type, right_type) = if comparison && is_null_expression(left) {
             let right_type = expression_type_in_module_expected(
@@ -7883,7 +8010,9 @@ fn check_expression_type(
                     operand_type
                 }
                 UnaryOperator::Negate => {
-                    expect_integer(program, &operand_type, *span, diagnostics);
+                    if !is_float_type(&operand_type) {
+                        expect_integer(program, &operand_type, *span, diagnostics);
+                    }
                     operand_type
                 }
             }
@@ -7894,6 +8023,25 @@ fn check_expression_type(
             right,
             span,
         } => {
+            let literal_operands = float_literal_arithmetic_operands(operator, left, right, inference);
+            if let Some(inferred) = infer_float_literal_arithmetic(literal_operands, left, right, |operand, expected| {
+                if let Some(expected) = expected {
+                    expression_type_expected(
+                        operand, expected, scope, visible_names, folded_names, program, diagnostics, unsafe_context, overloads, inference,
+                    )
+                } else {
+                    expression_type(
+                        operand, scope, visible_names, folded_names, program, diagnostics, unsafe_context, overloads, inference,
+                    )
+                }
+            }) {
+                return inferred.unwrap_or_else(|()| {
+                    diagnostics.push(diagnostic(
+                        program, "B0003", "floating-point arithmetic requires a matching f32 or f64 context", *span,
+                    ));
+                    ScalarType::Error
+                });
+            }
             let comparison = matches!(
                 operator,
                 BinaryOperator::Equal
@@ -8762,7 +8910,9 @@ fn check_expression_type_expected(
                 operand_type
             }
             UnaryOperator::Negate => {
-                expect_integer(program, &operand_type, *span, diagnostics);
+                if !is_float_type(&operand_type) {
+                    expect_integer(program, &operand_type, *span, diagnostics);
+                }
                 expect_type(program, expected, &operand_type, *span, diagnostics);
                 operand_type
             }

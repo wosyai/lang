@@ -199,7 +199,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
         ScalarExpression::Unary {
             operator, operand, ..
         } => {
-            let value = take_basic(emit_expression(context, state, operand)?)?.into_int_value();
+            let value = take_basic(emit_expression(context, state, operand)?)?;
             emit_unary_value(state, operator, value)
         }
         ScalarExpression::Binary {
@@ -340,8 +340,7 @@ pub(super) fn emit_project_typed_expression<'ctx, 'module>(
         } if integer_width(expected).is_some() || *expected == ScalarType::Bool => {
             let value = take_basic(emit_project_typed_expression(
                 context, state, operand, expected, module, modules,
-            )?)?
-            .into_int_value();
+            )?)?;
             emit_unary_value(state, operator, value)
         }
         ScalarExpression::Integer { value, .. } if integer_width(expected).is_some() => Ok(
@@ -649,8 +648,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
         } => {
             let value = take_basic(emit_project_expression(
                 context, state, operand, module, modules,
-            )?)?
-            .into_int_value();
+            )?)?;
             emit_unary_value(state, operator, value)
         }
         ScalarExpression::Binary {
@@ -1973,6 +1971,14 @@ fn integer_conversion_source_type(
     expression: &ScalarExpression,
     project_module: Option<&ScalarModule>,
 ) -> Result<ScalarType, String> {
+    let checked = state.body_call_nodes
+        .and_then(|nodes| nodes.checked_expression_type(expression))
+        .or_else(|| state.initializer_nodes
+            .and_then(|nodes| nodes.checked_integer_conversion_source(expression)));
+    if let Some(ty) = checked.filter(|ty| integer_width(ty).is_some()) {
+        return Ok(ty.clone());
+    }
+    // Detached legacy emission may not have checked occurrence facts.
     let ty = match expression {
         ScalarExpression::Member { .. }
             if state.prepared_render && state.initializer_nodes.is_some() =>
@@ -2065,6 +2071,9 @@ fn float_conversion_source_type(
     expression: &ScalarExpression,
     project_module: Option<&ScalarModule>,
 ) -> Result<ScalarType, String> {
+    if let Some(ty) = checked_float_type(state, expression) {
+        return Ok(ty.clone());
+    }
     let ty = match expression {
         ScalarExpression::Member { .. }
             if state.prepared_render && state.initializer_nodes.is_some() =>
@@ -2444,6 +2453,12 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
         ScalarExpression::Float { value, .. } if float => {
             Ok(EmitValue::Basic(float_constant(context, expected, *value)?.into()))
         }
+        ScalarExpression::Unary { operator: operator @ crate::scalar::UnaryOperator::Negate, operand, .. }
+            if float =>
+        {
+            let operand = take_basic(emit_contextual_numeric(context, state, operand, expected, path)?)?;
+            emit_unary_value(state, operator, operand)
+        }
         ScalarExpression::Binary { operator, left, right, .. }
             if float && matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract
                 | BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder) =>
@@ -2806,22 +2821,22 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
 pub(super) fn emit_unary_value<'ctx, 'module>(
     state: &EmitState<'ctx, 'module>,
     operator: &crate::scalar::UnaryOperator,
-    value: inkwell::values::IntValue<'ctx>,
+    value: BasicValueEnum<'ctx>,
 ) -> Result<EmitValue<'ctx>, String> {
-    match operator {
-        crate::scalar::UnaryOperator::LogicalNot | crate::scalar::UnaryOperator::BitwiseNot => {
-            state
-                .builder
-                .build_not(value, "not")
-                .map(|value| EmitValue::Basic(value.into()))
-                .map_err(builder_error)
-        }
-        crate::scalar::UnaryOperator::Negate => state
-            .builder
+    use crate::scalar::UnaryOperator::{BitwiseNot, LogicalNot, Negate};
+    let result = match (operator, value) {
+        (LogicalNot | BitwiseNot, BasicValueEnum::IntValue(value)) => state.builder
+            .build_not(value, "not")
+            .map(BasicValueEnum::from),
+        (Negate, BasicValueEnum::IntValue(value)) => state.builder
             .build_int_sub(value.get_type().const_zero(), value, "neg")
-            .map(|value| EmitValue::Basic(value.into()))
-            .map_err(builder_error),
-    }
+            .map(BasicValueEnum::from),
+        (Negate, BasicValueEnum::FloatValue(value)) => state.builder
+            .build_float_neg(value, "neg")
+            .map(BasicValueEnum::from),
+        _ => return Err("invalid unary LLVM operand".to_owned()),
+    };
+    result.map(EmitValue::Basic).map_err(builder_error)
 }
 
 fn emit_if<'ctx, 'module>(
