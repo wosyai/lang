@@ -288,3 +288,51 @@ fn main_initializer_compares_only_canonical_typed_integer_literals() {
     }
     assert!(matches!(check(&format!("core.require(2147483648 >= 0, {OUTPUT});")), ScalarCheckerOutcome::Invalid(_)));
 }
+
+#[test]
+fn main_initializer_reads_checked_bool_installations() {
+    assert_eq!(
+        check_scoped(
+            &format!("bool ready = true; core.require(ready, {OUTPUT}); core.narrow(ready, {OUTPUT});"),
+            ScalarCheckerScope::MainFlowOnly,
+        ),
+        ScalarCheckerOutcome::Passed,
+    );
+    let canonical = format!("%%start\nbool ready = false; core.require(ready, {OUTPUT});\n%%end");
+    let ScalarCheckerOutcome::Failed(failure) =
+        check(&format!("bool ready = false; core.require(ready, {OUTPUT});")) else {
+            panic!("expected failure from the installed false value");
+        };
+    assert_eq!(failure.operation, ScalarCheckerOperation::Require);
+    assert_eq!(&canonical[failure.condition.start as usize..failure.condition.end as usize], "ready");
+    assert_eq!(
+        check(&format!("bool ready = true; ready = false; core.require(ready, {OUTPUT});")),
+        ScalarCheckerOutcome::Unsupported,
+    );
+}
+
+#[test]
+fn main_initializer_keeps_bool_storage_separate_across_namespaces() {
+    let app = source();
+    let lib = SourceIdentity::new("local".into(), "demo".into(), "src/lib.w".into(), "phase4".into());
+    let app_text = format!("%%start\nbool ready = true; lib = namespace demo \"src/lib.w\"; core.require(ready, {OUTPUT});\n%%end");
+    let lib_text = format!("%%start\nbool ready = false; core.narrow(ready, {OUTPUT});\n%%end");
+    let load = |source: &SourceIdentity, text: &str| {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+    };
+    let root = load(&app, &app_text);
+    let namespace = root.namespaces().into_iter().next().unwrap();
+    let binding = ScalarNamespaceBinding { binding: namespace.binding.clone(), target: lib.clone(), span: namespace.span };
+    let ScalarCheckerOutcome::Failed(failure) = check_scalar_package(
+        vec![(root, vec![binding]), (load(&lib, &lib_text), vec![])],
+        vec![app, lib.clone()],
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ScalarCheckerScope::MainFlowOnly,
+    ) else {
+        panic!("expected the namespace to use its own false value");
+    };
+    assert_eq!(failure.source, lib);
+    assert_eq!(failure.operation, ScalarCheckerOperation::Narrow);
+}

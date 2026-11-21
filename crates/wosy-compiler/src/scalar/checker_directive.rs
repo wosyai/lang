@@ -27,6 +27,7 @@ pub(super) struct PreparedCheckerDirective {
     pub(super) operation: CheckerOperation,
     pub(super) condition: ByteSpan,
     pub(super) predicate: Option<CheckerPredicate>,
+    pub(super) initializer_bool_storage: Option<ByteSpan>,
     pub(super) call_signature: Option<CheckedCallSignature>,
     pub(super) output: CheckedLiteralOutput,
 }

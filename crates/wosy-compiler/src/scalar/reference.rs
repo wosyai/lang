@@ -6829,12 +6829,24 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             };
             let condition = &arguments[0];
             let predicate = self.checker_predicate(condition, names);
+            let initializer_bool_storage = match (condition, &self.mode) {
+                (ScalarExpression::Name { name, .. }, WalkMode::ModuleInitialization { source, declarations })
+                    if self.occurrence_typing.checked_expression_type(condition) == Some(&ScalarType::Bool) =>
+                {
+                    match initializer_storage(name, names, source, declarations) {
+                        Some(InitializationStorage::Module(span)) => Some(span),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
             self.structure.checker_directives.insert(
                 ordinal,
                 PreparedCheckerDirective {
                     operation: marker.operation,
                     condition: expression_span(condition),
                     predicate,
+                    initializer_bool_storage,
                     call_signature: self.occurrence_typing.take_call(condition),
                     output: marker.output,
                 },

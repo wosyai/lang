@@ -9,7 +9,7 @@ use super::{
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument,
         IntegerCheckFailure, IntegerInputs,
     },
-    control::{CheckedCallSignature, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, NamespaceTarget},
+    control::{BindingInitialization, BlockItemKind, CheckedCallSignature, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, NamespaceTarget},
     project_from_declarations,
     reference::{FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, ProjectCallSiteResults},
     static_calls::prepare_project_occurrences,
@@ -25,7 +25,6 @@ use super::{
         proves_requirement_with_imported_root_local, ImportedLocal, IntegerBranchProof,
         IntegerComparison, IntegerReturn, ProofCoverage,
     },
-    control::BlockItemKind,
     derive_block, derive_expression, BinaryOperator,
     reference::{CheckerTargetQuery, DirectDestinationIdentity, ResolvedCheckerTarget},
     symbolic_integer::{IntegerRelation, IntegerSet},
@@ -345,12 +344,33 @@ fn walk_package_initialization(
     let ModuleInitializationDetail::Occurrences(topology) = &region.detail else {
         return Err(ProjectCheck::MissingRootOccurrences);
     };
+    let structure = &topology.structure;
+    let mut checked_items = structure.blocks[structure.root.0].items.iter();
+    let mut bool_storage = HashMap::new();
     for step in &region.steps {
         if let ModuleInitializationStepKind::NamespaceDispatch { target, .. } = &step.kind {
             let NamespaceTarget::Bound(target) = target else {
                 return Err(ProjectCheck::Unsupported);
             };
             walk_package_initialization(project, calls, ordinals, visits, actual, target)?;
+            continue;
+        }
+        let checked_item = checked_items.next().filter(|item| item.position == step.item)
+            .ok_or(ProjectCheck::MissingRootOccurrences)?;
+        if let (ModuleInitializationStepKind::BindingInitialization,
+            Some(ScalarItem::Binding(binding)), BlockItemKind::Binding(checked)) =
+            (&step.kind, module.items.get(step.item), &checked_item.kind)
+        {
+            let ([receiver], BindingInitialization::Outputs(outputs), ScalarExpression::Boolean { value, .. }) =
+                (checked.receivers(), &checked.initialization, &binding.value) else {
+                    return Err(ProjectCheck::Unsupported);
+                };
+            if !outputs.secondary.is_empty() || receiver.ty != ScalarType::Bool
+                || structure.checked_types.expressions.get(&outputs.primary) != Some(&ScalarType::Bool)
+            {
+                return Err(ProjectCheck::Unsupported);
+            }
+            bool_storage.insert(receiver.span, *value);
             continue;
         }
         if !matches!((&step.kind, module.items.get(step.item)),
@@ -360,7 +380,6 @@ fn walk_package_initialization(
         ) {
             return Err(ProjectCheck::Unsupported);
         }
-        let structure = &topology.structure;
         let Some(OccurrenceNode::Expression(call)) = structure.edges.get(&(
             OccurrenceParent::Block(structure.root),
             OccurrenceEdge::ExpressionItem { item: step.item },
@@ -368,8 +387,10 @@ fn walk_package_initialization(
             return Err(ProjectCheck::Unsupported);
         };
         if let Some(directive) = structure.checker_directives.get(call) {
-            let Some(CheckerPredicate::Boolean(value)) = directive.predicate else {
-                return Err(ProjectCheck::Unsupported);
+            let value = match (&directive.predicate, directive.initializer_bool_storage) {
+                (Some(CheckerPredicate::Boolean(value)), None) => *value,
+                (None, Some(storage)) => *bool_storage.get(&storage).ok_or(ProjectCheck::Unsupported)?,
+                _ => return Err(ProjectCheck::Unsupported),
             };
             actual.had_obligations = true;
             if directive.operation.rejects(value, !value) {
