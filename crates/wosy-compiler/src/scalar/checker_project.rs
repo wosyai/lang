@@ -72,7 +72,10 @@ enum ProofVenue {
 
 enum ProofSummaryOrigin<'a> {
     DetachedFragment(&'a SourceIdentity),
-    ModuleDeclaration(&'a SourceIdentity),
+    ModuleDeclaration {
+        source: &'a SourceIdentity,
+        target: &'a ResolvedCallTarget,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -235,6 +238,12 @@ struct PreparedProofModule {
     prepared: PreparedCheckerProject,
 }
 
+struct SelectedModuleProof<'a> {
+    node: &'a CstNode,
+    function: (usize, usize, &'a ScalarFunction),
+    target: &'a ResolvedCallTarget,
+}
+
 struct VerifiedModuleReturnBound<'a> {
     issuer: &'a PreparedProofModule,
     proof: &'a CstNode,
@@ -326,25 +335,31 @@ impl PreparedProofModule {
     }
 
     fn check_at(&self, source: &SourceIdentity, proof_name: &str) -> Result<(ByteSpan, ProjectCheck), ProjectCheck> {
-        let (proof, query) = self.select(source, proof_name)?;
-        let function = self.resolve(query)?;
-        let (outcome, _) = check_selected_proof(&self.prepared, function, proof, None)?;
-        Ok((byte_span(proof), outcome))
+        let proof = self.select_resolved(source, proof_name)?;
+        let (outcome, _) = check_selected_proof(&self.prepared, proof.function, proof.node, None)?;
+        Ok((byte_span(proof.node), outcome))
     }
 
     fn verify(&self, proof_name: &str) -> Option<VerifiedModuleReturnBound<'_>> {
-        let (proof, query) = self.select(&self.source, proof_name).ok()?;
-        let function = self.resolve(query).ok()?;
+        let proof = self.select_resolved(&self.source, proof_name).ok()?;
         let (_, verified) = check_selected_proof(
             &self.prepared,
-            function,
-            proof,
-            Some(ProofSummaryOrigin::ModuleDeclaration(&self.source)),
+            proof.function,
+            proof.node,
+            Some(ProofSummaryOrigin::ModuleDeclaration {
+                source: &self.source,
+                target: proof.target,
+            }),
         ).ok()?;
-        Some(VerifiedModuleReturnBound { issuer: self, proof, bound: verified? })
+        Some(VerifiedModuleReturnBound { issuer: self, proof: proof.node, bound: verified? })
     }
 
-    fn resolve(&self, query: usize) -> Result<(usize, usize, &ScalarFunction), ProjectCheck> {
+    fn select_resolved(
+        &self,
+        proof_source: &SourceIdentity,
+        proof_name: &str,
+    ) -> Result<SelectedModuleProof<'_>, ProjectCheck> {
+        let (node, query) = self.select(proof_source, proof_name)?;
         let (project, calls) = self.prepared.parts();
         let ResolvedCheckerTarget { target, declaration: (module, item) } =
             calls.checker_targets.get(query).and_then(Option::as_ref).ok_or(ProjectCheck::MissingRoot)?;
@@ -359,7 +374,7 @@ impl PreparedProofModule {
         if source != &owner.source || *declaration_span != function.name_span {
             return Err(ProjectCheck::MissingRoot);
         }
-        Ok((*module, *item, function))
+        Ok(SelectedModuleProof { node, function: (*module, *item, function), target })
     }
 
     fn apply(
@@ -369,7 +384,11 @@ impl PreparedProofModule {
         verified: &VerifiedModuleReturnBound<'_>,
     ) -> Option<ImportedRequirement> {
         let bound = &verified.bound;
-        if !std::ptr::eq(self, verified.issuer)
+        let ResolvedCallTarget::ModuleCallable { source: target_source, .. } = &bound.target else {
+            return None;
+        };
+        if target_source != &self.source
+            || !std::ptr::eq(self, verified.issuer)
             || bound.proof_venue != ProofVenue::ModuleDeclaration
             || bound.proof_source != self.source
             || bound.proof_name != proof_name
@@ -558,21 +577,36 @@ fn issue_return_bound(
             })
         }
     };
-    let (proof_venue, proof_source) = match origin {
-        ProofSummaryOrigin::DetachedFragment(source) => (ProofVenue::DetachedFragment, source),
-        ProofSummaryOrigin::ModuleDeclaration(source) if source == target_source => (ProofVenue::ModuleDeclaration, source),
-        ProofSummaryOrigin::ModuleDeclaration(_) => return None,
+    let (proof_venue, proof_source, target) = match origin {
+        ProofSummaryOrigin::DetachedFragment(source) => (
+            ProofVenue::DetachedFragment,
+            source,
+            ResolvedCallTarget::ModuleCallable {
+                source: target_source.clone(),
+                declaration_span: function.name_span,
+                concrete: ConcreteCallSelection::Declaration,
+            },
+        ),
+        ProofSummaryOrigin::ModuleDeclaration { source, target } => {
+            let ResolvedCallTarget::ModuleCallable {
+                source: callable_source,
+                declaration_span,
+                concrete: ConcreteCallSelection::Declaration,
+            } = target else {
+                return None;
+            };
+            if callable_source != target_source || *declaration_span != function.name_span {
+                return None;
+            }
+            (ProofVenue::ModuleDeclaration, source, target.clone())
+        }
     };
     Some(VerifiedReturnBound {
         proof_venue,
         proof_source: proof_source.clone(),
         proof_span: byte_span(declaration),
         proof_name: identifiers(declaration).next()?,
-        target: ResolvedCallTarget::ModuleCallable {
-            source: target_source.clone(),
-            declaration_span: function.name_span,
-            concrete: ConcreteCallSelection::Declaration,
-        },
+        target,
         target_layout,
         parameters: body.boundary.parameters.iter().map(|parameter| parameter.ty.clone()).collect(),
         output_slot: output.ordinal,
@@ -1105,7 +1139,8 @@ mod tests {
         let tighter = "proof tighter for lib.value(x) -> (out) ensures (out <= 7) {}";
         let private = "proof inaccessible for lib._hidden(x) -> (out) ensures (out <= 7) {}";
         let unknown = "proof missing_namespace for absent.value(x) -> (out) ensures (out <= 7) {}";
-        let app_text = format!("%%start\nlib = namespace demo \"src/lib.w\";\nfree = namespace demo \"src/empty.w\";\nu8(u8) value = fn(x) {{ if (x == 0) {{}}; 7 }};\nu8() use_lib = fn {{ lib.value(0) }};\n{app_proof}\n{imported}\n{tighter}\n{private}\n{unknown}\n%%end");
+        let empty_guard = "proof empty_guard for lib.value(x) -> (out) where (false) ensures (out <= 9) {}";
+        let app_text = format!("%%start\nlib = namespace demo \"src/lib.w\";\nfree = namespace demo \"src/empty.w\";\nu8(u8) value = fn(x) {{ if (x == 0) {{}}; 7 }};\nu8() use_lib = fn {{ u8 result = lib.value(0); core.require(result <= 9, {OUTPUT}); result }};\n{app_proof}\n{imported}\n{tighter}\n{private}\n{unknown}\n{empty_guard}\n%%end");
         let lib_text = format!("%%start\nu8(u8) value = fn(x) {{ if (x == 0) {{}}; 9 }};\nu8(u8) _hidden = fn(x) {{ x }};\n{lib_proof}\n%%end");
         let namespace = |name: &str, target: &SourceIdentity| {
             let declaration = format!("{name} =");
@@ -1149,7 +1184,23 @@ mod tests {
             assert_eq!(project.check_at(&app, name), Err(ProjectCheck::MissingRoot));
         }
         assert_eq!(project.check_at(&source("src/main.w", "stale"), "imported"), Err(ProjectCheck::MissingRoot));
-        assert!(project.verify("imported").is_none());
+        let artifact = project.verify("imported").unwrap();
+        let bound = &artifact.bound;
+        let proof_start = app_text.find(imported).unwrap() as u32;
+        let target_start = lib_text.find("value").unwrap() as u32;
+        assert_eq!(bound.proof_venue, ProofVenue::ModuleDeclaration);
+        assert_eq!(bound.proof_source, app);
+        assert_eq!(bound.proof_span, ByteSpan::new(proof_start, proof_start + imported.len() as u32));
+        assert_eq!(bound.proof_name, "imported");
+        assert_eq!(bound.target, ResolvedCallTarget::ModuleCallable {
+            source: lib,
+            declaration_span: ByteSpan::new(target_start, target_start + "value".len() as u32),
+            concrete: ConcreteCallSelection::Declaration,
+        });
+        assert_eq!(project.apply("use_lib", "imported", &artifact), None);
+        for name in ["tighter", "inaccessible", "missing_namespace", "empty_guard", "missing"] {
+            assert!(project.verify(name).is_none());
+        }
     }
 
     #[test]
