@@ -3690,6 +3690,7 @@ fn transfer_reference_facts(
             last_use[dependency.0] = point.id.0;
         }
     }
+    let mut call_contracts = BTreeMap::new();
     let mut observed = vec![None::<ReferenceFlowPoint>; cfg.points.len()];
     let mut incoming = vec![Vec::<ReferenceEdgeState>::new(); cfg.points.len()];
     incoming[0].push(ReferenceEdgeState {
@@ -3778,17 +3779,26 @@ fn transfer_reference_facts(
                 ..
             } = &cfg.points[id.0].kind
             {
-                let contract = contracts.iter().find(|contract| {
+                let matches_contract = |contract: &ConcreteReferenceOutputContract| {
                     contract.source == *source
                         && contract.declaration_span == *declaration_span
                         && contract.selection == *concrete
-                        && contract.type_arguments
-                            == type_arguments
-                                .iter()
-                                .map(|argument| argument.ty.clone())
-                                .collect::<Vec<_>>()
                         && contract.output == *output
-                });
+                        && contract
+                            .type_arguments
+                            .iter()
+                            .eq(type_arguments.iter().map(|argument| &argument.ty))
+                };
+                let contract = match contracts {
+                    [] => None,
+                    [contract] => matches_contract(contract).then_some(contract),
+                    _ if visited[id.0].len() == 1 => {
+                        contracts.iter().find(|contract| matches_contract(contract))
+                    }
+                    _ => *call_contracts.entry(id).or_insert_with(|| {
+                        contracts.iter().find(|contract| matches_contract(contract))
+                    }),
+                };
                 contract.map(|contract| {
                     let mut results = BTreeSet::new();
                     for origin in &contract.origins {
