@@ -16,7 +16,7 @@ use super::{
     reference::{CheckerTargetQuery, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, ProjectCallSiteResults, ResolvedCheckerTarget},
     static_calls::prepare_project_occurrences,
     symbolic_integer::{IntegerRelation, IntegerSet},
-    typecheck::{integer_literal_fits_type, is_integer_type},
+    typecheck::{integer_literal_fits_type, is_integer_type, typecheck_proof_where},
     typecheck_scalar_project_in_mode, BinaryOperator, ByteSpan, ConcreteCallSelection,
     ReferenceBindingId, ResolvedCallTarget, ScalarBlock, ScalarBlockItem, ScalarExpression, ScalarFunction,
     ScalarItem, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarProject,
@@ -569,8 +569,20 @@ impl PreparedProofModule {
 
     fn check_at(&self, source: &SourceIdentity, proof_name: &str) -> Result<(ByteSpan, ProjectCheck), ProjectCheck> {
         let proof = self.select_resolved(source, proof_name)?;
-        let (outcome, _) = check_selected_proof(&self.prepared, proof.function, proof.node, None)?;
+        let (outcome, _) = check_selected_proof(&self.prepared, proof.function, proof.node, source, None)?;
         Ok((byte_span(proof.node), outcome))
+    }
+
+    fn type_where(&self, proof_name: &str) -> Result<(), ProjectCheck> {
+        let proof = self.select_resolved(&self.source, proof_name)?;
+        let (module, item, _) = proof.function;
+        let (project, calls) = self.prepared.parts();
+        let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        let target = child(proof.node, SyntaxKind::ProofTarget)?;
+        let inputs = identifiers(&child(&target, SyntaxKind::Parameters)?).collect::<Vec<_>>();
+        let layout = project.modules[module].target_layout;
+        let _ = typed_proof_where(proof.node, &self.source, layout, &inputs, body)?;
+        Ok(())
     }
 
     fn verify(&self, proof_name: &str) -> Option<VerifiedModuleReturnBound<'_>> {
@@ -579,6 +591,7 @@ impl PreparedProofModule {
             &self.prepared,
             proof.function,
             proof.node,
+            &self.source,
             Some(ProofSummaryOrigin::ModuleDeclaration {
                 source: &self.source,
                 target: proof.target,
@@ -683,13 +696,14 @@ fn check_proof_fragment_impl(
         return Err(ProjectCheck::Unsupported);
     }
     let function = select_checked_root(prepared.parts().0, target_source, name.text())?;
-    check_selected_proof(prepared, function, &declaration, summary_source)
+    check_selected_proof(prepared, function, &declaration, &root.source, summary_source)
 }
 
 fn check_selected_proof(
     prepared: &PreparedCheckerProject,
     (module, item, function): (usize, usize, &ScalarFunction),
     declaration: &CstNode,
+    proof_source: &SourceIdentity,
     summary_source: Option<ProofSummaryOrigin<'_>>,
 ) -> Result<(ProjectCheck, Option<VerifiedReturnBound>), ProjectCheck> {
     let steps = derive_block(&child(declaration, SyntaxKind::Block)?);
@@ -734,13 +748,12 @@ fn check_selected_proof(
         return Err(ProjectCheck::InvalidProof);
     }
 
-    let filter = declaration.children()
-        .find(|node| node.kind() == SyntaxKind::ProofWhere)
-        .map(|where_clause| {
-            let expression = derive_expression(&child(&where_clause, SyntaxKind::Expression)?);
-            proof_input_condition(&expression, &input_names, body)
-        })
-        .transpose()?;
+    let where_clause = typed_proof_where(declaration, proof_source, target.target_layout, &input_names, body)
+        .map_err(|error| match error {
+            ProjectCheck::Invalid(_) => ProjectCheck::InvalidProof,
+            error => error,
+        })?;
+    let filter = where_clause.as_ref().map(|expression| proof_input_condition(expression, &input_names, body)).transpose()?;
     let checked = if !steps.items.is_empty() {
         let proof = proof_show_branch(&steps, &input_names, output, &result.ty, body)?;
         check_integer_return_bound_with_shows(body, ensures.operator, ensures.bound, filter.as_ref(), &proof)
@@ -941,6 +954,43 @@ fn apply_verified_return_bound(
     } else {
         ImportedRequirement::NotEstablished
     })
+}
+
+fn pure_proof_input_expression(expression: &ScalarExpression) -> bool {
+    match expression {
+        ScalarExpression::Name { name, .. } => name != "null",
+        ScalarExpression::Boolean { .. } | ScalarExpression::Integer { .. }
+        | ScalarExpression::Float { .. } | ScalarExpression::Char { .. }
+        | ScalarExpression::InvalidInteger { .. } | ScalarExpression::InvalidFloat { .. } => true,
+        ScalarExpression::Unary { operand, .. } => pure_proof_input_expression(operand),
+        ScalarExpression::Binary { left, right, .. } =>
+            pure_proof_input_expression(left) && pure_proof_input_expression(right),
+        _ => false,
+    }
+}
+
+fn typed_proof_where(
+    declaration: &CstNode,
+    source: &SourceIdentity,
+    target_layout: ScalarTargetLayout,
+    input_names: &[String],
+    body: &FunctionCallSites,
+) -> Result<Option<ScalarExpression>, ProjectCheck> {
+    let Some(clause) = declaration.children().find(|node| node.kind() == SyntaxKind::ProofWhere) else {
+        return Ok(None);
+    };
+    if input_names.len() != body.boundary.parameters.len()
+        || input_names.iter().collect::<HashSet<_>>().len() != input_names.len()
+    {
+        return Err(ProjectCheck::InvalidProof);
+    }
+    let expression = derive_expression(&child(&clause, SyntaxKind::Expression)?);
+    if !pure_proof_input_expression(&expression) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let inputs = input_names.iter().zip(&body.boundary.parameters).map(|(name, parameter)| (name.clone(), parameter.ty.clone()));
+    typecheck_proof_where(source, target_layout, &expression, inputs).map_err(ProjectCheck::Invalid)?;
+    Ok(Some(expression))
 }
 
 fn proof_input_condition(
@@ -1745,6 +1795,42 @@ mod tests {
         assert!(!state.includes(&[10]));
         let unsupported = prepare("actual-return-unsupported", 10, "3 + 4");
         assert_eq!(check_package_roots(&unsupported.prepared), Err(ProjectCheck::Unsupported));
+    }
+
+    #[test]
+    fn parsed_where_types_in_isolated_proof_scope_without_symbolic_evaluation() {
+        for condition in ["true", "false", "x <= 10 && x >= 3", "x", "out <= 10", "unknown <= 10", "identity(x) <= 10"] {
+            let text = format!(r#"%%start
+                u8(u8) identity = fn(value) {{ value }};
+                proof bounded for identity(x) -> (out) where ({condition}) ensures (out <= 10) {{}}
+            %%end"#);
+            let revision = source("src/main.w", condition);
+            let prepared = PreparedProofModule::prepare(revision.clone(), text.clone(), inputs()).unwrap();
+            match condition {
+                "true" => {
+                    assert_eq!(prepared.type_where("bounded"), Ok(()));
+                    assert!(matches!(prepared.check("bounded"), Ok((_, ProjectCheck::Refuted))));
+                }
+                "false" => {
+                    assert_eq!(prepared.type_where("bounded"), Ok(()));
+                    assert!(matches!(prepared.check("bounded"), Ok((_, ProjectCheck::NoApplicableInputs))));
+                }
+                "x <= 10 && x >= 3" => {
+                    assert_eq!(prepared.type_where("bounded"), Ok(()));
+                    assert!(matches!(prepared.check("bounded"), Ok((_, ProjectCheck::Unsupported)) | Err(ProjectCheck::Unsupported)));
+                }
+                "identity(x) <= 10" => assert_eq!(prepared.type_where("bounded"), Err(ProjectCheck::Unsupported)),
+                _ => {
+                    let Err(ProjectCheck::Invalid(diagnostics)) = prepared.type_where("bounded") else {
+                        panic!("expected ordinary typing diagnostics for {condition}");
+                    };
+                    let start = text.find(&format!("where ({condition})")).unwrap() + "where (".len();
+                    assert!(diagnostics.iter().flat_map(|diagnostic| &diagnostic.labels).any(|label| {
+                        label.span.source == revision && label.span.range.start == start as u32
+                    }));
+                }
+            }
+        }
     }
 
     #[test]

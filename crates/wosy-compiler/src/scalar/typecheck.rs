@@ -4300,6 +4300,33 @@ fn check_expression_type_in_module(
     }
 }
 
+#[cfg(test)]
+pub(super) fn typecheck_proof_where(
+    source: &SourceIdentity,
+    target_layout: ScalarTargetLayout,
+    expression: &ScalarExpression,
+    inputs: impl Iterator<Item = (String, ScalarType)>,
+) -> Result<(), Vec<super::Diagnostic>> {
+    let members = BTreeMap::new();
+    let module = ScalarModuleTyping {
+        source, members: &members, namespace_bindings: &[], structs: &[], enums: &[], target_layout,
+    };
+    let scope = inputs.collect::<BTreeMap<_, _>>();
+    let visible = scope.keys().cloned().collect::<BTreeSet<_>>();
+    let owners = ScalarAssignmentOwners::new(&[]);
+    let overloads = ScalarOverloadEnvironment::single(source, &[]);
+    let mut inference = ScalarInferenceBuilder::new(&owners);
+    let mut diagnostics = Vec::new();
+    let ty = expression_type_in_module_expected(
+        expression, Some(&ScalarType::Bool), &scope, &visible, &BTreeMap::new(),
+        &module, std::slice::from_ref(&module), &mut diagnostics, false, &overloads.typing(0), &mut inference,
+    );
+    if ty != ScalarType::Bool && diagnostics.is_empty() {
+        diagnostics.push(module_diagnostic(&module, "B0003", "proof where clause must have type bool", expression_span(expression)));
+    }
+    if diagnostics.is_empty() { Ok(()) } else { Err(diagnostics) }
+}
+
 pub(super) fn expression_type_in_module_expected(
     expression: &ScalarExpression,
     expected: Option<&ScalarType>,
