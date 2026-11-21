@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use num_bigint::BigInt;
+
 use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation},
     checker_flow::{
@@ -11,13 +13,13 @@ use super::{
     reference::{DirectDestinationIdentity, FunctionCallSites, ProjectCallSiteResults},
     static_calls::prepare_project_occurrences,
     typecheck::{integer_literal_fits_type, is_integer_type},
-    typecheck_scalar_project_in_mode, BinaryOperator, ByteSpan, ReferenceBindingId, ScalarBlock,
-    ScalarBlockItem, ScalarExpression, ScalarFunction,
+    typecheck_scalar_project_in_mode, BinaryOperator, ByteSpan, ConcreteCallSelection,
+    ReferenceBindingId, ResolvedCallTarget, ScalarBlock, ScalarBlockItem, ScalarExpression, ScalarFunction,
     ScalarItem, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarProject,
-    ScalarSourceDeclarations, ScalarType,
+    ScalarSourceDeclarations, ScalarTargetLayout, ScalarType,
 };
 use crate::Diagnostic;
-use wosy_syntax::{CstNode, ParseResult, SourceIdentity, SyntaxKind};
+use wosy_syntax::{byte_span, CstNode, ParseResult, SourceIdentity, SyntaxKind};
 
 #[derive(Debug, PartialEq)]
 enum ProjectCheck {
@@ -40,6 +42,32 @@ enum ProjectCheck {
         state: IntegerInputs,
         axes: Vec<ReferenceBindingId>,
         output: CheckedLiteralOutput,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct VerifiedReturnBound {
+    proof_source: SourceIdentity,
+    proof_span: ByteSpan,
+    proof_name: String,
+    target: ResolvedCallTarget,
+    target_layout: ScalarTargetLayout,
+    parameters: Vec<ScalarType>,
+    output_slot: usize,
+    output_type: ScalarType,
+    operator: BinaryOperator,
+    bound: BigInt,
+    guard: Option<VerifiedEntryGuard>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum VerifiedEntryGuard {
+    Boolean(bool),
+    Integer {
+        slot: usize,
+        ty: ScalarType,
+        operator: BinaryOperator,
+        bound: BigInt,
     },
 }
 
@@ -149,18 +177,34 @@ fn check_proof_fragment(
     declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
+    target_source: &SourceIdentity,
     fragment: &ParseResult,
 ) -> ProjectCheck {
-    check_proof_fragment_impl(declarations, initialization_order, inputs, fragment)
+    check_proof_fragment_impl(declarations, initialization_order, inputs, target_source, fragment, false)
+        .map(|(outcome, _)| outcome)
         .unwrap_or_else(|error| error)
+}
+
+fn verify_return_bound(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+    target_source: &SourceIdentity,
+    fragment: &ParseResult,
+) -> Option<VerifiedReturnBound> {
+    check_proof_fragment_impl(declarations, initialization_order, inputs, target_source, fragment, true)
+        .ok()
+        .and_then(|(_, bound)| bound)
 }
 
 fn check_proof_fragment_impl(
     declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
+    target_source: &SourceIdentity,
     fragment: &ParseResult,
-) -> Result<ProjectCheck, ProjectCheck> {
+    retain_bound: bool,
+) -> Result<(ProjectCheck, Option<VerifiedReturnBound>), ProjectCheck> {
     if !fragment.is_valid() {
         return Err(ProjectCheck::InvalidProof);
     }
@@ -183,7 +227,8 @@ fn check_proof_fragment_impl(
     let ensures = IntegerComparison::from_expression(&ensures).ok_or(ProjectCheck::Unsupported)?;
 
     let (project, calls) = prepare_checker_project(declarations, initialization_order, inputs)?;
-    let (module, item, function) = select_checked_root(&project, &root.source, &name)?;
+    let (module, item, function) = select_checked_root(&project, target_source, &name)?;
+    let target = &project.modules[module];
     if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
         return Err(ProjectCheck::Unsupported);
     }
@@ -225,12 +270,80 @@ fn check_proof_fragment_impl(
         check_integer_return_bound(body, ensures.operator, ensures.bound)
             .map(|result| result.map(ProofCoverage::Applicable))
     };
-    Ok(match checked {
+    let outcome = match checked {
         None => ProjectCheck::Unsupported,
         Some(Ok(ProofCoverage::Applicable(true))) => ProjectCheck::Proved,
         Some(Ok(ProofCoverage::Applicable(false))) => ProjectCheck::Refuted,
         Some(Ok(ProofCoverage::NoApplicableInputs)) => ProjectCheck::NoApplicableInputs,
-        Some(Err(failure)) => project_failure(body, &root.source, failure),
+        Some(Err(failure)) => project_failure(body, &target.source, failure),
+    };
+    let verified = (retain_bound
+        && outcome == ProjectCheck::Proved
+        && !project.modules.iter().any(|module| module.source == root.source))
+        .then(|| issue_return_bound(
+            &root.source,
+            &declaration,
+            &target.source,
+            function,
+            body,
+            target.target_layout,
+            &ensures,
+            filter.as_ref(),
+        ))
+        .flatten();
+    Ok((outcome, verified))
+}
+
+fn issue_return_bound(
+    proof_source: &SourceIdentity,
+    declaration: &CstNode,
+    target_source: &SourceIdentity,
+    function: &ScalarFunction,
+    body: &FunctionCallSites,
+    target_layout: ScalarTargetLayout,
+    ensures: &IntegerComparison<'_>,
+    condition: Option<&CheckerPredicate>,
+) -> Option<VerifiedReturnBound> {
+    if !body.structure.checker_directives.is_empty()
+        || !body.call_occurrences.is_empty()
+        || !body.allocation_length_calls.is_empty()
+        || !body.assignments.is_empty()
+    {
+        return None;
+    }
+    let [output] = body.boundary.results.as_slice() else {
+        return None;
+    };
+    let guard = match condition {
+        None => None,
+        Some(CheckerPredicate::Boolean(value)) => Some(VerifiedEntryGuard::Boolean(*value)),
+        Some(CheckerPredicate::Integer(predicate)) => {
+            let slot = body.boundary.checker_parameter_bindings.as_deref()?
+                .iter().position(|binding| *binding == predicate.binding)?;
+            Some(VerifiedEntryGuard::Integer {
+                slot,
+                ty: body.boundary.parameters[slot].ty.clone(),
+                operator: predicate.operator.clone(),
+                bound: predicate.bound.clone(),
+            })
+        }
+    };
+    Some(VerifiedReturnBound {
+        proof_source: proof_source.clone(),
+        proof_span: byte_span(declaration),
+        proof_name: identifiers(declaration).next()?,
+        target: ResolvedCallTarget::ModuleCallable {
+            source: target_source.clone(),
+            declaration_span: function.name_span,
+            concrete: ConcreteCallSelection::Declaration,
+        },
+        target_layout,
+        parameters: body.boundary.parameters.iter().map(|parameter| parameter.ty.clone()).collect(),
+        output_slot: output.ordinal,
+        output_type: output.ty.clone(),
+        operator: ensures.operator.clone(),
+        bound: ensures.bound.clone(),
+        guard,
     })
 }
 
@@ -489,11 +602,15 @@ mod tests {
     }
 
     fn prove(source: &SourceIdentity, callable: &str, proof: &str) -> ProjectCheck {
-        let fragment = wosy_syntax::parse_proof_fragment(source.clone(), proof.to_owned(), &[]);
+        let proof_source = SourceIdentity::new(
+            source.project.clone(), source.package.clone(), "fragment.w".into(), "fragment".into(),
+        );
+        let fragment = wosy_syntax::parse_proof_fragment(proof_source, proof.to_owned(), &[]);
         check_proof_fragment(
             vec![(declarations(source, callable), Vec::new())],
             vec![source.clone()],
             inputs(),
+            source,
             &fragment,
         )
     }
@@ -555,7 +672,7 @@ mod tests {
             assert_eq!(prove(&app, callable, fragment), ProjectCheck::InvalidProof);
         }
         let fragment = wosy_syntax::parse_proof_fragment(
-            wrong,
+            source("fragment.w", "proof-r1"),
             "proof bounded for identity(x) -> (out) ensures (out <= 10) {}".into(),
             &[],
         );
@@ -564,6 +681,7 @@ mod tests {
                 vec![(declarations(&app, callable), Vec::new())],
                 vec![app],
                 inputs(),
+                &wrong,
                 &fragment,
             ),
             ProjectCheck::MissingRoot,
@@ -610,6 +728,101 @@ mod tests {
             }
         "#;
         assert_eq!(prove(&app, callable, proof), ProjectCheck::Unsupported);
+    }
+
+    fn verified_summary(
+        program_source: &SourceIdentity,
+        callable: &str,
+        target_source: &SourceIdentity,
+        proof_source: &SourceIdentity,
+        proof: &str,
+    ) -> Option<VerifiedReturnBound> {
+        let fragment = wosy_syntax::parse_proof_fragment(proof_source.clone(), proof.to_owned(), &[]);
+        verify_return_bound(
+            vec![(declarations(program_source, callable), Vec::new())],
+            vec![program_source.clone()],
+            inputs(),
+            target_source,
+            &fragment,
+        )
+    }
+
+    #[test]
+    fn verified_bound_preserves_exact_target_and_typed_entry_guard() {
+        let app = source("src/main.w", "chosen");
+        let callable = "%%start\nu16(u8, u16) choose = fn(first, value) { if (first == 0) {}; value };\n%%end";
+        let proof_source = source("proof/choose.fragment.w", "proof-r1");
+        let proof = "proof bounded for choose(a, b) -> (out) where (b <= 12) ensures (out <= 12) {}";
+        let bound = verified_summary(&app, callable, &app, &proof_source, proof).unwrap();
+        assert_eq!(bound.proof_source, proof_source);
+        assert_eq!(bound.proof_name, "bounded");
+        assert_eq!(&proof[bound.proof_span.start as usize..bound.proof_span.end as usize], proof);
+        let name_start = callable.find("choose").unwrap() as u32;
+        assert_eq!(bound.target, ResolvedCallTarget::ModuleCallable {
+            source: app.clone(),
+            declaration_span: ByteSpan::new(name_start, name_start + "choose".len() as u32),
+            concrete: ConcreteCallSelection::Declaration,
+        });
+        assert_eq!(bound.target_layout, ScalarTargetLayout::WASM32);
+        assert_eq!(bound.parameters, [ScalarType::U8, ScalarType::U16]);
+        assert_eq!(bound.output_slot, 0);
+        assert_eq!(bound.output_type, ScalarType::U16);
+        assert_eq!(bound.operator, BinaryOperator::LessEqual);
+        assert_eq!(bound.bound, BigInt::from(12));
+        assert_eq!(bound.guard, Some(VerifiedEntryGuard::Integer {
+            slot: 1,
+            ty: ScalarType::U16,
+            operator: BinaryOperator::LessEqual,
+            bound: BigInt::from(12),
+        }));
+        let second_source = source("proof/choose.fragment.w", "proof-r2");
+        let second_proof = "proof tighter for choose(a, b) -> (out) where (b <= 11) ensures (out <= 11) {}";
+        let second = verified_summary(&app, callable, &app, &second_source, second_proof).unwrap();
+        assert_eq!(second.target, bound.target);
+        assert_ne!(second.proof_source, bound.proof_source);
+        assert_eq!(second.proof_source, second_source);
+        assert_eq!(second.proof_name, "tighter");
+        assert_eq!(
+            &second_proof[second.proof_span.start as usize..second.proof_span.end as usize],
+            second_proof,
+        );
+
+        let wrong = source("src/main.w", "other-revision");
+        assert_eq!(verified_summary(&app, callable, &wrong, &proof_source, proof), None);
+        assert_eq!(verified_summary(&app, callable, &app, &app, proof), None);
+    }
+
+    #[test]
+    fn unproved_or_inapplicable_fragment_issues_no_bound() {
+        let app = source("src/main.w", "identity");
+        let proof_source = source("proof/identity.fragment.w", "proof-r1");
+        let callable = "%%start\nu8(u8) identity = fn(value) { value };\n%%end";
+        for proof in [
+            "proof bounded for identity(x) -> (out) ensures (out <= 10) {}",
+            "proof bounded for identity(x) -> (out) where (x > 255) ensures (out <= 10) {}",
+            "proof bounded for identity(x) -> (out) where (false) ensures (out <= 10) {}",
+            "proof bounded for identity(x) -> (out) ensures (out <= 256) {}",
+            "proof bounded for identity(x) -> (out) ensures (out <= 255) { core.show(out == x); }",
+        ] {
+            assert_eq!(verified_summary(&app, callable, &app, &proof_source, proof), None);
+        }
+    }
+
+    #[test]
+    fn proof_success_does_not_certify_a_callable_with_directives_writes_or_calls() {
+        let app = source("src/main.w", "identity");
+        let proof_source = source("proof/identity.fragment.w", "proof-r2");
+        let proof = "proof bounded for identity(x) -> (out) ensures (out <= 255) {}";
+        for body in [
+            format!("core.narrow(value <= 10, {OUTPUT}); value"),
+            format!("core.require(true, {OUTPUT}); value"),
+            "if (value > 0) {}; value = 0; value".into(),
+            "if (false) { other(); } value".into(),
+        ] {
+            let callable = format!("%%start\nu8(u8) identity = fn(value) {{ {body} }}; unit() other = fn {{}};\n%%end");
+            assert_eq!(prove(&app, &callable, proof), ProjectCheck::Proved);
+            assert_eq!(verified_summary(&app, &callable, &app, &proof_source, proof), None);
+        }
     }
 
 }

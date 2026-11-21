@@ -21,8 +21,8 @@ pub(super) enum CheckerPredicate {
 pub(super) struct IntegerPredicate {
     pub(super) binding: ReferenceBindingId,
     ty: ScalarType,
-    operator: BinaryOperator,
-    bound: BigInt,
+    pub(super) operator: BinaryOperator,
+    pub(super) bound: BigInt,
 }
 
 pub(super) struct IntegerComparison<'a> {
