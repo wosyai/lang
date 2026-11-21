@@ -1319,8 +1319,8 @@ fn checked_aggregate_reads_materialize_sized_values_on_both_targets_and_pipeline
                 .expect("project LLVM")
                 .to_text(),
         ] {
-            assert!(llvm.contains("load [8 x i8], ptr %deref"), "{llvm}");
-            assert!(llvm.contains("load [2 x i8], ptr %deref"), "{llvm}");
+            assert!(fixed_aggregate_move_count(&llvm, "%deref", 8) != 0, "{llvm}");
+            assert!(fixed_aggregate_move_count(&llvm, "%deref", 2) != 0, "{llvm}");
             assert!(
                 llvm.contains("getelementptr inbounds i8, ptr %deref, i8 4"),
                 "{llvm}"
@@ -1365,10 +1365,10 @@ fn checked_aggregate_return_reads_in_caller_on_both_targets_and_pipelines() {
                 .expect("project LLVM")
                 .to_text(),
         ] {
-            assert!(llvm.contains("load [8 x i8], ptr %deref"), "{llvm}");
-            assert!(llvm.contains("load [2 x i8], ptr %deref"), "{llvm}");
+            assert!(fixed_aggregate_move_count(&llvm, "%deref", 8) != 0, "{llvm}");
+            assert!(fixed_aggregate_move_count(&llvm, "%deref", 2) != 0, "{llvm}");
             assert!(
-                llvm.contains("%return_result_value = load [2 x i8]"),
+                fixed_aggregate_move_count(&llvm, "%return_result_source", 2) != 0,
                 "{llvm}"
             );
         }
@@ -1403,24 +1403,8 @@ fn validated_return_origins_materialize_local_pointees_and_forward_existing_owne
                 .to_text(),
         ] {
             assert!(llvm.contains("return_result_value = load i8"), "{llvm}");
-            assert!(
-                llvm.contains("return_result_value = load [1 x i8]"),
-                "{llvm}"
-            );
-            assert!(
-                llvm.contains("return_result_value = load [2 x i8]"),
-                "{llvm}"
-            );
-            assert!(
-                llvm.contains("return_result_value = load [2 x [1 x i8]]"),
-                "{llvm}"
-            );
-            assert_eq!(
-                llvm.matches("load [1 x i8], ptr %return_result_source")
-                    .count(),
-                3,
-                "{llvm}"
-            );
+            assert_eq!(fixed_aggregate_move_count(&llvm, "%return_result_source", 1), 3, "{llvm}");
+            assert_eq!(fixed_aggregate_move_count(&llvm, "%return_result_source", 2), 2, "{llvm}");
             assert_eq!(
                 llvm.matches("call void @__wosy_core_free(ptr %return_result_release)")
                     .count(),
@@ -1530,7 +1514,7 @@ fn mixed_fresh_and_borrowed_return_materializes_only_fresh_branch() {
                 .to_text(),
         ] {
             assert_eq!(
-                llvm.matches("return_result_value = load [1 x i8]").count(),
+                fixed_aggregate_move_count(&llvm, "%return_result_source", 1),
                 1,
                 "{llvm}"
             );
@@ -1854,8 +1838,8 @@ fn move_only_checked_aggregate_is_consumed_as_one_sized_value() {
                 .expect("project LLVM")
                 .to_text(),
         ] {
-            assert!(llvm.contains("load [1 x i8], ptr %deref"), "{llvm}");
-            assert!(llvm.contains("load [2 x [1 x i8]], ptr %deref"), "{llvm}");
+            assert!(fixed_aggregate_move_count(&llvm, "%deref", 1) != 0, "{llvm}");
+            assert!(fixed_aggregate_move_count(&llvm, "%deref", 2) != 0, "{llvm}");
             assert!(
                 !llvm.contains("call void @__wosy_core_free(ptr %deref"),
                 "{llvm}"
@@ -3416,6 +3400,66 @@ fn emits_project_multiple_unit_conditionals_in_a_branch_once() {
         4,
         "{llvm}"
     );
+}
+
+fn fixed_aggregate_move_count(ir: &str, source: &str, bytes: u64) -> usize {
+    let source = format!(", ptr align 1 {source}");
+    let size = format!(" {bytes}, i1 false)");
+    ir.lines()
+        .filter(|line| {
+            line.contains("call void @llvm.memmove")
+                && line.contains(&source)
+                && line.ends_with(&size)
+        })
+        .count()
+}
+
+#[test]
+fn emits_bulk_transfer_for_large_fixed_array_literals_on_both_targets() {
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let text = "%%start
+f32[6] point = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+POINTS
+%%end"
+        .replace(
+            "POINTS",
+            &[("point", "row", 24), ("row", "plane", 24), ("plane", "layer", 24), ("layer", "grid", 12)]
+                .into_iter()
+                .scan(String::from("f32[6]"), |ty, (item, name, count)| {
+                    ty.push_str(&format!("[{count}]"));
+                    Some(format!("{ty} {name} = [{}];", vec![item; count].join(", ")))
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source.clone(), text.clone(), &[]);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let single_ir = emit_scalar_llvm(&single).unwrap().to_text();
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program, Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        let project_ir = emit_scalar_project_llvm(&project).unwrap().to_text();
+        for ir in [single_ir, project_ir] {
+            assert_eq!(fixed_aggregate_move_count(&ir, "%array_literal", 3_981_312), 1, "{ir}");
+            assert!(ir.lines().all(|line| !line.contains("load [") && !line.contains("store [")), "{ir}");
+            if layout == ScalarTargetLayout::WASM32 {
+                assert!(ir.contains("@llvm.memmove.p0.p0.i32"), "{ir}");
+                assert!(ir.contains("\"target-features\"=\"+bulk-memory\""), "{ir}");
+            } else {
+                assert!(ir.contains("@llvm.memmove.p0.p0.i64"), "{ir}");
+                assert!(!ir.contains("+bulk-memory"), "{ir}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -5494,6 +5538,74 @@ i32 value = env.read();
             .get_string_attribute(AttributeLoc::Function, key)
             .expect("extern string attribute");
         assert_eq!(attribute.get_string_value().to_bytes(), expected.as_bytes());
+    }
+}
+
+#[test]
+fn extern_import_groups_do_not_replace_llvm_function_attributes() {
+    use inkwell::{attributes::AttributeLoc, memory_buffer::MemoryBuffer};
+
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let text = "%%start
+scene = extern wasm \"showcase\" { unit() mesh; };
+events = extern wasm \"events\" { unit() frame; };
+u8[2] row = [1, 2];
+u8[2][2] grid = [row, row];
+scene.mesh();
+events.frame();
+%%end";
+    let parsed = parse_source(source.clone(), text.into(), &[]);
+    let single = derive_scalar_program_with_layout(&parsed.result, ScalarTargetLayout::WASM32);
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    let single_partition = emit_scalar_llvm(&single).unwrap();
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(single.program, Vec::new())],
+        vec![source],
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    let project_partition = emit_scalar_project_llvm(&project).unwrap();
+
+    for partition in [single_partition, project_partition] {
+        let ir = partition.to_text();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "extern-groups");
+        let context = Context::create();
+        let module = context.create_module_from_ir(buffer).expect("parse emitted LLVM");
+        module.verify().expect("verify emitted LLVM");
+        assert_eq!(partition.declarations.len(), 2, "{ir}");
+        for (declaration, (module_name, import_name)) in partition
+            .declarations
+            .iter()
+            .zip([("showcase", "mesh"), ("events", "frame")])
+        {
+            let attributes = &declaration.attributes[0];
+            assert_eq!(attributes.wasm_import_module, module_name);
+            assert_eq!(attributes.wasm_import_name, import_name);
+            assert!(
+                ir.contains(&format!("declare void @{}() #{}", declaration.name, attributes.group)),
+                "{ir}"
+            );
+            let function = module.get_function(&declaration.name).unwrap();
+            for (key, expected) in [
+                ("wasm-import-module", module_name),
+                ("wasm-import-name", import_name),
+            ] {
+                let attribute = function.get_string_attribute(AttributeLoc::Function, key).unwrap();
+                assert_eq!(attribute.get_string_value().to_bytes(), expected.as_bytes());
+            }
+        }
+        assert!(module.get_functions().any(|function| {
+            !function.is_null()
+                && function.count_basic_blocks() > 0
+                && function
+                    .get_string_attribute(AttributeLoc::Function, "target-features")
+                    .is_some_and(|attribute| attribute.get_string_value().to_bytes() == b"+bulk-memory")
+        }), "{ir}");
+        assert!(ir.contains("attributes #") && ir.contains("memory(argmem: readwrite)"), "{ir}");
     }
 }
 
@@ -7586,10 +7698,9 @@ fn emits_direct_local_struct_addresses_and_loaded_pointer_bindings_for_externs()
     assert!(text.contains("wasm-import-name\"=\"touch"), "{text}");
     assert!(text.contains("wasm-import-name\"=\"inspect"), "{text}");
     assert!(forward.contains("alloca [8 x i8]"), "{forward}");
-    assert!(forward.contains("store [8 x i8]"), "{forward}");
     assert!(forward.contains("%local = alloca [8 x i8]"), "{forward}");
     assert!(
-        forward.contains("store [8 x i8] %struct_value") && forward.contains("ptr %local"),
+        forward.contains("ptr align 1 %local, ptr align 1 %struct_literal"),
         "{forward}"
     );
     assert!(forward.contains("ptrtoint ptr %pair"), "{forward}");
@@ -8104,8 +8215,11 @@ u64(bool) verify = fn(flag) { Pair value = _make(flag); value.total };
             let (_, hidden) = body.split_once("ptr ").expect("caller destination parameter");
             let destination = hidden.split(')').next().unwrap();
             assert!(body.contains("phi ptr "), "{body}");
-            assert!(body.contains("load [16 x i8]"), "{body}");
-            assert!(body.contains(&format!(", ptr {destination},")), "{body}");
+            assert!(body.lines().any(|line| {
+                line.contains("@llvm.memmove.")
+                    && line.contains(&format!("ptr align 1 {destination}, ptr align 1 %if,"))
+                    && (line.contains("i32 16, i1 false") || line.contains("i64 16, i1 false"))
+            }), "{body}");
             assert!(body.contains("ret void"), "{body}");
             assert!(!body.contains("ret ptr"), "{body}");
 
@@ -8118,7 +8232,7 @@ u64(bool) verify = fn(flag) { Pair value = _make(flag); value.total };
             }).expect("caller-owned aligned storage");
             assert!(body.lines().any(|line| line.contains(&format!("call void @{producer}("))
                 && line.ends_with(&format!(", ptr {slot})"))), "{body}");
-            assert!(body.contains(&format!("load [16 x i8], ptr {slot}")), "{body}");
+            assert_eq!(fixed_aggregate_move_count(body, slot, 16), 1, "{body}");
         }
     }
 }

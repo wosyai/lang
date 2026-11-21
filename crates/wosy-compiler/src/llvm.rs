@@ -1300,6 +1300,18 @@ fn declaration_attributes(declarations: &[LlvmFunction]) -> Vec<&LlvmFunctionAtt
     attributes
 }
 
+fn first_external_attribute_group(text: &str) -> u32 {
+    const PREFIX: &str = "\nattributes #";
+    text.match_indices(PREFIX)
+        .filter_map(|(start, _)| {
+            text[start + PREFIX.len()..]
+                .split_once(" = ")
+                .and_then(|(group, _)| group.parse::<u32>().ok())
+        })
+        .max()
+        .map_or(0, |group| group + 1)
+}
+
 fn finish_partition<'ctx>(
     module: inkwell::module::Module<'ctx>,
     module_name: String,
@@ -1338,6 +1350,11 @@ fn finish_partition<'ctx>(
             })
         })
         .collect();
+    let first_external_group = if externs.is_empty() {
+        0
+    } else {
+        first_external_attribute_group(&text)
+    };
     let declarations = externs
         .iter()
         .enumerate()
@@ -1367,7 +1384,7 @@ fn finish_partition<'ctx>(
                 result,
                 parameters,
                 attributes: vec![LlvmFunctionAttributes {
-                    group: group as u32,
+                    group: first_external_group + group as u32,
                     wasm_import_module: extern_identity.import_module.clone(),
                     wasm_import_name: extern_identity.import_name.clone(),
                 }],

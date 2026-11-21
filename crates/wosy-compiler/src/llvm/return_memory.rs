@@ -130,15 +130,19 @@ pub(super) fn emit_automatic_return_result<'ctx, 'module>(
             "return_result_source",
         )
         .map_err(builder_error)?;
-    let aggregate = storage_type(context, aggregate_type, state.layouts, state.target_layout)?;
-    let copied = state
-        .builder
-        .build_load(aggregate, source, "return_result_value")
-        .map_err(builder_error)?;
-    state
-        .builder
-        .build_store(destination, copied)
-        .map_err(builder_error)?;
+    if matches!(aggregate_type, ScalarType::Struct(_) | ScalarType::Array { .. }) {
+        memory::copy_fixed_aggregate(context, state, destination, source, aggregate_type)?;
+    } else {
+        let scalar = storage_type(context, aggregate_type, state.layouts, state.target_layout)?;
+        let copied = state
+            .builder
+            .build_load(scalar, source, "return_result_value")
+            .map_err(builder_error)?;
+        state
+            .builder
+            .build_store(destination, copied)
+            .map_err(builder_error)?;
+    }
     let heap_address = state
         .builder
         .build_ptr_to_int(
