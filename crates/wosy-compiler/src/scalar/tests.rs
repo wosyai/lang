@@ -12472,3 +12472,82 @@ unit(Pair) inspect = fn(owner) {{
     }
     assert!(missed.is_empty(), "{missed:?}");
 }
+
+#[test]
+fn known_projected_shared_leaf_stays_with_its_exact_named_shared_owner_and_holder() {
+    for (body, conflict) in [
+        ("u8 read = *leaf; u8 base = (*parent).right; owner = { .left = 3; .right = 4; }; read; base;", None),
+        ("u8 direct = owner.right; u8 base = (*parent).left; u8 read = *leaf; direct; base; read;", None),
+        ("owner = { .left = 3; .right = 4; }; u8 read = *leaf; read;", Some("owner =")),
+        ("owner.left = 3; u8 base = (*parent).right; u8 read = *leaf; base; read;", Some("left =")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *Pair parent = &owner;
+    *u8 leaf = &(*parent).left;
+    {body}
+}};
+%%end"#);
+        let root = text.find("&owner").unwrap() as u32;
+        let projected = text.find("&(*parent).left").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let borrow = function.reference_cfg.initial_points.iter().find(|point| {
+                point.source_span.range.start == projected
+                    && matches!(&point.kind, CfgPointKind::Borrow { place, loan }
+                        if loan.mode == ScalarReferenceMutability::Shared
+                            && loan.parent.as_deref().is_some_and(|parent| {
+                                parent.creation_span.start == root
+                                    && parent.mode == ScalarReferenceMutability::Shared
+                                    && parent.origin_place.binding == place.binding
+                            })
+                            && matches!(place.projections.as_slice(),
+                                [ReferencePlaceProjection::Dereference(_),
+                                ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                                if field.index == 0))
+            }).unwrap_or_else(|| panic!("actual projected checked borrow: {diagnostics:?}"));
+            if let Some(conflict) = conflict {
+                let start = text.find(conflict).unwrap() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == start)
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range)),
+                    "{body}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}");
+                assert!(function.reference_cfg.points[borrow.id.0].possible_origins.as_ref()
+                    .is_some_and(|origins| origins.len() == 1));
+            }
+        }
+    }
+}
+
+#[test]
+fn known_projected_shared_leaf_keeps_noncanonical_transports_closed() {
+    for (parent, body) in [
+        ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; *u8 alias = leaf; u8 read = *alias; read;"),
+        ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; leaf = null;"),
+        ("*Pair parent = &owner;", "&(*parent).left;"),
+        ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; if (true) { u8 read = *leaf; read; };"),
+        ("*!Pair parent = &!owner;", "*u8 leaf = &(*parent).left; u8 read = *leaf; read;"),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    {parent}
+    {body}
+}};
+%%end"#);
+        let projected = text.find("&(*parent).left").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == projected)),
+                "{parent} {body}: {diagnostics:?}");
+        }
+    }
+}

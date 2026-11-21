@@ -4849,7 +4849,7 @@ fn exact_projected_reborrow_parent_on_edge(
         || owner.binding == *binding || owner.binding != loan.origin_place.binding
         || loan.parent.as_deref() != Some(parent) || projected_parent.as_ref() != parent
         || field != projected_field
-        || (loan.mode == ScalarReferenceMutability::Mutable && parent.mode != ScalarReferenceMutability::Mutable)
+        || loan.mode != ScalarReferenceMutability::Shared || parent.mode != ScalarReferenceMutability::Shared
     {
         return false;
     }
@@ -4883,6 +4883,9 @@ fn transfer_reference_facts(
         .collect::<BTreeSet<_>>();
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
     let mut strictly_forward = true;
+    let mut projected_readonly_sites = HashMap::new();
+    let mut projected_readonly_holders = HashMap::new();
+    let mut projected_exposures = None;
     let mut known_lexical_owners = None::<HashMap<&ReferenceBindingId, Option<ReferencePlaceId>>>;
     let mut aggregate_expiry_allowed = aggregate.is_some();
     let pending = cfg.pending_named_reborrow;
@@ -4981,6 +4984,68 @@ fn transfer_reference_facts(
                         projections: Vec::new(),
                         place: root.clone(),
                     });
+                }
+            }
+            _ => {}
+        }
+        match &point.kind {
+            CfgPointKind::Borrow { loan, .. }
+                if loan.mode == ScalarReferenceMutability::Shared
+                    && direct_checked_field_base(&loan.origin_place.place).is_some() =>
+            {
+                let authority = cfg.named_reborrow_parents
+                    .binary_search_by_key(&point.id, |parent| parent.borrow)
+                    .ok().map(|index| &cfg.named_reborrow_parents[index]);
+                if let (Some(authority), [next]) = (authority, point.successors.as_slice()) {
+                    let parent = original_points.get(authority.pointer.0);
+                    let holder = original_points.get(next.0);
+                    if let (Some(ReferenceFlowPoint { kind: CfgPointKind::Read { binding: parent }, .. }),
+                        Some(ReferenceFlowPoint { kind: CfgPointKind::Bind { binding }, scope, .. }))
+                        = (parent, holder)
+                    {
+                        let owner = &loan.origin_place.binding;
+                        let (unknown, exposed) = projected_exposures.get_or_insert_with(|| {
+                            (cfg.raw_address_exposures.iter().any(|(_, root)| root.is_none()),
+                             cfg.raw_address_exposures.iter().filter_map(|(_, root)| root.as_ref())
+                                .collect::<HashSet<_>>())
+                        });
+                        let exact_init = cfg.checked_binding_initializers
+                            .binary_search_by_key(next, |(bind, _)| *bind)
+                            .is_ok_and(|index| cfg.checked_binding_initializers[index].1 == point.id);
+                        if point.id < *next && point.scope == *scope && exact_init && owner != binding
+                            && parent != binding && !cfg.allocations.contains(binding)
+                            && !*unknown && !exposed.contains(owner) && !exposed.contains(parent)
+                            && !exposed.contains(binding)
+                            && !projected_readonly_holders.contains_key(binding)
+                        {
+                            projected_readonly_holders.insert(binding, (point.id, point.scope));
+                            projected_readonly_sites.insert(point.id, authority);
+                        }
+                    }
+                }
+            }
+            CfgPointKind::Read { binding } => {
+                if let Some(&(borrow, scope)) = projected_readonly_holders.get(binding) {
+                    let is_direct_read = match point.successors.as_slice() {
+                        [next] => original_points.get(next.0).is_some_and(|next| {
+                            point.scope == scope && next.scope == scope
+                                && cfg.checked_pointee_reads.binary_search(&next.id).is_ok()
+                                && matches!(&next.kind, CfgPointKind::ReadPlace {
+                                    place: ScalarPlace::Dereference { pointer, .. },
+                                    pointer_point: Some(pointer_id), reads_origin: false, ..
+                                } if *pointer_id == point.id && matches!(pointer.as_ref(), ScalarExpression::Name { .. }))
+                        }),
+                        _ => false,
+                    };
+                    if !is_direct_read {
+                        projected_readonly_sites.remove(&borrow);
+                    }
+                }
+            }
+            CfgPointKind::Assign { target, .. } | CfgPointKind::Move { place: target, .. }
+            | CfgPointKind::DeferredMove { place: target, .. } | CfgPointKind::Borrow { place: target, .. } => {
+                if let Some(&(borrow, _)) = projected_readonly_holders.get(&target.binding) {
+                    projected_readonly_sites.remove(&borrow);
                 }
             }
             _ => {}
@@ -5288,7 +5353,7 @@ fn transfer_reference_facts(
             CfgPointKind::Borrow { place, loan } if direct_checked_field_base(&place.place).is_some() => Some(loan),
             _ => None,
         };
-        let projected_authority = projected_loan.and_then(|_| named_parent());
+        let projected_authority = projected_loan.and_then(|_| projected_readonly_sites.get(&id).copied());
         if effective_point.is_some() {
             cfg.points[id.0] = initial_point.clone();
         }

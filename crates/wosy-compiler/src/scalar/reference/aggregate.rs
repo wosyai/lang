@@ -238,7 +238,7 @@ pub(super) fn checked_scalar_output(outputs: &[RootOutputType]) -> bool {
             if ordinary_value(inner))
 }
 
-pub(super) fn ordinary_value(ty: &ScalarType) -> bool {
+pub(in crate::scalar) fn ordinary_value(ty: &ScalarType) -> bool {
     matches!(ty, ScalarType::Bool | ScalarType::Char | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 |
         ScalarType::I64 | ScalarType::I128 | ScalarType::U8 | ScalarType::U16 | ScalarType::U32 |
         ScalarType::U64 | ScalarType::U128 | ScalarType::F32 | ScalarType::F64)

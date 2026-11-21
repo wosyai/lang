@@ -364,9 +364,10 @@ fn projected_reborrow_authority_requires_a_canonical_live_parent_on_each_edge() 
     let text = r#"%%start
 struct copy Pair { u8 left; u8 right; }
 unit(Pair) inspect = fn(owner) {
-    *!Pair parent = &!owner;
-    *!Pair child = &!(*parent);
-    child;
+    *Pair parent = &owner;
+    *Pair child = &(*parent);
+    Pair observed = *child;
+    observed.left;
 };
 %%end"#;
     let parsed = parse_source(source(), text.into(), &[]);
@@ -389,6 +390,10 @@ unit(Pair) inspect = fn(owner) {
         .expect("ordinary child borrow to use as a transfer topology");
     let holder = cfg.initial_points.iter().find(|point| point.id > borrow.id
         && matches!(point.kind, CfgPointKind::Bind { .. })).expect("ordinary child holder");
+    let child_read = cfg.initial_points.iter().find(|point| {
+        matches!(&point.kind, CfgPointKind::ReadPlace { place: ScalarPlace::Dereference { .. }, .. })
+            && point.source_span.range.start == text.rfind("*child;").unwrap() as u32
+    }).expect("ordinary direct checked child read");
     let child_id = *borrow.possible_origins.as_ref().and_then(|origins| origins.first())
         .expect("ordinary child fact");
     let owner = &parent.origin_place;
@@ -456,6 +461,7 @@ unit(Pair) inspect = fn(owner) {
         let mut cfg = projected.clone();
         let mut proof = super::super::control::CallablePointFacts::default();
         proof.checked_binding_initializers.push((holder.id, borrow.id));
+        proof.checked_pointee_reads.push(child_read.id);
         if proven {
             proof.named_reborrow_parents.push(super::super::control::NamedReborrowParent {
                 borrow: borrow.id,
@@ -488,7 +494,7 @@ unit(Pair) inspect = fn(owner) {
 }
 
 #[test]
-fn projected_reborrow_authority_does_not_enable_new_source_syntax() {
+fn projected_reborrow_authority_does_not_enable_mutable_source_syntax() {
     let text = r#"%%start
 struct copy Pair { u8 left; u8 right; }
 u8(Pair) inspect = fn(owner) {

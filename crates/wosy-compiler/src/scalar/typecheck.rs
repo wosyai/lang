@@ -5017,6 +5017,22 @@ fn is_supported_checked_address_place(place: &ScalarPlace) -> bool {
     }
 }
 
+fn permits_readonly_named_checked_field(
+    place: &ScalarPlace,
+    mode: ScalarReferenceMutability,
+    scope: &BTreeMap<String, ScalarType>,
+) -> bool {
+    let ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(_), .. } = place else {
+        return false;
+    };
+    let ScalarPlace::Dereference { pointer, .. } = base.as_ref() else { return false };
+    let ScalarExpression::Name { name, .. } = pointer.as_ref() else { return false };
+    mode == ScalarReferenceMutability::Shared
+        && matches!(scope.get(name), Some(ScalarType::CheckedReference {
+            mutability: ScalarReferenceMutability::Shared, inner,
+        }) if matches!(inner.as_ref(), ScalarType::Struct(_)))
+}
+
 fn is_addressable_checked_reference_type(ty: &ScalarType) -> bool {
     !matches!(
         ty,
@@ -5034,6 +5050,17 @@ fn checked_address_type(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    if permits_readonly_named_checked_field(place, mutability, scope) {
+        let inner = checked_dereference_type(place, span, scope, program, diagnostics, false, overloads, inference);
+        if super::reference::aggregate::ordinary_value(&inner) {
+            return ScalarType::CheckedReference { mutability, inner: Box::new(inner) };
+        }
+        if inner != ScalarType::Error {
+            diagnostics.push(diagnostic(program, "B0003",
+                "checked projected borrow requires an ordinary Copy field", span));
+        }
+        return ScalarType::Error;
+    }
     if !is_supported_checked_address_place(place) {
         diagnostics.push(diagnostic(
             program,
@@ -5114,6 +5141,17 @@ fn checked_address_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    if permits_readonly_named_checked_field(place, mutability, scope) {
+        let inner = checked_dereference_type_in_module(place, span, scope, module, modules, diagnostics, false, overloads, inference);
+        if super::reference::aggregate::ordinary_value(&inner) {
+            return ScalarType::CheckedReference { mutability, inner: Box::new(inner) };
+        }
+        if inner != ScalarType::Error {
+            diagnostics.push(module_diagnostic(module, "B0003",
+                "checked projected borrow requires an ordinary Copy field", span));
+        }
+        return ScalarType::Error;
+    }
     if !is_supported_checked_address_place(place) {
         diagnostics.push(module_diagnostic(
             module,
