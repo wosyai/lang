@@ -1089,4 +1089,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn where_bound_filters_only_the_selected_proof() {
+        use crate::scalar::{
+            checker_flow::{check_integer_return_bound, check_integer_return_bound_where, ProofCoverage},
+            BinaryOperator,
+        };
+        check_source(
+            "u8(u8) identity = fn(value) { if (value <= 9) {}; value };",
+            |body| {
+                let filter = body.structure.checker_branches.values().next().unwrap();
+                assert_eq!(
+                    check_integer_return_bound(body, &BinaryOperator::LessEqual, &9.into()),
+                    Some(Ok(false)),
+                );
+                assert_eq!(
+                    check_integer_return_bound_where(body, &BinaryOperator::LessEqual, &9.into(), filter),
+                    Some(Ok(ProofCoverage::Applicable(true))),
+                );
+                assert_eq!(
+                    check_integer_return_bound_where(body, &BinaryOperator::LessEqual, &8.into(), filter),
+                    Some(Ok(ProofCoverage::Applicable(false))),
+                );
+                assert_eq!(
+                    check_integer_return_bound(body, &BinaryOperator::LessEqual, &9.into()),
+                    Some(Ok(false)),
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn where_filter_uses_call_entry_before_a_parameter_overwrite() {
+        use crate::scalar::{
+            checker_flow::{check_integer_return_bound_where, ProofCoverage},
+            BinaryOperator,
+        };
+        check_source(
+            "u8(u8) overwrite = fn(value) { if (value > 10) {}; value = 0; value };",
+            |body| {
+                let filter = body.structure.checker_branches.values().next().unwrap();
+                assert_eq!(
+                    check_integer_return_bound_where(body, &BinaryOperator::Equal, &0.into(), filter),
+                    Some(Ok(ProofCoverage::Applicable(true))),
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn empty_where_supplies_no_fact_and_local_is_not_an_input() {
+        use crate::scalar::{
+            checker_flow::{check_integer_return_bound, check_integer_return_bound_where, ProofCoverage},
+            BinaryOperator,
+        };
+        check_source(
+            "u8(u8) opaque = fn(value) { if (value > 255) {}; effect() }; u8() effect = fn { 1 };",
+            |body| {
+                let filter = body.structure.checker_branches.values().next().unwrap();
+                assert_eq!(check_integer_return_bound(body, &BinaryOperator::Equal, &0.into()), None);
+                assert_eq!(
+                    check_integer_return_bound_where(body, &BinaryOperator::Equal, &0.into(), filter),
+                    Some(Ok(ProofCoverage::NoApplicableInputs)),
+                );
+            },
+        );
+        check_source(
+            "u8(u8) local_guard = fn(value) { u8 local = 7; if (local == 7) {}; value };",
+            |body| {
+                let filter = body.structure.checker_branches.values().next().unwrap();
+                assert_eq!(
+                    check_integer_return_bound_where(body, &BinaryOperator::LessEqual, &255.into(), filter),
+                    None,
+                );
+            },
+        );
+    }
+
 }

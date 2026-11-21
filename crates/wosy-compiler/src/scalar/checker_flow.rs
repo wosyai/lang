@@ -278,20 +278,41 @@ enum IntegerControl<'a> {
     Fail(IntegerCheckFailure<'a>),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ProofCoverage<T> {
+    Applicable(T),
+    NoApplicableInputs,
+}
+
 pub(super) fn check_integer_requirements(
     calls: &FunctionCallSites,
 ) -> Option<Result<(), IntegerCheckFailure<'_>>> {
-    run_integer_callable(calls, integer_tail_type(calls), None)
+    run_integer_callable(calls, integer_tail_type(calls), None, None)
+        .map(|result| result.map(drop))
 }
 
 pub(super) fn observe_integer_returns(
     calls: &FunctionCallSites,
 ) -> Option<Result<Vec<IntegerReturningPath<'_>>, IntegerCheckFailure<'_>>> {
+    match observe_integer_returns_in_scope(calls, None)? {
+        Ok(ProofCoverage::Applicable(paths)) => Some(Ok(paths)),
+        Ok(ProofCoverage::NoApplicableInputs) => None,
+        Err(failure) => Some(Err(failure)),
+    }
+}
+
+fn observe_integer_returns_in_scope<'a>(
+    calls: &'a FunctionCallSites,
+    entry_filter: Option<&CheckerPredicate>,
+) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
     let tail = integer_tail_type(calls)?;
     let mut paths = Vec::new();
-    match run_integer_callable(calls, Some(tail), Some(&mut paths))? {
-        Ok(()) if !paths.is_empty() => Some(Ok(paths)),
-        Ok(()) => None,
+    match run_integer_callable(calls, Some(tail), entry_filter, Some(&mut paths))? {
+        Ok(ProofCoverage::Applicable(())) if !paths.is_empty() => {
+            Some(Ok(ProofCoverage::Applicable(paths)))
+        }
+        Ok(ProofCoverage::Applicable(())) => None,
+        Ok(ProofCoverage::NoApplicableInputs) => Some(Ok(ProofCoverage::NoApplicableInputs)),
         Err(failure) => Some(Err(failure)),
     }
 }
@@ -301,17 +322,40 @@ pub(super) fn check_integer_return_bound<'a>(
     operator: &BinaryOperator,
     bound: &BigInt,
 ) -> Option<Result<bool, IntegerCheckFailure<'a>>> {
+    match check_integer_return_bound_in_scope(calls, operator, bound, None)? {
+        Ok(ProofCoverage::Applicable(holds)) => Some(Ok(holds)),
+        Ok(ProofCoverage::NoApplicableInputs) => None,
+        Err(failure) => Some(Err(failure)),
+    }
+}
+
+pub(super) fn check_integer_return_bound_where<'a>(
+    calls: &'a FunctionCallSites,
+    operator: &BinaryOperator,
+    bound: &BigInt,
+    entry_filter: &CheckerPredicate,
+) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
+    check_integer_return_bound_in_scope(calls, operator, bound, Some(entry_filter))
+}
+
+fn check_integer_return_bound_in_scope<'a>(
+    calls: &'a FunctionCallSites,
+    operator: &BinaryOperator,
+    bound: &BigInt,
+    entry_filter: Option<&CheckerPredicate>,
+) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let relation = IntegerRelation::from_operator(operator)?;
-    let paths = match observe_integer_returns(calls)? {
-        Ok(paths) => paths,
+    let paths = match observe_integer_returns_in_scope(calls, entry_filter)? {
+        Ok(ProofCoverage::Applicable(paths)) => paths,
+        Ok(ProofCoverage::NoApplicableInputs) => return Some(Ok(ProofCoverage::NoApplicableInputs)),
         Err(failure) => return Some(Err(failure)),
     };
     for path in paths {
         if !path.output_satisfies(relation, bound)? {
-            return Some(Ok(false));
+            return Some(Ok(ProofCoverage::Applicable(false)));
         }
     }
-    Some(Ok(true))
+    Some(Ok(ProofCoverage::Applicable(true)))
 }
 
 fn integer_tail_type(calls: &FunctionCallSites) -> Option<&ScalarType> {
@@ -327,8 +371,9 @@ fn integer_tail_type(calls: &FunctionCallSites) -> Option<&ScalarType> {
 fn run_integer_callable<'a>(
     calls: &'a FunctionCallSites,
     tail: Option<&'a ScalarType>,
+    entry_filter: Option<&CheckerPredicate>,
     returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
-) -> Option<Result<(), IntegerCheckFailure<'a>>> {
+) -> Option<Result<ProofCoverage<()>, IntegerCheckFailure<'a>>> {
     let boundary = &calls.boundary;
     let checker_parameters = boundary.checker_parameter_bindings.as_deref()?;
     debug_assert_eq!(boundary.parameters.len(), checker_parameters.len());
@@ -344,9 +389,18 @@ fn run_integer_callable<'a>(
         .iter()
         .map(|parameter| IntegerSet::from_type(&parameter.ty).map(Rc::new))
         .collect::<Option<IntegerRow>>()?;
-    let root = IntegerInputs(vec![root]);
+    let mut root = IntegerInputs(vec![root]);
+    if let Some(filter) = entry_filter {
+        let (applicable, _, _) = root.split(&roots, filter)?;
+        if applicable.is_unreachable() {
+            return Some(Ok(ProofCoverage::NoApplicableInputs));
+        }
+        root = applicable;
+    }
     match walk_integer_block(calls, &mut roots, calls.structure.root, root, tail, returns)? {
-        IntegerControl::Continue(_) | IntegerControl::Returned => Some(Ok(())),
+        IntegerControl::Continue(_) | IntegerControl::Returned => {
+            Some(Ok(ProofCoverage::Applicable(())))
+        }
         IntegerControl::Fail(failure) => Some(Err(failure)),
     }
 }
