@@ -627,6 +627,32 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
         .replace("u8[count] bytes;", "u8[count] bytes;\n\tbytes = preserve(bytes, flag);");
     let observable_recommit = pure_recommit.replace("u8[](u8[], bool) preserve = fn(buffer, flag) { buffer };",
         "bool escaped = false;\nu8[](u8[], bool) preserve = fn(buffer, flag) { escaped = flag; buffer };");
+    let recursive_recommit = positive.replace("(*Packet, bool)(u64, bool) make_checked", r#"enum Validation { valid; invalid; }
+(u8[], Validation)(u8[], u64, Validation) check_byte = fn(buffer, index, status) {
+    u8 byte = buffer[index];
+    if (byte == 255) { status = Validation::invalid; };
+    buffer, status
+};
+(u8[], Validation)(u8[], u64, u64, Validation) check_range = fn(buffer, low, high, status) {
+    u64 one = core.int_extend<u64>(1);
+    if (low < high) {
+        u64 count = high - low;
+        if (count == one) {
+            buffer, status = check_byte(buffer, low, status);
+        } else {
+            u64 two = core.int_extend<u64>(2);
+            u64 middle = low + count / two;
+            buffer, status = check_range(buffer, low, middle, status);
+            buffer, status = check_range(buffer, middle, high, status);
+        };
+    };
+    buffer, status
+};
+(*Packet, bool)(u64, bool) make_checked"#)
+        .replace("u8[count] bytes;", "u8[count] bytes; u64 zero = 0; Validation result = Validation::valid; bytes, result = check_range(bytes, zero, count, result);");
+    let recursive_nonlocal = recursive_recommit
+        .replace("(u8[], Validation)(u8[], u64, Validation) check_byte", "u8 observed = 0;\n(u8[], Validation)(u8[], u64, Validation) check_byte")
+        .replace("u8 byte = buffer[index];", "u8 byte = buffer[index]; observed = byte;");
     let nullable_backing = positive.replace(
         "unsafe { data = &?bytes[0]; };",
         "if (count != 0) { unsafe { data = &?bytes[0]; }; };",
@@ -673,6 +699,7 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
             (length_call.as_str(), false, false),
             (module_sink.as_str(), false, false), (qualified_sink.as_str(), false, true),
             (pure_recommit.as_str(), true, false), (observable_recommit.as_str(), false, false),
+            (recursive_recommit.as_str(), true, false), (recursive_nonlocal.as_str(), false, false),
             (nullable_backing.as_str(), true, false), (null_field_live_base.as_str(), true, false),
             (aliased_nullable.as_str(), false, false), (nullable_descriptor.as_str(), false, false),
             (mixed_descriptor.as_str(), true, false), (competing_mixed.as_str(), false, false),

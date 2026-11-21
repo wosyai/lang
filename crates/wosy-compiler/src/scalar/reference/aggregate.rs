@@ -30,6 +30,9 @@ pub(super) struct AggregateFlowFacts {
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     pub(super) array_return_move: Option<CfgPointId>,
     pub(super) array_installs: BTreeSet<CfgPointId>,
+    pub(super) neutral_array_calls: BTreeSet<CfgPointId>,
+    pub(super) neutral_array_projections: BTreeMap<CfgPointId, CfgPointId>,
+    pub(super) neutral_array_scalars: BTreeSet<ReferenceBindingId>,
     pub(super) local_array_copy_allocation: Option<CfgPointId>,
     pub(super) local_array_nulls: BTreeSet<CfgPointId>,
     pub(super) local_array_failure_arms: BTreeMap<CfgPointId, BlockOrdinal>,
@@ -189,6 +192,23 @@ pub(super) fn array_roundtrip_signature(parameters: &[ScalarType], outputs: &Sca
         && rest.iter().all(|ty| ordinary_value(ty) || matches!(ty, ScalarType::Enum(_))
             || matches!(ty, ScalarType::CheckedReference { inner, .. } if ordinary_value(inner)))
         && tail.iter().all(|out| ordinary_value(&out.ty) || matches!(out.ty, ScalarType::Enum(_)))
+}
+
+pub(super) fn array_neutral_scalar(ty: &ScalarType) -> bool {
+    ordinary_value(ty) || matches!(ty, ScalarType::Enum(_))
+}
+
+pub(super) fn neutral_array_signature(parameters: &[ScalarType], outputs: &ScalarOutputSequence) -> bool {
+    array_roundtrip_signature(parameters, outputs)
+        && matches!(parameters.first(), Some(ScalarType::RuntimeArray { element, .. }) if ordinary_value(element))
+        && parameters[1..].iter().all(array_neutral_scalar)
+}
+
+fn neutral_scalar_evaluation(value: &ScalarExpression) -> bool {
+    matches!(value, ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }
+        | ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }
+        | ScalarExpression::Member { enum_tag: Some(_), .. }
+        | ScalarExpression::Binary { .. } | ScalarExpression::Unary { .. })
 }
 
 pub(super) fn ordinary_formal_outputs(outputs: &[RootOutputType]) -> bool {
@@ -462,8 +482,11 @@ impl AggregateFlowFacts {
             if !self.checked_producer_arms.is_empty() {
                 local.checked_producer_conflict |= self.checked_producer_nonlocal_installs.contains(&id);
                 local.checked_producer_conflict |= match &point.kind {
-                    CfgPointKind::Call { output: 0, .. } => !selected_recommit(id),
-                    CfgPointKind::Call { .. } | CfgPointKind::AssignThrough { .. }
+                    CfgPointKind::Call { output: 0, target: ResolvedCallTarget::Core(CoreOperationId::IntExtend), .. } => false,
+                    CfgPointKind::Call { output: 0, .. } => !self.neutral_array_calls.contains(&id) || !selected_recommit(id),
+                    CfgPointKind::Call { .. } => !self.neutral_array_projections.get(&id)
+                        .is_some_and(|&primary| selected_recommit(primary)),
+                    CfgPointKind::AssignThrough { .. }
                     | CfgPointKind::MoveThrough { .. } | CfgPointKind::DeferredMoveThrough { .. }
                     | CfgPointKind::Invalidate { .. } | CfgPointKind::Release { .. }
                     | CfgPointKind::Evaluate(ScalarExpression::ArrayLiteral { .. }) => true,
@@ -471,6 +494,8 @@ impl AggregateFlowFacts {
                         !target.projections.is_empty()
                             || if &target.binding == binding {
                                 !self.array_installs.contains(&id) || !selected_recommit(*rhs_point)
+                            } else if self.neutral_array_scalars.contains(&target.binding) {
+                                false
                             } else {
                                 !state.bindings.contains_key(&target.binding)
                                     || self.views.get(rhs_point) != Some(&allocation)
@@ -594,11 +619,25 @@ impl AggregateFlowFacts {
                     | CfgPointKind::Read { .. } | CfgPointKind::Branch { .. } | CfgPointKind::Join
                     | CfgPointKind::ReturnOutput { checked: false, .. } | CfgPointKind::Return
                     | CfgPointKind::ConditionalOutput { .. } => true,
+                    CfgPointKind::Bind { binding } => self.neutral_array_scalars.contains(binding),
+                    CfgPointKind::CaptureAssignmentPrevious { .. } => true,
+                    CfgPointKind::ReadPlace { pointer_point: None, candidates, reads_origin: false, .. } =>
+                        state.array_formal_live && matches!(candidates.as_slice(), [place]
+                            if &place.binding == formal && matches!(place.projections.as_slice(), [ReferencePlaceProjection::Index(_)])),
+                    CfgPointKind::Assign { target, rhs_point, .. } => target.projections.is_empty()
+                        && (self.neutral_array_scalars.contains(&target.binding)
+                            || (&target.binding == formal && self.array_installs.contains(&id)
+                                && self.neutral_array_calls.contains(rhs_point))),
+                    CfgPointKind::Call { output: 0, target: ResolvedCallTarget::Core(CoreOperationId::IntExtend), .. } => true,
+                    CfgPointKind::Call { output: 0, .. } => self.neutral_array_calls.contains(&id)
+                        && self.array_calls.get(&id).is_some_and(|(_, moved, binding)|
+                            binding == formal && Some(*moved) == state.array_formal_pending),
+                    CfgPointKind::Call { .. } => self.neutral_array_projections.get(&id)
+                        .and_then(|primary| self.array_calls.get(primary))
+                        .is_some_and(|(_, moved, binding)| binding == formal && Some(*moved) == state.array_formal_pending),
                     CfgPointKind::Move { place, owner, .. } => owner == formal
-                        && &place.binding == formal && place.projections.is_empty()
-                        && self.array_return_move == Some(id),
-                    CfgPointKind::Evaluate(ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }
-                        | ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }) => true,
+                        && &place.binding == formal && place.projections.is_empty(),
+                    CfgPointKind::Evaluate(value) => neutral_scalar_evaluation(value),
                     _ => false,
                 };
             }
@@ -1854,7 +1893,11 @@ fn closed_aggregates<'a>(
                 let (ordinal, _, _) = facts.array_calls.get(&call)?;
                 let callee = target_body(&declarations, body.cfg, call)?;
                 let callee_facts = bodies.get(&callee)?.facts?;
-                if callee.2.is_some() || !callee_facts.array_neutral || !array_leaves.contains(&callee)
+                let neutral = array_leaves.contains(&callee)
+                    || array_neighbors.get(&callee).is_some_and(|dependencies| dependencies.iter().all(|leaf|
+                        leaf.2.is_none() && array_leaves.contains(leaf)
+                            && bodies.get(leaf).and_then(|body| body.facts).is_some_and(|facts| facts.array_neutral)));
+                if callee.2.is_some() || !callee_facts.array_neutral || !neutral
                     || !result.bodies.get(&key)?.same_array_rebinds.contains(&ordinal.0)
                     || !matches!(&body.cfg.points.get(call.0)?.kind, CfgPointKind::Call {
                         output: 0,
