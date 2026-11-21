@@ -277,7 +277,11 @@ ReadLineStatus(u8) _read_line_zero_capacity = fn(first) {
 	};
 	if (status == ReadLineStatus::line) {
 		*?u8 data = null;
-		if (length != zero) { unsafe { data = &?bytes[0]; }; };
+		if (length != zero) {
+			unsafe { data = &?bytes[0]; };
+		} else {
+			unsafe { core.free(&bytes); };
+		};
 		utf8 text = { .data = data; .length = length; };
 		&text, status
 	} else { null, status }
