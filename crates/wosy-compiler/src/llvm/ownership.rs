@@ -232,13 +232,6 @@ pub(super) fn dynamic_return_outputs(
         .collect()
 }
 
-pub(super) fn dynamic_return_owner(
-    function_span: wosy_syntax::ByteSpan,
-    reference_cfg: &ScalarReferenceCfg,
-) -> bool {
-    !dynamic_return_outputs(function_span, reference_cfg).is_empty()
-}
-
 pub(super) fn joined_return_binding_types(
     function: &ScalarFunction,
     branches: &ReturnBranches,

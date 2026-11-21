@@ -532,7 +532,7 @@ fn emit_single_module_llvm<'a>(
                 );
                 let value = module.add_function(
                     &identity.internal_name,
-                    function_type(&context, &function.signature, target_layout)?.0,
+                    function_type(&context, &function.signature, target_layout)?,
                     None,
                 );
                 if prepared_render {
@@ -927,7 +927,7 @@ fn emit_project_llvm<'a>(
                 signatures.insert(name.clone(), function.signature.clone());
             }
             Declaration::Extern(identity, key, signature) => {
-                let value = module.add_function(&identity.internal_name, function_type(&context, signature, target_layout)?.0, None);
+                let value = module.add_function(&identity.internal_name, function_type(&context, signature, target_layout)?, None);
                 call_targets.insert(key, identity.internal_name.clone());
                 signatures.insert(identity.internal_name.clone(), signature.clone());
                 functions.insert(identity.internal_name.clone(), value);
@@ -1342,7 +1342,7 @@ fn function_type<'ctx>(
     context: &'ctx Context,
     signature: &ScalarType,
     target_layout: ScalarTargetLayout,
-) -> Result<(FunctionType<'ctx>, LlvmValueType), String> {
+) -> Result<FunctionType<'ctx>, String> {
     let ScalarType::Callable {
         outputs,
         parameters,
@@ -1354,15 +1354,14 @@ fn function_type<'ctx>(
         .iter()
         .map(|ty| basic_type(context, ty, target_layout).map(Into::into))
         .collect::<Result<Vec<BasicMetadataTypeEnum>, _>>()?;
-    let ty = match outputs.outputs.as_slice() {
+    Ok(match outputs.outputs.as_slice() {
         [] => context.void_type().fn_type(&parameters, false),
         [output] if output.ty == ScalarType::Unit => {
             context.void_type().fn_type(&parameters, false)
         }
         [output] => basic_type(context, &output.ty, target_layout)?.fn_type(&parameters, false),
         _ => aggregate_type(context, outputs, target_layout)?.fn_type(&parameters, false),
-    };
-    Ok((ty, function_value_result(outputs)?))
+    })
 }
 
 fn function_value_result(
@@ -1393,9 +1392,9 @@ fn definition_function_type<'ctx>(
     reference_cfg: &ScalarReferenceCfg,
     target_layout: ScalarTargetLayout,
 ) -> Result<FunctionType<'ctx>, String> {
-    let (ordinary, _) = function_type(context, &function.signature, target_layout)?;
-    if !dynamic_return_owner(function.span, reference_cfg) {
-        return Ok(ordinary);
+    let owner_outputs = dynamic_return_outputs(function.span, reference_cfg);
+    if owner_outputs.is_empty() {
+        return function_type(context, &function.signature, target_layout);
     }
     let ScalarType::Callable {
         outputs,
@@ -1408,7 +1407,7 @@ fn definition_function_type<'ctx>(
         .iter()
         .map(|ty| basic_type(context, ty, target_layout).map(Into::into))
         .collect::<Result<Vec<BasicMetadataTypeEnum>, _>>()?;
-    for _ in dynamic_return_outputs(function.span, reference_cfg) {
+    for _ in owner_outputs {
         arguments.push(context.ptr_type(AddressSpace::default()).into());
     }
     match outputs.outputs.as_slice() {
@@ -1804,7 +1803,7 @@ fn insert_function_result_provenance(
 
 mod ownership;
 use ownership::{
-    binding_receivers, checked_call_owners, dynamic_return_outputs, dynamic_return_owner,
+    binding_receivers, checked_call_owners, dynamic_return_outputs,
     emit_runtime_array_allocation, fresh_return_outputs, function_runtime_array_result_provenance,
     initialize_joined_return_bindings, joined_assignment_owners, joined_return_binding_types,
     release_scope_runtime_array_owners, return_bindings, transfer_runtime_array_return,
