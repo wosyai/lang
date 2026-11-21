@@ -6366,10 +6366,13 @@ fn transfer_reference_facts(
                             }
                         };
                         if check && !state.bindings.is_empty() {
-                            let access = if loan.parent.is_none() && loan.mode == ScalarReferenceMutability::Shared
+                            let access = if loan.parent.is_none()
                                 && matches!(reference_root(&place.place), ScalarPlace::Name { .. })
                             {
-                                LoanAccess::DirectShared
+                                match loan.mode {
+                                    ScalarReferenceMutability::Shared => LoanAccess::DirectShared,
+                                    ScalarReferenceMutability::Mutable => LoanAccess::Direct,
+                                }
                             } else {
                                 LoanAccess::Borrow(loan)
                             };

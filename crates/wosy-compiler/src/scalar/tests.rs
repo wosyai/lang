@@ -12811,3 +12811,69 @@ unit(Pair, bool) inspect = fn(owner, flag) {{
     }
     assert!(missed.is_empty(), "{missed:?}");
 }
+
+#[test]
+fn known_shared_projected_child_retains_whole_parent_against_new_mutable_field_loans() {
+    let mut missed = Vec::new();
+    for (parent, child, body, whole_parent, early) in [
+        ("*Pair parent = &owner;", "&(*parent).left", "*!u8 peer = &!owner.right; u8 left = *child; u8 right = *peer; left; right;", true, true),
+        ("*Pair parent = &owner;", "&(*parent).left", "u8 left = *child; *!u8 peer = &!owner.right; u8 right = *peer; left; right;", true, false),
+        ("*u8 parent = &owner.left;", "&(*parent)", "*!u8 peer = &!owner.right; u8 left = *child; u8 right = *peer; left; right;", false, false),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    {parent}
+    *u8 child = {child};
+    {body}
+}};
+%%end"#);
+        let root_span = text.find("&owner").unwrap() as u32;
+        let child_span = text.find(child).unwrap() as u32;
+        let peer_span = text.find("&!owner.right").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let child = cfg.initial_points.iter().find_map(|point| match &point.kind {
+                CfgPointKind::Borrow { loan, .. } if point.source_span.range.start == child_span
+                    && loan.mode == ScalarReferenceMutability::Shared
+                    && loan.parent.as_deref().is_some_and(|parent| parent.mode == ScalarReferenceMutability::Shared
+                        && parent.creation_span.start == root_span
+                        && parent.origin_place.projections.is_empty() == whole_parent) => Some(loan),
+                _ => None,
+            }).unwrap_or_else(|| panic!("{validator} {parent} {body}: {diagnostics:?}"));
+            if whole_parent {
+                assert!(matches!(child.origin_place.projections.as_slice(),
+                    [ReferencePlaceProjection::Dereference(_), ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                        if field.index == 0));
+            } else {
+                assert!(matches!(child.origin_place.projections.as_slice(), [ReferencePlaceProjection::Dereference(_)]));
+                assert!(matches!(child.parent.as_ref().unwrap().origin_place.projections.as_slice(),
+                    [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] if field.index == 0));
+            }
+            assert!(cfg.initial_points.iter().any(|point| point.source_span.range.start == peer_span
+                && matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
+                    if loan.mode == ScalarReferenceMutability::Mutable && loan.parent.is_none()
+                        && loan.origin_place.binding == child.origin_place.binding
+                        && matches!(loan.origin_place.projections.as_slice(),
+                            [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] if field.index == 1))),
+                "{validator} {parent} {body}: {diagnostics:?}");
+            if early {
+                if !diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == peer_span)
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == child_span))
+                {
+                    missed.push((validator, body, diagnostics.clone()));
+                }
+            } else {
+                assert!(diagnostics.is_empty(), "{validator} {parent} {body}: {diagnostics:?}");
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{missed:?}");
+}
