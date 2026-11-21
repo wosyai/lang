@@ -3853,27 +3853,51 @@ fn loan_borrows_place(loan: &ReferenceLoanId, place: &ReferencePlaceId) -> bool 
             .is_some_and(|parent| loan_borrows_place(parent, place))
 }
 
+fn loan_has_ancestor(loan: &ReferenceLoanId, ancestor: &ReferenceLoanId) -> bool {
+    let mut next = loan.parent.as_deref();
+    while let Some(parent) = next {
+        if parent == ancestor {
+            return true;
+        }
+        next = parent.parent.as_deref();
+    }
+    false
+}
+
+enum LoanAccess<'a> {
+    Direct,
+    Through(ReferenceOriginId),
+    WriteThrough(&'a InvalidationCandidate),
+}
+
 fn conflicting_live_loan(
     points: &[ReferenceFlowPoint],
     facts: &[ReferenceOrigin],
     state: &ReferenceEdgeState,
     point: CfgPointId,
     place: &ReferencePlaceId,
-    consuming_origin: Option<ReferenceOriginId>,
+    access: LoanAccess<'_>,
 ) -> Vec<SourceSpan> {
     let place = available_place(place);
     let mut conflicts = Vec::new();
     for (binding, origins) in &state.bindings {
         let mut reachable = false;
         for origin in origins {
-            if Some(*origin) == consuming_origin {
+            if match access {
+                LoanAccess::Direct => false,
+                LoanAccess::Through(selected) => *origin == selected,
+                LoanAccess::WriteThrough(selected) => *origin == selected.origin,
+            } {
                 continue;
             }
             let loan = match &facts[origin.0] {
                 ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. } => loan,
                 _ => continue,
             };
-            if !loan_borrows_place(loan, &place) {
+            if !loan_borrows_place(loan, &place)
+                || matches!(access, LoanAccess::WriteThrough(selected)
+                    if loan_has_ancestor(&selected.loan, loan))
+            {
                 continue;
             }
             if !reachable {
@@ -3974,6 +3998,7 @@ fn previous_candidate_origins(
                     .any(|candidate| candidate.origin == *origin)
                     && candidates.iter().any(|candidate| {
                         reference_places_overlap(&loan.origin_place, &candidate.place)
+                            && !loan_has_ancestor(&candidate.loan, loan)
                     })
             }
             ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
@@ -4761,7 +4786,7 @@ fn transfer_reference_facts(
                         &state,
                         id,
                         &candidate.place,
-                        Some(candidate.origin),
+                        LoanAccess::Through(candidate.origin),
                     );
                     if !origins.is_empty() {
                         errors.push(ReferenceAnalysisError::ConflictingPlace {
@@ -4963,7 +4988,7 @@ fn transfer_reference_facts(
                         &state,
                         id,
                         &place,
-                        None,
+                        LoanAccess::Direct,
                     ));
                     if !origins.is_empty() {
                         errors.push(ReferenceAnalysisError::ConflictingPlace {
@@ -4990,7 +5015,7 @@ fn transfer_reference_facts(
                             &state,
                             id,
                             &place,
-                            Some(candidate.origin),
+                            LoanAccess::Through(candidate.origin),
                         ));
                         if !origins.is_empty() {
                             errors.push(ReferenceAnalysisError::ConflictingPlace {
@@ -5023,7 +5048,7 @@ fn transfer_reference_facts(
                             &state,
                             id,
                             &target,
-                            None,
+                            LoanAccess::Direct,
                         );
                         if !origins.is_empty() {
                             errors.push(ReferenceAnalysisError::ConflictingPlace {
@@ -5046,7 +5071,7 @@ fn transfer_reference_facts(
                             &state,
                             id,
                             &target,
-                            Some(candidate.origin),
+                            LoanAccess::WriteThrough(candidate),
                         );
                         if !origins.is_empty() {
                             errors.push(ReferenceAnalysisError::ConflictingPlace {

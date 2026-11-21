@@ -1631,6 +1631,81 @@ unit(*!u8) transfer_parameter = fn(first) {
 }
 
 #[test]
+fn mutable_child_write_preserves_ancestor_loan_after_last_child_use() {
+    let text = "%%start
+unit(*!u8) check_parent = fn(parent) {
+    *!u8 child = &!(*parent);
+    *child = 3;
+    u8 observed = *child;
+    observed;
+    *parent = 4;
+};
+%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("expected callable");
+        };
+        let assignments = function
+            .reference_cfg
+            .points
+            .iter()
+            .filter_map(|point| match &point.kind {
+                CfgPointKind::AssignThrough {
+                    candidates,
+                    previous_origins,
+                    previous_loans,
+                    ..
+                } => Some((candidates, previous_origins, previous_loans)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(child, previous_origins, previous_loans), (parent, _, _)] = assignments.as_slice()
+        else {
+            panic!("expected child and parent writes");
+        };
+        assert!(previous_origins.is_empty(), "{previous_origins:?}");
+        assert!(previous_loans.is_empty(), "{previous_loans:?}");
+        assert_eq!(child.len(), 1);
+        assert_eq!(parent.len(), 1);
+        assert_eq!(child[0].loan.parent.as_deref(), Some(&parent[0].loan));
+    }
+}
+
+#[test]
+fn parent_write_rejects_a_mutable_child_with_a_later_use() {
+    let text = "%%start
+unit(*!u8) check_parent = fn(parent) {
+    *!u8 child = &!(*parent);
+    *parent = 3;
+    u8 observed = *child;
+    observed;
+};
+%%end";
+    let write = text.find("parent = 3").unwrap() as u32;
+    let child = text.find("&!(*parent)").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels[0].span.range.start == write
+            })
+            .unwrap_or_else(|| panic!("{diagnostics:?}"));
+        assert!(diagnostic.labels.iter().any(|label| {
+            label.kind == super::super::DiagnosticLabelKind::Secondary
+                && label.span.range.start == child
+        }), "{diagnostic:?}");
+    }
+}
+
+#[test]
 fn checked_aggregate_conflicts_label_the_initiating_loan_in_both_pipelines() {
     for (text, primary, origin) in [
             ("%%start\nstruct Payload { u8 value; }\nunit() f = fn { Payload specimen = { .value = 1; }; *!Payload writer = &!specimen; Payload taken = *writer; Payload again = *writer; taken; again; };\n%%end", "*writer; taken", "&!specimen"),
