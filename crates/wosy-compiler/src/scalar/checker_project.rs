@@ -198,33 +198,27 @@ fn identifiers(parent: &CstNode) -> impl Iterator<Item = String> + '_ {
 }
 
 fn check_proof_fragment(
-    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
-    initialization_order: Vec<SourceIdentity>,
-    inputs: ScalarPreparationInputs,
+    prepared: &PreparedCheckerProject,
     target_source: &SourceIdentity,
     fragment: &ParseResult,
 ) -> ProjectCheck {
-    check_proof_fragment_impl(declarations, initialization_order, inputs, target_source, fragment, false)
+    check_proof_fragment_impl(prepared, target_source, fragment, false)
         .map(|(outcome, _)| outcome)
         .unwrap_or_else(|error| error)
 }
 
 fn verify_return_bound(
-    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
-    initialization_order: Vec<SourceIdentity>,
-    inputs: ScalarPreparationInputs,
+    prepared: &PreparedCheckerProject,
     target_source: &SourceIdentity,
     fragment: &ParseResult,
 ) -> Option<VerifiedReturnBound> {
-    check_proof_fragment_impl(declarations, initialization_order, inputs, target_source, fragment, true)
+    check_proof_fragment_impl(prepared, target_source, fragment, true)
         .ok()
         .and_then(|(_, bound)| bound)
 }
 
 fn check_proof_fragment_impl(
-    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
-    initialization_order: Vec<SourceIdentity>,
-    inputs: ScalarPreparationInputs,
+    prepared: &PreparedCheckerProject,
     target_source: &SourceIdentity,
     fragment: &ParseResult,
     retain_bound: bool,
@@ -250,7 +244,6 @@ fn check_proof_fragment_impl(
     )?);
     let ensures = IntegerComparison::from_expression(&ensures).ok_or(ProjectCheck::Unsupported)?;
 
-    let prepared = prepare_checker_project(declarations, initialization_order, inputs)?;
     let (project, calls) = prepared.parts();
     let (module, item, function) = select_checked_root(project, target_source, &name)?;
     let target = &project.modules[module];
@@ -717,13 +710,45 @@ mod tests {
             source.project.clone(), source.package.clone(), "fragment.w".into(), "fragment".into(),
         );
         let fragment = wosy_syntax::parse_proof_fragment(proof_source, proof.to_owned(), &[]);
-        check_proof_fragment(
+        match prepare_proof_target(source, callable) {
+            Ok(prepared) => check_proof_fragment(&prepared, source, &fragment),
+            Err(error) => error,
+        }
+    }
+
+    fn prepare_proof_target(
+        source: &SourceIdentity,
+        callable: &str,
+    ) -> Result<PreparedCheckerProject, ProjectCheck> {
+        prepare_checker_project(
             vec![(declarations(source, callable), Vec::new())],
             vec![source.clone()],
             inputs(),
-            source,
-            &fragment,
         )
+    }
+
+    #[test]
+    fn selected_theorems_share_one_canonically_prepared_target() {
+        let app = source("src/main.w", "shared-clamp");
+        let callable = "%%start\nu8(u8) clamp = fn(value) { if (value > 10) { 10 } else { value } };\n%%end";
+        let prepared = prepare_proof_target(&app, callable).unwrap();
+        let proved_source = source("proof/proved.fragment.w", "proved-r1");
+        let proved = wosy_syntax::parse_proof_fragment(
+            proved_source.clone(),
+            "proof bounded for clamp(x) -> (out) ensures (out <= 10) {}".into(),
+            &[],
+        );
+        let refuted = wosy_syntax::parse_proof_fragment(
+            source("proof/refuted.fragment.w", "refuted-r1"),
+            "proof smaller for clamp(input) -> (result) ensures (result <= 9) {}".into(),
+            &[],
+        );
+        let (outcome, artifact) = check_proof_fragment_impl(&prepared, &app, &proved, true).unwrap();
+        assert_eq!(outcome, ProjectCheck::Proved);
+        assert_eq!(artifact.unwrap().proof_source, proved_source);
+        let (outcome, artifact) = check_proof_fragment_impl(&prepared, &app, &refuted, true).unwrap();
+        assert_eq!(outcome, ProjectCheck::Refuted);
+        assert_eq!(artifact, None);
     }
 
     #[test]
@@ -788,13 +813,7 @@ mod tests {
             &[],
         );
         assert_eq!(
-            check_proof_fragment(
-                vec![(declarations(&app, callable), Vec::new())],
-                vec![app],
-                inputs(),
-                &wrong,
-                &fragment,
-            ),
+            check_proof_fragment(&prepare_proof_target(&app, callable).unwrap(), &wrong, &fragment),
             ProjectCheck::MissingRoot,
         );
     }
@@ -849,13 +868,8 @@ mod tests {
         proof: &str,
     ) -> Option<VerifiedReturnBound> {
         let fragment = wosy_syntax::parse_proof_fragment(proof_source.clone(), proof.to_owned(), &[]);
-        verify_return_bound(
-            vec![(declarations(program_source, callable), Vec::new())],
-            vec![program_source.clone()],
-            inputs(),
-            target_source,
-            &fragment,
-        )
+        let prepared = prepare_proof_target(program_source, callable).ok()?;
+        verify_return_bound(&prepared, target_source, &fragment)
     }
 
     #[test]
