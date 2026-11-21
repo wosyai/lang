@@ -13,6 +13,36 @@ struct Interval {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct IntegerSet(Vec<Interval>);
 
+#[derive(Clone, Copy)]
+pub(super) struct IntegerRelation {
+    less: bool,
+    equal: bool,
+    greater: bool,
+}
+
+impl IntegerRelation {
+    pub(super) fn from_operator(operator: &BinaryOperator) -> Option<Self> {
+        let (less, equal, greater) = match operator {
+            BinaryOperator::Equal => (false, true, false),
+            BinaryOperator::NotEqual => (true, false, true),
+            BinaryOperator::Less => (true, false, false),
+            BinaryOperator::LessEqual => (true, true, false),
+            BinaryOperator::Greater => (false, false, true),
+            BinaryOperator::GreaterEqual => (false, true, true),
+            _ => return None,
+        };
+        Some(Self { less, equal, greater })
+    }
+
+    pub(super) fn accepts(self, comparison: Ordering) -> bool {
+        match comparison {
+            Ordering::Less => self.less,
+            Ordering::Equal => self.equal,
+            Ordering::Greater => self.greater,
+        }
+    }
+}
+
 impl IntegerSet {
     pub(super) fn from_type(ty: &ScalarType) -> Option<Self> {
         let (first, last) = integer_bounds(ty)?;
@@ -27,16 +57,16 @@ impl IntegerSet {
         self.0.is_empty()
     }
 
+    pub(super) fn every(&self, relation: IntegerRelation, bound: &BigInt) -> bool {
+        self.0.iter().all(|interval| {
+            (relation.less || &interval.first >= bound)
+                && (relation.equal || bound < &interval.first || bound > &interval.last)
+                && (relation.greater || &interval.last <= bound)
+        })
+    }
+
     pub(super) fn split(&self, operator: &BinaryOperator, bound: &BigInt) -> Option<(Self, Self)> {
-        let (select_less, select_equal, select_greater) = match operator {
-            BinaryOperator::Equal => (false, true, false),
-            BinaryOperator::NotEqual => (true, false, true),
-            BinaryOperator::Less => (true, false, false),
-            BinaryOperator::LessEqual => (true, true, false),
-            BinaryOperator::Greater => (false, false, true),
-            BinaryOperator::GreaterEqual => (false, true, true),
-            _ => return None,
-        };
+        let relation = IntegerRelation::from_operator(operator)?;
         let mut yes = Self::default();
         let mut no = Self::default();
         let append = |yes: &mut Self, no: &mut Self, select, first: BigInt, last: BigInt| {
@@ -49,10 +79,10 @@ impl IntegerSet {
                 } else {
                     bound - 1
                 };
-                append(&mut yes, &mut no, select_less, interval.first.clone(), last);
+                append(&mut yes, &mut no, relation.less, interval.first.clone(), last);
             }
             if &interval.first <= bound && bound <= &interval.last {
-                append(&mut yes, &mut no, select_equal, bound.clone(), bound.clone());
+                append(&mut yes, &mut no, relation.equal, bound.clone(), bound.clone());
             }
             if &interval.last > bound {
                 let first = if &interval.first > bound {
@@ -60,7 +90,7 @@ impl IntegerSet {
                 } else {
                     bound + 1
                 };
-                append(&mut yes, &mut no, select_greater, first, interval.last.clone());
+                append(&mut yes, &mut no, relation.greater, first, interval.last.clone());
             }
         }
         Some((yes, no))
@@ -134,6 +164,9 @@ mod tests {
         let (impossible, unchanged) = excluding.split(&BinaryOperator::Equal, &10.into()).unwrap();
         assert!(impossible.is_empty());
         assert_eq!(unchanged, excluding);
+        let not_equal = IntegerRelation::from_operator(&BinaryOperator::NotEqual).unwrap();
+        assert!(excluding.every(not_equal, &10.into()));
+        assert!(!input.every(not_equal, &10.into()));
         assert_eq!(excluding.join(matching), input);
     }
 
@@ -151,6 +184,10 @@ mod tests {
         for (operator, relation) in cases {
             for bound in [-1, 0, 1, 126, 254, 255, 256] {
                 let (yes, no) = input.split(&operator, &bound.into()).unwrap();
+                let abstract_relation = IntegerRelation::from_operator(&operator).unwrap();
+                assert_eq!(input.every(abstract_relation, &bound.into()), no.is_empty());
+                assert!(yes.every(abstract_relation, &bound.into()));
+                assert_eq!(no.every(abstract_relation, &bound.into()), no.is_empty());
                 for value in 0..=255 {
                     let contains = |set: &IntegerSet| {
                         let value = BigInt::from(value);

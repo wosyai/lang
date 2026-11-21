@@ -1004,7 +1004,11 @@ mod tests {
 
     #[test]
     fn tail_value_conditional_preserves_disjoint_constant_and_alias_returns() {
-        use crate::scalar::checker_flow::{observe_integer_returns, IntegerReturn};
+        use crate::scalar::{
+            checker_flow::{check_integer_return_bound, observe_integer_returns, IntegerReturn},
+            symbolic_integer::IntegerRelation,
+        };
+        use crate::BinaryOperator;
 
         check_source(
             "u8(u8) clamp_bounded = fn(value) { if (value > 10) { 10 } else { value } };",
@@ -1016,6 +1020,13 @@ mod tests {
                 let parameter = &body.boundary.checker_parameter_bindings.as_deref().unwrap()[0];
                 assert_eq!(high.value, IntegerReturn::Const(&BigInt::from(10)));
                 assert_eq!(low.value, IntegerReturn::Alias(parameter));
+                let upper = BinaryOperator::LessEqual;
+                let relation = IntegerRelation::from_operator(&upper).unwrap();
+                let ten = BigInt::from(10);
+                assert_eq!(low.binding_satisfies(parameter, relation, &ten), Some(true));
+                assert_eq!(high.binding_satisfies(parameter, relation, &ten), Some(false));
+                assert_eq!(check_integer_return_bound(body, &upper, &ten), Some(Ok(true)));
+                assert_eq!(check_integer_return_bound(body, &upper, &9.into()), Some(Ok(false)));
                 for value in 0..=255 {
                     assert_eq!(high.state.includes(&[value]), value > 10);
                     assert_eq!(low.state.includes(&[value]), value <= 10);
@@ -1026,7 +1037,7 @@ mod tests {
 
     #[test]
     fn tail_value_conditional_skips_only_unreachable_unsupported_returns() {
-        use crate::scalar::checker_flow::{observe_integer_returns, IntegerReturn};
+        use crate::scalar::checker_flow::{check_integer_return_bound, observe_integer_returns, IntegerReturn};
         for guard in [false, true] {
             let source = format!(
                 "u8(u8) select = fn(value) {{ if ({guard}) {{ effect() }} else {{ value }} }}; u8() effect = fn {{ 10 }};",
@@ -1035,6 +1046,10 @@ mod tests {
                 let result = observe_integer_returns(body);
                 if guard {
                     assert_eq!(result, None);
+                    assert_eq!(
+                        check_integer_return_bound(body, &crate::BinaryOperator::LessEqual, &10.into()),
+                        None,
+                    );
                 } else {
                     let paths = result.unwrap().unwrap();
                     let [path] = paths.as_slice() else {
@@ -1051,7 +1066,7 @@ mod tests {
 
     #[test]
     fn reachable_tail_arm_failure_is_not_a_partial_return_success() {
-        use crate::scalar::checker_flow::observe_integer_returns;
+        use crate::scalar::checker_flow::check_integer_return_bound;
         check_source(
             r#"
             u8(u8) checked_clamp = fn(value) {
@@ -1064,7 +1079,9 @@ mod tests {
             };
             "#,
             |body| {
-                let failure = observe_integer_returns(body).unwrap().unwrap_err();
+                let failure = check_integer_return_bound(body, &crate::BinaryOperator::LessEqual, &10.into())
+                    .unwrap()
+                    .unwrap_err();
                 for value in 0..=255 {
                     assert_eq!(failure.state.includes(&[value]), value == 11);
                 }

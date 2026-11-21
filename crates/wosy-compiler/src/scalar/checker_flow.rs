@@ -6,7 +6,7 @@ use super::{
     checker_directive::CheckerOperation,
     control::{AssignmentReplacement, BindingInitialization, BindingRegion, BlockItemKind, BlockPosition, ConditionalRegion},
     reference::{BlockOrdinal, DirectDestinationIdentity, FunctionCallSites, OccurrenceOrdinal, PlainNameIdentity},
-    symbolic_integer::IntegerSet,
+    symbolic_integer::{IntegerRelation, IntegerSet},
     typecheck::is_integer_type,
     BinaryOperator, ReferenceBindingId, ScalarExpression, ScalarType,
 };
@@ -253,6 +253,25 @@ pub(super) struct IntegerReturningPath<'a> {
     pub(super) axes: Vec<&'a ReferenceBindingId>,
 }
 
+impl IntegerReturningPath<'_> {
+    pub(super) fn binding_satisfies(
+        &self,
+        binding: &ReferenceBindingId,
+        relation: IntegerRelation,
+        bound: &BigInt,
+    ) -> Option<bool> {
+        let index = self.axes.iter().position(|known| *known == binding)?;
+        Some(self.state.0.iter().all(|row| row[index].every(relation, bound)))
+    }
+
+    fn output_satisfies(&self, relation: IntegerRelation, bound: &BigInt) -> Option<bool> {
+        match self.value {
+            IntegerReturn::Alias(binding) => self.binding_satisfies(binding, relation, bound),
+            IntegerReturn::Const(value) => Some(relation.accepts(value.cmp(bound))),
+        }
+    }
+}
+
 enum IntegerControl<'a> {
     Continue(IntegerInputs),
     Returned,
@@ -275,6 +294,24 @@ pub(super) fn observe_integer_returns(
         Ok(()) => None,
         Err(failure) => Some(Err(failure)),
     }
+}
+
+pub(super) fn check_integer_return_bound<'a>(
+    calls: &'a FunctionCallSites,
+    operator: &BinaryOperator,
+    bound: &BigInt,
+) -> Option<Result<bool, IntegerCheckFailure<'a>>> {
+    let relation = IntegerRelation::from_operator(operator)?;
+    let paths = match observe_integer_returns(calls)? {
+        Ok(paths) => paths,
+        Err(failure) => return Some(Err(failure)),
+    };
+    for path in paths {
+        if !path.output_satisfies(relation, bound)? {
+            return Some(Ok(false));
+        }
+    }
+    Some(Ok(true))
 }
 
 fn integer_tail_type(calls: &FunctionCallSites) -> Option<&ScalarType> {
