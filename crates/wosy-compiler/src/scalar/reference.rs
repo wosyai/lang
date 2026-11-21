@@ -1983,7 +1983,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 let direct = if pending.is_none_or(|pending| pending.handle == binding) {
                                     self.deferred_reborrow_roots.iter().find(|(handle, root, entry, _)| {
                                         *handle == binding
-                                            && (matches!(root, super::control::DeferredReborrowRoot::Formal { .. })
+                                            && (*mutability == ScalarReferenceMutability::Shared
+                                                || matches!(root, super::control::DeferredReborrowRoot::Formal { .. })
                                                 || self.cfg.points[entry.0].scope == scope)
                                     })
                                 } else {
@@ -4720,7 +4721,11 @@ impl<'a> ReferenceTransferCfg<'a> {
 fn deferred_named_reborrow_allowed(function: &ScalarFunction, calls: &FunctionCallSites) -> bool {
     function.generic_parameters.is_empty()
         && matches!(&function.signature, ScalarType::Callable { outputs, .. }
-            if matches!(outputs.outputs.as_slice(), [] | [ScalarOutput { ty: ScalarType::Unit, .. }]))
+            if match outputs.outputs.as_slice() {
+                [] => true,
+                [ScalarOutput { ty, .. }] => *ty == ScalarType::Unit || aggregate::ordinary_value(ty),
+                _ => false,
+            })
         && matches!(calls.named_place_roots, NamedPlaceRootFacts::Prepared(_))
         && calls.structure.module_storage_uses.is_empty()
 }
@@ -4763,6 +4768,11 @@ fn is_deferred_reborrow_child(parent: &ReferenceOrigin, child: &ReferenceOrigin,
             ReferenceOrigin::Fresh { allocation, loan: observed }) => root == allocation && loan == observed,
         _ => false,
     }
+}
+
+fn contains_loan_site(binding: &ReferenceBindingId, point: &ReferenceFlowPoint) -> bool {
+    let site = point.source_span.range;
+    binding.block_span.start <= site.start && site.end <= binding.block_span.end
 }
 
 fn is_pending_shared_reborrow(point: &ReferenceFlowPoint) -> bool {
@@ -5040,8 +5050,7 @@ fn transfer_reference_facts(
             if producer >= holder || holder >= site.read
                 || read.successors.as_slice() != [site.point]
                 || read.scope != borrow.scope
-                || binding.block_span.start > borrow.source_span.range.start
-                || binding.block_span.end < borrow.source_span.range.end
+                || !contains_loan_site(binding, borrow)
                 || !matches!(&read.kind, CfgPointKind::Read { binding: read_binding } if read_binding == binding)
                 || child_holders.get(binding).copied() != Some(producer)
             {
@@ -5073,7 +5082,9 @@ fn transfer_reference_facts(
                         local_definition.is_some()
                             && *borrow < pending.entry
                             && initializer.scope == original_points[pending.entry.0].scope
-                            && (site.parent.is_some() || initializer.scope == point.scope)
+                            && (site.parent.is_some()
+                                || initializer.scope == point.scope
+                                || (is_pending_shared_reborrow(&point) && contains_loan_site(&pending.handle, &point)))
                             && matches!(&initializer.kind, CfgPointKind::Borrow { place, loan }
                                 if place.binding == *owner && loan.parent.is_none())
                             && initializer.possible_origins.as_ref()

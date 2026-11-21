@@ -11878,3 +11878,87 @@ unit({parameters}) inspect = fn({formal}choose) {{
         }
     }
 }
+
+#[test]
+fn deferred_direct_shared_in_a_contained_arm_ends_at_arm_exit() {
+    for bad in [false, true] {
+        let access = if bad { "*parent = 8;" } else { "u8 prior = *parent; prior;" };
+        let text = format!(r#"%%start
+u8(bool) update = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 marker = 9; marker; }};
+    if (choose) {{
+        *u8 leaf = &(*parent);
+        {access}
+        u8 seen = *leaf;
+        seen;
+    }};
+    *parent = 11;
+    *parent
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let leaf = text.find("&(*parent)").unwrap() as u32;
+        let root = text.find("&!owner").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if bad {
+                let requested = text.find("parent = 8").unwrap() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == requested)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == leaf)
+                }), "{diagnostics:?}");
+                assert!(cfg.initial_points.iter().any(|point| point.source_span.range.start == leaf
+                    && point.possible_origins.is_none()
+                    && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))));
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let borrow = |start| cfg.points.iter().find(|point| point.source_span.range.start == start
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("sealed loan");
+            let (root, branch) = (borrow(root), borrow(leaf));
+            assert_ne!(root.scope, branch.scope);
+            assert_eq!(&cfg.initial_points[branch.id.0], branch);
+            let ReferenceOrigin::Fresh { loan: root, allocation } = sole_fact(function, root) else {
+                panic!("expected exact local root")
+            };
+            let ReferenceOrigin::Fresh { loan: shared, allocation: leaf_allocation } = sole_fact(function, branch) else {
+                panic!("expected exact shared leaf")
+            };
+            assert_eq!(leaf_allocation, allocation);
+            assert_eq!(shared.mode, ScalarReferenceMutability::Shared);
+            assert_eq!(shared.parent.as_deref(), Some(root));
+        }
+    }
+}
+
+#[test]
+fn deferred_shared_reborrow_does_not_infer_escape_for_checked_reference_result() {
+    let text = r#"%%start
+*u8(*!u8, bool) inspect = fn(parent, choose) {
+    if (choose) { u8 marker = 9; marker; };
+    *u8 leaf = &(*parent);
+    leaf
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    let leaf = text.find("&(*parent)").unwrap() as u32;
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0003" && diagnostic.message == "missing required dereference origin"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == leaf)
+        }), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+        assert!(function.reference_cfg.initial_points.iter().all(|point| point.source_span.range.start != leaf
+            || !matches!(point.kind, CfgPointKind::Borrow { .. })));
+    }
+}
