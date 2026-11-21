@@ -413,8 +413,17 @@ fn build_pair(
         );
         return;
     }
-    if matches!(pair.as_rule(), Rule::conditional_head | Rule::conditional_else)
-        || is_elided_operator_tier(&pair)
+    if pair.as_rule() == Rule::parenthesized_primary {
+        build_parenthesized_primary(builder, pair, text, comments, errors);
+        return;
+    }
+    if matches!(
+        pair.as_rule(),
+        Rule::conditional_head
+            | Rule::conditional_else
+            | Rule::parenthesized_field_suffix
+            | Rule::parenthesized_index_suffix
+    ) || is_elided_operator_tier(&pair)
     {
         let span = pair.as_span();
         let mut inner = pair.into_inner();
@@ -462,6 +471,38 @@ fn build_pair(
         cursor = child_span.end();
     }
     add_gap(builder, &text[cursor..span.end()], cursor, comments);
+    builder.finish_node();
+}
+
+fn build_parenthesized_primary(
+    builder: &mut GreenNodeBuilder<'_>,
+    pair: Pair<'_, Rule>,
+    text: &str,
+    comments: &[TypedComment],
+    errors: &mut Vec<SyntaxError>,
+) {
+    let mut children = pair.into_inner();
+    let head = children.next().expect("parenthesized primary head");
+    let Some(suffix) = children.next() else {
+        build_pair(builder, head, text, comments, errors);
+        return;
+    };
+    let mut suffix = suffix.into_inner();
+    let field = suffix.next().expect("parenthesized field suffix");
+    let indices = suffix.next();
+    let outer = if indices.is_some() {
+        SyntaxKind::IndexedPlace
+    } else {
+        SyntaxKind::FieldAccess
+    };
+    builder.start_node(WosyLanguage::kind_to_raw(outer));
+    builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::DereferencedField));
+    build_pair(builder, head, text, comments, errors);
+    build_pair(builder, field, text, comments, errors);
+    builder.finish_node();
+    if let Some(indices) = indices {
+        build_pair(builder, indices, text, comments, errors);
+    }
     builder.finish_node();
 }
 
@@ -1758,6 +1799,68 @@ mod tests {
             .descendants()
             .any(|node| node.kind() == SyntaxKind::Parenthesized
                 && node.text().to_string() == "(*reader)"));
+    }
+
+    #[test]
+    fn parenthesized_primaries_keep_field_index_and_trivia_boundaries() {
+        let text = "%%start\n(*base) # note: outer\n + 1;\n(*base) # note: field\n . member # note: index\n [1] [2];\n(*base).member # note: trailing\n ;\n(*base).member[1] = 2;\n&!(*base).member[1];\n%%end";
+        let parsed = parse(identity(), text.into(), &["note".to_owned()]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        for (spelling, outer, expected_children) in [
+            (
+                "(*base)",
+                SyntaxKind::Parenthesized,
+                &[SyntaxKind::Expression][..],
+            ),
+            (
+                "(*base) # note: field\n . member # note: index\n [1] [2]",
+                SyntaxKind::IndexedPlace,
+                &[
+                    SyntaxKind::DereferencedField,
+                    SyntaxKind::IndexSuffix,
+                    SyntaxKind::IndexSuffix,
+                ],
+            ),
+            (
+                "(*base).member",
+                SyntaxKind::FieldAccess,
+                &[SyntaxKind::DereferencedField],
+            ),
+        ] {
+            let start = text.find(spelling).expect("spelling") as u32;
+            let node = parsed
+                .root
+                .descendants()
+                .find(|node| {
+                    node.kind() == outer
+                        && byte_span(node) == ByteSpan::new(start, start + spelling.len() as u32)
+                })
+                .expect("original primary kind and exact range");
+            assert_eq!(
+                node.children().map(|child| child.kind()).collect::<Vec<_>>(),
+                expected_children
+            );
+        }
+        assert!(parsed.root.descendants().any(|node| {
+            node.kind() == SyntaxKind::AssignmentTarget && node.text() == "(*base).member[1]"
+        }));
+        assert!(parsed.root.descendants().any(|node| {
+            node.kind() == SyntaxKind::PlaceTarget && node.text() == "(*base).member[1]"
+        }));
+    }
+
+    #[test]
+    fn incomplete_parenthesized_suffixes_restore_recovery_boundary() {
+        for suffix in [".", ".member[", ".member[1]["] {
+            let text = format!("%%start\n(*base){suffix};\nu8 kept = 1;\n%%end");
+            let parsed = parse(identity(), text.clone(), &[]);
+            assert!(!parsed.is_valid());
+            assert_eq!(parsed.reconstruct(), text);
+            assert!(parsed.root.descendants().any(|node| {
+                node.kind() == SyntaxKind::BindingDecl && node.text() == "u8 kept = 1;"
+            }));
+        }
     }
 
     #[test]
