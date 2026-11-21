@@ -2720,8 +2720,12 @@ fn emit_block_at<'ctx, 'module>(
     }
     aggregate_transfer::release_scope(context, state, block)?;
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
+    if matches!(emission, BlockEmission::Return(_)) {
+        aggregate_transfer::release_checked_backing(context, state)?;
+    }
     release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
     if matches!(emission, BlockEmission::TailArm(_)) {
+        aggregate_transfer::publish_checked_backing_arm(state, block)?;
         aggregate_transfer::release_failure_allocation(context, state, block)?;
     }
     state.storage = storage;
@@ -2800,8 +2804,12 @@ fn emit_project_block_at<'ctx, 'module>(
     }
     aggregate_transfer::release_scope(context, state, block)?;
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
+    if matches!(emission, BlockEmission::Return(_)) {
+        aggregate_transfer::release_checked_backing(context, state)?;
+    }
     release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
     if matches!(emission, BlockEmission::TailArm(_)) {
+        aggregate_transfer::publish_checked_backing_arm(state, block)?;
         aggregate_transfer::release_failure_allocation(context, state, block)?;
     }
     state.storage = storage;

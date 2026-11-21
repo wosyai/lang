@@ -24,6 +24,8 @@ pub(crate) struct CallablePointFacts {
     pub(super) definitions: HashMap<(BlockOrdinal, usize, usize), BindingDefinition>,
     pub(super) formals: HashMap<usize, super::ReferenceBindingId>,
     pub(super) scalar_descriptor_install: ScalarDescriptorCandidates,
+    pub(super) backing_descriptor_install: ScalarDescriptorCandidates,
+    pub(super) has_nonlexical_install: bool,
 }
 
 #[derive(Default)]
@@ -36,6 +38,7 @@ pub(super) enum ScalarDescriptorCandidates {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScalarDescriptorInstall {
+    pub(crate) validate_backing: bool,
     pub(crate) frozen: FrozenInstall,
     pub(crate) capture: super::CfgPointId,
     pub(crate) binding: super::ReferenceBindingId,
