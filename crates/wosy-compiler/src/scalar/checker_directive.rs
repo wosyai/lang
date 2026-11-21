@@ -1,9 +1,35 @@
-use super::{typecheck::expression_span, ByteSpan, ScalarExpression};
+use super::{
+    checker_flow::IntegerPredicate, control::CheckedCallSignature, typecheck::expression_span,
+    ByteSpan, ScalarExpression,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CheckerOperation {
     Require,
     Narrow,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct PreparedCheckerDirective {
+    pub(super) operation: CheckerOperation,
+    pub(super) condition: ByteSpan,
+    pub(super) integer_predicate: Option<IntegerPredicate>,
+    pub(super) call_signature: Option<CheckedCallSignature>,
+    pub(super) output: CheckedLiteralOutput,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CheckedLiteralOutput {
+    pub(super) stdout: ByteSpan,
+    pub(super) stderr: ByteSpan,
+    pub(super) code: ByteSpan,
+    pub(super) files: ByteSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CheckedDirectiveMarker {
+    pub(super) operation: CheckerOperation,
+    pub(super) output: CheckedLiteralOutput,
 }
 
 pub(super) struct CheckerDirective<'a> {
@@ -17,6 +43,7 @@ pub(super) struct CheckerOutput<'a> {
     pub(super) stderr: Option<&'a ScalarExpression>,
     pub(super) code: Option<&'a ScalarExpression>,
     pub(super) files: Option<Vec<CheckerFileOutput<'a>>>,
+    files_literal: Option<ByteSpan>,
 }
 
 pub(super) struct CheckerFileOutput<'a> {
@@ -95,11 +122,25 @@ impl CheckerDirectiveShapeErrorKind {
 }
 
 impl CheckerOutput<'_> {
-    pub(super) fn is_explicit_literal(&self) -> bool {
-        matches!(self.stdout, Some(ScalarExpression::Utf8 { .. }))
-            && matches!(self.stderr, Some(ScalarExpression::Utf8 { .. }))
-            && matches!(self.code, Some(ScalarExpression::Integer { .. }))
-            && self.files.as_ref().is_some_and(Vec::is_empty)
+    pub(super) fn explicit_literal(&self) -> Option<CheckedLiteralOutput> {
+        let ScalarExpression::Utf8 { span: stdout, .. } = self.stdout? else {
+            return None;
+        };
+        let ScalarExpression::Utf8 { span: stderr, .. } = self.stderr? else {
+            return None;
+        };
+        let ScalarExpression::Integer { span: code, .. } = self.code? else {
+            return None;
+        };
+        if !self.files.as_ref()?.is_empty() {
+            return None;
+        }
+        Some(CheckedLiteralOutput {
+            stdout: *stdout,
+            stderr: *stderr,
+            code: *code,
+            files: self.files_literal?,
+        })
     }
 }
 
@@ -107,6 +148,7 @@ impl<'a> CheckerOutput<'a> {
     fn from_expression(expression: &'a ScalarExpression) -> Result<Self, CheckerDirectiveShapeError> {
         let [stdout, stderr, code, files] =
             record_fields(expression, ["stdout", "stderr", "code", "files"])?;
+        let files_literal = files.map(expression_span);
         let files = files
             .map(|expression| {
                 let ScalarExpression::ArrayLiteral { elements, .. } = expression else {
@@ -118,7 +160,7 @@ impl<'a> CheckerOutput<'a> {
                 elements.iter().map(CheckerFileOutput::from_expression).collect()
             })
             .transpose()?;
-        Ok(Self { stdout, stderr, code, files })
+        Ok(Self { stdout, stderr, code, files, files_literal })
     }
 }
 
@@ -315,14 +357,19 @@ mod tests {
             panic!("expected one probe output")
         };
         assert_eq!(output.ty, ScalarType::Bool);
+        let expected_probe = signature.clone();
 
         let calls = reference::resolve_project_call_sites_with_occurrences(&checked.project.modules, typing);
         assert_eq!(calls.lookup_errors().count(), 0);
         let body = calls.function(0, 1);
         let directives = &body.structure.checker_directives;
         assert_eq!(directives.len(), 2);
-        assert!(directives.values().any(|operation| *operation == CheckerOperation::Require));
-        assert!(directives.values().any(|operation| *operation == CheckerOperation::Narrow));
+        assert!(directives.values().any(|directive| directive.operation == CheckerOperation::Require));
+        assert!(directives.values().any(|directive| directive.operation == CheckerOperation::Narrow));
+        let retained_probe = directives.values()
+            .find(|directive| directive.operation == CheckerOperation::Narrow)
+            .expect("narrow directive");
+        assert_eq!(retained_probe.call_signature.as_ref(), Some(&expected_probe));
         assert!(body.call_occurrences.is_empty());
         for occurrence in directives.keys() {
             assert_eq!(body.structure.checked_types.expressions.get(occurrence), Some(&ScalarType::Unit));
@@ -356,6 +403,80 @@ mod tests {
             "{:?}",
             rejected.diagnostics,
         );
+    }
+
+    #[test]
+    fn canonical_branch_refines_checker_requirement_without_leaking_past_join() {
+        use crate::scalar::{
+            control::ConditionalRegion,
+            reference::{self, OccurrenceEdge, OccurrenceNode, OccurrenceParent},
+            typecheck_scalar_project_in_mode,
+        };
+
+        let project = checker_project(
+            r#"
+            u8(u8) check_value = fn(value) {
+                if (value > 10) {
+                    core.require(value >= 11, { .stdout = ""; .stderr = "branch"; .code = 1; .files = []; });
+                }
+                core.require(value >= 11, { .stdout = ""; .stderr = "join"; .code = 1; .files = []; });
+                core.require(value <= 255, { .stdout = ""; .stderr = "type"; .code = 1; .files = []; });
+                value
+            };
+            "#,
+        );
+        let (checked, typing) = typecheck_scalar_project_in_mode(project, true);
+        assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
+        let module = &checked.project.modules[0];
+        let ScalarItem::Function(function) = &module.items[0] else {
+            panic!("expected function")
+        };
+        let ScalarBlockItem::Expression(ScalarExpression::UnitIf { then_branch, .. }) =
+            &function.body.items[0]
+        else {
+            panic!("expected canonical branch")
+        };
+        let calls = reference::resolve_project_call_sites_with_occurrences(&checked.project.modules, typing);
+        assert_eq!(calls.lookup_errors().count(), 0);
+        let body = calls.function(0, 0);
+        let region = body.conditionals.values().next().expect("branch topology");
+        let ConditionalRegion::Unit { condition: condition_ordinal, then_block, .. } = region else {
+            panic!("expected unit branch topology")
+        };
+        let branch = &body.structure.checker_integer_branches[condition_ordinal];
+        let directive_for = |block, item| {
+            let OccurrenceNode::Expression(ordinal) = body.structure.edges
+                [&(OccurrenceParent::Block(block), OccurrenceEdge::ExpressionItem { item })]
+            else {
+                panic!("expected expression item")
+            };
+            &body.structure.checker_directives[&ordinal]
+        };
+        let branch_directive = directive_for(*then_block, 0);
+        let ScalarBlockItem::Expression(canonical) = &then_branch.items[0] else {
+            panic!("expected canonical directive")
+        };
+        let syntax = CheckerDirective::from_expression(canonical).unwrap().unwrap();
+        assert_eq!(branch_directive.condition, expression_span(syntax.condition));
+        assert_eq!(branch_directive.output, syntax.output.explicit_literal().unwrap());
+
+        let (then_path, else_path) = branch.root().unwrap().split(branch).unwrap();
+        assert!(!then_path.is_unreachable());
+        assert!(!else_path.is_unreachable());
+        let predicate = branch_directive.integer_predicate.as_ref().unwrap();
+        let (passing, failing) = then_path.split(predicate).unwrap();
+        assert!(!passing.is_unreachable());
+        assert!(failing.is_unreachable());
+
+        let joined = then_path.join(else_path).unwrap();
+        let after_join = directive_for(body.structure.root, 1);
+        let (passing, failing) = joined.split(after_join.integer_predicate.as_ref().unwrap()).unwrap();
+        assert!(!passing.is_unreachable());
+        assert!(!failing.is_unreachable());
+
+        let type_range = directive_for(body.structure.root, 2);
+        let (_, failing) = joined.split(type_range.integer_predicate.as_ref().unwrap()).unwrap();
+        assert!(failing.is_unreachable());
     }
 
 }

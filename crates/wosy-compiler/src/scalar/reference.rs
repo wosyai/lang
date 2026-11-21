@@ -5993,7 +5993,9 @@ pub(super) struct OccurrenceStructure {
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
     #[cfg(test)]
-    pub(super) checker_directives: HashMap<OccurrenceOrdinal, super::checker_directive::CheckerOperation>,
+    pub(super) checker_directives: HashMap<OccurrenceOrdinal, super::checker_directive::PreparedCheckerDirective>,
+    #[cfg(test)]
+    pub(super) checker_integer_branches: HashMap<OccurrenceOrdinal, super::checker_flow::IntegerPredicate>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
     pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
@@ -6015,6 +6017,8 @@ impl OccurrenceStructure {
             checked_types: CheckedOccurrenceTypes::default(),
             #[cfg(test)]
             checker_directives: HashMap::new(),
+            #[cfg(test)]
+            checker_integer_branches: HashMap::new(),
             literal_fields: HashMap::new(),
             module_storage_uses: HashMap::new(),
             module_storage_installs: BTreeMap::new(),
@@ -6603,6 +6607,29 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         self.expression_at_with_initializer_statement(expression, names, types, parent, edge, false)
     }
 
+    #[cfg(test)]
+    fn checker_integer_predicate(
+        &self,
+        expression: &ScalarExpression,
+        names: &BTreeMap<String, WalkBinding>,
+    ) -> Option<super::checker_flow::IntegerPredicate> {
+        use super::checker_flow::IntegerComparison;
+        let WalkMode::Callable(callable) = &self.mode else {
+            return None;
+        };
+        let comparison = IntegerComparison::from_expression(expression)?;
+        let PlainNameIdentity::Lexical(binding) =
+            callable.target_resolver.plain_name(comparison.name, names)?
+        else {
+            return None;
+        };
+        comparison.typed(
+            self.occurrence_typing.checked_expression_type(comparison.left)?,
+            self.occurrence_typing.checked_expression_type(comparison.right)?,
+            binding,
+        )
+    }
+
     fn expression_at_with_initializer_statement(
         &mut self,
         expression: &ScalarExpression,
@@ -6634,9 +6661,33 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             self.structure.checked_types.expressions.insert(ordinal, ty);
         }
         #[cfg(test)]
-        if let Some(operation) = self.occurrence_typing.take_checker_directive(expression) {
-            self.structure.checker_directives.insert(ordinal, operation);
+        if let Some(marker) = self.occurrence_typing.take_checker_directive(expression) {
+            use super::checker_directive::PreparedCheckerDirective;
+            let ScalarExpression::Call { arguments, .. } = expression else {
+                unreachable!("typed directive is a canonical call");
+            };
+            let condition = &arguments[0];
+            let integer_predicate = self.checker_integer_predicate(condition, names);
+            self.structure.checker_directives.insert(
+                ordinal,
+                PreparedCheckerDirective {
+                    operation: marker.operation,
+                    condition: expression_span(condition),
+                    integer_predicate,
+                    call_signature: self.occurrence_typing.take_call(condition),
+                    output: marker.output,
+                },
+            );
             return Ok(ordinal);
+        }
+        #[cfg(test)]
+        if self.occurrence_typing.checker_directives_enabled()
+            && matches!(edge, OccurrenceEdge::Condition)
+            && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)
+        {
+            if let Some(predicate) = self.checker_integer_predicate(expression, names) {
+                self.structure.checker_integer_branches.insert(ordinal, predicate);
+            }
         }
         if matches!(&self.mode, WalkMode::ModuleInitialization { .. })
             && matches!(expression, ScalarExpression::Utf8 { .. })
@@ -6658,29 +6709,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 WalkMode::CallableAllocationLength(resolver) => *resolver,
                 _ => unreachable!("plain name facts are owned by a prepared callable"),
             };
-            let identity = if name == "null" {
-                Some(PlainNameIdentity::Null)
-            } else {
-                let module = || resolver.declarations.value_token(resolver.source, name);
-                match names.get(name) {
-                    Some(binding) if !binding.introduced_by_assignment => {
-                        Some(PlainNameIdentity::Lexical(
-                            binding.reference_id(resolver.source, resolver.function_span),
-                        ))
-                    }
-                    binding => match module() {
-                        Some(span) => Some(PlainNameIdentity::ModuleValue(SourceSpan::new(
-                            resolver.source.clone(),
-                            span,
-                        ))),
-                        None => binding.map(|binding| {
-                            PlainNameIdentity::Lexical(
-                                binding.reference_id(resolver.source, resolver.function_span),
-                            )
-                        }),
-                    },
-                }
-            };
+            let identity = resolver.plain_name(name, names);
             if let Some(identity) = identity {
                 if let PlainNameIdentity::ModuleValue(target) = &identity {
                     if typed_callable {
@@ -6836,6 +6865,36 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
 }
 
 impl CallableTargetResolver<'_> {
+    fn plain_name(
+        &self,
+        name: &str,
+        names: &BTreeMap<String, WalkBinding>,
+    ) -> Option<PlainNameIdentity> {
+        if name == "null" {
+            Some(PlainNameIdentity::Null)
+        } else {
+            let module = || self.declarations.value_token(self.source, name);
+            match names.get(name) {
+                Some(binding) if !binding.introduced_by_assignment => {
+                    Some(PlainNameIdentity::Lexical(
+                        binding.reference_id(self.source, self.function_span),
+                    ))
+                }
+                binding => match module() {
+                    Some(span) => Some(PlainNameIdentity::ModuleValue(SourceSpan::new(
+                        self.source.clone(),
+                        span,
+                    ))),
+                    None => binding.map(|binding| {
+                        PlainNameIdentity::Lexical(
+                            binding.reference_id(self.source, self.function_span),
+                        )
+                    }),
+                },
+            }
+        }
+    }
+
     fn resolve(
         &self,
         expression: &ScalarExpression,

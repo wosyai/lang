@@ -3247,18 +3247,25 @@ fn check_expression_type_in_module(
                 expression_span(directive.condition),
                 diagnostics,
             );
-            if !directive.output.is_explicit_literal() {
+            let Some(output) = directive.output.explicit_literal() else {
                 diagnostics.push(module_diagnostic(
                     module,
                     "B0003",
                     "checker directive preparation currently requires explicit literal output",
                     expression_span(expression),
                 ));
-            }
+                return ScalarType::Error;
+            };
             if !matches!(condition, ScalarType::Bool) || diagnostics.len() != previous_diagnostics {
                 return ScalarType::Error;
             }
-            inference.record_checker_directive(expression, directive.operation);
+            inference.record_checker_directive(
+                expression,
+                super::checker_directive::CheckedDirectiveMarker {
+                    operation: directive.operation,
+                    output,
+                },
+            );
             return ScalarType::Unit;
         }
     }
