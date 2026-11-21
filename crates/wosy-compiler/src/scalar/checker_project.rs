@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use num_bigint::BigInt;
 
@@ -209,9 +209,15 @@ fn identifiers(parent: &CstNode) -> impl Iterator<Item = String> + '_ {
     })
 }
 
+struct ProofModuleInput {
+    source: SourceIdentity,
+    text: String,
+    namespaces: Vec<ScalarNamespaceBinding>,
+}
+
 struct PreparedProofModule {
     source: SourceIdentity,
-    proofs: Vec<CstNode>,
+    proofs: HashMap<SourceIdentity, Vec<CstNode>>,
     prepared: PreparedCheckerProject,
 }
 
@@ -223,21 +229,59 @@ struct VerifiedModuleReturnBound<'a> {
 
 impl PreparedProofModule {
     fn prepare(source: SourceIdentity, text: String, inputs: ScalarPreparationInputs) -> Result<Self, ProjectCheck> {
-        let parsed = wosy_syntax::parse_proof_module(source, text, &[]);
-        if !parsed.is_valid() {
-            return Err(ProjectCheck::InvalidProof);
+        Self::prepare_project(
+            source.clone(),
+            vec![ProofModuleInput { source: source.clone(), text, namespaces: Vec::new() }],
+            vec![source],
+            inputs,
+        )
+    }
+
+    fn prepare_project(
+        source: SourceIdentity,
+        modules: Vec<ProofModuleInput>,
+        initialization_order: Vec<SourceIdentity>,
+        inputs: ScalarPreparationInputs,
+    ) -> Result<Self, ProjectCheck> {
+        let mut declarations = Vec::with_capacity(modules.len());
+        let mut proofs = HashMap::new();
+        let mut graph_sources: HashMap<_, _> = initialization_order.iter().map(|source| (source, false)).collect();
+        if graph_sources.len() != initialization_order.len() {
+            return Err(ProjectCheck::AmbiguousRoot);
         }
-        let canonical = parsed.canonical_cst();
-        let root = child(&canonical.root, SyntaxKind::Root)?;
-        let proofs = root.children().filter(|node| node.kind() == SyntaxKind::ProofDecl).collect();
-        let declarations = super::derive_scalar_declarations_from_cst(canonical);
-        let source = canonical.source.clone();
-        let prepared = prepare_checker_project(vec![(declarations, Vec::new())], vec![source.clone()], inputs)?;
+        if !graph_sources.contains_key(&source) {
+            return Err(ProjectCheck::MissingRoot);
+        }
+        for module in modules {
+            let parsed = wosy_syntax::parse_proof_module(module.source, module.text, &[]);
+            if !parsed.is_valid() {
+                return Err(ProjectCheck::InvalidProof);
+            }
+            let canonical = parsed.canonical_cst();
+            let seen = graph_sources.get_mut(&canonical.source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
+            if std::mem::replace(seen, true) {
+                return Err(ProjectCheck::AmbiguousRoot);
+            }
+            if module.namespaces.iter().any(|edge| !graph_sources.contains_key(&edge.target)) {
+                return Err(ProjectCheck::RootSourceOutsideInitOrder);
+            }
+            let mut module_proofs = Vec::new();
+            let module_declarations = super::derive_scalar_declarations(canonical, Some(&mut module_proofs));
+            if !module_proofs.is_empty() {
+                proofs.insert(canonical.source.clone(), module_proofs);
+            }
+            declarations.push((module_declarations, module.namespaces));
+        }
+        if graph_sources.values().any(|seen| !seen) {
+            return Err(ProjectCheck::MissingRoot);
+        }
+        let prepared = prepare_checker_project(declarations, initialization_order, inputs)?;
         Ok(Self { source, proofs, prepared })
     }
 
-    fn select(&self, proof_name: &str) -> Result<&CstNode, ProjectCheck> {
-        let mut selected = self.proofs.iter().filter(|proof| {
+    fn select(&self, source: &SourceIdentity, proof_name: &str) -> Result<&CstNode, ProjectCheck> {
+        let proofs = self.proofs.get(source).ok_or(ProjectCheck::MissingRoot)?;
+        let mut selected = proofs.iter().filter(|proof| {
             proof.children_with_tokens()
                 .filter_map(|element| element.into_token())
                 .find(|token| token.kind() == SyntaxKind::Identifier)
@@ -251,13 +295,17 @@ impl PreparedProofModule {
     }
 
     fn check(&self, proof_name: &str) -> Result<(ByteSpan, ProjectCheck), ProjectCheck> {
-        let proof = self.select(proof_name)?;
-        let (outcome, _) = check_selected_proof(&self.prepared, &self.source, proof, None)?;
+        self.check_at(&self.source, proof_name)
+    }
+
+    fn check_at(&self, source: &SourceIdentity, proof_name: &str) -> Result<(ByteSpan, ProjectCheck), ProjectCheck> {
+        let proof = self.select(source, proof_name)?;
+        let (outcome, _) = check_selected_proof(&self.prepared, source, proof, None)?;
         Ok((byte_span(proof), outcome))
     }
 
     fn verify(&self, proof_name: &str) -> Option<VerifiedModuleReturnBound<'_>> {
-        let proof = self.select(proof_name).ok()?;
+        let proof = self.select(&self.source, proof_name).ok()?;
         let (_, verified) = check_selected_proof(
             &self.prepared,
             &self.source,
@@ -980,6 +1028,68 @@ mod tests {
         );
         let identity = (&verified.bound.proof_source, verified.bound.proof_span, "bounded");
         assert_eq!(use_verified_return_bound(&module.prepared, &file, "inside", identity, &verified.bound), None);
+    }
+
+    #[test]
+    fn canonical_proof_project_retains_sparse_module_census_and_ordinary_dependencies() {
+        let app = source("src/main.w", "proof-root");
+        let lib = source("src/lib.w", "proof-lib");
+        let empty = source("src/empty.w", "proof-free");
+        let app_proof = "proof bound for value(x) -> (out) ensures (out <= 7) {}";
+        let lib_proof = "proof bound for value(x) -> (out) ensures (out <= 8) {}";
+        let app_text = format!("%%start\nlib = namespace demo \"src/lib.w\";\nfree = namespace demo \"src/empty.w\";\nu8(u8) value = fn(x) {{ if (x == 0) {{}}; 7 }};\nu8() use_lib = fn {{ lib.value(0) }};\n{app_proof}\n%%end");
+        let lib_text = format!("%%start\nu8(u8) value = fn(x) {{ if (x == 0) {{}}; 9 }};\n{lib_proof}\n%%end");
+        let namespace = |name: &str, target: &SourceIdentity| {
+            let declaration = format!("{name} =");
+            let start = app_text.find(&declaration).unwrap();
+            let end = start + app_text[start..].find(';').unwrap() + 1;
+            ScalarNamespaceBinding {
+                binding: name.into(),
+                target: target.clone(),
+                span: ByteSpan::new(start as u32, end as u32),
+            }
+        };
+        let modules = vec![
+            ProofModuleInput {
+                source: app.clone(),
+                namespaces: vec![namespace("lib", &lib), namespace("free", &empty)],
+                text: app_text.clone(),
+            },
+            ProofModuleInput { source: lib.clone(), namespaces: Vec::new(), text: lib_text.clone() },
+            ProofModuleInput { source: empty.clone(), namespaces: Vec::new(), text: "%%start\nu8() unused = fn { 0 };\n%%end".into() },
+        ];
+        let order = vec![empty.clone(), lib.clone(), app.clone()];
+        let project = PreparedProofModule::prepare_project(app.clone(), modules, order.clone(), inputs()).unwrap();
+        let (prepared, _) = project.prepared.parts();
+        assert_eq!(prepared.initialization_order, order);
+        assert_eq!(prepared.modules.len(), 3);
+        assert_eq!(project.proofs.len(), 2);
+        assert!(!project.proofs.contains_key(&empty));
+        for (file, text, proof, outcome) in [
+            (&app, &app_text, app_proof, ProjectCheck::Proved),
+            (&lib, &lib_text, lib_proof, ProjectCheck::Refuted),
+        ] {
+            let start = text.find(proof).unwrap() as u32;
+            assert_eq!(project.check_at(file, "bound"), Ok((ByteSpan::new(start, start + proof.len() as u32), outcome)));
+        }
+        assert_eq!(project.check_at(&empty, "bound"), Err(ProjectCheck::MissingRoot));
+    }
+
+    #[test]
+    fn proof_census_rejects_a_parsed_revision_outside_the_graph_order() {
+        let graph_source = source("src/main.w", "graph-revision");
+        let parsed_source = source("src/main.w", "other-revision");
+        let result = PreparedProofModule::prepare_project(
+            graph_source.clone(),
+            vec![ProofModuleInput {
+                source: parsed_source,
+                text: "%%start\nu8() answer = fn { 42 };\n%%end".into(),
+                namespaces: Vec::new(),
+            }],
+            vec![graph_source],
+            inputs(),
+        );
+        assert!(matches!(result, Err(ProjectCheck::RootSourceOutsideInitOrder)));
     }
 
     #[test]

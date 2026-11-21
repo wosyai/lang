@@ -2306,6 +2306,17 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
 pub fn derive_scalar_declarations_from_cst(
     canonical: &CanonicalCstRoot,
 ) -> ScalarSourceDeclarations {
+    derive_scalar_declarations(
+        canonical,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn derive_scalar_declarations(
+    canonical: &CanonicalCstRoot,
+    #[cfg(test)] mut proofs: Option<&mut Vec<CstNode>>,
+) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
     let diagnostics = derive_scalar_diagnostics_from_cst(canonical);
     let source_root = canonical
@@ -2346,6 +2357,14 @@ pub fn derive_scalar_declarations_from_cst(
     let mut generic_function = false;
     for node in source_root.children() {
         match node.kind() {
+            #[cfg(test)]
+            SyntaxKind::ProofDecl if proofs.is_some() => {
+                if let Some(proofs) = proofs.as_deref_mut() {
+                    proofs.push(node);
+                }
+                generic_function = false;
+                continue;
+            }
             SyntaxKind::NamespaceDecl => items.push(ScalarItem::Namespace(derive_namespace(&node))),
             SyntaxKind::ExternDecl => items.push(ScalarItem::Extern(derive_extern(&node))),
             SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node))),
