@@ -688,15 +688,13 @@ bool() unknown_effect = fn { true };
                 &module.structs, &module.enums, true, &mut Vec::new(),
             );
             assert!(!result.aggregate.checked_producer_authoritative);
-            let mut concrete = Vec::new();
+            let contracts = ReferenceOutputContracts::default();
             let mut replays = Vec::new();
             let mut cursor = 0;
-            collect_concrete_output_contracts(
-                &mut result, &[], &mut concrete, &mut replays, &mut cursor,
+            transfer_function_output_contracts(
+                &mut result, &contracts, &contracts, &mut HashMap::new(), &mut replays, &mut cursor,
             );
-            let mut replay_order = replays.iter_mut();
-            transfer_function_output_contracts(&mut result, &concrete, &mut replay_order, true);
-            assert_eq!(replay_order.len(), 0);
+            assert_eq!(cursor, replays.len());
             assert!(replays.iter().all(|replay| replay.errors.is_empty()));
             assert!(result.aggregate.checked_producer_authoritative);
             let proof = &result.aggregate.checked_producer_backing;
