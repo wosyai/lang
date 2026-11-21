@@ -589,6 +589,16 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
         .replace("u8[count] bytes;", "u8[count] bytes;\n\tbytes = preserve(bytes, flag);");
     let observable_recommit = pure_recommit.replace("u8[](u8[], bool) preserve = fn(buffer, flag) { buffer };",
         "bool escaped = false;\nu8[](u8[], bool) preserve = fn(buffer, flag) { escaped = flag; buffer };");
+    let nullable_backing = positive.replace(
+        "unsafe { data = &?bytes[0]; };",
+        "if (count != 0) { unsafe { data = &?bytes[0]; }; };",
+    );
+    let null_field_live_base = positive.replace("unsafe { data = &?bytes[0]; };", "");
+    let aliased_nullable = nullable_backing.replace(
+        "Packet packet = { .data = data; .length = count; };",
+        "*?u8 alias = data; Packet packet = { .data = alias; .length = count; };",
+    );
+    let nullable_descriptor = nullable_backing.replace("&packet, false", "null, false");
     let app = source("private_checked_backing", "src/main.w");
     let values = source("package", "src/values.w");
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
@@ -596,6 +606,8 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
             (positive, true, false), (unproved.as_str(), false, false),
             (module_sink.as_str(), false, false), (qualified_sink.as_str(), false, true),
             (pure_recommit.as_str(), true, false), (observable_recommit.as_str(), false, false),
+            (nullable_backing.as_str(), true, false), (null_field_live_base.as_str(), true, false),
+            (aliased_nullable.as_str(), false, false), (nullable_descriptor.as_str(), false, false),
         ] {
             let (inputs, order) = if qualified {
                 (vec![(declarations(&app, text), vec![namespace("imported", &values)]),
