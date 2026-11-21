@@ -615,7 +615,7 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
         "byte = core.load<u8>(input.data); if (byte == 9) { core.system_panic(); };");
     let length_call = passive
         .replace("u8(Packet) read_payload", "u64() scratch_length = fn { core.int_extend<u64>(1) };\nu8(Packet) read_payload")
-        .replace("u8 byte = 0;", "u8[scratch_length()] scratch; u8 byte = 0;");
+        .replace("u8 byte = 0;", "u8[scratch_length()] scratch; if (false) { scratch[0]; }; u8 byte = 0;");
     let ambiguous_alias = passive.replace("Packet carrier =",
         "content = null; Packet carrier =");
     let module_sink = positive.replace("i32(u64, bool) inspect_checked", "*Packet escaped = null;\ni32(u64, bool) inspect_checked")
@@ -623,9 +623,9 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
     let qualified_sink = positive.replace("struct Packet", "imported = namespace package \"values.w\";\nstruct Packet")
         .replace("if (received != null && status)", "imported.value = 4;\n\tif (received != null && status)");
     let pure_recommit = positive.replace("(*Packet, bool)(u64, bool) make_checked",
-        "u8[](u8[], bool) preserve = fn(buffer, flag) { buffer };\n(*Packet, bool)(u64, bool) make_checked")
+        "u8[](u8[], bool) preserve = fn(buffer, flag) { flag; buffer };\n(*Packet, bool)(u64, bool) make_checked")
         .replace("u8[count] bytes;", "u8[count] bytes;\n\tbytes = preserve(bytes, flag);");
-    let observable_recommit = pure_recommit.replace("u8[](u8[], bool) preserve = fn(buffer, flag) { buffer };",
+    let observable_recommit = pure_recommit.replace("u8[](u8[], bool) preserve = fn(buffer, flag) { flag; buffer };",
         "bool escaped = false;\nu8[](u8[], bool) preserve = fn(buffer, flag) { escaped = flag; buffer };");
     let recursive_recommit = positive.replace("(*Packet, bool)(u64, bool) make_checked", r#"enum Validation { valid; invalid; }
 (u8[], Validation)(u8[], u64, Validation) check_byte = fn(buffer, index, status) {
@@ -657,22 +657,26 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
         "unsafe { data = &?bytes[0]; };",
         "if (count != 0) { unsafe { data = &?bytes[0]; }; };",
     );
-    let null_field_live_base = positive.replace("unsafe { data = &?bytes[0]; };", "");
+    let null_field_live_base = positive.replace("unsafe { data = &?bytes[0]; };", "")
+        .replace("u8[count] bytes;", "u8[count] bytes; if (count != 0) { bytes[0]; };");
     let aliased_nullable = nullable_backing.replace(
         "Packet packet = { .data = data; .length = count; };",
         "*?u8 alias = data; Packet packet = { .data = alias; .length = count; };",
     );
-    let nullable_descriptor = nullable_backing.replace("&packet, false", "null, false");
+    let nullable_descriptor = nullable_backing.replace(
+        "else {\n\t\t*?u8 data = null;\n\t\tif (count != 0) { unsafe { data = &?bytes[0]; }; };\n\t\tPacket packet = { .data = data; .length = count; };\n\t\t&packet, false\n\t}",
+        "else { null, false }");
     let mixed_descriptor = pure_recommit.replace("&packet, false", "null, false")
         .replace(
             "else {\n\t\t*?u8 data = null;\n\t\tunsafe { data = &?bytes[0]; };\n\t\tPacket packet = { .data = data; .length = count; };\n\t\tnull, false\n\t}",
             "else { null, false }",
         );
-    let competing_mixed = mixed_descriptor.replace("u8[count] bytes;", "u8[count] bytes; u8[count] other;");
+    let competing_mixed = mixed_descriptor.replace("u8[count] bytes;", "u8[count] bytes; u8[count] other; if (count != 0) { other[0]; };");
     let missing_failure_receipt = mixed_descriptor.replace("bytes = preserve(bytes, flag);", "");
     let competing_formal = mixed_descriptor
         .replace("(*Packet, bool)(u64, bool) make_checked = fn(count, flag)",
             "(*Packet, bool)(u64, bool, u8[]) make_checked = fn(count, flag, unused)")
+        .replace("make_checked = fn(count, flag, unused) {", "make_checked = fn(count, flag, unused) { if (false) { unused[0]; };")
         .replace("i32(u64, bool) inspect_checked = fn(count, flag)",
             "i32(u64, bool, u8[]) inspect_checked = fn(count, flag, buffer)")
         .replace("make_checked(count, flag)", "make_checked(count, flag, buffer)");
@@ -754,7 +758,40 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
                 assert_eq!(producer.count_params(), 3);
                 assert_eq!(producer.get_linkage(), inkwell::module::Linkage::Internal);
                 let mixed = text == mixed_descriptor || text == wrapper.as_str();
-                assert_eq!(producer_ir.matches("store ptr %allocation, ptr").count(), if mixed { 1 } else { 2 }, "{producer_ir}");
+                let allocation = module.get_function("__wosy_core_alloc").unwrap();
+                let instructions = || producer.get_basic_blocks().into_iter()
+                    .flat_map(|block| block.get_instructions());
+                let mut allocations = instructions().filter_map(|instruction| {
+                    if instruction.get_opcode() != InstructionOpcode::Call {
+                        return None;
+                    }
+                    let call = CallSiteValue::try_from(instruction).unwrap();
+                    if call.get_called_fn_value() != Some(allocation)
+                        || instruction.get_operand(1)?.value()?.into_int_value()
+                            .get_zero_extended_constant() != Some(1)
+                    {
+                        return None;
+                    }
+                    call.try_as_basic_value().basic()
+                });
+                let original_base = allocations.next().expect("original byte array allocation");
+                assert!(allocations.next().is_none(), "{producer_ir}");
+                let output_slot = producer.get_last_param().expect("hidden backing result");
+                let mut originals = 0;
+                let mut nulls = 0;
+                for store in instructions().filter(|instruction| {
+                    instruction.get_opcode() == InstructionOpcode::Store
+                        && instruction.get_operand(1).unwrap().value() == Some(output_slot)
+                }) {
+                    let value = store.get_operand(0).unwrap().value().expect("published backing");
+                    if value == original_base {
+                        originals += 1;
+                    } else {
+                        assert!(value.into_pointer_value().is_null(), "{producer_ir}");
+                        nulls += 1;
+                    }
+                }
+                assert_eq!((originals, nulls), if mixed { (1, 1) } else { (2, 0) }, "{producer_ir}");
                 assert_eq!(producer_ir.matches("call void @__wosy_core_free").count(), usize::from(mixed), "{producer_ir}");
                 if mixed {
                     assert!(producer_ir.contains("call void @__wosy_core_free(ptr %allocation)"), "{producer_ir}");
