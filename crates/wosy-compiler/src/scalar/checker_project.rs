@@ -22,7 +22,7 @@ use super::{
     ScalarSourceDeclarations, ScalarTargetLayout, ScalarType,
 };
 use crate::Diagnostic;
-use wosy_syntax::{byte_span, CstNode, ParseResult, SourceIdentity, SyntaxKind};
+use wosy_syntax::{byte_span, CstNode, ProofFragmentParse, SourceIdentity, SyntaxKind};
 
 #[derive(Debug, PartialEq)]
 enum ProjectCheck {
@@ -50,6 +50,7 @@ enum ProjectCheck {
 
 #[derive(Debug, PartialEq, Eq)]
 struct VerifiedReturnBound {
+    proof_venue: ProofVenue,
     proof_source: SourceIdentity,
     proof_span: ByteSpan,
     proof_name: String,
@@ -61,6 +62,17 @@ struct VerifiedReturnBound {
     operator: BinaryOperator,
     bound: BigInt,
     guard: Option<VerifiedEntryGuard>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProofVenue {
+    DetachedFragment,
+    ModuleDeclaration,
+}
+
+enum ProofSummaryOrigin<'a> {
+    DetachedFragment(&'a SourceIdentity),
+    ModuleDeclaration(&'a SourceIdentity),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -218,7 +230,7 @@ impl PreparedProofModule {
         Ok(Self { source, proofs, prepared })
     }
 
-    fn check(&self, proof_name: &str) -> Result<(ByteSpan, ProjectCheck), ProjectCheck> {
+    fn select(&self, proof_name: &str) -> Result<&CstNode, ProjectCheck> {
         let mut selected = self.proofs.iter().filter(|proof| {
             proof.children_with_tokens()
                 .filter_map(|element| element.into_token())
@@ -229,15 +241,31 @@ impl PreparedProofModule {
         if selected.next().is_some() {
             return Err(ProjectCheck::AmbiguousRoot);
         }
+        Ok(proof)
+    }
+
+    fn check(&self, proof_name: &str) -> Result<(ByteSpan, ProjectCheck), ProjectCheck> {
+        let proof = self.select(proof_name)?;
         let (outcome, _) = check_selected_proof(&self.prepared, &self.source, proof, None)?;
         Ok((byte_span(proof), outcome))
+    }
+
+    fn verify(&self, proof_name: &str) -> Option<VerifiedReturnBound> {
+        let proof = self.select(proof_name).ok()?;
+        let (_, verified) = check_selected_proof(
+            &self.prepared,
+            &self.source,
+            proof,
+            Some(ProofSummaryOrigin::ModuleDeclaration(&self.source)),
+        ).ok()?;
+        verified
     }
 }
 
 fn check_proof_fragment(
     prepared: &PreparedCheckerProject,
     target_source: &SourceIdentity,
-    fragment: &ParseResult,
+    fragment: &ProofFragmentParse,
 ) -> ProjectCheck {
     check_proof_fragment_impl(prepared, target_source, fragment, false)
         .map(|(outcome, _)| outcome)
@@ -247,7 +275,7 @@ fn check_proof_fragment(
 fn verify_return_bound(
     prepared: &PreparedCheckerProject,
     target_source: &SourceIdentity,
-    fragment: &ParseResult,
+    fragment: &ProofFragmentParse,
 ) -> Option<VerifiedReturnBound> {
     check_proof_fragment_impl(prepared, target_source, fragment, true)
         .ok()
@@ -257,16 +285,18 @@ fn verify_return_bound(
 fn check_proof_fragment_impl(
     prepared: &PreparedCheckerProject,
     target_source: &SourceIdentity,
-    fragment: &ParseResult,
+    fragment: &ProofFragmentParse,
     retain_bound: bool,
 ) -> Result<(ProjectCheck, Option<VerifiedReturnBound>), ProjectCheck> {
+    let fragment = fragment.as_result();
     if !fragment.is_valid() {
         return Err(ProjectCheck::InvalidProof);
     }
     let root = fragment.canonical_cst();
     let declaration = child(&child(&root.root, SyntaxKind::Root)?, SyntaxKind::ProofDecl)?;
     let summary_source = retain_bound.then_some(&root.source)
-        .filter(|source| !prepared.parts().0.modules.iter().any(|module| &module.source == *source));
+        .filter(|source| !prepared.parts().0.modules.iter().any(|module| &module.source == *source))
+        .map(ProofSummaryOrigin::DetachedFragment);
     check_selected_proof(prepared, target_source, &declaration, summary_source)
 }
 
@@ -274,7 +304,7 @@ fn check_selected_proof(
     prepared: &PreparedCheckerProject,
     target_source: &SourceIdentity,
     declaration: &CstNode,
-    summary_source: Option<&SourceIdentity>,
+    summary_source: Option<ProofSummaryOrigin<'_>>,
 ) -> Result<(ProjectCheck, Option<VerifiedReturnBound>), ProjectCheck> {
     let steps = derive_block(&child(declaration, SyntaxKind::Block)?);
     let target = child(declaration, SyntaxKind::ProofTarget)?;
@@ -343,9 +373,9 @@ fn check_selected_proof(
         Some(Ok(ProofCoverage::NoApplicableInputs)) => ProjectCheck::NoApplicableInputs,
         Some(Err(failure)) => project_failure(body, &target.source, failure),
     };
-    let verified = summary_source.filter(|_| outcome == ProjectCheck::Proved).and_then(|source| {
+    let verified = summary_source.filter(|_| outcome == ProjectCheck::Proved).and_then(|origin| {
         issue_return_bound(
-            source,
+            origin,
             declaration,
             &target.source,
             function,
@@ -359,7 +389,7 @@ fn check_selected_proof(
 }
 
 fn issue_return_bound(
-    proof_source: &SourceIdentity,
+    origin: ProofSummaryOrigin<'_>,
     declaration: &CstNode,
     target_source: &SourceIdentity,
     function: &ScalarFunction,
@@ -392,7 +422,13 @@ fn issue_return_bound(
             })
         }
     };
+    let (proof_venue, proof_source) = match origin {
+        ProofSummaryOrigin::DetachedFragment(source) => (ProofVenue::DetachedFragment, source),
+        ProofSummaryOrigin::ModuleDeclaration(source) if source == target_source => (ProofVenue::ModuleDeclaration, source),
+        ProofSummaryOrigin::ModuleDeclaration(_) => return None,
+    };
     Some(VerifiedReturnBound {
+        proof_venue,
         proof_source: proof_source.clone(),
         proof_span: byte_span(declaration),
         proof_name: identifiers(declaration).next()?,
@@ -424,7 +460,9 @@ fn use_verified_return_bound(
     proof_identity: (&SourceIdentity, ByteSpan, &str),
     verified: &VerifiedReturnBound,
 ) -> Option<ImportedRequirement> {
-    if proof_identity != (&verified.proof_source, verified.proof_span, verified.proof_name.as_str()) {
+    if verified.proof_venue != ProofVenue::DetachedFragment
+        || proof_identity != (&verified.proof_source, verified.proof_span, verified.proof_name.as_str())
+    {
         return None;
     }
     let (project, calls) = prepared.parts();
@@ -724,7 +762,8 @@ mod tests {
 
         let identity = source("src/main.w", "proof-fragment");
         let fragment = "proof clamp_bounded for clamp(x) -> (out) where (x <= 10) ensures (out <= 10) {}";
-        let parsed = parse_proof_fragment(identity.clone(), fragment.to_owned(), &[]);
+        let fragment_parse = parse_proof_fragment(identity.clone(), fragment.to_owned(), &[]);
+        let parsed = fragment_parse.as_result();
         assert!(parsed.is_valid(), "{:?}", parsed.errors);
         assert_eq!(parsed.canonical_cst().source, identity);
         assert_eq!(parsed.reconstruct(), fragment);
@@ -827,6 +866,46 @@ mod tests {
         let text = format!("%%start\n{declaration}\nu8(u8) identity = fn(value) {{ nonsense nonsense; {declaration} value }};\n%%end");
         let result = PreparedProofModule::prepare(source("src/main.w", "invalid-proofs"), text, inputs());
         assert!(matches!(result, Err(ProjectCheck::InvalidProof)));
+    }
+
+    #[test]
+    fn verified_module_bound_preserves_actual_proof_and_callable_sites() {
+        let file = source("src/main.w", "module-proof-r1");
+        let proof = "proof bounded for clamp(x) -> (out) where (x <= 10) ensures (out <= 10) {}";
+        let false_proof = "proof smaller for clamp(x) -> (out) ensures (out <= 9) {}";
+        let empty = "proof empty for clamp(x) -> (out) where (false) ensures (out <= 10) {}";
+        let text = format!("%%start\nu8(u8) clamp = fn(value) {{ if (value > 10) {{ 10 }} else {{ value }} }};\n{proof}\n{false_proof}\n{empty}\n%%end");
+        let module = PreparedProofModule::prepare(file.clone(), text.clone(), inputs()).unwrap();
+        let artifact = module.verify("bounded").unwrap();
+        let proof_start = text.find(proof).unwrap() as u32;
+        let target_start = text.find("clamp").unwrap() as u32;
+        assert_eq!(artifact.proof_venue, ProofVenue::ModuleDeclaration);
+        assert_eq!(artifact.proof_source, file);
+        assert_eq!(artifact.proof_span, ByteSpan::new(proof_start, proof_start + proof.len() as u32));
+        assert_eq!(artifact.proof_name, "bounded");
+        assert_eq!(artifact.target, ResolvedCallTarget::ModuleCallable {
+            source: file.clone(),
+            declaration_span: ByteSpan::new(target_start, target_start + "clamp".len() as u32),
+            concrete: ConcreteCallSelection::Declaration,
+        });
+        assert_eq!(artifact.target_layout, ScalarTargetLayout::WASM32);
+        assert_eq!(artifact.parameters, [ScalarType::U8]);
+        assert_eq!(artifact.output_slot, 0);
+        assert_eq!(artifact.output_type, ScalarType::U8);
+        assert_eq!(artifact.guard, Some(VerifiedEntryGuard::Integer {
+            slot: 0,
+            ty: ScalarType::U8,
+            operator: BinaryOperator::LessEqual,
+            bound: BigInt::from(10),
+        }));
+        for name in ["smaller", "empty", "absent"] {
+            assert_eq!(module.verify(name), None);
+        }
+        let detached = wosy_syntax::parse_proof_fragment(file.clone(), proof.into(), &[]);
+        assert_eq!(verify_return_bound(&module.prepared, &file, &detached), None);
+        let duplicate = text.replace("proof smaller", "proof bounded");
+        let module = PreparedProofModule::prepare(source("src/main.w", "duplicate-proof"), duplicate, inputs()).unwrap();
+        assert_eq!(module.verify("bounded"), None);
     }
 
     #[test]

@@ -457,12 +457,23 @@ pub fn parse(source: SourceIdentity, text: String, configured_comments: &[String
 
 #[cfg(any(test, feature = "checker-test-support"))]
 #[doc(hidden)]
+pub struct ProofFragmentParse(ParseResult);
+
+#[cfg(any(test, feature = "checker-test-support"))]
+impl ProofFragmentParse {
+    pub fn as_result(&self) -> &ParseResult {
+        &self.0
+    }
+}
+
+#[cfg(any(test, feature = "checker-test-support"))]
+#[doc(hidden)]
 pub fn parse_proof_fragment(
     source: SourceIdentity,
     text: String,
     configured_comments: &[String],
-) -> ParseResult {
-    parse_entry(source, text, configured_comments, Rule::proof_fragment)
+) -> ProofFragmentParse {
+    ProofFragmentParse(parse_entry(source, text, configured_comments, Rule::proof_fragment))
 }
 
 #[cfg(any(test, feature = "checker-test-support"))]
@@ -2533,7 +2544,8 @@ mod proof_fragment_tests {
     core.show(out == x);
 }"#;
         let result = parse_proof_fragment(source(), text.to_owned(), &[]);
-        let proof = proof(&result);
+        let result = result.as_result();
+        let proof = proof(result);
         assert_eq!(result.reconstruct(), text);
         assert!(proof.children_with_tokens().any(|element| {
             element.into_token().is_some_and(|token| {
@@ -2559,8 +2571,9 @@ mod proof_fragment_tests {
     #[test]
     fn proof_fragment_retains_empty_body_without_where() {
         let text = "proof bounded for clamp_bounded(x) -> (out) ensures (out <= 10) {}";
-        let result = parse_proof_fragment(source(), text.to_owned(), &[]);
-        let proof = proof(&result);
+        let fragment: ProofFragmentParse = parse_proof_fragment(source(), text.to_owned(), &[]);
+        let result = fragment.as_result();
+        let proof = proof(result);
         assert_eq!(result.reconstruct(), text);
         assert!(!proof.children().any(|node| node.kind() == SyntaxKind::ProofWhere));
         assert!(proof.children().any(|node| node.kind() == SyntaxKind::Block && node.text() == "{}"));
@@ -2582,7 +2595,7 @@ mod proof_fragment_tests {
         let second = "proof limit for identity(v) -> (r) ensures (r <= 255) {}";
         let text = format!("%%start\n{first}\nu8(u8) identity = fn(value) {{ value }};\n{second}\n%%end");
         let identity = source();
-        let result = parse_proof_module(identity.clone(), text.clone(), &[]);
+        let result: ParseResult = parse_proof_module(identity.clone(), text.clone(), &[]);
         assert!(result.is_valid(), "{:?}", result.errors);
         assert_eq!(result.reconstruct(), text);
         assert_eq!(result.canonical_cst().source, identity);
@@ -2628,7 +2641,8 @@ mod proof_fragment_tests {
             "proof bounded for clamp_bounded(x) -> (out) {}",
             "proof bounded for clamp_bounded(x) -> (out) ensures (out <= 10) {} trailing",
         ] {
-            let result = parse_proof_fragment(source(), text.to_owned(), &[]);
+            let fragment = parse_proof_fragment(source(), text.to_owned(), &[]);
+            let result = fragment.as_result();
             assert!(!result.is_valid(), "{text}");
             assert_eq!(result.reconstruct(), text);
             let [error] = result.errors.as_slice() else {
