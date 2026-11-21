@@ -2793,6 +2793,56 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(())
     }
 
+
+    fn checked_backing_forward(&self, region: &BlockRegion, output_points: &[CfgPointId])
+        -> Option<(OccurrenceOrdinal, CfgPointId)>
+    {
+        let calls = self.call_sites;
+        let [first, result, status] = region.items.as_slice() else { return None };
+        let (BlockItemKind::Binding(binding), BlockItemKind::FinalOutput(left), BlockItemKind::FinalOutput(right)) =
+            (&first.kind, &result.kind, &status.kind) else { return None };
+        let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None };
+        if !matches!(outputs.secondary.as_slice(), [BindingOutput::ProjectPrimary { output: 1 }])
+            || !matches!(binding.receivers(), [left, right]
+                if matches!(left.ty, ScalarType::CheckedReference { .. }) && aggregate::ordinary_value(&right.ty))
+            || !matches!((left.output, right.output), (0, 1))
+            || calls.boundary.root_outputs.len() != 2
+            || !calls.boundary.parameters.iter().all(|parameter| aggregate::ordinary_value(&parameter.ty))
+            || !calls.structure.module_storage_uses.is_empty()
+            || !matches!(calls.call_occurrences.as_slice(), [occurrence] if occurrence.ordinal == outputs.primary)
+            || !calls.allocation_length_call_targets.is_empty()
+            || !calls.callable_escapes.is_empty()
+        {
+            return None;
+        }
+        let [read_left, read_right] = output_points else { return None };
+        let bound = |lane, read: CfgPointId| {
+            let BindingDefinition::Initialized { bind, value } =
+                *self.proof_points.definitions.get(&(calls.structure.root, first.position, lane))?
+                else { return None };
+            let CfgPointKind::Bind { binding } = &self.cfg.points.get(bind.0)?.kind else { return None };
+            matches!(&self.cfg.points.get(read.0)?.kind, CfgPointKind::Read { binding: actual } if actual == binding)
+                .then_some(value)
+        };
+        let primary = bound(0, *read_left)?;
+        let secondary = bound(1, *read_right)?;
+        if self.proof_points.evaluations.get(&outputs.primary) != Some(&primary) {
+            return None;
+        }
+        let CfgPointKind::Call { output: 0, target: primary_target @ ResolvedCallTarget::ModuleCallable {
+            concrete: ConcreteCallSelection::Declaration, ..
+        }, argument_points, .. } = &self.cfg.points.get(primary.0)?.kind else { return None };
+        if !matches!(&self.cfg.points.get(secondary.0)?.kind, CfgPointKind::Call { output: 1, target, argument_points: args, .. }
+            if target == primary_target && args == argument_points)
+            || argument_points.len() != calls.boundary.parameters.len()
+            || !argument_points.iter().enumerate().all(|(slot, point)| matches!(&self.cfg.points[point.0].kind,
+                CfgPointKind::Read { binding } if self.proof_points.formals.get(&slot) == Some(binding)))
+        {
+            return None;
+        }
+        Some((outputs.primary, primary))
+    }
+
     fn record_binding_definition(
         &mut self,
         position: BlockPosition,
@@ -3513,6 +3563,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
         }
         if scope == ReferenceScopeId(0) {
+            let backing_forward = self.checked_backing_forward(region, &result.output_points);
             for (slot, &value_point) in region.final_outputs().zip(&result.output_points) {
                 let metadata = &calls.boundary.root_outputs[slot.output];
                 assert_eq!(metadata.output, slot.output);
@@ -3525,6 +3576,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     slot.span,
                     scope,
                 );
+                if let Some((ordinal, primary)) = backing_forward.filter(|_| slot.output == 0) {
+                    self.aggregate_result.checked_backing_forward_candidate =
+                        Some((ordinal, primary, self.cursor.expect("checked backing terminal output")));
+                }
             }
         }
         self.point(CfgPointKind::ScopeExit, region.span, scope, BTreeSet::new());
@@ -8537,6 +8592,17 @@ fn transfer_function_output_contracts(
                     CheckedProducerTerminal::Unknown => true,
                 }
             });
+        result.aggregate.checked_backing_forward = result.aggregate.checked_backing_forward_candidate
+            .filter(|&(_, primary, terminal)| {
+                let Some(origins) = result.cfg.points[primary.0].possible_origins.as_ref() else { return false };
+                transferred.is_empty()
+                    && result.cfg.points[terminal.0].possible_origins.as_ref() == Some(origins)
+                    && origins.iter().any(|id| matches!(&result.cfg.facts[id.0], ReferenceOrigin::Fresh { loan, .. }
+                        if matches!(loan.origin_place.binding.kind, ReferenceBindingKind::CallOutput { point, output: 0 } if point == primary)))
+                    && origins.iter().all(|id| matches!(&result.cfg.facts[id.0], ReferenceOrigin::Null { .. })
+                        || matches!(&result.cfg.facts[id.0], ReferenceOrigin::Fresh { loan, .. }
+                            if matches!(loan.origin_place.binding.kind, ReferenceBindingKind::CallOutput { point, output: 0 } if point == primary)))
+            }).map(|(ordinal, primary, _)| (ordinal, primary));
         let install = descriptor.filter(|proof| transferred.is_empty() && proof.exited && !proof.invalid)
             .and_then(|proof| candidate.map(|(destination, _)| (*destination, proof.candidate)));
         result.aggregate.scalar_descriptor_assignment = install

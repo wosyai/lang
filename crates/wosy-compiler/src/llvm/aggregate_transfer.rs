@@ -72,6 +72,7 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     checked_backing_pending: Option<PointerValue<'ctx>>,
     checked_backing_receiver: Option<PointerValue<'ctx>>,
     checked_backing_released: bool,
+    checked_backing_forwarded: bool,
     receipts: BTreeMap<usize, PointerValue<'ctx>>,
     input: Option<(usize, PointerValue<'ctx>)>,
 }
@@ -100,7 +101,8 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             None
         };
         if (plan.ordinary_result || !plan.ordinary_calls.is_empty())
-            && (plan.checked_backing_producer.is_some() || plan.checked_backing_consumer.is_some())
+            && (plan.checked_backing_producer.is_some() || plan.checked_backing_consumer.is_some()
+                || plan.checked_backing_wrapper.is_some())
         {
             return Err("overlapping ordinary and checked aggregate conventions".into());
         }
@@ -119,7 +121,8 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
         let input = plan.input.map(|slot| definition.get_nth_param(definition.count_params() - 1)
             .ok_or_else(|| "missing aggregate formal input base".to_owned())
             .map(|base| (slot, base.into_pointer_value()))).transpose()?;
-        let checked_backing_output = plan.checked_backing_producer.map(|_| definition.get_nth_param(definition.count_params() - 1)
+        let checked_backing_output = (plan.checked_backing_producer.is_some() || plan.checked_backing_wrapper.is_some())
+            .then(|| definition.get_nth_param(definition.count_params() - 1)
             .ok_or_else(|| "missing private checked backing output".to_owned())
             .map(|value| value.into_pointer_value())).transpose()?;
         let failure_site = plan.local_array_failure.filter(|_| {
@@ -151,6 +154,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             checked_backing_pending: None,
             checked_backing_receiver: None,
             checked_backing_released: false,
+            checked_backing_forwarded: false,
             receipts: BTreeMap::new(),
         }))
     }
@@ -164,7 +168,8 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
 }
 
 pub(super) fn linkage(plan: Option<&ClosedBody>) -> Option<Linkage> {
-    plan.filter(|body| body.returning.is_some() || body.input.is_some() || body.checked_backing_producer.is_some() || body.ordinary_result)
+    plan.filter(|body| body.returning.is_some() || body.input.is_some() || body.checked_backing_producer.is_some()
+        || body.checked_backing_wrapper.is_some() || body.ordinary_result)
         .map(|_| Linkage::Internal)
 }
 
@@ -196,7 +201,8 @@ pub(super) fn definition_type<'ctx>(
     }
     if plan.and_then(|body| body.returning).is_none() {
         let original = definition_function_type(context, function, cfg, layout)?;
-        if !plan.is_some_and(|body| body.input.is_some() || body.checked_backing_producer.is_some()) {
+        if !plan.is_some_and(|body| body.input.is_some() || body.checked_backing_producer.is_some()
+            || body.checked_backing_wrapper.is_some()) {
             return Ok(original);
         }
         let mut parameters = original.get_param_types().into_iter().map(Into::into)
@@ -460,8 +466,9 @@ pub(super) fn emit_call<'ctx, 'module>(
     }
     let Some(aggregate) = &state.aggregate else { return Ok(None) };
     let Some(ordinal) = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)) else { return Ok(None) };
-    if aggregate.plan.checked_backing_consumer.is_some_and(|(_, call)| ordinal == call) {
-        return emit_checked_backing_call(context, state, expression, arguments, project).map(Some);
+    let forwards = aggregate.plan.checked_backing_wrapper == Some(ordinal);
+    if forwards || aggregate.plan.checked_backing_consumer.is_some_and(|(_, call)| ordinal == call) {
+        return emit_checked_backing_call(context, state, expression, arguments, project, forwards).map(Some);
     }
     if let Some(declaration) = aggregate.plan.ordinary_calls.get(&ordinal) {
         let Some(nodes) = state.body_call_nodes else {
@@ -493,6 +500,7 @@ fn emit_checked_backing_call<'ctx, 'module>(
     expression: &ScalarExpression,
     arguments: &[ScalarExpression],
     project: Option<(&ScalarModule, &[&ScalarModule])>,
+    forwards: bool,
 ) -> Result<EmitValue<'ctx>, String> {
     let symbol = state.direct_aggregate_symbol(expression, None)?;
     let function = *state.functions.get(symbol).ok_or_else(|| "missing checked backing definition".to_owned())?;
@@ -513,14 +521,25 @@ fn emit_checked_backing_call<'ctx, 'module>(
     }
     let owner_slots = super::expression::stage_checked_return_sidecars(context, state, flags, &mut operands)?;
     let pointer = context.ptr_type(AddressSpace::default());
-    let slot = entry_alloca(state, pointer.into(), "checked_backing_out")?;
+    let slot = if forwards {
+        state.aggregate.as_ref().and_then(|aggregate| aggregate.checked_backing_output)
+            .ok_or_else(|| "missing private checked backing wrapper output".to_owned())?
+    } else {
+        entry_alloca(state, pointer.into(), "checked_backing_out")?
+    };
     operands.push(slot.into());
     let value = state.builder.build_call(function, &operands, "checked_backing_call").map_err(builder_error)?;
     super::expression::publish_checked_return_sidecars(context, state, owner_slots)?;
-    let base = state.builder.build_load(pointer, slot, "checked_backing_base").map_err(builder_error)?.into_pointer_value();
     let aggregate = state.aggregate.as_mut().expect("closed checked backing call context");
-    if aggregate.checked_backing_pending.replace(base).is_some() {
-        return Err("overlapping private checked backing receipts".into());
+    if forwards {
+        if std::mem::replace(&mut aggregate.checked_backing_forwarded, true) {
+            return Err("duplicate private checked backing forwarding".into());
+        }
+    } else {
+        let base = state.builder.build_load(pointer, slot, "checked_backing_base").map_err(builder_error)?.into_pointer_value();
+        if aggregate.checked_backing_pending.replace(base).is_some() {
+            return Err("overlapping private checked backing receipts".into());
+        }
     }
     super::expression::ordinary_call_result(value.try_as_basic_value(), outputs)
 }
@@ -872,6 +891,9 @@ pub(super) fn finish_return<'ctx>(
         && (!aggregate.failure_arm_visited || aggregate.failure_allocation.is_some())
     {
         return Err("unconsumed local array failure allocation".into());
+    }
+    if aggregate.plan.checked_backing_wrapper.is_some() && !aggregate.checked_backing_forwarded {
+        return Err("missing private checked backing forwarding".into());
     }
     if aggregate.plan.checked_backing_producer.is_some() && aggregate.checked_backing_arms != 0b11 {
         return Err("incomplete checked backing producer arms".into());

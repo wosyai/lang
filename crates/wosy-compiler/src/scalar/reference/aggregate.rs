@@ -279,6 +279,8 @@ impl AggregateEdgeState {
 
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
+    pub(super) checked_backing_forward_candidate: Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>,
+    pub(super) checked_backing_forward: Option<(OccurrenceOrdinal, CfgPointId)>,
     pub(super) checked_backing_assignment: Option<(usize, usize, CfgPointId)>,
     pub(super) passive_descriptor_read: Option<Box<PassiveDescriptorRead>>,
     pub(super) checked_producer_blocks: BTreeMap<CfgPointId, usize>,
@@ -347,7 +349,7 @@ impl AggregateFlowResult {
 
     pub(super) fn has_observations(&self) -> bool {
         (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
-            || self.checked_backing_assignment.is_some()
+            || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
             || self.scalar_descriptor_assignment.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
             || self.returning_leaf || !self.calls.is_empty() || !self.returns.is_empty() || !self.formals.is_empty() || !self.inputs.is_empty() || !self.raw_terminals.is_empty() || !self.read_formals.is_empty()
     }
@@ -1123,6 +1125,7 @@ pub(crate) struct ClosedCheckedBacking {
 pub(crate) struct ClosedBody {
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
     pub(crate) checked_backing_producer: Option<ClosedCheckedBacking>,
+    pub(crate) checked_backing_wrapper: Option<usize>,
     pub(crate) checked_backing_consumer: Option<(usize, usize)>,
     pub(crate) checked_backing_optional: bool,
     pub(crate) returning: Option<ClosedReturn>,
@@ -1556,6 +1559,11 @@ fn initializer_target(
     Some((module, item, arm))
 }
 
+enum CheckedBackingIncoming {
+    Sink((usize, usize)),
+    Wrapper(usize),
+}
+
 fn closed_checked_backing_consumer<'a>(
     reservations: &AggregateReservations,
     module_at: &impl Fn(usize) -> Option<ModuleInput<'a>>,
@@ -1563,7 +1571,7 @@ fn closed_checked_backing_consumer<'a>(
     declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
     initializers: impl Iterator<Item = &'a ModuleInitializationRegion>,
     producer: BodyKey,
-) -> Result<Option<(BodyKey, (usize, usize))>, String> {
+) -> Result<Option<(BodyKey, CheckedBackingIncoming)>, String> {
     let input = module_at(producer.0).ok_or_else(|| "missing checked backing module".to_owned())?;
     let Some(ScalarItem::Function(definition)) = input.items.get(producer.1) else {
         return Err("missing checked backing declaration".into());
@@ -1592,24 +1600,34 @@ fn closed_checked_backing_consumer<'a>(
                 return Ok(None);
             }
             let Some(body) = bodies.get(&key) else { return Ok(None) };
-            let Some((destination, callee, point)) = body.facts.and_then(|facts| facts.checked_backing_assignment) else {
-                return Ok(None);
-            };
-            if callee != call.ordinal.0 || target_body(declarations, body.cfg, point) != Some(producer) {
-                return Ok(None);
-            }
-            if sites.call_occurrences.len() != 1 {
-                let Some(passive) = body.facts.and_then(|facts| facts.passive_descriptor_read.as_ref()) else { return Ok(None) };
-                let Some(reader) = target_body(declarations, body.cfg, passive.call) else { return Ok(None) };
-                if !bodies.get(&reader).and_then(|body| body.facts)
-                    .and_then(|facts| facts.read_formal_fields.get(&0))
-                    .is_some_and(|field| field == &passive.field)
-                    || prove_read_views((reader, ReadSource::Carrier(0)), bodies, declarations, &mut BTreeSet::new()).is_err()
+            let Some(facts) = body.facts else { return Ok(None) };
+            let incoming = if let Some((destination, callee, point)) = facts.checked_backing_assignment {
+                if callee != call.ordinal.0 || target_body(declarations, body.cfg, point) != Some(producer) {
+                    return Ok(None);
+                }
+                if sites.call_occurrences.len() != 1 {
+                    let Some(passive) = facts.passive_descriptor_read.as_ref() else { return Ok(None) };
+                    let Some(reader) = target_body(declarations, body.cfg, passive.call) else { return Ok(None) };
+                    if !bodies.get(&reader).and_then(|body| body.facts)
+                        .and_then(|facts| facts.read_formal_fields.get(&0))
+                        .is_some_and(|field| field == &passive.field)
+                        || prove_read_views((reader, ReadSource::Carrier(0)), bodies, declarations, &mut BTreeSet::new()).is_err()
+                    {
+                        return Ok(None);
+                    }
+                }
+                CheckedBackingIncoming::Sink((destination, callee))
+            } else if let Some((callee, point)) = facts.checked_backing_forward {
+                if sites.call_occurrences.len() != 1 || callee != call.ordinal
+                    || target_body(declarations, body.cfg, point) != Some(producer)
                 {
                     return Ok(None);
                 }
-            }
-            consumer = Some((key, (destination, callee)));
+                CheckedBackingIncoming::Wrapper(callee.0)
+            } else {
+                return Ok(None);
+            };
+            consumer = Some((key, incoming));
         }
     }
     if consumer.is_none() { return Ok(None) }
@@ -1618,7 +1636,9 @@ fn closed_checked_backing_consumer<'a>(
         if topology.callable_escapes.iter().any(|decl| same_declaration(&decl.source, decl.range))
             || topology.calls.iter().any(|call| {
                 match region.call_target(*call) {
-                    Some(ModuleInitializationCallTarget::Direct { declaration, .. }) => same_declaration(&declaration.source, declaration.range),
+                    Some(ModuleInitializationCallTarget::Direct { declaration, .. }
+                        | ModuleInitializationCallTarget::Generic { declaration, .. }) =>
+                        same_declaration(&declaration.source, declaration.range),
                     Some(_) => false,
                     None => true,
                 }
@@ -1634,7 +1654,7 @@ fn closed_aggregates<'a>(
     reservations: &AggregateReservations,
     module_at: impl Fn(usize) -> Option<ModuleInput<'a>>,
     result_at: impl Fn(BodyKey, &'a ScalarFunction) -> Option<(Option<&'a AggregateFlowResult>, &'a ScalarReferenceCfg)>,
-    initializers: impl Iterator<Item = &'a ModuleInitializationRegion>,
+    initializers: impl Iterator<Item = &'a ModuleInitializationRegion> + Clone,
 ) -> Result<ClosedAggregates, String> {
     let ordinary = ordinary_result_cohort(reservations, |module| {
         let input = module_at(module)?;
@@ -1857,10 +1877,24 @@ fn closed_aggregates<'a>(
         });
         if let Some((producer, plan)) = producers.next() {
             if producers.next().is_none() {
-                if let Some((consumer, install)) = closed_checked_backing_consumer(
-                    reservations, &module_at, &bodies, &declarations, initializers, producer,
+                let end = match closed_checked_backing_consumer(
+                    reservations, &module_at, &bodies, &declarations, initializers.clone(), producer,
                 )? {
+                    Some((consumer, CheckedBackingIncoming::Sink(install))) => Some((consumer, install, None)),
+                    Some((wrapper, CheckedBackingIncoming::Wrapper(ordinal))) => match closed_checked_backing_consumer(
+                        reservations, &module_at, &bodies, &declarations, initializers, wrapper,
+                    )? {
+                        Some((consumer, CheckedBackingIncoming::Sink(install))) if consumer != producer =>
+                            Some((consumer, install, Some((wrapper, ordinal)))),
+                        _ => None,
+                    },
+                    None => None,
+                };
+                if let Some((consumer, install, wrapper)) = end {
                     result.bodies.entry(producer).or_default().checked_backing_producer = Some(plan);
+                    if let Some((wrapper, ordinal)) = wrapper {
+                        result.bodies.entry(wrapper).or_default().checked_backing_wrapper = Some(ordinal);
+                    }
                     let receiver = result.bodies.entry(consumer).or_default();
                     receiver.checked_backing_consumer = Some(install);
                     receiver.checked_backing_optional = plan.failure.is_some();
@@ -2294,6 +2328,7 @@ fn closed_aggregates<'a>(
         }
         if returning || !plan.calls.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()
             || !plan.same_array_rebinds.is_empty() || plan.scalar_descriptor_assignment.is_some()
+            || plan.checked_backing_wrapper.is_some()
         {
             result.bodies.insert(key, plan);
         }
