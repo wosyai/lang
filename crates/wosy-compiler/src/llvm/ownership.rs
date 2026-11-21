@@ -1,8 +1,15 @@
 use super::*;
 use crate::scalar::{CfgPointId, ReferenceFlowPoint};
 
-type ReturnBranches =
-    BTreeMap<(u32, u32), (BTreeSet<usize>, BTreeSet<usize>, BTreeMap<usize, String>)>;
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct ReturnBranch {
+    pub(super) local: BTreeSet<usize>,
+    pub(super) covered: BTreeSet<usize>,
+    pub(super) joined: BTreeMap<usize, String>,
+    pub(super) forwarded: BTreeMap<usize, String>,
+}
+
+pub(super) type ReturnBranches = BTreeMap<(u32, u32), ReturnBranch>;
 
 pub(super) fn fresh_return_outputs(
     function: &ScalarFunction,
@@ -185,6 +192,7 @@ fn record_projected_return_branches(
         metadata.span,
         point,
         output,
+        Some(syntax_output),
         branches,
     )
 }
@@ -233,14 +241,14 @@ pub(super) fn dynamic_return_owner(
 
 pub(super) fn joined_return_binding_types(
     function: &ScalarFunction,
-    branches: &BTreeMap<(u32, u32), (BTreeSet<usize>, BTreeSet<usize>, BTreeMap<usize, String>)>,
+    branches: &ReturnBranches,
 ) -> Result<BTreeMap<String, ScalarType>, String> {
     let mut bindings = BTreeMap::new();
     let ScalarType::Callable { outputs, .. } = &function.signature else {
         return Err("function has no callable signature".to_owned());
     };
-    for (_, _, joined) in branches.values() {
-        for (output, name) in joined {
+    for branch in branches.values() {
+        for (output, name) in &branch.joined {
             let ty = outputs
                 .outputs
                 .get(*output)
@@ -358,8 +366,8 @@ fn record_return_branches(
                 let selected = branches
                     .entry((function.body.span.start, function.body.span.end))
                     .or_default();
-                selected.1.insert(output);
-                selected.2.insert(output, name.clone());
+                selected.covered.insert(output);
+                selected.joined.insert(output, name.clone());
                 return Ok(());
             }
         }
@@ -416,6 +424,7 @@ fn record_return_branches(
             value.span,
             point,
             output,
+            None,
             branches,
         )?;
     }
@@ -430,6 +439,7 @@ fn record_return_branch_owner(
     span: wosy_syntax::ByteSpan,
     point: &ReferenceFlowPoint,
     output: usize,
+    projected_slot: Option<usize>,
     branches: &mut ReturnBranches,
 ) -> Result<(), String> {
     let origins = point
@@ -453,18 +463,88 @@ fn record_return_branch_owner(
     let selected = branches
         .entry((branch.span.start, branch.span.end))
         .or_default();
-    selected.1.insert(output);
+    selected.covered.insert(output);
     if local && external {
         let ScalarExpression::Name { name, .. } = expression else {
             return Err(format!(
                 "return branch at {span:?} has joined owners without a binding"
             ));
         };
-        selected.2.insert(output, name.clone());
+        selected.joined.insert(output, name.clone());
     } else if local {
-        selected.0.insert(output);
+        selected.local.insert(output);
+    } else if external && projected_slot == Some(output) {
+        if let Some(name) = exact_named_call_return(reference_cfg, branch, expression, point) {
+            selected.forwarded.insert(output, name.to_owned());
+        }
     }
     Ok(())
+}
+
+fn exact_named_call_return<'a>(
+    cfg: &ScalarReferenceCfg,
+    branch: &ScalarBlock,
+    expression: &'a ScalarExpression,
+    point: &ReferenceFlowPoint,
+) -> Option<&'a str> {
+    if branch.unsafe_context
+        || branch.final_output_values.len() != 2
+        || branch.items.len() != branch.final_output_values.len() + 1
+    {
+        return None;
+    }
+    let ScalarBlockItem::LocalBinding(initializer) = &branch.items[0] else { return None };
+    let (
+        ScalarExpression::Name { name, .. },
+        ScalarExpression::Call { span, .. },
+        CfgPointKind::Read { binding },
+    ) = (expression, &initializer.value, &point.kind) else { return None };
+    if initializer.is_allocation
+        || initializer.output_origin != ScalarBindingOutputOrigin::SingleExpression
+        || binding.block_span != branch.span
+    {
+        return None;
+    }
+    let (slot, receiver) = initializer.receivers.iter().enumerate()
+        .find(|(_, receiver)| receiver.name == *name)?;
+    if !matches!(receiver.ty, ScalarType::CheckedReference { .. })
+        || binding.declaration_span != receiver.name_span
+    {
+        return None;
+    }
+    let [first, second] = initializer.receivers.as_slice() else { return None };
+    let sibling = if slot == 0 { second } else { first };
+    if sibling.name == *name
+        || !(integer_width(&sibling.ty).is_some()
+            || matches!(sibling.ty, ScalarType::Bool | ScalarType::Char | ScalarType::F32 | ScalarType::F64 | ScalarType::Enum(_)))
+    {
+        return None;
+    }
+    let mut terminals = branch.final_expressions();
+    let ((first, _), (second, _)) = (terminals.next()?, terminals.next()?);
+    let other = if std::ptr::eq(first, expression) { second }
+        else if std::ptr::eq(second, expression) { first }
+        else { return None };
+    if !matches!(other, ScalarExpression::Name { name: terminal, .. } if terminal == &sibling.name) {
+        return None;
+    }
+    let mut acquired = false;
+    for origin in point.possible_origins.as_ref()? {
+        match cfg.facts.get(origin.0)? {
+            ReferenceOrigin::Fresh { loan, .. } => {
+                let ReferenceBindingKind::CallOutput { point: call, output } = loan.origin_place.binding.kind else { return None };
+                let call = cfg.points.get(call.0)?;
+                let CfgPointKind::Call { expression: ScalarExpression::Call { span: call_span, .. }, output: call_output, .. } = &call.kind else { return None };
+                if call.id >= point.id || *call_span != *span || output != slot || *call_output != slot {
+                    return None;
+                }
+                acquired = true;
+            }
+            ReferenceOrigin::BorrowedFrom { .. } | ReferenceOrigin::Null { .. } => {}
+            ReferenceOrigin::Invalid { .. } => return None,
+        }
+    }
+    acquired.then_some(name.as_str())
 }
 
 #[cfg(test)]

@@ -201,19 +201,19 @@ fn projected_checked_returns_classify_exact_arm_points_by_slot() {
         BTreeMap::from([
             (
                 (8, 20),
-                (BTreeSet::from([0]), BTreeSet::from([0, 1]), BTreeMap::new())
+                ReturnBranch { local: BTreeSet::from([0]), covered: BTreeSet::from([0, 1]), ..ReturnBranch::default() }
             ),
             (
                 (30, 42),
-                (BTreeSet::from([1]), BTreeSet::from([0, 1]), BTreeMap::new())
+                ReturnBranch { local: BTreeSet::from([1]), covered: BTreeSet::from([0, 1]), ..ReturnBranch::default() }
             ),
             (
                 (50, 72),
-                (
-                    BTreeSet::new(),
-                    BTreeSet::from([0, 1]),
-                    BTreeMap::from([(0, "joined_first".into())])
-                )
+                ReturnBranch {
+                    covered: BTreeSet::from([0, 1]),
+                    joined: BTreeMap::from([(0, "joined_first".into())]),
+                    ..ReturnBranch::default()
+                }
             ),
         ])
     );
@@ -224,13 +224,13 @@ fn independent_scalar_if_retains_second_projected_owner_slot() {
     let function = projected_checked_return(true);
     let (fresh, branches) = fresh_return_outputs(&function, &function.reference_cfg).unwrap();
     assert!(fresh.is_empty());
-    assert_eq!(branches[&(8, 20)].0, BTreeSet::from([0]));
-    assert_eq!(branches[&(8, 20)].1, BTreeSet::from([0]));
-    assert_eq!(branches[&(11, 14)].0, BTreeSet::from([1]));
-    assert_eq!(branches[&(11, 14)].1, BTreeSet::from([1]));
-    assert!(branches[&(15, 18)].0.is_empty());
-    assert_eq!(branches[&(15, 18)].1, BTreeSet::from([1]));
-    assert_eq!(branches[&(30, 42)].0, BTreeSet::from([1]));
+    assert_eq!(branches[&(8, 20)].local, BTreeSet::from([0]));
+    assert_eq!(branches[&(8, 20)].covered, BTreeSet::from([0]));
+    assert_eq!(branches[&(11, 14)].local, BTreeSet::from([1]));
+    assert_eq!(branches[&(11, 14)].covered, BTreeSet::from([1]));
+    assert!(branches[&(15, 18)].local.is_empty());
+    assert_eq!(branches[&(15, 18)].covered, BTreeSet::from([1]));
+    assert_eq!(branches[&(30, 42)].local, BTreeSet::from([1]));
 }
 
 #[test]

@@ -102,8 +102,7 @@ struct EmitState<'ctx, 'module> {
     storage: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
     return_bindings: BTreeMap<String, ScalarExpression>,
     fresh_return_outputs: BTreeSet<usize>,
-    branch_return_outputs:
-        BTreeMap<(u32, u32), (BTreeSet<usize>, BTreeSet<usize>, BTreeMap<usize, String>)>,
+    branch_return_outputs: ownership::ReturnBranches,
     joined_return_bindings: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
     joined_assignment_owners: BTreeMap<(u32, u32), CheckedAssignmentOwner>,
     return_output_types: Vec<ScalarType>,
@@ -3050,6 +3049,7 @@ fn emit_ordered_final_outputs<'ctx, 'module>(
             record_forwarded_return_owner(context, state, expression, position)?;
         }
     }
+    record_named_branch_return_owners(context, state, block)?;
     for ((expression, _), output) in block.final_expressions().zip(&outputs.outputs) {
         transfer_runtime_array_return(state, block, expression, &output.ty);
         transfer_automatic_return_result(state, expression);
@@ -4291,6 +4291,7 @@ use expression::{
 mod return_memory;
 use return_memory::{
     emit_automatic_return_result, emit_return, finish_block_return, record_forwarded_return_owner,
+    record_named_branch_return_owners,
     transfer_automatic_return_result,
 };
 fn project_function_name(source: &wosy_syntax::SourceIdentity, name: &str) -> String {

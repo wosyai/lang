@@ -48,6 +48,27 @@ pub(super) fn record_forwarded_return_owner<'ctx>(
     Ok(())
 }
 
+pub(super) fn record_named_branch_return_owners<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    block: &ScalarBlock,
+) -> Result<(), String> {
+    let Some(branch) = state.branch_return_outputs.get(&(block.span.start, block.span.end)) else {
+        return Ok(());
+    };
+    for (&output, name) in &branch.forwarded {
+        if !state.return_owner_slots.contains_key(&output)
+            || !state.automatic_return_result_owners.contains_key(name)
+        {
+            return Err(format!("missing validated named return owner for {name}"));
+        }
+        let owner = state.checked_owner_flags.get(name).copied()
+            .unwrap_or_else(|| context.bool_type().const_int(1, false));
+        state.return_owner_flags.insert(output, owner);
+    }
+    Ok(())
+}
+
 pub(super) fn emit_automatic_return_result<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -261,7 +282,7 @@ fn materialize_return_branch<'ctx, 'module>(
     value: EmitValue<'ctx>,
     ordered_outputs: Option<&crate::ScalarOutputSequence>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let Some((indices, covered, joined)) = state
+    let Some(ownership::ReturnBranch { local: indices, covered, joined, forwarded }) = state
         .branch_return_outputs
         .get(&(block.span.start, block.span.end))
         .cloned()
@@ -269,6 +290,12 @@ fn materialize_return_branch<'ctx, 'module>(
         return Ok(value);
     };
     for output in covered {
+        if forwarded.contains_key(&output) {
+            if !state.return_owner_flags.contains_key(&output) {
+                return Err(format!("missing named forwarded owner slot {output}"));
+            }
+            continue;
+        }
         let owner = if let Some(name) = joined.get(&output) {
             let (slot, _) = state
                 .joined_return_bindings
