@@ -6,8 +6,8 @@ use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation},
     checker_flow::{
         check_integer_requirements, check_integer_requirements_at_entry, check_integer_return_bound, check_integer_return_bound_where,
-        check_integer_return_bound_with_shows, exact_integer_call_argument, proves_requirement_with_imported_root_local,
-        ExactIntegerArgument,
+        check_integer_return_bound_with_shows, exact_integer_call_argument, exact_integer_return_at_entry,
+        proves_requirement_with_imported_root_local, ActualCallResult, ExactIntegerArgument,
         CheckerPredicate, ImportedLocal, IntegerBranchProof,
         IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
@@ -213,7 +213,7 @@ fn walk_package_initialization(
         };
         let signature = topology.checked_call_signatures.get(call).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let argument = exact_integer_call_argument(structure, *call, |_, _| None);
-        actual.run(structure, *call, signature, argument, &declaration.source, declaration.range)?;
+        actual.run(structure, *call, signature, argument, &declaration.source, declaration.range, &ScalarType::Unit)?;
     }
     visits[ordinal] = InitializationVisit::Completed;
     Ok(())
@@ -234,7 +234,8 @@ impl ActualCalls<'_> {
         caller: &FunctionCallSites,
         call: OccurrenceOrdinal,
         argument: Option<ExactIntegerArgument<'_>>,
-    ) -> Result<(), ProjectCheck> {
+        expected: &ScalarType,
+    ) -> Result<ActualCallResult, ProjectCheck> {
         let site = caller.resolved_call_site(call).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let ResolvedCallTarget::ModuleCallable {
             source,
@@ -244,7 +245,7 @@ impl ActualCalls<'_> {
             return Err(ProjectCheck::Unsupported);
         };
         let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::MissingRootOccurrences)?;
-        self.run(&caller.structure, call, signature, argument, source, *declaration_span)
+        self.run(&caller.structure, call, signature, argument, source, *declaration_span, expected)
     }
 
     fn run(
@@ -255,7 +256,8 @@ impl ActualCalls<'_> {
         projected: Option<ExactIntegerArgument<'_>>,
         target_source: &SourceIdentity,
         target_span: ByteSpan,
-    ) -> Result<(), ProjectCheck> {
+        expected: &ScalarType,
+    ) -> Result<ActualCallResult, ProjectCheck> {
         let &(target_module, target_item) = structure.checker_direct_targets.get(&call)
             .ok_or(ProjectCheck::MissingRootOccurrences)?;
         let owner = self.project.modules.get(target_module).ok_or(ProjectCheck::MissingRoot)?;
@@ -265,7 +267,7 @@ impl ActualCalls<'_> {
         if &owner.source != target_source || function.name_span != target_span {
             return Err(ProjectCheck::MissingRoot);
         }
-        if !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit) {
+        if !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == expected) {
             return Err(ProjectCheck::Unsupported);
         }
         let body = self.calls.function_body(target_module, target_item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
@@ -285,25 +287,38 @@ impl ActualCalls<'_> {
         if !self.active.insert(target) {
             return Err(ProjectCheck::Unsupported);
         }
-        let mut nested_error = None;
-        let checked = check_integer_requirements_at_entry(body, exact, &mut |caller, occurrence, argument| {
-            match self.nested(caller, occurrence, argument) {
-                Ok(()) => true,
-                Err(error) => {
-                    nested_error = Some(error);
-                    false
+        let result = if *expected == ScalarType::Unit {
+            let mut nested_error = None;
+            let checked = check_integer_requirements_at_entry(body, exact, &mut |caller, occurrence, argument, expected| {
+                match self.nested(caller, occurrence, argument, expected) {
+                    Ok(result) => Some(result),
+                    Err(error) => {
+                        nested_error = Some(error);
+                        None
+                    }
                 }
+            });
+            match checked {
+                Some(Ok(())) => Ok(ActualCallResult::Unit),
+                Some(Err(failure)) => Err(project_failure(body, &owner.source, failure)),
+                None => Err(nested_error.unwrap_or(ProjectCheck::Unsupported)),
             }
-        });
+        } else if is_integer_type(expected)
+            && body.structure.checker_directives.is_empty()
+            && body.call_occurrences.is_empty()
+            && body.allocation_length_calls.is_empty()
+            && body.assignments.is_empty()
+        {
+            exact_integer_return_at_entry(body, expected, exact).map(ActualCallResult::Integer)
+                .ok_or(ProjectCheck::Unsupported)
+        } else {
+            Err(ProjectCheck::Unsupported)
+        };
         self.active.remove(&target);
-        match checked {
-            Some(Ok(())) => {
-                self.reached.insert(target);
-                Ok(())
-            }
-            Some(Err(failure)) => Err(project_failure(body, &owner.source, failure)),
-            None => Err(nested_error.unwrap_or(ProjectCheck::Unsupported)),
+        if result.is_ok() {
+            self.reached.insert(target);
         }
+        result
     }
 }
 
@@ -1699,6 +1714,37 @@ mod tests {
             let prepared = prepare_proof_target(&source, &chain(depth)).unwrap();
             assert_eq!(check_package_roots(&prepared), expected);
         }
+    }
+
+    #[test]
+    fn actual_scalar_call_and_proof_use_the_same_exact_return_observer() {
+        let file = source("src/main.w", "actual-return");
+        let prepare = |text_revision: &str, limit: u8, value: &str| {
+            let text = format!(r#"%%start
+                u8(u8) clamp = fn(value) {{ if (value > 10) {{ 10 }} else {{ value }} }};
+                proof bounded for clamp(x) -> (out) ensures (out <= 10) {{}}
+                unit() enter = fn {{
+                    u8 result = clamp({value});
+                    if (result == 0) {{}};
+                    core.require(result <= {limit}, {OUTPUT});
+                }};
+                enter();
+            %%end"#);
+            let identity = source("src/main.w", text_revision);
+            PreparedProofModule::prepare(identity, text, inputs()).unwrap()
+        };
+        let prepared = prepare(&file.revision, 7, "7");
+        assert!(matches!(prepared.check("bounded"), Ok((_, ProjectCheck::Proved))));
+        assert_eq!(check_package_roots(&prepared.prepared), Ok(()));
+        let failed = prepare("actual-return-fail", 6, "7");
+        let Err(ProjectCheck::Failed { source, state, .. }) = check_package_roots(&failed.prepared) else {
+            panic!("expected an authored downstream failure from actual returned value");
+        };
+        assert_eq!(source, failed.source);
+        assert!(state.includes(&[7]));
+        assert!(!state.includes(&[10]));
+        let unsupported = prepare("actual-return-unsupported", 10, "3 + 4");
+        assert_eq!(check_package_roots(&unsupported.prepared), Err(ProjectCheck::Unsupported));
     }
 
     #[test]

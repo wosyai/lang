@@ -389,8 +389,33 @@ pub(super) fn exact_integer_call_argument<'a>(
     Some((ty, value))
 }
 
+pub(super) enum ActualCallResult {
+    Unit,
+    Integer(BigInt),
+}
+
+fn actual_nested_argument<'a>(
+    calls: &'a FunctionCallSites,
+    expression: OccurrenceOrdinal,
+    roots: &IntegerRoots<'_>,
+    path: &'a IntegerInputs,
+) -> Option<ExactIntegerArgument<'a>> {
+    exact_integer_call_argument(&calls.structure, expression, |ordinal, ty| {
+        let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(ordinal)? else {
+            return None;
+        };
+        let (axis, binding_type) = roots.lookup(binding)?;
+        if binding_type != ty {
+            return None;
+        }
+        path.singleton_at(axis)
+    })
+}
+
 type ActualCallHandler<'a, 'handler> =
-    dyn FnMut(&'a FunctionCallSites, OccurrenceOrdinal, Option<ExactIntegerArgument<'_>>) -> bool + 'handler;
+    dyn FnMut(
+        &'a FunctionCallSites, OccurrenceOrdinal, Option<ExactIntegerArgument<'_>>, &ScalarType,
+    ) -> Option<ActualCallResult> + 'handler;
 
 pub(super) fn check_integer_requirements_at_entry<'a>(
     calls: &'a FunctionCallSites,
@@ -418,7 +443,7 @@ pub(super) fn proves_requirement_with_imported_root_local(
 pub(super) fn observe_integer_returns(
     calls: &FunctionCallSites,
 ) -> Option<Result<Vec<IntegerReturningPath<'_>>, IntegerCheckFailure<'_>>> {
-    match observe_integer_returns_in_scope(calls, None)? {
+    match observe_integer_returns_in_scope(calls, None, None)? {
         Ok(ProofCoverage::Applicable(paths)) => Some(Ok(paths)),
         Ok(ProofCoverage::NoApplicableInputs) => None,
         Err(failure) => Some(Err(failure)),
@@ -428,10 +453,11 @@ pub(super) fn observe_integer_returns(
 fn observe_integer_returns_in_scope<'a>(
     calls: &'a FunctionCallSites,
     entry_filter: Option<&CheckerPredicate>,
+    exact_arguments: Option<&[&BigInt]>,
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
     let tail = integer_tail_type(calls)?;
     let mut paths = Vec::new();
-    match run_integer_callable(calls, Some(tail), entry_filter, Some(&mut paths), None, None, None)? {
+    match run_integer_callable(calls, Some(tail), entry_filter, Some(&mut paths), None, exact_arguments, None)? {
         Ok(ProofCoverage::Applicable(())) if !paths.is_empty() => {
             Some(Ok(ProofCoverage::Applicable(paths)))
         }
@@ -439,6 +465,31 @@ fn observe_integer_returns_in_scope<'a>(
         Ok(ProofCoverage::NoApplicableInputs) => Some(Ok(ProofCoverage::NoApplicableInputs)),
         Err(failure) => Some(Err(failure)),
     }
+}
+
+pub(super) fn exact_integer_return_at_entry(
+    calls: &FunctionCallSites,
+    expected: &ScalarType,
+    arguments: &[&BigInt],
+) -> Option<BigInt> {
+    if integer_tail_type(calls)? != expected {
+        return None;
+    }
+    let ProofCoverage::Applicable(paths) = observe_integer_returns_in_scope(calls, None, Some(arguments))?.ok()? else {
+        return None;
+    };
+    fn singleton<'a>(path: &'a IntegerReturningPath<'_>) -> Option<&'a BigInt> {
+        match &path.value {
+            IntegerReturn::Const(value) => Some(value),
+            IntegerReturn::Alias(binding) => {
+                let axis = path.axes.iter().position(|id| *id == *binding)?;
+                path.state.singleton_at(axis)
+            }
+        }
+    }
+    let (first, rest) = paths.split_first()?;
+    let value = singleton(first)?;
+    rest.iter().all(|path| singleton(path) == Some(value)).then(|| value.clone())
 }
 
 pub(super) fn check_integer_return_bound<'a>(
@@ -480,7 +531,7 @@ fn check_integer_return_bound_in_scope<'a>(
     proof: Option<&IntegerBranchProof<'_>>,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let relation = IntegerRelation::from_operator(operator)?;
-    let paths = match observe_integer_returns_in_scope(calls, entry_filter)? {
+    let paths = match observe_integer_returns_in_scope(calls, entry_filter, None)? {
         Ok(ProofCoverage::Applicable(paths)) => paths,
         Ok(ProofCoverage::NoApplicableInputs) => return Some(Ok(ProofCoverage::NoApplicableInputs)),
         Err(failure) => return Some(Err(failure)),
@@ -596,19 +647,10 @@ fn walk_integer_block<'a>(
                     }
                 } else if structure.checker_direct_targets.contains_key(&expression) {
                     let handle = handle_call.as_mut()?;
-                    let argument = exact_integer_call_argument(structure, expression, |ordinal, ty| {
-                        let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(ordinal)? else {
-                            return None;
-                        };
-                        let (axis, binding_type) = roots.lookup(binding)?;
-                        if binding_type != ty {
-                            return None;
-                        }
-                        path.singleton_at(axis)
-                    });
-                    if !handle(calls, expression, argument) {
+                    let argument = actual_nested_argument(calls, expression, roots, &path);
+                    let ActualCallResult::Unit = handle(calls, expression, argument, &ScalarType::Unit)? else {
                         return None;
-                    }
+                    };
                 } else {
                     let ConditionalRegion::Unit { condition, then_block, .. } =
                         calls.conditionals.get(&expression)?
@@ -714,6 +756,19 @@ fn walk_integer_block<'a>(
                     }
                     roots.add(&origin.binding, &receiver.ty);
                     path.append_local(local.values);
+                    continue;
+                }
+                if let Some(origin) = structure.checker_integer_call_locals.get(&(block, item.position)) {
+                    let handle = handle_call.as_mut()?;
+                    let [receiver] = binding.receivers() else {
+                        return None;
+                    };
+                    let argument = actual_nested_argument(calls, origin.call, roots, &path);
+                    let ActualCallResult::Integer(value) = handle(calls, origin.call, argument, &receiver.ty)? else {
+                        return None;
+                    };
+                    roots.add(&origin.binding, &receiver.ty);
+                    path.append_local(IntegerSet::singleton(&value));
                     continue;
                 }
                 let (identity, ty, value) = integer_local(calls, binding, block, item.position)?;
