@@ -8998,3 +8998,119 @@ u8(bool) update = fn(choose) {
         }), "{:?}", denied.diagnostics());
     }
 }
+
+#[test]
+fn emits_known_disjoint_checked_field_writes_through_the_ordinary_driver() {
+    use inkwell::values::{BasicValue, BasicValueEnum, InstructionOpcode, InstructionValue};
+
+    fn operand<'ctx>(instruction: InstructionValue<'ctx>, index: u32) -> Option<BasicValueEnum<'ctx>> {
+        instruction.get_operand(index).and_then(|operand| operand.value())
+    }
+
+    fn sole_stored_value<'ctx>(
+        instructions: &[InstructionValue<'ctx>], slot: BasicValueEnum<'ctx>,
+    ) -> Option<BasicValueEnum<'ctx>> {
+        let mut stores = instructions.iter().copied().filter(|instruction| {
+            instruction.get_opcode() == InstructionOpcode::Store && operand(*instruction, 1) == Some(slot)
+        });
+        let store = stores.next()?;
+        if stores.next().is_some() { return None; }
+        operand(store, 0)
+    }
+
+    fn field_path<'ctx>(
+        instructions: &[InstructionValue<'ctx>], address: BasicValueEnum<'ctx>,
+    ) -> Option<(BasicValueEnum<'ctx>, u64)> {
+        let dereference = address.as_instruction_value()?;
+        if dereference.get_opcode() != InstructionOpcode::IntToPtr { return None; }
+        let handle_load = operand(dereference, 0)?.as_instruction_value()?;
+        if handle_load.get_opcode() != InstructionOpcode::Load { return None; }
+        let handle = sole_stored_value(instructions, operand(handle_load, 0)?)?.as_instruction_value()?;
+        if handle.get_opcode() != InstructionOpcode::PtrToInt { return None; }
+        let field = operand(handle, 0)?.as_instruction_value()?;
+        if field.get_opcode() != InstructionOpcode::GetElementPtr { return None; }
+        let BasicValueEnum::IntValue(offset) = operand(field, 1)? else { return None };
+        Some((operand(field, 0)?, offset.get_zero_extended_constant()?))
+    }
+
+    fn constant_byte(value: BasicValueEnum<'_>) -> Option<u64> {
+        let BasicValueEnum::IntValue(value) = value else { return None };
+        if value.get_type().get_bit_width() != 8 { return None; }
+        value.get_zero_extended_constant()
+    }
+
+    let source = r#"%%start
+struct copy Pair { u8 left; u8 right; }
+u8(Pair) update = fn(owner) {
+    *!u8 left = &!owner.left;
+    *!u8 right = &!owner.right;
+    *left = 8;
+    *right = 9;
+    *left + *right
+};
+%%end"#;
+    let invalid = source.replace("*left = 8;", "owner = { .left = 3; .right = 4; }; *left = 8;");
+    let borrow = invalid.find("&!owner.left").unwrap() as u32;
+    let write = invalid.find("owner =").unwrap() as u32;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for partition in [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ] {
+            let ir = partition.expect("known checked fields LLVM").to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+                ir.as_bytes(), "known-checked-disjoint-fields",
+            );
+            let module = context.create_module_from_ir(buffer).expect("parse known checked fields LLVM");
+            module.verify().expect("verify checked field LLVM");
+            let routine = module.get_functions().find(|routine| {
+                matches!(routine.get_type().get_return_type(), Some(inkwell::types::BasicTypeEnum::IntType(ty))
+                    if ty.get_bit_width() == 8)
+            }).expect("checked callable");
+            let instructions = routine.get_basic_blocks().iter().flat_map(|block| {
+                std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction())
+            }).collect::<Vec<_>>();
+            let mut writes = instructions.iter().copied().filter_map(|instruction| {
+                if instruction.get_opcode() != InstructionOpcode::Store { return None; }
+                let path = field_path(&instructions, operand(instruction, 1)?)?;
+                let value = operand(instruction, 0)?;
+                let literal = constant_byte(value).or_else(|| {
+                    let reload = value.as_instruction_value()?;
+                    if reload.get_opcode() != InstructionOpcode::Load { return None; }
+                    constant_byte(sole_stored_value(&instructions, operand(reload, 0)?)?)
+                })?;
+                Some((path, literal))
+            }).collect::<Vec<_>>();
+            writes.sort_by_key(|((_, offset), _)| *offset);
+            let [(left @ (_, 0), 8), (right @ (_, 1), 9)] = writes.as_slice() else {
+                panic!("two actual writes to distinct checked field offsets: {ir}");
+            };
+            assert_eq!(left.0, right.0, "both fields belong to the same owner");
+            let result = instructions.iter().copied().find(|instruction| {
+                instruction.get_opcode() == InstructionOpcode::Return
+            }).expect("field result");
+            let result = operand(result, 0).and_then(|value| value.as_instruction_value()).expect("computed field sum");
+            assert_eq!(result.get_opcode(), InstructionOpcode::Add);
+            let mut reads = [0, 1].map(|index| {
+                let read = operand(result, index).and_then(|value| value.as_instruction_value())
+                    .expect("add consumes the checked field read");
+                assert_eq!(read.get_opcode(), InstructionOpcode::Load);
+                field_path(&instructions, operand(read, 0).expect("read address"))
+                    .expect("read resolves to an actual checked field path")
+            });
+            reads.sort_by_key(|(_, offset)| *offset);
+            assert_eq!(reads, [*left, *right], "the returned add reads the same fields that were written");
+        }
+        let prepared = prepare_initializer_test(&invalid, layout);
+        let denied = analyze_scalar_build(&prepared);
+        assert!(denied.diagnostics().iter().any(|diagnostic| {
+            diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == write)
+                && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == borrow)
+        }), "{:?}", denied.diagnostics());
+    }
+}
