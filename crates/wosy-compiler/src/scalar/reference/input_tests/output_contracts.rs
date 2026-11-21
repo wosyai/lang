@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn standalone_detached_convergence_propagates_checked_returns_without_integral_copies() {
-    let text = "%%start\n*u8(*u8) forward = fn(input) { input };\n*u8(*u8) relay = fn(input) { forward(input) };\n%%end";
+    let text = "%%start\n*u8(*u8) forward = fn(input) { input };\n*u8(*u8) relay = fn(input) { forward(input) };\n*u8(*u8) third = fn(input) { relay(input) };\n%%end";
     for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
         let parsed = parse_source(source(), text.into(), &[]);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -114,5 +114,57 @@ fn standalone_detached_failure_installs_exact_partial_cfg_and_ownership_error() 
         };
         assert!(!function.reference_cfg.points.is_empty());
         assert!(!function.reference_cfg.initial_points.is_empty());
+    }
+}
+
+#[test]
+fn independent_contract_replay_retains_first_cfg_and_ordered_errors_without_replay() {
+    let text = "%%start\nstruct Payload { u8 value; }\nPayload(Payload) left = fn(value) { next = value; next; next };\nPayload(Payload) right = fn(value) { next = value; next; next };\n%%end";
+    for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let typed = typecheck_scalar_program(declarations, target);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let calls = resolve_program_call_sites(&program).unwrap();
+        let (mut updates, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut replays = Vec::new();
+        let mut concrete = Vec::new();
+        for initial in [true, false] {
+            let mut cursor = 0;
+            for (_, result) in &mut updates {
+                collect_concrete_output_contracts(
+                    result, &[], &mut concrete, &mut replays, &mut cursor,
+                );
+            }
+            assert!(concrete.is_empty());
+            let before = updates.iter().map(|(_, result)| result.cfg.points.as_ptr()).collect::<Vec<_>>();
+            let before_errors = replays.iter().map(|replay| replay.errors.as_ptr()).collect::<Vec<_>>();
+            let mut order = replays.iter_mut();
+            for (_, result) in &mut updates {
+                transfer_function_output_contracts(result, &concrete, &mut order, initial);
+            }
+            assert_eq!(replays.len(), 2);
+            assert!(replays.iter().all(|replay| !replay.depends_on_module_calls && replay.errors.len() == 1));
+            if !initial {
+                for ((_, result), pointer) in updates.iter().zip(before) {
+                    assert_eq!(result.cfg.points.as_ptr(), pointer);
+                }
+                for (replay, pointer) in replays.iter().zip(before_errors) {
+                    assert_eq!(replay.errors.as_ptr(), pointer);
+                }
+            }
+        }
+        let starts = replays.into_iter().flat_map(|replay| replay.errors).map(|error| {
+            let ReferenceAnalysisError::ConflictingPlace { source_span, .. } = error else {
+                panic!("expected unavailable place")
+            };
+            source_span.range.start
+        }).collect::<Vec<_>>();
+        assert!(starts[0] < starts[1], "{starts:?}");
     }
 }

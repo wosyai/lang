@@ -8076,15 +8076,31 @@ struct ConcreteReferenceOutputContract {
     origins: Vec<ReferenceOrigin>,
 }
 
+#[derive(Default)]
+struct ReferenceContractReplay {
+    depends_on_module_calls: bool,
+    errors: Vec<ReferenceAnalysisError>,
+}
+
 fn collect_concrete_output_contracts(
     result: &mut FunctionReferenceResult,
     templates: &[ReferenceOutputContract],
     concrete: &mut Vec<ConcreteReferenceOutputContract>,
+    replays: &mut Vec<ReferenceContractReplay>,
+    cursor: &mut usize,
 ) {
     result.aggregate.checked_successor_contract = false;
     for arm in &mut result.arms {
-        collect_concrete_output_contracts(arm, templates, concrete);
+        collect_concrete_output_contracts(arm, templates, concrete, replays, cursor);
     }
+    let index = *cursor;
+    *cursor += 1;
+    if index == replays.len() {
+        replays.push(ReferenceContractReplay::default());
+    } else if !replays[index].depends_on_module_calls {
+        return;
+    }
+    let replay = &mut replays[index];
     for point in &result.cfg.initial_points {
         let CfgPointKind::Call {
             expression: ScalarExpression::Call { type_arguments, .. },
@@ -8100,6 +8116,7 @@ fn collect_concrete_output_contracts(
         else {
             continue;
         };
+        replay.depends_on_module_calls = true;
         let body = match selection {
             ConcreteCallSelection::Declaration => ReferenceCallableBody::Declaration,
             ConcreteCallSelection::Overload(arm) => ReferenceCallableBody::Overload(arm.arm_index),
@@ -8202,12 +8219,14 @@ fn collect_function_output_contracts(
 fn transfer_function_output_contracts(
     result: &mut FunctionReferenceResult,
     contracts: &[ConcreteReferenceOutputContract],
-) -> Vec<ReferenceAnalysisError> {
-    let mut errors = Vec::new();
+    replays: &mut std::slice::IterMut<'_, ReferenceContractReplay>,
+    initial_round: bool,
+) {
     for arm in &mut result.arms {
-        errors.extend(transfer_function_output_contracts(arm, contracts));
+        transfer_function_output_contracts(arm, contracts, replays, initial_round);
     }
-    if !result.cfg.initial_points.is_empty() {
+    let replay = replays.next().expect("reference contract replay for body");
+    if !result.cfg.initial_points.is_empty() && (initial_round || replay.depends_on_module_calls) {
         result.cfg.points = result.cfg.initial_points.clone();
         let candidate = match &result.proof_points.scalar_descriptor_install {
             ScalarDescriptorCandidates::One(destination, marker) => Some((destination, marker)),
@@ -8229,9 +8248,8 @@ fn transfer_function_output_contracts(
         result.aggregate.scalar_descriptor_assignment = descriptor
             .filter(|proof| transferred.is_empty() && proof.exited && !proof.invalid)
             .and_then(|proof| candidate.map(|(destination, _)| (destination.0, proof.candidate.call.0, proof.candidate.output)));
-        errors.extend(transferred);
+        replay.errors = transferred;
     }
-    errors
 }
 
 fn resolve_reference_output_contracts(
@@ -8240,17 +8258,24 @@ fn resolve_reference_output_contracts(
     #[cfg(test)]
     stage_observations::record_output_contracts();
     let mut contracts = Vec::new();
+    let mut replays = Vec::new();
     loop {
+        let initial_round = replays.is_empty();
         let mut concrete = Vec::new();
+        let mut cursor = 0;
         for module in modules.iter_mut() {
             for (_, result) in module.results.iter_mut() {
-                collect_concrete_output_contracts(result, &contracts, &mut concrete);
+                collect_concrete_output_contracts(
+                    result, &contracts, &mut concrete, &mut replays, &mut cursor,
+                );
             }
         }
-        let mut errors = Vec::new();
+        let mut replay_order = replays.iter_mut();
         for module in modules.iter_mut() {
             for (_, result) in module.results.iter_mut() {
-                errors.extend(transfer_function_output_contracts(result, &concrete));
+                transfer_function_output_contracts(
+                    result, &concrete, &mut replay_order, initial_round,
+                );
             }
         }
         let mut next = Vec::new();
@@ -8270,7 +8295,7 @@ fn resolve_reference_output_contracts(
             }
         }
         if next == contracts {
-            return errors;
+            return replays.into_iter().flat_map(|replay| replay.errors).collect();
         }
         contracts = next;
     }
