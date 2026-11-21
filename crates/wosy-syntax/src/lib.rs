@@ -413,7 +413,9 @@ fn build_pair(
         );
         return;
     }
-    if is_elided_operator_tier(&pair) {
+    if matches!(pair.as_rule(), Rule::conditional_head | Rule::conditional_else)
+        || is_elided_operator_tier(&pair)
+    {
         let span = pair.as_span();
         let mut inner = pair.into_inner();
         let Some(first) = inner.next() else {
@@ -433,7 +435,19 @@ fn build_pair(
         add_gap(builder, &text[cursor..span.end()], cursor, comments);
         return;
     }
-    let kind = kind(pair.as_rule());
+    let kind = if pair.as_rule() == Rule::conditional_expr {
+        if pair
+            .clone()
+            .into_inner()
+            .any(|child| child.as_rule() == Rule::conditional_else)
+        {
+            SyntaxKind::IfExpr
+        } else {
+            SyntaxKind::UnitIfExpr
+        }
+    } else {
+        kind(pair.as_rule())
+    };
     let mut inner = pair.into_inner();
     let Some(first) = inner.next() else {
         builder.token(WosyLanguage::kind_to_raw(kind), span.as_str());
@@ -640,8 +654,6 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::generic_type_argument => SyntaxKind::GenericTypeArgument,
         Rule::qualified_member => SyntaxKind::QualifiedMember,
         Rule::assignment_target => SyntaxKind::AssignmentTarget,
-        Rule::if_expr => SyntaxKind::IfExpr,
-        Rule::unit_if_expr => SyntaxKind::UnitIfExpr,
         Rule::unsafe_expr => SyntaxKind::Unsafe,
         Rule::assignment => SyntaxKind::Assignment,
         Rule::top_level_item => SyntaxKind::TopLevelItem,
@@ -1508,6 +1520,68 @@ mod tests {
             .expect("unit if expression");
         assert_eq!(conditional.text(), "if (true) {\n\t\tprint();\n\t}");
         assert_eq!(byte_span(&conditional), ByteSpan::new(28, 53));
+    }
+
+    #[test]
+    fn nested_unit_conditionals_preserve_ordinary_named_calls() {
+        let depth = 20;
+        let mut body = "if(1);".to_owned();
+        for _ in 0..depth {
+            body = format!("if (true) {{ {body} }}\nwhile(2);");
+        }
+        let text = format!("%%start\nunit() main = fn {{\n{body}\n}};\n%%end");
+        let result = parse(identity(), text.clone(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(
+            result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::UnitIfExpr)
+                .count(),
+            depth
+        );
+        let calls = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::Call)
+            .map(|node| node.text().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(calls.first().map(String::as_str), Some("if(1)"));
+        assert_eq!(calls.len(), depth + 1);
+        assert!(calls[1..].iter().all(|call| call == "while(2)"));
+    }
+
+    #[test]
+    fn conditional_else_keeps_trivia_and_failed_else_recovers() {
+        let text = "%%start\nunit() f = fn {\nif (true) {} # note: before else\nelse {};\nif (true) {} # note: before next\nif(1);\n};\n%%end";
+        let result = parse(identity(), text.into(), &["note".to_owned()]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let conditionals = result
+            .root
+            .descendants()
+            .filter(|node| matches!(node.kind(), SyntaxKind::IfExpr | SyntaxKind::UnitIfExpr))
+            .map(|node| (node.kind(), node.text().to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            conditionals,
+            vec![
+                (
+                    SyntaxKind::IfExpr,
+                    "if (true) {} # note: before else\nelse {}".to_owned()
+                ),
+                (SyntaxKind::UnitIfExpr, "if (true) {}".to_owned())
+            ]
+        );
+
+        let invalid = "%%start\nbroken = if (true) { 0 } else ;\nu8 kept = 1;\n%%end";
+        let recovered = parse(identity(), invalid.into(), &[]);
+        assert!(!recovered.is_valid());
+        assert_eq!(recovered.reconstruct(), invalid);
+        assert!(recovered.root.descendants().any(|node| {
+            node.kind() == SyntaxKind::BindingDecl && node.text().to_string().contains("kept")
+        }));
     }
 
     #[test]

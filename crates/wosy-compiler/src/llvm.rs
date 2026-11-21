@@ -1090,30 +1090,47 @@ pub fn emit_scalar_llvm_text(validation: &ScalarValidation) -> Result<String, St
 
 impl LlvmPartition {
     pub fn to_text(&self) -> String {
-        let mut text = self.text.clone();
         if !self.declarations.is_empty() {
-            let module_directives = text.lines().take(2).collect::<Vec<_>>().join("\n");
-            let body = text
-                .lines()
-                .skip(2)
-                .filter(|line| {
-                    !self.declarations.iter().any(|declaration| {
-                        line.starts_with("declare ")
-                            && line.contains(&format!("@{}(", declaration.name))
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let module_directives = self.text.lines().take(2).collect::<Vec<_>>().join("\n");
+            let mut declarations = self
+                .declarations
+                .iter()
+                .map(|declaration| (declaration.name.as_str(), None))
+                .collect::<HashMap<_, _>>();
+            let simple_names = declarations.keys().all(|name| !name.contains('('));
+            let mut body = Vec::new();
+            for (index, line) in self.text.lines().enumerate() {
+                let mut matched = false;
+                if let Some((_, after_at)) = line
+                    .strip_prefix("declare ")
+                    .and_then(|declaration| declaration.split_once('@'))
+                {
+                    if simple_names && !after_at.contains('@') {
+                        if let Some(first) = after_at
+                            .split_once('(')
+                            .and_then(|(name, _)| declarations.get_mut(name))
+                        {
+                            first.get_or_insert(line);
+                            matched = true;
+                        }
+                    } else {
+                        for (&name, first) in &mut declarations {
+                            if line.contains(&format!("@{name}(")) {
+                                first.get_or_insert(line);
+                                matched = true;
+                            }
+                        }
+                    }
+                }
+                if index >= 2 && !matched {
+                    body.push(line);
+                }
+            }
             let mut serialized = String::new();
             serialized.push_str(&module_directives);
             serialized.push_str("\n\n");
             for declaration in &self.declarations {
-                let line = text
-                    .lines()
-                    .find(|line| {
-                        line.starts_with("declare ")
-                            && line.contains(&format!("@{}(", declaration.name))
-                    })
+                let line = declarations[declaration.name.as_str()]
                     .expect("LLVM extern declaration is present in module text");
                 serialized.push_str(line);
                 write!(serialized, " #{}", declaration.attributes[0].group,)
@@ -1131,11 +1148,16 @@ impl LlvmPartition {
                 )
                 .expect("writing to a String cannot fail");
             }
-            serialized.push_str(&body);
-            text = serialized;
+            for (index, line) in body.into_iter().enumerate() {
+                if index != 0 {
+                    serialized.push('\n');
+                }
+                serialized.push_str(line);
+            }
+            serialized
         } else {
-            let has_trailing_newline = text.ends_with('\n');
-            let mut lines = text.lines().collect::<Vec<_>>();
+            let has_trailing_newline = self.text.ends_with('\n');
+            let mut lines = self.text.lines().collect::<Vec<_>>();
             if let Some(index) = lines
                 .iter()
                 .position(|line| line.starts_with("source_filename"))
@@ -1144,12 +1166,12 @@ impl LlvmPartition {
                     lines.remove(index + 2);
                 }
             }
-            text = lines.join("\n");
+            let mut text = lines.join("\n");
             if has_trailing_newline {
                 text.push('\n');
             }
+            text
         }
-        text
     }
 }
 
