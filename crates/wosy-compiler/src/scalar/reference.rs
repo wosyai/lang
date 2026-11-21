@@ -1981,8 +1981,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     .find_map(|site| {
                                         let holder = site.holder?;
                                         let point = &self.cfg.points[holder.0];
-                                        (holder < read && point.scope == scope
-                                            && self.cfg.points[site.point.0].scope == scope
+                                        (holder < read
                                             && matches!(&point.kind, CfgPointKind::Bind { binding: child } if *child == binding))
                                             .then_some((site.point, holder))
                                     }));
@@ -5023,10 +5022,13 @@ fn transfer_reference_facts(
             };
             let read = &original_points[site.read.0];
             let declaration = &original_points[holder.0];
+            let borrow = &original_points[site.point.0];
             let CfgPointKind::Bind { binding } = &declaration.kind else { return None };
             if producer >= holder || holder >= site.read
                 || read.successors.as_slice() != [site.point]
-                || declaration.scope != read.scope || read.scope != original_points[site.point.0].scope
+                || read.scope != borrow.scope
+                || binding.block_span.start > borrow.source_span.range.start
+                || binding.block_span.end < borrow.source_span.range.end
                 || !matches!(&read.kind, CfgPointKind::Read { binding: read_binding } if read_binding == binding)
                 || child_holders.get(binding).copied() != Some(producer)
             {
@@ -5036,7 +5038,7 @@ fn transfer_reference_facts(
             let CfgPointKind::Borrow { loan, .. } = &source.kind else { return None };
             let origins = source.possible_origins.as_ref()?;
             let origin = *origins.first().filter(|_| origins.len() == 1)?;
-            if source.scope != read.scope || loan.parent.as_deref() != Some(root_loan)
+            if source.scope != declaration.scope || loan.parent.as_deref() != Some(root_loan)
                 || loan.mode != ScalarReferenceMutability::Mutable
                 || !is_deferred_reborrow_child(root, cfg.facts.get(origin.0)?, loan)
             {
@@ -5058,7 +5060,7 @@ fn transfer_reference_facts(
                         local_definition.is_some()
                             && *borrow < pending.entry
                             && initializer.scope == original_points[pending.entry.0].scope
-                            && initializer.scope == point.scope
+                            && (site.parent.is_some() || initializer.scope == point.scope)
                             && matches!(&initializer.kind, CfgPointKind::Borrow { place, loan }
                                 if place.binding == *owner && loan.parent.is_none())
                             && initializer.possible_origins.as_ref()
