@@ -123,6 +123,7 @@ pub(super) enum ReadCall {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ReadSource {
     Owner(usize),
+    Carrier(usize),
     Formal(usize),
 }
 
@@ -279,6 +280,7 @@ impl AggregateEdgeState {
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
     pub(super) checked_backing_assignment: Option<(usize, usize, CfgPointId)>,
+    pub(super) passive_descriptor_read: Option<Box<PassiveDescriptorRead>>,
     pub(super) checked_producer_blocks: BTreeMap<CfgPointId, usize>,
     pub(super) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
     pub(super) checked_producer_backing: BTreeMap<CfgPointId, CheckedProducerBacking>,
@@ -311,6 +313,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) checked_successor_result: bool,
     raw_invalid: Option<CfgPointId>,
     pub(super) read_formals: BTreeSet<usize>,
+    pub(super) read_formal_fields: BTreeMap<usize, ScalarStructFieldId>,
     read_invalid: BTreeMap<ReadSource, CfgPointId>,
     read_loads: BTreeSet<ReadSource>,
     read_active: BTreeSet<ReadSource>,
@@ -925,7 +928,7 @@ impl AggregateFlowFacts {
                         if let Some(source) = value.and_then(|value| value.read_source()) {
                             let live = match source {
                                 ReadSource::Formal(_) => true,
-                                ReadSource::Owner(owner) => !state.moved.contains(&OwnerSource::Formal(owner))
+                                ReadSource::Owner(owner) | ReadSource::Carrier(owner) => !state.moved.contains(&OwnerSource::Formal(owner))
                                     && self.formals.get(&owner).and_then(|binding| state.bindings.get(binding))
                                         .is_some_and(|(value, _, _)| matches!(value, Some(Value::Aggregate {
                                             backing: OwnerSource::Formal(actual), field: None
@@ -1225,6 +1228,7 @@ fn prove_read_views(
     if proven.contains(&root) {
         return Ok(());
     }
+    let check_effects = matches!(root.1, ReadSource::Carrier(_));
     let mut pending = vec![root];
     let mut seen = BTreeSet::new();
     let mut previous = BTreeMap::<_, Vec<_>>::new();
@@ -1243,18 +1247,61 @@ fn prove_read_views(
         let supported_outputs = outputs.iter().all(|output| ordinary_value(&output.ty) || output.ty == ScalarType::Unit)
             || (checked_scalar_output(outputs)
                 && (facts.independent_checked_result || facts.raw_read_forward_result));
-        if matches!(source, ReadSource::Formal(slot) if !facts.read_formals.contains(&slot) || !supported_outputs)
-            || !body.is_monomorphic
-        {
+        let observations = match source {
+            ReadSource::Formal(slot) if facts.read_formals.contains(&slot) && supported_outputs => source,
+            ReadSource::Owner(_) => source,
+            ReadSource::Carrier(slot) if supported_outputs
+                && facts.read_formal_fields.contains_key(&slot)
+                && !facts.formal_unsupported.contains(&slot) => ReadSource::Owner(slot),
+            _ => return Err(format!("unproved ordinary raw read formal {source:?} at {key:?} in {:?}", body.source)),
+        };
+        if !body.is_monomorphic {
             return Err(format!("unproved ordinary raw read formal {source:?} at {key:?} in {:?}", body.source));
         }
-        if let Some(point) = facts.read_invalid.get(&source) {
+        if let Some(point) = facts.read_invalid.get(&observations) {
             return Err(format!("unproved ordinary raw read use at {point:?} for {source:?} in {:?}", body.source));
         }
-        if facts.read_loads.contains(&source) {
+        if facts.read_loads.contains(&observations) {
             loads.push(node);
         }
-        if let Some(edges) = facts.read_edges.get(&source) {
+        let raw_edges = facts.read_edges.get(&observations);
+        let carrier_edge = match (source, facts.formal_forward) {
+            (ReadSource::Carrier(source_slot), Some((formal, point, _, destination_slot)))
+                if formal == source_slot => Some((point, destination_slot)),
+            _ => None,
+        };
+        if check_effects && (!body.cfg.allocations.is_empty()
+            || !body.sites.allocation_length_call_targets.is_empty()
+            || body.cfg.points.iter().any(|call| {
+                if matches!(&call.kind, CfgPointKind::Release { .. } | CfgPointKind::Invalidate { .. }
+                    | CfgPointKind::AssignThrough { .. })
+                {
+                    return true;
+                }
+                let CfgPointKind::Call { output: 0, target, .. } = &call.kind else { return false };
+                match target {
+                    ResolvedCallTarget::Core(operation) => !matches!(operation,
+                        CoreOperationId::Load | CoreOperationId::Offset | CoreOperationId::IntTrunc
+                        | CoreOperationId::IntExtend | CoreOperationId::UintToFloat
+                        | CoreOperationId::SintToFloat | CoreOperationId::FloatToSintTrunc
+                        | CoreOperationId::FloatToUintTrunc | CoreOperationId::FloatTrunc
+                        | CoreOperationId::FloatExtend | CoreOperationId::Bitcast),
+                    ResolvedCallTarget::ModuleCallable { .. } => {
+                        !carrier_edge.is_some_and(|(point, _)| point == call.id)
+                            && !raw_edges.is_some_and(|edges| edges.range((call.id, 0)..=(call.id, usize::MAX)).next().is_some())
+                            && !target_body(declarations, body.cfg, call.id)
+                                .and_then(|target| bodies.get(&target))
+                                .is_some_and(|callee| callee.is_monomorphic
+                                    && callee.cfg.allocations.is_empty()
+                                    && callee.sites.allocation_length_call_targets.is_empty()
+                                    && callee.facts.is_some_and(|facts| facts.returning_leaf))
+                    }
+                    _ => true,
+                }
+            })) {
+            return Err(format!("unproved effect in passive reader {source:?} at {key:?} in {:?}", body.source));
+        }
+        if let Some(edges) = raw_edges {
             for &(point, slot) in edges {
                 let target = target_body(declarations, body.cfg, point)
                     .ok_or_else(|| format!("unbound ordinary raw read call at {point:?} in {:?}", body.source))?;
@@ -1262,6 +1309,19 @@ fn prove_read_views(
                 previous.entry(next).or_default().push(node);
                 pending.push(next);
             }
+        }
+        if let (ReadSource::Carrier(source_slot), Some((point, destination_slot))) = (source, carrier_edge) {
+            let target = target_body(declarations, body.cfg, point)
+                .and_then(|target| bodies.get(&target).map(|callee| (target, callee)))
+                .filter(|(_, callee)| callee.is_monomorphic && callee.facts.is_some_and(|callee_facts| {
+                    callee_facts.read_formal_fields.get(&destination_slot)
+                        == facts.read_formal_fields.get(&source_slot)
+                }))
+                .map(|(target, _)| target)
+                .ok_or_else(|| format!("unproved exact carrier forwarding at {point:?} in {:?}", body.source))?;
+            let next = (target, ReadSource::Carrier(destination_slot));
+            previous.entry(next).or_default().push(node);
+            pending.push(next);
         }
     }
     let mut closed = BTreeSet::new();
@@ -1526,7 +1586,7 @@ fn closed_checked_backing_consumer<'a>(
             let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete } = &site.target else { continue };
             if !same_declaration(source, *declaration_span) { continue }
             if consumer.is_some() || !monomorphic || key == producer || arm.is_some()
-                || sites.call_occurrences.len() != 1 || !sites.allocation_length_call_targets.is_empty()
+                || !sites.allocation_length_call_targets.is_empty()
                 || !matches!(concrete, ConcreteCallSelection::Declaration)
             {
                 return Ok(None);
@@ -1537,6 +1597,17 @@ fn closed_checked_backing_consumer<'a>(
             };
             if callee != call.ordinal.0 || target_body(declarations, body.cfg, point) != Some(producer) {
                 return Ok(None);
+            }
+            if sites.call_occurrences.len() != 1 {
+                let Some(passive) = body.facts.and_then(|facts| facts.passive_descriptor_read.as_ref()) else { return Ok(None) };
+                let Some(reader) = target_body(declarations, body.cfg, passive.call) else { return Ok(None) };
+                if !bodies.get(&reader).and_then(|body| body.facts)
+                    .and_then(|facts| facts.read_formal_fields.get(&0))
+                    .is_some_and(|field| field == &passive.field)
+                    || prove_read_views((reader, ReadSource::Carrier(0)), bodies, declarations, &mut BTreeSet::new()).is_err()
+                {
+                    return Ok(None);
+                }
             }
             consumer = Some((key, (destination, callee)));
         }
@@ -2344,6 +2415,75 @@ leaf = overload {
                     None => result.unwrap(),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn passive_carrier_consumes_a_whole_move_in_the_exact_selected_reader() {
+        let text = "%%start
+struct Input { *?u8 data; u64 length; }
+struct Other { *?u32 data; u64 length; }
+struct Ambiguous { *?u8 data; *?u8 spare; }
+*u8(Input) read = fn(input) {
+    u8 out = 0;
+    if (input.data != null) {
+        unsafe { out = core.load<u8>(input.data); };
+    };
+    &out
+};
+*u32(Other) consume = fn(input) {
+    u32 out = 0;
+    unsafe { out = core.load<u32>(input.data); core.free(input.data); };
+    &out
+};
+*u8(Ambiguous) ambiguous = fn(input) {
+    u8 out = 0;
+    unsafe { out = core.load<u8>(input.data); };
+    &out
+};
+pick = overload {
+    *u8(Input) => fn(input) { read(input) };
+    *u32(Other) => fn(input) { consume(input) };
+    *u8(Ambiguous) => fn(input) { ambiguous(input) };
+};
+%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let source = SourceIdentity::new("project".into(), "package".into(), "main.w".into(), "r1".into());
+            let parsed = crate::parse_source(source.clone(), text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let typed = typecheck_scalar_program(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), layout);
+            assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+            let program = typed.program;
+            let calls = resolve_program_call_sites(&program).unwrap();
+            let (updates, errors) = derive_and_converge_program_references(&program, &calls);
+            assert!(errors.is_empty(), "{errors:?}");
+            let mut bodies = BTreeMap::new();
+            let mut declarations = HashMap::new();
+            for (item, result) in &updates {
+                let ScalarItem::Function(function) = &program.items[*item] else { unreachable!() };
+                declarations.insert((&program.source, function.name_span), (0, *item));
+                for (arm, result) in std::iter::once((None, result)).chain(
+                    result.arms.iter().enumerate().map(|(index, result)| (Some(index), result)),
+                ) {
+                    let Some(sites) = calls.function_body(*item, arm) else { continue };
+                    bodies.insert((0, *item, arm), Body {
+                        facts: Some(&result.aggregate),
+                        cfg: &result.cfg,
+                        sites,
+                        source: &program.source,
+                        is_monomorphic: true,
+                        supports_input_result: true,
+                    });
+                }
+            }
+            let selection = updates.last().unwrap().0;
+            let mut proven = BTreeSet::new();
+            assert_eq!(prove_read_views(((0, selection, Some(0)), ReadSource::Carrier(0)),
+                &bodies, &declarations, &mut proven), Ok(()));
+            assert!(prove_read_views(((0, selection, Some(1)), ReadSource::Carrier(0)),
+                &bodies, &declarations, &mut proven).is_err());
+            assert!(prove_read_views(((0, selection, Some(2)), ReadSource::Carrier(0)),
+                &bodies, &declarations, &mut proven).unwrap_err().contains("unproved ordinary raw read formal"));
         }
     }
 

@@ -580,6 +580,27 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
 %%end"#;
     let unproved = positive.replace("if (received != null && status) { 1 } else { 0 }",
         "if (received != null && status) { if ((*received).data != null) { 1 } else { 2 } } else { 0 }");
+    let passive = positive.replace("i32(u64, bool) inspect_checked", r#"u8(Packet) read_payload = fn(input) {
+        u8 byte = 0;
+        if (input.data != null) { unsafe { byte = core.load<u8>(input.data); }; };
+        byte
+    };
+    reader = overload { u8(Packet) => fn(input) { read_payload(input) }; };
+    i32(u64, bool) inspect_checked"#)
+        .replace("if (received != null && status) { 1 } else { 0 }", r#"*?u8 content = null;
+        if (received != null) { content = (*received).data; };
+        Packet carrier = { .data = content; .length = count; };
+        u8 byte = reader(carrier);
+        if (status && byte == 0) { 1 } else { 0 }"#);
+    let consuming = passive.replace("byte = core.load<u8>(input.data);",
+        "byte = core.load<u8>(input.data); core.free(input.data);");
+    let nonreturning = passive.replace("byte = core.load<u8>(input.data);",
+        "byte = core.load<u8>(input.data); if (byte == 9) { core.system_panic(); };");
+    let length_call = passive
+        .replace("u8(Packet) read_payload", "u64() scratch_length = fn { core.int_extend<u64>(1) };\nu8(Packet) read_payload")
+        .replace("u8 byte = 0;", "u8[scratch_length()] scratch; u8 byte = 0;");
+    let ambiguous_alias = passive.replace("Packet carrier =",
+        "content = null; Packet carrier =");
     let module_sink = positive.replace("i32(u64, bool) inspect_checked", "*Packet escaped = null;\ni32(u64, bool) inspect_checked")
         .replace("if (received != null && status)", "escaped = received;\n\tif (received != null && status)");
     let qualified_sink = positive.replace("struct Packet", "imported = namespace package \"values.w\";\nstruct Packet")
@@ -617,6 +638,9 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         for (text, expected_transport, qualified) in [
             (positive, true, false), (unproved.as_str(), false, false),
+            (passive.as_str(), true, false), (consuming.as_str(), false, false),
+            (ambiguous_alias.as_str(), false, false), (nonreturning.as_str(), false, false),
+            (length_call.as_str(), false, false),
             (module_sink.as_str(), false, false), (qualified_sink.as_str(), false, true),
             (pure_recommit.as_str(), true, false), (observable_recommit.as_str(), false, false),
             (nullable_backing.as_str(), true, false), (null_field_live_base.as_str(), true, false),
