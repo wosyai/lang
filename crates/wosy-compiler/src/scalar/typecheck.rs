@@ -3158,7 +3158,7 @@ fn float_literal_fits_type(value: f64, ty: &ScalarType) -> bool {
     }
 }
 
-fn integer_literal_fits_type(value: &BigInt, ty: &ScalarType) -> bool {
+pub(super) fn integer_literal_fits_type(value: &BigInt, ty: &ScalarType) -> bool {
     integer_bounds(ty).is_some_and(|(minimum, maximum)| value >= &minimum && value <= &maximum)
 }
 

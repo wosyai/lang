@@ -1,24 +1,35 @@
+use std::collections::HashSet;
+
 use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation},
-    checker_flow::{check_integer_requirements, IntegerInputs},
-    project_from_declarations,
+    checker_flow::{
+        check_integer_requirements, check_integer_return_bound, check_integer_return_bound_where,
+        CheckerPredicate, IntegerCheckFailure, IntegerComparison, IntegerInputs, ProofCoverage,
+    },
+    derive_expression, project_from_declarations,
+    reference::{FunctionCallSites, ProjectCallSiteResults},
     static_calls::prepare_project_occurrences,
-    typecheck_scalar_project_in_mode, ByteSpan, ReferenceBindingId, ScalarItem,
-    ScalarNamespaceBinding, ScalarPreparationInputs, ScalarSourceDeclarations, ScalarType,
+    typecheck::{integer_literal_fits_type, is_integer_type},
+    typecheck_scalar_project_in_mode, ByteSpan, ReferenceBindingId, ScalarExpression, ScalarFunction,
+    ScalarItem, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarProject,
+    ScalarSourceDeclarations, ScalarType,
 };
 use crate::Diagnostic;
-use wosy_syntax::SourceIdentity;
+use wosy_syntax::{CstNode, ParseResult, SourceIdentity, SyntaxKind};
 
 #[derive(Debug, PartialEq)]
 enum ProjectCheck {
     Invalid(Vec<Diagnostic>),
+    InvalidProof,
     MissingRoot,
     AmbiguousRoot,
     RootSourceOutsideInitOrder,
     MissingRootOccurrences,
     Unsupported,
     NoChecks,
+    NoApplicableInputs,
     Proved,
+    Refuted,
     Failed {
         source: SourceIdentity,
         operation: CheckerOperation,
@@ -37,34 +48,14 @@ fn check_closed_project_callable(
     root_source: &SourceIdentity,
     root_name: &str,
 ) -> ProjectCheck {
-    let prepared = project_from_declarations(declarations, initialization_order, inputs)
-        .and_then(|project| prepare_project_occurrences(typecheck_scalar_project_in_mode(project, true)));
-    let (project, calls) = match prepared {
+    let (project, calls) = match prepare_checker_project(declarations, initialization_order, inputs) {
         Ok(prepared) => prepared,
-        Err(rejected) => return ProjectCheck::Invalid(rejected.into_inspection().diagnostics),
+        Err(error) => return error,
     };
-    let mut roots = project
-        .modules
-        .iter()
-        .enumerate()
-        .filter(|(_, module)| &module.source == root_source)
-        .flat_map(|(module, source)| {
-            source.items.iter().enumerate().filter_map(move |(item, value)| {
-                let ScalarItem::Function(function) = value else {
-                    return None;
-                };
-                (function.name == root_name).then_some((module, item, function))
-            })
-        });
-    let Some((module, item, function)) = roots.next() else {
-        return ProjectCheck::MissingRoot;
+    let (module, item, function) = match select_checked_root(&project, root_source, root_name) {
+        Ok(root) => root,
+        Err(error) => return error,
     };
-    if roots.next().is_some() {
-        return ProjectCheck::AmbiguousRoot;
-    }
-    if !project.initialization_order.contains(root_source) {
-        return ProjectCheck::RootSourceOutsideInitOrder;
-    }
     let ScalarType::Callable { outputs, parameters } = &function.signature else {
         return ProjectCheck::Unsupported;
     };
@@ -82,19 +73,178 @@ fn check_closed_project_callable(
         None => ProjectCheck::Unsupported,
         Some(Ok(())) if body.structure.checker_directives.is_empty() => ProjectCheck::NoChecks,
         Some(Ok(())) => ProjectCheck::Proved,
-        Some(Err(failure)) => {
-            let directive = &body.structure.checker_directives[&failure.directive];
-            ProjectCheck::Failed {
-                source: root_source.clone(),
-                operation: directive.operation,
-                directive: body.occurrences[failure.directive.0].span,
-                condition: directive.condition,
-                state: failure.state,
-                axes: failure.axes.into_iter().cloned().collect(),
-                output: directive.output.clone(),
-            }
-        }
+        Some(Err(failure)) => project_failure(body, root_source, failure),
     }
+}
+
+fn prepare_checker_project(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+) -> Result<(ScalarProject, ProjectCallSiteResults), ProjectCheck> {
+    project_from_declarations(declarations, initialization_order, inputs)
+        .and_then(|project| prepare_project_occurrences(typecheck_scalar_project_in_mode(project, true)))
+        .map_err(|rejected| ProjectCheck::Invalid(rejected.into_inspection().diagnostics))
+}
+
+fn select_checked_root<'a>(
+    project: &'a ScalarProject,
+    source: &SourceIdentity,
+    name: &str,
+) -> Result<(usize, usize, &'a ScalarFunction), ProjectCheck> {
+    let mut roots = project
+        .modules
+        .iter()
+        .enumerate()
+        .filter(|(_, module)| &module.source == source)
+        .flat_map(|(module, source)| {
+            source.items.iter().enumerate().filter_map(move |(item, value)| {
+                let ScalarItem::Function(function) = value else {
+                    return None;
+                };
+                (function.name == name).then_some((module, item, function))
+            })
+        });
+    let root = roots.next().ok_or(ProjectCheck::MissingRoot)?;
+    if roots.next().is_some() {
+        return Err(ProjectCheck::AmbiguousRoot);
+    }
+    if !project.initialization_order.contains(source) {
+        return Err(ProjectCheck::RootSourceOutsideInitOrder);
+    }
+    Ok(root)
+}
+
+fn project_failure(
+    body: &FunctionCallSites,
+    source: &SourceIdentity,
+    failure: IntegerCheckFailure<'_>,
+) -> ProjectCheck {
+    let directive = &body.structure.checker_directives[&failure.directive];
+    ProjectCheck::Failed {
+        source: source.clone(),
+        operation: directive.operation,
+        directive: body.occurrences[failure.directive.0].span,
+        condition: directive.condition,
+        state: failure.state,
+        axes: failure.axes.into_iter().cloned().collect(),
+        output: directive.output.clone(),
+    }
+}
+
+fn child(parent: &CstNode, kind: SyntaxKind) -> Result<CstNode, ProjectCheck> {
+    parent.children().find(|node| node.kind() == kind).ok_or(ProjectCheck::InvalidProof)
+}
+
+fn identifiers(parent: &CstNode) -> impl Iterator<Item = String> + '_ {
+    parent.children_with_tokens().filter_map(|element| {
+        let token = element.into_token()?;
+        (token.kind() == SyntaxKind::Identifier).then(|| token.text().to_owned())
+    })
+}
+
+fn check_empty_proof_fragment(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+    fragment: &ParseResult,
+) -> ProjectCheck {
+    check_empty_proof_fragment_impl(declarations, initialization_order, inputs, fragment)
+        .unwrap_or_else(|error| error)
+}
+
+fn check_empty_proof_fragment_impl(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+    fragment: &ParseResult,
+) -> Result<ProjectCheck, ProjectCheck> {
+    if !fragment.is_valid() {
+        return Err(ProjectCheck::InvalidProof);
+    }
+    let root = fragment.canonical_cst();
+    let declaration = child(&child(&root.root, SyntaxKind::Root)?, SyntaxKind::ProofDecl)?;
+    if child(&declaration, SyntaxKind::Block)?.children().next().is_some() {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let target = child(&declaration, SyntaxKind::ProofTarget)?;
+    let name = identifiers(&target).next().ok_or(ProjectCheck::InvalidProof)?;
+    let input_names = identifiers(&child(&target, SyntaxKind::Parameters)?).collect::<Vec<_>>();
+    let outputs = child(&declaration, SyntaxKind::ProofOutputs)?;
+    let output_names = identifiers(&child(&outputs, SyntaxKind::Parameters)?).collect::<Vec<_>>();
+    let mut unique = HashSet::new();
+    if !input_names.iter().chain(&output_names).all(|name| unique.insert(name.as_str())) {
+        return Err(ProjectCheck::InvalidProof);
+    }
+    let ensures = derive_expression(&child(
+        &child(&declaration, SyntaxKind::ProofEnsures)?,
+        SyntaxKind::Expression,
+    )?);
+    let ensures = IntegerComparison::from_expression(&ensures).ok_or(ProjectCheck::Unsupported)?;
+
+    let (project, calls) = prepare_checker_project(declarations, initialization_order, inputs)?;
+    let (module, item, function) = select_checked_root(&project, &root.source, &name)?;
+    if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+    let boundary = &body.boundary;
+    if input_names.len() != boundary.parameters.len() || output_names.len() != boundary.results.len() {
+        return Err(ProjectCheck::InvalidProof);
+    }
+    let ([result], [output]) = (boundary.results.as_slice(), output_names.as_slice()) else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    if !is_integer_type(&result.ty) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    if ensures.name != output {
+        return Err(if input_names.iter().any(|input| input == ensures.name) {
+            ProjectCheck::Unsupported
+        } else {
+            ProjectCheck::InvalidProof
+        });
+    }
+    if !integer_literal_fits_type(ensures.bound, &result.ty) {
+        return Err(ProjectCheck::InvalidProof);
+    }
+
+    let filter = declaration.children()
+        .find(|node| node.kind() == SyntaxKind::ProofWhere)
+        .map(|where_clause| {
+            let expression = derive_expression(&child(&where_clause, SyntaxKind::Expression)?);
+            if let ScalarExpression::Boolean { value, .. } = expression {
+                return Ok(CheckerPredicate::Boolean(value));
+            }
+            let condition = IntegerComparison::from_expression(&expression).ok_or(ProjectCheck::Unsupported)?;
+            let index = input_names.iter().position(|input| input == condition.name)
+                .ok_or(ProjectCheck::InvalidProof)?;
+            let ty = &boundary.parameters[index].ty;
+            if !is_integer_type(ty) {
+                return Err(ProjectCheck::Unsupported);
+            }
+            if !integer_literal_fits_type(condition.bound, ty) {
+                return Err(ProjectCheck::InvalidProof);
+            }
+            let bindings = boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
+            let predicate = condition.typed(ty, ty, bindings[index].clone())
+                .ok_or(ProjectCheck::Unsupported)?;
+            Ok(CheckerPredicate::Integer(predicate))
+        })
+        .transpose()?;
+    let checked = if let Some(filter) = filter.as_ref() {
+        check_integer_return_bound_where(body, ensures.operator, ensures.bound, filter)
+    } else {
+        check_integer_return_bound(body, ensures.operator, ensures.bound)
+            .map(|result| result.map(ProofCoverage::Applicable))
+    };
+    Ok(match checked {
+        None => ProjectCheck::Unsupported,
+        Some(Ok(ProofCoverage::Applicable(true))) => ProjectCheck::Proved,
+        Some(Ok(ProofCoverage::Applicable(false))) => ProjectCheck::Refuted,
+        Some(Ok(ProofCoverage::NoApplicableInputs)) => ProjectCheck::NoApplicableInputs,
+        Some(Err(failure)) => project_failure(body, &root.source, failure),
+    })
 }
 
 mod tests {
@@ -248,6 +398,88 @@ mod tests {
             .root
             .descendants()
             .any(|node| node.kind() == SyntaxKind::ProofDecl));
+    }
+
+    fn prove(source: &SourceIdentity, callable: &str, proof: &str) -> ProjectCheck {
+        let fragment = wosy_syntax::parse_proof_fragment(source.clone(), proof.to_owned(), &[]);
+        check_empty_proof_fragment(
+            vec![(declarations(source, callable), Vec::new())],
+            vec![source.clone()],
+            inputs(),
+            &fragment,
+        )
+    }
+
+    #[test]
+    fn canonical_empty_clamp_proof_binds_aliases_by_position() {
+        let app = source("src/main.w", "clamp");
+        let callable = "%%start\nu8(u8) clamp = fn(value) { if (value > 10) { 10 } else { value } };\n%%end";
+        let proof = |clause: &str| format!("proof clamp_bounded for clamp(x) -> (out) {clause} {{}}");
+        assert_eq!(prove(&app, callable, &proof("ensures (out <= 10)")), ProjectCheck::Proved);
+        assert_eq!(prove(&app, callable, &proof("ensures (out <= 9)")), ProjectCheck::Refuted);
+        assert_eq!(prove(&app, callable, &proof("ensures (out <= 256)")), ProjectCheck::InvalidProof);
+        assert_eq!(
+            prove(&app, callable, "proof clamp_bounded for clamp(x) -> (out) ensures (out <= 10) { core.show(out == x); }"),
+            ProjectCheck::Unsupported,
+        );
+    }
+
+    #[test]
+    fn canonical_where_uses_input_aliases_and_an_empty_filter_supplies_no_fact() {
+        let app = source("src/main.w", "identity");
+        let callable = "%%start\nu8(u8) identity = fn(value) { value };\n%%end";
+        let proof = |clause: &str| format!("proof bounded for identity(x) -> (out) {clause} {{}}");
+        for (clause, expected) in [
+            ("ensures (out <= 10)", ProjectCheck::Refuted),
+            ("where (x <= 10) ensures (out <= 10)", ProjectCheck::Proved),
+            ("where (x > 255) ensures (out <= 10)", ProjectCheck::NoApplicableInputs),
+            ("where (false) ensures (out <= 10)", ProjectCheck::NoApplicableInputs),
+            ("where (x <= 256) ensures (out <= 10)", ProjectCheck::InvalidProof),
+            ("where (out <= 10) ensures (out <= 10)", ProjectCheck::InvalidProof),
+            ("where (unknown <= 10) ensures (out <= 10)", ProjectCheck::InvalidProof),
+        ] {
+            assert_eq!(prove(&app, callable, &proof(clause)), expected);
+        }
+    }
+
+
+    #[test]
+    fn proof_input_aliases_use_exact_spelling_and_canonical_positions() {
+        let app = source("src/main.w", "second");
+        let callable = "%%start\nu8(u8, u8) second = fn(first, second_value) { if (first == 0) {}; second_value };\n%%end";
+        let proof = |filter: &str| {
+            format!("proof bounded for second(x, X) -> (out) where ({filter} <= 10) ensures (out <= 10) {{}}")
+        };
+        assert_eq!(prove(&app, callable, &proof("X")), ProjectCheck::Proved);
+        assert_eq!(prove(&app, callable, &proof("x")), ProjectCheck::Refuted);
+    }
+
+    #[test]
+    fn malformed_proof_aliases_and_wrong_source_do_not_select_another_callable() {
+        let app = source("src/main.w", "identity");
+        let wrong = source("src/main.w", "wrong-revision");
+        let callable = "%%start\nu8(u8) identity = fn(value) { value };\n%%end";
+        for fragment in [
+            "proof invalid for identity(x, y) -> (out) ensures (out <= 10) {}",
+            "proof invalid for identity(x) -> (x) ensures (x <= 10) {}",
+            "proof invalid for identity(x) -> (out) ensures (unknown <= 10) {}",
+        ] {
+            assert_eq!(prove(&app, callable, fragment), ProjectCheck::InvalidProof);
+        }
+        let fragment = wosy_syntax::parse_proof_fragment(
+            wrong,
+            "proof bounded for identity(x) -> (out) ensures (out <= 10) {}".into(),
+            &[],
+        );
+        assert_eq!(
+            check_empty_proof_fragment(
+                vec![(declarations(&app, callable), Vec::new())],
+                vec![app],
+                inputs(),
+                &fragment,
+            ),
+            ProjectCheck::MissingRoot,
+        );
     }
 
 }

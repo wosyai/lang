@@ -29,8 +29,8 @@ pub(super) struct IntegerComparison<'a> {
     pub(super) left: &'a ScalarExpression,
     pub(super) right: &'a ScalarExpression,
     pub(super) name: &'a str,
-    operator: &'a BinaryOperator,
-    bound: &'a BigInt,
+    pub(super) operator: &'a BinaryOperator,
+    pub(super) bound: &'a BigInt,
 }
 
 impl<'a> IntegerComparison<'a> {
