@@ -40,7 +40,17 @@ fn source_aggregate_copy_policies_in_both_validators() {
                 false,
             ),
             (
+                "%%start\nstruct copy Outer { Middle first; Middle[2] rest; }\nstruct copy Middle { Leaf nested; }\nstruct copy Leaf { Status status; }\nenum copy Status { ok; }\n%%end",
+                vec![CopyPolicy::Copy, CopyPolicy::Copy, CopyPolicy::Copy],
+                false,
+            ),
+            (
                 "%%start\nstruct Plain { i32 value; }\nstruct copy Invalid { Plain nested; }\n%%end",
+                vec![CopyPolicy::Move, CopyPolicy::Move],
+                true,
+            ),
+            (
+                "%%start\nstruct copy Left { Right right; }\nstruct copy Right { Left left; }\n%%end",
                 vec![CopyPolicy::Move, CopyPolicy::Move],
                 true,
             ),
