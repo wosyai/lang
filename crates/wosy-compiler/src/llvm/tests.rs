@@ -8032,3 +8032,77 @@ fn ordinary_result_transport_declines_legacy_source_and_aggregate_forwarding() {
         }
     }
 }
+
+#[test]
+fn projected_named_checked_result_retains_the_exact_acquired_owner() {
+    let text = "%%start
+struct copy Cell { u8 value; }
+(*Cell, u8)(bool) new_or_null = fn(present) {
+    Cell item = { .value = 7; };
+    if (present) { &item, 1 } else { null, 2 }
+};
+(*Cell, u8)(*Cell, bool) new_or_borrowed = fn(input, own) {
+    Cell item = { .value = 8; };
+    if (own) { &item, 1 } else { input, 3 }
+};
+(*Cell, u8)(bool, bool) nullable = fn(local, present) {
+    if (local) { Cell item = { .value = 9; }; &item, 4 } else {
+        *Cell result, u8 status = new_or_null(present);
+        result, status
+    }
+};
+(*Cell, u8)(*Cell, bool, bool) mixed = fn(input, local, own) {
+    if (local) { Cell item = { .value = 10; }; &item, 4 } else {
+        *Cell result, u8 status = new_or_borrowed(input, own);
+        result, status
+    }
+};
+%%end";
+    let source = SourceIdentity::new(
+        "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+    );
+    for (layout, pointer) in [
+        (ScalarTargetLayout::WASM32, "i32"),
+        (ScalarTargetLayout::NATIVE64, "i64"),
+    ] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (project_route, llvm) in [
+            (false, emit_scalar_llvm(&single).unwrap().to_text()),
+            (true, emit_scalar_project_llvm(&project).unwrap().to_text()),
+        ] {
+            let body = |name: &str| {
+                let symbol = if project_route {
+                    project_function_name(&source, name)
+                } else {
+                    name.to_owned()
+                };
+                llvm.split_once(&format!("define {{ {pointer}, i8 }} @{symbol}("))
+                    .and_then(|(_, rest)| rest.split_once("\n}"))
+                    .map(|(body, _)| body)
+                    .expect("wrapper definition")
+            };
+            let nullable = body("nullable");
+            let phi = nullable.lines()
+                .find(|line| line.contains("return_owner_0 = phi i1"))
+                .expect("nullable owner merge");
+            assert_eq!(phi.matches("[ true,").count(), 2, "{nullable}");
+            let mixed = body("mixed");
+            let flag = mixed.lines().find_map(|line| {
+                let (name, _) = line.trim_start().split_once(" = load i1, ")?;
+                name.starts_with("%checked_return_owned_0").then_some(name)
+            }).expect("exact owner flag from callee");
+            let phi = mixed.lines()
+                .find(|line| line.contains("return_owner_0 = phi i1"))
+                .expect("mixed owner merge");
+            assert!(phi.contains("[ true,") && phi.contains(&format!("[ {flag},")), "{mixed}");
+            assert!(!nullable.contains("forwarded_return_present"), "{nullable}");
+        }
+    }
+}
