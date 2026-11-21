@@ -7,10 +7,29 @@ fn standalone_detached_convergence_propagates_checked_returns_without_integral_c
         let parsed = parse_source(source(), text.into(), &[]);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
-        let typed = typecheck_scalar_program(declarations, target);
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, target);
         assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
         let mut program = typed.program;
-        let call_sites = resolve_program_call_sites(&program).unwrap();
+        let call_sites = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let (provisional, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &call_sites, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        for (_, result) in &provisional[1..] {
+            let call = result.cfg.points.iter().find(|point| matches!(
+                &point.kind,
+                CfgPointKind::Call { target: ResolvedCallTarget::ModuleCallable { .. }, output: 0, .. },
+            )).expect("unresolved checked call");
+            let CfgPointKind::Call { argument_points, .. } = &call.kind else {
+                unreachable!()
+            };
+            assert!(result.cfg.points[argument_points[0].0].possible_origins.as_ref()
+                .is_some_and(|origins| !origins.is_empty()));
+            assert!(call.possible_origins.is_none());
+            assert!(result.cfg.points.iter().find(|point| matches!(
+                point.kind, CfgPointKind::ReturnOutput { checked: true, .. },
+            )).unwrap().possible_origins.is_none());
+        }
         let public = derive_scalar_program_with_layout(&parsed.result, target);
         assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
         let scope = layout::observations::Scope::new();
@@ -62,6 +81,62 @@ fn standalone_detached_convergence_propagates_checked_returns_without_integral_c
                 function.parameter_spans[0]
             );
         }
+    }
+}
+
+#[test]
+fn mixed_direct_module_call_marks_only_the_checked_output_in_both_grouped_routes() {
+    let text = r#"%%start
+(*u8, u8)(*u8) checked_first = fn(input) { input, 3 };
+(u8, *u8)(*u8) checked_second = fn(input) { 5, input };
+(*u8, u8)(*u8) declare_first = fn(input) {
+    *u8 reference, u8 scalar = checked_first(input);
+    reference, scalar
+};
+(u8, *u8)(*u8) declare_second = fn(input) {
+    u8 scalar, *u8 reference = checked_second(input);
+    scalar, reference
+};
+(*u8, u8)(*u8) assign_first = fn(input) {
+    *u8 reference = null;
+    u8 scalar = 0;
+    reference, scalar = checked_first(input);
+    reference, scalar
+};
+(u8, *u8)(*u8) assign_second = fn(input) {
+    u8 scalar = 0;
+    *u8 reference = null;
+    scalar, reference = checked_second(input);
+    scalar, reference
+};
+%%end"#;
+    for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, target);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let call_sites = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let (provisional, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &call_sites, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(provisional.len(), 6);
+        for ((_, result), checked_slot) in provisional[2..].iter().zip([0, 1, 0, 1]) {
+            let outputs = result.cfg.points.iter().filter_map(|point| match &point.kind {
+                CfgPointKind::Call {
+                    target: ResolvedCallTarget::ModuleCallable { .. }, output, ..
+                } => Some((*output, point)),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert!(matches!(&outputs[..], [(0, _), (1, _)]));
+            let checked = outputs[checked_slot].1;
+            assert_eq!(result.proof_points.resolved_checked_call_outputs, [checked.id]);
+            assert!(checked.possible_origins.is_none());
+        }
+        let public = derive_scalar_program_with_layout(&parsed.result, target);
+        assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
     }
 }
 
@@ -174,10 +249,10 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
         let parsed = parse_source(source(), text.into(), &[]);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
-        let typed = typecheck_scalar_program(declarations, target);
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, target);
         assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
         let program = typed.program;
-        let calls = resolve_program_call_sites(&program).unwrap();
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
         let (mut updates, errors) = derive_module_reference_origins(
             &program.source, &program.items, &calls, &program.structs, &program.enums, false,
         );
@@ -218,11 +293,22 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
 
         let mut replays = Vec::new();
         let mut pointers = Vec::new();
-        for (from, to) in [
+        let assert_missing_left = |replays: &[ReferenceContractReplay], updates: &[(usize, FunctionReferenceResult)]| {
+            assert!(matches!(
+                replays[2].errors.as_slice(),
+                [ReferenceAnalysisError::MissingContext {
+                    reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin, ..
+                }]
+            ), "{:?}", replays[2].errors);
+            let left_call = replays[2].module_calls[0];
+            assert!(updates[2].1.cfg.points[left_call.0].possible_origins.is_none());
+            assert!(replays[3].errors.is_empty(), "{:?}", replays[3].errors);
+        };
+        for (step, (from, to)) in [
             (&previous, &previous),
             (&previous, &current),
             (&current, &current),
-        ] {
+        ].into_iter().enumerate() {
             let mut cursor = 0;
             let mut inputs = HashMap::new();
             for (_, result) in &mut updates {
@@ -231,6 +317,11 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
                 );
             }
             assert_eq!(cursor, replays.len());
+            if step == 0 {
+                assert_missing_left(&replays, &updates);
+            } else {
+                assert!(replays.iter().all(|replay| replay.errors.is_empty()));
+            }
             pointers.push(updates.iter().map(|(_, result)| result.cfg.points.as_ptr()).collect::<Vec<_>>());
         }
         assert_ne!(pointers[0][2], pointers[1][2]);
@@ -238,8 +329,6 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
             assert_eq!(pointers[0][index], pointers[1][index]);
         }
         assert_eq!(pointers[1], pointers[2]);
-        assert!(replays.iter().all(|replay| replay.errors.is_empty()));
-
         let right_call = replays[3].module_calls[0];
         updates[3].1.aggregate.checked_successor_candidate = Some(right_call);
         let metadata_only = ReferenceOutputContracts::new(vec![
@@ -272,6 +361,11 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
             assert_eq!(cursor, replays.len());
             assert_eq!(updates[3].1.cfg.points.as_ptr(), right_before);
             assert_eq!(updates[3].1.aggregate.checked_successor_contract, successor);
+            if std::ptr::eq(to, &removed) {
+                assert_missing_left(&replays, &updates);
+            } else {
+                assert!(replays.iter().all(|replay| replay.errors.is_empty()));
+            }
             assert_eq!(
                 updates[2].1.cfg.points.as_ptr() != left_before,
                 std::ptr::eq(to, &removed),

@@ -1461,7 +1461,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, ..
                 }) && signature.is_some_and(|signature|
                     aggregate::neutral_array_signature(&signature.parameters, &signature.outputs));
+                let checked_module_output = matches!(&call, CfgPointKind::Call {
+                    target: ResolvedCallTarget::ModuleCallable { .. }, ..
+                }) && matches!(signature.and_then(|signature| signature.outputs.outputs.first()),
+                    Some(ScalarOutput { ty: ScalarType::CheckedReference { .. }, .. }));
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
+                if checked_module_output {
+                    self.proof_points.resolved_checked_call_outputs.push(id);
+                }
                 if let Some((moved, binding)) = array_argument.filter(|_| array_call) {
                     self.aggregate_facts.array_calls.insert(id, (ordinal, moved, binding));
                     if neutral_array_call {
@@ -2836,7 +2843,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(())
     }
 
-    fn project_call_output(&mut self, producer: CfgPointId, output: usize) -> CfgPointId {
+    fn project_call_output(
+        &mut self,
+        producer: CfgPointId,
+        ordinal: OccurrenceOrdinal,
+        output: usize,
+    ) -> CfgPointId {
         let point = &self.cfg.points[producer.0];
         let CfgPointKind::Call {
             expression,
@@ -2847,6 +2859,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
         else {
             unreachable!("evaluated output-zero call")
         };
+        let checked_module_output = matches!(target, ResolvedCallTarget::ModuleCallable { .. })
+            && self.call_sites.checked_call_signatures.get(&ordinal)
+                .and_then(|signature| signature.outputs.outputs.get(output))
+                .is_some_and(|slot| matches!(slot.ty, ScalarType::CheckedReference { .. }));
         let kind = CfgPointKind::Call {
             expression: expression.clone(),
             output,
@@ -2854,6 +2870,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
             argument_points: argument_points.clone(),
         };
         let projection = self.point_with_origins(kind, point.source_span.range, point.scope, None);
+        if checked_module_output {
+            self.proof_points.resolved_checked_call_outputs.push(projection);
+        }
         if self.aggregate_facts.neutral_array_calls.contains(&producer) {
             self.aggregate_facts.neutral_array_projections.insert(projection, producer);
         }
@@ -2868,6 +2887,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         declared: &mut Vec<(String, ReferenceBindingId, Option<ReferenceBindingId>)>,
         call_producer: Option<CfgPointId>,
         receivers: &[BindingReceiverSlot],
+        primary: OccurrenceOrdinal,
         secondary: &[BindingOutput],
         position: BlockPosition,
     ) -> Result<(), ReferenceAnalysisError> {
@@ -2882,7 +2902,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
                 BindingOutput::ProjectPrimary { output } => {
                     if let Some(producer) = call_producer {
-                        self.project_call_output(producer, *output);
+                        self.project_call_output(producer, primary, *output);
                     }
                 }
             }
@@ -3247,6 +3267,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 &mut declared,
                                 call_producer,
                                 binding_region.receivers(),
+                                outputs.primary,
                                 &outputs.secondary,
                                 position,
                             )?;
@@ -3285,6 +3306,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         &mut declared,
                         call_producer,
                         binding_region.receivers(),
+                        outputs.primary,
                         &outputs.secondary,
                         position,
                     )?;
@@ -3355,7 +3377,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     }
                     for projection in group.projected_outputs() {
                         let producer = values[projection.producer.position].1;
-                        let rhs_point = self.project_call_output(producer, projection.output);
+                        let rhs_point = self.project_call_output(producer, projection.producer.expression, projection.output);
                         values.push((ReferenceValue::Uncomputed, rhs_point));
                     }
                     let destinations = group
@@ -4483,6 +4505,7 @@ struct ReferenceTransferCfg<'a> {
     points: &'a mut [ReferenceFlowPoint],
     facts: &'a mut Vec<ReferenceOrigin>,
     allocations: &'a BTreeSet<ReferenceBindingId>,
+    resolved_checked_call_outputs: &'a [CfgPointId],
     checked_pointee_reads: &'a [CfgPointId],
     named_reborrow_parents: &'a [super::control::NamedReborrowParent],
 }
@@ -4494,6 +4517,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             points: &mut cfg.points,
             facts: &mut cfg.facts,
             allocations: &cfg.allocations,
+            resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
             named_reborrow_parents: proof.map_or(&[], |proof| &proof.named_reborrow_parents),
         }
@@ -4754,6 +4778,11 @@ fn transfer_reference_facts(
             let point = &mut cfg.points[id.0];
             if let Some(origins) = call_origins {
                 point.possible_origins = Some(origins);
+            }
+            let isolated_call_output = matches!(point.kind, CfgPointKind::Call { .. })
+                && cfg.resolved_checked_call_outputs.binary_search(&id).is_ok();
+            if isolated_call_output && point.possible_origins.as_ref().is_some_and(BTreeSet::is_empty) {
+                point.possible_origins = None;
             }
             if let CfgPointKind::ReadPlace {
                 place,
@@ -5554,7 +5583,7 @@ fn transfer_reference_facts(
                             }
                         }
                     }
-                    if point.possible_origins.is_none() {
+                    if !isolated_call_output && point.possible_origins.is_none() {
                         state.value.clone()
                     } else {
                         point.possible_origins.clone().filter(|set| !set.is_empty())
@@ -9299,6 +9328,7 @@ fn derive_function_specialized_copy_policies(
                     points: &mut points,
                     facts: &mut facts,
                     allocations: &template_cfg.allocations,
+                    resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
                     named_reborrow_parents: &template_result.proof_points.named_reborrow_parents,
                 },
