@@ -75,7 +75,7 @@ impl<'a> IntegerComparison<'a> {
 pub(super) struct ImportedLocal<'a> {
     pub(super) position: usize,
     pub(super) values: IntegerSet,
-    pub(super) guard: Option<(IntegerRelation, &'a BigInt)>,
+    pub(super) guards: Vec<(IntegerRelation, &'a BigInt)>,
 }
 
 type IntegerRow = Vec<Rc<IntegerSet>>;
@@ -744,7 +744,7 @@ fn walk_integer_block<'a>(
                     };
                     let applies = match &origin.argument {
                         CheckerIntegerCallArgument::Literal(value) =>
-                            local.guard.is_none_or(|(relation, bound)| relation.accepts(value.cmp(bound))),
+                            local.guards.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound))),
                         CheckerIntegerCallArgument::PlainName => {
                             let PlainNameIdentity::Lexical(argument) =
                                 calls.prepared_plain_name(origin.argument_ordinal)?
@@ -755,8 +755,8 @@ fn walk_integer_block<'a>(
                             if structure.checked_types.expressions.get(&origin.argument_ordinal)? != ty {
                                 return None;
                             }
-                            local.guard.is_none_or(|(relation, bound)| {
-                                path.0.iter().all(|row| row[axis].every(relation, bound))
+                            path.0.iter().all(|row| {
+                                local.guards.iter().all(|(relation, bound)| row[axis].every(*relation, bound))
                             })
                         }
                     };

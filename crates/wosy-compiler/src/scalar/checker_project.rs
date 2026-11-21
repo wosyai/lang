@@ -62,7 +62,7 @@ struct VerifiedReturnBound {
     output_type: ScalarType,
     operator: BinaryOperator,
     bound: BigInt,
-    guard: Option<VerifiedEntryGuard>,
+    guards: Vec<VerifiedEntryGuard>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -793,7 +793,7 @@ fn issue_return_bound(
     body: &FunctionCallSites,
     target_layout: ScalarTargetLayout,
     ensures: &IntegerComparison<'_>,
-    condition: Option<&[CheckerPredicate]>,
+    conditions: Option<&[CheckerPredicate]>,
 ) -> Option<VerifiedReturnBound> {
     if !body.structure.checker_directives.is_empty()
         || !body.call_occurrences.is_empty()
@@ -805,21 +805,21 @@ fn issue_return_bound(
     let [output] = body.boundary.results.as_slice() else {
         return None;
     };
-    let guard = match condition {
-        None => None,
-        Some([CheckerPredicate::Boolean(value)]) => Some(VerifiedEntryGuard::Boolean(*value)),
-        Some([CheckerPredicate::Integer(predicate)]) => {
-            let slot = body.boundary.checker_parameter_bindings.as_deref()?
-                .iter().position(|binding| *binding == predicate.binding)?;
-            Some(VerifiedEntryGuard::Integer {
-                slot,
-                ty: body.boundary.parameters[slot].ty.clone(),
-                operator: predicate.operator.clone(),
-                bound: predicate.bound.clone(),
-            })
+    let guards = conditions.unwrap_or_default().iter().map(|condition| {
+        match condition {
+            CheckerPredicate::Boolean(value) => Some(VerifiedEntryGuard::Boolean(*value)),
+            CheckerPredicate::Integer(predicate) => {
+                let slot = body.boundary.checker_parameter_bindings.as_deref()?
+                    .iter().position(|binding| *binding == predicate.binding)?;
+                Some(VerifiedEntryGuard::Integer {
+                    slot,
+                    ty: body.boundary.parameters[slot].ty.clone(),
+                    operator: predicate.operator.clone(),
+                    bound: predicate.bound.clone(),
+                })
+            }
         }
-        Some(_) => return None,
-    };
+    }).collect::<Option<Vec<_>>>()?;
     let (proof_venue, proof_source, target) = match origin {
         ProofSummaryOrigin::DetachedFragment(source) => (
             ProofVenue::DetachedFragment,
@@ -856,7 +856,7 @@ fn issue_return_bound(
         output_type: output.ty.clone(),
         operator: ensures.operator.clone(),
         bound: ensures.bound.clone(),
-        guard,
+        guards,
     })
 }
 
@@ -942,14 +942,17 @@ fn apply_verified_return_bound(
     {
         return None;
     }
-    let guard = match &verified.guard {
-        None | Some(VerifiedEntryGuard::Boolean(true)) => None,
-        Some(VerifiedEntryGuard::Integer { slot: 0, ty, operator, bound }) if ty == parameter =>
-            Some((IntegerRelation::from_operator(operator)?, bound)),
-        _ => return None,
-    };
-    let (values, _) = IntegerSet::from_type(&verified.output_type)?.split(&verified.operator, &verified.bound)?;
-    let imported = ImportedLocal { position: binding_item.position, values, guard };
+    let mut guards = Vec::new();
+    for guard in &verified.guards {
+        match guard {
+            VerifiedEntryGuard::Boolean(true) => {}
+            VerifiedEntryGuard::Integer { slot: 0, ty, operator, bound } if ty == parameter =>
+                guards.push((IntegerRelation::from_operator(operator)?, bound)),
+            _ => return None,
+        }
+    }
+    let values = IntegerSet::from_type(&verified.output_type)?.keep(&verified.operator, &verified.bound)?;
+    let imported = ImportedLocal { position: binding_item.position, values, guards };
     Some(if proves_requirement_with_imported_root_local(body, imported)? {
         ImportedRequirement::Proved
     } else {
@@ -1369,12 +1372,12 @@ mod tests {
         assert_eq!(artifact.parameters, [ScalarType::U8]);
         assert_eq!(artifact.output_slot, 0);
         assert_eq!(artifact.output_type, ScalarType::U8);
-        assert_eq!(artifact.guard, Some(VerifiedEntryGuard::Integer {
+        assert_eq!(artifact.guards, [VerifiedEntryGuard::Integer {
             slot: 0,
             ty: ScalarType::U8,
             operator: BinaryOperator::LessEqual,
             bound: BigInt::from(10),
-        }));
+        }]);
         for name in ["smaller", "empty", "absent"] {
             assert!(module.verify(name).is_none());
         }
@@ -1837,7 +1840,7 @@ mod tests {
                 "x <= 10 && x >= 3" => {
                     assert_eq!(prepared.type_where("bounded"), Ok(()));
                     assert!(matches!(prepared.check("bounded"), Ok((_, ProjectCheck::Proved))));
-                    assert!(prepared.verify("bounded").is_none());
+                    assert_eq!(prepared.verify("bounded").unwrap().bound.guards.len(), 2);
                 }
                 "identity(x) <= 10" => assert_eq!(prepared.type_where("bounded"), Err(ProjectCheck::Unsupported)),
                 _ => {
@@ -1854,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn conjunctive_where_narrows_all_axes_without_issuing_a_summary() {
+    fn conjunctive_where_narrows_all_axes_before_issuing_a_summary() {
         for (guard, expected) in [
             ("lo <= 10 && hi >= 7 && hi <= 10", ProjectCheck::Proved),
             ("lo <= 10 && hi >= 7", ProjectCheck::Refuted),
@@ -1872,7 +1875,17 @@ mod tests {
             let prepared = PreparedProofModule::prepare(revision, text, inputs()).unwrap();
             assert_eq!(prepared.type_where("bounded"), Ok(()));
             assert_eq!(prepared.check("bounded").map(|(_, outcome)| outcome).unwrap_or_else(|error| error), expected);
-            assert!(prepared.verify("bounded").is_none());
+            let summary = prepared.verify("bounded");
+            if expected == ProjectCheck::Proved {
+                let guards = summary.unwrap().bound.guards;
+                assert!(matches!(guards.as_slice(), [
+                    VerifiedEntryGuard::Integer { slot: 0, .. },
+                    VerifiedEntryGuard::Integer { slot: 1, .. },
+                    VerifiedEntryGuard::Integer { slot: 1, .. },
+                ]));
+            } else {
+                assert!(summary.is_none());
+            }
         }
     }
 
@@ -2019,12 +2032,12 @@ mod tests {
         assert_eq!(bound.output_type, ScalarType::U16);
         assert_eq!(bound.operator, BinaryOperator::LessEqual);
         assert_eq!(bound.bound, BigInt::from(12));
-        assert_eq!(bound.guard, Some(VerifiedEntryGuard::Integer {
+        assert_eq!(bound.guards, [VerifiedEntryGuard::Integer {
             slot: 1,
             ty: ScalarType::U16,
             operator: BinaryOperator::LessEqual,
             bound: BigInt::from(12),
-        }));
+        }]);
         let second_source = source("proof/choose.fragment.w", "proof-r2");
         let second_proof = "proof tighter for choose(a, b) -> (out) where (b <= 11) ensures (out <= 11) {}";
         let second = verified_summary(&app, callable, &app, &second_source, second_proof).unwrap();
@@ -2121,6 +2134,35 @@ mod tests {
                 assert_eq!(origin.argument, super::super::reference::CheckerIntegerCallArgument::PlainName);
             }
             assert_eq!(check_integer_requirements(body), None);
+        }
+    }
+
+    #[test]
+    fn compound_bound_requires_every_guard_at_the_actual_incoming_argument() {
+        let app = source("src/main.w", "conjunctive-consumer");
+        let proof_source = source("proof/identity.fragment.w", "compound-r1");
+        let proof = "proof bounded for identity(x) -> (out) where (x <= 10 && x >= 3 && x != 6) ensures (out <= 10) {}";
+        let text = format!(r#"%%start
+            u8(u8) identity = fn(value) {{ value }};
+            u8() accepted = fn {{ u8 result = identity(7); core.require(result <= 10, {OUTPUT}); result }};
+            u8() below = fn {{ u8 result = identity(2); core.require(result <= 10, {OUTPUT}); result }};
+            u8() above = fn {{ u8 result = identity(11); core.require(result <= 10, {OUTPUT}); result }};
+            u8() hole = fn {{ u8 incoming = 6; u8 result = identity(incoming); core.require(result <= 10, {OUTPUT}); result }};
+            u8() accepted_local = fn {{ u8 incoming = 10; u8 result = identity(incoming); core.require(result <= 10, {OUTPUT}); result }};
+            u8(u8) broad = fn(incoming) {{ u8 result = identity(incoming); core.require(result <= 10, {OUTPUT}); result }};
+        %%end"#);
+        let bound = verified_summary(&app, &text, &app, &proof_source, proof).unwrap();
+        let prepared = prepare_checker_project(
+            vec![(declarations(&app, &text), Vec::new())],
+            vec![app.clone()],
+            inputs(),
+        ).unwrap();
+        let identity = (&proof_source, bound.proof_span, "bounded");
+        for name in ["accepted", "accepted_local"] {
+            assert_eq!(use_verified_return_bound(&prepared, &app, name, identity, &bound), Some(ImportedRequirement::Proved));
+        }
+        for name in ["below", "above", "hole", "broad"] {
+            assert_eq!(use_verified_return_bound(&prepared, &app, name, identity, &bound), None);
         }
     }
 
