@@ -2993,6 +2993,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let bind = self.cursor.expect("existing binding definition point");
         if let CfgPointKind::Bind { binding } = &self.cfg.points[bind.0].kind {
             if let Some(ty) = self.binding_types.get(binding) {
+                if !allocation && matches!(ty, ScalarType::CheckedReference { .. }) {
+                    if let Some(value) = initializer {
+                        let frozen = &self.cfg.points[bind.0].possible_origins;
+                        if frozen.is_none()
+                            || frozen == &self.cfg.points[value.0].possible_origins
+                        {
+                            self.proof_points.checked_binding_initializers.push((bind, value));
+                        }
+                    }
+                }
                 if self.independent_checked_query && !allocation && initializer.is_some() && aggregate::ordinary_value(ty) {
                     self.checked_scalar_storage.insert(binding.clone());
                 }
@@ -4505,6 +4515,7 @@ struct ReferenceTransferCfg<'a> {
     points: &'a mut [ReferenceFlowPoint],
     facts: &'a mut Vec<ReferenceOrigin>,
     allocations: &'a BTreeSet<ReferenceBindingId>,
+    checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
     checked_pointee_reads: &'a [CfgPointId],
     named_reborrow_parents: &'a [super::control::NamedReborrowParent],
@@ -4517,6 +4528,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             points: &mut cfg.points,
             facts: &mut cfg.facts,
             allocations: &cfg.allocations,
+            checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
             named_reborrow_parents: proof.map_or(&[], |proof| &proof.named_reborrow_parents),
@@ -4591,6 +4603,9 @@ fn transfer_reference_facts(
             descriptor.invalid = true;
         }
         descriptor = None;
+    }
+    for &(bind, value) in cfg.checked_binding_initializers {
+        last_use[value.0] = last_use[value.0].max(bind.0);
     }
     for parent in cfg.named_reborrow_parents {
         last_use[parent.pointer.0] = last_use[parent.pointer.0].max(parent.borrow.0);
@@ -5433,10 +5448,11 @@ fn transfer_reference_facts(
                             .as_ref()
                             .is_some_and(|set| !set.is_empty()) =>
                 {
-                    let rhs = if point.possible_origins.is_none() {
-                        state.value.as_ref()
-                    } else {
-                        point.possible_origins.as_ref()
+                    let rhs = match cfg.checked_binding_initializers
+                        .binary_search_by_key(&id, |&(bind, _)| bind)
+                    {
+                        Ok(index) => state.point_values.get(cfg.checked_binding_initializers[index].1),
+                        Err(_) => point.possible_origins.as_ref(),
                     };
                     match rhs.filter(|origins| !origins.is_empty()) {
                         Some(origins) => {
@@ -9328,6 +9344,7 @@ fn derive_function_specialized_copy_policies(
                     points: &mut points,
                     facts: &mut facts,
                     allocations: &template_cfg.allocations,
+                    checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
                     named_reborrow_parents: &template_result.proof_points.named_reborrow_parents,

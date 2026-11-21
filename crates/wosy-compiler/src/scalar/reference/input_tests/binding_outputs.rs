@@ -343,3 +343,54 @@ fn raw_binding_outputs_use_canonical_primary_and_real_secondary() {
         }
     }
 }
+
+#[test]
+fn checked_binding_initializer_retains_both_borrow_arms_and_the_pre_move_read() {
+    let text = r#"%%start
+*u8(*u8, *u8, bool) choose = fn(first, second, flag) {
+    *u8 selected = if (flag) { &(*first) } else { &(*second) };
+    selected
+};
+unit(*!u8) transfer = fn(input) {
+    *!u8 output = input;
+    *output = 3;
+};
+%%end"#;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let (results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let [(0, choose), (1, transfer)] = results.as_slice() else {
+            panic!("expected the two resolved source bodies")
+        };
+        let [(bind, initializer)] = choose.proof_points.checked_binding_initializers.as_slice() else {
+            panic!("expected a single lexical checked initialization")
+        };
+        let points = &choose.cfg.points;
+        let origins = points[bind.0].possible_origins.as_ref().expect("checked binding origins");
+        assert_eq!(points[initializer.0].possible_origins.as_ref(), Some(origins));
+        assert_eq!(origins.len(), 2);
+        let parameters = origins.iter().map(|id| match &choose.cfg.facts[id.0] {
+            ReferenceOrigin::BorrowedFrom { parameter, loan } if loan.parent.is_some() => *parameter,
+            origin => panic!("expected either reborrowed parameter, got {origin:?}"),
+        }).collect::<BTreeSet<_>>();
+        assert_eq!(parameters, BTreeSet::from([0, 1]));
+        let [(bind, initializer)] = transfer.proof_points.checked_binding_initializers.as_slice() else {
+            panic!("expected the exact checked initializer before the move")
+        };
+        let points = &transfer.cfg.points;
+        assert!(matches!(points[initializer.0].kind, CfgPointKind::Read { .. }));
+        assert!(points[initializer.0 + 1..bind.0].iter().any(|point| matches!(point.kind, CfgPointKind::Move { .. })));
+        assert_eq!(points[bind.0].possible_origins, points[initializer.0].possible_origins);
+        let public = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
+    }
+}
