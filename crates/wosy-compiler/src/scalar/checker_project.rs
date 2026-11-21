@@ -13,6 +13,7 @@ use super::{
     derive_block, derive_expression, project_from_declarations,
     reference::{CheckerTargetQuery, FunctionCallSites, OccurrenceOrdinal, OccurrenceStructure, ProjectCallSiteResults, ResolvedCheckerTarget},
     static_calls::prepare_project_occurrences,
+    symbolic_integer::IntegerRelation,
     typecheck::{integer_literal_fits_type, is_integer_type, typecheck_proof_where},
     typecheck_scalar_project_in_mode, ByteSpan, ConcreteCallSelection, ReferenceBindingId, ResolvedCallTarget,
     BinaryOperator, ScalarExpression, ScalarFunction, ScalarItem, ScalarModule, ScalarNamespaceBinding, ScalarPreparationInputs,
@@ -26,7 +27,7 @@ use super::{
         IntegerReturn,
     },
     reference::DirectDestinationIdentity,
-    symbolic_integer::{IntegerRelation, IntegerSet},
+    symbolic_integer::IntegerSet,
     ScalarBlock, ScalarBlockItem,
 };
 use crate::Diagnostic;
@@ -302,6 +303,7 @@ fn package_initialization_order(
     Ok((root, ordinals))
 }
 
+#[cfg(test)]
 fn check_package_initialization(prepared: &PreparedCheckerProject) -> Result<CheckedInitialization<'_>, ProjectCheck> {
     let (root, ordinals) = package_initialization_order(prepared.parts().0)?;
     check_package_initialization_with_order(prepared, root, ordinals)
@@ -312,11 +314,20 @@ fn check_package_initialization_with_order<'a>(
     root: &'a SourceIdentity,
     ordinals: HashMap<&'a SourceIdentity, usize>,
 ) -> Result<CheckedInitialization<'a>, ProjectCheck> {
+    check_package_initialization_observing(prepared, root, ordinals, ()).map(|(initialization, ())| initialization)
+}
+
+fn check_package_initialization_observing<'a, Observer: ActualIntegerObserver>(
+    prepared: &'a PreparedCheckerProject,
+    root: &'a SourceIdentity,
+    ordinals: HashMap<&'a SourceIdentity, usize>,
+    observer: Observer,
+) -> Result<(CheckedInitialization<'a>, Observer), ProjectCheck> {
     let (project, calls) = prepared.parts();
     let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
-    let mut actual = ActualCalls { project, calls, active: HashSet::new(), reached: HashSet::new(), had_obligations: false };
+    let mut actual = ActualCalls { project, calls, active: HashSet::new(), reached: HashSet::new(), had_obligations: false, observer };
     walk_package_initialization(project, calls, &ordinals, &mut visits, &mut actual, root)?;
-    Ok(CheckedInitialization { visits, reached: actual.reached, ordinals, had_obligations: actual.had_obligations })
+    Ok((CheckedInitialization { visits, reached: actual.reached, ordinals, had_obligations: actual.had_obligations }, actual.observer))
 }
 
 fn walk_package_initialization(
@@ -324,7 +335,7 @@ fn walk_package_initialization(
     calls: &ProjectCallSiteResults,
     ordinals: &HashMap<&SourceIdentity, usize>,
     visits: &mut [InitializationVisit],
-    actual: &mut ActualCalls<'_>,
+    actual: &mut ActualCalls<'_, impl ActualIntegerObserver>,
     source: &SourceIdentity,
 ) -> Result<(), ProjectCheck> {
     let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
@@ -386,7 +397,7 @@ fn walk_package_initialization(
 
 fn check_initializer_expression(
     topology: &ModuleInitializationTopology,
-    actual: &mut ActualCalls<'_>,
+    actual: &mut ActualCalls<'_, impl ActualIntegerObserver>,
     source: &SourceIdentity,
     storage: &HashMap<ByteSpan, InitializerValue<'_>>,
     expression: OccurrenceOrdinal,
@@ -480,17 +491,33 @@ fn evaluate_initializer_predicate(
 
 const MAX_INITIALIZER_BRANCH_DEPTH: usize = 64;
 
-struct ActualCalls<'a> {
+struct ActualCalls<'a, Observer> {
     project: &'a ScalarProject,
     calls: &'a ProjectCallSiteResults,
     active: HashSet<(usize, usize)>,
     reached: HashSet<(usize, usize)>,
     had_obligations: bool,
+    observer: Observer,
+}
+
+trait ActualIntegerObserver {
+    const ENABLED: bool;
+
+    fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt) -> Result<(), ProjectCheck>;
+}
+
+impl ActualIntegerObserver for () {
+    const ENABLED: bool = false;
+
+    #[inline(always)]
+    fn observe(&mut self, _target: (usize, usize), _arguments: &[&BigInt], _value: &BigInt) -> Result<(), ProjectCheck> {
+        Ok(())
+    }
 }
 
 const MAX_ACTUAL_CALL_DEPTH: usize = 64;
 
-impl ActualCalls<'_> {
+impl<Observer: ActualIntegerObserver> ActualCalls<'_, Observer> {
     fn nested(
         &mut self,
         caller: &FunctionCallSites,
@@ -580,6 +607,11 @@ impl ActualCalls<'_> {
             Err(ProjectCheck::Unsupported)
         };
         self.active.remove(&target);
+        if Observer::ENABLED {
+            if let Ok(ActualCallResult::Integer(value)) = &result {
+                self.observer.observe(target, exact, value)?;
+            }
+        }
         if result.is_ok() {
             self.reached.insert(target);
         }
@@ -971,7 +1003,7 @@ pub fn check_scalar_module_proof(
     inputs: ScalarPreparationInputs,
 ) -> ScalarModuleProofOutcome {
     let result = PreparedProofModule::prepare_project(proof_source, modules, initialization_order, inputs)
-        .and_then(|prepared| prepared.check_unused(proof_name));
+        .and_then(|prepared| prepared.check_module_proof(proof_name));
     match result {
         Ok(ProjectCheck::Proved) => ScalarModuleProofOutcome::Proved,
         Ok(ProjectCheck::Refuted) => ScalarModuleProofOutcome::Refuted,
@@ -984,28 +1016,39 @@ pub fn check_scalar_module_proof(
 
 #[cfg(feature = "internal-checker")]
 impl PreparedProofModule {
-    fn check_unused(&self, proof_name: &str) -> Result<ProjectCheck, ProjectCheck> {
+    fn check_module_proof(&self, proof_name: &str) -> Result<ProjectCheck, ProjectCheck> {
         let proof = self.select_resolved(&self.source, proof_name)?;
         let (module, item, _) = proof.function;
-        let initialization = check_package_initialization(&self.prepared)?;
-        let proof_module = initialization.ordinals.get(&self.source).ok_or(ProjectCheck::MissingRoot)?;
-        if initialization.visits[module] != InitializationVisit::Completed
-            || initialization.visits[*proof_module] != InitializationVisit::Completed
-            || initialization.reached.contains(&(module, item))
-        {
-            return Err(ProjectCheck::Unsupported);
-        }
         if !derive_block(&child(proof.node, SyntaxKind::Block)?).items.is_empty() {
             return Err(ProjectCheck::Unsupported);
         }
         let TypedProofPostcondition { target, body, input_names, operator, bound, .. } =
             typed_proof_postcondition(&self.prepared, proof.function, proof.node)?;
+        let filter = prepare_proof_entry_filter(proof.node, &self.source, target.target_layout, &input_names, body)?;
+        let observer = SelectedProofObserver {
+            target: (module, item),
+            guard: actual_single_integer_guard(body, filter.as_deref().unwrap_or_default()),
+            relation: IntegerRelation::from_operator(&operator).ok_or(ProjectCheck::Unsupported)?,
+            bound: &bound,
+            applicable: None,
+            observed: false,
+        };
+        let (root, ordinals) = package_initialization_order(self.prepared.parts().0)?;
+        let (initialization, observer) = check_package_initialization_observing(&self.prepared, root, ordinals, observer)?;
+        let proof_module = initialization.ordinals.get(&self.source).ok_or(ProjectCheck::MissingRoot)?;
+        if initialization.visits[module] != InitializationVisit::Completed
+            || initialization.visits[*proof_module] != InitializationVisit::Completed
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        if initialization.reached.contains(&(module, item)) {
+            return observer.outcome();
+        }
         if !body.structure.checker_directives.is_empty() || !body.call_occurrences.is_empty()
             || !body.allocation_length_calls.is_empty() || !body.assignments.is_empty()
         {
             return Err(ProjectCheck::Unsupported);
         }
-        let filter = prepare_proof_entry_filter(proof.node, &self.source, target.target_layout, &input_names, body)?;
         let checked = if let Some(filter) = filter.as_deref() {
             check_integer_return_bound_where(body, &operator, &bound, filter)
         } else {
@@ -1019,6 +1062,79 @@ impl PreparedProofModule {
             Some(Err(failure)) => Err(project_failure(body, &target.source, failure)),
             None => Err(ProjectCheck::Unsupported),
         }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+struct ActualSingleIntegerGuard<'a> {
+    always_rejects: bool,
+    comparisons: Vec<(IntegerRelation, &'a BigInt)>,
+}
+
+#[cfg(feature = "internal-checker")]
+fn actual_single_integer_guard<'a>(
+    body: &FunctionCallSites,
+    filter: &'a [CheckerPredicate],
+) -> Option<ActualSingleIntegerGuard<'a>> {
+    let ([parameter], Some([binding])) = (body.boundary.parameters.as_slice(), body.boundary.checker_parameter_bindings.as_deref()) else {
+        return None;
+    };
+    if !is_integer_type(&parameter.ty) {
+        return None;
+    }
+    let mut guard = ActualSingleIntegerGuard { always_rejects: false, comparisons: Vec::new() };
+    for predicate in filter {
+        match predicate {
+            CheckerPredicate::Boolean(value) => guard.always_rejects |= !value,
+            CheckerPredicate::Integer(condition) if &condition.binding == binding => {
+                guard.comparisons.push((IntegerRelation::from_operator(&condition.operator)?, &condition.bound));
+            }
+            CheckerPredicate::Integer(_) => return None,
+        }
+    }
+    Some(guard)
+}
+
+#[cfg(feature = "internal-checker")]
+struct SelectedProofObserver<'a> {
+    target: (usize, usize),
+    guard: Option<ActualSingleIntegerGuard<'a>>,
+    relation: IntegerRelation,
+    bound: &'a BigInt,
+    applicable: Option<bool>,
+    observed: bool,
+}
+
+#[cfg(feature = "internal-checker")]
+impl SelectedProofObserver<'_> {
+    fn outcome(self) -> Result<ProjectCheck, ProjectCheck> {
+        if !self.observed {
+            return Err(ProjectCheck::Unsupported);
+        }
+        Ok(match self.applicable {
+            Some(true) => ProjectCheck::Proved,
+            Some(false) => ProjectCheck::Refuted,
+            None => ProjectCheck::NoApplicableInputs,
+        })
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+impl ActualIntegerObserver for SelectedProofObserver<'_> {
+    const ENABLED: bool = true;
+
+    fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt) -> Result<(), ProjectCheck> {
+        if target != self.target {
+            return Ok(());
+        }
+        let (Some(guard), [argument]) = (&self.guard, arguments) else { return Err(ProjectCheck::Unsupported); };
+        self.observed = true;
+        if !guard.always_rejects && self.applicable != Some(false)
+            && guard.comparisons.iter().all(|(relation, bound)| relation.accepts(argument.cmp(bound)))
+        {
+            self.applicable = Some(self.relation.accepts(value.cmp(self.bound)));
+        }
+        Ok(())
     }
 }
 

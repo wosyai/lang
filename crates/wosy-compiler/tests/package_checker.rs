@@ -529,3 +529,36 @@ fn reached_initializer_cycles_and_depth_fail_closed_when_there_are_obligations()
     assert_eq!(check(&chain(64)), ScalarCheckerOutcome::Passed);
     assert_eq!(check(&chain(65)), ScalarCheckerOutcome::Unsupported);
 }
+
+#[test]
+fn explicit_module_proof_uses_all_and_only_resolved_actual_call_contexts() {
+    let identity = source();
+    let proof = |invocations: &str, guard: &str, claim: &str| check_scalar_module_proof(
+        identity.clone(),
+        "observed",
+        vec![ScalarProofModuleInput {
+            source: identity.clone(),
+            text: format!(
+                "%%start\n                u8(u8) project = fn(value) {{ value }};\n                unit(u8) use = fn(input) {{ u8 result = project(input); core.require(result <= 255, {OUTPUT}); }};\n                {invocations}\n                proof observed for project(input) -> (out) {guard} ensures ({claim}) {{}}\n                %%end",
+            ),
+            namespaces: Vec::new(),
+        }],
+        vec![identity.clone()],
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    );
+    assert_eq!(proof("use(5); use(7);", "", "out <= 7"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(proof("", "", "out <= 7"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(proof("use(5); use(7);", "", "out <= 6"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(
+        proof("use(5); use(7);", "where (input <= 4)", "out <= 4"),
+        ScalarModuleProofOutcome::NoApplicableInputs,
+    );
+    assert_eq!(
+        proof("use(5); use(7);", "where (input <= 6)", "out <= 6"),
+        ScalarModuleProofOutcome::Proved,
+    );
+    assert_eq!(
+        proof("use(5); u8 unknown = project(1);", "", "out <= 5"),
+        ScalarModuleProofOutcome::Unsupported,
+    );
+}
