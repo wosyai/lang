@@ -1,4 +1,4 @@
-use std::{collections::HashMap, rc::Rc};
+use std::{borrow::Cow, collections::HashMap, rc::Rc};
 
 use num_bigint::BigInt;
 
@@ -8,7 +8,7 @@ use super::{
     reference::{BlockOrdinal, CheckerIntegerCallArgument, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, PlainNameIdentity},
     symbolic_integer::{IntegerRelation, IntegerSet},
     typecheck::is_integer_type,
-    BinaryOperator, ReferenceBindingId, ScalarExpression, ScalarType,
+    BinaryOperator, ReferenceBindingId, ScalarExpression, ScalarType, UnaryOperator,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,7 +30,7 @@ pub(super) struct IntegerComparison<'a> {
     pub(super) right: &'a ScalarExpression,
     pub(super) name: &'a str,
     pub(super) operator: &'a BinaryOperator,
-    pub(super) bound: &'a BigInt,
+    pub(super) bound: Cow<'a, BigInt>,
 }
 
 impl<'a> IntegerComparison<'a> {
@@ -48,14 +48,21 @@ impl<'a> IntegerComparison<'a> {
         let ScalarExpression::Name { name, .. } = left.as_ref() else {
             return None;
         };
-        let ScalarExpression::Integer { value: bound, .. } = right.as_ref() else {
-            return None;
+        let bound = match right.as_ref() {
+            ScalarExpression::Integer { value, .. } => Cow::Borrowed(value),
+            ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } => {
+                let ScalarExpression::Integer { value, .. } = operand.as_ref() else {
+                    return None;
+                };
+                Cow::Owned(-value)
+            }
+            _ => return None,
         };
         Some(Self { left, right, name, operator, bound })
     }
 
     pub(super) fn typed(
-        &self,
+        self,
         left_type: &ScalarType,
         right_type: &ScalarType,
         binding: ReferenceBindingId,
@@ -67,7 +74,7 @@ impl<'a> IntegerComparison<'a> {
             binding,
             ty: left_type.clone(),
             operator: self.operator.clone(),
-            bound: self.bound.clone(),
+            bound: self.bound.into_owned(),
         })
     }
 }
@@ -230,10 +237,18 @@ impl IntegerInputs {
     }
 
     pub(super) fn includes(&self, coordinates: &[u128]) -> bool {
+        self.includes_coordinates(coordinates)
+    }
+
+    pub(super) fn includes_signed(&self, coordinates: &[i128]) -> bool {
+        self.includes_coordinates(coordinates)
+    }
+
+    fn includes_coordinates<T: Copy + Into<BigInt>>(&self, coordinates: &[T]) -> bool {
         self.0.iter().any(|row| {
             row.len() == coordinates.len()
                 && row.iter().zip(coordinates).all(|(axis, value)| {
-                    axis.split(&BinaryOperator::Equal, &BigInt::from(*value))
+                    axis.split(&BinaryOperator::Equal, &(*value).into())
                         .is_some_and(|(matching, _)| !matching.is_empty())
                 })
         })

@@ -744,7 +744,7 @@ fn check_selected_proof(
             ProjectCheck::InvalidProof
         });
     }
-    if !integer_literal_fits_type(ensures.bound, &result.ty) {
+    if !integer_literal_fits_type(ensures.bound.as_ref(), &result.ty) {
         return Err(ProjectCheck::InvalidProof);
     }
 
@@ -756,11 +756,11 @@ fn check_selected_proof(
     let filter = where_clause.as_ref().map(|expression| proof_entry_filters(expression, &input_names, body)).transpose()?;
     let checked = if !steps.items.is_empty() {
         let proof = proof_show_branch(&steps, &input_names, output, &result.ty, body)?;
-        check_integer_return_bound_with_shows(body, ensures.operator, ensures.bound, filter.as_deref(), &proof)
+        check_integer_return_bound_with_shows(body, ensures.operator, ensures.bound.as_ref(), filter.as_deref(), &proof)
     } else if let Some(filter) = filter.as_deref() {
-        check_integer_return_bound_where(body, ensures.operator, ensures.bound, filter)
+        check_integer_return_bound_where(body, ensures.operator, ensures.bound.as_ref(), filter)
     } else {
-        check_integer_return_bound(body, ensures.operator, ensures.bound)
+        check_integer_return_bound(body, ensures.operator, ensures.bound.as_ref())
             .map(|result| result.map(ProofCoverage::Applicable))
     };
     let outcome = match checked {
@@ -855,7 +855,7 @@ fn issue_return_bound(
         output_slot: output.ordinal,
         output_type: output.ty.clone(),
         operator: ensures.operator.clone(),
-        bound: ensures.bound.clone(),
+        bound: ensures.bound.as_ref().clone(),
         guards,
     })
 }
@@ -1045,7 +1045,7 @@ fn proof_input_condition(
     if !is_integer_type(ty) {
         return Err(ProjectCheck::Unsupported);
     }
-    if !integer_literal_fits_type(condition.bound, ty) {
+    if !integer_literal_fits_type(condition.bound.as_ref(), ty) {
         return Err(ProjectCheck::InvalidProof);
     }
     let bindings = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
@@ -1931,6 +1931,28 @@ mod tests {
                 expected,
                 "guard {guard}",
             );
+        }
+    }
+
+    #[test]
+    fn signed_where_and_ensures_use_the_actual_integer_width_and_boundaries() {
+        let app = source("src/main.w", "signed-proof-input");
+        for (ty, guard, result, expected) in [
+            ("i8", "x >= -128 && x <= -5", "out <= -5", ProjectCheck::Proved),
+            ("i8", "x >= -128 && x <= -5", "out < -5", ProjectCheck::Refuted),
+            ("i8", "x <= -128 && x > -128", "out <= -5", ProjectCheck::NoApplicableInputs),
+            ("i8", "x >= -129", "out <= -5", ProjectCheck::InvalidProof),
+            ("i8", "x <= -5", "out >= -129", ProjectCheck::InvalidProof),
+            ("u8", "x >= -1", "out <= 5", ProjectCheck::InvalidProof),
+            ("i8", "!(x < -5) && x <= -2", "out >= -5", ProjectCheck::Proved),
+            ("i8", "x >= -x", "out <= -5", ProjectCheck::Unsupported),
+            ("i64", "x == -9223372036854775808", "out == -9223372036854775808", ProjectCheck::Proved),
+            ("i128", "x == -170141183460469231731687303715884105728",
+                "out == -170141183460469231731687303715884105728", ProjectCheck::Proved),
+        ] {
+            let callable = format!("%%start\n{ty}({ty}) identity = fn(value) {{ value }};\n%%end");
+            let proof = format!("proof bounded for identity(x) -> (out) where ({guard}) ensures ({result}) {{}}");
+            assert_eq!(prove(&app, &callable, &proof), expected, "{ty} {guard} {result}");
         }
     }
 

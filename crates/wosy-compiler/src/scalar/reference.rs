@@ -6772,11 +6772,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         else {
             return None;
         };
-        comparison.typed(
-            self.occurrence_typing.checked_expression_type(comparison.left)?,
-            self.occurrence_typing.checked_expression_type(comparison.right)?,
-            binding,
-        ).map(CheckerPredicate::Integer)
+        let left_type = self.occurrence_typing.checked_expression_type(comparison.left)?;
+        let right_type = self.occurrence_typing.checked_expression_type(comparison.right)?;
+        comparison.typed(left_type, right_type, binding).map(CheckerPredicate::Integer)
     }
 
     fn expression_at_with_initializer_statement(

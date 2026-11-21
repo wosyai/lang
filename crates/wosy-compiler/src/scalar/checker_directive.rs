@@ -1090,6 +1090,32 @@ mod tests {
     }
 
     #[test]
+    fn signed_callable_branch_and_requirement_share_the_same_exact_bound() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        for bound in [-5, -6] {
+            let source = format!(r#"
+                i8(i8) checked = fn(value) {{
+                    if (value >= {bound}) {{
+                        core.require(value >= -5, {{ .stdout = ""; .stderr = "below -5"; .code = 1; .files = []; }});
+                    }};
+                    value
+                }};
+            "#);
+            check_source(&source, |body| {
+                let checked = check_integer_requirements(body).unwrap();
+                if bound == -5 {
+                    assert_eq!(checked, Ok(()));
+                } else {
+                    let failure = checked.unwrap_err();
+                    for value in -128..=127 {
+                        assert_eq!(failure.state.includes_signed(&[value]), value == -6);
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
     fn where_bound_filters_only_the_selected_proof() {
         use crate::scalar::{
             checker_flow::{check_integer_return_bound, check_integer_return_bound_where, ProofCoverage},
