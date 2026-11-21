@@ -17,7 +17,7 @@ Each diagnostic carries a code, a message, and labeled spans.
 ## Types and effects
 
 - `B0003`: type and form errors, including unknown scalar types, missing fields, invalid struct types, naming-convention violations, unsupported raw pointer or extern shapes, direct foreign arrays or checked references, type mismatches against the expected type, integer operations over non-integers, context-free `null`, string, or array literals, and dereference assignment through an immutable reference.
-- `B0005 while/conditional expression requires bool`: `while` and `if` conditions must be `bool`.
+- `B0005 conditional expression requires bool`: `if` conditions must be `bool`.
 - `B0006 conditional branches must have equal types`: `if/else` value branches must agree.
 - `B0007 assignment targets a SCREAMING_SNAKE_CASE const binding`: constants never accept assignment.
 - `B0009 local binding or parameter has no required static use`: every local must be read.

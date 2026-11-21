@@ -114,15 +114,12 @@ if (ready) {
 } else {
   log();
 }
-while (value < 3) {
-  value = value + 1;
-}
 unsafe {
   *?u8 p = &?iovec;
 }
 ```
 
-Conditions are always `bool`. `&&` and `||` short-circuit.
+Conditions are always `bool`. `&&` and `||` short-circuit. Use recursion for repetition in the base language.
 
 ## Types, addresses, core
 
@@ -183,4 +180,4 @@ i32 MAXIMUM = 1;
 MAXIMUM = 2;
 ```
 
-Every local binding must be read. An unused local fails with `B0009`. A `while` or `if` over a non-`bool` fails with `B0005`. Unknown names fail with `B0001`, duplicates with `B0002`, arity mismatches with `B0004`, out-of-range literals with `B0010`, missing modules with `M0001`, import cycles with `M0003`.
+Every local binding must be read. An unused local fails with `B0009`. An `if` over a non-`bool` fails with `B0005`. Unknown names fail with `B0001`, duplicates with `B0002`, arity mismatches with `B0004`, out-of-range literals with `B0010`, missing modules with `M0001`, import cycles with `M0003`.
