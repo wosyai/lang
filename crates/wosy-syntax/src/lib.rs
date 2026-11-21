@@ -645,6 +645,9 @@ fn scan_comments(
     errors: &mut Vec<SyntaxError>,
 ) -> Vec<TypedComment> {
     let mut comments = Vec::new();
+    if !text.as_bytes().contains(&b'#') {
+        return comments;
+    }
     let Ok(mut pairs) = WosyParser::parse(Rule::comment_scan, text) else {
         return comments;
     };
@@ -736,7 +739,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::generic_type_arguments => SyntaxKind::GenericTypeArguments,
         Rule::generic_type_argument => SyntaxKind::GenericTypeArgument,
         Rule::qualified_member => SyntaxKind::QualifiedMember,
-        Rule::assignment_target => SyntaxKind::AssignmentTarget,
+        Rule::assignment_target | Rule::non_indexed_assignment_target => SyntaxKind::AssignmentTarget,
         Rule::unsafe_expr => SyntaxKind::Unsafe,
         Rule::assignment => SyntaxKind::Assignment,
         Rule::top_level_item => SyntaxKind::TopLevelItem,
