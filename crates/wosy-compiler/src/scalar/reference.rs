@@ -3686,7 +3686,7 @@ struct ReferenceEdgeState {
     point_values: ReferencePointValues,
     return_outputs: BTreeMap<usize, BTreeSet<ReferenceOriginId>>,
     moved: Vec<(ReferencePlaceId, SourceSpan)>,
-    moved_checked_handles: BTreeMap<ReferenceBindingId, SourceSpan>,
+    moved_checked_handles: BTreeMap<ReferenceBindingId, Vec<(Vec<ReferencePlaceProjection>, SourceSpan)>>,
     assignment_previous: BTreeMap<CfgPointId, BTreeSet<ReferenceOriginId>>,
 }
 
@@ -3825,6 +3825,27 @@ fn unavailable_origins(state: &ReferenceEdgeState, place: &ReferencePlaceId) -> 
         .moved
         .iter()
         .filter(|(moved, _)| reference_places_overlap(moved, &place))
+        .map(|(_, origin)| origin.clone())
+        .collect()
+}
+
+fn is_lexical_checked_handle_path(path: &[ReferencePlaceProjection]) -> bool {
+    path.iter().all(|projection| {
+        matches!(projection, ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(_)))
+    })
+}
+
+fn unavailable_checked_handles(
+    state: &ReferenceEdgeState,
+    binding: &ReferenceBindingId,
+    path: &[ReferencePlaceProjection],
+) -> Vec<SourceSpan> {
+    state
+        .moved_checked_handles
+        .get(binding)
+        .into_iter()
+        .flatten()
+        .filter(|(moved, _)| moved.starts_with(path) || path.starts_with(moved))
         .map(|(_, origin)| origin.clone())
         .collect()
 }
@@ -4975,11 +4996,22 @@ fn transfer_reference_facts(
                     _ => unreachable!("assignment previous origins"),
                 }
             }
-            let read_places = match &point.kind {
-                CfgPointKind::ReadPlace { candidates, .. } => candidates.as_slice(),
-                _ => &[],
+            let (read_places, lexical_read) = match &point.kind {
+                CfgPointKind::ReadPlace { candidates, pointer_point, .. } => {
+                    (candidates.as_slice(), pointer_point.is_none())
+                }
+                _ => (&[][..], false),
             };
             for place in read_places {
+                if lexical_read && is_lexical_checked_handle_path(&place.projections) {
+                    let origins = unavailable_checked_handles(&state, &place.binding, &place.projections);
+                    if !origins.is_empty() {
+                        errors.push(ReferenceAnalysisError::ConflictingPlace {
+                            source_span: point.source_span.clone(),
+                            origins,
+                        });
+                    }
+                }
                 if unavailable_place(&state, place)
                     || state.released.contains(&place.binding)
                     || state.invalidated.contains(&place.binding)
@@ -4999,11 +5031,14 @@ fn transfer_reference_facts(
                             ..
                         },
                     ..
-                } if place.projections.is_empty() => {
-                    state
+                } if is_lexical_checked_handle_path(&place.projections) => {
+                    let moved = state
                         .moved_checked_handles
                         .entry(place.binding.clone())
-                        .or_insert_with(|| point.source_span.clone());
+                        .or_default();
+                    if !moved.iter().any(|(path, _)| *path == place.projections) {
+                        moved.push((place.projections.clone(), point.source_span.clone()));
+                    }
                 }
                 CfgPointKind::Move {
                     place,
@@ -5165,10 +5200,11 @@ fn transfer_reference_facts(
                     }
                 }
                 CfgPointKind::Read { binding } => {
-                    if let Some(origin) = state.moved_checked_handles.get(binding) {
+                    let origins = unavailable_checked_handles(&state, binding, &[]);
+                    if !origins.is_empty() {
                         errors.push(ReferenceAnalysisError::ConflictingPlace {
                             source_span: point.source_span.clone(),
-                            origins: vec![origin.clone()],
+                            origins,
                         });
                     }
                     if state
@@ -5261,6 +5297,14 @@ fn transfer_reference_facts(
                         state.released.remove(binding);
                         state.invalidated.remove(binding);
                     } else {
+                        if let Some(moved) = state.moved_checked_handles.get_mut(binding) {
+                            if is_lexical_checked_handle_path(&target.projections) {
+                                moved.retain(|(path, _)| !path.starts_with(&target.projections));
+                                if moved.is_empty() {
+                                    state.moved_checked_handles.remove(binding);
+                                }
+                            }
+                        }
                         for origins in state.bindings.values_mut() {
                             origins.retain(|origin| !previous_origins.contains(origin));
                         }

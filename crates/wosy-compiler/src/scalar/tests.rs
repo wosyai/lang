@@ -1773,6 +1773,69 @@ fn parent_and_child_pointee_reads_respect_last_use_sharing_and_unrelated_origins
 }
 
 #[test]
+fn moved_mutable_checked_field_rejects_joined_field_and_whole_reads() {
+    for read in ["parcel.handle", "parcel"] {
+        let text = format!("%%start
+struct Bag {{ *!u8 handle; u8 other; }}
+unit(u8, bool) check_field = fn(value, condition) {{
+    Bag parcel = {{ .handle = null; .other = 1; }};
+    parcel.handle = &!value;
+    if (condition) {{
+        *!u8 taken = parcel.handle;
+        *taken = 3;
+    }};
+    parcel.other = 2;
+    {read};
+}};
+%%end");
+        let moved = text.find("taken = parcel.handle").unwrap() as u32 + "taken = ".len() as u32;
+        let start = text.rfind(&format!("{read};")).unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected one unavailable-place diagnostic for {read}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.code, "B0003");
+            assert_eq!(diagnostic.message, "read or move of unavailable place");
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(start, start + read.len() as u32),
+            );
+            assert_eq!(
+                diagnostic.labels[1].span.range,
+                ByteSpan::new(moved, moved + "parcel.handle".len() as u32),
+            );
+            assert_eq!(
+                diagnostic.labels[1].kind,
+                super::super::DiagnosticLabelKind::Secondary,
+            );
+        }
+    }
+}
+
+#[test]
+fn mutable_checked_field_transfer_allows_sibling_and_reinitialized_reads() {
+    let text = "%%start
+struct Bag { *!u8 handle; u8 other; }
+unit(u8, u8) check_field = fn(value, replacement) {
+    Bag parcel = { .handle = null; .other = 1; };
+    parcel.handle = &!value;
+    *!u8 taken = parcel.handle;
+    *taken = 3;
+    parcel.other;
+    parcel.handle = &!replacement;
+    *!u8 renewed = parcel.handle;
+    renewed;
+    parcel = { .handle = null; .other = 2; };
+    parcel;
+};
+%%end";
+    let (single, project) = both_reference_functions(text);
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+}
+
+#[test]
 fn checked_aggregate_conflicts_label_the_initiating_loan_in_both_pipelines() {
     for (text, primary, origin) in [
             ("%%start\nstruct Payload { u8 value; }\nunit() f = fn { Payload specimen = { .value = 1; }; *!Payload writer = &!specimen; Payload taken = *writer; Payload again = *writer; taken; again; };\n%%end", "*writer; taken", "&!specimen"),
