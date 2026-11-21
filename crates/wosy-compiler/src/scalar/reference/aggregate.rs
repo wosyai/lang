@@ -2454,10 +2454,12 @@ leaf = overload {
             let source = SourceIdentity::new("project".into(), "package".into(), "main.w".into(), "r1".into());
             let parsed = crate::parse_source(source.clone(), text.into(), &[]);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-            let typed = typecheck_scalar_program(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), layout);
+            let (typed, occurrences) = typecheck_scalar_program_with_occurrences(
+                derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), layout,
+            );
             assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
             let program = typed.program;
-            let calls = resolve_program_call_sites(&program).unwrap();
+            let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
             let (updates, errors) = derive_and_converge_program_references(&program, &calls);
             assert!(errors.is_empty(), "{errors:?}");
             let mut bodies = BTreeMap::new();
@@ -2530,10 +2532,12 @@ pick = overload {
             let source = SourceIdentity::new("project".into(), "package".into(), "main.w".into(), "r1".into());
             let parsed = crate::parse_source(source.clone(), text.into(), &[]);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-            let typed = typecheck_scalar_program(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), layout);
+            let (typed, occurrences) = typecheck_scalar_program_with_occurrences(
+                derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), layout,
+            );
             assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
             let program = typed.program;
-            let calls = resolve_program_call_sites(&program).unwrap();
+            let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
             let (updates, errors) = derive_and_converge_program_references(&program, &calls);
             assert!(errors.is_empty(), "{errors:?}");
             let mut bodies = BTreeMap::new();

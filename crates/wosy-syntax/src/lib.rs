@@ -1836,7 +1836,11 @@ mod tests {
             );
         }
         assert!(parsed.root.descendants().any(|node| {
-            node.kind() == SyntaxKind::AssignmentTarget && node.text() == "(*base).member[1]"
+            node.kind() == SyntaxKind::AssignmentTarget
+                && node.text() == "(*base).member[1] "
+                && node.descendants().any(|suffix| {
+                    suffix.kind() == SyntaxKind::IndexSuffix && suffix.text() == "[1]"
+                })
         }));
         assert!(parsed.root.descendants().any(|node| {
             node.kind() == SyntaxKind::PlaceTarget && node.text() == "(*base).member[1]"

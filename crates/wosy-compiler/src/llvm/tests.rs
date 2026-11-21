@@ -3606,7 +3606,7 @@ fn releases_runtime_array_backing_after_copying_primitive_returns() {
 u8(u64) indexed = fn(length) { u8[length] bytes; bytes[0] = 7; bytes[0] };
 u8(u64) copied = fn(length) { u8[length] bytes; bytes[0] = 7; u8 result = bytes[0]; result };
 u8(u64) indirect = fn(length) { u8[length] bytes; bytes[0] = 7; *u8 view = &bytes[0]; *view };
-enum Event { none; started; }
+enum copy Event { none; started; }
 Event(u64) enum_indexed = fn(length) { Event[length] events; events[0] = Event::started; events[0] };
 Event(u64) enum_copied = fn(length) { Event[length] events; events[0] = Event::started; Event result = events[0]; result };
 %%end";
