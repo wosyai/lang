@@ -259,12 +259,18 @@ fn source_observation_path(observation: &SourceObservation) -> std::path::PathBu
     std::path::Path::new(&observation.source.project).join(observation.source.path.as_path())
 }
 
-fn compile_project(
+struct CanonicalProjectInputs {
+    declarations: Vec<(wosy_compiler::ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    graph: wosy_project::SourceGraph,
+    texts: BTreeMap<ProjectSourceIdentity, String>,
+}
+
+fn load_canonical_project_inputs(
     root: &std::path::Path,
     project: &ProjectContext,
     configuration: &ProjectConfiguration,
-    target_layout: ScalarTargetLayout,
-) -> Result<(String, Vec<SourceObservation>), String> {
+) -> Result<CanonicalProjectInputs, String> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
     let root_project = root.to_string_lossy().into_owned();
     let mut discovered = HashMap::from([(
@@ -440,10 +446,30 @@ fn compile_project(
                 .ok_or_else(|| format!("missing module {}", node.source.path.as_path().display()))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    Ok(CanonicalProjectInputs {
+        declarations: project_declarations,
+        initialization_order,
+        graph,
+        texts,
+    })
+}
+
+fn compile_project(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+) -> Result<(String, Vec<SourceObservation>), String> {
+    let CanonicalProjectInputs {
+        declarations,
+        initialization_order,
+        graph,
+        texts,
+    } = load_canonical_project_inputs(root, project, configuration)?;
     #[cfg(test)]
     routing_observations::record(|counts| counts.preparations += 1);
     let prepared = prepare_scalar_project(
-        project_declarations,
+        declarations,
         initialization_order,
         ScalarPreparationInputs { target_layout },
     )
