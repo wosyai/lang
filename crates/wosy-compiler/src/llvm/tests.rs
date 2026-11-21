@@ -14,7 +14,7 @@ use crate::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, derive_scalar_program,
     derive_scalar_program_with_layout, emit_scalar_build_project_llvm,
     emit_scalar_build_single_module_llvm, parse_source, prepare_scalar_project,
-    validate_scalar_project, ScalarItem, ScalarModule, ScalarNamespaceBinding, ScalarOutput,
+    validate_scalar_project, ScalarBlockItem, ScalarExpression, ScalarItem, ScalarModule, ScalarNamespaceBinding, ScalarOutput,
     ScalarOutputSequence, ScalarPreparationInputs, ScalarProject, ScalarTargetLayout, ScalarType,
 };
 use wosy_syntax::{ByteSpan, SourceIdentity};
@@ -3435,6 +3435,64 @@ fn emits_multiple_unit_conditionals_in_a_branch() {
         4,
         "{llvm}"
     );
+}
+
+#[test]
+fn discards_terminated_call_result_but_preserves_effects_and_value_conditional() {
+    let text = r#"%%start
+i32 saved = 0;
+i32() touch = fn {
+    saved = 5;
+    saved
+};
+unit(bool) attempt = fn(enabled) {
+    if (enabled) {
+        touch();
+    } else {
+        saved = 2;
+    };
+};
+i32(bool) choose = fn(enabled) {
+    if (enabled) { saved } else { 3 }
+};
+unit done = attempt(true);
+i32 result = choose(true);
+%%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let module = &prepared.project().modules[0];
+        let attempt = module.items.iter().find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == "attempt" => Some(function),
+            _ => None,
+        }).unwrap();
+        let [ScalarBlockItem::Expression(ScalarExpression::If { then_branch, .. })] =
+            attempt.body.items.as_slice()
+        else {
+            panic!("expected conditional statement");
+        };
+        assert_eq!(then_branch.terminated_items, [true]);
+        assert!(then_branch.final_output_values.is_empty());
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let scalar = derive_scalar_program_with_layout(&parse_source(source, text.into(), &[]).result, layout);
+        assert!(scalar.diagnostics.is_empty(), "{:?}", scalar.diagnostics);
+        for partition in [
+            emit_scalar_llvm(&scalar),
+            emit_scalar_build_single_module_llvm(&checked),
+            emit_scalar_build_project_llvm(&checked),
+        ] {
+            let ir = partition.unwrap().to_text();
+            let effects = ir.lines().filter(|line| line.contains(" = call i32 @")).count();
+            assert_eq!(effects, 2, "{layout:?}: {ir}");
+            assert_eq!(ir.matches("phi i32").count(), 1, "{layout:?}: {ir}");
+            assert!(ir.contains("store i32 5"), "{layout:?}: {ir}");
+            assert!(ir.contains("store i32 2"), "{layout:?}: {ir}");
+            let ctx = Context::create();
+            let memory = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "discarded-call");
+            ctx.create_module_from_ir(memory).unwrap().verify().unwrap();
+        }
+    }
 }
 
 #[test]
