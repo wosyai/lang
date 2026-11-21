@@ -2725,8 +2725,8 @@ fn emit_block_at<'ctx, 'module>(
     }
     release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
     if matches!(emission, BlockEmission::TailArm(_)) {
-        aggregate_transfer::publish_checked_backing_arm(state, block)?;
         aggregate_transfer::release_failure_allocation(context, state, block)?;
+        aggregate_transfer::publish_checked_backing_arm(state, block)?;
     }
     state.storage = storage;
     state.values = values;
@@ -2809,8 +2809,8 @@ fn emit_project_block_at<'ctx, 'module>(
     }
     release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
     if matches!(emission, BlockEmission::TailArm(_)) {
-        aggregate_transfer::publish_checked_backing_arm(state, block)?;
         aggregate_transfer::release_failure_allocation(context, state, block)?;
+        aggregate_transfer::publish_checked_backing_arm(state, block)?;
     }
     state.storage = storage;
     state.values = values;

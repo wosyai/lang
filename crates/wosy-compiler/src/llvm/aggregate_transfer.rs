@@ -122,6 +122,15 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
         let checked_backing_output = plan.checked_backing_producer.map(|_| definition.get_nth_param(definition.count_params() - 1)
             .ok_or_else(|| "missing private checked backing output".to_owned())
             .map(|value| value.into_pointer_value())).transpose()?;
+        let failure_site = plan.local_array_failure.filter(|_| {
+            plan.returning.is_none() && plan.input.is_none() && plan.calls.is_empty()
+                && plan.releases.is_empty() && plan.input_calls.is_empty()
+        });
+        if let Some(failure) = plan.checked_backing_producer.filter(|backing| backing.failure.is_some()) {
+            if failure_site != failure.failure.map(|arm| (failure.allocation, arm)) {
+                return Err("mixed checked backing producer has no matching local release".into());
+            }
+        }
         Ok(Some(Self {
             plan,
             input,
@@ -131,10 +140,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             ordinary_called: false,
             base: None,
             registered_allocation: None,
-            failure_site: plan.local_array_failure.filter(|_| {
-                plan.returning.is_none() && plan.input.is_none() && plan.calls.is_empty()
-                    && plan.releases.is_empty() && plan.input_calls.is_empty()
-            }),
+            failure_site,
             failure_allocation: None,
             failure_arm_visited: false,
             committed: false,
@@ -300,6 +306,9 @@ pub(super) fn release_failure_allocation<'ctx>(
     if !state.automatic_return_result_owners.is_empty() || !state.joined_return_bindings.is_empty()
         || state.runtime_array_owners.keys().any(|name| name != &owner)
     {
+        if aggregate.plan.checked_backing_producer.is_some_and(|plan| plan.failure == Some(arm)) {
+            return Err("mixed checked backing release overlaps another owner".into());
+        }
         return Ok(());
     }
     super::ownership::release_proven_local_array(context, state, base, live)
@@ -533,7 +542,15 @@ pub(super) fn publish_checked_backing_arm<'ctx>(
     let (base, name) = aggregate.checked_backing_base.as_ref()
         .ok_or_else(|| "missing proved original checked backing".to_owned())?;
     let output = aggregate.checked_backing_output.ok_or_else(|| "missing proved checked backing output".to_owned())?;
-    state.builder.build_store(output, *base).map_err(builder_error)?;
+    let published = if plan.failure == Some(ordinal) {
+        if !aggregate.failure_arm_visited || aggregate.failure_allocation.is_some() {
+            return Err("mixed checked backing arm did not consume the original allocation".into());
+        }
+        base.get_type().const_null()
+    } else {
+        *base
+    };
+    state.builder.build_store(output, published).map_err(builder_error)?;
     aggregate.checked_backing_arms |= bit;
     state.runtime_array_owners.insert(name.clone(), false);
     Ok(())
@@ -549,9 +566,18 @@ pub(super) fn release_checked_backing<'ctx>(
     }
     let base = aggregate.checked_backing_receiver.take().ok_or_else(|| "missing checked backing at lexical exit".to_owned())?;
     declare_core_runtime(context, state.module);
-    let free = state.module.get_function(CORE_FREE_SYMBOL).ok_or_else(|| "missing checked backing runtime free".to_owned())?;
-    state.builder.build_call(free, &[base.into()], "checked_backing_release").map_err(builder_error)?;
+    let optional = aggregate.plan.checked_backing_optional;
     aggregate.checked_backing_released = true;
+    if optional {
+        let live = state.builder.build_is_not_null(base, "checked_backing_present").map_err(builder_error)?;
+        super::ownership::consume_runtime_array_release(context, state, super::ownership::RuntimeArrayRelease {
+            pointer: base.into(),
+            live: Some(live),
+        })?;
+    } else {
+        let free = state.module.get_function(CORE_FREE_SYMBOL).ok_or_else(|| "missing checked backing runtime free".to_owned())?;
+        state.builder.build_call(free, &[base.into()], "checked_backing_release").map_err(builder_error)?;
+    }
     Ok(())
 }
 

@@ -599,6 +599,19 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
         "*?u8 alias = data; Packet packet = { .data = alias; .length = count; };",
     );
     let nullable_descriptor = nullable_backing.replace("&packet, false", "null, false");
+    let mixed_descriptor = pure_recommit.replace("&packet, false", "null, false")
+        .replace(
+            "else {\n\t\t*?u8 data = null;\n\t\tunsafe { data = &?bytes[0]; };\n\t\tPacket packet = { .data = data; .length = count; };\n\t\tnull, false\n\t}",
+            "else { null, false }",
+        );
+    let competing_mixed = mixed_descriptor.replace("u8[count] bytes;", "u8[count] bytes; u8[count] other;");
+    let missing_failure_receipt = mixed_descriptor.replace("bytes = preserve(bytes, flag);", "");
+    let competing_formal = mixed_descriptor
+        .replace("(*Packet, bool)(u64, bool) make_checked = fn(count, flag)",
+            "(*Packet, bool)(u64, bool, u8[]) make_checked = fn(count, flag, unused)")
+        .replace("i32(u64, bool) inspect_checked = fn(count, flag)",
+            "i32(u64, bool, u8[]) inspect_checked = fn(count, flag, buffer)")
+        .replace("make_checked(count, flag)", "make_checked(count, flag, buffer)");
     let app = source("private_checked_backing", "src/main.w");
     let values = source("package", "src/values.w");
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
@@ -608,6 +621,8 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
             (pure_recommit.as_str(), true, false), (observable_recommit.as_str(), false, false),
             (nullable_backing.as_str(), true, false), (null_field_live_base.as_str(), true, false),
             (aliased_nullable.as_str(), false, false), (nullable_descriptor.as_str(), false, false),
+            (mixed_descriptor.as_str(), true, false), (competing_mixed.as_str(), false, false),
+            (missing_failure_receipt.as_str(), false, false), (competing_formal.as_str(), false, false),
         ] {
             let (inputs, order) = if qualified {
                 (vec![(declarations(&app, text), vec![namespace("imported", &values)]),
@@ -636,12 +651,18 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
                 let producer_ir = producer.print_to_string().to_string();
                 assert_eq!(producer.count_params(), 3);
                 assert_eq!(producer.get_linkage(), inkwell::module::Linkage::Internal);
-                assert_eq!(producer_ir.matches("store ptr %allocation, ptr").count(), 2, "{producer_ir}");
-                assert!(!producer_ir.contains("call void @__wosy_core_free"), "{producer_ir}");
+                let mixed = text == mixed_descriptor;
+                assert_eq!(producer_ir.matches("store ptr %allocation, ptr").count(), if mixed { 1 } else { 2 }, "{producer_ir}");
+                assert_eq!(producer_ir.matches("call void @__wosy_core_free").count(), usize::from(mixed), "{producer_ir}");
+                if mixed {
+                    assert!(producer_ir.contains("call void @__wosy_core_free(ptr %allocation)"), "{producer_ir}");
+                    assert!(producer_ir.contains("store ptr null, ptr"), "{producer_ir}");
+                    assert!(consumer_ir.contains("icmp ne ptr %checked_backing_base, null"), "{consumer_ir}");
+                }
                 assert_eq!(consumer_ir.matches("call void @__wosy_core_free").count(), 2, "{consumer_ir}");
                 assert!(consumer_ir.contains("call void @__wosy_core_free(ptr %checked_backing_base)"), "{consumer_ir}");
             } else {
-                assert_eq!(producer.count_params(), 2);
+                assert_eq!(producer.count_params(), if text == competing_formal.as_str() { 3 } else { 2 });
                 assert!(!consumer_ir.contains("checked_backing_call"), "{consumer_ir}");
             }
         }
