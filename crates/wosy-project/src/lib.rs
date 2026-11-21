@@ -442,11 +442,14 @@ pub struct ProjectConfiguration {
 
 impl ProjectConfiguration {
     pub fn load(root: &Path) -> Result<Self, String> {
+        Self::load_with_manifest(root).map(|(configuration, _)| configuration)
+    }
+
+    pub fn load_with_manifest(root: &Path) -> Result<(Self, toml_edit::ImDocument<String>), String> {
         let path = root.join("wosy.toml");
         let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-        let document = content
-            .parse::<toml_edit::ImDocument<String>>()
-            .map_err(|error| error.to_string())?;
+        let document =
+            toml_edit::ImDocument::parse(content).map_err(|error| error.to_string())?;
         let package = document
             .get("package")
             .and_then(Item::as_table)
@@ -492,14 +495,17 @@ impl ProjectConfiguration {
                 },
             );
         }
-        Ok(Self {
-            default_target,
-            builders,
-            runners,
-            targets,
-            dependencies,
-            resolved_packages,
-        })
+        Ok((
+            Self {
+                default_target,
+                builders,
+                runners,
+                targets,
+                dependencies,
+                resolved_packages,
+            },
+            document,
+        ))
     }
 
     pub fn resolve_target(&self, target: Option<&str>) -> Result<String, String> {
@@ -986,6 +992,14 @@ impl ProjectContext {
         let document = content
             .parse::<DocumentMut>()
             .map_err(|error| format!("failed to parse {}: {error}", config_path.display()))?;
+        Self::from_manifest(root, target, document.as_table())
+    }
+
+    pub fn from_manifest(
+        root: &Path,
+        target: &str,
+        document: &toml_edit::Table,
+    ) -> Result<Self, String> {
         let target_table = document
             .get("targets")
             .and_then(Item::as_table)
