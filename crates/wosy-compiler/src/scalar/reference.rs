@@ -3319,10 +3319,79 @@ struct ReferenceEdgeState {
     value: Option<BTreeSet<ReferenceOriginId>>,
     released: BTreeSet<ReferenceBindingId>,
     invalidated: BTreeSet<ReferenceBindingId>,
-    point_values: Vec<Option<BTreeSet<ReferenceOriginId>>>,
+    point_values: ReferencePointValues,
     return_outputs: BTreeMap<usize, BTreeSet<ReferenceOriginId>>,
     moved: Vec<(ReferencePlaceId, SourceSpan)>,
     assignment_previous: BTreeMap<CfgPointId, BTreeSet<ReferenceOriginId>>,
+}
+
+#[derive(Clone, Default, PartialEq)]
+struct ReferencePointValues(Vec<(CfgPointId, BTreeSet<ReferenceOriginId>)>);
+
+impl ReferencePointValues {
+    fn position(&self, point: CfgPointId) -> Result<usize, usize> {
+        self.0.binary_search_by_key(&point, |(index, _)| *index)
+    }
+
+    fn get(&self, point: CfgPointId) -> Option<&BTreeSet<ReferenceOriginId>> {
+        self.position(point).ok().map(|index| &self.0[index].1)
+    }
+
+    fn record(
+        &mut self,
+        point: CfgPointId,
+        origins: &Option<BTreeSet<ReferenceOriginId>>,
+        last_use: &[usize],
+    ) {
+        self.0
+            .retain(|(index, _)| index.0 > point.0 || last_use[index.0] > point.0);
+        if last_use[point.0] > point.0 {
+            match (self.position(point), origins) {
+                (Ok(index), Some(origins)) => self.0[index].1 = origins.clone(),
+                (Err(index), Some(origins)) => self.0.insert(index, (point, origins.clone())),
+                (Ok(index), None) => {
+                    self.0.remove(index);
+                }
+                (Err(_), None) => {}
+            }
+        }
+    }
+
+    fn clear_from(&mut self, point: CfgPointId) {
+        let retained = self.0.partition_point(|(index, _)| *index < point);
+        self.0.truncate(retained);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn sparse_reference_point_values_keep_path_presence_and_expire_at_original_boundaries() {
+    let uses = [4, 3, 2, 6, 4, 6, 6];
+    let origins = BTreeSet::from([ReferenceOriginId(0)]);
+    let empty = BTreeSet::new();
+    let mut first = ReferencePointValues::default();
+    first.record(CfgPointId(0), &Some(origins.clone()), &uses);
+    first.record(CfgPointId(1), &Some(empty.clone()), &uses);
+    first.record(CfgPointId(2), &Some(empty.clone()), &uses);
+    assert_eq!(first.get(CfgPointId(0)), Some(&origins));
+    assert_eq!(first.get(CfgPointId(1)), Some(&empty));
+    assert_eq!(first.get(CfgPointId(2)), None);
+
+    let mut sibling = first.clone();
+    sibling.record(CfgPointId(3), &Some(origins.clone()), &uses);
+    assert_eq!(first.get(CfgPointId(1)), Some(&empty));
+    assert_eq!(sibling.get(CfgPointId(1)), None);
+    sibling.record(CfgPointId(1), &Some(empty.clone()), &uses);
+    assert_eq!(sibling.get(CfgPointId(3)), Some(&origins));
+    assert_eq!(sibling.get(CfgPointId(1)), Some(&empty));
+    sibling.clear_from(CfgPointId(3));
+    assert_eq!(sibling.get(CfgPointId(3)), None);
+    assert!(sibling == first);
+
+    sibling.record(CfgPointId(1), &None, &uses);
+    assert_eq!(sibling.get(CfgPointId(1)), None);
+    sibling.record(CfgPointId(4), &None, &uses);
+    assert_eq!(sibling.get(CfgPointId(0)), None);
 }
 
 #[derive(Clone, PartialEq)]
@@ -3625,7 +3694,6 @@ fn transfer_reference_facts(
     let mut incoming = vec![Vec::<ReferenceEdgeState>::new(); cfg.points.len()];
     incoming[0].push(ReferenceEdgeState {
         aggregate: aggregate.as_ref().map(|(facts, _, _)| facts.entry_state()),
-        point_values: vec![None; cfg.points.len()],
         ..ReferenceEdgeState::default()
     });
     let mut visited = vec![Vec::<ReferenceEdgeState>::new(); cfg.points.len()];
@@ -3655,7 +3723,7 @@ fn transfer_reference_facts(
                     ..
                 } => Some((
                     address_span.clone(),
-                    state.point_values[address_point.0].clone(),
+                    state.point_values.get(*address_point).cloned(),
                 )),
                 CfgPointKind::Release {
                     target:
@@ -3666,33 +3734,34 @@ fn transfer_reference_facts(
                         },
                 } => Some((
                     address_span.clone(),
-                    state.point_values[address_point.0].clone(),
+                    state.point_values.get(*address_point).cloned(),
                 )),
                 _ => None,
             };
             let move_pointer = match &cfg.points[id.0].kind {
                 CfgPointKind::MoveThrough { pointer_point, .. }
                 | CfgPointKind::DeferredMoveThrough { pointer_point, .. } => {
-                    Some(state.point_values[pointer_point.0].clone())
+                    Some(state.point_values.get(*pointer_point).cloned())
                 }
                 _ => None,
             };
             let assignment_rhs = match &cfg.points[id.0].kind {
                 CfgPointKind::Assign { rhs_point, .. }
                 | CfgPointKind::AssignThrough { rhs_point, .. } => {
-                    Some(state.point_values[rhs_point.0].clone())
+                    Some(state.point_values.get(*rhs_point).cloned())
                 }
                 _ => None,
             };
             let assignment_pointer = match &cfg.points[id.0].kind {
                 CfgPointKind::AssignThrough { pointer_point, .. } => {
-                    Some(state.point_values[pointer_point.0].clone())
+                    Some(state.point_values.get(*pointer_point).cloned())
                 }
                 _ => None,
             };
             let place_read_pointer = match &cfg.points[id.0].kind {
                 CfgPointKind::ReadPlace { pointer_point, .. } => {
-                    pointer_point.map(|pointer_point| state.point_values[pointer_point.0].clone())
+                    pointer_point
+                        .map(|pointer_point| state.point_values.get(pointer_point).cloned())
                 }
                 _ => None,
             };
@@ -3725,7 +3794,7 @@ fn transfer_reference_facts(
                     for origin in &contract.origins {
                         let actual = match origin {
                             ReferenceOrigin::BorrowedFrom { parameter, .. } => {
-                                if let Some(argument) = state.point_values[argument_points[*parameter].0].as_ref() {
+                                if let Some(argument) = state.point_values.get(argument_points[*parameter]) {
                                     results.extend(argument);
                                 } else {
                                     errors.push(ReferenceAnalysisError::MissingContext {
@@ -4089,7 +4158,7 @@ fn transfer_reference_facts(
                             pointer_point,
                             ..
                         } => {
-                            let candidates = match &state.point_values[pointer_point.0] {
+                            let candidates = match state.point_values.get(*pointer_point) {
                                 Some(origins) => {
                                     assignment_pointer_candidates(place, origins, &cfg.facts)
                                 }
@@ -4272,7 +4341,7 @@ fn transfer_reference_facts(
             }
             let checked_value = match &point.kind {
                 CfgPointKind::ReturnOutput { value_point, .. } => {
-                    state.point_values[value_point.0].clone()
+                    state.point_values.get(*value_point).cloned()
                 }
                 CfgPointKind::ReadPlace {
                     reads_origin: false,
@@ -4495,10 +4564,10 @@ fn transfer_reference_facts(
                     then_point,
                     else_point,
                 } => {
-                    let then_value = &state.point_values[then_point.0];
-                    let else_value = &state.point_values[else_point.0];
+                    let then_value = state.point_values.get(*then_point);
+                    let else_value = state.point_values.get(*else_point);
                     debug_assert!(then_value.is_none() || else_value.is_none());
-                    then_value.as_ref().or(else_value.as_ref()).cloned()
+                    then_value.or(else_value).cloned()
                 }
                 CfgPointKind::Return => Some(
                     state
@@ -4595,12 +4664,9 @@ fn transfer_reference_facts(
                 CfgPointKind::AssignThrough { .. } => state.value = checked_value,
                 _ => {}
             }
-            state.point_values[id.0] = point.possible_origins.clone();
-            for (index, value) in state.point_values.iter_mut().enumerate().take(id.0 + 1) {
-                if last_use[index] <= id.0 {
-                    *value = None;
-                }
-            }
+            state
+                .point_values
+                .record(id, &point.possible_origins, &last_use);
             if let Some(previous) = &mut observed[id.0] {
                 if let Some(origins) = &point.possible_origins {
                     previous
@@ -4711,7 +4777,7 @@ fn transfer_reference_facts(
                 if move_alternatives.is_empty() {
                     let mut next = state.clone();
                     if successor.0 <= id.0 {
-                        next.point_values[successor.0..].fill(None);
+                        next.point_values.clear_from(*successor);
                     }
                     if !visited[successor.0].contains(&next) && !slot.contains(&next) {
                         slot.push(next);
@@ -4723,7 +4789,7 @@ fn transfer_reference_facts(
                             next.moved.push((place.clone(), origin.clone()));
                         }
                         if successor.0 <= id.0 {
-                            next.point_values[successor.0..].fill(None);
+                            next.point_values.clear_from(*successor);
                         }
                         if !visited[successor.0].contains(&next) && !slot.contains(&next) {
                             slot.push(next);
