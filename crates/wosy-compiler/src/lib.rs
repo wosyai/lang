@@ -82,14 +82,19 @@ mod tests {
         assert!(core_runtime("llvm", "native")
             .expect("native runtime")
             .contains("__wosy_core_alloc"));
-        for output in ["wasm-wasip1", "wasm-wasip2"] {
-            let runtime = core_runtime("llvm", output).expect("Wasm runtime");
-            assert!(runtime.contains("wasm32-wasi"));
-            assert!(runtime.contains("%free_header_end = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %free_header64, i64 16)"));
-            assert!(runtime.contains("%reused_pointer_address = and i64 %free_aligned_sum_value, %free_alignment_inverse"));
-            assert!(runtime.contains("%back_pointer = getelementptr i8, ptr %payload, i32 -4"));
-            assert!(!runtime.contains("payload_address_slot"));
-        }
+        let preview1 = core_runtime("llvm", "wasm-wasip1").expect("Preview 1 runtime");
+        let preview2 = core_runtime("llvm", "wasm-wasip2").expect("Preview 2 runtime");
+        assert_eq!(preview1, preview2);
+        assert!(preview1.contains("target triple = \"wasm32-wasi\""));
+        assert!(preview1.contains("define ptr @__wosy_core_alloc(i64"));
+        assert!(preview1.contains("define void @__wosy_core_free(ptr"));
+        assert!(preview1.contains("define void @__wosy_core_system_panic()"));
+        assert!(preview1.lines().any(|line| {
+            line.contains("icmp ule i64") && line.ends_with(", 4294967296")
+        }));
+        assert!(preview1.lines().any(|line| {
+            line.contains("icmp ult i64") && line.ends_with(", 4294967296")
+        }));
     }
 
     #[test]
