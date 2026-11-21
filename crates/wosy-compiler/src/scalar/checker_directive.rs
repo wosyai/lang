@@ -1,3 +1,5 @@
+use std::collections::{hash_map::Entry, HashMap};
+
 use num_bigint::BigInt;
 
 use super::{
@@ -29,6 +31,15 @@ pub(super) struct CheckedLiteralOutput {
     pub(super) stdout_bytes: Box<[u8]>,
     pub(super) stderr_bytes: Box<[u8]>,
     pub(super) code_value: BigInt,
+    pub(super) text_files: Box<[ScalarCheckerTextFile]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScalarCheckerTextFile {
+    pub path: Box<str>,
+    pub path_span: ByteSpan,
+    pub text_span: ByteSpan,
+    pub text: Box<[u8]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,7 +62,6 @@ pub(super) struct CheckerOutput<'a> {
     files_literal: Option<ByteSpan>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct CheckerFileOutput<'a> {
     pub(super) path: &'a ScalarExpression,
     pub(super) content: CheckerFileContent<'a>,
@@ -139,9 +149,39 @@ impl CheckerOutput<'_> {
         let ScalarExpression::Integer { span: code, value: code_value } = self.code? else {
             return None;
         };
-        if !self.files.as_ref()?.is_empty() {
-            return None;
+        let files = self.files.as_ref()?.iter()
+            .map(CheckerFileOutput::explicit_text)
+            .collect::<Option<Vec<_>>>()?;
+        let mut targets = HashMap::new();
+        let mut next_id = 1;
+        for file in &files {
+            let mut parent = 0;
+            let mut components = file.path.split('/').peekable();
+            while let Some(component) = components.next() {
+                let is_file = components.peek().is_none();
+                match targets.entry((parent, component.to_ascii_uppercase())) {
+                    Entry::Vacant(entry) => {
+                        entry.insert((next_id, component, is_file));
+                        parent = next_id;
+                        next_id += 1;
+                    }
+                    Entry::Occupied(entry) if !is_file => {
+                        let &(id, spelling, existing_is_file) = entry.get();
+                        if existing_is_file || spelling != component {
+                            return None;
+                        }
+                        parent = id;
+                    }
+                    Entry::Occupied(_) => return None,
+                }
+            }
         }
+        let text_files = files.into_iter().map(|file| ScalarCheckerTextFile {
+            path: file.path.into(),
+            path_span: file.path_span,
+            text_span: file.text_span,
+            text: file.text.into(),
+        }).collect();
         Some(CheckedLiteralOutput {
             stdout: *stdout,
             stderr: *stderr,
@@ -150,6 +190,7 @@ impl CheckerOutput<'_> {
             stdout_bytes: stdout_bytes.as_slice().into(),
             stderr_bytes: stderr_bytes.as_slice().into(),
             code_value: code_value.clone(),
+            text_files,
         })
     }
 }
@@ -174,7 +215,63 @@ impl<'a> CheckerOutput<'a> {
     }
 }
 
+struct BorrowedCheckerTextFile<'a> {
+    path: &'a str,
+    path_span: ByteSpan,
+    text_span: ByteSpan,
+    text: &'a [u8],
+}
+
+const MAX_PORTABLE_OUTPUT_PATH_BYTES: usize = 4096;
+const MAX_PORTABLE_OUTPUT_COMPONENT_BYTES: usize = 255;
+const MAX_PORTABLE_OUTPUT_COMPONENTS: usize = 64;
+
+fn portable_relative_output_path(path: &str) -> bool {
+    if path.len() > MAX_PORTABLE_OUTPUT_PATH_BYTES || !path.is_ascii() {
+        return false;
+    }
+    path.split('/').enumerate().all(|(depth, component)| {
+        if depth >= MAX_PORTABLE_OUTPUT_COMPONENTS
+            || component.is_empty() || component.len() > MAX_PORTABLE_OUTPUT_COMPONENT_BYTES
+            || component.ends_with(['.', ' '])
+            || component.bytes().any(|b| b.is_ascii_control() || matches!(b, b'\\' | b':' | b'<' | b'>' | b'"' | b'|' | b'?' | b'*'))
+        {
+            return false;
+        }
+        let stem = component.split('.').next().expect("component has a first segment").trim_end_matches(' ');
+        let upper = stem.to_ascii_uppercase();
+        let device = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$")
+            || upper.strip_prefix("COM").or_else(|| upper.strip_prefix("LPT")).is_some_and(|suffix| {
+                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            });
+        let short_alias = stem.rsplit_once('~').is_some_and(|(_, suffix)| {
+            !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+        });
+        !device && !short_alias
+    })
+}
+
 impl<'a> CheckerFileOutput<'a> {
+    fn explicit_text(&self) -> Option<BorrowedCheckerTextFile<'a>> {
+        let ScalarExpression::Utf8 { span: path_span, value: path_text } = self.path else {
+            return None;
+        };
+        let CheckerFileContent::Text(ScalarExpression::Utf8 { span: text_span, value: text }) = &self.content else {
+            return None;
+        };
+        let path = std::str::from_utf8(path_text).ok()?;
+        if !portable_relative_output_path(path) {
+            return None;
+        }
+        std::str::from_utf8(text).ok()?;
+        Some(BorrowedCheckerTextFile {
+            path,
+            path_span: *path_span,
+            text_span: *text_span,
+            text,
+        })
+    }
+
     fn from_expression(expression: &'a ScalarExpression) -> Result<Self, CheckerDirectiveShapeError> {
         let [path, state, text] = record_fields(expression, ["path", "state", "text"])?;
         let span = expression_span(expression);
@@ -944,18 +1041,73 @@ mod tests {
     }
 
     #[test]
-    fn output_payload_requires_explicit_literals_and_empty_files() {
+    fn output_payload_rejects_nonconcrete_or_uncontained_text_files_and_typed_state() {
         for source in [
             r#"core.require(false, { .stdout = write(); .stderr = ""; .code = 1; .files = []; })"#,
             r#"core.require(false, { .stdout = ""; .stderr = ""; .code = 1; })"#,
             r#"core.require(false, {
                 .stdout = ""; .stderr = ""; .code = 1;
-                .files = [{ .path = "out.txt"; .text = "test"; }];
+                .files = [{ .path = "out.txt"; .text = message; }];
+            })"#,
+            r#"core.require(false, {
+                .stdout = ""; .stderr = ""; .code = 1;
+                .files = [{ .path = "out.txt"; .state = 42; }];
+            })"#,
+            r#"core.require(false, {
+                .stdout = ""; .stderr = ""; .code = 1;
+                .files = [{ .path = "../out.txt"; .text = "test"; }];
+            })"#,
+            r#"core.require(false, {
+                .stdout = ""; .stderr = ""; .code = 1;
+                .files = [{ .path = "/out.txt"; .text = "test"; }];
+            })"#,
+            r#"core.require(false, {
+                .stdout = ""; .stderr = ""; .code = 1;
+                .files = [{ .path = "reports/day.txt"; .text = "a"; },
+                          { .path = "./reports//day.txt"; .text = "b"; }];
             })"#,
         ] {
             with_expression(source, |expression| {
                 let directive = CheckerDirective::from_expression(expression).unwrap().unwrap();
                 assert!(directive.output.explicit_literal().is_none());
+            });
+        }
+    }
+
+    #[test]
+    fn checker_file_paths_reject_portable_aliases_and_file_directory_conflicts() {
+        use super::portable_relative_output_path;
+        for path in [
+            "", "/out.txt", "./out.txt", "../out.txt", "reports/../out.txt", "reports//day.txt",
+            "reports/./day.txt", "reports/day.txt/", ".", "..", "out.txt.", "out.txt ",
+            r"C:\temp\out.txt", "C:/temp/out.txt", r"\\server\share\out.txt",
+            "//server/share/out.txt", "report.txt:stream", "nul.txt", "COM¹.txt", "LPT9.out",
+            "a/ConIn$.txt", "aux .out", "REPORT~1.TXT", "a\0b.txt", "a?b.txt",
+            "réports/day.txt", "re\u{301}ports/day.txt",
+        ] {
+            assert!(!portable_relative_output_path(path), "path {path:?}");
+        }
+        for path in ["reports/day.txt", "README", ".hidden/report.txt", "February/report.txt"] {
+            assert!(portable_relative_output_path(path), "path {path:?}");
+        }
+        assert!(portable_relative_output_path(&"a".repeat(255)));
+        assert!(!portable_relative_output_path(&"a".repeat(256)));
+        assert!(portable_relative_output_path(&["a"; 64].join("/")));
+        assert!(!portable_relative_output_path(&["a"; 65].join("/")));
+        assert!(portable_relative_output_path(&vec!["a".repeat(255); 16].join("/")));
+        assert!(!portable_relative_output_path(&vec!["a".repeat(255); 17].join("/")));
+        for (first, second) in [
+            ("report.txt", "REPORT.TXT"), ("Reports/one.txt", "reports/two.txt"),
+            ("a", "a/b.txt"), ("a/b.txt", "a"), ("A", "a/b.txt"),
+        ] {
+            let source = format!(r#"core.require(false, {{
+                .stdout = ""; .stderr = ""; .code = 1;
+                .files = [{{ .path = "{first}"; .text = ""; }},
+                          {{ .path = "{second}"; .text = ""; }}];
+            }})"#);
+            with_expression(&source, |expression| {
+                let directive = CheckerDirective::from_expression(expression).unwrap().unwrap();
+                assert!(directive.output.explicit_literal().is_none(), "{first:?} vs {second:?}");
             });
         }
     }

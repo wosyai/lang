@@ -3713,6 +3713,8 @@ mod checker_project;
 #[cfg(any(test, feature = "internal-checker"))]
 mod symbolic_integer;
 #[cfg(feature = "internal-checker")]
+pub use checker_directive::ScalarCheckerTextFile;
+#[cfg(feature = "internal-checker")]
 pub use checker_project::{check_scalar_package, ScalarCheckerFailure, ScalarCheckerOperation, ScalarCheckerOutcome};
 pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};
 pub(crate) use static_calls::PreparedProgram;

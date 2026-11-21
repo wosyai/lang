@@ -44,7 +44,8 @@ fn internal_checker_works_without_emission_and_keeps_authored_output() {
     assert_eq!(at(failure.stdout_span), "\"given-out\"");
     assert_eq!(at(failure.stderr_span), "\"given-err\"");
     assert_eq!(at(failure.code_span), "23");
-    assert_eq!(at(failure.empty_files_span), "[]");
+    assert_eq!(at(failure.files_span), "[]");
+    assert!(failure.files.is_empty());
     assert!(at(failure.directive).starts_with("core.require(value <= 7,"));
 }
 
@@ -112,4 +113,32 @@ fn malformed_initialization_order_cannot_be_reported_as_no_checks() {
         ),
         ScalarCheckerOutcome::Unsupported,
     );
+}
+
+
+#[test]
+fn selected_failure_returns_only_authored_utf8_text_files_and_their_spans() {
+    let text = r#"unit() required = fn {
+        core.require(true, { .stdout = ""; .stderr = ""; .code = 1;
+            .files = [{ .path = "ignore.txt"; .text = "not emitted"; }]; });
+        core.narrow(false, { .stdout = ""; .stderr = ""; .code = 9;
+            .files = [
+                { .path = "Out/Report.txt"; .text = "ação\nline 2\t☕"; },
+                { .path = "empty.txt"; .text = ""; }
+            ]; });
+    }; required();"#;
+    let ScalarCheckerOutcome::Failed(failure) = check(text) else {
+        panic!("expected concrete text output from the selected failure");
+    };
+    assert_eq!(failure.operation, ScalarCheckerOperation::Narrow);
+    let [first, second] = failure.files.as_ref() else { panic!("exactly two authored files"); };
+    assert_eq!(&*first.path, "Out/Report.txt");
+    assert_eq!(&*first.text, "ação\nline 2\t☕".as_bytes());
+    assert_eq!(&*second.path, "empty.txt");
+    assert!(second.text.is_empty());
+    let canonical = format!("%%start\n{text}\n%%end");
+    let at = |span: wosy_syntax::ByteSpan| &canonical[span.start as usize..span.end as usize];
+    assert_eq!(at(first.path_span), r#""Out/Report.txt""#);
+    assert_eq!(at(first.text_span), r#""ação\nline 2\t☕""#);
+    assert!(at(failure.files_span).contains("empty.txt"));
 }
