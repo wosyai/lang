@@ -1047,6 +1047,8 @@ pub(crate) struct ClosedBody {
     pub(crate) checked_backing_producer: Option<ClosedCheckedBacking>,
     pub(crate) checked_backing_consumer: Option<(usize, usize)>,
     pub(crate) returning: Option<ClosedReturn>,
+    pub(crate) ordinary_result: bool,
+    pub(crate) ordinary_calls: BTreeMap<usize, SourceSpan>,
     pub(crate) calls: BTreeMap<usize, ClosedCall>,
     pub(crate) scope_exits: BTreeMap<usize, CfgPointId>,
     pub(crate) releases: BTreeMap<CfgPointId, Vec<usize>>,
@@ -1198,9 +1200,190 @@ fn prove_read_views(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OrdinaryResultSite {
+    pub(crate) caller: BodyKey,
+    pub(crate) call: OccurrenceOrdinal,
+}
+
+enum OrdinaryResultCandidate {
+    Unused,
+    Direct(OrdinaryResultSite),
+    Refused,
+}
+
+impl OrdinaryResultCandidate {
+    fn record(&mut self, site: Option<OrdinaryResultSite>) {
+        *self = match (&*self, site) {
+            (Self::Unused, Some(site)) => Self::Direct(site),
+            _ => Self::Refused,
+        };
+    }
+}
+
+fn ordinary_result_literal(expression: &ScalarExpression) -> bool {
+    let ScalarExpression::StructLiteral { fields, .. } = expression else { return false };
+    fields.iter().all(|field| matches!(&field.value,
+        ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }
+        | ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }))
+}
+
+fn live_ordinary_result_storage(block: &ScalarBlock, ty: &ScalarType, root: bool) -> bool {
+    if block.final_output_values.len() != 1 || block.unsafe_context {
+        return false;
+    }
+    match block.items.as_slice() {
+        [ScalarBlockItem::Expression(ScalarExpression::If { condition, then_branch, else_branch, .. })] => {
+            matches!(condition.as_ref(), ScalarExpression::Name { .. } | ScalarExpression::Boolean { .. })
+                && live_ordinary_result_storage(then_branch, ty, false)
+                && live_ordinary_result_storage(else_branch, ty, false)
+        }
+        [ScalarBlockItem::Expression(expression)] => root && ordinary_result_literal(expression),
+        [ScalarBlockItem::LocalBinding(binding), ScalarBlockItem::Expression(ScalarExpression::Name { name, .. })] => {
+            !binding.is_allocation
+                && matches!(binding.receivers.as_slice(), [receiver] if receiver.name == *name && receiver.ty == *ty)
+                && ordinary_result_literal(&binding.value)
+        }
+        _ => false,
+    }
+}
+
+fn scalar_only_ordinary_result_use(
+    function: &ScalarFunction,
+    sites: &FunctionCallSites,
+    call: OccurrenceOrdinal,
+) -> bool {
+    let ScalarType::Callable { parameters, outputs } = &function.signature else { return false };
+    if !parameters.iter().all(ordinary_value)
+        || !matches!(outputs.outputs.as_slice(), [output] if ordinary_value(&output.ty))
+        || function.body.unsafe_context
+        || function.body.final_output_values.len() != 1
+    {
+        return false;
+    }
+    let [ScalarBlockItem::LocalBinding(binding), ScalarBlockItem::Expression(ScalarExpression::Member { receiver, .. })] =
+        function.body.items.as_slice() else { return false };
+    !binding.is_allocation
+        && matches!(binding.receivers.as_slice(), [value] if &value.name == receiver && matches!(value.ty, ScalarType::Struct(_)))
+        && matches!(binding.value, ScalarExpression::Call { .. })
+        && sites.structure.edges.get(&(
+            OccurrenceParent::Block(sites.structure.root),
+            OccurrenceEdge::BindingRoot { item: 0, output: 0 },
+        )) == Some(&OccurrenceNode::Expression(call))
+}
+
+pub(super) fn ordinary_result_cohort<'a>(
+    reservations: &AggregateReservations,
+    module_at: impl Fn(usize) -> Option<(&'a SourceIdentity, &'a [ScalarItem], &'a [ScalarStruct], &'a ModuleCallSites)>,
+) -> BTreeMap<BodyKey, OrdinaryResultSite> {
+    let mut definitions = HashMap::new();
+    let mut candidates = BTreeMap::new();
+    for (&key @ (module, item, arm), &ordinary) in &reservations.bodies {
+        if !ordinary || arm.is_some() {
+            continue;
+        }
+        let Some((source, items, structs, _)) = module_at(module) else { return BTreeMap::new() };
+        let Some(ScalarItem::Function(function)) = items.get(item) else { return BTreeMap::new() };
+        if !crate::scalar::typecheck::is_module_private_name(&function.name)
+            || !function.generic_parameters.is_empty()
+            || !function.overload_arms.is_empty()
+        {
+            continue;
+        }
+        let ScalarType::Callable { parameters, outputs } = &function.signature else { continue };
+        if !parameters.iter().all(ordinary_value) {
+            continue;
+        }
+        let [ScalarOutput { ty, .. }] = outputs.outputs.as_slice() else { continue };
+        let ScalarType::Struct(id) = ty else { continue };
+        if !matches!(function.body.final_output_values.as_slice(), [output] if output.ty == *ty)
+            || !live_ordinary_result_storage(&function.body, ty, true)
+        {
+            continue;
+        }
+        let Some(structure) = structs.iter().find(|structure| &structure.id == id) else { continue };
+        if !structure.fields.iter().all(|field| ordinary_value(&field.ty)) {
+            continue;
+        }
+        if definitions.insert((source, function.name_span), key).is_some() {
+            return BTreeMap::new();
+        }
+        candidates.insert(key, OrdinaryResultCandidate::Unused);
+    }
+    if candidates.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut visit = |source: &SourceIdentity, range, site| {
+        if let Some(key) = definitions.get(&(source, range)) {
+            candidates.get_mut(key).expect("ordinary result candidate").record(site);
+        }
+    };
+    for (&caller @ (module, item, arm), &ordinary) in &reservations.bodies {
+        let Some((_, items, _, calls)) = module_at(module) else { return BTreeMap::new() };
+        let Some(ScalarItem::Function(function)) = items.get(item) else { return BTreeMap::new() };
+        let Some(sites) = calls.function_body(item, arm) else { return BTreeMap::new() };
+        if !matches!(&sites.plain_names, PlainNameFacts::Prepared(_))
+            || sites.allocation_length_calls.iter().any(|ordinal| !sites.allocation_length_call_targets.contains_key(ordinal))
+        {
+            return BTreeMap::new();
+        }
+        for escape in &sites.callable_escapes {
+            visit(&escape.source, escape.range, None);
+        }
+        for target in sites.allocation_length_call_targets.values() {
+            match target {
+                ResolvedCallTarget::ModuleCallable { source, declaration_span, .. } => {
+                    visit(source, *declaration_span, None);
+                }
+                ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. } => return BTreeMap::new(),
+                _ => {}
+            }
+        }
+        for occurrence in &sites.call_occurrences {
+            let Some(resolved) = sites.sites.get(occurrence.site) else { return BTreeMap::new() };
+            if matches!(&resolved.target, ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. }) {
+                return BTreeMap::new();
+            }
+            if let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete } = &resolved.target {
+                let allowed = ordinary && arm.is_none()
+                    && function.generic_parameters.is_empty() && function.overload_arms.is_empty()
+                    && matches!(concrete, ConcreteCallSelection::Declaration)
+                    && scalar_only_ordinary_result_use(function, sites, occurrence.ordinal);
+                visit(source, *declaration_span, allowed.then_some(OrdinaryResultSite {
+                    caller,
+                    call: occurrence.ordinal,
+                }));
+            }
+        }
+    }
+    for &module in &reservations.modules {
+        let Some((_, _, _, calls)) = module_at(module) else { return BTreeMap::new() };
+        let ModuleInitializationDetail::Occurrences(topology) = &calls.initialization.detail else { return BTreeMap::new() };
+        for escape in &topology.callable_escapes {
+            visit(&escape.source, escape.range, None);
+        }
+        for &ordinal in &topology.calls {
+            match calls.initialization.call_target(ordinal) {
+                Some(ModuleInitializationCallTarget::Direct { declaration, .. }
+                    | ModuleInitializationCallTarget::Generic { declaration, .. }) => {
+                    visit(&declaration.source, declaration.range, None);
+                }
+                Some(ModuleInitializationCallTarget::CallableBinding(_) | ModuleInitializationCallTarget::CallableField { .. })
+                | None => return BTreeMap::new(),
+                Some(_) => {}
+            }
+        }
+    }
+    candidates.into_iter().filter_map(|(key, candidate)| match candidate {
+        OrdinaryResultCandidate::Direct(site) if site.caller != key => Some((key, site)),
+        _ => None,
+    }).collect()
+}
+
 struct ModuleInput<'a> {
     source: &'a SourceIdentity,
     items: &'a [ScalarItem],
+    structs: &'a [ScalarStruct],
     calls: &'a ModuleCallSites,
 }
 
@@ -1303,6 +1486,22 @@ fn closed_aggregates<'a>(
     result_at: impl Fn(BodyKey, &'a ScalarFunction) -> Option<(Option<&'a AggregateFlowResult>, &'a ScalarReferenceCfg)>,
     initializers: impl Iterator<Item = &'a ModuleInitializationRegion>,
 ) -> Result<ClosedAggregates, String> {
+    let ordinary = ordinary_result_cohort(reservations, |module| {
+        let input = module_at(module)?;
+        Some((input.source, input.items, input.structs, input.calls))
+    });
+    let install_ordinary = |result: &mut ClosedAggregates| {
+        for (&producer, site) in &ordinary {
+            if result.bodies.contains_key(&producer) || result.bodies.contains_key(&site.caller) {
+                continue;
+            }
+            let Some(input) = module_at(producer.0) else { continue };
+            let Some(ScalarItem::Function(function)) = input.items.get(producer.1) else { continue };
+            let declaration = SourceSpan::new(input.source.clone(), function.name_span);
+            result.bodies.entry(producer).or_default().ordinary_result = true;
+            result.bodies.entry(site.caller).or_default().ordinary_calls.insert(site.call.0, declaration);
+        }
+    };
     let mut bodies = BTreeMap::new();
     let mut declarations = HashMap::new();
     let mut storage_uses = HashMap::<&SourceSpan, usize>::new();
@@ -1489,6 +1688,7 @@ fn closed_aggregates<'a>(
                 }
             }
         }
+        install_ordinary(&mut result);
         return Ok(result);
     }
     let mut initializer_uses = Vec::new();
@@ -1925,6 +2125,7 @@ fn closed_aggregates<'a>(
         }
         result.initializers = initializer_plans;
     }
+    install_ordinary(&mut result);
     Ok(result)
 }
 
@@ -1936,7 +2137,7 @@ pub(in crate::scalar) fn close_installed(
 ) -> Result<ClosedAggregates, String> {
     closed_aggregates(
         reservations,
-        |module| (module == 0).then_some(ModuleInput { source: &program.source, items: &program.items, calls }),
+        |module| (module == 0).then_some(ModuleInput { source: &program.source, items: &program.items, structs: &program.structs, calls }),
         |(_, item, arm), function| Some((facts.0.get(&(item, arm)), &function.reference_cfg)),
         std::iter::once(&calls.initialization),
     )
@@ -1954,7 +2155,7 @@ impl ProjectReferenceResults {
             |module| {
                 let row = project.modules.get(module)?;
                 let sites = calls.modules.get(module)?.as_ref().ok()?;
-                Some(ModuleInput { source: &row.source, items: &row.items, calls: sites })
+                Some(ModuleInput { source: &row.source, items: &row.items, structs: &row.structs, calls: sites })
             },
             |(module, item, arm), _| self.function_result(module, item, arm).map(|result| (Some(&result.aggregate), &result.cfg)),
             reservations.modules.iter().filter_map(|module| calls.modules.get(*module)?.as_ref().ok().map(|module| &module.initialization)),

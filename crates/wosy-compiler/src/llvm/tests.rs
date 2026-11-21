@@ -7963,3 +7963,72 @@ pick = overload {
         }
     }
 }
+
+#[test]
+fn closed_ordinary_struct_result_writes_caller_storage_before_returning() {
+    let text = "%%start
+struct Pair { u8 tag; u64 total; }
+Pair(bool) _make = fn(flag) { if (flag) { Pair item = { .tag = 7; .total = 19; }; item } else { Pair item = { .tag = 5; .total = 23; }; item } };
+u64(bool) verify = fn(flag) { Pair value = _make(flag); value.total };
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (producer, caller, llvm) in [
+            ("_make".to_owned(), "verify".to_owned(),
+                emit_scalar_build_single_module_llvm(&checked).unwrap().to_text()),
+            (project_function_name(source, "_make"), project_function_name(source, "verify"),
+                emit_scalar_build_project_llvm(&checked).unwrap().to_text()),
+        ] {
+            let definition = format!("define internal void @{producer}(");
+            let (_, tail) = llvm.split_once(&definition).expect("private ordinary definition");
+            let (body, _) = tail.split_once("\n}").expect("producer end");
+            let (_, hidden) = body.split_once("ptr ").expect("caller destination parameter");
+            let destination = hidden.split(')').next().unwrap();
+            assert!(body.contains("phi ptr "), "{body}");
+            assert!(body.contains("load [16 x i8]"), "{body}");
+            assert!(body.contains(&format!(", ptr {destination},")), "{body}");
+            assert!(body.contains("ret void"), "{body}");
+            assert!(!body.contains("ret ptr"), "{body}");
+
+            let (_, tail) = llvm.split_once(&format!("define i64 @{caller}(")).expect("caller");
+            let (body, _) = tail.split_once("\n}").expect("caller end");
+            let slot = body.lines().find_map(|line| {
+                let (name, rest) = line.trim_start().split_once(" = alloca ")?;
+                (name.starts_with("%ordinary_result_destination") && rest.starts_with("[16 x i8], align 8"))
+                    .then_some(name)
+            }).expect("caller-owned aligned storage");
+            assert!(body.lines().any(|line| line.contains(&format!("call void @{producer}("))
+                && line.ends_with(&format!(", ptr {slot})"))), "{body}");
+            assert!(body.contains(&format!("load [16 x i8], ptr {slot}")), "{body}");
+        }
+    }
+}
+
+#[test]
+fn ordinary_result_transport_declines_legacy_source_and_aggregate_forwarding() {
+    let pair = "struct Pair { u8 tag; u64 total; }";
+    for body in [
+        "Pair() old_make = fn { Pair item = { .tag = 7; .total = 19; }; item }; Pair() _make = fn { old_make() }; u64() verify = fn { Pair value = _make(); value.total };",
+        "Pair() _make = fn { Pair item = { .tag = 7; .total = 19; }; item }; Pair() forward = fn { _make() };",
+        "Pair() _make = fn { Pair item = { .tag = 7; .total = 19; }; item }; Pair() forward = fn { Pair value = _make(); value };",
+    ] {
+        let text = format!("%%start\n{pair}\n{body}\n%%end");
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let prepared = prepare_initializer_test(&text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (producer, llvm) in [
+                ("_make".to_owned(), emit_scalar_build_single_module_llvm(&checked).unwrap().to_text()),
+                (project_function_name(source, "_make"), emit_scalar_build_project_llvm(&checked).unwrap().to_text()),
+            ] {
+                let legacy = format!("define ptr @{producer}(");
+                assert!(llvm.contains(&legacy), "{llvm}");
+                assert!(!llvm.contains("ordinary_result_destination"), "{llvm}");
+            }
+        }
+    }
+}
