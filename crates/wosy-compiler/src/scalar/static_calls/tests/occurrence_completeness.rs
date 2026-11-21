@@ -17,6 +17,64 @@ fn initializer_member_tokens(
 }
 
 #[test]
+fn nested_conditional_retains_signed_float_literal_and_contextual_result_types() {
+    let text = "%%start\nf32(f32) delta = fn(direction) { if (direction > 0.0) { 1.0 / direction } else { if (direction < 0.0) { -1.0 / direction } else { -0.0 } } };\n%%end";
+    let parsed = parsed(text);
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let project = prepare_extracted(&parsed, target);
+        let standalone = PreparedProgram::new(
+            derive_scalar_declarations_from_cst(parsed.canonical_cst()),
+            target,
+        )
+        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        for (module, items) in [
+            (project.calls.module(0), &project.project().modules[0].items),
+            (&standalone.calls, &standalone.program.items),
+        ] {
+            assert_eq!(occurrence_obligations::validate_module(module), Ok(()));
+            let row = module.function(0);
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("delta function");
+            };
+            let ScalarExpression::If { else_branch, .. } = &function.body.final_output_values[0].value else {
+                panic!("outer conditional");
+            };
+            let ScalarExpression::If { then_branch, else_branch, span, .. } = &else_branch.final_output_values[0].value else {
+                panic!("nested conditional");
+            };
+            let ScalarExpression::Binary { left, .. } = &then_branch.final_output_values[0].value else {
+                panic!("division");
+            };
+            for (literal, expected, negative) in [
+                (left.as_ref(), "-1.0", -1.0_f64),
+                (&else_branch.final_output_values[0].value, "-0.0", -0.0_f64),
+            ] {
+                let ScalarExpression::Float { value, spelling, span } = literal else {
+                    panic!("signed float literal");
+                };
+                assert_eq!(value.to_bits(), negative.to_bits());
+                assert_eq!(spelling, expected);
+                assert_eq!(&text[span.start as usize..span.end as usize], expected);
+                let ordinal = row.occurrences.iter().position(|occurrence| {
+                    occurrence.role == OccurrenceRole::Expression && occurrence.span == *span
+                }).expect("signed literal occurrence");
+                assert_eq!(
+                    row.structure.checked_types.expressions[&OccurrenceOrdinal(ordinal)],
+                    ScalarType::F32,
+                );
+            }
+            let ordinal = row.occurrences.iter().position(|occurrence| {
+                occurrence.role == OccurrenceRole::Expression && occurrence.span == *span
+            }).expect("nested conditional occurrence");
+            assert_eq!(
+                row.structure.checked_types.expressions[&OccurrenceOrdinal(ordinal)],
+                ScalarType::F32,
+            );
+        }
+    }
+}
+
+#[test]
 fn initializer_members_retain_selection_and_type_on_both_routes_and_layouts() {
     let text = "%%start\nstruct Record { u8 field; }\nenum Mode { ready; }\nRecord item = { .field = 1; };\nu8 extracted = item.field;\nMode status = Mode.ready;\n*?Record pointer = null;\nu8 indirect = pointer.field;\n%%end";
     let parsed = parsed(text);

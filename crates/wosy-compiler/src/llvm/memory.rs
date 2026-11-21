@@ -1,7 +1,8 @@
 use inkwell::values::BasicValue;
 
 use super::expression::{
-    emit_expression, emit_project_expression, emit_project_typed_expression, emit_unary_value,
+    emit_contextual_numeric, emit_expression, emit_project_expression, emit_project_typed_expression,
+    emit_unary_value, ExpressionPath,
 };
 use super::*;
 
@@ -694,9 +695,18 @@ pub(super) fn emit_typed_expression<'ctx, 'module>(
         (ScalarExpression::Integer { value, .. }, ty) if integer_width(ty).is_some() => Ok(
             EmitValue::Basic(integer_constant(context, ty, value)?.into()),
         ),
-        (ScalarExpression::Float { value, .. }, ty) => Ok(EmitValue::Basic(
-            float_constant(context, ty, *value)?.into(),
-        )),
+        (ScalarExpression::If { .. } | ScalarExpression::Block(_), ty)
+            if integer_width(ty).is_some() =>
+        {
+            emit_contextual_numeric(context, state, expression, ty, ExpressionPath::Single)
+        }
+        (_, ScalarType::F32 | ScalarType::F64) => emit_contextual_numeric(
+            context,
+            state,
+            expression,
+            expected,
+            ExpressionPath::Single,
+        ),
         _ => emit_expression(context, state, expression),
     }
 }

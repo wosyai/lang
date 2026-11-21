@@ -8142,3 +8142,64 @@ struct copy Cell { u8 value; }
         }
     }
 }
+
+
+#[test]
+fn emits_contextual_float_literals_in_left_operands_and_conditional_arms() {
+    let source = "
+%%start
+f32(f32) f32_ratio = fn(v) { 1.0 / v };
+f64(f64) f64_ratio = fn(v) { 1.0 / v };
+f32(f32) f32_branch = fn(v) { if (v < 0.0) { 1.0 } else { v } };
+f64(f64) f64_branch = fn(v) { if (v < 0.0) { v } else { 1.0 } };
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for partition in [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ] {
+            let ir = partition.expect("contextual float LLVM").to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+                ir.as_bytes(), "contextual-float",
+            );
+            let module = context.create_module_from_ir(buffer).expect("parse contextual LLVM");
+            module.verify().expect("verify contextual LLVM");
+            for ty in ["float", "double"] {
+                assert!(ir.contains(&format!("fdiv {ty} 1.000000e+00,")), "{ir}");
+                assert!(ir.contains(&format!("phi {ty} ")), "{ir}");
+            }
+        }
+    }
+}
+
+#[test]
+fn emits_fixed_width_integer_results_for_both_conditional_arms() {
+    let source = "
+%%start
+u8(bool, u8) mixed = fn(b, n) { if (b) { n } else { 0 } };
+u8(bool) literals = fn(b) { if (b) { 1 } else { 0 } };
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for partition in [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ] {
+            let ir = partition.expect("conditional result LLVM").to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+                ir.as_bytes(), "conditional-integer-width",
+            );
+            let module = context.create_module_from_ir(buffer).expect("parse conditional LLVM");
+            module.verify().expect("verify conditional LLVM");
+            assert_eq!(ir.matches("phi i8 ").count(), 2, "{ir}");
+            assert!(!ir.contains("phi i32"), "{ir}");
+        }
+    }
+}

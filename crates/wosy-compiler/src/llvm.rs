@@ -2702,11 +2702,28 @@ fn initialize_project_module<'ctx, 'module>(
 #[derive(Clone, Copy)]
 enum BlockEmission<'a> {
     Ordinary,
+    ContextualNumeric(&'a ScalarType),
     Return(&'a crate::ScalarOutputSequence),
     TailArm(&'a crate::ScalarOutputSequence),
 }
 
 impl<'a> BlockEmission<'a> {
+    fn expected_numeric(self) -> Option<&'a ScalarType> {
+        match self {
+            Self::ContextualNumeric(ty) => Some(ty),
+            Self::Return(outputs) | Self::TailArm(outputs) => match outputs.outputs.as_slice() {
+                [output]
+                    if integer_width(&output.ty).is_some()
+                        || matches!(output.ty, ScalarType::F32 | ScalarType::F64) =>
+                {
+                    Some(&output.ty)
+                }
+                _ => None,
+            },
+            Self::Ordinary => None,
+        }
+    }
+
     fn ordered_outputs(self) -> Option<&'a crate::ScalarOutputSequence> {
         match self {
             Self::Return(outputs) | Self::TailArm(outputs) if outputs.outputs.len() > 1 => {
@@ -2965,7 +2982,8 @@ fn emit_final_outputs<'ctx, 'module>(
             }
             return Ok(value);
         }
-        let value = emit_typed_expression(context, state, expression, &output.ty)?;
+        let ty = emission.expected_numeric().unwrap_or(&output.ty);
+        let value = emit_typed_expression(context, state, expression, ty)?;
         if !state
             .branch_return_outputs
             .contains_key(&(block.span.start, block.span.end))
@@ -3066,8 +3084,9 @@ fn emit_project_final_outputs<'ctx, 'module>(
             }
             return Ok(value);
         }
+        let ty = emission.expected_numeric().unwrap_or(&output.ty);
         let value =
-            emit_project_typed_expression(context, state, expression, &output.ty, module, modules)?;
+            emit_project_typed_expression(context, state, expression, ty, module, modules)?;
         if !state
             .branch_return_outputs
             .contains_key(&(block.span.start, block.span.end))
