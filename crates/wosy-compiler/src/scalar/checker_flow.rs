@@ -4,7 +4,7 @@ use num_bigint::BigInt;
 
 use super::{
     checker_directive::CheckerOperation,
-    control::{AssignmentReplacement, BlockItemKind, BlockPosition, ConditionalRegion},
+    control::{AssignmentReplacement, BindingInitialization, BindingRegion, BlockItemKind, BlockPosition, ConditionalRegion},
     reference::{BlockOrdinal, DirectDestinationIdentity, FunctionCallSites, OccurrenceOrdinal, PlainNameIdentity},
     symbolic_integer::IntegerSet,
     typecheck::is_integer_type,
@@ -67,7 +67,31 @@ impl<'a> IntegerComparison<'a> {
 }
 
 type IntegerRow = Vec<Rc<IntegerSet>>;
-type IntegerRoots<'a> = HashMap<&'a ReferenceBindingId, (usize, &'a ScalarType)>;
+#[derive(Default)]
+struct IntegerRoots<'a> {
+    axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
+    by_binding: HashMap<&'a ReferenceBindingId, usize>,
+    parameters: usize,
+}
+
+impl<'a> IntegerRoots<'a> {
+    fn add(&mut self, binding: &'a ReferenceBindingId, ty: &'a ScalarType) {
+        let previous = self.by_binding.insert(binding, self.axes.len());
+        assert!(previous.is_none());
+        self.axes.push((binding, ty));
+    }
+
+    fn lookup(&self, binding: &ReferenceBindingId) -> Option<(usize, &'a ScalarType)> {
+        let index = *self.by_binding.get(binding)?;
+        Some((index, self.axes[index].1))
+    }
+
+    fn truncate(&mut self, depth: usize) {
+        for (binding, _) in self.axes.drain(depth..) {
+            self.by_binding.remove(binding);
+        }
+    }
+}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct IntegerInputs(Vec<IntegerRow>);
@@ -78,7 +102,7 @@ impl IntegerInputs {
         roots: &IntegerRoots<'_>,
         predicate: &IntegerPredicate,
     ) -> Option<(Self, Self, usize)> {
-        let &(index, ty) = roots.get(&predicate.binding)?;
+        let (index, ty) = roots.lookup(&predicate.binding)?;
         if ty != &predicate.ty {
             return None;
         }
@@ -136,6 +160,19 @@ impl IntegerInputs {
         Self::compact_axis(self.0, axis)
     }
 
+    fn append_local(&mut self, value: &BigInt) {
+        let value = Rc::new(IntegerSet::singleton(value));
+        for row in &mut self.0 {
+            row.push(Rc::clone(&value));
+        }
+    }
+
+    fn drop_locals(&mut self, depth: usize) {
+        for row in &mut self.0 {
+            row.truncate(depth);
+        }
+    }
+
     fn compact_axis(rows: impl IntoIterator<Item = IntegerRow>, axis: usize) -> Self {
         let mut joined = Self::default();
         let mut representatives = HashMap::new();
@@ -184,50 +221,52 @@ fn merge_axis(representative: &mut IntegerRow, row: IntegerRow, axis: usize) {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct IntegerCheckFailure {
+pub(super) struct IntegerCheckFailure<'a> {
     pub(super) directive: OccurrenceOrdinal,
     pub(super) state: IntegerInputs,
+    pub(super) axes: Vec<&'a ReferenceBindingId>,
 }
 
-enum IntegerControl {
+enum IntegerControl<'a> {
     Continue(IntegerInputs),
-    Fail(IntegerCheckFailure),
+    Fail(IntegerCheckFailure<'a>),
 }
 
 pub(super) fn check_integer_requirements(
     calls: &FunctionCallSites,
-) -> Option<Result<(), IntegerCheckFailure>> {
+) -> Option<Result<(), IntegerCheckFailure<'_>>> {
     let boundary = &calls.boundary;
     if boundary.parameters.is_empty()
         || boundary.parameters.len() != boundary.checker_parameter_bindings.len()
     {
         return None;
     }
-    let roots: IntegerRoots<'_> = boundary
-        .checker_parameter_bindings
-        .iter()
-        .zip(&boundary.parameters)
-        .enumerate()
-        .map(|(index, (binding, parameter))| (binding, (index, &parameter.ty)))
-        .collect();
+    let mut roots = IntegerRoots {
+        parameters: boundary.parameters.len(),
+        ..IntegerRoots::default()
+    };
+    for (binding, parameter) in boundary.checker_parameter_bindings.iter().zip(&boundary.parameters) {
+        roots.add(binding, &parameter.ty);
+    }
     let root = boundary
         .parameters
         .iter()
         .map(|parameter| IntegerSet::from_type(&parameter.ty).map(Rc::new))
         .collect::<Option<IntegerRow>>()?;
     let root = IntegerInputs(vec![root]);
-    match walk_integer_block(calls, &roots, calls.structure.root, root)? {
+    match walk_integer_block(calls, &mut roots, calls.structure.root, root)? {
         IntegerControl::Continue(_) => Some(Ok(())),
         IntegerControl::Fail(failure) => Some(Err(failure)),
     }
 }
 
-fn walk_integer_block(
-    calls: &FunctionCallSites,
-    roots: &IntegerRoots<'_>,
+fn walk_integer_block<'a>(
+    calls: &'a FunctionCallSites,
+    roots: &mut IntegerRoots<'a>,
     block: BlockOrdinal,
     mut path: IntegerInputs,
-) -> Option<IntegerControl> {
+) -> Option<IntegerControl<'a>> {
+    let depth = roots.axes.len();
     let structure = &calls.structure;
     for item in &structure.blocks.get(block.0)?.items {
         if path.is_unreachable() {
@@ -242,12 +281,14 @@ fn walk_integer_block(
                             return Some(IntegerControl::Fail(IntegerCheckFailure {
                                 directive: expression,
                                 state: failing,
+                                axes: roots.axes.iter().map(|(binding, _)| *binding).collect(),
                             }));
                         }
                         CheckerOperation::Narrow if passing.is_unreachable() => {
                             return Some(IntegerControl::Fail(IntegerCheckFailure {
                                 directive: expression,
                                 state: failing,
+                                axes: roots.axes.iter().map(|(binding, _)| *binding).collect(),
                             }));
                         }
                         CheckerOperation::Require | CheckerOperation::Narrow => path = passing,
@@ -271,7 +312,7 @@ fn walk_integer_block(
                 else {
                     return None;
                 };
-                if !roots.contains_key(binding) {
+                if !roots.by_binding.contains_key(binding) {
                     return None;
                 }
             }
@@ -279,8 +320,16 @@ fn walk_integer_block(
                 let (axis, value) = integer_assignment(calls, roots, group)?;
                 path = path.overwrite(axis, value);
             }
-            BlockItemKind::Binding(_) => return None,
+            BlockItemKind::Binding(ref binding) => {
+                let (identity, ty, value) = integer_local(calls, binding, block, item.position)?;
+                roots.add(identity, ty);
+                path.append_local(value);
+            }
         }
+    }
+    if roots.axes.len() != depth {
+        path.drop_locals(depth);
+        roots.truncate(depth);
     }
     Some(IntegerControl::Continue(path))
 }
@@ -305,13 +354,33 @@ fn integer_assignment<'a>(
     else {
         return None;
     };
-    let &(axis, ty) = roots.get(binding)?;
+    let (axis, ty) = roots.lookup(binding)?;
+    if axis >= roots.parameters {
+        return None;
+    }
     let AssignmentReplacement::Resolved(replacement) = &destination.replacement else {
         return None;
     };
     if ty != replacement {
         return None;
     }
-    let value = calls.structure.checker_integer_assignment_rhs.get(&rhs.expression)?;
+    let value = calls.structure.checker_integer_literals.get(&rhs.expression)?;
     Some((axis, value))
+}
+
+fn integer_local<'a>(
+    calls: &'a FunctionCallSites,
+    region: &'a BindingRegion,
+    block: BlockOrdinal,
+    item: usize,
+) -> Option<(&'a ReferenceBindingId, &'a ScalarType, &'a BigInt)> {
+    let identity = calls.structure.checker_integer_locals.get(&(block, item))?;
+    let BindingInitialization::Outputs(outputs) = &region.initialization else {
+        return None;
+    };
+    let [receiver] = region.receivers() else {
+        return None;
+    };
+    let value = calls.structure.checker_integer_literals.get(&outputs.primary)?;
+    Some((identity, &receiver.ty, value))
 }

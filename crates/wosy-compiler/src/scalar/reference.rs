@@ -5997,7 +5997,9 @@ pub(super) struct OccurrenceStructure {
     #[cfg(test)]
     pub(super) checker_integer_branches: HashMap<OccurrenceOrdinal, super::checker_flow::IntegerPredicate>,
     #[cfg(test)]
-    pub(super) checker_integer_assignment_rhs: HashMap<OccurrenceOrdinal, BigInt>,
+    pub(super) checker_integer_literals: HashMap<OccurrenceOrdinal, BigInt>,
+    #[cfg(test)]
+    pub(super) checker_integer_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
     pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
@@ -6022,7 +6024,9 @@ impl OccurrenceStructure {
             #[cfg(test)]
             checker_integer_branches: HashMap::new(),
             #[cfg(test)]
-            checker_integer_assignment_rhs: HashMap::new(),
+            checker_integer_literals: HashMap::new(),
+            #[cfg(test)]
+            checker_integer_locals: HashMap::new(),
             literal_fields: HashMap::new(),
             module_storage_uses: HashMap::new(),
             module_storage_installs: BTreeMap::new(),
@@ -6697,11 +6701,11 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         }
         #[cfg(test)]
         if self.occurrence_typing.checker_directives_enabled()
-            && matches!(edge, OccurrenceEdge::AssignmentRhs { .. })
+            && matches!(edge, OccurrenceEdge::AssignmentRhs { .. } | OccurrenceEdge::BindingRoot { .. })
             && self.structure.checked_types.expressions.get(&ordinal).is_some_and(is_integer_type)
         {
             if let ScalarExpression::Integer { value, .. } = expression {
-                self.structure.checker_integer_assignment_rhs.insert(ordinal, value.clone());
+                self.structure.checker_integer_literals.insert(ordinal, value.clone());
             }
         }
         if matches!(&self.mode, WalkMode::ModuleInitialization { .. })
@@ -7712,6 +7716,20 @@ impl StructuralWalker<'_, '_> {
         } else {
             BindingInitialization::Outputs(self.binding_outputs(binding, position, scope)?)
         };
+        #[cfg(test)]
+        let checker_local = match &initialization {
+            BindingInitialization::Outputs(outputs)
+                if binding.receivers.len() == 1
+                    && outputs.secondary.is_empty()
+                    && self.structure.checker_integer_literals.contains_key(&outputs.primary) =>
+            {
+                match &self.mode {
+                    WalkMode::Callable(callable) => Some(callable.target_resolver),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         if matches!(
             self.mode,
             WalkMode::Callable(_)
@@ -7722,14 +7740,19 @@ impl StructuralWalker<'_, '_> {
                 scope
                     .types
                     .insert(receiver.name.clone(), receiver.ty.clone());
-                scope.names.insert(
-                    receiver.name.clone(),
-                    WalkBinding {
-                        declaration_span: receiver.name_span,
-                        block_span,
-                        introduced_by_assignment: false,
-                    },
-                );
+                let lexical = WalkBinding {
+                    declaration_span: receiver.name_span,
+                    block_span,
+                    introduced_by_assignment: false,
+                };
+                #[cfg(test)]
+                if let Some(callable) = checker_local {
+                    self.structure.checker_integer_locals.insert(
+                        (position.block, position.item),
+                        lexical.reference_id(callable.source, callable.function_span),
+                    );
+                }
+                scope.names.insert(receiver.name.clone(), lexical);
             }
         }
         Ok(BindingRegion::new(initialization, binding))

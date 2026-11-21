@@ -669,4 +669,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sibling_integer_locals_have_distinct_ids_and_leave_no_axis_at_the_join() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        check_source(
+            r#"
+            u8(u8, u8) check_pair = fn(x, y) {
+                if (x > 0) {
+                    u8 local = 1;
+                    core.require(local == 1, { .stdout = ""; .stderr = "first local"; .code = 1; .files = []; });
+                    core.narrow(y > 0, { .stdout = ""; .stderr = "narrow"; .code = 1; .files = []; });
+                }
+                if (x == 0) {
+                    u8 local = 2;
+                    core.require(local == 2, { .stdout = ""; .stderr = "second local"; .code = 1; .files = []; });
+                }
+                if (x > 0) {
+                    core.require(y > 0, { .stdout = ""; .stderr = "outer correlation"; .code = 1; .files = []; });
+                }
+                core.require(y > 0, { .stdout = ""; .stderr = "after join"; .code = 1; .files = []; });
+                x
+            };
+            "#,
+            |body| {
+                let locals = body.structure.checker_integer_locals.values().collect::<Vec<_>>();
+                assert_eq!(locals.len(), 2);
+                assert_ne!(locals[0], locals[1]);
+
+                let failure = check_integer_requirements(body).unwrap().unwrap_err();
+                assert_eq!(failure.axes, body.boundary.checker_parameter_bindings.iter().collect::<Vec<_>>());
+                assert!(failure.state.includes(&[0, 0]));
+                assert!(!failure.state.includes(&[1, 0]));
+            },
+        );
+    }
+
+    #[test]
+    fn failure_inside_branch_retains_current_local_for_author_output() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        check_source(
+            r#"
+            u8(u8) check_value = fn(value) {
+                if (value > 0) {
+                    u8 local = 7;
+                    core.require(local < 7, { .stdout = ""; .stderr = "local failure"; .code = 1; .files = []; });
+                }
+                value
+            };
+            "#,
+            |body| {
+                let failure = check_integer_requirements(body).unwrap().unwrap_err();
+                let local = body.structure.checker_integer_locals.values().next().unwrap();
+                assert_eq!(failure.axes, [&body.boundary.checker_parameter_bindings[0], local]);
+                assert!(failure.state.includes(&[1, 7]));
+                assert!(!failure.state.includes(&[0, 7]));
+                assert!(!failure.state.includes(&[1, 6]));
+            },
+        );
+    }
+
+    #[test]
+    fn mutable_local_is_outside_constant_binding_slice() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        check_source(
+            r#"
+            u8(u8) check_value = fn(value) {
+                u8 local = 1;
+                local = 2;
+                core.require(local == 1, { .stdout = ""; .stderr = "mutated local"; .code = 1; .files = []; });
+                value
+            };
+            "#,
+            |body| assert_eq!(check_integer_requirements(body), None),
+        );
+    }
+
+    #[test]
+    fn checker_mode_does_not_allow_shadowing_a_visible_ancestor() {
+        let project = checker_project(
+            r#"
+            u8(u8) check_value = fn(value) {
+                if (value > 0) {
+                    u8 value = 7;
+                    core.require(value == 7, { .stdout = ""; .stderr = "shadow"; .code = 1; .files = []; });
+                }
+                value
+            };
+            "#,
+        );
+        let (rejected, _) = crate::scalar::typecheck_scalar_project_in_mode(project, true);
+        assert!(
+            rejected.diagnostics.iter().any(|diagnostic| diagnostic.code == "B0002"
+                && diagnostic.message == "duplicate declaration"),
+            "{:?}",
+            rejected.diagnostics,
+        );
+    }
+
 }
