@@ -3661,6 +3661,8 @@ mod occurrence_obligations;
 mod reference;
 mod static_calls;
 #[cfg(test)]
+mod checker_directive;
+#[cfg(test)]
 mod symbolic_integer;
 pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};
 pub(crate) use static_calls::PreparedProgram;
