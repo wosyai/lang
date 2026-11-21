@@ -3715,7 +3715,7 @@ mod symbolic_integer;
 #[cfg(feature = "internal-checker")]
 pub use checker_directive::ScalarCheckerTextFile;
 #[cfg(feature = "internal-checker")]
-pub use checker_project::{check_scalar_module_proof, check_scalar_package, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope};
+pub use checker_project::{check_scalar_module_proof, check_scalar_module_proofs, check_scalar_package, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope};
 pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};
 pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{

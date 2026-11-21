@@ -1,7 +1,7 @@
 #![cfg(feature = "internal-checker")]
 
 use wosy_compiler::{
-    check_scalar_module_proof, check_scalar_package, derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project,
+    check_scalar_module_proof, check_scalar_module_proofs, check_scalar_package, derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project,
     ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarNamespaceBinding,
     ScalarModuleProofOutcome, ScalarPreparationInputs, ScalarProofModuleInput, ScalarTargetLayout,
 };
@@ -613,4 +613,56 @@ fn main_initializer_installs_pure_scalar_call_results_from_prepared_bindings() {
     assert_eq!(check(&text), ScalarCheckerOutcome::Unsupported);
     let text = format!("{base} u8 argument = 128; i8 result = bounded(argument); core.require(result == -128, {OUTPUT});");
     assert!(matches!(check(&text), ScalarCheckerOutcome::Invalid(_)));
+}
+
+#[test]
+fn named_proof_batch_preserves_order_applicability_and_independent_outcomes() {
+    let identity = source();
+    let checks = |proof_names: &[&str], tail: &str| check_scalar_module_proofs(
+        identity.clone(),
+        proof_names,
+        vec![ScalarProofModuleInput {
+            source: identity.clone(),
+            text: format!(r#"%%start
+                u8(u8) called = fn(input) {{ input }};
+                u8(u8) unused = fn(input) {{ input }};
+                u8 actual = called(7);
+                {tail}
+                proof valid for called(input) -> (out) ensures (out <= 7) {{}}
+                proof falsified for called(input) -> (out) ensures (out < 7) {{}}
+                proof excluded for called(input) -> (out) where (input < 7) ensures (out < 7) {{}}
+                proof invalid for called(input) -> (out) ensures (out <= 256) {{}}
+                proof every for unused(input) -> (out) ensures (out <= 255) {{}}
+                proof used_show for called(input) -> (out) ensures (out <= 7) {{
+                    if (input == 7) {{ core.show(out == 7); }} else {{ core.show(out == input); }}
+                }}
+            %%end"#),
+            namespaces: Vec::new(),
+        }],
+        vec![identity.clone()],
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    );
+    let names = ["excluded", "valid", "falsified", "used_show", "missing", "every", "invalid", "valid"];
+    assert_eq!(checks(&names, "").unwrap(), [
+        ScalarModuleProofOutcome::NoApplicableInputs,
+        ScalarModuleProofOutcome::Proved,
+        ScalarModuleProofOutcome::Refuted,
+        ScalarModuleProofOutcome::Unsupported,
+        ScalarModuleProofOutcome::Unsupported,
+        ScalarModuleProofOutcome::Proved,
+        ScalarModuleProofOutcome::Invalid(Vec::new()),
+        ScalarModuleProofOutcome::Proved,
+    ]);
+    assert_eq!(checks(&["valid", "invalid", "every"], "bool changed = true; changed = false;").unwrap(), [
+        ScalarModuleProofOutcome::Unsupported,
+        ScalarModuleProofOutcome::Invalid(Vec::new()),
+        ScalarModuleProofOutcome::Unsupported,
+    ]);
+    assert_eq!(check_scalar_module_proofs(
+        identity,
+        &[],
+        Vec::new(),
+        Vec::new(),
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    ), Ok(Vec::new()));
 }

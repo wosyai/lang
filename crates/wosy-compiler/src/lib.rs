@@ -31,7 +31,7 @@ pub use scalar::{
 
 #[cfg(feature = "internal-checker")]
 #[doc(hidden)]
-pub use scalar::{check_scalar_module_proof, check_scalar_package, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarCheckerTextFile};
+pub use scalar::{check_scalar_module_proof, check_scalar_module_proofs, check_scalar_package, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarCheckerTextFile};
 
 mod llvm;
 

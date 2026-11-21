@@ -540,16 +540,14 @@ struct ActualCalls<'a, Observer> {
 trait ActualIntegerObserver {
     const ENABLED: bool;
 
-    fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt) -> Result<(), ProjectCheck>;
+    fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
 }
 
 impl ActualIntegerObserver for () {
     const ENABLED: bool = false;
 
     #[inline(always)]
-    fn observe(&mut self, _target: (usize, usize), _arguments: &[&BigInt], _value: &BigInt) -> Result<(), ProjectCheck> {
-        Ok(())
-    }
+    fn observe(&mut self, _target: (usize, usize), _arguments: &[&BigInt], _value: &BigInt) {}
 }
 
 const MAX_ACTUAL_CALL_DEPTH: usize = 64;
@@ -646,7 +644,7 @@ impl<Observer: ActualIntegerObserver> ActualCalls<'_, Observer> {
         self.active.remove(&target);
         if Observer::ENABLED {
             if let Ok(ActualCallResult::Integer(value)) = &result {
-                self.observer.observe(target, exact, value)?;
+                self.observer.observe(target, exact, value);
             }
         }
         if result.is_ok() {
@@ -1021,7 +1019,7 @@ impl PreparedProofModule {
 
 #[cfg(feature = "internal-checker")]
 #[doc(hidden)]
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ScalarModuleProofOutcome {
     Proved,
     Refuted,
@@ -1039,8 +1037,31 @@ pub fn check_scalar_module_proof(
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
 ) -> ScalarModuleProofOutcome {
-    let result = PreparedProofModule::prepare_project(proof_source, modules, initialization_order, inputs)
-        .and_then(|prepared| prepared.check_module_proof(proof_name));
+    match check_scalar_module_proofs(proof_source, &[proof_name], modules, initialization_order, inputs) {
+        Ok(mut outcomes) => outcomes.pop().unwrap_or(ScalarModuleProofOutcome::Unsupported),
+        Err(outcome) => outcome,
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn check_scalar_module_proofs(
+    proof_source: SourceIdentity,
+    proof_names: &[&str],
+    modules: Vec<ScalarProofModuleInput>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+) -> Result<Vec<ScalarModuleProofOutcome>, ScalarModuleProofOutcome> {
+    if proof_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let prepared = PreparedProofModule::prepare_project(proof_source, modules, initialization_order, inputs)
+        .map_err(|error| module_proof_outcome(Err(error)))?;
+    Ok(prepared.check_module_proofs(proof_names))
+}
+
+#[cfg(feature = "internal-checker")]
+fn module_proof_outcome(result: Result<ProjectCheck, ProjectCheck>) -> ScalarModuleProofOutcome {
     match result {
         Ok(ProjectCheck::Proved) => ScalarModuleProofOutcome::Proved,
         Ok(ProjectCheck::Refuted) => ScalarModuleProofOutcome::Refuted,
@@ -1052,46 +1073,116 @@ pub fn check_scalar_module_proof(
 }
 
 #[cfg(feature = "internal-checker")]
+struct PlannedModuleProof<'a> {
+    target: (usize, usize),
+    typed: TypedProofPostcondition<'a>,
+    steps: ScalarBlock,
+    filter: Option<Vec<CheckerPredicate>>,
+    relation: IntegerRelation,
+}
+
+#[cfg(feature = "internal-checker")]
 impl PreparedProofModule {
-    fn check_module_proof(&self, proof_name: &str) -> Result<ProjectCheck, ProjectCheck> {
+    fn plan_module_proof(&self, proof_name: &str) -> Result<PlannedModuleProof<'_>, ProjectCheck> {
         let proof = self.select_resolved(&self.source, proof_name)?;
         let (module, item, _) = proof.function;
         let steps = derive_block(&child(proof.node, SyntaxKind::Block)?);
-        let TypedProofPostcondition { target, body, result_type, input_names, output, operator, bound } =
-            typed_proof_postcondition(&self.prepared, proof.function, proof.node)?;
-        let filter = prepare_proof_entry_filter(proof.node, &self.source, target.target_layout, &input_names, body)?;
-        let observer = SelectedProofObserver {
-            target: (module, item),
-            guard: steps.items.is_empty().then(|| actual_single_integer_guard(body, filter.as_deref().unwrap_or_default())).flatten(),
-            relation: IntegerRelation::from_operator(&operator).ok_or(ProjectCheck::Unsupported)?,
-            bound: &bound,
-            applicable: None,
-            observed: false,
-        };
-        let (root, ordinals) = package_initialization_order(self.prepared.parts().0)?;
-        let (initialization, observer) = check_package_initialization_observing(&self.prepared, root, ordinals, observer)?;
-        let proof_module = initialization.ordinals.get(&self.source).ok_or(ProjectCheck::MissingRoot)?;
-        if initialization.visits[module] != InitializationVisit::Completed
-            || initialization.visits[*proof_module] != InitializationVisit::Completed
-        {
-            return Err(ProjectCheck::Unsupported);
+        let typed = typed_proof_postcondition(&self.prepared, proof.function, proof.node)?;
+        let filter = prepare_proof_entry_filter(
+            proof.node, &self.source, typed.target.target_layout, &typed.input_names, typed.body,
+        )?;
+        let relation = IntegerRelation::from_operator(&typed.operator).ok_or(ProjectCheck::Unsupported)?;
+        Ok(PlannedModuleProof { target: (module, item), typed, steps, filter, relation })
+    }
+
+    fn check_module_proofs(&self, proof_names: &[&str]) -> Vec<ScalarModuleProofOutcome> {
+        let mut outcomes = vec![ScalarModuleProofOutcome::Unsupported; proof_names.len()];
+        let mut selected = HashMap::new();
+        let mut duplicate = Vec::new();
+        let mut plans = Vec::new();
+        for (index, &name) in proof_names.iter().enumerate() {
+            match selected.entry(name) {
+                std::collections::hash_map::Entry::Occupied(first) => duplicate.push((index, *first.get())),
+                std::collections::hash_map::Entry::Vacant(first) => {
+                    first.insert(index);
+                    match self.plan_module_proof(name) {
+                        Ok(plan) => plans.push((index, plan)),
+                        Err(error) => outcomes[index] = module_proof_outcome(Err(error)),
+                    }
+                }
+            }
         }
-        if initialization.reached.contains(&(module, item)) {
-            return observer.outcome();
+        self.run_module_proof_plans(&plans, &mut outcomes);
+        for (index, first) in duplicate {
+            outcomes[index] = outcomes[first].clone();
         }
+        outcomes
+    }
+
+    fn run_module_proof_plans(
+        &self,
+        plans: &[(usize, PlannedModuleProof<'_>)],
+        outcomes: &mut [ScalarModuleProofOutcome],
+    ) {
+        if plans.is_empty() {
+            return;
+        }
+        let Ok((root, ordinals)) = package_initialization_order(self.prepared.parts().0) else { return; };
+        let Some(&proof_module) = ordinals.get(&self.source) else { return; };
+        let mut observers = ActualProofBatch { targets: HashMap::new(), proofs: Vec::with_capacity(plans.len()) };
+        for (plan_index, (_, plan)) in plans.iter().enumerate() {
+            observers.targets.entry(plan.target).or_default().push(plan_index);
+            observers.proofs.push(plan.observer());
+        }
+        let Ok((initialization, observers)) =
+            check_package_initialization_observing(&self.prepared, root, ordinals, observers)
+        else { return; };
+        if initialization.visits[proof_module] != InitializationVisit::Completed {
+            return;
+        }
+        for ((index, plan), observer) in plans.iter().zip(observers.proofs) {
+            if initialization.visits[plan.target.0] != InitializationVisit::Completed {
+                continue;
+            }
+            let result = if initialization.reached.contains(&plan.target) {
+                observer.outcome()
+            } else {
+                plan.verify_arbitrary()
+            };
+            outcomes[*index] = module_proof_outcome(result);
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+impl PlannedModuleProof<'_> {
+    fn observer(&self) -> SelectedProofObserver<'_> {
+        SelectedProofObserver {
+            guard: if self.steps.items.is_empty() {
+                actual_single_integer_guard(self.typed.body, self.filter.as_deref().unwrap_or_default())
+            } else {
+                None
+            },
+            relation: self.relation,
+            bound: &self.typed.bound,
+            coverage: ActualProofCoverage::Unseen,
+        }
+    }
+
+    fn verify_arbitrary(&self) -> Result<ProjectCheck, ProjectCheck> {
+        let TypedProofPostcondition { target, body, result_type, input_names, output, operator, bound } = &self.typed;
         if !body.structure.checker_directives.is_empty() || !body.call_occurrences.is_empty()
             || !body.allocation_length_calls.is_empty() || !body.assignments.is_empty()
         {
             return Err(ProjectCheck::Unsupported);
         }
-        let checked = if !steps.items.is_empty() {
-            let proof = proof_show_branch::<false>(&steps, &input_names, &output, result_type, body)?;
-            check_integer_return_bound_with_shows(body, &operator, &bound, filter.as_deref(), &proof)
-        } else if let Some(filter) = filter.as_deref() {
-            check_integer_return_bound_where(body, &operator, &bound, filter)
+        let checked = if !self.steps.items.is_empty() {
+            let proof = proof_show_branch::<false>(&self.steps, input_names, output, result_type, body)?;
+            check_integer_return_bound_with_shows(body, operator, bound, self.filter.as_deref(), &proof)
+        } else if let Some(filter) = self.filter.as_deref() {
+            check_integer_return_bound_where(body, operator, bound, filter)
         } else {
-            check_integer_return_bound(body, &operator, &bound)
-                .map(|result| result.map(ProofCoverage::Applicable))
+            check_integer_return_bound(body, operator, bound).map(|result| result.map(ProofCoverage::Applicable))
         };
         match checked {
             Some(Ok(ProofCoverage::Applicable(true))) => Ok(ProjectCheck::Proved),
@@ -1135,44 +1226,70 @@ fn actual_single_integer_guard<'a>(
 
 #[cfg(feature = "internal-checker")]
 struct SelectedProofObserver<'a> {
-    target: (usize, usize),
     guard: Option<ActualSingleIntegerGuard<'a>>,
     relation: IntegerRelation,
     bound: &'a BigInt,
-    applicable: Option<bool>,
-    observed: bool,
+    coverage: ActualProofCoverage,
+}
+
+#[cfg(feature = "internal-checker")]
+enum ActualProofCoverage {
+    Unseen,
+    Inapplicable,
+    Proved,
+    Refuted,
+    Unsupported,
 }
 
 #[cfg(feature = "internal-checker")]
 impl SelectedProofObserver<'_> {
     fn outcome(self) -> Result<ProjectCheck, ProjectCheck> {
-        if !self.observed {
-            return Err(ProjectCheck::Unsupported);
+        match self.coverage {
+            ActualProofCoverage::Proved => Ok(ProjectCheck::Proved),
+            ActualProofCoverage::Refuted => Ok(ProjectCheck::Refuted),
+            ActualProofCoverage::Inapplicable => Ok(ProjectCheck::NoApplicableInputs),
+            ActualProofCoverage::Unsupported | ActualProofCoverage::Unseen => Err(ProjectCheck::Unsupported),
         }
-        Ok(match self.applicable {
-            Some(true) => ProjectCheck::Proved,
-            Some(false) => ProjectCheck::Refuted,
-            None => ProjectCheck::NoApplicableInputs,
-        })
+    }
+
+    fn record(&mut self, arguments: &[&BigInt], value: &BigInt) {
+        let (Some(guard), [argument]) = (&self.guard, arguments) else {
+            self.coverage = ActualProofCoverage::Unsupported;
+            return;
+        };
+        if matches!(self.coverage, ActualProofCoverage::Unsupported | ActualProofCoverage::Refuted) {
+            return;
+        }
+        if !guard.always_rejects
+            && guard.comparisons.iter().all(|(relation, bound)| relation.accepts(argument.cmp(bound)))
+        {
+            self.coverage = if self.relation.accepts(value.cmp(self.bound)) {
+                ActualProofCoverage::Proved
+            } else {
+                ActualProofCoverage::Refuted
+            };
+        } else if matches!(self.coverage, ActualProofCoverage::Unseen) {
+            self.coverage = ActualProofCoverage::Inapplicable;
+        }
     }
 }
 
 #[cfg(feature = "internal-checker")]
-impl ActualIntegerObserver for SelectedProofObserver<'_> {
+struct ActualProofBatch<'a> {
+    targets: HashMap<(usize, usize), Vec<usize>>,
+    proofs: Vec<SelectedProofObserver<'a>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ActualIntegerObserver for ActualProofBatch<'_> {
     const ENABLED: bool = true;
 
-    fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt) -> Result<(), ProjectCheck> {
-        if target != self.target {
-            return Ok(());
+    fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt) {
+        if let Some(proofs) = self.targets.get(&target) {
+            for &proof in proofs {
+                self.proofs[proof].record(arguments, value);
+            }
         }
-        let (Some(guard), [argument]) = (&self.guard, arguments) else { return Err(ProjectCheck::Unsupported); };
-        self.observed = true;
-        if !guard.always_rejects && self.applicable != Some(false)
-            && guard.comparisons.iter().all(|(relation, bound)| relation.accepts(argument.cmp(bound)))
-        {
-            self.applicable = Some(self.relation.accepts(value.cmp(self.bound)));
-        }
-        Ok(())
     }
 }
 
