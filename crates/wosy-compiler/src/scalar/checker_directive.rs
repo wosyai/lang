@@ -1,5 +1,5 @@
 use super::{
-    checker_flow::IntegerPredicate, control::CheckedCallSignature, typecheck::expression_span,
+    checker_flow::CheckerPredicate, control::CheckedCallSignature, typecheck::expression_span,
     ByteSpan, ScalarExpression,
 };
 
@@ -13,7 +13,7 @@ pub(super) enum CheckerOperation {
 pub(super) struct PreparedCheckerDirective {
     pub(super) operation: CheckerOperation,
     pub(super) condition: ByteSpan,
-    pub(super) integer_predicate: Option<IntegerPredicate>,
+    pub(super) predicate: Option<CheckerPredicate>,
     pub(super) call_signature: Option<CheckedCallSignature>,
     pub(super) output: CheckedLiteralOutput,
 }
@@ -444,7 +444,9 @@ mod tests {
         let ConditionalRegion::Unit { condition: condition_ordinal, then_block, .. } = region else {
             panic!("expected unit branch topology")
         };
-        let branch = &body.structure.checker_integer_branches[condition_ordinal];
+        let CheckerPredicate::Integer(branch) = &body.structure.checker_branches[condition_ordinal] else {
+            panic!("expected typed integer branch");
+        };
         let directive_for = |block, item| {
             let OccurrenceNode::Expression(ordinal) = body.structure.edges
                 [&(OccurrenceParent::Block(block), OccurrenceEdge::ExpressionItem { item })]
@@ -458,10 +460,10 @@ mod tests {
             panic!("expected canonical directive")
         };
         let syntax = CheckerDirective::from_expression(canonical).unwrap().unwrap();
-        assert_eq!(
-            branch.binding,
-            branch_directive.integer_predicate.as_ref().unwrap().binding,
-        );
+        let Some(CheckerPredicate::Integer(directive_predicate)) = &branch_directive.predicate else {
+            panic!("expected typed integer directive");
+        };
+        assert_eq!(branch.binding, directive_predicate.binding);
         assert_eq!(branch_directive.condition, expression_span(syntax.condition));
         assert_eq!(branch_directive.output, syntax.output.explicit_literal().unwrap());
 
@@ -823,7 +825,7 @@ mod tests {
         use crate::scalar::{checker_flow::check_integer_requirements, reference, typecheck_scalar_project_in_mode};
         for source in [
             r#"unit() check_value = fn {
-                core.require(true, { .stdout = ""; .stderr = "unsupported"; .code = 1; .files = []; });
+                core.require(!false, { .stdout = ""; .stderr = "unsupported"; .code = 1; .files = []; });
             };"#,
             r#"
             unit() check_value = fn { effect(); };
@@ -841,6 +843,63 @@ mod tests {
         let body = calls.function(0, 0);
         assert!(body.boundary.checker_parameter_bindings.is_none());
         assert_eq!(check_integer_requirements(body), None);
+    }
+
+    #[test]
+    fn boolean_literals_partition_the_reachable_state_exactly() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        let output = r#"{ .stdout = ""; .stderr = "literal failure"; .code = 1; .files = []; }"#;
+        for (operation, syntax) in [
+            (CheckerOperation::Require, "require"),
+            (CheckerOperation::Narrow, "narrow"),
+        ] {
+            for value in [true, false] {
+                let source = format!(
+                    "u8() check_value = fn {{ u8 local = 7; core.{syntax}({value}, {output}); local }};"
+                );
+                check_source(&source, |body| {
+                    let result = check_integer_requirements(body).unwrap();
+                    let directive = body.structure.checker_directives.values().next().unwrap();
+                    assert_eq!(directive.predicate, Some(CheckerPredicate::Boolean(value)));
+                    if value {
+                        assert_eq!(result, Ok(()));
+                    } else {
+                        let failure = result.unwrap_err();
+                        assert_eq!(body.structure.checker_directives[&failure.directive].operation, operation);
+                        assert_eq!(failure.axes.len(), 1);
+                        assert_eq!(failure.state.row_count(), 1);
+                        assert!(failure.state.includes(&[7]));
+                        assert!(!failure.state.includes(&[6]));
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn constant_unit_branch_only_checks_its_reachable_arm() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        let output = r#"{ .stdout = ""; .stderr = "reached"; .code = 1; .files = []; }"#;
+        for guard in [false, true] {
+            let source = format!(
+                r#"
+                unit() check_value = fn {{
+                    if ({guard}) {{
+                        effect();
+                        core.require(false, {output});
+                    }}
+                    core.require(true, {output});
+                }};
+                unit() effect = fn {{}};
+                "#
+            );
+            check_source(&source, |body| {
+                assert!(body.structure.checker_branches.values().any(|predicate| {
+                    *predicate == CheckerPredicate::Boolean(guard)
+                }));
+                assert_eq!(check_integer_requirements(body), if guard { None } else { Some(Ok(())) });
+            });
+        }
     }
 
 }

@@ -5995,7 +5995,7 @@ pub(super) struct OccurrenceStructure {
     #[cfg(test)]
     pub(super) checker_directives: HashMap<OccurrenceOrdinal, super::checker_directive::PreparedCheckerDirective>,
     #[cfg(test)]
-    pub(super) checker_integer_branches: HashMap<OccurrenceOrdinal, super::checker_flow::IntegerPredicate>,
+    pub(super) checker_branches: HashMap<OccurrenceOrdinal, super::checker_flow::CheckerPredicate>,
     #[cfg(test)]
     pub(super) checker_integer_literals: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(test)]
@@ -6022,7 +6022,7 @@ impl OccurrenceStructure {
             #[cfg(test)]
             checker_directives: HashMap::new(),
             #[cfg(test)]
-            checker_integer_branches: HashMap::new(),
+            checker_branches: HashMap::new(),
             #[cfg(test)]
             checker_integer_literals: HashMap::new(),
             #[cfg(test)]
@@ -6618,12 +6618,15 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
     }
 
     #[cfg(test)]
-    fn checker_integer_predicate(
+    fn checker_predicate(
         &self,
         expression: &ScalarExpression,
         names: &BTreeMap<String, WalkBinding>,
-    ) -> Option<super::checker_flow::IntegerPredicate> {
-        use super::checker_flow::IntegerComparison;
+    ) -> Option<super::checker_flow::CheckerPredicate> {
+        use super::checker_flow::{CheckerPredicate, IntegerComparison};
+        if let ScalarExpression::Boolean { value, .. } = expression {
+            return Some(CheckerPredicate::Boolean(*value));
+        }
         let WalkMode::Callable(callable) = &self.mode else {
             return None;
         };
@@ -6637,7 +6640,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             self.occurrence_typing.checked_expression_type(comparison.left)?,
             self.occurrence_typing.checked_expression_type(comparison.right)?,
             binding,
-        )
+        ).map(CheckerPredicate::Integer)
     }
 
     fn expression_at_with_initializer_statement(
@@ -6677,13 +6680,13 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 unreachable!("typed directive is a canonical call");
             };
             let condition = &arguments[0];
-            let integer_predicate = self.checker_integer_predicate(condition, names);
+            let predicate = self.checker_predicate(condition, names);
             self.structure.checker_directives.insert(
                 ordinal,
                 PreparedCheckerDirective {
                     operation: marker.operation,
                     condition: expression_span(condition),
-                    integer_predicate,
+                    predicate,
                     call_signature: self.occurrence_typing.take_call(condition),
                     output: marker.output,
                 },
@@ -6695,8 +6698,8 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             && matches!(edge, OccurrenceEdge::Condition)
             && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)
         {
-            if let Some(predicate) = self.checker_integer_predicate(expression, names) {
-                self.structure.checker_integer_branches.insert(ordinal, predicate);
+            if let Some(predicate) = self.checker_predicate(expression, names) {
+                self.structure.checker_branches.insert(ordinal, predicate);
             }
         }
         #[cfg(test)]

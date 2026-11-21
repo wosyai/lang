@@ -12,6 +12,12 @@ use super::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum CheckerPredicate {
+    Boolean(bool),
+    Integer(IntegerPredicate),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct IntegerPredicate {
     pub(super) binding: ReferenceBindingId,
     ty: ScalarType,
@@ -100,8 +106,13 @@ impl IntegerInputs {
     fn split(
         self,
         roots: &IntegerRoots<'_>,
-        predicate: &IntegerPredicate,
-    ) -> Option<(Self, Self, usize)> {
+        predicate: &CheckerPredicate,
+    ) -> Option<(Self, Self, Option<usize>)> {
+        let predicate = match predicate {
+            CheckerPredicate::Boolean(true) => return Some((self, Self::default(), None)),
+            CheckerPredicate::Boolean(false) => return Some((Self::default(), self, None)),
+            CheckerPredicate::Integer(predicate) => predicate,
+        };
         let (index, ty) = roots.lookup(&predicate.binding)?;
         if ty != &predicate.ty {
             return None;
@@ -122,16 +133,17 @@ impl IntegerInputs {
                 failing.0.push(alternate);
             }
         }
-        Some((passing, failing, index))
+        Some((passing, failing, Some(index)))
     }
 
-    fn join(mut self, mut other: Self, axis: usize) -> Self {
+    fn join(mut self, mut other: Self, axis: Option<usize>) -> Self {
         if self.is_unreachable() {
             return other;
         }
         if other.is_unreachable() {
             return self;
         }
+        let axis = axis.expect("both nonempty paths require a partition axis");
         if self.0.len() == 1 && other.0.len() == 1 {
             let left = &mut self.0[0];
             let right = &other.0[0];
@@ -272,7 +284,7 @@ fn walk_integer_block<'a>(
         match item.kind {
             BlockItemKind::Evaluation { expression } => {
                 if let Some(directive) = structure.checker_directives.get(&expression) {
-                    let (passing, failing, _) = path.split(roots, directive.integer_predicate.as_ref()?)?;
+                    let (passing, failing, _) = path.split(roots, directive.predicate.as_ref()?)?;
                     match directive.operation {
                         CheckerOperation::Require if !failing.is_unreachable() => {
                             return Some(IntegerControl::Fail(IntegerCheckFailure {
@@ -296,7 +308,7 @@ fn walk_integer_block<'a>(
                     else {
                         return None;
                     };
-                    let predicate = structure.checker_integer_branches.get(condition)?;
+                    let predicate = structure.checker_branches.get(condition)?;
                     let (yes, no, axis) = path.split(roots, predicate)?;
                     match walk_integer_block(calls, roots, *then_block, yes)? {
                         IntegerControl::Continue(then_path) => path = then_path.join(no, axis),
