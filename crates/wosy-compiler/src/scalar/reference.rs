@@ -1825,6 +1825,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             } => {
                 let place_ordinal = self.place_ordinal(parent, OccurrenceEdge::ExpressionPlace);
                 let root = self.place_root(place, place_ordinal);
+                let mut named_parent_point = None;
                 let parents = match root.place {
                     ScalarPlace::Dereference { pointer, .. } => {
                         let pointer_ordinal = self.expression_ordinal(
@@ -1849,6 +1850,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
                             ));
                         };
+                        if matches!(pointer.as_ref(), ScalarExpression::Name { .. })
+                            && origins.len() == 1
+                        {
+                            named_parent_point = self.cursor;
+                        }
                         Some(origins)
                     }
                     _ => None,
@@ -1966,7 +1972,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         self.checked_result_origins.insert(id);
                     }
                     origins.insert(id);
-                    self.point(
+                    let borrow = self.point(
                         CfgPointKind::Borrow {
                             place: loan.origin_place.clone(),
                             loan,
@@ -1975,6 +1981,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         scope,
                         BTreeSet::from([id]),
                     );
+                    if let (Some(pointer), Some(origin)) = (named_parent_point, parent_id) {
+                        self.proof_points.named_reborrow_parents.push(super::control::NamedReborrowParent {
+                            borrow,
+                            pointer,
+                            origin,
+                        });
+                    }
                 }
                 Ok(ReferenceValue::Checked(origins))
             }
@@ -3899,7 +3912,7 @@ enum LoanAccess<'a> {
     Through(ReferenceOriginId),
     WriteThrough(&'a InvalidationCandidate),
     ReadThrough(&'a ReferenceLoanId),
-    FreshBorrow(ScalarReferenceMutability),
+    Borrow(&'a ReferenceLoanId),
 }
 
 fn conflicting_live_loan(
@@ -3916,7 +3929,7 @@ fn conflicting_live_loan(
         let mut reachable = false;
         for origin in origins {
             if match access {
-                LoanAccess::Direct | LoanAccess::ReadThrough(_) | LoanAccess::FreshBorrow(_) => false,
+                LoanAccess::Direct | LoanAccess::ReadThrough(_) | LoanAccess::Borrow(_) => false,
                 LoanAccess::Through(selected) => *origin == selected,
                 LoanAccess::WriteThrough(selected) => *origin == selected.origin,
             } {
@@ -3935,10 +3948,11 @@ fn conflicting_live_loan(
                 LoanAccess::WriteThrough(selected) => {
                     loan_borrows_place(loan, &place) && !loan_has_ancestor(&selected.loan, loan)
                 }
-                LoanAccess::FreshBorrow(mode) => {
-                    (mode == ScalarReferenceMutability::Mutable
+                LoanAccess::Borrow(new) => {
+                    (new.mode == ScalarReferenceMutability::Mutable
                         || loan.mode == ScalarReferenceMutability::Mutable)
                         && reference_places_overlap(&available_place(&loan.origin_place), &place)
+                        && !loan_has_ancestor(new, loan)
                 }
                 LoanAccess::Direct | LoanAccess::Through(_) => loan_borrows_place(loan, &place),
             };
@@ -4380,16 +4394,18 @@ struct ReferenceTransferCfg<'a> {
     facts: &'a mut Vec<ReferenceOrigin>,
     allocations: &'a BTreeSet<ReferenceBindingId>,
     checked_pointee_reads: &'a [CfgPointId],
+    named_reborrow_parents: &'a [super::control::NamedReborrowParent],
 }
 
 impl<'a> ReferenceTransferCfg<'a> {
-    fn new(cfg: &'a mut ScalarReferenceCfg, checked_pointee_reads: &'a [CfgPointId]) -> Self {
+    fn new(cfg: &'a mut ScalarReferenceCfg, proof: Option<&'a CallablePointFacts>) -> Self {
         Self {
             initial_points: &cfg.initial_points,
             points: &mut cfg.points,
             facts: &mut cfg.facts,
             allocations: &cfg.allocations,
-            checked_pointee_reads,
+            checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
+            named_reborrow_parents: proof.map_or(&[], |proof| &proof.named_reborrow_parents),
         }
     }
 }
@@ -4461,6 +4477,9 @@ fn transfer_reference_facts(
             descriptor.invalid = true;
         }
         descriptor = None;
+    }
+    for parent in cfg.named_reborrow_parents {
+        last_use[parent.pointer.0] = last_use[parent.pointer.0].max(parent.borrow.0);
     }
     let aggregate_deadlines = aggregate.as_ref()
         .filter(|_| aggregate_expiry_allowed)
@@ -5394,17 +5413,26 @@ fn transfer_reference_facts(
                                 reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
                             });
                         }
-                        if loan.parent.is_none()
-                            && !state.bindings.is_empty()
-                            && is_lexical_field_path(&place.projections)
-                        {
+                        let check = if loan.parent.is_none() {
+                            is_lexical_field_path(&place.projections)
+                        } else {
+                            cfg.named_reborrow_parents
+                                .binary_search_by_key(&id, |parent| parent.borrow)
+                                .ok()
+                                .is_some_and(|index| {
+                                    let parent = &cfg.named_reborrow_parents[index];
+                                    state.point_values.get(parent.pointer)
+                                        .is_some_and(|origins| origins.contains(&parent.origin))
+                                })
+                        };
+                        if check && !state.bindings.is_empty() {
                             let origins = conflicting_live_loan(
                                 original_points,
                                 &cfg.facts,
                                 &state,
                                 id,
                                 place,
-                                LoanAccess::FreshBorrow(loan.mode),
+                                LoanAccess::Borrow(loan),
                             );
                             if !origins.is_empty() {
                                 errors.push(ReferenceAnalysisError::ConflictingPlace {
@@ -8865,7 +8893,7 @@ fn transfer_function_output_contracts<'a>(
                     invalid: false, exited: false })
         });
         let transferred = transfer_reference_facts(
-            ReferenceTransferCfg::new(&mut result.cfg, &result.proof_points.checked_pointee_reads),
+            ReferenceTransferCfg::new(&mut result.cfg, Some(&result.proof_points)),
             &BTreeMap::new(),
             inputs,
             None,
@@ -9160,6 +9188,7 @@ fn derive_function_specialized_copy_policies(
                     facts: &mut facts,
                     allocations: &template_cfg.allocations,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
+                    named_reborrow_parents: &template_result.proof_points.named_reborrow_parents,
                 },
                 &deferred,
                 &HashMap::new(),
@@ -9474,7 +9503,7 @@ fn build_function_reference_cfg(
             &mut aggregate,
         ));
         let provisional = transfer_reference_facts(
-            ReferenceTransferCfg::new(&mut builder.cfg, &builder.proof_points.checked_pointee_reads),
+            ReferenceTransferCfg::new(&mut builder.cfg, Some(&builder.proof_points)),
             &BTreeMap::new(),
             &HashMap::new(),
             flow,

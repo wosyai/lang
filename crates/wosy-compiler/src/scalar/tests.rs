@@ -1918,6 +1918,84 @@ fn compatible_fresh_checked_borrows_remain_valid() {
 }
 
 #[test]
+fn incompatible_sibling_reborrow_reports_live_peer_without_labeling_parent() {
+    for (first, second) in [
+        ("*!u8 first = &!(*parent);", "*!u8 second = &!(*parent);"),
+        ("*u8 first = &(*parent);", "*!u8 second = &!(*parent);"),
+        ("*!u8 first = &!(*parent);", "*u8 second = &(*parent);"),
+    ] {
+        let text = format!("%%start
+unit(*!u8) check_siblings = fn(parent) {{
+    {first}
+    {second}
+    u8 before = *first;
+    u8 after = *second;
+    u8 resumed = *parent;
+    before; after; resumed;
+}};
+%%end");
+        let span = |borrow: &str| {
+            let prefix = borrow.find('&').unwrap();
+            let start = text.find(borrow).unwrap() + prefix;
+            ByteSpan::new(start as u32, (start + borrow.len() - prefix - 1) as u32)
+        };
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected one overlapping sibling diagnostic: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.code, "B0003");
+            assert_eq!(diagnostic.message, "read or move of unavailable place");
+            assert_eq!(diagnostic.labels[0].span.range, span(second));
+            assert_eq!(diagnostic.labels[1].span.range, span(first));
+            assert_eq!(
+                diagnostic.labels[1].kind,
+                super::super::DiagnosticLabelKind::Secondary,
+            );
+            assert_eq!(diagnostic.labels.len(), 2);
+        }
+    }
+}
+
+#[test]
+fn explicit_named_reborrow_accepts_sharing_last_use_ancestors_and_exclusive_arms() {
+    for text in [
+        "%%start
+        unit(*!u8) check_siblings = fn(parent) {
+          *u8 first = &(*parent); *u8 second = &(*parent);
+          u8 before = *first; u8 after = *second; before; after;
+        };
+        %%end",
+        "%%start
+        unit(*!u8) check_siblings = fn(parent) {
+          *!u8 first = &!(*parent); u8 before = *first;
+          *!u8 second = &!(*parent); u8 after = *second;
+          u8 resumed = *parent; before; after; resumed;
+        };
+        %%end",
+        "%%start
+        unit(*!u8) check_siblings = fn(parent) {
+          *!u8 child = &!(*parent); *!u8 grandchild = &!(*child);
+          u8 first = *grandchild; u8 second = *child; u8 third = *parent;
+          first; second; third;
+        };
+        %%end",
+        "%%start
+        unit(bool) check_siblings = fn(choose) {
+          u8 left = 1; u8 right = 2; *!u8 selected = null;
+          if (choose) { *!u8 parent = &!left; selected = &!(*parent); }
+          else { *!u8 parent = &!right; selected = &!(*parent); };
+          u8 observed = *selected; observed;
+        };
+        %%end",
+    ] {
+        let (single, project) = both_reference_functions(text);
+        assert!(single.diagnostics.is_empty(), "{text}: {:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{text}: {:?}", project.diagnostics);
+    }
+}
+
+#[test]
 fn checked_aggregate_conflicts_label_the_initiating_loan_in_both_pipelines() {
     for (text, primary, origin) in [
             ("%%start\nstruct Payload { u8 value; }\nunit() f = fn { Payload specimen = { .value = 1; }; *!Payload writer = &!specimen; Payload taken = *writer; Payload again = *writer; taken; again; };\n%%end", "*writer; taken", "&!specimen"),

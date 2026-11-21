@@ -23,10 +23,17 @@ pub(crate) struct CallablePointFacts {
     pub(super) installs: HashMap<OccurrenceOrdinal, FrozenInstall>,
     pub(super) definitions: HashMap<(BlockOrdinal, usize, usize), BindingDefinition>,
     pub(super) checked_pointee_reads: Vec<super::CfgPointId>,
+    pub(super) named_reborrow_parents: Vec<NamedReborrowParent>,
     pub(super) formals: HashMap<usize, super::ReferenceBindingId>,
     pub(super) scalar_descriptor_install: ScalarDescriptorCandidates,
     pub(super) backing_descriptor_install: ScalarDescriptorCandidates,
     pub(super) has_nonlexical_install: bool,
+}
+
+pub(super) struct NamedReborrowParent {
+    pub(super) borrow: super::CfgPointId,
+    pub(super) pointer: super::CfgPointId,
+    pub(super) origin: super::ReferenceOriginId,
 }
 
 #[derive(Default)]
