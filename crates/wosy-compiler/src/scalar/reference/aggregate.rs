@@ -2433,18 +2433,16 @@ mod tests {
         let text = "%%start
 leaf = overload {
     *u8(*?u8, *u8) => fn(data, foreign) {
-        u8 value = 0;
-        unsafe { value = core.load<u8>(data); };
+        u8 value = unsafe { core.load<u8>(data) };
         &value
     };
-    *u32(*?u32, *u32) => fn(data, foreign) {
-        u32 value = 0;
-        unsafe { value = core.load<u32>(data); };
+    *u32(*?u8, *u32) => fn(data, foreign) {
+        unsafe { core.load<u8>(data); };
         foreign
     };
 };
 *u8(*?u8, *u8) relay = fn(data, foreign) { leaf(data, foreign) };
-*u32(*?u32, *u32) borrowed_relay = fn(data, foreign) { leaf(data, foreign) };
+*u32(*?u8, *u32) borrowed_relay = fn(data, foreign) { leaf(data, foreign) };
 *u8(*?u8) unknown = fn(data) { u8 value = 0; if (data == null) { value = 0; }; &value };
 *u8(*?u8) consuming = fn(data) {
     u8 value = 0;
