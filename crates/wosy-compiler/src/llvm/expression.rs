@@ -122,7 +122,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                         .map_err(builder_error)?,
                 ));
             }
-            if let Some((global, ty)) = state.globals.get(name).cloned() {
+            if let Some((global, ty)) = state.globals.get(name) {
                 if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
                     return Ok(EmitValue::Basic(global.as_pointer_value().into()));
                 }
@@ -130,7 +130,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                     state
                         .builder
                         .build_load(
-                            storage_type(context, &ty, state.layouts, state.target_layout)?,
+                            storage_type(context, ty, state.layouts, state.target_layout)?,
                             global.as_pointer_value(),
                             name,
                         )
@@ -141,6 +141,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                 .values
                 .get(name)
                 .cloned()
+                .or_else(|| state.unit_values.contains(name.as_str()).then_some(EmitValue::Unit))
                 .ok_or_else(|| format!("unknown LLVM value {name}"))
         }
         ScalarExpression::Member {
