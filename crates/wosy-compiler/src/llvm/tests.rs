@@ -4,7 +4,7 @@ use inkwell::context::Context;
 
 use super::emit_scalar_llvm;
 use super::emit_scalar_project_llvm;
-use super::function_type;
+use super::function_value_result;
 use super::project_function_name;
 use super::project_global_name;
 use super::storage_type;
@@ -4173,7 +4173,6 @@ fn serializes_without_externs_preserving_line_endings_and_separator() {
 
 #[test]
 fn preserves_callable_return_metadata_for_every_output_form() {
-    let context = Context::create();
     let sequence = |types: Vec<ScalarType>| ScalarOutputSequence {
         outputs: types
             .into_iter()
@@ -4184,49 +4183,21 @@ fn preserves_callable_return_metadata_for_every_output_form() {
             .collect(),
         span: wosy_syntax::ByteSpan::new(0, 0),
     };
-    let callable = |outputs| ScalarType::Callable {
-        outputs,
-        parameters: Vec::new(),
-    };
 
     assert_eq!(
-        function_type(
-            &context,
-            &callable(sequence(Vec::new())),
-            ScalarTargetLayout::WASM32,
-        )
-        .expect("zero-output function type")
-        .1,
+        function_value_result(&sequence(Vec::new())).expect("zero-output function type"),
         LlvmValueType::Void
     );
     assert_eq!(
-        function_type(
-            &context,
-            &callable(sequence(vec![ScalarType::I32])),
-            ScalarTargetLayout::WASM32,
-        )
-        .expect("direct function type")
-        .1,
+        function_value_result(&sequence(vec![ScalarType::I32])).expect("direct function type"),
         LlvmValueType::I32
     );
     assert_eq!(
-        function_type(
-            &context,
-            &callable(sequence(vec![ScalarType::I32, ScalarType::Bool])),
-            ScalarTargetLayout::WASM32,
-        )
-        .expect("aggregate function type")
-        .1,
+        function_value_result(&sequence(vec![ScalarType::I32, ScalarType::Bool])).expect("aggregate function type"),
         LlvmValueType::Aggregate(vec![LlvmValueType::I32, LlvmValueType::I1])
     );
     assert_eq!(
-        function_type(
-            &context,
-            &callable(sequence(vec![ScalarType::Unit, ScalarType::I32])),
-            ScalarTargetLayout::WASM32,
-        )
-        .expect("unit aggregate function type")
-        .1,
+        function_value_result(&sequence(vec![ScalarType::Unit, ScalarType::I32])).expect("unit aggregate function type"),
         LlvmValueType::Aggregate(vec![LlvmValueType::I8, LlvmValueType::I32])
     );
 }
