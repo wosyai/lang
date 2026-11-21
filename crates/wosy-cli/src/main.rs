@@ -3,8 +3,10 @@ use codespan_reporting::diagnostic::{Diagnostic as Report, Label};
 use codespan_reporting::files::SimpleFiles;
 use codespan_reporting::term;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
+#[cfg(test)]
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::process::ExitCode;
@@ -87,9 +89,10 @@ fn main() -> ExitCode {
 fn parse_command(target: Option<&str>) -> Result<bool, String> {
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
-    let configuration = ProjectConfiguration::load(&root)?;
+    let (configuration, document) = ProjectConfiguration::load_with_manifest(&root)?;
     let target_name = configuration.resolve_target(target)?;
-    let project = ProjectContext::load(&root, &target_name)?;
+    let project = ProjectContext::from_manifest(&root, &target_name, document.as_table())?;
+    drop(document);
     let source_path = project.source_path();
     let text = fs::read_to_string(&source_path)
         .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
@@ -125,12 +128,14 @@ fn parse_command(target: Option<&str>) -> Result<bool, String> {
 fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
-    let configuration = ProjectConfiguration::load(&root)?;
+    let (configuration, document) = ProjectConfiguration::load_with_manifest(&root)?;
     let target_name = configuration.resolve_target(target)?;
-    let project = ProjectContext::load(&root, &target_name)?;
+    let project = ProjectContext::from_manifest(&root, &target_name, document.as_table())?;
     let (_target_config, artifact, artifact_profile, target_profile) =
         configuration.artifact_profile(&target_name, profile)?;
     let target_layout = artifact_profile.target_layout().map(scalar_target_layout)?;
+    let configuration_identity = blake3::hash(document.raw().as_bytes()).to_hex().to_string();
+    drop(document);
     let (llvm, source_observations) =
         compile_project(&root, &project, &configuration, target_layout)?;
     let source_identity = wosy_project::source_identity(&source_observations);
@@ -147,7 +152,7 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let runtime = wosy_compiler::core_runtime(&artifact_profile.backend, &artifact_profile.output)?;
     fs::write(&runtime_path, runtime).map_err(|error| error.to_string())?;
     let identity = artifact_identity(
-        &root,
+        configuration_identity,
         &configuration,
         &target_name,
         profile,
@@ -188,10 +193,12 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
 fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Result<u8, String> {
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
-    let configuration = ProjectConfiguration::load(&root)?;
+    let (configuration, document) = ProjectConfiguration::load_with_manifest(&root)?;
     let target_name = configuration.resolve_target(target)?;
     let (_target_config, artifact, artifact_profile, target_profile) =
         configuration.artifact_profile(&target_name, profile)?;
+    let configuration_identity = blake3::hash(document.raw().as_bytes()).to_hex().to_string();
+    drop(document);
     let manifest_path =
         artifact_manifest_path(&root, &target_name, profile, &target_profile.main_artifact);
     let manifest = load_artifact_manifest(&manifest_path)
@@ -209,7 +216,6 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let config = fs::read(root.join("wosy.toml")).map_err(|error| error.to_string())?;
     let builder = configuration
         .builders
         .get(&artifact_profile.builder)
@@ -220,7 +226,7 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
         .ok_or_else(|| format!("runner {} is missing", artifact_profile.run_runner))?;
     let identity = &manifest.identity;
     if identity.source_identity != wosy_project::source_identity(&current_observations)
-        || identity.configuration_identity != blake3::hash(&config).to_hex().to_string()
+        || identity.configuration_identity != configuration_identity
         || identity.artifact_identity != format!("{target_name}:{profile}:{}", artifact.artifact)
         || identity.backend != artifact_profile.backend
         || identity.output != artifact_profile.output
@@ -240,10 +246,6 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
             manifest.executable.display()
         ));
     }
-    let runner = configuration
-        .runners
-        .get(&artifact_profile.run_runner)
-        .ok_or_else(|| format!("runner {} is missing", artifact_profile.run_runner))?;
     invoke_direct_with_arguments(
         &root,
         &runner.command,
@@ -265,20 +267,16 @@ fn compile_project(
 ) -> Result<(String, Vec<SourceObservation>), String> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
     let root_project = root.to_string_lossy().into_owned();
-    let mut pending = vec![(project.package.clone(), root_path.clone())];
-    let mut index = 0;
+    let mut discovered = HashMap::from([(
+        project.package.as_str(),
+        HashSet::from([root_path.clone()]),
+    )]);
+    let mut pending = VecDeque::from([(project.package.clone(), root_path)]);
     let mut nodes = Vec::new();
     let mut declarations_by_path = BTreeMap::new();
     let mut texts = BTreeMap::new();
 
-    while index < pending.len() {
-        let (package, path) = pending[index].clone();
-        index += 1;
-        if nodes.iter().any(|node: &SourceNodeInput| {
-            node.source.package == package && node.source.path == path
-        }) {
-            continue;
-        }
+    while let Some((package, path)) = pending.pop_front() {
         let (package_root, project_identity) = if package == project.package {
             (root.to_path_buf(), root_project.clone())
         } else {
@@ -301,46 +299,47 @@ fn compile_project(
             path.as_path().to_string_lossy().replace('\\', "/"),
             revision.clone(),
         );
-        let output = parse_source(source.clone(), text.clone(), &project.comment_categories);
-        render_diagnostics(&text, &output.diagnostics, &output.result.source);
+        let output = parse_source(source, text, &project.comment_categories);
+        let source = &output.result.source;
+        render_diagnostics(&output.result.text, &output.diagnostics, source);
         if !output.diagnostics.is_empty() {
             return Err("build rejected by syntax diagnostics".to_owned());
         }
-        let snapshot_path = persist_cst(root, &output)?;
-        let cst = load_canonical_cst(&snapshot_path)?;
+        persist_cst(root, &output)?;
         #[cfg(test)]
         routing_observations::record(|counts| counts.extractions += 1);
-        let declarations = derive_scalar_declarations_from_cst(&cst);
+        let declarations = derive_scalar_declarations_from_cst(output.result.canonical_cst());
         let mut namespace_edges = Vec::new();
         for namespace in declarations.namespaces() {
             let module_path = serde_json::from_str::<String>(&namespace.path)
                 .map_err(|error| format!("invalid namespace path: {error}"))?;
             let module_path = PackageRelativePath::new(module_path.into())?;
-            let target_path = if namespace.package == project.package {
-                module_path.clone()
+            let (target_package, target_root, target_path) = if namespace.package == project.package {
+                (project.package.as_str(), root, Cow::Borrowed(&module_path))
             } else {
-                let resolved = configuration
+                let (package, resolved) = configuration
                     .resolved_packages
-                    .get(&namespace.package)
-                    .ok_or_else(|| {
-                        format!("dependency package {} is missing", namespace.package)
-                    })?;
-                PackageRelativePath::new(
+                    .get_key_value(&namespace.package)
+                    .ok_or_else(|| format!("dependency package {} is missing", namespace.package))?;
+                let target_path = PackageRelativePath::new(
                     resolved.identity.path.as_path().join(module_path.as_path()),
-                )?
+                )?;
+                (
+                    package.as_str(),
+                    resolved.project_root.as_path(),
+                    Cow::Owned(target_path),
+                )
             };
-            let target_root = if namespace.package == project.package {
-                root.to_path_buf()
-            } else {
-                configuration
-                    .resolved_packages
-                    .get(&namespace.package)
-                    .ok_or_else(|| format!("dependency package {} is missing", namespace.package))?
-                    .project_root
-                    .clone()
-            };
-            if target_root.join(target_path.as_path()).is_file() {
-                pending.push((namespace.package.clone(), target_path.clone()));
+            let already_discovered = discovered
+                .get(target_package)
+                .is_some_and(|paths| paths.contains(target_path.as_ref()));
+            if !already_discovered && target_root.join(target_path.as_path()).is_file() {
+                let target_path = target_path.into_owned();
+                discovered
+                    .entry(target_package)
+                    .or_default()
+                    .insert(target_path.clone());
+                pending.push_back((target_package.to_owned(), target_path));
             }
             namespace_edges.push(NamespaceEdgeInput {
                 origin: namespace.package.clone(),
@@ -367,12 +366,12 @@ fn compile_project(
             namespace_edges,
         });
         declarations_by_path.insert((package, path), declarations);
-        texts.insert(graph_source, text);
+        texts.insert(graph_source, output.result.text);
     }
+    drop((discovered, pending));
 
     let root_node = nodes
-        .iter()
-        .find(|node| node.source.package == project.package && node.source.path == root_path)
+        .first()
         .cloned()
         .ok_or_else(|| "project root source is missing".to_owned())?;
     let graph = load_reachable_source_graph(
@@ -488,10 +487,7 @@ fn scalar_target_layout(layout: wosy_project::TargetLayout) -> ScalarTargetLayou
     }
 }
 
-fn persist_cst(
-    root: &std::path::Path,
-    output: &wosy_compiler::ParseOutput,
-) -> Result<std::path::PathBuf, String> {
+fn persist_cst(root: &std::path::Path, output: &wosy_compiler::ParseOutput) -> Result<(), String> {
     let path = root
         .join(".wosy/cst")
         .join(format!("{}.json", output.result.source.revision));
@@ -500,10 +496,10 @@ fn persist_cst(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    fs::write(&path, bytes).map_err(|error| error.to_string())?;
-    Ok(path)
+    fs::write(&path, bytes).map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn load_canonical_cst(path: &std::path::Path) -> Result<wosy_syntax::CanonicalCstRoot, String> {
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     let mut deserializer = serde_json::Deserializer::from_slice(bytes.as_slice());
@@ -558,7 +554,7 @@ fn render_graph_diagnostics(
                 };
                 let file_id = files.add(
                     diagnostic.edge.source.path.as_path().display().to_string(),
-                    text.clone(),
+                    text.as_str(),
                 );
                 let report = Report::error()
                     .with_code(diagnostic.code.clone())
@@ -614,7 +610,7 @@ fn render_project_diagnostics(
                     PackageRelativePath::new(label.span.source.path.clone().into()).ok()?,
                 );
                 let text = texts.get(&source)?;
-                let file_id = files.add(label.span.source.path.clone(), text.clone());
+                let file_id = files.add(&label.span.source.path, text.as_str());
                 let range = label.span.range.start as usize..label.span.range.end as usize;
                 Some(
                     match label.kind {
@@ -642,7 +638,7 @@ fn render_project_diagnostics(
 }
 
 fn artifact_identity(
-    root: &std::path::Path,
+    configuration_identity: String,
     configuration: &ProjectConfiguration,
     target: &str,
     profile: &str,
@@ -651,7 +647,6 @@ fn artifact_identity(
     source_identity: &str,
     llvm: &str,
 ) -> Result<ArtifactIdentity, String> {
-    let config = fs::read_to_string(root.join("wosy.toml")).map_err(|error| error.to_string())?;
     let builder = configuration
         .builders
         .get(&artifact_profile.builder)
@@ -662,7 +657,7 @@ fn artifact_identity(
         .ok_or_else(|| format!("runner {} is missing", artifact_profile.run_runner))?;
     Ok(ArtifactIdentity {
         source_identity: source_identity.to_owned(),
-        configuration_identity: blake3::hash(config.as_bytes()).to_hex().to_string(),
+        configuration_identity,
         artifact_identity: format!("{target}:{profile}:{}", artifact.artifact),
         backend: artifact_profile.backend.clone(),
         output: artifact_profile.output.clone(),
@@ -738,8 +733,11 @@ fn render_diagnostics(
     diagnostics: &[wosy_compiler::Diagnostic],
     source: &SourceIdentity,
 ) {
+    if diagnostics.is_empty() {
+        return;
+    }
     let mut files = SimpleFiles::new();
-    let file_id = files.add(source.path.clone(), source_text.to_owned());
+    let file_id = files.add(&source.path, source_text);
     let config = term::Config::default();
     let stream = StandardStream::stderr(ColorChoice::Auto);
     let mut stream_lock = stream.lock();
