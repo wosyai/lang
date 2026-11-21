@@ -4,7 +4,7 @@ use inkwell::context::Context;
 
 use super::emit_scalar_llvm;
 use super::emit_scalar_project_llvm;
-use super::function_type;
+use super::function_value_result;
 use super::project_function_name;
 use super::project_global_name;
 use super::storage_type;
@@ -4152,8 +4152,27 @@ fn serializes_imports_in_metadata_order_without_changing_body_lines() {
 }
 
 #[test]
+fn serializes_without_externs_preserving_line_endings_and_separator() {
+    let cases = [
+        ("", ""),
+        ("first\nsecond", "first\nsecond"),
+        ("\r\nfirst\r\nlast\r", "\nfirst\nlast\r"),
+        ("source_filename = \"m\"\n\n\nbody\n", "source_filename = \"m\"\n\nbody\n"),
+        ("source_filename = \"m\"\r\n\r\n\r\n", "source_filename = \"m\"\n\n"),
+    ];
+    for (raw, expected) in cases {
+        let partition = LlvmPartition {
+            module_name: "test".into(),
+            declarations: Vec::new(),
+            functions: Vec::new(),
+            text: raw.into(),
+        };
+        assert_eq!(partition.to_text(), expected);
+    }
+}
+
+#[test]
 fn preserves_callable_return_metadata_for_every_output_form() {
-    let context = Context::create();
     let sequence = |types: Vec<ScalarType>| ScalarOutputSequence {
         outputs: types
             .into_iter()
@@ -4164,49 +4183,21 @@ fn preserves_callable_return_metadata_for_every_output_form() {
             .collect(),
         span: wosy_syntax::ByteSpan::new(0, 0),
     };
-    let callable = |outputs| ScalarType::Callable {
-        outputs,
-        parameters: Vec::new(),
-    };
 
     assert_eq!(
-        function_type(
-            &context,
-            &callable(sequence(Vec::new())),
-            ScalarTargetLayout::WASM32,
-        )
-        .expect("zero-output function type")
-        .1,
+        function_value_result(&sequence(Vec::new())).expect("zero-output function type"),
         LlvmValueType::Void
     );
     assert_eq!(
-        function_type(
-            &context,
-            &callable(sequence(vec![ScalarType::I32])),
-            ScalarTargetLayout::WASM32,
-        )
-        .expect("direct function type")
-        .1,
+        function_value_result(&sequence(vec![ScalarType::I32])).expect("direct function type"),
         LlvmValueType::I32
     );
     assert_eq!(
-        function_type(
-            &context,
-            &callable(sequence(vec![ScalarType::I32, ScalarType::Bool])),
-            ScalarTargetLayout::WASM32,
-        )
-        .expect("aggregate function type")
-        .1,
+        function_value_result(&sequence(vec![ScalarType::I32, ScalarType::Bool])).expect("aggregate function type"),
         LlvmValueType::Aggregate(vec![LlvmValueType::I32, LlvmValueType::I1])
     );
     assert_eq!(
-        function_type(
-            &context,
-            &callable(sequence(vec![ScalarType::Unit, ScalarType::I32])),
-            ScalarTargetLayout::WASM32,
-        )
-        .expect("unit aggregate function type")
-        .1,
+        function_value_result(&sequence(vec![ScalarType::Unit, ScalarType::I32])).expect("unit aggregate function type"),
         LlvmValueType::Aggregate(vec![LlvmValueType::I8, LlvmValueType::I32])
     );
 }
@@ -5379,6 +5370,51 @@ fn emits_generic_extern_module_symbol_and_signature() {
     assert!(partition.to_text().contains("declare i32 @wosy_extern__"));
     assert!(partition.to_text().contains("declare void @wosy_extern__"));
     assert!(partition.to_text().contains("call i32 @wosy_extern__"));
+}
+
+#[test]
+fn extern_import_module_roundtrips_escaped_llvm_attribute_bytes() {
+    use inkwell::{attributes::AttributeLoc, memory_buffer::MemoryBuffer};
+
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let validation = derive_scalar_program(
+        &parse_source(
+            source,
+            r#"%%start
+env = extern wasm "café\" tools\\path\n\t" { i32() read; };
+i32 value = env.read();
+%%end"#
+                .into(),
+            &[],
+        )
+        .result,
+    );
+    assert!(validation.diagnostics.is_empty(), "{:?}", validation.diagnostics);
+    let partition = emit_scalar_llvm(&validation).expect("valid Wosy import");
+    let [declaration] = partition.declarations.as_slice() else {
+        panic!("expected one extern declaration")
+    };
+    let ir = partition.to_text();
+    assert!(ir.contains(r#"wasm-import-module"="caf\C3\A9\22 tools\5Cpath\0A\09""#));
+    let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "extern-attribute");
+    let context = Context::create();
+    let module = context.create_module_from_ir(buffer).expect("parse emitted LLVM");
+    module.verify().expect("verify emitted LLVM");
+    let function = module.get_function(&declaration.name).expect("extern symbol");
+    for (key, expected) in [
+        ("wasm-import-module", "café\" tools\\path\n\t"),
+        ("wasm-import-name", "read"),
+    ] {
+        let attribute = function
+            .get_string_attribute(AttributeLoc::Function, key)
+            .expect("extern string attribute");
+        assert_eq!(attribute.get_string_value().to_bytes(), expected.as_bytes());
+    }
 }
 
 #[test]

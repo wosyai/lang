@@ -84,6 +84,39 @@ enum EmitValue<'ctx> {
     },
 }
 
+type GlobalStorage<'ctx> = (GlobalValue<'ctx>, ScalarType);
+struct GlobalNames<'ctx, 'module>(BTreeMap<&'module str, &'module GlobalStorage<'ctx>>);
+
+impl<'ctx, 'module> GlobalNames<'ctx, 'module> {
+    fn get(&self, name: &str) -> Option<&'module GlobalStorage<'ctx>> {
+        self.0.get(name).copied()
+    }
+}
+
+struct ModuleNames<'ctx, 'module> {
+    globals: GlobalNames<'ctx, 'module>,
+    unit_values: BTreeSet<&'module str>,
+    members: BTreeMap<&'module str, MemberName<'module>>,
+    namespaces: BTreeMap<&'module str, &'module wosy_syntax::SourceIdentity>,
+    externs: BTreeMap<&'module str, &'module crate::scalar::ScalarExtern>,
+}
+
+struct MemberName<'module> {
+    ty: &'module ScalarType,
+    unsigned: bool,
+}
+
+struct ProjectNames<'ctx, 'module> {
+    scopes: Vec<ModuleNames<'ctx, 'module>>,
+    positions: HashMap<&'module wosy_syntax::SourceIdentity, usize>,
+}
+
+impl<'ctx, 'module> ProjectNames<'ctx, 'module> {
+    fn for_module(&self, module: &ScalarModule) -> &ModuleNames<'ctx, 'module> {
+        &self.scopes[self.positions[&module.source]]
+    }
+}
+
 struct EmitState<'ctx, 'module> {
     prepared_render: bool,
     aggregate: Option<aggregate_transfer::AggregateEmitter<'ctx, 'module>>,
@@ -125,8 +158,10 @@ struct EmitState<'ctx, 'module> {
         ),
     >,
     automatic_return_result_owners: BTreeMap<String, ScalarAutomaticReturnResult>,
-    globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
-    all_globals: BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
+    globals: &'module GlobalNames<'ctx, 'module>,
+    all_globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
+    unit_values: &'module BTreeSet<&'module str>,
+    project_names: Option<&'module ProjectNames<'ctx, 'module>>,
     structs: &'module [&'module ScalarStruct],
     layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
     target_layout: ScalarTargetLayout,
@@ -517,7 +552,7 @@ fn emit_single_module_llvm<'a>(
                 );
                 let value = module.add_function(
                     &identity.internal_name,
-                    function_type(&context, &function.signature, target_layout)?.0,
+                    function_type(&context, &function.signature, target_layout)?,
                     None,
                 );
                 if prepared_render {
@@ -564,6 +599,18 @@ fn emit_single_module_llvm<'a>(
             cfg,
         );
     }
+    let names = ModuleNames {
+        globals: GlobalNames(
+            globals
+                .iter()
+                .map(|(name, global)| (name.as_str(), global))
+                .collect(),
+        ),
+        unit_values: unit_values(items),
+        members: BTreeMap::new(),
+        namespaces: BTreeMap::new(),
+        externs: BTreeMap::new(),
+    };
     for (function, cfg, name, item, arm) in definitions {
         let nodes = generic_input.bind_body(0, item, arm, &function.body)?;
         emit_function(
@@ -582,7 +629,7 @@ fn emit_single_module_llvm<'a>(
             nodes.as_ref(),
             &initializer_symbols,
             name,
-            items,
+            &names,
             &module,
             &structs,
             &layouts,
@@ -600,6 +647,7 @@ fn emit_single_module_llvm<'a>(
         &runtime_array_results,
         &dynamic_owner_outputs,
         &globals,
+        &names,
         items,
         initialization_region,
         initializer_nodes.as_ref(),
@@ -612,11 +660,9 @@ fn emit_single_module_llvm<'a>(
     finish_partition(
         ManuallyDrop::into_inner(module),
         source.path.clone(),
-        &context,
         &functions,
         &signatures,
         &externs,
-        target_layout,
     )
 }
 
@@ -675,18 +721,21 @@ fn emit_project_llvm<'a>(
     ) -> Option<&'a ScalarReferenceCfg>,
     project_build: Option<&'a ScalarBuildValidation<'a>>,
 ) -> Result<LlvmPartition, String> {
+    let mut module_ordinals = HashMap::with_capacity(project.modules.len());
+    for (ordinal, module) in project.modules.iter().enumerate() {
+        module_ordinals.entry(&module.source).or_insert(ordinal);
+    }
     let ordered_modules = project
         .initialization_order
         .iter()
         .map(|source| {
-            project
-                .modules
-                .iter()
-                .enumerate()
-                .find(|(_, module)| module.source == *source)
+            module_ordinals
+                .get(source)
+                .map(|&ordinal| (ordinal, &project.modules[ordinal]))
                 .ok_or_else(|| format!("missing module {}", source.path))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    drop(module_ordinals);
     let modules = ordered_modules
         .iter()
         .map(|&(_, module)| module)
@@ -901,7 +950,7 @@ fn emit_project_llvm<'a>(
                 signatures.insert(name.clone(), function.signature.clone());
             }
             Declaration::Extern(identity, key, signature) => {
-                let value = module.add_function(&identity.internal_name, function_type(&context, signature, target_layout)?.0, None);
+                let value = module.add_function(&identity.internal_name, function_type(&context, signature, target_layout)?, None);
                 call_targets.insert(key, identity.internal_name.clone());
                 signatures.insert(identity.internal_name.clone(), signature.clone());
                 functions.insert(identity.internal_name.clone(), value);
@@ -1007,6 +1056,21 @@ fn emit_project_llvm<'a>(
             cfg,
         );
     }
+    let scopes = modules
+        .iter()
+        .map(|module| project_module_names(module, &globals))
+        .collect();
+
+    let mut module_positions = HashMap::with_capacity(modules.len());
+    let mut ordered_positions = vec![0; project.modules.len()];
+    for (position, &(ordinal, module)) in ordered_modules.iter().enumerate() {
+        let first_position = *module_positions.entry(&module.source).or_insert(position);
+        ordered_positions[ordinal] = first_position;
+    }
+    let names = ProjectNames {
+        scopes,
+        positions: module_positions,
+    };
     for (ordinal, source_module, function, cfg, name, item, arm, original) in definitions
         .iter()
         .map(|(ordinal, module, function, cfg, name, item, arm)| {
@@ -1053,6 +1117,8 @@ fn emit_project_llvm<'a>(
             source_module,
             &modules,
             &globals,
+            &names,
+            &names.scopes[ordered_positions[ordinal]],
             name,
             &module,
             &all_structs,
@@ -1072,6 +1138,7 @@ fn emit_project_llvm<'a>(
         &dynamic_owner_outputs,
         &modules,
         &regions,
+        &names,
         initializer_nodes.as_deref(),
         &initializer_symbols,
         &globals,
@@ -1083,11 +1150,9 @@ fn emit_project_llvm<'a>(
     finish_partition(
         ManuallyDrop::into_inner(module),
         module_name,
-        &context,
         &functions,
         &signatures,
         &externs,
-        target_layout,
     )
 }
 
@@ -1098,14 +1163,14 @@ pub fn emit_scalar_llvm_text(validation: &ScalarValidation) -> Result<String, St
 impl LlvmPartition {
     pub fn to_text(&self) -> String {
         if !self.declarations.is_empty() {
-            let module_directives = self.text.lines().take(2).collect::<Vec<_>>().join("\n");
             let mut declarations = self
                 .declarations
                 .iter()
                 .map(|declaration| (declaration.name.as_str(), None))
                 .collect::<HashMap<_, _>>();
             let simple_names = declarations.keys().all(|name| !name.contains('('));
-            let mut body = Vec::new();
+            let mut excluded = Vec::with_capacity(declarations.len());
+            let mut excluded_bytes = 0;
             for (index, line) in self.text.lines().enumerate() {
                 let mut matched = false;
                 if let Some((_, after_at)) = line
@@ -1129,12 +1194,20 @@ impl LlvmPartition {
                         }
                     }
                 }
-                if index >= 2 && !matched {
-                    body.push(line);
+                if index >= 2 && matched {
+                    excluded.push(index);
+                    excluded_bytes += line.len();
                 }
             }
             let mut serialized = String::new();
-            serialized.push_str(&module_directives);
+            let mut lines = self.text.lines();
+            if let Some(first) = lines.next() {
+                serialized.push_str(first);
+            }
+            if let Some(second) = lines.next() {
+                serialized.push('\n');
+                serialized.push_str(second);
+            }
             serialized.push_str("\n\n");
             for declaration in &self.declarations {
                 let line = declarations[declaration.name.as_str()]
@@ -1150,35 +1223,71 @@ impl LlvmPartition {
                     serialized,
                     "attributes #{} = {{ \"wasm-import-module\"=\"{}\" \"wasm-import-name\"=\"{}\" }}",
                     attributes.group,
-                    attributes.wasm_import_module,
-                    attributes.wasm_import_name
+                    LlvmQuotedAttribute(&attributes.wasm_import_module),
+                    LlvmQuotedAttribute(&attributes.wasm_import_name)
                 )
                 .expect("writing to a String cannot fail");
             }
-            for (index, line) in body.into_iter().enumerate() {
-                if index != 0 {
+            serialized.reserve_exact(self.text.len() - excluded_bytes);
+            let mut excluded = excluded.into_iter().peekable();
+            let mut first = true;
+            for (index, line) in lines.enumerate() {
+                if excluded.peek() == Some(&(index + 2)) {
+                    excluded.next();
+                    continue;
+                }
+                if !std::mem::replace(&mut first, false) {
                     serialized.push('\n');
                 }
                 serialized.push_str(line);
             }
             serialized
         } else {
-            let has_trailing_newline = self.text.ends_with('\n');
-            let mut lines = self.text.lines().collect::<Vec<_>>();
-            if let Some(index) = lines
-                .iter()
-                .position(|line| line.starts_with("source_filename"))
-            {
-                if lines.get(index + 1) == Some(&"") && lines.get(index + 2) == Some(&"") {
-                    lines.remove(index + 2);
+            let mut lines = self.text.lines().enumerate();
+            let excluded = lines.find(|(_, line)| line.starts_with("source_filename"))
+                .and_then(|(index, _)| {
+                    (matches!(lines.next(), Some((_, ""))) && matches!(lines.next(), Some((_, ""))))
+                        .then_some(index + 2)
+                });
+            if excluded.is_none() && !self.text.contains("\r\n") {
+                return self.text.clone();
+            }
+            let mut serialized = String::with_capacity(self.text.len());
+            let mut first = true;
+            for (index, line) in self.text.lines().enumerate() {
+                if excluded == Some(index) {
+                    continue;
                 }
+                if !std::mem::replace(&mut first, false) {
+                    serialized.push('\n');
+                }
+                serialized.push_str(line);
             }
-            let mut text = lines.join("\n");
-            if has_trailing_newline {
-                text.push('\n');
+            if self.text.ends_with('\n') {
+                serialized.push('\n');
             }
-            text
+            serialized
         }
+    }
+}
+
+struct LlvmQuotedAttribute<'a>(&'a str);
+
+impl std::fmt::Display for LlvmQuotedAttribute<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut start = 0;
+        for (index, ch) in self.0.char_indices() {
+            if ch.is_ascii() && !ch.is_ascii_control() && !matches!(ch, '"' | '\\') {
+                continue;
+            }
+            formatter.write_str(&self.0[start..index])?;
+            let mut buffer = [0; 4];
+            for byte in ch.encode_utf8(&mut buffer).bytes() {
+                write!(formatter, "\\{byte:02X}")?;
+            }
+            start = index + ch.len_utf8();
+        }
+        formatter.write_str(&self.0[start..])
     }
 }
 
@@ -1194,38 +1303,22 @@ fn declaration_attributes(declarations: &[LlvmFunction]) -> Vec<&LlvmFunctionAtt
 fn finish_partition<'ctx>(
     module: inkwell::module::Module<'ctx>,
     module_name: String,
-    context: &'ctx Context,
     functions: &BTreeMap<String, FunctionValue<'ctx>>,
     signatures: &BTreeMap<String, ScalarType>,
     externs: &[LlvmExternIdentity],
-    target_layout: ScalarTargetLayout,
 ) -> Result<LlvmPartition, String> {
     module.verify().map_err(|error| error.to_string())?;
     let text = module.print_to_string().to_string();
     let metadata = functions
         .iter()
         .filter_map(|(name, function)| {
-            let signature = if name == "main" {
-                ScalarType::Callable {
-                    outputs: crate::ScalarOutputSequence {
-                        outputs: vec![crate::ScalarOutput {
-                            ty: ScalarType::I32,
-                            span: wosy_syntax::ByteSpan::new(0, 0),
-                        }],
-                        span: wosy_syntax::ByteSpan::new(0, 0),
-                    },
-                    parameters: Vec::new(),
-                }
+            let (result, parameters) = if name == "main" {
+                (LlvmValueType::I32, &[][..])
             } else {
-                signatures.get(name)?.clone()
-            };
-            let (_, result) = function_type(context, &signature, target_layout).ok()?;
-            let ScalarType::Callable {
-                outputs: _,
-                parameters,
-            } = signature
-            else {
-                return None;
+                let ScalarType::Callable { outputs, parameters } = signatures.get(name)? else {
+                    return None;
+                };
+                (function_value_result(outputs).ok()?, parameters.as_slice())
             };
             let parameters = parameters
                 .iter()
@@ -1251,14 +1344,13 @@ fn finish_partition<'ctx>(
         .filter_map(|(group, extern_identity)| {
             let function = functions.get(&extern_identity.internal_name)?;
             let ScalarType::Callable {
-                outputs: _,
+                outputs,
                 parameters,
             } = &extern_identity.signature
             else {
                 return None;
             };
-            let (_, result) =
-                function_type(context, &extern_identity.signature, target_layout).ok()?;
+            let result = function_value_result(outputs).ok()?;
             let parameters = parameters
                 .iter()
                 .enumerate()
@@ -1295,7 +1387,7 @@ fn function_type<'ctx>(
     context: &'ctx Context,
     signature: &ScalarType,
     target_layout: ScalarTargetLayout,
-) -> Result<(FunctionType<'ctx>, LlvmValueType), String> {
+) -> Result<FunctionType<'ctx>, String> {
     let ScalarType::Callable {
         outputs,
         parameters,
@@ -1307,34 +1399,34 @@ fn function_type<'ctx>(
         .iter()
         .map(|ty| basic_type(context, ty, target_layout).map(Into::into))
         .collect::<Result<Vec<BasicMetadataTypeEnum>, _>>()?;
+    Ok(match outputs.outputs.as_slice() {
+        [] => context.void_type().fn_type(&parameters, false),
+        [output] if output.ty == ScalarType::Unit => {
+            context.void_type().fn_type(&parameters, false)
+        }
+        [output] => basic_type(context, &output.ty, target_layout)?.fn_type(&parameters, false),
+        _ => aggregate_type(context, outputs, target_layout)?.fn_type(&parameters, false),
+    })
+}
+
+fn function_value_result(
+    outputs: &crate::ScalarOutputSequence,
+) -> Result<LlvmValueType, String> {
     match outputs.outputs.as_slice() {
-        [] => Ok((
-            context.void_type().fn_type(&parameters, false),
-            LlvmValueType::Void,
-        )),
-        [output] if output.ty == ScalarType::Unit => Ok((
-            context.void_type().fn_type(&parameters, false),
-            LlvmValueType::Void,
-        )),
-        [output] => Ok((
-            basic_type(context, &output.ty, target_layout)?.fn_type(&parameters, false),
-            value_type(&output.ty)?,
-        )),
-        _ => Ok((
-            aggregate_type(context, outputs, target_layout)?.fn_type(&parameters, false),
-            LlvmValueType::Aggregate(
-                outputs
-                    .outputs
-                    .iter()
-                    .map(|output| {
-                        if output.ty == ScalarType::Unit {
-                            Ok(LlvmValueType::I8)
-                        } else {
-                            value_type(&output.ty)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
+        [] => Ok(LlvmValueType::Void),
+        [output] => value_type(&output.ty),
+        _ => Ok(LlvmValueType::Aggregate(
+            outputs
+                .outputs
+                .iter()
+                .map(|output| {
+                    if output.ty == ScalarType::Unit {
+                        Ok(LlvmValueType::I8)
+                    } else {
+                        value_type(&output.ty)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         )),
     }
 }
@@ -1345,9 +1437,9 @@ fn definition_function_type<'ctx>(
     reference_cfg: &ScalarReferenceCfg,
     target_layout: ScalarTargetLayout,
 ) -> Result<FunctionType<'ctx>, String> {
-    let (ordinary, _) = function_type(context, &function.signature, target_layout)?;
-    if !dynamic_return_owner(function.span, reference_cfg) {
-        return Ok(ordinary);
+    let owner_outputs = dynamic_return_outputs(function.span, reference_cfg);
+    if owner_outputs.is_empty() {
+        return function_type(context, &function.signature, target_layout);
     }
     let ScalarType::Callable {
         outputs,
@@ -1360,7 +1452,7 @@ fn definition_function_type<'ctx>(
         .iter()
         .map(|ty| basic_type(context, ty, target_layout).map(Into::into))
         .collect::<Result<Vec<BasicMetadataTypeEnum>, _>>()?;
-    for _ in dynamic_return_outputs(function.span, reference_cfg) {
+    for _ in owner_outputs {
         arguments.push(context.ptr_type(AddressSpace::default()).into());
     }
     match outputs.outputs.as_slice() {
@@ -1756,7 +1848,7 @@ fn insert_function_result_provenance(
 
 mod ownership;
 use ownership::{
-    binding_receivers, checked_call_owners, dynamic_return_outputs, dynamic_return_owner,
+    binding_receivers, checked_call_owners, dynamic_return_outputs,
     emit_runtime_array_allocation, fresh_return_outputs, function_runtime_array_result_provenance,
     initialize_joined_return_bindings, joined_assignment_owners, joined_return_binding_types,
     release_scope_runtime_array_owners, return_bindings, transfer_runtime_array_return,
@@ -1812,13 +1904,13 @@ fn emit_function<'ctx, 'module>(
     signatures: &'ctx BTreeMap<String, ScalarType>,
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
-    globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
+    globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
     function: &ScalarFunction,
     reference_cfg: &ScalarReferenceCfg,
     body_call_nodes: Option<&'module CallableBodyCallNodes<'module>>,
     initializer_symbols: &'module InitializerSymbols,
     name: &str,
-    items: &[ScalarItem],
+    names: &'module ModuleNames<'ctx, 'module>,
     module: &'module Module<'ctx>,
     structs: &'module [&'module ScalarStruct],
     layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
@@ -1879,8 +1971,10 @@ fn emit_function<'ctx, 'module>(
         mutable_runtime_allocations: mutable_runtime_allocations(reference_cfg),
         invalidations: resolved_invalidations(reference_cfg)?,
         automatic_return_result_owners: BTreeMap::new(),
-        globals: globals.clone(),
-        all_globals: globals.clone(),
+        globals: &names.globals,
+        all_globals: globals,
+        unit_values: &names.unit_values,
+        project_names: None,
         structs,
         layouts,
         target_layout,
@@ -1888,7 +1982,6 @@ fn emit_function<'ctx, 'module>(
         next_block: 0,
     };
     initialize_joined_return_bindings(context, &mut state, joined_bindings)?;
-    insert_unit_values(&mut state.values, items);
     if let ScalarType::Callable { parameters, .. } = &function.signature {
         for (position, output) in dynamic_return_outputs(function.span, reference_cfg)
             .into_iter()
@@ -1993,7 +2086,8 @@ fn emit_main<'ctx, 'module>(
     signatures: &'ctx BTreeMap<String, ScalarType>,
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
-    globals: &'ctx BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
+    globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
+    names: &'module ModuleNames<'ctx, 'module>,
     items: &[ScalarItem],
     initialization_region: &ModuleInitializationRegion,
     initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
@@ -2042,15 +2136,16 @@ fn emit_main<'ctx, 'module>(
         mutable_runtime_allocations: BTreeSet::new(),
         invalidations: BTreeMap::new(),
         automatic_return_result_owners: BTreeMap::new(),
-        globals: globals.clone(),
-        all_globals: globals.clone(),
+        globals: &names.globals,
+        all_globals: globals,
+        unit_values: &names.unit_values,
+        project_names: None,
         structs,
         layouts,
         target_layout,
         next_literal: 0,
         next_block: 0,
     };
-    insert_unit_values(&mut state.values, items);
     for step in &initialization_region.steps {
         match (&step.kind, &items[step.item]) {
             (ModuleInitializationStepKind::BindingInitialization, ScalarItem::Binding(binding)) => {
@@ -2121,7 +2216,9 @@ fn emit_project_function<'ctx, 'module>(
     initializer_symbols: &'module InitializerSymbols,
     source_module: &ScalarModule,
     modules: &[&'module ScalarModule],
-    globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
+    globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
+    project_names: &'module ProjectNames<'ctx, 'module>,
+    names: &'module ModuleNames<'ctx, 'module>,
     name: &str,
     module: &'module Module<'ctx>,
     structs: &'module [&'module ScalarStruct],
@@ -2183,8 +2280,10 @@ fn emit_project_function<'ctx, 'module>(
         mutable_runtime_allocations: mutable_runtime_allocations(reference_cfg),
         invalidations: resolved_invalidations(reference_cfg)?,
         automatic_return_result_owners: BTreeMap::new(),
-        globals: module_globals(source_module, globals),
-        all_globals: globals.clone(),
+        globals: &names.globals,
+        all_globals: globals,
+        unit_values: &names.unit_values,
+        project_names: Some(project_names),
         structs,
         layouts,
         target_layout,
@@ -2192,7 +2291,6 @@ fn emit_project_function<'ctx, 'module>(
         next_block: 0,
     };
     initialize_joined_return_bindings(context, &mut state, joined_bindings)?;
-    insert_unit_values(&mut state.values, &source_module.items);
     if let ScalarType::Callable { parameters, .. } = &function.signature {
         for (position, output) in dynamic_return_outputs(function.span, reference_cfg)
             .into_iter()
@@ -2323,9 +2421,10 @@ fn emit_project_main<'ctx, 'module>(
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     modules: &[&ScalarModule],
     regions: &[&ModuleInitializationRegion],
+    names: &'module ProjectNames<'ctx, 'module>,
     initializer_nodes: Option<&'module [InitializerCallNodes<'module>]>,
     initializer_symbols: &'module InitializerSymbols,
-    globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
+    globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
     module: &'module Module<'ctx>,
     structs: &'module [&'module ScalarStruct],
     layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
@@ -2336,6 +2435,8 @@ fn emit_project_main<'ctx, 'module>(
         .ok_or_else(|| "missing main".to_owned())?;
     let entry = context.append_basic_block(main, "entry");
     builder.position_at_end(entry);
+    let empty_globals = GlobalNames(BTreeMap::new());
+    let empty_unit_values = BTreeSet::new();
     let mut state = EmitState {
         prepared_render,
         aggregate: None,
@@ -2370,8 +2471,10 @@ fn emit_project_main<'ctx, 'module>(
         mutable_runtime_allocations: BTreeSet::new(),
         invalidations: BTreeMap::new(),
         automatic_return_result_owners: BTreeMap::new(),
-        globals: BTreeMap::new(),
-        all_globals: globals.clone(),
+        globals: &empty_globals,
+        all_globals: globals,
+        unit_values: &empty_unit_values,
+        project_names: Some(names),
         structs,
         layouts,
         target_layout,
@@ -2385,9 +2488,9 @@ fn emit_project_main<'ctx, 'module>(
         0,
         modules,
         regions,
+        names,
         initializer_nodes,
-        globals,
-        &mut Vec::new(),
+        &mut vec![false; modules.len()],
     )?;
     release_scope_runtime_array_owners(context, &mut state, &BTreeMap::new())?;
     release_automatic_return_result_owners(context, &mut state, &BTreeMap::new())?;
@@ -2404,17 +2507,16 @@ fn initialize_project_module<'ctx, 'module>(
     position: usize,
     modules: &[&'module ScalarModule],
     regions: &[&ModuleInitializationRegion],
+    names: &'module ProjectNames<'ctx, 'module>,
     initializer_nodes: Option<&'module [InitializerCallNodes<'module>]>,
-    globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
-    initialized: &mut Vec<wosy_syntax::SourceIdentity>,
+    initialized: &mut [bool],
 ) -> Result<(), String> {
     let module = modules[position];
     let region = regions[position];
     assert_eq!(region.source, module.source);
-    if initialized.contains(&module.source) {
+    if std::mem::replace(&mut initialized[position], true) {
         return Ok(());
     }
-    initialized.push(module.source.clone());
 
     aggregate_transfer::initializer_namespace_edge(state)?;
     let previous_aggregate = std::mem::replace(&mut state.initializer_aggregate,
@@ -2422,25 +2524,17 @@ fn initialize_project_module<'ctx, 'module>(
     let previous_nodes = state.initializer_nodes;
     state.initializer_nodes = initializer_nodes.map(|nodes| &nodes[position]);
 
-    let values = state.values.clone();
-    let storage = state.storage.clone();
-    let runtime_array_owners = state.runtime_array_owners.clone();
-    let runtime_array_allocations = state.runtime_array_allocations.clone();
-    let runtime_array_lengths = state.runtime_array_lengths.clone();
-    let runtime_array_live = state.runtime_array_live.clone();
-    let automatic_return_result_owners = state.automatic_return_result_owners.clone();
-    let checked_owner_flags = state.checked_owner_flags.clone();
-    let current_module_globals = module_globals(module, globals);
-    let current_globals = std::mem::replace(&mut state.globals, current_module_globals);
-    state.values.clear();
-    state.storage.clear();
-    state.runtime_array_owners.clear();
-    state.runtime_array_allocations.clear();
-    state.runtime_array_lengths.clear();
-    state.runtime_array_live.clear();
-    state.checked_owner_flags.clear();
-    state.automatic_return_result_owners.clear();
-    insert_unit_values(&mut state.values, &module.items);
+    let values = std::mem::take(&mut state.values);
+    let storage = std::mem::take(&mut state.storage);
+    let runtime_array_owners = std::mem::take(&mut state.runtime_array_owners);
+    let runtime_array_allocations = std::mem::take(&mut state.runtime_array_allocations);
+    let runtime_array_lengths = std::mem::take(&mut state.runtime_array_lengths);
+    let runtime_array_live = std::mem::take(&mut state.runtime_array_live);
+    let automatic_return_result_owners = std::mem::take(&mut state.automatic_return_result_owners);
+    let checked_owner_flags = std::mem::take(&mut state.checked_owner_flags);
+    let current_globals = std::mem::replace(&mut state.globals, &names.scopes[position].globals);
+    let current_unit_values =
+        std::mem::replace(&mut state.unit_values, &names.scopes[position].unit_values);
 
     for step in &region.steps {
         match (&step.kind, &module.items[step.item]) {
@@ -2457,9 +2551,8 @@ fn initialize_project_module<'ctx, 'module>(
                 let NamespaceTarget::Bound(target) = target else {
                     return Err(format!("unknown namespace binding {binding}"));
                 };
-                let position = modules
-                    .iter()
-                    .position(|candidate| &candidate.source == target)
+                let &position = names.positions
+                    .get(target)
                     .ok_or_else(|| format!("missing namespace target {}", target.path))?;
                 initialize_project_module(
                     context,
@@ -2468,11 +2561,10 @@ fn initialize_project_module<'ctx, 'module>(
                     position,
                     modules,
                     regions,
+                    names,
                     initializer_nodes,
-                    globals,
                     initialized,
                 )?;
-                state.globals = module_globals(module, globals);
             }
             (ModuleInitializationStepKind::BindingInitialization, ScalarItem::Binding(binding)) => {
                 if aggregate_transfer::emit_initializer_binding(context, state, binding, Some((module, modules)))? {
@@ -2502,9 +2594,8 @@ fn initialize_project_module<'ctx, 'module>(
                     .into_int_value();
                     let pointer = emit_runtime_array_allocation(context, state, element, length)?;
                     let (global, _) = state
-                        .all_globals
-                        .get(&project_global_name(&module.source, &receiver.name))
-                        .cloned()
+                        .globals
+                        .get(&receiver.name)
                         .ok_or_else(|| format!("unknown LLVM global {}", receiver.name))?;
                     state
                         .builder
@@ -2528,9 +2619,8 @@ fn initialize_project_module<'ctx, 'module>(
                     }
                     let value = extract_output(state, &value, position)?;
                     let (global, _) = state
-                        .all_globals
-                        .get(&project_global_name(&module.source, name))
-                        .cloned()
+                        .globals
+                        .get(name)
                         .ok_or_else(|| format!("unknown LLVM global {name}"))?;
                     store_value(context, state, global.as_pointer_value(), ty, value)?;
                     if matches!(ty, ScalarType::RuntimeArray { .. }) {
@@ -2560,6 +2650,7 @@ fn initialize_project_module<'ctx, 'module>(
     state.initializer_aggregate = previous_aggregate;
     state.initializer_nodes = previous_nodes;
     state.globals = current_globals;
+    state.unit_values = current_unit_values;
     state.values = values;
     let mut retained_storage = storage;
     retained_storage.extend(
@@ -3386,7 +3477,7 @@ fn emit_assignment<'ctx, 'module>(
         context,
         state,
         &assignment.values,
-        &expected,
+        |position| expected.get(position).and_then(Option::as_ref),
         |state, value, expected| match expected {
             Some(ty) => emit_typed_expression(context, state, value, ty),
             None => emit_expression(context, state, value),
@@ -3465,22 +3556,21 @@ fn emit_project_assignment<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    let names = state.project_names.expect("project emission names");
+    let scope = names.for_module(module);
     let expected = assignment
         .targets
         .iter()
         .map(|target| {
-            if let Some(receiver) = target.receiver.as_ref().filter(|receiver| {
-                module
-                    .namespace_bindings
-                    .iter()
-                    .any(|namespace| namespace.binding == **receiver)
+            if let Some(source) = target.receiver.as_ref().and_then(|receiver| {
+                scope.namespaces.get(receiver.as_str())
             }) {
-                let target_module = project_namespace_target(module, modules, receiver)?;
-                Ok(Some(
-                    project_member_global(state, target_module, &target.target)?.1,
-                ))
+                let position = names.positions.get(*source)
+                    .ok_or_else(|| format!("missing namespace target {}", source.path))?;
+                let (global, ty) = project_member_global(&names.scopes[*position], &target.target)?;
+                Ok((Some(ty.clone()), Some(global)))
             } else {
-                Ok(assignment_target_type(state, target))
+                Ok((assignment_target_type(state, target), None))
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -3488,7 +3578,7 @@ fn emit_project_assignment<'ctx, 'module>(
         context,
         state,
         &assignment.values,
-        &expected,
+        |position| expected.get(position).and_then(|(ty, _)| ty.as_ref()),
         |state, value, expected| match expected {
             Some(ty) => emit_project_typed_expression(context, state, value, ty, module, modules),
             None => emit_project_expression(context, state, value, module, modules),
@@ -3498,19 +3588,13 @@ fn emit_project_assignment<'ctx, 'module>(
         .targets
         .iter()
         .zip(&values)
-        .map(|(target, value)| {
+        .zip(expected)
+        .map(|((target, value), (_, global))| {
             let ty = &value.ty;
             if *ty == ScalarType::Unit {
                 return Ok(AssignmentDestination::Unit);
             }
-            if let Some(receiver) = target.receiver.as_ref().filter(|receiver| {
-                module
-                    .namespace_bindings
-                    .iter()
-                    .any(|namespace| namespace.binding == **receiver)
-            }) {
-                let target_module = project_namespace_target(module, modules, receiver)?;
-                let (global, _) = project_member_global(state, target_module, &target.target)?;
+            if let Some(global) = global {
                 let pointer = global
                     .ok_or_else(|| format!("unknown LLVM member storage {}", target.target))?
                     .as_pointer_value();
@@ -4017,11 +4101,11 @@ fn emit_checked_dereference_guard<'ctx, 'module>(
     Ok(())
 }
 
-fn materialize_assignment_values<'ctx, 'module>(
+fn materialize_assignment_values<'ctx, 'module, 'expected>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     expressions: &[ScalarExpression],
-    expected: &[Option<ScalarType>],
+    expected: impl Fn(usize) -> Option<&'expected ScalarType>,
     emit: impl FnMut(
         &mut EmitState<'ctx, 'module>,
         &ScalarExpression,
@@ -4048,11 +4132,8 @@ fn materialize_assignment_values<'ctx, 'module>(
         } else {
             None
         };
-        let value = emit(
-            state,
-            expression,
-            expected.get(position).and_then(Option::as_ref),
-        )?;
+        let expected_type = expected(position);
+        let value = emit(state, expression, expected_type)?;
         let joined_source = if let ScalarExpression::Name { name, .. } = expression {
             if let Some((owner_slot, _)) = state.joined_return_bindings.get(name) {
                 let storage = state
@@ -4076,13 +4157,10 @@ fn materialize_assignment_values<'ctx, 'module>(
         } else {
             None
         };
-        let call_flags = state.call_owner_flags.clone();
         let output_types = match &value {
             EmitValue::Aggregate { outputs, .. } => outputs.clone(),
             EmitValue::Unit => vec![ScalarType::Unit],
-            EmitValue::Basic(value) => vec![expected
-                .get(position)
-                .and_then(Option::as_ref)
+            EmitValue::Basic(value) => vec![expected_type
                 .cloned()
                 .unwrap_or_else(|| basic_value_type(*value))],
         };
@@ -4121,7 +4199,7 @@ fn materialize_assignment_values<'ctx, 'module>(
                 value,
                 ty,
                 provenance: provenance.clone(),
-                call_flag: call_flags.get(&output_position).copied(),
+                call_flag: state.call_owner_flags.get(&output_position).copied(),
                 joined_source,
                 runtime_array_source,
                 same_array_rebind: same_array_rebind && output_position == 0,
@@ -4782,85 +4860,89 @@ fn project_runtime_array_name(source: &wosy_syntax::SourceIdentity, name: &str) 
     project_global_name(source, name)
 }
 
-fn project_namespace_target<'a>(
-    module: &'a ScalarModule,
-    modules: &'a [&ScalarModule],
+fn project_namespace_target<'a, 'ctx, 'module>(
+    names: &'a ProjectNames<'ctx, 'module>,
+    module: &ScalarModule,
     receiver: &str,
-) -> Result<&'a ScalarModule, String> {
-    let namespace = module
-        .namespace_bindings
-        .iter()
-        .find(|namespace| namespace.binding == receiver)
+) -> Result<&'a ModuleNames<'ctx, 'module>, String> {
+    let source = names.for_module(module).namespaces
+        .get(receiver)
         .ok_or_else(|| format!("unknown namespace binding {receiver}"))?;
-    modules
-        .iter()
-        .find(|candidate| candidate.source == namespace.target)
-        .copied()
-        .ok_or_else(|| format!("missing namespace target {}", namespace.target.path))
+    names.positions
+        .get(*source)
+        .map(|&position| &names.scopes[position])
+        .ok_or_else(|| format!("missing namespace target {}", source.path))
 }
 
 fn project_member_global<'ctx, 'module>(
-    state: &EmitState<'ctx, 'module>,
-    target: &ScalarModule,
+    target: &ModuleNames<'ctx, 'module>,
     name: &str,
-) -> Result<(Option<GlobalValue<'ctx>>, ScalarType), String> {
-    let binding = target.items.iter().find_map(|item| match item {
-        ScalarItem::Binding(binding) if binding.name == name => Some(binding),
-        ScalarItem::Binding(_)
-        | ScalarItem::Extern(_)
-        | ScalarItem::Namespace(_)
-        | ScalarItem::Function(_)
-        | ScalarItem::Executable(_) => None,
-    });
-    let binding = binding.ok_or_else(|| format!("unknown LLVM member {name}"))?;
-    let global = state
-        .all_globals
-        .get(&project_global_name(&target.source, name))
-        .map(|(global, _)| *global);
-    if binding.declared_type != ScalarType::Unit && global.is_none() {
+) -> Result<(Option<GlobalValue<'ctx>>, &'module ScalarType), String> {
+    let member = target.members.get(name).ok_or_else(|| format!("unknown LLVM member {name}"))?;
+    let global = target.globals.get(name).map(|(global, _)| *global);
+    if *member.ty != ScalarType::Unit && global.is_none() {
         return Err(format!("unknown LLVM member storage {name}"));
     }
-    Ok((global, binding.declared_type.clone()))
+    Ok((global, member.ty))
 }
 
-fn insert_unit_values<'ctx>(values: &mut BTreeMap<String, EmitValue<'ctx>>, items: &[ScalarItem]) {
-    for item in items {
-        if let ScalarItem::Binding(binding) = item {
-            if binding.declared_type == ScalarType::Unit {
-                values.insert(binding.name.clone(), EmitValue::Unit);
+fn unit_values(items: &[ScalarItem]) -> BTreeSet<&str> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ScalarItem::Binding(binding) if binding.declared_type == ScalarType::Unit => {
+                Some(binding.name.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn project_module_names<'ctx, 'module>(
+    module: &'module ScalarModule,
+    globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
+) -> ModuleNames<'ctx, 'module> {
+    let mut names = ModuleNames {
+        globals: GlobalNames(BTreeMap::new()),
+        unit_values: BTreeSet::new(),
+        members: BTreeMap::new(),
+        namespaces: BTreeMap::new(),
+        externs: BTreeMap::new(),
+    };
+    for namespace in &module.namespace_bindings {
+        names.namespaces.entry(namespace.binding.as_str()).or_insert(&namespace.target);
+    }
+    for item in &module.items {
+        let binding = match item {
+            ScalarItem::Binding(binding) => binding,
+            ScalarItem::Extern(declaration) => {
+                names.externs.entry(declaration.binding.as_str()).or_insert(declaration);
+                continue;
+            }
+            _ => continue,
+        };
+        let ty = &binding.declared_type;
+        let unsigned = matches!(
+            ty,
+            ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::U128
+        );
+        let member = names.members.entry(binding.name.as_str()).or_insert(MemberName {
+            ty,
+            unsigned: false,
+        });
+        member.unsigned |= unsigned;
+        if *ty == ScalarType::Unit {
+            names.unit_values.insert(binding.name.as_str());
+        }
+        for name in std::iter::once(binding.name.as_str())
+            .chain(binding.receivers.iter().map(|receiver| receiver.name.as_str()))
+        {
+            if let Some(global) = globals.get(&project_global_name(&module.source, name)) {
+                names.globals.0.insert(name, global);
             }
         }
     }
-}
-
-fn module_globals<'ctx>(
-    module: &ScalarModule,
-    globals: &BTreeMap<String, (GlobalValue<'ctx>, ScalarType)>,
-) -> BTreeMap<String, (GlobalValue<'ctx>, ScalarType)> {
-    module
-        .items
-        .iter()
-        .flat_map(|item| match item {
-            ScalarItem::Binding(binding) => std::iter::once(binding.name.clone())
-                .chain(
-                    binding
-                        .receivers
-                        .iter()
-                        .map(|receiver| receiver.name.clone()),
-                )
-                .filter_map(|name| {
-                    globals
-                        .get(&project_global_name(&module.source, &name))
-                        .cloned()
-                        .map(|global| (name, global))
-                })
-                .collect::<Vec<_>>(),
-            ScalarItem::Namespace(_)
-            | ScalarItem::Extern(_)
-            | ScalarItem::Function(_)
-            | ScalarItem::Executable(_) => Vec::new(),
-        })
-        .collect()
+    names
 }
 
 #[cfg(test)]

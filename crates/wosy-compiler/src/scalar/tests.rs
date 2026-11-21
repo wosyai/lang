@@ -4716,6 +4716,39 @@ fn derives_pointer_struct_layouts_from_the_target() {
 }
 
 #[test]
+fn lowers_empty_conditional_arms_and_unit_blocks_on_both_targets() {
+    let text = "%%start\nunit(i32) descend = fn(n) { if (n == 0) { } else { descend(n - 1) } };\nunit() empty = fn {};\nunit() other = fn { if (false) { empty() } else {}; if (true) {}; unsafe {}; };\ndescend(2);\nother();\n%%end";
+    let parsed = parse_source(source(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let result = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        crate::llvm::emit_scalar_llvm(&result).unwrap();
+    }
+}
+
+#[test]
+fn rejects_empty_value_branch_with_diagnostics_instead_of_panicking() {
+    let text = "%%start\ni32 value = if (true) {} else { 1 };\n%%end";
+    let result = validate_text(text);
+    assert!(!result.diagnostics.is_empty());
+}
+
+#[test]
+fn derives_empty_struct_literal_as_a_record_with_no_fields() {
+    let text = "%%start\nstruct Empty {}\nEmpty value = {};\n%%end";
+    let parsed = parse_source(source(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let decls = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+    assert!(decls.diagnostics().is_empty(), "{:?}", decls.diagnostics());
+    assert!(matches!(
+        &decls.items[0],
+        ScalarItem::Binding(ScalarBinding { value: ScalarExpression::StructLiteral { fields, .. }, .. })
+            if fields.is_empty()
+    ));
+}
+
+#[test]
 fn derives_unit_if_statement_and_requires_bool_condition_span() {
     let text =
         "%%start\nunit() touch = fn { 1; };\nunit() run = fn { if (true) { touch(); }; };\n%%end";

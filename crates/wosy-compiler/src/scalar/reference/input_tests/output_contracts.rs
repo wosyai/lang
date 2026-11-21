@@ -133,23 +133,21 @@ fn independent_contract_replay_retains_first_cfg_and_ordered_errors_without_repl
         );
         assert!(errors.is_empty(), "{errors:?}");
         let mut replays = Vec::new();
-        let mut concrete = Vec::new();
+        let contracts = ReferenceOutputContracts::default();
         for initial in [true, false] {
             let mut cursor = 0;
-            for (_, result) in &mut updates {
-                collect_concrete_output_contracts(
-                    result, &[], &mut concrete, &mut replays, &mut cursor,
-                );
-            }
-            assert!(concrete.is_empty());
+            let mut inputs = HashMap::new();
             let before = updates.iter().map(|(_, result)| result.cfg.points.as_ptr()).collect::<Vec<_>>();
-            let before_errors = replays.iter().map(|replay| replay.errors.as_ptr()).collect::<Vec<_>>();
-            let mut order = replays.iter_mut();
+            let before_errors = replays.iter().map(|replay: &ReferenceContractReplay| replay.errors.as_ptr()).collect::<Vec<_>>();
             for (_, result) in &mut updates {
-                transfer_function_output_contracts(result, &concrete, &mut order, initial);
+                transfer_function_output_contracts(
+                    result, &contracts, &contracts, &mut inputs, &mut replays, &mut cursor,
+                );
+                assert!(inputs.is_empty());
             }
+            assert_eq!(cursor, replays.len());
             assert_eq!(replays.len(), 2);
-            assert!(replays.iter().all(|replay| !replay.depends_on_module_calls && replay.errors.len() == 1));
+            assert!(replays.iter().all(|replay| replay.module_calls.is_empty() && replay.errors.len() == 1));
             if !initial {
                 for ((_, result), pointer) in updates.iter().zip(before) {
                     assert_eq!(result.cfg.points.as_ptr(), pointer);
@@ -166,5 +164,118 @@ fn independent_contract_replay_retains_first_cfg_and_ordered_errors_without_repl
             source_span.range.start
         }).collect::<Vec<_>>();
         assert!(starts[0] < starts[1], "{starts:?}");
+    }
+}
+
+#[test]
+fn replay_observes_only_consumed_first_output_contract_origins() {
+    let text = "%%start\n*u8(*u8) left = fn(input) { input };\n*u8(*u8) right = fn(input) { input };\n*u8(*u8) left_relay = fn(input) { left(input) };\n*u8(*u8) right_relay = fn(input) { right(input) };\n%%end";
+    for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let typed = typecheck_scalar_program(declarations, target);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let calls = resolve_program_call_sites(&program).unwrap();
+        let (mut updates, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let span = |index| match &program.items[index] {
+            ScalarItem::Function(function) => function.name_span,
+            _ => panic!("expected callable"),
+        };
+        let origins = vec![ReferenceOrigin::Null { span: ByteSpan::new(0, 1) }];
+        let row = |declaration_span, output, origins| ReferenceOutputContract {
+            source: &program.source,
+            declaration_span,
+            body: ReferenceCallableBody::Declaration,
+            output,
+            origins,
+            independent_static: true,
+        };
+        let previous = ReferenceOutputContracts::new(vec![
+            row(span(0), 0, Vec::new()),
+            row(span(1), 0, origins.clone()),
+        ]);
+        let current = ReferenceOutputContracts::new(vec![
+            row(span(0), 0, origins.clone()),
+            row(span(0), 0, Vec::new()),
+            row(span(1), 0, origins.clone()),
+            row(span(1), 1, Vec::new()),
+        ]);
+        let (left, unique) = current.find(
+            &program.source, span(0), &ConcreteCallSelection::Declaration, 0,
+        ).unwrap();
+        assert!(!unique);
+        assert_eq!(left.origins, origins);
+        let (right_other_output, unique) = current.find(
+            &program.source, span(1), &ConcreteCallSelection::Declaration, 1,
+        ).unwrap();
+        assert!(unique);
+        assert!(right_other_output.origins.is_empty());
+
+        let mut replays = Vec::new();
+        let mut pointers = Vec::new();
+        for (from, to) in [
+            (&previous, &previous),
+            (&previous, &current),
+            (&current, &current),
+        ] {
+            let mut cursor = 0;
+            let mut inputs = HashMap::new();
+            for (_, result) in &mut updates {
+                transfer_function_output_contracts(
+                    result, from, to, &mut inputs, &mut replays, &mut cursor,
+                );
+            }
+            assert_eq!(cursor, replays.len());
+            pointers.push(updates.iter().map(|(_, result)| result.cfg.points.as_ptr()).collect::<Vec<_>>());
+        }
+        assert_ne!(pointers[0][2], pointers[1][2]);
+        for index in [0, 1, 3] {
+            assert_eq!(pointers[0][index], pointers[1][index]);
+        }
+        assert_eq!(pointers[1], pointers[2]);
+        assert!(replays.iter().all(|replay| replay.errors.is_empty()));
+
+        let right_call = replays[3].module_calls[0];
+        updates[3].1.aggregate.checked_successor_candidate = Some(right_call);
+        let metadata_only = ReferenceOutputContracts::new(vec![
+            row(span(0), 0, origins.clone()),
+            row(span(0), 0, Vec::new()),
+            ReferenceOutputContract {
+                independent_static: false,
+                ..row(span(1), 0, origins.clone())
+            },
+            row(span(1), 1, Vec::new()),
+        ]);
+        let removed = ReferenceOutputContracts::new(vec![
+            row(span(1), 0, origins.clone()),
+            row(span(1), 1, Vec::new()),
+        ]);
+        for (from, to, successor) in [
+            (&current, &current, true),
+            (&current, &metadata_only, false),
+            (&metadata_only, &removed, true),
+        ] {
+            let mut cursor = 0;
+            let mut inputs = HashMap::new();
+            let left_before = updates[2].1.cfg.points.as_ptr();
+            let right_before = updates[3].1.cfg.points.as_ptr();
+            for (_, result) in &mut updates {
+                transfer_function_output_contracts(
+                    result, from, to, &mut inputs, &mut replays, &mut cursor,
+                );
+            }
+            assert_eq!(cursor, replays.len());
+            assert_eq!(updates[3].1.cfg.points.as_ptr(), right_before);
+            assert_eq!(updates[3].1.aggregate.checked_successor_contract, successor);
+            assert_eq!(
+                updates[2].1.cfg.points.as_ptr() != left_before,
+                std::ptr::eq(to, &removed),
+            );
+        }
     }
 }

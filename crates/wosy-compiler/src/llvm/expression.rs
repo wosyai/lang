@@ -122,7 +122,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                         .map_err(builder_error)?,
                 ));
             }
-            if let Some((global, ty)) = state.globals.get(name).cloned() {
+            if let Some((global, ty)) = state.globals.get(name) {
                 if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
                     return Ok(EmitValue::Basic(global.as_pointer_value().into()));
                 }
@@ -130,7 +130,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                     state
                         .builder
                         .build_load(
-                            storage_type(context, &ty, state.layouts, state.target_layout)?,
+                            storage_type(context, ty, state.layouts, state.target_layout)?,
                             global.as_pointer_value(),
                             name,
                         )
@@ -141,6 +141,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                 .values
                 .get(name)
                 .cloned()
+                .or_else(|| state.unit_values.contains(name.as_str()).then_some(EmitValue::Unit))
                 .ok_or_else(|| format!("unknown LLVM value {name}"))
         }
         ScalarExpression::Member {
@@ -382,9 +383,10 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             if let Some(place) = struct_member_place(state, receiver, name)? {
                 return emit_place_value(context, state, &place);
             }
-            let target = project_namespace_target(module, modules, receiver)?;
-            let (global, ty) = project_member_global(state, target, name)?;
-            if ty == ScalarType::Unit {
+            let names = state.project_names.expect("project emission names");
+            let target = project_namespace_target(names, module, receiver)?;
+            let (global, ty) = project_member_global(target, name)?;
+            if *ty == ScalarType::Unit {
                 return Ok(EmitValue::Unit);
             }
             let global = global.ok_or_else(|| format!("unknown LLVM member storage {name}"))?;
@@ -395,7 +397,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                 state
                     .builder
                     .build_load(
-                        storage_type(context, &ty, state.layouts, state.target_layout)?,
+                        storage_type(context, ty, state.layouts, state.target_layout)?,
                         global.as_pointer_value(),
                         name,
                     )
@@ -545,26 +547,16 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                 return Err("unknown LLVM extern binding core".to_owned());
             }
             let qualified = if let Some(binding) = receiver {
-                if let Some(namespace) = module
-                    .namespace_bindings
-                    .iter()
-                    .find(|namespace| namespace.binding == binding)
-                {
-                    let target = modules
-                        .iter()
-                        .find(|candidate| candidate.source == namespace.target)
-                        .ok_or_else(|| format!("unknown LLVM namespace {binding}"))?;
-                    project_function_name(&target.source, name)
+                let names = state.project_names.expect("project emission names");
+                let scope = names.for_module(module);
+                if let Some(source) = scope.namespaces.get(binding) {
+                    if !names.positions.contains_key(*source) {
+                        return Err(format!("unknown LLVM namespace {binding}"));
+                    }
+                    project_function_name(source, name)
                 } else {
-                    let declaration = module
-                        .items
-                        .iter()
-                        .find_map(|item| match item {
-                            ScalarItem::Extern(declaration) if declaration.binding == binding => {
-                                Some(declaration)
-                            }
-                            _ => None,
-                        })
+                    let declaration = scope.externs
+                        .get(binding)
                         .ok_or_else(|| format!("unknown LLVM extern binding {binding}"))?;
                     let crate::scalar::ScalarExternModule::Valid(import_module) =
                         &declaration.actual_module
@@ -654,7 +646,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
         } => {
             let unsigned = match prepared_initializer_unsigned(state, left)? {
                 Some(unsigned) => unsigned,
-                None => project_expression_is_unsigned(state, left, module, modules),
+                None => project_expression_is_unsigned(state, left, module),
             };
             let left = emit_project_expression(context, state, left, module, modules)?;
             emit_binary_with_rhs(
@@ -2370,33 +2362,20 @@ fn project_expression_is_unsigned<'ctx, 'module>(
     state: &EmitState<'ctx, 'module>,
     expression: &ScalarExpression,
     module: &ScalarModule,
-    modules: &[&ScalarModule],
 ) -> bool {
     match expression {
         ScalarExpression::Member { receiver, name, .. } => {
-            if let Ok(target) = project_namespace_target(module, modules, receiver) {
-                return target.items.iter().any(|item| {
-                    matches!(
-                        item,
-                        ScalarItem::Binding(binding)
-                            if binding.name == *name && matches!(
-                                &binding.declared_type,
-                                ScalarType::U8
-                                    | ScalarType::U16
-                                    | ScalarType::U32
-                                    | ScalarType::U64
-                                    | ScalarType::U128
-                            )
-                    )
-                });
+            let names = state.project_names.expect("project emission names");
+            if let Ok(target) = project_namespace_target(names, module, receiver) {
+                return target.members.get(name.as_str()).is_some_and(|member| member.unsigned);
             }
             expression_is_unsigned(state, expression)
         }
         ScalarExpression::Unary { operand, .. } => {
-            project_expression_is_unsigned(state, operand, module, modules)
+            project_expression_is_unsigned(state, operand, module)
         }
         ScalarExpression::Binary { left, .. } => {
-            project_expression_is_unsigned(state, left, module, modules)
+            project_expression_is_unsigned(state, left, module)
         }
         _ => expression_is_unsigned(state, expression),
     }
