@@ -263,6 +263,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) checked_producer_sources: Vec<(CfgPointId, CheckedProducerTerminal)>,
     pub(super) checked_producer_authoritative: bool,
     pub(super) array_invalid: bool,
+    pub(super) array_neutral: bool,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     pub(super) array_returns: BTreeSet<Option<BTreeSet<CfgPointId>>>,
     pub(super) array_rebinds: BTreeMap<CfgPointId, (CfgPointId, ReferenceBindingId)>,
@@ -425,16 +426,27 @@ impl AggregateFlowFacts {
                     local.viewed = true;
                 }
             }
+            let selected_recommit = |call| {
+                self.array_calls.get(&call).is_some_and(|(_, moved, actual)| {
+                    actual == binding && Some(*moved) == local.pending && !local.viewed
+                })
+            };
             if !self.checked_producer_arms.is_empty() {
                 local.checked_producer_conflict |= self.checked_producer_nonlocal_installs.contains(&id);
                 local.checked_producer_conflict |= match &point.kind {
+                    CfgPointKind::Call { output: 0, .. } => !selected_recommit(id),
                     CfgPointKind::Call { .. } | CfgPointKind::AssignThrough { .. }
                     | CfgPointKind::MoveThrough { .. } | CfgPointKind::DeferredMoveThrough { .. }
                     | CfgPointKind::Invalidate { .. } | CfgPointKind::Release { .. }
                     | CfgPointKind::Evaluate(ScalarExpression::ArrayLiteral { .. }) => true,
                     CfgPointKind::Assign { target, rhs_point, .. } => {
-                        !target.projections.is_empty() || !state.bindings.contains_key(&target.binding)
-                            || state.values.get(rhs_point) != Some(&Value::View(OwnerSource::Allocation(allocation)))
+                        !target.projections.is_empty()
+                            || if &target.binding == binding {
+                                !self.array_installs.contains(&id) || !selected_recommit(*rhs_point)
+                            } else {
+                                !state.bindings.contains_key(&target.binding)
+                                    || state.values.get(rhs_point) != Some(&Value::View(OwnerSource::Allocation(allocation)))
+                            }
                     }
                     CfgPointKind::Move { place, owner, .. } | CfgPointKind::DeferredMove { place, owner, .. } => {
                         self.checked_producer_arms.iter().any(|(_, terminal)| matches!(terminal,
@@ -536,6 +548,20 @@ impl AggregateFlowFacts {
             }
         }
         if let Some(formal) = &self.array_formal {
+            if result.array_neutral {
+                result.array_neutral = match &point.kind {
+                    CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit
+                    | CfgPointKind::Read { .. } | CfgPointKind::Branch { .. } | CfgPointKind::Join
+                    | CfgPointKind::ReturnOutput { checked: false, .. } | CfgPointKind::Return
+                    | CfgPointKind::ConditionalOutput { .. } => true,
+                    CfgPointKind::Move { place, owner, .. } => owner == formal
+                        && &place.binding == formal && place.projections.is_empty()
+                        && self.array_return_move == Some(id),
+                    CfgPointKind::Evaluate(ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }
+                        | ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }) => true,
+                    _ => false,
+                };
+            }
             match &point.kind {
                 CfgPointKind::Borrow { place, .. } if &place.binding == formal => {
                     result.array_invalid = true;
@@ -1680,6 +1706,24 @@ fn closed_aggregates<'a>(
                 return None;
             };
             if left != right { return None }
+            let CfgPointKind::Bind { binding } = &body.cfg.points.get(left.0)?.kind else { return None };
+            for &(call, ref destination) in facts.array_rebinds.values() {
+                if destination != binding { continue }
+                let (ordinal, _, _) = facts.array_calls.get(&call)?;
+                let callee = target_body(&declarations, body.cfg, call)?;
+                let callee_facts = bodies.get(&callee)?.facts?;
+                if callee.2.is_some() || !callee_facts.array_neutral || !array_leaves.contains(&callee)
+                    || !result.bodies.get(&key)?.same_array_rebinds.contains(&ordinal.0)
+                    || !matches!(&body.cfg.points.get(call.0)?.kind, CfgPointKind::Call {
+                        output: 0,
+                        target: ResolvedCallTarget::ModuleCallable {
+                            concrete: ConcreteCallSelection::Declaration, ..
+                        }, ..
+                    })
+                {
+                    return None;
+                }
+            }
             let allocation = *facts.allocation_slots.get(left)?;
             let arms = [*facts.checked_producer_blocks.get(first)?, *facts.checked_producer_blocks.get(last)?];
             Some((key, ClosedCheckedBacking { allocation, arms }))

@@ -584,12 +584,18 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
         .replace("if (received != null && status)", "escaped = received;\n\tif (received != null && status)");
     let qualified_sink = positive.replace("struct Packet", "imported = namespace package \"values.w\";\nstruct Packet")
         .replace("if (received != null && status)", "imported.value = 4;\n\tif (received != null && status)");
+    let pure_recommit = positive.replace("(*Packet, bool)(u64, bool) make_checked",
+        "u8[](u8[], bool) preserve = fn(buffer, flag) { buffer };\n(*Packet, bool)(u64, bool) make_checked")
+        .replace("u8[count] bytes;", "u8[count] bytes;\n\tbytes = preserve(bytes, flag);");
+    let observable_recommit = pure_recommit.replace("u8[](u8[], bool) preserve = fn(buffer, flag) { buffer };",
+        "bool escaped = false;\nu8[](u8[], bool) preserve = fn(buffer, flag) { escaped = flag; buffer };");
     let app = source("private_checked_backing", "src/main.w");
     let values = source("package", "src/values.w");
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         for (text, expected_transport, qualified) in [
             (positive, true, false), (unproved.as_str(), false, false),
             (module_sink.as_str(), false, false), (qualified_sink.as_str(), false, true),
+            (pure_recommit.as_str(), true, false), (observable_recommit.as_str(), false, false),
         ] {
             let (inputs, order) = if qualified {
                 (vec![(declarations(&app, text), vec![namespace("imported", &values)]),
