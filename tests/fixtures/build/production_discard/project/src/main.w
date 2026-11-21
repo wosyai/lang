@@ -28,10 +28,38 @@ unit() recover = fn {
 	observer.checkpoint(3, 0, null, null);
 };
 
+unit(i32) descriptor_probe = fn(which) {
+	*std.utf8 text, std.ReadLineStatus status = std.read_line(8);
+	if (which == 2) {
+		if (text != null || status != std.ReadLineStatus::eof) { core.system_panic(); };
+		observer.checkpoint(6, which, null, null);
+	} else {
+		if (text == null || status != std.ReadLineStatus::line) { core.system_panic(); };
+		*?u8 bytes = (*text).data;
+		if (which == 0) {
+			if ((*text).length != 2 || bytes == null) { core.system_panic(); };
+			observer.checkpoint(6, which, bytes, null);
+			unsafe { core.free(bytes); };
+		} else {
+			if ((*text).length != 0 || bytes != null) { core.system_panic(); };
+			observer.checkpoint(6, which, null, null);
+		};
+	};
+};
+
 discard(0, std.ReadLineStatus::limit_exceeded);
 recover();
 discard(1, std.ReadLineStatus::limit_exceeded);
 discard(2, std.ReadLineStatus::limit_exceeded);
 discard(3, std.ReadLineStatus::io_error);
 observer.checkpoint(4, 3, null, null);
+observer.checkpoint(5, 0, null, null);
+descriptor_probe(0);
+observer.checkpoint(7, 0, null, null);
+observer.checkpoint(5, 1, null, null);
+descriptor_probe(1);
+observer.checkpoint(7, 1, null, null);
+observer.checkpoint(5, 2, null, null);
+descriptor_probe(2);
+observer.checkpoint(7, 2, null, null);
 %%end

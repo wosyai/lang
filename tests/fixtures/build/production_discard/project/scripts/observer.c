@@ -10,9 +10,10 @@ extern void __real___wosy_core_free(void *address);
 struct iovec { word destination; u32 length; };
 struct read_site { word destination, iovec, count, stack; };
 
-enum phase { IDLE, DISCARD, RECOVERY, RELEASING, DONE };
+enum phase { IDLE, DISCARD, RECOVERY, RELEASING, DONE, DESCRIPTOR, DESCRIPTOR_RELEASING };
 static enum phase phase;
 static u32 which, next_case, reads, recovery_reads, allocations, releases;
+static u32 probe, next_probe, probe_reads;
 static struct read_site public_site, discard_site, repeat_site, recovery_public_site, recovery_tail_site;
 static void *backing, *record;
 
@@ -66,6 +67,22 @@ int FD_READ(int descriptor, word address, int vectors, word count) {
         *reported = 1;
         return which == 3 ? 5 : 0;
     }
+    if (phase == DESCRIPTOR) {
+        require(!releases);
+        u32 index = probe_reads++;
+        if (probe == 0) {
+            require(index < 3 && allocations == (index == 0 ? 0u : 1u));
+            *destination = ((const byte *)"OK\n")[index];
+            *reported = 1;
+        } else {
+            require(index == 0 && !allocations && probe < 3);
+            if (probe == 1) {
+                *destination = '\n';
+                *reported = 1;
+            }
+        }
+        return 0;
+    }
     require(phase == RECOVERY && recovery_reads < 3 && !releases);
     u32 index = recovery_reads++;
     if (index == 0) {
@@ -85,6 +102,22 @@ int FD_READ(int descriptor, word address, int vectors, word count) {
 }
 
 void *__wrap___wosy_core_alloc(u64 size, u64 alignment) {
+    if (phase == DESCRIPTOR) {
+        require(!releases && probe < 2);
+        if (probe == 0 && allocations == 0) {
+            require(probe_reads == 1 && size == 8 && alignment == 1);
+            backing = __real___wosy_core_alloc(size, alignment);
+            require(backing);
+            ++allocations;
+            return backing;
+        }
+        require(allocations == (probe == 0 ? 1u : 0u));
+        require(probe_reads == (probe == 0 ? 3u : 1u) && size == 16 && alignment == 8);
+        record = __real___wosy_core_alloc(size, alignment);
+        require(record && record != backing);
+        ++allocations;
+        return record;
+    }
     require(phase == RECOVERY && !releases);
     if (allocations == 0) {
         require(recovery_reads == 1 && size == 8 && alignment == 1);
@@ -101,6 +134,13 @@ void *__wrap___wosy_core_alloc(u64 size, u64 alignment) {
 }
 
 void __wrap___wosy_core_free(void *address) {
+    if (phase == DESCRIPTOR_RELEASING) {
+        require(probe < 2 && releases < (probe == 0 ? 2u : 1u));
+        require(address == (probe == 0 && releases == 0 ? backing : record));
+        ++releases;
+        __real___wosy_core_free(address);
+        return;
+    }
     require(phase == RELEASING && allocations == 2 && releases < 2);
     require(address == (releases == 0 ? backing : record));
     ++releases;
@@ -113,6 +153,19 @@ void CHECKPOINT(int event, int sequence, word data, word slot) {
         require(data == (word)backing && slot && *(const word *)slot == (word)record);
         require(((const byte *)data)[0] == 'O' && ((const byte *)data)[1] == 'K');
         phase = RELEASING;
+        return;
+    }
+    if (event == 6) {
+        require(phase == DESCRIPTOR && sequence == (int)probe && !slot && !releases);
+        require(probe_reads == (probe == 0 ? 3u : 1u));
+        require(allocations == (probe == 0 ? 2u : probe == 1 ? 1u : 0u));
+        if (probe == 0) {
+            require(data == (word)backing && record);
+            require(((const byte *)data)[0] == 'O' && ((const byte *)data)[1] == 'K');
+        } else {
+            require(!data && !backing && (probe == 1 ? record != 0 : record == 0));
+        }
+        phase = DESCRIPTOR_RELEASING;
         return;
     }
     require(!data && !slot);
@@ -136,6 +189,18 @@ void CHECKPOINT(int event, int sequence, word data, word slot) {
         return;
     case 4:
         require(sequence == 3 && phase == IDLE && next_case == 4 && recovery_reads == 3);
+        phase = DONE;
+        return;
+    case 5:
+        require(phase == DONE && sequence == (int)next_probe && next_probe < 3);
+        probe = next_probe++;
+        allocations = releases = probe_reads = 0;
+        backing = record = 0;
+        phase = DESCRIPTOR;
+        return;
+    case 7:
+        require(phase == DESCRIPTOR_RELEASING && sequence == (int)probe);
+        require(releases == allocations);
         phase = DONE;
         return;
     }
