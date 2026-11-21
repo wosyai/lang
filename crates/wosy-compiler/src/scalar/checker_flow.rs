@@ -262,31 +262,34 @@ enum IntegerControl<'a> {
 pub(super) fn check_integer_requirements(
     calls: &FunctionCallSites,
 ) -> Option<Result<(), IntegerCheckFailure<'_>>> {
-    run_integer_callable(calls, None)
+    run_integer_callable(calls, integer_tail_type(calls), None)
 }
 
 pub(super) fn observe_integer_returns(
     calls: &FunctionCallSites,
 ) -> Option<Result<Vec<IntegerReturningPath<'_>>, IntegerCheckFailure<'_>>> {
-    let [result] = calls.boundary.results.as_slice() else {
-        return None;
-    };
-    let [output] = calls.boundary.root_outputs.as_slice() else {
-        return None;
-    };
-    if !is_integer_type(&result.ty) || result.ty != output.ty {
-        return None;
-    }
+    let tail = integer_tail_type(calls)?;
     let mut paths = Vec::new();
-    match run_integer_callable(calls, Some(&mut paths))? {
+    match run_integer_callable(calls, Some(tail), Some(&mut paths))? {
         Ok(()) if !paths.is_empty() => Some(Ok(paths)),
         Ok(()) => None,
         Err(failure) => Some(Err(failure)),
     }
 }
 
+fn integer_tail_type(calls: &FunctionCallSites) -> Option<&ScalarType> {
+    let [result] = calls.boundary.results.as_slice() else {
+        return None;
+    };
+    let [output] = calls.boundary.root_outputs.as_slice() else {
+        return None;
+    };
+    (is_integer_type(&result.ty) && result.ty == output.ty).then_some(&result.ty)
+}
+
 fn run_integer_callable<'a>(
     calls: &'a FunctionCallSites,
+    tail: Option<&'a ScalarType>,
     returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
 ) -> Option<Result<(), IntegerCheckFailure<'a>>> {
     let boundary = &calls.boundary;
@@ -305,7 +308,7 @@ fn run_integer_callable<'a>(
         .map(|parameter| IntegerSet::from_type(&parameter.ty).map(Rc::new))
         .collect::<Option<IntegerRow>>()?;
     let root = IntegerInputs(vec![root]);
-    match walk_integer_block(calls, &mut roots, calls.structure.root, root, returns)? {
+    match walk_integer_block(calls, &mut roots, calls.structure.root, root, tail, returns)? {
         IntegerControl::Continue(_) | IntegerControl::Returned => Some(Ok(())),
         IntegerControl::Fail(failure) => Some(Err(failure)),
     }
@@ -316,6 +319,7 @@ fn walk_integer_block<'a>(
     roots: &mut IntegerRoots<'a>,
     block: BlockOrdinal,
     mut path: IntegerInputs,
+    tail: Option<&'a ScalarType>,
     mut returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
 ) -> Option<IntegerControl<'a>> {
     let depth = roots.axes.len();
@@ -353,7 +357,7 @@ fn walk_integer_block<'a>(
                     };
                     let predicate = structure.checker_branches.get(condition)?;
                     let (yes, no, axis) = path.split(roots, predicate)?;
-                    match walk_integer_block(calls, roots, *then_block, yes, None)? {
+                    match walk_integer_block(calls, roots, *then_block, yes, None, None)? {
                         IntegerControl::Continue(then_path) => path = then_path.join(no, axis),
                         failure @ IntegerControl::Fail(_) => return Some(failure),
                         IntegerControl::Returned => return None,
@@ -362,8 +366,31 @@ fn walk_integer_block<'a>(
             }
             BlockItemKind::FinalOutput(slot) => {
                 let ty = structure.checked_types.expressions.get(&slot.expression)?;
-                if !is_integer_type(ty) {
+                if let Some(expected) = tail {
+                    if slot.output != 0 || ty != expected {
+                        return None;
+                    }
+                } else if !is_integer_type(ty) {
                     return None;
+                }
+                if let Some(ConditionalRegion::Value { condition, then_block, else_block, .. }) =
+                    calls.conditionals.get(&slot.expression)
+                {
+                    let expected = tail?;
+                    let predicate = structure.checker_branches.get(condition)?;
+                    let (yes, no, _) = path.split(roots, predicate)?;
+                    for (arm, incoming) in [(*then_block, yes), (*else_block, no)] {
+                        if incoming.is_unreachable() {
+                            continue;
+                        }
+                        match walk_integer_block(calls, roots, arm, incoming, Some(expected), returns.as_deref_mut())? {
+                            IntegerControl::Returned => {}
+                            failure @ IntegerControl::Fail(_) => return Some(failure),
+                            IntegerControl::Continue(_) => return None,
+                        }
+                    }
+                    roots.truncate(depth);
+                    return Some(IntegerControl::Returned);
                 }
                 let value = if let Some(value) = structure.checker_integer_literals.get(&slot.expression) {
                     IntegerReturn::Const(value)
@@ -378,16 +405,15 @@ fn walk_integer_block<'a>(
                     }
                     IntegerReturn::Alias(binding)
                 };
-                if let Some(returns) = returns.as_deref_mut() {
-                    if slot.output != 0 {
-                        return None;
+                if tail.is_some() {
+                    if let Some(returns) = returns.as_deref_mut() {
+                        returns.push(IntegerReturningPath {
+                            value,
+                            ty,
+                            state: path,
+                            axes: roots.axes.iter().map(|(binding, _)| *binding).collect(),
+                        });
                     }
-                    returns.push(IntegerReturningPath {
-                        value,
-                        ty,
-                        state: path,
-                        axes: roots.axes.iter().map(|(binding, _)| *binding).collect(),
-                    });
                     roots.truncate(depth);
                     return Some(IntegerControl::Returned);
                 }

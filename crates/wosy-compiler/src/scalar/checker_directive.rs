@@ -1002,4 +1002,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tail_value_conditional_preserves_disjoint_constant_and_alias_returns() {
+        use crate::scalar::checker_flow::{observe_integer_returns, IntegerReturn};
+
+        check_source(
+            "u8(u8) clamp_bounded = fn(value) { if (value > 10) { 10 } else { value } };",
+            |body| {
+                let paths = observe_integer_returns(body).unwrap().unwrap();
+                let [high, low] = paths.as_slice() else {
+                    panic!("expected two disjoint return paths");
+                };
+                let parameter = &body.boundary.checker_parameter_bindings.as_deref().unwrap()[0];
+                assert_eq!(high.value, IntegerReturn::Const(&BigInt::from(10)));
+                assert_eq!(low.value, IntegerReturn::Alias(parameter));
+                for value in 0..=255 {
+                    assert_eq!(high.state.includes(&[value]), value > 10);
+                    assert_eq!(low.state.includes(&[value]), value <= 10);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn tail_value_conditional_skips_only_unreachable_unsupported_returns() {
+        use crate::scalar::checker_flow::{observe_integer_returns, IntegerReturn};
+        for guard in [false, true] {
+            let source = format!(
+                "u8(u8) select = fn(value) {{ if ({guard}) {{ effect() }} else {{ value }} }}; u8() effect = fn {{ 10 }};",
+            );
+            check_source(&source, |body| {
+                let result = observe_integer_returns(body);
+                if guard {
+                    assert_eq!(result, None);
+                } else {
+                    let paths = result.unwrap().unwrap();
+                    let [path] = paths.as_slice() else {
+                        panic!("expected one reachable return path");
+                    };
+                    let parameter = &body.boundary.checker_parameter_bindings.as_deref().unwrap()[0];
+                    assert_eq!(path.value, IntegerReturn::Alias(parameter));
+                    assert!(path.state.includes(&[0]));
+                    assert!(path.state.includes(&[255]));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn reachable_tail_arm_failure_is_not_a_partial_return_success() {
+        use crate::scalar::checker_flow::observe_integer_returns;
+        check_source(
+            r#"
+            u8(u8) checked_clamp = fn(value) {
+                if (value <= 10) {
+                    value
+                } else {
+                    core.require(value >= 12, { .stdout = ""; .stderr = "eleven"; .code = 1; .files = []; });
+                    10
+                }
+            };
+            "#,
+            |body| {
+                let failure = observe_integer_returns(body).unwrap().unwrap_err();
+                for value in 0..=255 {
+                    assert_eq!(failure.state.includes(&[value]), value == 11);
+                }
+            },
+        );
+    }
+
 }
