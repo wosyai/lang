@@ -9015,16 +9015,22 @@ fn known_field_stored_value<'ctx>(
     known_field_operand(store, 0)
 }
 
-fn known_checked_field_path<'ctx>(
+fn known_checked_address<'ctx>(
     instructions: &[InstructionValue<'ctx>], address: BasicValueEnum<'ctx>,
-) -> Option<(BasicValueEnum<'ctx>, u64)> {
+) -> Option<BasicValueEnum<'ctx>> {
     let dereference = address.as_instruction_value()?;
     if dereference.get_opcode() != InstructionOpcode::IntToPtr { return None; }
     let handle_load = known_field_operand(dereference, 0)?.as_instruction_value()?;
     if handle_load.get_opcode() != InstructionOpcode::Load { return None; }
     let handle = known_field_stored_value(instructions, known_field_operand(handle_load, 0)?)?.as_instruction_value()?;
     if handle.get_opcode() != InstructionOpcode::PtrToInt { return None; }
-    known_direct_field_path(known_field_operand(handle, 0)?)
+    known_field_operand(handle, 0)
+}
+
+fn known_checked_field_path<'ctx>(
+    instructions: &[InstructionValue<'ctx>], address: BasicValueEnum<'ctx>,
+) -> Option<(BasicValueEnum<'ctx>, u64)> {
+    known_direct_field_path(known_checked_address(instructions, address)?)
 }
 
 fn known_direct_field_path(address: BasicValueEnum<'_>) -> Option<(BasicValueEnum<'_>, u64)> {
@@ -9178,5 +9184,59 @@ u8(Pair) inspect = fn(owner) {
                 && diagnostic.labels.first().is_some_and(|label| label.span.range.start == source_read)
                 && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == loan)
         }), "{:?}", denied.diagnostics());
+    }
+}
+
+#[test]
+fn emits_known_shared_projected_leaf_from_the_original_owner_through_the_ordinary_driver() {
+    let source = r#"%%start
+struct copy Pair { u8 left; u8 right; }
+u8(Pair) inspect = fn(owner) {
+    *Pair parent = &owner;
+    *u8 leaf = &(*parent).right;
+    owner.left + *leaf
+};
+%%end"#;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for partition in [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ] {
+            let ir = partition.expect("ordinary shared projected leaf LLVM").to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+                ir.as_bytes(), "known-shared-projected-leaf",
+            );
+            let module = context.create_module_from_ir(buffer).expect("parse shared projected leaf LLVM");
+            module.verify().expect("verify shared projected leaf LLVM");
+            let routine = module.get_functions().find(|routine| {
+                matches!(routine.get_type().get_return_type(), Some(inkwell::types::BasicTypeEnum::IntType(ty))
+                    if ty.get_bit_width() == 8)
+            }).expect("typed byte result");
+            let instructions = routine.get_basic_blocks().iter().flat_map(|block| {
+                std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction())
+            }).collect::<Vec<_>>();
+            let result = instructions.iter().copied().find(|instruction| {
+                instruction.get_opcode() == InstructionOpcode::Return
+            }).expect("returned byte sum");
+            let result = known_field_operand(result, 0).and_then(|value| value.as_instruction_value())
+                .expect("returned add value");
+            assert_eq!(result.get_opcode(), InstructionOpcode::Add);
+            let [direct, checked] = [0, 1].map(|index| {
+                let read = known_field_operand(result, index).and_then(|value| value.as_instruction_value())
+                    .expect("add consumes field read");
+                assert_eq!(read.get_opcode(), InstructionOpcode::Load);
+                known_field_operand(read, 0).expect("actual field address")
+            });
+            let (direct_owner, direct_offset) = known_direct_field_path(direct).expect("direct owner field");
+            let (through_parent, leaf_offset) = known_checked_field_path(&instructions, checked)
+                .expect("read through the projected checked leaf");
+            let loan_owner = known_checked_address(&instructions, through_parent).expect("whole checked parent");
+            assert_eq!((direct_offset, leaf_offset), (0, 1));
+            assert_eq!(direct_owner, loan_owner, "both returned reads derive from the actual owner");
+        }
     }
 }
