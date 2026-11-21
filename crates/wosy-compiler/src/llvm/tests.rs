@@ -3666,6 +3666,53 @@ Event(u64) enum_copied = fn(length) { Event[length] events; events[0] = Event::s
 }
 
 #[test]
+fn publishes_runtime_array_storage_for_ordinary_module_calls_before_root_cleanup() {
+    let text = "%%start\nu64 length = 2;\nu8[length] values;\nvalues[0] = 7;\nu8() read = fn { values[0] };\nunit(u8) write = fn(value) { values[0] = value; };\nu8 first = read();\nwrite(9);\nu8 second = read();\n%%end";
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, target_layout);
+        let source = &prepared.project().modules[0].source;
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        let standalone = derive_scalar_program_with_layout(&parsed.result, target_layout);
+        assert!(standalone.diagnostics.is_empty(), "{:?}", standalone.diagnostics);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for (partition, global, read, write) in [
+            (emit_scalar_llvm(&standalone), "values".to_owned(), "read".to_owned(), "write".to_owned()),
+            (emit_scalar_build_single_module_llvm(&build), "values".to_owned(), "read".to_owned(), "write".to_owned()),
+            (
+                emit_scalar_build_project_llvm(&build),
+                project_global_name(source, "values"),
+                project_function_name(source, "read"),
+                project_function_name(source, "write"),
+            ),
+        ] {
+            let text = partition.unwrap().to_text();
+            let body = |definition: &str| {
+                text.split_once(definition).unwrap_or_else(|| panic!("{definition}: {text}"))
+                    .1.split_once("\n}").unwrap().0
+            };
+            let entry = body("define i32 @main()");
+            let allocation = entry.find("call ptr @__wosy_core_alloc").unwrap();
+            let publication = entry.find(&format!("store ptr %allocation, ptr @{global}")).unwrap();
+            let first_write = entry.find("store i8 7").unwrap();
+            let first_read = entry.find(&format!("call i8 @{read}()")).unwrap();
+            let write_call = entry.find(&format!("call void @{write}(i8 9)")).unwrap();
+            let last_read = entry.rfind(&format!("call i8 @{read}()")).unwrap();
+            let cleanup = entry.find("call void @__wosy_core_free").unwrap();
+            assert!(allocation < publication && publication < first_write && first_write < first_read
+                && first_read < write_call && write_call < last_read && last_read < cleanup, "{entry}");
+            assert_eq!(text.matches("call ptr @__wosy_core_alloc").count(), 1, "{text}");
+            assert_eq!(text.matches("call void @__wosy_core_free").count(), 1, "{text}");
+            for name in [read, write] {
+                let definition = text.lines().find(|line| line.starts_with("define ")
+                    && line.contains(&format!("@{name}("))).unwrap();
+                assert!(body(definition).contains(&format!("load ptr, ptr @{global}")), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
 fn emits_one_release_for_a_moved_top_level_runtime_array_for_both_targets() {
     let source = SourceIdentity::new(
         "project".into(),

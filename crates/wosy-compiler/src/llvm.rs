@@ -2152,11 +2152,13 @@ fn emit_main<'ctx, 'module>(
                 if aggregate_transfer::emit_initializer_binding(context, &mut state, binding, None)? {
                     continue;
                 }
-                let value = emit_binding_value(context, &mut state, binding)?;
                 if binding.is_allocation {
-                    store_binding_outputs(context, &mut state, binding, value)?;
+                    initialize_runtime_array_global(context, &mut state, binding, |state, length| {
+                        emit_typed_expression(context, state, length, &ScalarType::U64)
+                    })?;
                     continue;
                 }
+                let value = emit_binding_value(context, &mut state, binding)?;
                 for (position, (name, ty)) in binding_receivers(binding).iter().enumerate() {
                     if *ty == ScalarType::Unit {
                         continue;
@@ -2500,6 +2502,40 @@ fn emit_project_main<'ctx, 'module>(
     Ok(())
 }
 
+fn initialize_runtime_array_global<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    binding: &crate::ScalarBinding,
+    emit_length: impl FnOnce(
+        &mut EmitState<'ctx, 'module>,
+        &ScalarExpression,
+    ) -> Result<EmitValue<'ctx>, String>,
+) -> Result<(), String> {
+    let receiver = binding
+        .receivers
+        .first()
+        .ok_or_else(|| "runtime allocation has no receiver".to_owned())?;
+    let ScalarType::RuntimeArray { element, .. } = &receiver.ty else {
+        return Err("allocation binding requires a runtime array type".to_owned());
+    };
+    let length = receiver
+        .allocation_length
+        .as_ref()
+        .ok_or_else(|| "runtime allocation has no length".to_owned())?;
+    let length = take_basic(emit_length(state, length)?)?.into_int_value();
+    let pointer = emit_runtime_array_allocation(context, state, element, length)?;
+    let (global, _) = state
+        .globals
+        .get(&receiver.name)
+        .ok_or_else(|| format!("unknown LLVM global {}", receiver.name))?;
+    let storage = global.as_pointer_value();
+    state.builder.build_store(storage, pointer).map_err(builder_error)?;
+    state.storage.insert(receiver.name.clone(), (storage, receiver.ty.clone()));
+    state.runtime_array_owners.insert(receiver.name.clone(), true);
+    state.runtime_array_allocations.insert(receiver.name.clone(), false);
+    Ok(())
+}
+
 fn initialize_project_module<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -2570,49 +2606,15 @@ fn initialize_project_module<'ctx, 'module>(
                 if aggregate_transfer::emit_initializer_binding(context, state, binding, Some((module, modules)))? {
                     continue;
                 }
-                let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 if binding.is_allocation {
-                    let receiver = binding
-                        .receivers
-                        .first()
-                        .ok_or_else(|| "runtime allocation has no receiver".to_owned())?;
-                    let ScalarType::RuntimeArray { element, .. } = &receiver.ty else {
-                        return Err("allocation binding requires a runtime array type".to_owned());
-                    };
-                    let length = receiver
-                        .allocation_length
-                        .as_ref()
-                        .ok_or_else(|| "runtime allocation has no length".to_owned())?;
-                    let length = take_basic(emit_project_typed_expression(
-                        context,
-                        state,
-                        length,
-                        &ScalarType::U64,
-                        module,
-                        modules,
-                    )?)?
-                    .into_int_value();
-                    let pointer = emit_runtime_array_allocation(context, state, element, length)?;
-                    let (global, _) = state
-                        .globals
-                        .get(&receiver.name)
-                        .ok_or_else(|| format!("unknown LLVM global {}", receiver.name))?;
-                    state
-                        .builder
-                        .build_store(global.as_pointer_value(), pointer)
-                        .map_err(builder_error)?;
-                    state.storage.insert(
-                        receiver.name.clone(),
-                        (global.as_pointer_value(), receiver.ty.clone()),
-                    );
-                    state
-                        .runtime_array_owners
-                        .insert(receiver.name.clone(), true);
-                    state
-                        .runtime_array_allocations
-                        .insert(receiver.name.clone(), false);
+                    initialize_runtime_array_global(context, state, binding, |state, length| {
+                        emit_project_typed_expression(
+                            context, state, length, &ScalarType::U64, module, modules,
+                        )
+                    })?;
                     continue;
                 }
+                let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 for (position, (name, ty)) in binding_receivers(binding).iter().enumerate() {
                     if *ty == ScalarType::Unit {
                         continue;
