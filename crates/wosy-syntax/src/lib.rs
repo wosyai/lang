@@ -91,15 +91,15 @@ pub enum SyntaxKind {
     AllocationBinding,
     ParenthesizedDereferencePlace,
     CopyModifier,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "checker-test-support"))]
     ProofDecl = 81,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "checker-test-support"))]
     ProofTarget = 82,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "checker-test-support"))]
     ProofOutputs = 83,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "checker-test-support"))]
     ProofWhere = 84,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "checker-test-support"))]
     ProofEnsures = 85,
 }
 
@@ -191,15 +191,15 @@ impl Language for WosyLanguage {
             78 => SyntaxKind::AllocationBinding,
             79 => SyntaxKind::ParenthesizedDereferencePlace,
             80 => SyntaxKind::CopyModifier,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "checker-test-support"))]
             81 => SyntaxKind::ProofDecl,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "checker-test-support"))]
             82 => SyntaxKind::ProofTarget,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "checker-test-support"))]
             83 => SyntaxKind::ProofOutputs,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "checker-test-support"))]
             84 => SyntaxKind::ProofWhere,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "checker-test-support"))]
             85 => SyntaxKind::ProofEnsures,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
@@ -455,8 +455,9 @@ pub fn parse(source: SourceIdentity, text: String, configured_comments: &[String
     parse_entry(source, text, configured_comments, Rule::source)
 }
 
-#[cfg(test)]
-fn parse_proof_fragment(
+#[cfg(any(test, feature = "checker-test-support"))]
+#[doc(hidden)]
+pub fn parse_proof_fragment(
     source: SourceIdentity,
     text: String,
     configured_comments: &[String],
@@ -484,7 +485,7 @@ fn parse_entry(
             add_gap(&mut builder, &text, 0, &comments);
             builder.finish_node();
             let span = ByteSpan::new(0, text.len() as u32);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "checker-test-support"))]
             let span = if rule == Rule::proof_fragment {
                 match _error.location {
                     pest::error::InputLocation::Pos(at) => ByteSpan::new(at as u32, at as u32),
@@ -752,17 +753,17 @@ fn collect_comments(
 fn kind(rule: Rule) -> SyntaxKind {
     match rule {
         Rule::source => SyntaxKind::Root,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "checker-test-support"))]
         Rule::proof_fragment => SyntaxKind::Root,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "checker-test-support"))]
         Rule::proof_decl => SyntaxKind::ProofDecl,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "checker-test-support"))]
         Rule::proof_target => SyntaxKind::ProofTarget,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "checker-test-support"))]
         Rule::proof_outputs => SyntaxKind::ProofOutputs,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "checker-test-support"))]
         Rule::proof_where => SyntaxKind::ProofWhere,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "checker-test-support"))]
         Rule::proof_ensures => SyntaxKind::ProofEnsures,
         Rule::boundary_start => SyntaxKind::BoundaryStart,
         Rule::boundary_end => SyntaxKind::BoundaryEnd,

@@ -217,4 +217,37 @@ mod tests {
             ProjectCheck::MissingRoot
         );
     }
+    #[test]
+    fn compiler_test_dependency_accepts_only_the_explicit_proof_fragment_entry() {
+        use wosy_syntax::{parse_proof_fragment, SyntaxKind};
+
+        let identity = source("src/main.w", "proof-fragment");
+        let fragment = "proof clamp_bounded for clamp(x) -> (out) where (x <= 10) ensures (out <= 10) {}";
+        let parsed = parse_proof_fragment(identity.clone(), fragment.to_owned(), &[]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.canonical_cst().source, identity);
+        assert_eq!(parsed.reconstruct(), fragment);
+        let declaration = parsed
+            .canonical_cst()
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ProofDecl)
+            .expect("canonical fragment proof");
+        assert!(declaration.children().any(|node| node.kind() == SyntaxKind::ProofWhere));
+        assert!(declaration.children().any(|node| node.kind() == SyntaxKind::ProofEnsures));
+
+        let ordinary = crate::parse_source(
+            identity,
+            format!("%%start\n{fragment}\n%%end"),
+            &[],
+        );
+        assert!(!ordinary.diagnostics.is_empty());
+        assert!(!ordinary
+            .result
+            .canonical_cst()
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::ProofDecl));
+    }
+
 }
