@@ -1981,12 +1981,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                             .then_some((site.point, holder))
                                     }));
                                 let direct = if pending.is_none_or(|pending| pending.handle == binding) {
-                                    self.deferred_reborrow_roots.iter().find(|(handle, root, entry, _)| {
-                                        *handle == binding
-                                            && (*mutability == ScalarReferenceMutability::Shared
-                                                || matches!(root, super::control::DeferredReborrowRoot::Formal { .. })
-                                                || self.cfg.points[entry.0].scope == scope)
-                                    })
+                                    self.deferred_reborrow_roots.iter().find(|(handle, _, _, _)| *handle == binding)
                                 } else {
                                     None
                                 };
@@ -4790,6 +4785,15 @@ fn contains_loan_site(binding: &ReferenceBindingId, point: &ReferenceFlowPoint) 
     binding.block_span.start <= site.start && site.end <= binding.block_span.end
 }
 
+fn deferred_local_reborrow_differs_in_scope(
+    pending: &super::control::PendingNamedReborrow,
+    point: &ReferenceFlowPoint,
+    points: &[ReferenceFlowPoint],
+) -> bool {
+    matches!(&pending.root, super::control::DeferredReborrowRoot::Local { borrow, .. }
+        if point.scope != points[borrow.0].scope)
+}
+
 fn is_pending_shared_reborrow(point: &ReferenceFlowPoint) -> bool {
     match &point.kind {
         CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { mutability, .. }) =>
@@ -4841,7 +4845,9 @@ fn transfer_reference_facts(
     let mut pending_allowed = pending.is_some_and(|pending| {
         let has_shared = pending.sites.iter().any(|site|
             is_pending_shared_reborrow(&original_points[site.point.0]));
-        if pending.sites.len() > 1 || has_shared {
+        if pending.sites.len() > 1 || has_shared || pending.sites.first().is_some_and(|site|
+            deferred_local_reborrow_differs_in_scope(pending, &original_points[site.point.0], original_points))
+        {
             for site in &pending.sites {
                 let Some(holder) = site.holder else { return false };
                 let point = &original_points[holder.0];
@@ -5128,9 +5134,8 @@ fn transfer_reference_facts(
                         local_definition.is_some()
                             && *borrow < pending.entry
                             && initializer.scope == original_points[pending.entry.0].scope
-                            && (site.parent.is_some()
-                                || initializer.scope == point.scope
-                                || (is_pending_shared_reborrow(&point) && contains_loan_site(&pending.handle, &point)))
+                            && (site.parent.is_some() || initializer.scope == point.scope
+                                || contains_loan_site(&pending.handle, &point))
                             && matches!(&initializer.kind, CfgPointKind::Borrow { place, loan }
                                 if place.binding == *owner && loan.parent.is_none())
                             && initializer.possible_origins.as_ref()
@@ -10293,13 +10298,15 @@ fn build_function_reference_cfg(
                                     && deferred_local_owner_store(pending, point, &builder.cfg.initial_points))
                     )).cloned());
                 }
-                if pending.sites.len() > 1 || is_pending_shared_reborrow(&builder.cfg.initial_points[pending.sites[0].point.0]) {
+                let differs_in_scope = |point| deferred_local_reborrow_differs_in_scope(pending, point, &builder.cfg.initial_points);
+                let first = &builder.cfg.initial_points[pending.sites[0].point.0];
+                if pending.sites.len() > 1 || is_pending_shared_reborrow(first) || differs_in_scope(first) {
                     errors.extend(provisional.iter().filter(|error| matches!(error,
                         ReferenceAnalysisError::ConflictingPlace { source_span, origins } if pending.sites.iter().any(|site| {
                             let solved = &builder.cfg.points[site.point.0];
                             let CfgPointKind::Borrow { loan, .. } = &solved.kind else { return false };
                             solved.source_span == *source_span
-                                || ((site.parent.is_some() || loan.mode == ScalarReferenceMutability::Shared)
+                                || ((site.parent.is_some() || loan.mode == ScalarReferenceMutability::Shared || differs_in_scope(solved))
                                         && origins.contains(&solved.source_span)
                                             && builder.proof_points.checked_pointee_reads.iter()
                                                 .chain(&builder.proof_points.deferred_child_scalar_stores)

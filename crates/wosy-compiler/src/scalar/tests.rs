@@ -12112,3 +12112,100 @@ u8(bool) inspect = fn(choose) {{
         }
     }
 }
+
+#[test]
+fn deferred_mutable_reborrow_inside_a_contained_arm_checks_ancestors_and_siblings() {
+    for (access, requested) in [
+        ("*leaf = 8;", None),
+        ("u8 early = *parent; early; *leaf = 8;", Some("*parent;")),
+        ("*parent = 8; *leaf = 9;", Some("parent = 8")),
+        ("*u8 rival = &(*parent); *leaf = 8; u8 seen = *rival; seen;", Some("&(*parent)")),
+    ] {
+        let text = format!(r#"%%start
+u8(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ bool marker = true; marker; }};
+    if (choose) {{
+        *!u8 leaf = &!(*parent);
+        {access}
+    }} else {{
+        *parent = 9;
+    }};
+    *parent
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let root = text.find("&!owner").unwrap() as u32;
+        let leaf = text.find("&!(*parent)").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if let Some(requested) = requested {
+                let requested = text.find(requested).unwrap() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == requested)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == leaf)
+                }), "{access}: {diagnostics:?}");
+                assert!(cfg.initial_points.iter().all(|point| !matches!(point.kind, CfgPointKind::Borrow { .. })
+                    || ![leaf, requested].contains(&point.source_span.range.start)));
+            } else {
+                assert!(diagnostics.is_empty(), "{access}: {diagnostics:?}");
+                let find = |start| cfg.points.iter().find(|point| point.source_span.range.start == start
+                    && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("sealed loan");
+                let (root, child) = (find(root), find(leaf));
+                assert_ne!(root.scope, child.scope);
+                assert_eq!(&cfg.initial_points[child.id.0], child);
+                let ReferenceOrigin::Fresh { loan: root_loan, allocation } = sole_fact(function, root) else {
+                    panic!("expected exact local borrow")
+                };
+                let ReferenceOrigin::Fresh { loan, allocation: child_allocation } = sole_fact(function, child) else {
+                    panic!("expected exact scoped loan")
+                };
+                assert_eq!(child_allocation, allocation);
+                assert_eq!(loan.parent.as_deref(), Some(root_loan));
+                assert_eq!(loan.mode, ScalarReferenceMutability::Mutable);
+                let write = text.find("leaf = 8").unwrap() as u32;
+                let writer = cfg.points.iter().find(|point| point.source_span.range.start == write
+                    && matches!(point.kind, CfgPointKind::AssignThrough { .. })).expect("actual scoped scalar store");
+                assert!(matches!(&writer.kind, CfgPointKind::AssignThrough { candidates, .. }
+                    if matches!(candidates.as_slice(), [candidate] if &candidate.loan == loan)));
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_mutable_reborrow_inside_a_contained_arm_rejects_noncanonical_holder_use() {
+    for body in [
+        "&!(*parent);",
+        "*!u8 leaf = &!(*parent); *!u8 forwarded = leaf; u8 seen = *forwarded; seen;",
+        "*!u8 leaf = &!(*parent); owner = 8; *leaf = 9;",
+    ] {
+        let text = format!(r#"%%start
+u8(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ bool marker = true; marker; }};
+    if (choose) {{ {body} }};
+    *parent
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let leaf = text.find("&!(*parent)").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.message == "missing required dereference origin"), "{body}: {diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            assert!(function.reference_cfg.initial_points.iter().all(|point| point.source_span.range.start != leaf
+                || !matches!(point.kind, CfgPointKind::Borrow { .. })));
+        }
+    }
+}
