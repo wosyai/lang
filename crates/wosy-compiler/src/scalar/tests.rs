@@ -12354,3 +12354,71 @@ unit(bool) inspect = fn(choose) {
         assert_ne!(borrowed, written);
     }
 }
+
+#[test]
+fn known_direct_copy_reads_respect_the_live_mode_and_extent_of_a_field_loan() {
+    for (prefix, body, conflict) in [
+        ("!", "u8 disjoint = owner.right; u8 seen = *leaf; disjoint; seen;", None),
+        ("", "Pair snapshot = owner; u8 seen = *leaf; snapshot.right; seen;", None),
+        ("!", "u8 seen = *leaf; Pair snapshot = owner; snapshot.right; seen;", None),
+        ("!", "Pair snapshot = owner; u8 seen = *leaf; snapshot.right; seen;", Some("owner; u8 seen")),
+        ("!", "u8 overlap = owner.left; u8 seen = *leaf; overlap; seen;", Some("owner.left; u8 seen")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *{prefix}u8 leaf = &{prefix}owner.left;
+    {body}
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let loan = text.find(&format!("&{prefix}owner.left")).unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let borrow = cfg.initial_points.iter().find(|point| point.source_span.range.start == loan
+                && matches!(&point.kind, CfgPointKind::Borrow { loan, .. } if loan.parent.is_none()
+                    && matches!(loan.origin_place.projections.as_slice(),
+                        [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] if field.index == 0)
+                    && loan.mode == if prefix.is_empty() { ScalarReferenceMutability::Shared } else { ScalarReferenceMutability::Mutable }))
+                .unwrap_or_else(|| panic!("known direct field loan: {diagnostics:?}"));
+            if let Some(conflict) = conflict {
+                let read = text.find(conflict).unwrap() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == read)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range)
+                }), "{prefix}; {body}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{prefix}; {body}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn known_direct_consuming_reads_do_not_repeat_the_existing_move_conflict() {
+    let text = r#"%%start
+struct Pair { u8 left; u8 right; }
+unit(Pair) inspect = fn(owner) {
+    *!u8 leaf = &!owner.left;
+    Pair moved = owner;
+    u8 seen = *leaf;
+    moved.right; seen;
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    let source = text.find("owner;").unwrap() as u32;
+    let loan = text.find("&!owner.left").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let conflicts = diagnostics.iter().filter(|diagnostic| {
+            diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == source)
+                && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == loan)
+        }).count();
+        assert_eq!(conflicts, 1, "{diagnostics:?}");
+    }
+}

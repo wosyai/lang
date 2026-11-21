@@ -4196,6 +4196,7 @@ fn loan_has_ancestor(loan: &ReferenceLoanId, ancestor: &ReferenceLoanId) -> bool
 
 enum LoanAccess<'a> {
     Direct,
+    DirectRead,
     Through(ReferenceOriginId),
     WriteThrough(&'a InvalidationCandidate),
     ReadThrough(&'a ReferenceLoanId),
@@ -4216,7 +4217,7 @@ fn conflicting_live_loan(
         let mut reachable = false;
         for origin in origins {
             if match access {
-                LoanAccess::Direct | LoanAccess::ReadThrough(_) | LoanAccess::Borrow(_) => false,
+                LoanAccess::Direct | LoanAccess::DirectRead | LoanAccess::ReadThrough(_) | LoanAccess::Borrow(_) => false,
                 LoanAccess::Through(selected) => *origin == selected,
                 LoanAccess::WriteThrough(selected) => *origin == selected.origin,
             } {
@@ -4241,6 +4242,8 @@ fn conflicting_live_loan(
                         && reference_places_overlap(&available_place(&loan.origin_place), &place)
                         && !loan_has_ancestor(new, loan)
                 }
+                LoanAccess::DirectRead => loan.mode == ScalarReferenceMutability::Mutable
+                    && loan_borrows_place(loan, &place),
                 LoanAccess::Direct | LoanAccess::Through(_) => loan_borrows_place(loan, &place),
             };
             if !conflicts_with_access {
@@ -4838,7 +4841,7 @@ fn transfer_reference_facts(
         .collect::<BTreeSet<_>>();
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
     let mut strictly_forward = true;
-    let mut known_field_owners = None::<HashSet<&ReferenceBindingId>>;
+    let mut known_field_owners = None::<HashMap<&ReferenceBindingId, Option<ReferencePlaceId>>>;
     let mut aggregate_expiry_allowed = aggregate.is_some();
     let pending = cfg.pending_named_reborrow;
     let mut local_definition = None;
@@ -4912,10 +4915,27 @@ fn transfer_reference_facts(
         aggregate_expiry_allowed = aggregate_expiry_allowed && strictly_forward
             && !matches!(&point.kind, CfgPointKind::MoveThrough { place, .. }
                 if !matches!(place, ScalarPlace::Dereference { .. }));
-        if let CfgPointKind::Borrow { place, loan } = &point.kind {
-            if loan.parent.is_none() && !place.projections.is_empty() && is_lexical_field_path(&place.projections) {
-                known_field_owners.get_or_insert_with(HashSet::new).insert(&place.binding);
+        match &point.kind {
+            CfgPointKind::Borrow { place, loan } if loan.parent.is_none()
+                && !place.projections.is_empty() && is_lexical_field_path(&place.projections) =>
+            {
+                let owner = known_field_owners.get_or_insert_with(HashMap::new).entry(&place.binding).or_insert(None);
+                let root = reference_root(&place.place);
+                if owner.is_none() && loan.mode == ScalarReferenceMutability::Mutable
+                    && matches!(root, ScalarPlace::Name { .. })
+                {
+                    *owner = Some(ReferencePlaceId {
+                        source: place.source.clone(),
+                        function_span: place.function_span,
+                        declaration_span: place.declaration_span,
+                        block_span: place.block_span,
+                        binding: place.binding.clone(),
+                        projections: Vec::new(),
+                        place: root.clone(),
+                    });
+                }
             }
+            _ => {}
         }
         if let Some(pending) = pending.filter(|_| pending_allowed) {
             if let super::control::DeferredReborrowRoot::Local { owner, borrow } = &pending.root {
@@ -5738,6 +5758,39 @@ fn transfer_reference_facts(
                 }
                 _ => (&[][..], None),
             };
+            if let Some(owners) = &known_field_owners {
+                let (whole, projected) = match &point.kind {
+                    CfgPointKind::Read { binding } => (owners.get(binding).and_then(Option::as_ref), &[][..]),
+                    CfgPointKind::ReadPlace { candidates, pointer_point: None, .. } => (None, candidates.as_slice()),
+                    _ => (None, &[][..]),
+                };
+                for place in whole.into_iter().chain(projected) {
+                    if !owners.get(&place.binding).is_some_and(Option::is_some)
+                        || !is_lexical_field_path(&place.projections)
+                        || !matches!(reference_root(&place.place), ScalarPlace::Name { .. })
+                        || original_points[id.0].successors.as_slice().first()
+                            .filter(|_| original_points[id.0].successors.len() == 1)
+                            .is_some_and(|successor| {
+                                let next = &original_points[successor.0];
+                                let moved = match &next.kind {
+                                    CfgPointKind::Move { place, ty: ScalarType::Struct(_) | ScalarType::Array { .. }
+                                        | ScalarType::RuntimeArray { .. }, .. } => place,
+                                    CfgPointKind::DeferredMove { place, .. }
+                                        if deferred_policies.get(&successor.0) == Some(&CopyPolicy::Move) => place,
+                                    _ => return false,
+                                };
+                                point.scope == next.scope && point.source_span == next.source_span
+                                    && reference_places_same(moved, place)
+                            })
+                    {
+                        continue;
+                    }
+                    let origins = conflicting_live_loan(original_points, &cfg.facts, &state, id, place, LoanAccess::DirectRead);
+                    if !origins.is_empty() {
+                        errors.push(ReferenceAnalysisError::ConflictingPlace { source_span: point.source_span.clone(), origins });
+                    }
+                }
+            }
             for place in read_places {
                 if let Some(storage) = handle_storage {
                     let normalized;
@@ -5862,7 +5915,7 @@ fn transfer_reference_facts(
                     let target = available_place(target);
                     if !target.projections.is_empty()
                         || (matches!(target.place, ScalarPlace::Name { .. }) && known_field_owners.as_ref()
-                            .is_some_and(|owners| owners.contains(&target.binding)))
+                            .is_some_and(|owners| owners.contains_key(&target.binding)))
                         || (pending_allowed
                             && pending.is_some_and(|pending| deferred_local_owner_store(pending, point, original_points)))
                     {
