@@ -4132,11 +4132,8 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
         } else {
             None
         };
-        let value = emit(
-            state,
-            expression,
-            expected(position),
-        )?;
+        let expected_type = expected(position);
+        let value = emit(state, expression, expected_type)?;
         let joined_source = if let ScalarExpression::Name { name, .. } = expression {
             if let Some((owner_slot, _)) = state.joined_return_bindings.get(name) {
                 let storage = state
@@ -4160,11 +4157,10 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
         } else {
             None
         };
-        let call_flags = state.call_owner_flags.clone();
         let output_types = match &value {
             EmitValue::Aggregate { outputs, .. } => outputs.clone(),
             EmitValue::Unit => vec![ScalarType::Unit],
-            EmitValue::Basic(value) => vec![expected(position)
+            EmitValue::Basic(value) => vec![expected_type
                 .cloned()
                 .unwrap_or_else(|| basic_value_type(*value))],
         };
@@ -4203,7 +4199,7 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
                 value,
                 ty,
                 provenance: provenance.clone(),
-                call_flag: call_flags.get(&output_position).copied(),
+                call_flag: state.call_owner_flags.get(&output_position).copied(),
                 joined_source,
                 runtime_array_source,
                 same_array_rebind: same_array_rebind && output_position == 0,
