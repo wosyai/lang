@@ -8875,3 +8875,126 @@ u8(bool) update = fn(choose) {
         }), "{:?}", denied.diagnostics());
     }
 }
+
+#[test]
+fn emits_deferred_mutable_arm_reborrow_without_extending_it_into_the_other_arm() {
+    use inkwell::basic_block::BasicBlock;
+    use inkwell::values::{BasicValue, BasicValueEnum, InstructionOpcode, InstructionValue};
+
+    let source = r#"%%start
+u8(bool) update = fn(choose) {
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) { bool marker = true; marker; };
+    if (choose) {
+        *!u8 leaf = &!(*parent);
+        *leaf = 8;
+    } else {
+        *parent = 9;
+    };
+    *parent
+};
+%%end"#;
+    let invalid = source.replace("*leaf = 8;", "*parent = 8; *leaf = 8;");
+    let borrow = invalid.find("&!(*parent)").unwrap() as u32;
+    let write = invalid.find("parent = 8").unwrap() as u32;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for partition in [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ] {
+            let ir = partition.expect("scoped mutable LLVM").to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+                ir.as_bytes(), "checked-scoped-mutable",
+            );
+            let module = context.create_module_from_ir(buffer).expect("parse scoped mutable LLVM");
+            module.verify().expect("verify scoped mutable LLVM");
+            let function = module.get_functions().find(|function| {
+                matches!(function.get_type().get_return_type(), Some(inkwell::types::BasicTypeEnum::IntType(ty))
+                    if ty.get_bit_width() == 8)
+            }).expect("ordinary scoped function");
+            let blocks = function.get_basic_blocks();
+            let instructions = blocks.iter().flat_map(|block| {
+                std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction())
+            }).collect::<Vec<_>>();
+            fn operand<'ctx>(instruction: InstructionValue<'ctx>, index: u32) -> Option<BasicValueEnum<'ctx>> {
+                instruction.get_operand(index).and_then(|operand| operand.value())
+            }
+            let checked_pointer = |pointer: BasicValueEnum<'_>| {
+                pointer.as_instruction_value().is_some_and(|destination| {
+                    destination.get_opcode() == InstructionOpcode::IntToPtr
+                        && operand(destination, 0).and_then(|address| address.as_instruction_value())
+                            .is_some_and(|load| load.get_opcode() == InstructionOpcode::Load)
+                })
+            };
+            let actual_store = |literal| {
+                let stage = instructions.iter().copied().find(|instruction| {
+                    instruction.get_opcode() == InstructionOpcode::Store
+                        && matches!(operand(*instruction, 0), Some(BasicValueEnum::IntValue(value))
+                            if value.get_type().get_bit_width() == 8 && value.get_zero_extended_constant() == Some(literal))
+                })?;
+                let slot = operand(stage, 1)?;
+                if checked_pointer(slot) {
+                    return Some(stage);
+                }
+                instructions.iter().copied().find(|instruction| {
+                    instruction.get_opcode() == InstructionOpcode::Store
+                        && operand(*instruction, 1).is_some_and(checked_pointer)
+                        && operand(*instruction, 0).and_then(|value| value.as_instruction_value())
+                            .is_some_and(|load| load.get_opcode() == InstructionOpcode::Load
+                                && operand(load, 0) == Some(slot))
+                })
+            };
+            let first = actual_store(8).and_then(|store| store.get_parent())
+                .expect("taken arm writes through scoped child");
+            let other = actual_store(9).and_then(|store| store.get_parent())
+                .expect("other arm writes through original parent");
+            let result = instructions.iter().copied().find(|instruction| {
+                instruction.get_opcode() == InstructionOpcode::Return
+            }).expect("post-join return");
+            let output = operand(result, 0).and_then(|value| value.as_instruction_value())
+                .expect("returned value is a load through resumed parent");
+            assert_eq!(output.get_opcode(), InstructionOpcode::Load);
+            assert!(operand(output, 0).is_some_and(checked_pointer));
+            let join = output.get_parent().expect("joined output block");
+            let reaches = |start: BasicBlock<'_>, end: BasicBlock<'_>| {
+                let mut pending = vec![start];
+                let mut seen = std::collections::HashSet::new();
+                while let Some(block) = pending.pop() {
+                    if block == end {
+                        return true;
+                    }
+                    if seen.insert(block) {
+                        if let Some(terminal) = block.get_terminator() {
+                            pending.extend(terminal.get_operands().filter_map(|operand| operand?.block()));
+                        }
+                    }
+                }
+                false
+            };
+            assert!(first != other && reaches(first, join) && reaches(other, join), "{ir}");
+            assert!(!reaches(first, other) && !reaches(other, first), "{ir}");
+            assert!(instructions.iter().any(|instruction| {
+                if instruction.get_opcode() != InstructionOpcode::Br || instruction.is_conditional() != Ok(true) {
+                    return false;
+                }
+                let targets = instruction.get_operands().filter_map(|operand| operand?.block()).collect::<Vec<_>>();
+                let [left, right] = targets.as_slice() else { return false };
+                let separates = |left, right| reaches(left, first) && !reaches(left, other)
+                    && reaches(right, other) && !reaches(right, first);
+                separates(*left, *right) || separates(*right, *left)
+            }), "one conditional must separate both stores before they rejoin: {ir}");
+        }
+        let prepared = prepare_initializer_test(&invalid, layout);
+        let denied = analyze_scalar_build(&prepared);
+        assert!(denied.diagnostics().iter().any(|diagnostic| {
+            diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == write)
+                && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == borrow)
+        }), "{:?}", denied.diagnostics());
+    }
+}
