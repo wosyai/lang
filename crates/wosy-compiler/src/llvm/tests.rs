@@ -5077,6 +5077,53 @@ fn emits_float_conversions_for_single_file_and_project() {
 }
 
 #[test]
+fn lowers_runtime_float_negation_as_ieee_fneg() {
+    let text = r#"%%start
+f32(f32) narrow = fn(value) { -value };
+f64(f64) wide = fn(value) { -(value + value) };
+f64(f64) flip_wide = fn(value) { -value };
+i32(i32) integer = fn(value) { ~(-value) };
+f32 positive32 = 0.0;
+f32 negative32 = -0.0;
+f64 positive64 = 0.0;
+f64 negative64 = -0.0;
+u32 sign32 = core.bitcast<u32>(narrow(positive32));
+u32 clear32 = core.bitcast<u32>(narrow(negative32));
+u64 sign64 = core.bitcast<u64>(flip_wide(positive64));
+u64 clear64 = core.bitcast<u64>(flip_wide(negative64));
+wide(positive64);
+integer(2);
+%%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let standalone = derive_scalar_program_with_layout(
+            &parse_source(source, text.into(), &[]).result,
+            layout,
+        );
+        assert!(standalone.diagnostics.is_empty(), "{:?}", standalone.diagnostics);
+        for partition in [
+            emit_scalar_llvm(&standalone),
+            emit_scalar_build_single_module_llvm(&checked),
+            emit_scalar_build_project_llvm(&checked),
+        ] {
+            let ir = partition.unwrap().to_text();
+            for expected in [
+                "fneg float", "fneg double", "fadd double",
+                "bitcast float", "bitcast double", "sub i32 0", "xor i32",
+                "store float 0.000000e+00", "store float -0.000000e+00",
+                "store double 0.000000e+00", "store double -0.000000e+00",
+            ] {
+                assert!(ir.contains(expected), "{layout:?}, missing {expected}: {ir}");
+            }
+            assert!(!ir.contains("fsub"), "{layout:?}: {ir}");
+        }
+    }
+}
+
+#[test]
 fn emits_float_conversions_of_width_inferred_arithmetic() {
     let source = SourceIdentity::new(
         "project".into(),

@@ -3450,7 +3450,9 @@ fn check_expression_type_in_module(
                     operand_type
                 }
                 UnaryOperator::Negate => {
-                    expect_module_integer(module, &operand_type, *span, diagnostics);
+                    if !is_float_type(&operand_type) {
+                        expect_module_integer(module, &operand_type, *span, diagnostics);
+                    }
                     operand_type
                 }
             }
@@ -4282,6 +4284,23 @@ fn check_expression_type_in_module_expected(
         span,
     } = expression
     {
+        if let Some(expected) = expected.filter(|ty| is_float_type(ty)) {
+            let actual = expression_type_in_module_expected(
+                operand,
+                Some(expected),
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            );
+            expect_module_type(module, expected, &actual, *span, diagnostics);
+            return actual;
+        }
         if let ScalarExpression::Integer { value, .. } = operand.as_ref() {
             if let Some(
                 expected @ (ScalarType::I8
@@ -7883,7 +7902,9 @@ fn check_expression_type(
                     operand_type
                 }
                 UnaryOperator::Negate => {
-                    expect_integer(program, &operand_type, *span, diagnostics);
+                    if !is_float_type(&operand_type) {
+                        expect_integer(program, &operand_type, *span, diagnostics);
+                    }
                     operand_type
                 }
             }
@@ -8762,7 +8783,9 @@ fn check_expression_type_expected(
                 operand_type
             }
             UnaryOperator::Negate => {
-                expect_integer(program, &operand_type, *span, diagnostics);
+                if !is_float_type(&operand_type) {
+                    expect_integer(program, &operand_type, *span, diagnostics);
+                }
                 expect_type(program, expected, &operand_type, *span, diagnostics);
                 operand_type
             }

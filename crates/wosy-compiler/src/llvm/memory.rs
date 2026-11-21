@@ -689,8 +689,7 @@ pub(super) fn emit_typed_expression<'ctx, 'module>(
             },
             ty,
         ) if integer_width(ty).is_some() || *ty == ScalarType::Bool => {
-            let value =
-                take_basic(emit_typed_expression(context, state, operand, ty)?)?.into_int_value();
+            let value = take_basic(emit_typed_expression(context, state, operand, ty)?)?;
             emit_unary_value(state, operator, value)
         }
         (ScalarExpression::Integer { value, .. }, ty) if integer_width(ty).is_some() => Ok(
