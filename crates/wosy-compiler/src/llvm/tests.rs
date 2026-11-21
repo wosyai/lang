@@ -8693,3 +8693,42 @@ u8(bool) literals = fn(b) { if (b) { 1 } else { 0 } };
         }
     }
 }
+
+#[test]
+fn emits_deferred_shared_arm_reborrow_and_post_join_store() {
+    let source = r#"%%start
+u8(bool) update = fn(choose) {
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) { u8 marker = 9; marker; };
+    if (choose) {
+        *u8 leaf = &(*parent);
+        u8 prior = *parent;
+        u8 seen = *leaf;
+        prior; seen;
+    };
+    *parent = 11;
+    *parent
+};
+%%end"#;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for partition in [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ] {
+            let ir = partition.expect("checked branch reborrow LLVM").to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+                ir.as_bytes(), "checked-branch-reborrow",
+            );
+            let module = context.create_module_from_ir(buffer).expect("parse checked branch LLVM");
+            module.verify().expect("verify checked branch LLVM");
+            assert!(ir.contains("br i1 "), "{ir}");
+            assert!(ir.contains("store i8 11"), "{ir}");
+            assert!(ir.contains("load i8, ptr "), "{ir}");
+        }
+    }
+}
