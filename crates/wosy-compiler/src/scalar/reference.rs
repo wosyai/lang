@@ -6764,15 +6764,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             return Some(CheckerPredicate::Boolean(*value));
         }
         if matches!(self.mode, WalkMode::ModuleInitialization { .. }) {
-            let ScalarExpression::Binary { operator, left, right, .. } = expression else {
-                return None;
-            };
-            let relation = super::symbolic_integer::IntegerRelation::from_operator(operator)?;
-            let left_type = self.occurrence_typing.checked_expression_type(left)?;
-            let right_type = self.occurrence_typing.checked_expression_type(right)?;
-            if left_type != right_type || !is_integer_type(left_type) {
-                return None;
-            }
+            let (relation, left, right) = self.checked_initializer_comparison(expression)?;
             let left = concrete_integer_literal(left)?;
             let right = concrete_integer_literal(right)?;
             return Some(CheckerPredicate::Boolean(relation.accepts(left.as_ref().cmp(right.as_ref()))));
@@ -6789,6 +6781,60 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         let left_type = self.occurrence_typing.checked_expression_type(comparison.left)?;
         let right_type = self.occurrence_typing.checked_expression_type(comparison.right)?;
         comparison.typed(left_type, right_type, binding).map(CheckerPredicate::Integer)
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    fn checked_initializer_comparison<'expr>(
+        &self,
+        expression: &'expr ScalarExpression,
+    ) -> Option<(super::symbolic_integer::IntegerRelation, &'expr ScalarExpression, &'expr ScalarExpression)> {
+        let ScalarExpression::Binary { operator, left, right, .. } = expression else {
+            return None;
+        };
+        let relation = super::symbolic_integer::IntegerRelation::from_operator(operator)?;
+        let left_type = self.occurrence_typing.checked_expression_type(left)?;
+        let right_type = self.occurrence_typing.checked_expression_type(right)?;
+        (left_type == right_type && is_integer_type(left_type)).then_some((relation, left, right))
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    fn initializer_predicate(
+        &self,
+        expression: &ScalarExpression,
+        names: &BTreeMap<String, WalkBinding>,
+    ) -> Option<super::checker_directive::InitializerPredicate> {
+        use super::{checker_directive::{InitializerIntegerOperand, InitializerPredicate}, checker_flow::concrete_integer_literal};
+        let WalkMode::ModuleInitialization { source, declarations } = &self.mode else {
+            return None;
+        };
+        if let ScalarExpression::Boolean { value, .. } = expression {
+            return Some(InitializerPredicate::Boolean(*value));
+        }
+        let storage = |expression: &ScalarExpression| {
+            let ScalarExpression::Name { name, .. } = expression else { return None; };
+            let InitializationStorage::Module(span) = initializer_storage(name, names, source, declarations)? else {
+                return None;
+            };
+            Some(span)
+        };
+        if let Some(span) = storage(expression) {
+            return (self.occurrence_typing.checked_expression_type(expression) == Some(&ScalarType::Bool))
+                .then_some(InitializerPredicate::BooleanStorage(span));
+        }
+        let (relation, left, right) = self.checked_initializer_comparison(expression)?;
+        let left_literal = concrete_integer_literal(left);
+        let right_literal = concrete_integer_literal(right);
+        if let (Some(left), Some(right)) = (&left_literal, &right_literal) {
+            return Some(InitializerPredicate::Boolean(relation.accepts(left.as_ref().cmp(right.as_ref()))));
+        }
+        let operand = |expression: &ScalarExpression, literal: Option<std::borrow::Cow<'_, BigInt>>| {
+            if let Some(value) = literal {
+                return Some(InitializerIntegerOperand::Literal(value.into_owned()));
+            }
+            storage(expression).map(InitializerIntegerOperand::Storage)
+        };
+        let operands = Box::new([operand(left, left_literal)?, operand(right, right_literal)?]);
+        Some(InitializerPredicate::IntegerComparison { relation, operands })
     }
 
     fn expression_at_with_initializer_statement(
@@ -6828,17 +6874,10 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 unreachable!("typed directive is a canonical call");
             };
             let condition = &arguments[0];
-            let predicate = self.checker_predicate(condition, names);
-            let initializer_bool_storage = match (condition, &self.mode) {
-                (ScalarExpression::Name { name, .. }, WalkMode::ModuleInitialization { source, declarations })
-                    if self.occurrence_typing.checked_expression_type(condition) == Some(&ScalarType::Bool) =>
-                {
-                    match initializer_storage(name, names, source, declarations) {
-                        Some(InitializationStorage::Module(span)) => Some(span),
-                        _ => None,
-                    }
-                }
-                _ => None,
+            let (predicate, initializer_predicate) = if matches!(self.mode, WalkMode::ModuleInitialization { .. }) {
+                (None, self.initializer_predicate(condition, names))
+            } else {
+                (self.checker_predicate(condition, names), None)
             };
             self.structure.checker_directives.insert(
                 ordinal,
@@ -6846,7 +6885,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     operation: marker.operation,
                     condition: expression_span(condition),
                     predicate,
-                    initializer_bool_storage,
+                    initializer_predicate,
                     call_signature: self.occurrence_typing.take_call(condition),
                     output: marker.output,
                 },

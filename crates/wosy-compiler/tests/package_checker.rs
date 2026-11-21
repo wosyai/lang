@@ -375,3 +375,26 @@ fn main_initializer_does_not_assume_unknown_branch_state_or_skip_reached_mutatio
         ScalarCheckerOutcome::Unsupported,
     );
 }
+
+#[test]
+fn main_initializer_compares_canonical_installed_integer_literals() {
+    let text = format!(
+        "i8 low = -128; i8 high = 127; core.require(low < high, {OUTPUT}); core.narrow(low == -128, {OUTPUT}); core.require(high >= 127, {OUTPUT});",
+    );
+    assert_eq!(check_scoped(&text, ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::Passed);
+    let text = format!("u8 current = 255; core.require(current < 255, {OUTPUT});");
+    let ScalarCheckerOutcome::Failed(failure) = check(&text) else {
+        panic!("expected failure from the canonically installed u8");
+    };
+    let canonical = format!("%%start\n{text}\n%%end");
+    assert_eq!(&canonical[failure.condition.start as usize..failure.condition.end as usize], "current < 255");
+    assert_eq!(failure.operation, ScalarCheckerOperation::Require);
+    assert_eq!(
+        check(&format!("i8 value = -1; value = 1; core.require(value < 0, {OUTPUT});")),
+        ScalarCheckerOutcome::Unsupported,
+    );
+    assert!(matches!(
+        check(&format!("u8 value = 256; core.require(value > 0, {OUTPUT});")),
+        ScalarCheckerOutcome::Invalid(_),
+    ));
+}

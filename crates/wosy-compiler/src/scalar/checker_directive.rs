@@ -3,7 +3,7 @@ use std::collections::{hash_map::Entry, HashMap};
 use num_bigint::BigInt;
 
 use super::{
-    checker_flow::CheckerPredicate, control::CheckedCallSignature, typecheck::expression_span,
+    checker_flow::CheckerPredicate, control::CheckedCallSignature, symbolic_integer::IntegerRelation, typecheck::expression_span,
     ByteSpan, ScalarExpression,
 };
 
@@ -27,9 +27,25 @@ pub(super) struct PreparedCheckerDirective {
     pub(super) operation: CheckerOperation,
     pub(super) condition: ByteSpan,
     pub(super) predicate: Option<CheckerPredicate>,
-    pub(super) initializer_bool_storage: Option<ByteSpan>,
+    pub(super) initializer_predicate: Option<InitializerPredicate>,
     pub(super) call_signature: Option<CheckedCallSignature>,
     pub(super) output: CheckedLiteralOutput,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum InitializerPredicate {
+    Boolean(bool),
+    BooleanStorage(ByteSpan),
+    IntegerComparison {
+        relation: IntegerRelation,
+        operands: Box<[InitializerIntegerOperand; 2]>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum InitializerIntegerOperand {
+    Storage(ByteSpan),
+    Literal(BigInt),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

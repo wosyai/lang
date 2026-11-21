@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::{borrow::Cow, collections::{HashMap, HashSet}};
 
 use num_bigint::BigInt;
 
 use super::{
-    checker_directive::{CheckedLiteralOutput, CheckerOperation, PreparedCheckerDirective},
+    checker_directive::{CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
-        check_integer_requirement_activity, check_integer_requirements_at_entry, exact_integer_call_argument,
+        check_integer_requirement_activity, check_integer_requirements_at_entry, concrete_integer_literal, exact_integer_call_argument,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument,
         IntegerCheckFailure, IntegerInputs,
     },
@@ -346,7 +346,7 @@ fn walk_package_initialization(
     };
     let structure = &topology.structure;
     let mut checked_items = structure.blocks[structure.root.0].items.iter();
-    let mut bool_storage = HashMap::new();
+    let mut storage = HashMap::new();
     for step in &region.steps {
         if let ModuleInitializationStepKind::NamespaceDispatch { target, .. } = &step.kind {
             let NamespaceTarget::Bound(target) = target else {
@@ -361,23 +361,30 @@ fn walk_package_initialization(
             Some(ScalarItem::Binding(binding)), BlockItemKind::Binding(checked)) =
             (&step.kind, module.items.get(step.item), &checked_item.kind)
         {
-            let ([receiver], BindingInitialization::Outputs(outputs), ScalarExpression::Boolean { value, .. }) =
-                (checked.receivers(), &checked.initialization, &binding.value) else {
+            let ([receiver], BindingInitialization::Outputs(outputs)) =
+                (checked.receivers(), &checked.initialization) else {
                     return Err(ProjectCheck::Unsupported);
                 };
-            if !outputs.secondary.is_empty() || receiver.ty != ScalarType::Bool
-                || structure.checked_types.expressions.get(&outputs.primary) != Some(&ScalarType::Bool)
+            if !outputs.secondary.is_empty()
+                || structure.checked_types.expressions.get(&outputs.primary) != Some(&receiver.ty)
             {
                 return Err(ProjectCheck::Unsupported);
             }
-            bool_storage.insert(receiver.span, *value);
+            let value = match (&receiver.ty, &binding.value) {
+                (ScalarType::Bool, ScalarExpression::Boolean { value, .. }) => InitializerValue::Boolean(*value),
+                (ty, expression) if is_integer_type(ty) => InitializerValue::Integer(
+                    concrete_integer_literal(expression).ok_or(ProjectCheck::Unsupported)?,
+                ),
+                _ => return Err(ProjectCheck::Unsupported),
+            };
+            storage.insert(receiver.span, value);
             continue;
         }
         let (ModuleInitializationStepKind::ExecutableItem, BlockItemKind::Evaluation { expression }) =
             (&step.kind, &checked_item.kind) else {
                 return Err(ProjectCheck::Unsupported);
             };
-        check_initializer_expression(topology, actual, source, &bool_storage, *expression, 0)?;
+        check_initializer_expression(topology, actual, source, &storage, *expression, 0)?;
     }
     visits[ordinal] = InitializationVisit::Completed;
     Ok(())
@@ -387,17 +394,14 @@ fn check_initializer_expression(
     topology: &ModuleInitializationTopology,
     actual: &mut ActualCalls<'_>,
     source: &SourceIdentity,
-    bool_storage: &HashMap<ByteSpan, bool>,
+    storage: &HashMap<ByteSpan, InitializerValue<'_>>,
     expression: OccurrenceOrdinal,
     depth: usize,
 ) -> Result<(), ProjectCheck> {
     let structure = &topology.structure;
     if let Some(directive) = structure.checker_directives.get(&expression) {
-        let value = match (&directive.predicate, directive.initializer_bool_storage) {
-            (Some(CheckerPredicate::Boolean(value)), None) => *value,
-            (None, Some(storage)) => *bool_storage.get(&storage).ok_or(ProjectCheck::Unsupported)?,
-            _ => return Err(ProjectCheck::Unsupported),
-        };
+        let predicate = directive.initializer_predicate.as_ref().ok_or(ProjectCheck::Unsupported)?;
+        let value = evaluate_initializer_predicate(predicate, storage).ok_or(ProjectCheck::Unsupported)?;
         actual.had_obligations = true;
         if directive.operation.rejects(value, !value) {
             let span = topology.occurrences.get(expression.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
@@ -413,7 +417,10 @@ fn check_initializer_expression(
                     topology.identities.names.get(condition) else {
                         return Err(ProjectCheck::Unsupported);
                     };
-                *bool_storage.get(span).ok_or(ProjectCheck::Unsupported)?
+                let Some(InitializerValue::Boolean(value)) = storage.get(span) else {
+                    return Err(ProjectCheck::Unsupported);
+                };
+                *value
             }
             _ => return Err(ProjectCheck::Unsupported),
         };
@@ -426,7 +433,7 @@ fn check_initializer_expression(
                 let BlockItemKind::Evaluation { expression } = item.kind else {
                     return Err(ProjectCheck::Unsupported);
                 };
-                check_initializer_expression(topology, actual, source, bool_storage, expression, depth + 1)?;
+                check_initializer_expression(topology, actual, source, storage, expression, depth + 1)?;
             }
         }
         return Ok(());
@@ -441,6 +448,40 @@ fn check_initializer_expression(
     let argument = exact_integer_call_argument(structure, expression, |_, _| None);
     actual.run(structure, expression, signature, argument, &declaration.source, declaration.range, &ScalarType::Unit)?;
     Ok(())
+}
+
+enum InitializerValue<'a> {
+    Boolean(bool),
+    Integer(Cow<'a, BigInt>),
+}
+
+fn evaluate_initializer_predicate(
+    predicate: &InitializerPredicate,
+    storage: &HashMap<ByteSpan, InitializerValue<'_>>,
+) -> Option<bool> {
+    match predicate {
+        InitializerPredicate::Boolean(value) => Some(*value),
+        InitializerPredicate::BooleanStorage(span) => match storage.get(span)? {
+            InitializerValue::Boolean(value) => Some(*value),
+            InitializerValue::Integer(_) => None,
+        },
+        InitializerPredicate::IntegerComparison { relation, operands } => {
+            fn integer<'a>(
+                operand: &'a InitializerIntegerOperand,
+                storage: &'a HashMap<ByteSpan, InitializerValue<'_>>,
+            ) -> Option<&'a BigInt> {
+                match operand {
+                    InitializerIntegerOperand::Literal(value) => Some(value),
+                    InitializerIntegerOperand::Storage(span) => match storage.get(span)? {
+                        InitializerValue::Integer(value) => Some(value.as_ref()),
+                        InitializerValue::Boolean(_) => None,
+                    },
+                }
+            }
+            let [left, right] = operands.as_ref();
+            Some(relation.accepts(integer(left, storage)?.cmp(integer(right, storage)?)))
+        }
+    }
 }
 
 const MAX_INITIALIZER_BRANCH_DEPTH: usize = 64;

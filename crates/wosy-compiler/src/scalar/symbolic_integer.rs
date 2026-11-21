@@ -13,7 +13,7 @@ struct Interval {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct IntegerSet(Vec<Interval>);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct IntegerRelation {
     less: bool,
     equal: bool,
