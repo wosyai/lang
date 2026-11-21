@@ -11489,3 +11489,71 @@ unit(bool) inspect = fn(choose) {{
         }
     }
 }
+
+#[test]
+fn deferred_nested_sibling_reborrows_require_last_use_before_the_next_loan() {
+    for (body, overlaps) in [
+        ("*left = 8; *!u8 right = &!(*child); *right = 9;", false),
+        ("*!u8 right = &!(*child); *left = 8; *right = 9;", true),
+    ] {
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 inside = 9; inside; }};
+    *!u8 child = &!(*parent);
+    *!u8 left = &!(*child);
+    {body}
+    u8 intermediate = *child;
+    u8 resumed = *parent;
+    intermediate; resumed;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let direct = text.find("&!(*parent)").unwrap() as u32;
+        let sites = text.match_indices("&!(*child)").map(|(start, spelling)|
+            ByteSpan::new(start as u32, (start + spelling.len()) as u32)
+        ).collect::<Vec<_>>();
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if overlaps {
+                let [diagnostic] = diagnostics.as_slice() else {
+                    panic!("expected exact live nested sibling conflict: {diagnostics:?}")
+                };
+                assert_eq!(diagnostic.code, "B0003");
+                assert_eq!(diagnostic.message, "read or move of unavailable place");
+                let [requested, existing] = diagnostic.labels.as_slice() else {
+                    panic!("expected current and peer")
+                };
+                assert_eq!(requested.span.range, sites[1]);
+                assert_eq!(existing.span.range, sites[0]);
+                assert!(cfg.initial_points.iter().all(|point| !matches!(point.kind, CfgPointKind::Borrow { .. })
+                    || (point.source_span.range.start != direct && !sites.contains(&point.source_span.range))));
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let child = cfg.points.iter().find(|point| point.source_span.range.start == direct
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("exact direct child");
+            let ReferenceOrigin::Fresh { loan: child_loan, allocation } = sole_fact(function, child) else {
+                panic!("expected local allocation")
+            };
+            let nested = sites.iter().map(|site| cfg.points.iter().find(|point| point.source_span.range == *site
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("exact nested child")).collect::<Vec<_>>();
+            assert_ne!(nested[0].possible_origins, nested[1].possible_origins);
+            for point in nested {
+                assert_eq!(&cfg.initial_points[point.id.0], point);
+                let ReferenceOrigin::Fresh { loan, allocation: nested_allocation } = sole_fact(function, point) else {
+                    panic!("expected rooted allocation")
+                };
+                assert_eq!(nested_allocation, allocation);
+                assert_eq!(loan.parent.as_deref(), Some(child_loan));
+                assert!(matches!(loan.origin_place.projections.as_slice(),
+                    [ReferencePlaceProjection::Dereference(parent)] if **parent == *child_loan));
+            }
+        }
+    }
+}

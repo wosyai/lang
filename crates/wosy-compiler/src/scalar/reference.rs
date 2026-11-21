@@ -1976,9 +1976,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                         && (matches!(root, super::control::DeferredReborrowRoot::Formal { .. })
                                             || self.cfg.points[entry.0].scope == scope)
                                 });
-                                let nested = pending.filter(|pending| pending.handle != binding
-                                    && pending.sites.iter().all(|site| site.parent.is_none()))
-                                    .and_then(|pending| pending.sites.iter().find_map(|site| {
+                                let nested = pending.filter(|pending| pending.handle != binding)
+                                    .and_then(|pending| pending.sites.iter().filter(|site| site.parent.is_none())
+                                    .find_map(|site| {
                                         let holder = site.holder?;
                                         let point = &self.cfg.points[holder.0];
                                         (holder < read && point.scope == scope
