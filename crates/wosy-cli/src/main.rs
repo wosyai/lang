@@ -491,7 +491,7 @@ fn persist_cst(root: &std::path::Path, output: &wosy_compiler::ParseOutput) -> R
     let path = root
         .join(".wosy/cst")
         .join(format!("{}.json", output.result.source.revision));
-    let bytes = serde_json::to_vec_pretty(&output.result.canonical_cst().snapshot())
+    let bytes = serde_json::to_vec_pretty(&output.result.canonical_cst().snapshot_json_serializable())
         .map_err(|error| error.to_string())?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -990,12 +990,13 @@ mod tests {
         );
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
         let path = snapshot_test_path("deep");
-        fs::write(
-            &path,
-            serde_json::to_vec(&output.result.canonical_cst().snapshot())
-                .expect("serialize canonical CST snapshot"),
-        )
-        .expect("write archived snapshot");
+        let tree = output.result.canonical_cst();
+        let borrowed = serde_json::to_vec_pretty(&tree.snapshot_json_serializable())
+            .expect("serialize borrowed CST snapshot");
+        let owned = serde_json::to_vec_pretty(&tree.snapshot())
+            .expect("serialize owned CST snapshot");
+        assert!(borrowed == owned, "borrowed CST snapshot changed bytes");
+        fs::write(&path, borrowed).expect("write archived snapshot");
 
         let canonical = load_canonical_cst(&path).expect("load deep canonical CST snapshot");
         let scalar = wosy_compiler::derive_scalar_program_from_cst(&canonical);

@@ -1,7 +1,8 @@
 use pest::iterators::Pair;
 use pest::Parser;
 use rowan::{GreenNodeBuilder, Language, SyntaxNode, SyntaxToken};
-use serde::{Deserialize, Serialize};
+use serde::ser::{SerializeSeq, SerializeStruct};
+use serde::{Deserialize, Serialize, Serializer};
 
 #[derive(pest_derive::Parser)]
 #[grammar = "grammar.pest"]
@@ -210,6 +211,10 @@ impl CanonicalCstRoot {
         }
     }
 
+    pub fn snapshot_json_serializable(&self) -> impl Serialize + '_ {
+        SerializableCstSnapshot(self)
+    }
+
     pub fn from_snapshot(snapshot: CanonicalCstSnapshot) -> Self {
         let mut builder = GreenNodeBuilder::new();
         build_snapshot_node(&mut builder, &snapshot.root);
@@ -234,6 +239,76 @@ pub struct CanonicalCstSnapshotNode {
 pub enum CanonicalCstSnapshotElement {
     Node(CanonicalCstSnapshotNode),
     Token { kind: SyntaxKind, text: String },
+}
+
+struct SerializableCstSnapshot<'a>(&'a CanonicalCstRoot);
+
+impl Serialize for SerializableCstSnapshot<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let text = self.0.root.text().to_string();
+        let root = SerializableCstNode {
+            node: &self.0.root,
+            text: &text,
+            offset: self.0.root.text_range().start().into(),
+        };
+        let mut snapshot = serializer.serialize_struct("CanonicalCstSnapshot", 2)?;
+        snapshot.serialize_field("source", &self.0.source)?;
+        snapshot.serialize_field("root", &root)?;
+        snapshot.end()
+    }
+}
+
+struct SerializableCstNode<'a> {
+    node: &'a CstNode,
+    text: &'a str,
+    offset: usize,
+}
+
+impl Serialize for SerializableCstNode<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let range = self.node.text_range();
+        let start = usize::from(range.start()) - self.offset;
+        let end = usize::from(range.end()) - self.offset;
+        let mut node = serializer.serialize_struct("CanonicalCstSnapshotNode", 3)?;
+        node.serialize_field("kind", &self.node.kind())?;
+        node.serialize_field("text", &self.text[start..end])?;
+        node.serialize_field("children", &SerializableCstChildren(self))?;
+        node.end()
+    }
+}
+
+struct SerializableCstChildren<'a>(&'a SerializableCstNode<'a>);
+
+impl Serialize for SerializableCstChildren<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(rename = "CanonicalCstSnapshotElement")]
+        enum Element<'a> {
+            Node(SerializableCstNode<'a>),
+            Token { kind: SyntaxKind, text: &'a str },
+        }
+
+        let parent = self.0;
+        let mut children = serializer.serialize_seq(None)?;
+        for element in parent.node.children_with_tokens() {
+            match element {
+                rowan::NodeOrToken::Node(child) => {
+                    children.serialize_element(&Element::Node(SerializableCstNode {
+                        node: &child,
+                        text: parent.text,
+                        offset: parent.offset,
+                    }))?;
+                }
+                rowan::NodeOrToken::Token(token) => {
+                    children.serialize_element(&Element::Token {
+                        kind: token.kind(),
+                        text: token.text(),
+                    })?;
+                }
+            }
+        }
+        children.end()
+    }
 }
 
 fn snapshot_node(node: &CstNode) -> CanonicalCstSnapshotNode {
@@ -728,6 +803,34 @@ mod tests {
     fn identity() -> SourceIdentity {
         SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "r1".into())
     }
+    #[test]
+    fn borrowed_snapshot_preserves_pretty_json_bytes() {
+        for (text, valid) in [
+            ("%%start\r\nstr label = \"Olá\\t日本語\";\r\n%%end", true),
+            ("%%start\nsomething ?????;\ni32 value = 4;\n%%end", false),
+        ] {
+            let result = parse(identity(), text.into(), &[]);
+            assert_eq!(result.is_valid(), valid, "{:?}", result.errors);
+            let root = result.canonical_cst();
+            let tail = root
+                .root
+                .descendants()
+                .find(|node| {
+                    let range = node.text_range();
+                    usize::from(range.start()) > 0 && !range.is_empty()
+                })
+                .expect("nonempty nested syntax after the root starts");
+            let subtree = CanonicalCstRoot::new(root.source.clone(), tail);
+
+            for tree in [&root, &subtree] {
+                assert_eq!(
+                    serde_json::to_vec_pretty(&tree.snapshot_json_serializable()).unwrap(),
+                    serde_json::to_vec_pretty(&tree.snapshot()).unwrap(),
+                );
+            }
+        }
+    }
+
     #[test]
     fn baseline_and_lossless() {
         let result = parse(identity(), BASE.into(), &["INTENT".into()]);
