@@ -180,6 +180,35 @@ impl ScalarProjectPreparationRejection {
     }
 }
 
+pub(super) fn prepare_project_occurrences(
+    (validation, occurrence_typing): (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>),
+) -> Result<(ScalarProject, reference::ProjectCallSiteResults), ScalarProjectPreparationRejection> {
+    if !validation.diagnostics.is_empty() {
+        return Err(ScalarProjectPreparationRejection::extraction_or_typing(
+            validation,
+        ));
+    }
+    let project = validation.project;
+    let calls = reference::resolve_project_call_sites_with_occurrences(
+        &project.modules,
+        occurrence_typing,
+    );
+    let diagnostics = calls
+        .lookup_errors()
+        .map(ReferenceAnalysisError::diagnostic)
+        .collect::<Vec<_>>();
+    if !diagnostics.is_empty() {
+        return Err(ScalarProjectPreparationRejection {
+            inspection: ScalarProjectValidation {
+                project,
+                diagnostics,
+            },
+            kind: ProjectPreparationRejectionKind::StaticLookup(calls),
+        });
+    }
+    Ok((project, calls))
+}
+
 impl PreparedScalarProject {
     #[cfg(test)]
     pub(super) fn function_calls(
@@ -191,30 +220,8 @@ impl PreparedScalarProject {
     }
 
     pub(crate) fn new(project: ScalarProject) -> Result<Self, ScalarProjectPreparationRejection> {
-        let (validation, occurrence_typing) = typecheck_scalar_project_with_occurrences(project);
-        if !validation.diagnostics.is_empty() {
-            return Err(ScalarProjectPreparationRejection::extraction_or_typing(
-                validation,
-            ));
-        }
-        let project = validation.project;
-        let calls = reference::resolve_project_call_sites_with_occurrences(
-            &project.modules,
-            occurrence_typing,
-        );
-        let diagnostics = calls
-            .lookup_errors()
-            .map(ReferenceAnalysisError::diagnostic)
-            .collect::<Vec<_>>();
-        if !diagnostics.is_empty() {
-            return Err(ScalarProjectPreparationRejection {
-                inspection: ScalarProjectValidation {
-                    project,
-                    diagnostics,
-                },
-                kind: ProjectPreparationRejectionKind::StaticLookup(calls),
-            });
-        }
+        let (project, calls) =
+            prepare_project_occurrences(typecheck_scalar_project_with_occurrences(project))?;
         Ok(Self { project, calls })
     }
 

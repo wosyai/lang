@@ -3018,6 +3018,18 @@ pub fn prepare_scalar_project(
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
 ) -> Result<PreparedScalarProject, ScalarProjectPreparationRejection> {
+    PreparedScalarProject::new(project_from_declarations(
+        declarations,
+        initialization_order,
+        inputs,
+    )?)
+}
+
+fn project_from_declarations(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+) -> Result<ScalarProject, ScalarProjectPreparationRejection> {
     let mut modules = Vec::with_capacity(declarations.len());
     let mut diagnostics = Vec::new();
     for (declarations, namespace_bindings) in declarations {
@@ -3045,7 +3057,7 @@ pub fn prepare_scalar_project(
             },
         ));
     }
-    PreparedScalarProject::new(project)
+    Ok(project)
 }
 
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
@@ -3677,6 +3689,8 @@ mod static_calls;
 mod checker_directive;
 #[cfg(test)]
 mod checker_flow;
+#[cfg(test)]
+mod checker_project;
 #[cfg(test)]
 mod symbolic_integer;
 pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};
