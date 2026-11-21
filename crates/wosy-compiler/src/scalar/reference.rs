@@ -1198,7 +1198,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
             ScalarExpression::Block(block) => {
                 let result = self.block_result(block, self.block_ordinal(parent, OccurrenceEdge::BlockBody), false)?;
-                let value = match result.scalar {
+                let checked_terminal = match result.output_points.as_slice() {
+                    [terminal] if matches!(calls.structure.checked_types.expressions.get(&ordinal),
+                        Some(ScalarType::CheckedReference { .. })) => Some(*terminal),
+                    _ => None,
+                };
+                let scalar = result.scalar.or_else(|| {
+                    checked_terminal
+                        .filter(|terminal| self.cfg.points[terminal.0].possible_origins.is_none())
+                        .map(|_| ReferenceValue::Uncomputed)
+                });
+                let value = match scalar {
                     Some(ReferenceValue::Checked(origins)) => {
                         self.point(
                             CfgPointKind::Evaluate(expression.clone()),
@@ -1224,9 +1234,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 };
                 if !matches!(value, ReferenceValue::Other) {
                     if let [output] = result.output_points.as_slice() {
-                        self.aggregate_facts.receipt_loan_forwarding.insert(
-                            self.cursor.expect("block value"), vec![*output],
-                        );
+                        let wrapper = self.cursor.expect("block value");
+                        self.aggregate_facts.receipt_loan_forwarding.insert(wrapper, vec![*output]);
+                        if checked_terminal.is_some() {
+                            let frozen = &self.cfg.points[wrapper.0].possible_origins;
+                            if frozen.is_none() || frozen == &self.cfg.points[output.0].possible_origins {
+                                self.proof_points.checked_block_values.push((wrapper, *output));
+                            }
+                        }
                     }
                 }
                 Ok(value)
@@ -4515,6 +4530,7 @@ struct ReferenceTransferCfg<'a> {
     points: &'a mut [ReferenceFlowPoint],
     facts: &'a mut Vec<ReferenceOrigin>,
     allocations: &'a BTreeSet<ReferenceBindingId>,
+    checked_block_values: &'a [(CfgPointId, CfgPointId)],
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
     checked_pointee_reads: &'a [CfgPointId],
@@ -4528,6 +4544,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             points: &mut cfg.points,
             facts: &mut cfg.facts,
             allocations: &cfg.allocations,
+            checked_block_values: proof.map_or(&[], |proof| &proof.checked_block_values),
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
@@ -4603,6 +4620,9 @@ fn transfer_reference_facts(
             descriptor.invalid = true;
         }
         descriptor = None;
+    }
+    for &(wrapper, value) in cfg.checked_block_values {
+        last_use[value.0] = last_use[value.0].max(wrapper.0);
     }
     for &(bind, value) in cfg.checked_binding_initializers {
         last_use[value.0] = last_use[value.0].max(bind.0);
@@ -5348,7 +5368,14 @@ fn transfer_reference_facts(
                 }
                 _ => {}
             }
+            let checked_block_value = matches!(&point.kind, CfgPointKind::Evaluate(ScalarExpression::Block(_)))
+                .then(|| cfg.checked_block_values.binary_search_by_key(&id, |&(wrapper, _)| wrapper).ok())
+                .flatten()
+                .map(|index| cfg.checked_block_values[index].1);
             let checked_value = match &point.kind {
+                CfgPointKind::Evaluate(_) if let Some(terminal) = checked_block_value => {
+                    state.point_values.get(terminal).cloned()
+                }
                 CfgPointKind::ReturnOutput { value_point, .. } => {
                     state.point_values.get(*value_point).cloned()
                 }
@@ -5674,7 +5701,7 @@ fn transfer_reference_facts(
                     | CfgPointKind::AssignThrough { .. }
                     | CfgPointKind::ReturnOutput { .. }
                     | CfgPointKind::Return
-            ) || point.possible_origins.is_none()
+            ) || checked_block_value.is_some() || point.possible_origins.is_none()
             {
                 point.possible_origins = checked_value.clone();
             }
@@ -9344,6 +9371,7 @@ fn derive_function_specialized_copy_policies(
                     points: &mut points,
                     facts: &mut facts,
                     allocations: &template_cfg.allocations,
+                    checked_block_values: &template_result.proof_points.checked_block_values,
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,

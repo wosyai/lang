@@ -722,3 +722,50 @@ bool() unknown_effect = fn { true };
         assert_eq!(checked, 6);
     }
 }
+
+#[test]
+fn checked_block_observes_the_exact_terminal_before_scope_exit_and_converges() {
+    let text = r#"%%start
+*u8(*u8) forward = fn(input) { input };
+*u8(*u8) frozen = fn(input) { unsafe { input } };
+*u8(*u8) relay = fn(input) {
+    *u8 result = unsafe { forward(input) };
+    result
+};
+%%end"#;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let (results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let public = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
+        for (item, expected_frozen) in [(1, true), (2, false)] {
+            let result = &results[item].1;
+            let [(wrapper, terminal)] = result.proof_points.checked_block_values.as_slice() else {
+                panic!("expected exactly one closed block terminal in body {item}")
+            };
+            let points = &result.cfg.points;
+            assert!(matches!(&points[wrapper.0].kind, CfgPointKind::Evaluate(ScalarExpression::Block(_))));
+            assert!(points[terminal.0 + 1..wrapper.0].iter().any(|point| matches!(point.kind, CfgPointKind::ScopeExit)));
+            assert_eq!(result.cfg.initial_points[wrapper.0].possible_origins.is_some(), expected_frozen);
+            assert_eq!(points[wrapper.0].possible_origins, points[terminal.0].possible_origins);
+            assert_eq!(points[wrapper.0].possible_origins.is_some(), expected_frozen);
+            let ScalarItem::Function(function) = &public.program.items[item] else {
+                panic!("expected checked function")
+            };
+            let cfg = &function.reference_cfg;
+            let observed = cfg.points[wrapper.0].possible_origins.as_ref().expect("proven block value");
+            assert_eq!(cfg.points[terminal.0].possible_origins.as_ref(), Some(observed));
+            assert_eq!(observed.len(), 1);
+            assert!(matches!(&cfg.facts[observed.first().unwrap().0], ReferenceOrigin::BorrowedFrom { parameter: 0, .. }));
+        }
+    }
+}
