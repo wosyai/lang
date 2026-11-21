@@ -6,7 +6,7 @@ use super::super::reference::{
 };
 use super::super::typecheck::expression_span;
 use super::super::{
-    ResolvedCallTarget, ScalarBindingOutput, ScalarBindingOutputOrigin, ScalarBlock,
+    CoreOperationId, ResolvedCallTarget, ScalarBindingOutput, ScalarBindingOutputOrigin, ScalarBlock,
     ScalarBlockItem, ScalarBlockItemRole, ScalarExpression, ScalarPlace,
 };
 use super::*;
@@ -19,6 +19,7 @@ pub(crate) struct InitializerCallNodes<'a> {
     targets: HashMap<*const ScalarExpression, (usize, &'a ModuleInitializationCallTarget)>,
     members: HashMap<*const ScalarExpression, BoundInitializerMember<'a>>,
     float_types: HashMap<*const ScalarExpression, &'a ScalarType>,
+    integer_conversion_sources: HashMap<*const ScalarExpression, &'a ScalarType>,
     items: PhantomData<&'a [ScalarItem]>,
 }
 
@@ -44,6 +45,7 @@ impl<'a> InitializerCallNodes<'a> {
             targets: HashMap::with_capacity(topology.calls.len()),
             members: HashMap::with_capacity(topology.identities.members.len()),
             float_types: HashMap::new(),
+            integer_conversion_sources: HashMap::new(),
             items: PhantomData,
         };
         let mut bind_call = |ordinal: OccurrenceOrdinal, expression: &'a ScalarExpression| {
@@ -81,6 +83,18 @@ impl<'a> InitializerCallNodes<'a> {
                 .call_targets
                 .get(&ordinal)
                 .ok_or_else(|| topology.missing_call_target(&region.source, ordinal))?;
+            if matches!(target, ModuleInitializationCallTarget::Core(
+                CoreOperationId::IntTrunc | CoreOperationId::IntExtend
+                | CoreOperationId::UintToFloat | CoreOperationId::SintToFloat
+            )) {
+                if let (ScalarExpression::Call { arguments, .. }, Some(signature)) =
+                    (expression, topology.checked_call_signatures.get(&ordinal))
+                {
+                    if let ([operand], [source]) = (arguments.as_slice(), signature.parameters.as_slice()) {
+                        nodes.integer_conversion_sources.insert(std::ptr::from_ref(operand), source);
+                    }
+                }
+            }
             nodes.targets.insert(std::ptr::from_ref(expression), (ordinal.0, target));
             Ok(())
         };
@@ -114,6 +128,13 @@ impl<'a> InitializerCallNodes<'a> {
 
     pub(crate) fn checked_float_type(&self, expression: &ScalarExpression) -> Option<&'a ScalarType> {
         self.float_types.get(&std::ptr::from_ref(expression)).copied()
+    }
+
+    pub(crate) fn checked_integer_conversion_source(
+        &self,
+        operand: &ScalarExpression,
+    ) -> Option<&'a ScalarType> {
+        self.integer_conversion_sources.get(&std::ptr::from_ref(operand)).copied()
     }
 
     pub(crate) fn target(

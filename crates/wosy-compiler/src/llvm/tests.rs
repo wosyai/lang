@@ -5234,6 +5234,44 @@ fn reports_ambiguous_or_mixed_float_literal_arithmetic_before_emission() {
 }
 
 #[test]
+fn emits_integer_conversions_with_checked_indexed_operand_types() {
+    let text = r#"%%start
+i32[2] stage = [-17, 0];
+u32[2] unsigned_stage = [4000000000, 0];
+u8() word = fn { core.int_trunc<u8>(stage[0] % 256) };
+i64() signed_word = fn { core.int_extend<i64>(stage[0]) };
+u64() unsigned_word = fn { core.int_extend<u64>(unsigned_stage[0]) };
+u8 body_trunc = word();
+i64 body_signed = signed_word();
+u64 body_unsigned = unsigned_word();
+u8 initializer_trunc = core.int_trunc<u8>(stage[0] % 256);
+i64 initializer_signed = core.int_extend<i64>(stage[0]);
+u64 initializer_unsigned = core.int_extend<u64>(unsigned_stage[0]);
+f64 initializer_float = core.uint_to_float<f64>(unsigned_stage[0]);
+%%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for partition in [
+            emit_scalar_build_single_module_llvm(&checked),
+            emit_scalar_build_project_llvm(&checked),
+        ] {
+            let ir = partition.unwrap().to_text();
+            assert_eq!(ir.matches("srem i32").count(), 2, "{layout:?}: {ir}");
+            for (op, destination) in [("trunc", "i8"), ("sext", "i64"), ("zext", "i64")] {
+                assert_eq!(ir.lines().filter(|line| line.contains(" = ")
+                    && line.contains("int_")
+                    && line.contains(&format!(" = {op} i32 "))
+                    && line.ends_with(&format!(" to {destination}"))).count(), 2, "{layout:?}: {ir}");
+            }
+            assert!(ir.lines().any(|line| line.contains(" = uitofp i32 ")
+                    && line.ends_with(" to double")), "{layout:?}: {ir}");
+        }
+    }
+}
+
+#[test]
 fn emits_bitcast_for_single_file_and_project() {
     let source = SourceIdentity::new(
         "project".into(),

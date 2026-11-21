@@ -1971,6 +1971,14 @@ fn integer_conversion_source_type(
     expression: &ScalarExpression,
     project_module: Option<&ScalarModule>,
 ) -> Result<ScalarType, String> {
+    let checked = state.body_call_nodes
+        .and_then(|nodes| nodes.checked_expression_type(expression))
+        .or_else(|| state.initializer_nodes
+            .and_then(|nodes| nodes.checked_integer_conversion_source(expression)));
+    if let Some(ty) = checked.filter(|ty| integer_width(ty).is_some()) {
+        return Ok(ty.clone());
+    }
+    // Detached legacy emission may not have checked occurrence facts.
     let ty = match expression {
         ScalarExpression::Member { .. }
             if state.prepared_render && state.initializer_nodes.is_some() =>
