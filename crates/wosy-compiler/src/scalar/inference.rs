@@ -28,7 +28,12 @@ impl ScalarAssignmentOwners {
                     ScalarItem::Function(function) => Some(function),
                     _ => None,
                 })
-                .flat_map(|function| std::iter::once(function).chain(&function.overload_arms))
+                .flat_map(|function| {
+                    (function.overload_arms.is_empty() || !function.body.items.is_empty())
+                        .then_some(function)
+                        .into_iter()
+                        .chain(&function.overload_arms)
+                })
                 .map(|function| ScalarAssignmentOwner {
                     body_span: function.body.span,
                     function_span: function.span,
@@ -189,7 +194,6 @@ pub(super) struct ScalarInferenceBuilder<'a> {
     assignments: HashMap<ResolvedAssignmentOutputId, ScalarType>,
     occurrences: PreparationOccurrenceTyping,
     in_module_initialization: bool,
-    capture_callable_assignment_outputs: bool,
     suppress_checked_occurrences: bool,
 }
 
@@ -200,7 +204,6 @@ impl<'a> ScalarInferenceBuilder<'a> {
             assignments: HashMap::new(),
             occurrences: PreparationOccurrenceTyping::default(),
             in_module_initialization: false,
-            capture_callable_assignment_outputs: true,
             suppress_checked_occurrences: true,
         }
     }
@@ -417,10 +420,6 @@ impl<'a> ScalarInferenceBuilder<'a> {
             matches!(item, ScalarItem::Binding(_) | ScalarItem::Executable(_));
     }
 
-    pub(super) fn set_callable_assignment_output_capture(&mut self, capture: bool) {
-        self.capture_callable_assignment_outputs = capture;
-    }
-
     pub(super) fn record_assignment_outputs(
         &mut self,
         source: &SourceIdentity,
@@ -437,9 +436,6 @@ impl<'a> ScalarInferenceBuilder<'a> {
                     .map(|output| output.ty.clone())
                     .collect(),
             );
-            return;
-        }
-        if !self.capture_callable_assignment_outputs {
             return;
         }
         let Some(function_span) = self.owners.function_span(assignment.span) else {
@@ -499,6 +495,64 @@ mod tests {
                     }),
                 Some(ty)
             );
+        }
+    }
+
+    #[test]
+    fn single_output_overload_assignments_belong_to_their_executable_arms() {
+        let text = "%%start
+read = overload {
+    u8(u8) => fn(input) { u8 value = 0; value = input; value };
+    u8(*?u8) => fn(input) { u8 value = 0; unsafe { value = core.load<u8>(input); }; value };
+};
+u8 seed = 7;
+u8 plain = read(seed);
+u8 indirect = unsafe { read(&?seed) };
+%%end";
+        let source = source("overload.w");
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let check = |items: &[ScalarItem], facts: &ScalarAssignmentTyping| {
+            let ScalarItem::Function(overload) = &items[0] else { panic!("overload") };
+            assert_eq!(facts.len(), 2);
+            for (index, arm) in overload.overload_arms.iter().enumerate() {
+                let item = &arm.body.items[1];
+                let (assignment, unsafe_scope) = match item {
+                    ScalarBlockItem::Assignment(assignment) => (assignment, false),
+                    ScalarBlockItem::Expression(ScalarExpression::Block(block)) => {
+                        let [ScalarBlockItem::Assignment(assignment)] = block.items.as_slice()
+                        else { panic!("unsafe assignment") };
+                        (assignment, block.unsafe_context)
+                    }
+                    _ => panic!("assignment"),
+                };
+                assert_eq!(unsafe_scope, index == 1);
+                let key = ResolvedAssignmentOutputId {
+                    source: source.clone(),
+                    function_span: arm.span,
+                    target_span: assignment.targets[0].target_span,
+                    output_index: 0,
+                };
+                assert_eq!(facts.get(&key), Some(&ScalarType::U8));
+                assert_eq!(facts.get(&ResolvedAssignmentOutputId {
+                    function_span: overload.span, ..key
+                }), None);
+            }
+        };
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            check(&single.program.items, &single.program.resolved_assignment_outputs);
+            let prepared = crate::prepare_scalar_project(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()],
+                ScalarPreparationInputs { target_layout: layout },
+            ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let checked = crate::analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let module = &prepared.project().modules[0];
+            check(&module.items, &module.resolved_assignment_outputs);
+            crate::emit_scalar_build_project_llvm(&checked).expect("selected overload calls and assignments");
         }
     }
 

@@ -6780,8 +6780,6 @@ pub(super) fn validate(
                     };
                     let multi_result_tail =
                         outputs.outputs.len() > 1 && function.body.tail_conditional().is_some();
-                    inference
-                        .set_callable_assignment_output_capture(!is_overload || multi_result_tail);
                     let arity_mismatch = function.parameters.len() != parameters.len();
                     let inherited_overload_tail_order = is_overload && multi_result_tail;
                     if arity_mismatch && inherited_overload_tail_order {
@@ -6941,7 +6939,6 @@ pub(super) fn validate(
                         ));
                     }
                 }
-                inference.set_callable_assignment_output_capture(true);
             }
             ScalarItem::Executable(executable) => {
                 let mut visible_names = declaration_names.clone();
