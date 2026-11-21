@@ -4770,6 +4770,21 @@ fn is_deferred_reborrow_child(parent: &ReferenceOrigin, child: &ReferenceOrigin,
     }
 }
 
+fn deferred_local_owner_store(
+    pending: &super::control::PendingNamedReborrow,
+    point: &ReferenceFlowPoint,
+    points: &[ReferenceFlowPoint],
+) -> bool {
+    let super::control::DeferredReborrowRoot::Local { owner, borrow } = &pending.root else {
+        return false;
+    };
+    matches!(&point.kind, CfgPointKind::Assign { target, .. }
+        if &target.binding == owner && target.projections.is_empty()
+            && matches!(target.place, ScalarPlace::Name { .. }))
+        && point.scope == points[borrow.0].scope
+        && pending.sites.last().is_some_and(|site| site.point < point.id)
+}
+
 fn contains_loan_site(binding: &ReferenceBindingId, point: &ReferenceFlowPoint) -> bool {
     let site = point.source_span.range;
     binding.block_span.start <= site.start && site.end <= binding.block_span.end
@@ -4905,7 +4920,8 @@ fn transfer_reference_facts(
             pending_allowed &= !match &point.kind {
                 CfgPointKind::Call { .. } | CfgPointKind::Invalidate { .. } | CfgPointKind::Release { .. } => true,
                 CfgPointKind::Assign { target, .. } => target.binding == pending.handle
-                    || &target.binding == deferred_reborrow_owner(pending)
+                    || (&target.binding == deferred_reborrow_owner(pending)
+                        && (grouped_installs.contains(&point.id) || !deferred_local_owner_store(pending, point, original_points)))
                     || child_holders.contains_key(&target.binding),
                 CfgPointKind::AssignThrough { .. } => exact_child_store(point).is_none()
                     && pending.sites.last().is_some_and(|last| point.id < last.point),
@@ -5833,7 +5849,9 @@ fn transfer_reference_facts(
                 }
                 CfgPointKind::Assign { target, .. } => {
                     let target = available_place(target);
-                    if !target.projections.is_empty() {
+                    if !target.projections.is_empty() || (pending_allowed
+                        && pending.is_some_and(|pending| deferred_local_owner_store(pending, point, original_points)))
+                    {
                         let origins = conflicting_live_loan(
                             original_points,
                             &cfg.facts,
@@ -10263,6 +10281,18 @@ fn build_function_reference_cfg(
                 }
             } else {
                 let prior_errors = errors.len();
+                if let super::control::DeferredReborrowRoot::Local { borrow, .. } = &pending.root {
+                    let root = &builder.cfg.initial_points[borrow.0].source_span;
+                    errors.extend(provisional.iter().filter(|error| matches!(error,
+                        ReferenceAnalysisError::ConflictingPlace { source_span, origins }
+                            if (origins.contains(root) || pending.sites.iter().any(|site| {
+                                let solved = &builder.cfg.points[site.point.0];
+                                matches!(solved.kind, CfgPointKind::Borrow { .. }) && origins.contains(&solved.source_span)
+                            }))
+                                && builder.cfg.initial_points.iter().any(|point| point.source_span == *source_span
+                                    && deferred_local_owner_store(pending, point, &builder.cfg.initial_points))
+                    )).cloned());
+                }
                 if pending.sites.len() > 1 || is_pending_shared_reborrow(&builder.cfg.initial_points[pending.sites[0].point.0]) {
                     errors.extend(provisional.iter().filter(|error| matches!(error,
                         ReferenceAnalysisError::ConflictingPlace { source_span, origins } if pending.sites.iter().any(|site| {

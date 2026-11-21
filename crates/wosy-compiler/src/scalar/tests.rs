@@ -12028,3 +12028,87 @@ unit(bool) inspect = fn(choose) {{
         }
     }
 }
+
+#[test]
+fn deferred_local_owner_store_requires_every_actual_borrowers_last_use() {
+    for (body, blocking) in [
+        ("u8 copied = *alias; u8 original = *leaf; u8 root = *parent; owner = 11; copied; original; root;", None),
+        ("u8 original = *leaf; owner = 11; u8 copied = *alias; copied; original;", Some("&(*parent)")),
+        ("u8 copied = *alias; owner = 11; u8 original = *leaf; copied; original;", Some("&(*parent)")),
+        ("u8 copied = *alias; u8 original = *leaf; owner = 11; u8 root = *parent; copied; original; root;", Some("&!owner")),
+    ] {
+        let text = format!(r#"%%start
+u8(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 marker = 9; marker; }};
+    *u8 leaf = &(*parent);
+    *u8 alias = leaf;
+    {body}
+    owner
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let write = text.find("owner = 11").unwrap() as u32;
+        let leaf = text.find("&(*parent)").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if let Some(blocking) = blocking {
+                let blocking = text.find(blocking).unwrap() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == write)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == blocking)
+                }), "{body}: {diagnostics:?}");
+                assert!(cfg.initial_points.iter().any(|point| point.source_span.range.start == leaf
+                    && point.possible_origins.is_none()
+                    && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))));
+            } else {
+                assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}");
+                assert!(cfg.initial_points.iter().any(|point| point.source_span.range.start == leaf
+                    && matches!(point.kind, CfgPointKind::Borrow { .. })));
+                assert!(cfg.points.iter().any(|point| point.source_span.range.start == write
+                    && matches!(&point.kind, CfgPointKind::Assign { target, .. } if target.projections.is_empty())));
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_local_owner_store_does_not_weaken_structural_exclusions() {
+    for (early, late) in [
+        ("owner = 11;", ""),
+        ("", "if (choose) { owner = 11; };"),
+        ("", "u8 other = 3; owner, other = 11, 13; other;"),
+        ("", "parent = null;"),
+    ] {
+        let text = format!(r#"%%start
+u8(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 marker = 9; marker; }};
+    {early}
+    *u8 leaf = &(*parent);
+    u8 observed = *leaf;
+    {late}
+    observed; owner
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let leaf = text.find("&(*parent)").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.message == "missing required dereference origin"), "{early}; {late}: {diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            assert!(function.reference_cfg.initial_points.iter().all(|point| point.source_span.range.start != leaf
+                || !matches!(point.kind, CfgPointKind::Borrow { .. })));
+        }
+    }
+}
