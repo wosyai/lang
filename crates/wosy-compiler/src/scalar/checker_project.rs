@@ -384,11 +384,7 @@ impl PreparedProofModule {
         verified: &VerifiedModuleReturnBound<'_>,
     ) -> Option<ImportedRequirement> {
         let bound = &verified.bound;
-        let ResolvedCallTarget::ModuleCallable { source: target_source, .. } = &bound.target else {
-            return None;
-        };
-        if target_source != &self.source
-            || !std::ptr::eq(self, verified.issuer)
+        if !std::ptr::eq(self, verified.issuer)
             || bound.proof_venue != ProofVenue::ModuleDeclaration
             || bound.proof_source != self.source
             || bound.proof_name != proof_name
@@ -1135,12 +1131,12 @@ mod tests {
         let empty = source("src/empty.w", "proof-free");
         let app_proof = "proof bound for value(x) -> (out) ensures (out <= 7) {}";
         let lib_proof = "proof bound for value(x) -> (out) ensures (out <= 8) {}";
-        let imported = "proof imported for lib.value(x) -> (out) ensures (out <= 9) {}";
+        let imported = "proof imported for lib.value(x) -> (out) where (x <= 10) ensures (out <= 9) {}";
         let tighter = "proof tighter for lib.value(x) -> (out) ensures (out <= 7) {}";
         let private = "proof inaccessible for lib._hidden(x) -> (out) ensures (out <= 7) {}";
         let unknown = "proof missing_namespace for absent.value(x) -> (out) ensures (out <= 7) {}";
         let empty_guard = "proof empty_guard for lib.value(x) -> (out) where (false) ensures (out <= 9) {}";
-        let app_text = format!("%%start\nlib = namespace demo \"src/lib.w\";\nfree = namespace demo \"src/empty.w\";\nu8(u8) value = fn(x) {{ if (x == 0) {{}}; 7 }};\nu8() use_lib = fn {{ u8 result = lib.value(0); core.require(result <= 9, {OUTPUT}); result }};\n{app_proof}\n{imported}\n{tighter}\n{private}\n{unknown}\n{empty_guard}\n%%end");
+        let app_text = format!("%%start\nlib = namespace demo \"src/lib.w\";\nfree = namespace demo \"src/empty.w\";\nu8(u8) value = fn(x) {{ if (x == 0) {{}}; 7 }};\nu8() use_lib = fn {{ u8 arg = 7; u8 result = lib.value(arg); core.require(result <= 9, {OUTPUT}); result }};\nu8() outside = fn {{ u8 result = lib.value(11); core.require(result <= 9, {OUTPUT}); result }};\nu8() too_narrow = fn {{ u8 result = lib.value(7); core.require(result <= 8, {OUTPUT}); result }};\nu8() wrong_local = fn {{ u8 result = value(7); core.require(result <= 9, {OUTPUT}); result }};\nu8() wrong_import = fn {{ u8 result = free.value(7); core.require(result <= 9, {OUTPUT}); result }};\n{app_proof}\n{imported}\n{tighter}\n{private}\n{unknown}\n{empty_guard}\n%%end");
         let lib_text = format!("%%start\nu8(u8) value = fn(x) {{ if (x == 0) {{}}; 9 }};\nu8(u8) _hidden = fn(x) {{ x }};\n{lib_proof}\n%%end");
         let namespace = |name: &str, target: &SourceIdentity| {
             let declaration = format!("{name} =");
@@ -1152,17 +1148,17 @@ mod tests {
                 span: ByteSpan::new(start as u32, end as u32),
             }
         };
-        let modules = vec![
+        let modules = |lib: &SourceIdentity| vec![
             ProofModuleInput {
                 source: app.clone(),
-                namespaces: vec![namespace("lib", &lib), namespace("free", &empty)],
+                namespaces: vec![namespace("lib", lib), namespace("free", &empty)],
                 text: app_text.clone(),
             },
             ProofModuleInput { source: lib.clone(), namespaces: Vec::new(), text: lib_text.clone() },
-            ProofModuleInput { source: empty.clone(), namespaces: Vec::new(), text: "%%start\nu8() unused = fn { 0 };\n%%end".into() },
+            ProofModuleInput { source: empty.clone(), namespaces: Vec::new(), text: "%%start\nu8(u8) value = fn(x) { x };\n%%end".into() },
         ];
         let order = vec![empty.clone(), lib.clone(), app.clone()];
-        let project = PreparedProofModule::prepare_project(app.clone(), modules, order.clone(), inputs()).unwrap();
+        let project = PreparedProofModule::prepare_project(app.clone(), modules(&lib), order.clone(), inputs()).unwrap();
         let (prepared, _) = project.prepared.parts();
         assert_eq!(prepared.initialization_order, order);
         assert_eq!(prepared.modules.len(), 3);
@@ -1193,11 +1189,22 @@ mod tests {
         assert_eq!(bound.proof_span, ByteSpan::new(proof_start, proof_start + imported.len() as u32));
         assert_eq!(bound.proof_name, "imported");
         assert_eq!(bound.target, ResolvedCallTarget::ModuleCallable {
-            source: lib,
+            source: lib.clone(),
             declaration_span: ByteSpan::new(target_start, target_start + "value".len() as u32),
             concrete: ConcreteCallSelection::Declaration,
         });
-        assert_eq!(project.apply("use_lib", "imported", &artifact), None);
+        assert_eq!(project.apply("use_lib", "imported", &artifact), Some(ImportedRequirement::Proved));
+        assert_eq!(project.apply("too_narrow", "imported", &artifact), Some(ImportedRequirement::NotEstablished));
+        for caller in ["outside", "wrong_local", "wrong_import"] {
+            assert_eq!(project.apply(caller, "imported", &artifact), None);
+        }
+        let fresh = PreparedProofModule::prepare_project(app.clone(), modules(&lib), order, inputs()).unwrap();
+        assert_eq!(fresh.apply("use_lib", "imported", &artifact), None);
+        let stale_lib = source("src/lib.w", "proof-lib-r2");
+        let changed = PreparedProofModule::prepare_project(
+            app.clone(), modules(&stale_lib), vec![empty, stale_lib, app.clone()], inputs(),
+        ).unwrap();
+        assert_eq!(changed.apply("use_lib", "imported", &artifact), None);
         for name in ["tighter", "inaccessible", "missing_namespace", "empty_guard", "missing"] {
             assert!(project.verify(name).is_none());
         }
