@@ -1,5 +1,6 @@
 use super::inference::CheckedMember;
 use super::*;
+use std::borrow::Cow;
 
 pub(super) struct ScalarProgramTyping<'a> {
     pub source: &'a SourceIdentity,
@@ -301,15 +302,18 @@ fn call_output_sequence_in_module(
         return Some(outputs);
     }
     let callable = callable?;
-    let callable = if let Some(parameters) = target_view.generics(name) {
-        substitute_generic_callable(callable, parameters, type_arguments)?
-    } else {
-        callable.clone()
-    };
+    if let Some(parameters) = target_view.generics(name) {
+        let ScalarType::Callable { outputs, .. } =
+            substitute_generic_callable(callable, parameters, type_arguments)?
+        else {
+            return None;
+        };
+        return Some(outputs);
+    }
     let ScalarType::Callable { outputs, .. } = callable else {
         return None;
     };
-    Some(outputs)
+    Some(outputs.clone())
 }
 
 fn call_output_sequence(
@@ -358,15 +362,18 @@ fn call_output_sequence(
         return Some(outputs);
     }
     let generic_parameters = receiver.is_none().then(|| overloads.generics(name));
-    let callable = if let Some(Some(parameters)) = generic_parameters {
-        substitute_generic_callable(callable, parameters, type_arguments)?
-    } else {
-        callable.clone()
-    };
+    if let Some(Some(parameters)) = generic_parameters {
+        let ScalarType::Callable { outputs, .. } =
+            substitute_generic_callable(callable, parameters, type_arguments)?
+        else {
+            return None;
+        };
+        return Some(outputs);
+    }
     let ScalarType::Callable { outputs, .. } = callable else {
         return None;
     };
-    Some(outputs)
+    Some(outputs.clone())
 }
 
 fn scalar_call_result(outputs: &ScalarOutputSequence) -> ScalarType {
@@ -468,6 +475,88 @@ fn validate_output_receivers(
     }
 }
 
+struct BlockLexicalScope<'a> {
+    types: Cow<'a, BTreeMap<String, ScalarType>>,
+    names: Cow<'a, BTreeSet<String>>,
+    folded_names: Cow<'a, BTreeMap<String, (String, ByteSpan)>>,
+}
+
+impl<'a> BlockLexicalScope<'a> {
+    fn new(
+        types: &'a BTreeMap<String, ScalarType>,
+        names: &'a BTreeSet<String>,
+        folded_names: &'a BTreeMap<String, (String, ByteSpan)>,
+    ) -> Self {
+        Self {
+            types: Cow::Borrowed(types),
+            names: Cow::Borrowed(names),
+            folded_names: Cow::Borrowed(folded_names),
+        }
+    }
+
+    fn item_type(
+        &mut self,
+        item: &ScalarBlockItem,
+        typing: TailConditionalTyping<'_>,
+        diagnostics: &mut Vec<super::Diagnostic>,
+        unsafe_context: bool,
+        overloads: &ScalarTypingView<'_>,
+        inference: &mut ScalarInferenceBuilder<'_>,
+    ) -> ScalarType {
+        match (item, typing) {
+            (ScalarBlockItem::Expression(expression), _) => typing.expression_type(
+                expression,
+                None,
+                &self.types,
+                &self.names,
+                &self.folded_names,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            ),
+            (ScalarBlockItem::Assignment(assignment), TailConditionalTyping::Program(program)) => {
+                assignment_type(
+                    assignment,
+                    self.types.to_mut(),
+                    &self.names,
+                    &self.folded_names,
+                    program,
+                    diagnostics,
+                    unsafe_context,
+                    overloads,
+                    inference,
+                )
+            }
+            (
+                ScalarBlockItem::Assignment(assignment),
+                TailConditionalTyping::Module { module, modules },
+            ) => assignment_type_in_module(
+                assignment,
+                self.types.to_mut(),
+                &self.names,
+                &self.folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            ),
+            (ScalarBlockItem::LocalBinding(_), _) => typing.block_item_type(
+                item,
+                self.types.to_mut(),
+                self.names.to_mut(),
+                self.folded_names.to_mut(),
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            ),
+        }
+    }
+}
+
 pub(super) fn block_type_in_module(
     block: &ScalarBlock,
     scope: &BTreeMap<String, ScalarType>,
@@ -480,19 +569,13 @@ pub(super) fn block_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    let mut scope = scope.clone();
-    let mut visible_names = visible_names.clone();
-    let mut folded_names = folded_names.clone();
+    let mut scope = BlockLexicalScope::new(scope, visible_names, folded_names);
     let unsafe_context = unsafe_context || block.unsafe_context;
     let mut result = ScalarType::Unit;
     for (index, item) in block.items.iter().enumerate() {
-        result = block_item_type_in_module(
+        result = scope.item_type(
             item,
-            &mut scope,
-            &mut visible_names,
-            &mut folded_names,
-            module,
-            modules,
+            TailConditionalTyping::Module { module, modules },
             diagnostics,
             unsafe_context,
             overloads,
@@ -518,9 +601,7 @@ pub(super) fn block_type_in_module_expected(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    let mut scope = scope.clone();
-    let mut visible_names = visible_names.clone();
-    let mut folded_names = folded_names.clone();
+    let mut scope = BlockLexicalScope::new(scope, visible_names, folded_names);
     let unsafe_context = unsafe_context || block.unsafe_context;
     let mut result = ScalarType::Unit;
     for (index, item) in block.items.iter().enumerate() {
@@ -531,9 +612,9 @@ pub(super) fn block_type_in_module_expected(
                 expression_type_in_module_expected(
                     expression,
                     expected,
-                    &scope,
-                    &visible_names,
-                    &folded_names,
+                    &scope.types,
+                    &scope.names,
+                    &scope.folded_names,
                     module,
                     modules,
                     diagnostics,
@@ -542,13 +623,9 @@ pub(super) fn block_type_in_module_expected(
                     inference,
                 )
             }
-            _ => block_item_type_in_module(
+            _ => scope.item_type(
                 item,
-                &mut scope,
-                &mut visible_names,
-                &mut folded_names,
-                module,
-                modules,
+                TailConditionalTyping::Module { module, modules },
                 diagnostics,
                 unsafe_context,
                 overloads,
@@ -1009,28 +1086,41 @@ fn conditional_arm_types(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> Vec<ScalarType> {
-    let mut scope = scope.clone();
-    let mut visible_names = visible_names.clone();
-    let mut folded_names = folded_names.clone();
+    let mut scope = BlockLexicalScope::new(scope, visible_names, folded_names);
     let unsafe_context = unsafe_context || block.unsafe_context;
-    check_final_output_prefix(
-        block,
-        &mut scope,
-        &mut visible_names,
-        &mut folded_names,
-        typing,
-        diagnostics,
-        unsafe_context,
-        overloads,
-        inference,
-    );
+    let final_start = block.items.len() - block.final_output_values.len();
+    for item in &block.items[..final_start] {
+        match item {
+            ScalarBlockItem::Expression(
+                expression @ (ScalarExpression::If { .. } | ScalarExpression::UnitIf { .. }),
+            ) => typing.expression_type(
+                expression,
+                Some(&ScalarType::Unit),
+                &scope.types,
+                &scope.names,
+                &scope.folded_names,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            ),
+            _ => scope.item_type(
+                item,
+                typing,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            ),
+        };
+    }
     if let Some(tail) = block.tail_conditional() {
         return tail_conditional_types(
             tail,
             expected,
-            &scope,
-            &visible_names,
-            &folded_names,
+            &scope.types,
+            &scope.names,
+            &scope.folded_names,
             typing,
             diagnostics,
             unsafe_context,
@@ -1055,9 +1145,9 @@ fn conditional_arm_types(
         actual.push(typing.expression_type(
             expression,
             Some(&output.ty),
-            &scope,
-            &visible_names,
-            &folded_names,
+            &scope.types,
+            &scope.names,
+            &scope.folded_names,
             diagnostics,
             unsafe_context,
             overloads,
@@ -7165,18 +7255,13 @@ pub(super) fn block_type(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    let mut scope = scope.clone();
-    let mut visible_names = visible_names.clone();
-    let mut folded_names = folded_names.clone();
+    let mut scope = BlockLexicalScope::new(scope, visible_names, folded_names);
     let unsafe_context = unsafe_context || block.unsafe_context;
     let mut result = ScalarType::Unit;
     for (index, item) in block.items.iter().enumerate() {
-        result = block_item_type(
+        result = scope.item_type(
             item,
-            &mut scope,
-            &mut visible_names,
-            &mut folded_names,
-            program,
+            TailConditionalTyping::Program(program),
             diagnostics,
             unsafe_context,
             overloads,
@@ -7201,9 +7286,7 @@ fn block_type_expected(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    let mut scope = scope.clone();
-    let mut visible_names = visible_names.clone();
-    let mut folded_names = folded_names.clone();
+    let mut scope = BlockLexicalScope::new(scope, visible_names, folded_names);
     let unsafe_context = unsafe_context || block.unsafe_context;
     let mut result = ScalarType::Unit;
     for (index, item) in block.items.iter().enumerate() {
@@ -7214,9 +7297,9 @@ fn block_type_expected(
                 expression_type_expected(
                     expression,
                     expected,
-                    &scope,
-                    &visible_names,
-                    &folded_names,
+                    &scope.types,
+                    &scope.names,
+                    &scope.folded_names,
                     program,
                     diagnostics,
                     unsafe_context,
@@ -7224,12 +7307,9 @@ fn block_type_expected(
                     inference,
                 )
             }
-            _ => block_item_type(
+            _ => scope.item_type(
                 item,
-                &mut scope,
-                &mut visible_names,
-                &mut folded_names,
-                program,
+                TailConditionalTyping::Program(program),
                 diagnostics,
                 unsafe_context,
                 overloads,
