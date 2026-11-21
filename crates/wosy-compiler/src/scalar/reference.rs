@@ -3829,7 +3829,7 @@ fn unavailable_origins(state: &ReferenceEdgeState, place: &ReferencePlaceId) -> 
         .collect()
 }
 
-fn is_lexical_checked_handle_path(path: &[ReferencePlaceProjection]) -> bool {
+fn is_lexical_field_path(path: &[ReferencePlaceProjection]) -> bool {
     path.iter().all(|projection| {
         matches!(projection, ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(_)))
     })
@@ -3899,6 +3899,7 @@ enum LoanAccess<'a> {
     Through(ReferenceOriginId),
     WriteThrough(&'a InvalidationCandidate),
     ReadThrough(&'a ReferenceLoanId),
+    FreshBorrow(ScalarReferenceMutability),
 }
 
 fn conflicting_live_loan(
@@ -3915,7 +3916,7 @@ fn conflicting_live_loan(
         let mut reachable = false;
         for origin in origins {
             if match access {
-                LoanAccess::Direct | LoanAccess::ReadThrough(_) => false,
+                LoanAccess::Direct | LoanAccess::ReadThrough(_) | LoanAccess::FreshBorrow(_) => false,
                 LoanAccess::Through(selected) => *origin == selected,
                 LoanAccess::WriteThrough(selected) => *origin == selected.origin,
             } {
@@ -3933,6 +3934,11 @@ fn conflicting_live_loan(
                 }
                 LoanAccess::WriteThrough(selected) => {
                     loan_borrows_place(loan, &place) && !loan_has_ancestor(&selected.loan, loan)
+                }
+                LoanAccess::FreshBorrow(mode) => {
+                    (mode == ScalarReferenceMutability::Mutable
+                        || loan.mode == ScalarReferenceMutability::Mutable)
+                        && reference_places_overlap(&available_place(&loan.origin_place), &place)
                 }
                 LoanAccess::Direct | LoanAccess::Through(_) => loan_borrows_place(loan, &place),
             };
@@ -5003,7 +5009,7 @@ fn transfer_reference_facts(
                 _ => (&[][..], false),
             };
             for place in read_places {
-                if lexical_read && is_lexical_checked_handle_path(&place.projections) {
+                if lexical_read && is_lexical_field_path(&place.projections) {
                     let origins = unavailable_checked_handles(&state, &place.binding, &place.projections);
                     if !origins.is_empty() {
                         errors.push(ReferenceAnalysisError::ConflictingPlace {
@@ -5031,7 +5037,7 @@ fn transfer_reference_facts(
                             ..
                         },
                     ..
-                } if is_lexical_checked_handle_path(&place.projections) => {
+                } if is_lexical_field_path(&place.projections) => {
                     let moved = state
                         .moved_checked_handles
                         .entry(place.binding.clone())
@@ -5298,7 +5304,7 @@ fn transfer_reference_facts(
                         state.invalidated.remove(binding);
                     } else {
                         if let Some(moved) = state.moved_checked_handles.get_mut(binding) {
-                            if is_lexical_checked_handle_path(&target.projections) {
+                            if is_lexical_field_path(&target.projections) {
                                 moved.retain(|(path, _)| !path.starts_with(&target.projections));
                                 if moved.is_empty() {
                                     state.moved_checked_handles.remove(binding);
@@ -5381,12 +5387,31 @@ fn transfer_reference_facts(
                 CfgPointKind::Evaluate(_)
                 | CfgPointKind::Borrow { .. }
                 | CfgPointKind::Call { .. } => {
-                    if let CfgPointKind::Borrow { place, .. } = &point.kind {
+                    if let CfgPointKind::Borrow { place, loan } = &point.kind {
                         if state.released.contains(&place.binding) {
                             errors.push(ReferenceAnalysisError::MissingContext {
                                 source_span: point.source_span.clone(),
                                 reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
                             });
+                        }
+                        if loan.parent.is_none()
+                            && !state.bindings.is_empty()
+                            && is_lexical_field_path(&place.projections)
+                        {
+                            let origins = conflicting_live_loan(
+                                original_points,
+                                &cfg.facts,
+                                &state,
+                                id,
+                                place,
+                                LoanAccess::FreshBorrow(loan.mode),
+                            );
+                            if !origins.is_empty() {
+                                errors.push(ReferenceAnalysisError::ConflictingPlace {
+                                    source_span: point.source_span.clone(),
+                                    origins,
+                                });
+                            }
                         }
                     }
                     if point.possible_origins.is_none() {

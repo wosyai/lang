@@ -1836,6 +1836,88 @@ unit(u8, u8) check_field = fn(value, replacement) {
 }
 
 #[test]
+fn incompatible_fresh_checked_borrows_report_the_earlier_live_loan() {
+    for (first, second, still_live) in [
+        ("*!u8 first = &!value;", "*!u8 second = &!value;", "first"),
+        ("*u8 first = &value;", "*!u8 second = &!value;", "first"),
+        ("*!u8 first = &!value;", "*u8 second = &value;", "first"),
+        (
+            "*!u8 first = &!value; *!u8 child = &!(*first);",
+            "*!u8 second = &!value;",
+            "child",
+        ),
+    ] {
+        let text = format!("%%start
+unit() check_fresh = fn {{
+    u8 value = 1;
+    {first}
+    {second}
+    u8 before = *{still_live};
+    u8 after = *second;
+    before; after;
+}};
+%%end");
+        let earlier = text.find(first).unwrap() + first.rfind('&').unwrap();
+        let later = text.find(second).unwrap() + second.find('&').unwrap();
+        let earlier_length = first[first.rfind('&').unwrap()..].trim_end_matches(';').len();
+        let later_length = second[second.find('&').unwrap()..].trim_end_matches(';').len();
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected one incompatible-loan diagnostic: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.code, "B0003");
+            assert_eq!(diagnostic.message, "read or move of unavailable place");
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(later as u32, (later + later_length) as u32),
+            );
+            assert_eq!(
+                diagnostic.labels[1].span.range,
+                ByteSpan::new(earlier as u32, (earlier + earlier_length) as u32),
+            );
+            assert_eq!(
+                diagnostic.labels[1].kind,
+                super::super::DiagnosticLabelKind::Secondary,
+            );
+        }
+    }
+}
+
+#[test]
+fn compatible_fresh_checked_borrows_remain_valid() {
+    for body in [
+        "u8 value = 1;
+        *u8 first = &value; *u8 second = &value;
+        u8 before = *first; u8 after = *second; before; after;",
+        "u8 value = 1;
+        *!u8 first = &!value; u8 before = *first;
+        *!u8 second = &!value; u8 after = *second; before; after;",
+        "Pair value = { .left = 1; .right = 2; };
+        *!u8 first = &!value.left; *!u8 second = &!value.right;
+        u8 before = *first; u8 after = *second; before; after;",
+        "u8 value = 1;
+        *!u8 parent = &!value; *!u8 child = &!(*parent);
+        u8 before = *child; u8 after = *parent; before; after;",
+        "u8 value = 1; *!u8 selected = null;
+        if (choose) { selected = &!value; } else { selected = &!value; };
+        u8 observed = *selected; observed;",
+    ] {
+        let signature = if body.contains("choose") {
+            "unit(bool) check_fresh = fn(choose)"
+        } else {
+            "unit() check_fresh = fn"
+        };
+        let text = format!(
+            "%%start\nstruct Pair {{ u8 left; u8 right; }}\n{signature} {{ {body} }};\n%%end"
+        );
+        let (single, project) = both_reference_functions(&text);
+        assert!(single.diagnostics.is_empty(), "{body}: {:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{body}: {:?}", project.diagnostics);
+    }
+}
+
+#[test]
 fn checked_aggregate_conflicts_label_the_initiating_loan_in_both_pipelines() {
     for (text, primary, origin) in [
             ("%%start\nstruct Payload { u8 value; }\nunit() f = fn { Payload specimen = { .value = 1; }; *!Payload writer = &!specimen; Payload taken = *writer; Payload again = *writer; taken; again; };\n%%end", "*writer; taken", "&!specimen"),
