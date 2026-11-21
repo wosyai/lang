@@ -6960,8 +6960,9 @@ fn emits_wasm32_struct_layout_literals_and_field_addresses() {
         text.contains("@item = internal global [8 x i8] zeroinitializer"),
         "{text}"
     );
-    assert!(text.contains("store i8 1"), "{text}");
-    assert!(text.contains("store i32 2"), "{text}");
+    let first = text.find("store i8 1").expect("first field store");
+    let second = text.find("store i32 2").expect("second field store");
+    assert!(first < second, "{text}");
     assert!(
         text.contains("getelementptr inbounds i8, ptr %struct_literal, i8 4"),
         "{text}"

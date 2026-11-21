@@ -536,25 +536,19 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
     );
     let destination = entry_alloca(state, storage.into(), "struct_literal")?;
     let mut values = BTreeMap::new();
+    for field in &structure.fields {
+        values.entry(field.name.as_str()).or_insert((&field.ty, None));
+    }
     for field in fields {
-        values.insert(
-            field.name.clone(),
-            emit_typed_expression(
-                context,
-                state,
-                &field.value,
-                &structure
-                    .fields
-                    .iter()
-                    .find(|candidate| candidate.name == field.name)
-                    .expect("validated struct field")
-                    .ty,
-            )?,
-        );
+        let (ty, value) = values
+            .get_mut(field.name.as_str())
+            .expect("validated struct field");
+        *value = Some(emit_typed_expression(context, state, &field.value, ty)?);
     }
     for field in &structure.fields {
         let value = values
-            .remove(&field.name)
+            .get_mut(field.name.as_str())
+            .and_then(|(_, value)| value.take())
             .ok_or_else(|| format!("missing LLVM struct literal field {}", field.name))?;
         let pointer = unsafe {
             state.builder.build_in_bounds_gep(
