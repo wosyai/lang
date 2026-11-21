@@ -11732,3 +11732,84 @@ unit(bool) inspect = fn(choose) {
             !sites.contains(&point.source_span.range.start) || !matches!(point.kind, CfgPointKind::Borrow { .. })));
     }
 }
+
+#[test]
+fn deferred_nested_shared_and_mutable_siblings_use_their_actual_live_modes() {
+    for (first_mutable, second_mutable, first_ends_early, conflicts) in [
+        (false, false, false, false),
+        (false, true, false, true),
+        (true, false, false, true),
+        (false, true, true, false),
+        (true, false, true, false),
+    ] {
+        let qualifier = |mutable| if mutable { "!" } else { "" };
+        let first_q = qualifier(first_mutable);
+        let second_q = qualifier(second_mutable);
+        let observe_first = "u8 seen_first = *first;";
+        let early = if first_ends_early { observe_first } else { "" };
+        let late = if first_ends_early { "" } else { observe_first };
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 inside = 9; inside; }};
+    *!u8 child = &!(*parent);
+    *{first_q}u8 first = &{first_q}(*child);
+    {early}
+    *{second_q}u8 second = &{second_q}(*child);
+    {late}
+    u8 seen_second = *second;
+    *child = 8;
+    seen_first; seen_second;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let find_address = |binding, q| {
+            let spelling = format!("{binding} = &{q}(*child)");
+            let start = text.find(&spelling).expect("written sibling") + spelling.find('&').unwrap();
+            ByteSpan::new(start as u32, start as u32 + format!("&{q}(*child)").len() as u32)
+        };
+        let first_span = find_address("first", first_q);
+        let second_span = find_address("second", second_q);
+        let direct = text.find("&!(*parent)").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if conflicts {
+                let [diagnostic] = diagnostics.as_slice() else {
+                    panic!("expected one live mixed-mode conflict: {diagnostics:?}")
+                };
+                assert_eq!(diagnostic.code, "B0003");
+                assert_eq!(diagnostic.message, "read or move of unavailable place");
+                let [requested, existing] = diagnostic.labels.as_slice() else {
+                    panic!("expected current and peer")
+                };
+                assert_eq!(requested.span.range, second_span);
+                assert_eq!(existing.span.range, first_span);
+                assert!(cfg.initial_points.iter().all(|point| !matches!(point.kind, CfgPointKind::Borrow { .. })
+                    || (point.source_span.range.start != direct && ![first_span, second_span].contains(&point.source_span.range))));
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let child = cfg.points.iter().find(|point| point.source_span.range.start == direct
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("exact direct child");
+            let ReferenceOrigin::Fresh { loan: child_loan, allocation } = sole_fact(function, child) else {
+                panic!("expected local allocation")
+            };
+            for (span, mutable) in [(first_span, first_mutable), (second_span, second_mutable)] {
+                let point = cfg.points.iter().find(|point| point.source_span.range == span
+                    && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("sealed sibling");
+                assert_eq!(&cfg.initial_points[point.id.0], point);
+                let ReferenceOrigin::Fresh { loan, allocation: nested_allocation } = sole_fact(function, point) else {
+                    panic!("expected rooted allocation")
+                };
+                assert_eq!(nested_allocation, allocation);
+                assert_eq!(loan.parent.as_deref(), Some(child_loan));
+                assert_eq!(loan.mode, if mutable { ScalarReferenceMutability::Mutable } else { ScalarReferenceMutability::Shared });
+            }
+        }
+    }
+}

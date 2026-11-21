@@ -1969,12 +1969,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             if matches!(place, ScalarPlace::Dereference { .. }) {
                                 let read = self.cursor.expect("named checked read");
                                 let pending = self.proof_points.pending_named_reborrow.as_ref();
-                                let direct = self.deferred_reborrow_roots.iter().find(|(handle, root, entry, _)| {
-                                    *mutability == ScalarReferenceMutability::Mutable
-                                        && *handle == binding
-                                        && (matches!(root, super::control::DeferredReborrowRoot::Formal { .. })
-                                            || self.cfg.points[entry.0].scope == scope)
-                                });
+                                let direct = if *mutability == ScalarReferenceMutability::Mutable {
+                                    self.deferred_reborrow_roots.iter().find(|(handle, root, entry, _)| {
+                                        *handle == binding
+                                            && (matches!(root, super::control::DeferredReborrowRoot::Formal { .. })
+                                                || self.cfg.points[entry.0].scope == scope)
+                                    })
+                                } else {
+                                    None
+                                };
                                 let nested = pending.filter(|pending| pending.handle != binding)
                                     .and_then(|pending| pending.sites.iter().filter(|site| site.parent.is_none())
                                     .find_map(|site| {
