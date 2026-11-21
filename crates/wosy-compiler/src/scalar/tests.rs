@@ -11109,3 +11109,72 @@ fn validates_scoped_fixed_array_callable_transport_and_preserves_module_collisio
         project.diagnostics
     );
 }
+
+#[test]
+fn deferred_formal_reborrow_after_an_unrelated_join_keeps_one_canonical_child() {
+    let text = r#"%%start
+unit(*!u8, bool) inspect = fn(parent, choose) {
+    if (choose) { u8 inside = 9; inside; };
+    *!u8 child = &!(*parent);
+    u8 before = *child;
+    before;
+    u8 after = *parent;
+    after;
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected formal borrower") };
+        let cfg = &function.reference_cfg;
+        let expected = text.find("&!(*parent)").unwrap() as u32;
+        let find_child = |points: &[ReferenceFlowPoint]| points.iter().filter(|point| {
+            point.source_span.range.start == expected && matches!(point.kind, CfgPointKind::Borrow { .. })
+        }).map(|point| point.id).collect::<Vec<_>>();
+        let children = find_child(&cfg.points);
+        let [child] = children.as_slice() else { panic!("expected exactly one materialized child") };
+        assert_eq!(find_child(&cfg.initial_points), children);
+        let initial = &cfg.initial_points[child.0];
+        let observed = &cfg.points[child.0];
+        assert_eq!(initial, observed);
+        let ReferenceOrigin::BorrowedFrom { parameter: 0, loan } = sole_fact(function, observed) else {
+            panic!("expected child of the first formal");
+        };
+        assert_eq!(loan.mode, ScalarReferenceMutability::Mutable);
+        let parent = loan.parent.as_ref().expect("canonical formal parent");
+        assert!(parent.parent.is_none());
+        assert_eq!(parent.origin_place.binding.declaration_span, function.parameter_spans[0]);
+    }
+}
+
+#[test]
+fn deferred_formal_reborrow_never_authorizes_a_changed_or_exposed_formal_cell() {
+    for prefix in ["parent = null;", "&parent;"] {
+        let text = format!(r#"%%start
+unit(*!u8, bool) inspect = fn(parent, choose) {{
+    {prefix}
+    if (choose) {{ u8 inside = 9; inside; }};
+    &!(*parent);
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let borrow = text.find("&!(*parent)").unwrap() as u32;
+        let ScalarItem::Function(function) = &single.program.items[0] else { panic!("expected typed formal") };
+        let unsolved = function.reference_cfg.initial_points.iter().filter(|point|
+            point.source_span.range.start == borrow
+                && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))
+        ).collect::<Vec<_>>();
+        assert!(matches!(unsolved.as_slice(), [point] if point.possible_origins.is_none()),
+            "{prefix}: expected to reach the typed pending event, without acceptance");
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "missing required dereference origin"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == borrow)
+            }), "{prefix}: {diagnostics:?}");
+        }
+    }
+}

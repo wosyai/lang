@@ -22,6 +22,7 @@ pub(crate) struct CallablePointFacts {
     pub(super) evaluations: HashMap<OccurrenceOrdinal, super::CfgPointId>,
     pub(super) installs: HashMap<OccurrenceOrdinal, FrozenInstall>,
     pub(super) definitions: HashMap<(BlockOrdinal, usize, usize), BindingDefinition>,
+    pub(super) pending_formal_reborrow: Option<PendingFormalReborrow>,
     pub(super) raw_address_exposures: Vec<(super::CfgPointId, Option<super::ReferenceBindingId>)>,
     pub(super) checked_join_values: Vec<(super::CfgPointId, [Option<super::CfgPointId>; 2])>,
     pub(super) checked_block_values: Vec<(super::CfgPointId, super::CfgPointId)>,
@@ -33,6 +34,15 @@ pub(crate) struct CallablePointFacts {
     pub(super) scalar_descriptor_install: ScalarDescriptorCandidates,
     pub(super) backing_descriptor_install: ScalarDescriptorCandidates,
     pub(super) has_nonlexical_install: bool,
+}
+
+pub(super) struct PendingFormalReborrow {
+    pub(super) point: super::CfgPointId,
+    pub(super) read: super::CfgPointId,
+    pub(super) entry: super::CfgPointId,
+    pub(super) formal: super::ReferenceBindingId,
+    pub(super) parameter: usize,
+    pub(super) origin: super::ReferenceOriginId,
 }
 
 pub(super) struct NamedReborrowParent {
