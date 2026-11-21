@@ -6045,7 +6045,14 @@ pub(super) struct CheckerIntegerCallOrigin {
     pub(super) binding: ReferenceBindingId,
     pub(super) call: OccurrenceOrdinal,
     pub(super) argument_ordinal: OccurrenceOrdinal,
-    pub(super) argument: BigInt,
+    pub(super) argument: CheckerIntegerCallArgument,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CheckerIntegerCallArgument {
+    Literal(BigInt),
+    PlainName,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -7776,15 +7783,15 @@ impl StructuralWalker<'_, '_> {
     }
 
     #[cfg(test)]
-    fn checker_integer_call_argument<'a>(
+    fn checker_integer_call_argument(
         &self,
-        binding: &'a ScalarBinding,
+        binding: &ScalarBinding,
         call: OccurrenceOrdinal,
-    ) -> Option<(OccurrenceOrdinal, &'a BigInt)> {
+    ) -> Option<(OccurrenceOrdinal, CheckerIntegerCallArgument)> {
         let ScalarExpression::Call { arguments, .. } = &binding.value else {
             return None;
         };
-        let [ScalarExpression::Integer { value, .. }] = arguments.as_slice() else {
+        let [source_argument] = arguments.as_slice() else {
             return None;
         };
         let signature = self.checked_call_signatures.get(&call)?;
@@ -7807,7 +7814,12 @@ impl StructuralWalker<'_, '_> {
         {
             return None;
         }
-        Some((*argument, value))
+        let origin = match source_argument {
+            ScalarExpression::Integer { value, .. } => CheckerIntegerCallArgument::Literal(value.clone()),
+            ScalarExpression::Name { .. } => CheckerIntegerCallArgument::PlainName,
+            _ => return None,
+        };
+        Some((*argument, origin))
     }
 
     fn binding_region(
@@ -7833,7 +7845,7 @@ impl StructuralWalker<'_, '_> {
             BindingInitialization::Outputs(self.binding_outputs(binding, position, scope)?)
         };
         #[cfg(test)]
-        let checker_local = match (&initialization, &self.mode) {
+        let mut checker_local = match (&initialization, &self.mode) {
             (BindingInitialization::Outputs(outputs), WalkMode::Callable(callable))
                 if self.occurrence_typing.checker_directives_enabled()
                     && binding.receivers.len() == 1
@@ -7866,7 +7878,7 @@ impl StructuralWalker<'_, '_> {
                     introduced_by_assignment: false,
                 };
                 #[cfg(test)]
-                if let Some((callable, from_call)) = checker_local {
+                if let Some((callable, from_call)) = checker_local.take() {
                     let binding = lexical.reference_id(callable.source, callable.function_span);
                     let key = (position.block, position.item);
                     if let Some((call, argument_ordinal, argument)) = from_call {
@@ -7876,7 +7888,7 @@ impl StructuralWalker<'_, '_> {
                                 binding,
                                 call,
                                 argument_ordinal,
-                                argument: argument.clone(),
+                                argument,
                             },
                         );
                     } else {

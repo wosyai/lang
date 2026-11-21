@@ -5,7 +5,7 @@ use num_bigint::BigInt;
 use super::{
     checker_directive::CheckerOperation,
     control::{AssignmentReplacement, BindingInitialization, BindingRegion, BlockItemKind, BlockPosition, ConditionalRegion},
-    reference::{BlockOrdinal, DirectDestinationIdentity, FunctionCallSites, OccurrenceOrdinal, PlainNameIdentity},
+    reference::{BlockOrdinal, CheckerIntegerCallArgument, DirectDestinationIdentity, FunctionCallSites, OccurrenceOrdinal, PlainNameIdentity},
     symbolic_integer::{IntegerRelation, IntegerSet},
     typecheck::is_integer_type,
     BinaryOperator, ReferenceBindingId, ScalarExpression, ScalarType,
@@ -72,13 +72,19 @@ impl<'a> IntegerComparison<'a> {
     }
 }
 
+pub(super) struct ImportedLocal<'a> {
+    pub(super) position: usize,
+    pub(super) values: IntegerSet,
+    pub(super) guard: Option<(IntegerRelation, &'a BigInt)>,
+}
+
 type IntegerRow = Vec<Rc<IntegerSet>>;
 #[derive(Default)]
 struct IntegerRoots<'a> {
     axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
     by_binding: HashMap<&'a ReferenceBindingId, usize>,
     parameters: usize,
-    imported_local: Option<IntegerSet>,
+    imported_local: Option<ImportedLocal<'a>>,
 }
 
 impl<'a> IntegerRoots<'a> {
@@ -356,13 +362,16 @@ pub(super) fn check_integer_requirements(
 
 pub(super) fn proves_requirement_with_imported_root_local(
     calls: &FunctionCallSites,
-    values: IntegerSet,
-) -> bool {
-    !values.is_empty()
-        && matches!(
-            run_integer_callable(calls, integer_tail_type(calls), None, None, Some(values)),
-            Some(Ok(ProofCoverage::Applicable(())))
-        )
+    local: ImportedLocal<'_>,
+) -> Option<bool> {
+    if local.values.is_empty() {
+        return None;
+    }
+    match run_integer_callable(calls, integer_tail_type(calls), None, None, Some(local))? {
+        Ok(ProofCoverage::Applicable(())) => Some(true),
+        Ok(ProofCoverage::NoApplicableInputs) => None,
+        Err(_) => Some(false),
+    }
 }
 
 pub(super) fn observe_integer_returns(
@@ -463,7 +472,7 @@ fn run_integer_callable<'a>(
     tail: Option<&'a ScalarType>,
     entry_filter: Option<&CheckerPredicate>,
     returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
-    imported_local: Option<IntegerSet>,
+    imported_local: Option<ImportedLocal<'a>>,
 ) -> Option<Result<ProofCoverage<()>, IntegerCheckFailure<'a>>> {
     let boundary = &calls.boundary;
     let checker_parameters = boundary.checker_parameter_bindings.as_deref()?;
@@ -489,7 +498,11 @@ fn run_integer_callable<'a>(
         }
         root = applicable;
     }
-    match walk_integer_block(calls, &mut roots, calls.structure.root, root, tail, returns)? {
+    let result = walk_integer_block(calls, &mut roots, calls.structure.root, root, tail, returns)?;
+    if roots.imported_local.is_some() {
+        return None;
+    }
+    match result {
         IntegerControl::Continue(_) | IntegerControl::Returned => {
             Some(Ok(ProofCoverage::Applicable(())))
         }
@@ -606,16 +619,38 @@ fn walk_integer_block<'a>(
                 path = path.overwrite(axis, value);
             }
             BlockItemKind::Binding(ref binding) => {
-                if block == structure.root && item.position == 0 {
-                    if let Some(values) = roots.imported_local.take() {
-                        let origin = structure.checker_integer_call_locals.get(&(block, item.position))?;
-                        let [receiver] = binding.receivers() else {
-                            return None;
-                        };
-                        roots.add(&origin.binding, &receiver.ty);
-                        path.append_local(values);
-                        continue;
+                if block == structure.root
+                    && roots.imported_local.as_ref().is_some_and(|local| local.position == item.position)
+                {
+                    let local = roots.imported_local.take()?;
+                    let origin = structure.checker_integer_call_locals.get(&(block, item.position))?;
+                    let [receiver] = binding.receivers() else {
+                        return None;
+                    };
+                    let applies = match &origin.argument {
+                        CheckerIntegerCallArgument::Literal(value) =>
+                            local.guard.is_none_or(|(relation, bound)| relation.accepts(value.cmp(bound))),
+                        CheckerIntegerCallArgument::PlainName => {
+                            let PlainNameIdentity::Lexical(argument) =
+                                calls.prepared_plain_name(origin.argument_ordinal)?
+                            else {
+                                return None;
+                            };
+                            let (axis, ty) = roots.lookup(argument)?;
+                            if structure.checked_types.expressions.get(&origin.argument_ordinal)? != ty {
+                                return None;
+                            }
+                            local.guard.is_none_or(|(relation, bound)| {
+                                path.0.iter().all(|row| row[axis].every(relation, bound))
+                            })
+                        }
+                    };
+                    if !applies {
+                        return None;
                     }
+                    roots.add(&origin.binding, &receiver.ty);
+                    path.append_local(local.values);
+                    continue;
                 }
                 let (identity, ty, value) = integer_local(calls, binding, block, item.position)?;
                 roots.add(identity, ty);

@@ -7,7 +7,7 @@ use super::{
     checker_flow::{
         check_integer_requirements, check_integer_return_bound, check_integer_return_bound_where,
         check_integer_return_bound_with_shows, proves_requirement_with_imported_root_local,
-        CheckerPredicate, IntegerBranchProof,
+        CheckerPredicate, ImportedLocal, IntegerBranchProof,
         IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
     control::BlockItemKind,
@@ -404,11 +404,15 @@ fn use_verified_return_bound(
     let body = calls.function_body(module, item, None)?;
     let structure = &body.structure;
     let root = structure.root;
-    let [binding_item, requirement_item, tail @ ..] = structure.blocks.get(root.0)?.items.as_slice() else {
+    let items = &structure.blocks.get(root.0)?.items;
+    let first_nonliteral = items.iter().position(|item| {
+        !matches!(item.kind, BlockItemKind::Binding(_))
+            || !structure.checker_integer_locals.contains_key(&(root, item.position))
+    })?;
+    let [binding_item, requirement_item, tail @ ..] = &items[first_nonliteral..] else {
         return None;
     };
-    if binding_item.position != 0
-        || !matches!(binding_item.kind, BlockItemKind::Binding(_))
+    if !matches!(binding_item.kind, BlockItemKind::Binding(_))
         || !(tail.is_empty() || matches!(tail, [item] if matches!(item.kind, BlockItemKind::FinalOutput(_))))
     {
         return None;
@@ -439,14 +443,15 @@ fn use_verified_return_bound(
     {
         return None;
     }
-    match &verified.guard {
-        None | Some(VerifiedEntryGuard::Boolean(true)) => {}
-        Some(VerifiedEntryGuard::Integer { slot: 0, ty, operator, bound })
-            if ty == parameter && IntegerRelation::from_operator(operator)?.accepts(origin.argument.cmp(bound)) => {}
+    let guard = match &verified.guard {
+        None | Some(VerifiedEntryGuard::Boolean(true)) => None,
+        Some(VerifiedEntryGuard::Integer { slot: 0, ty, operator, bound }) if ty == parameter =>
+            Some((IntegerRelation::from_operator(operator)?, bound)),
         _ => return None,
-    }
+    };
     let (values, _) = IntegerSet::from_type(&verified.output_type)?.split(&verified.operator, &verified.bound)?;
-    Some(if proves_requirement_with_imported_root_local(body, values) {
+    let imported = ImportedLocal { position: binding_item.position, values, guard };
+    Some(if proves_requirement_with_imported_root_local(body, imported)? {
         ImportedRequirement::Proved
     } else {
         ImportedRequirement::NotEstablished
@@ -966,14 +971,15 @@ mod tests {
                 assert_eq!(signature.parameters, [ScalarType::U8]);
                 assert_eq!(signature.outputs.outputs[0].ty, ScalarType::U8);
                 assert_eq!(body.structure.checked_types.expressions[&origin.argument_ordinal], ScalarType::U8);
-                assert_eq!(origin.argument, BigInt::from(7));
+                assert_eq!(origin.argument, super::super::reference::CheckerIntegerCallArgument::Literal(BigInt::from(7)));
                 let directive = body.structure.checker_directives.values().next().unwrap();
                 let Some(CheckerPredicate::Integer(requirement)) = &directive.predicate else {
                     panic!("expected a typed integer requirement");
                 };
                 assert_eq!(requirement.binding, origin.binding);
             } else {
-                assert!(origin.is_none());
+                let origin = origin.expect("canonical plain-name argument");
+                assert_eq!(origin.argument, super::super::reference::CheckerIntegerCallArgument::PlainName);
             }
             assert_eq!(check_integer_requirements(body), None);
         }
@@ -989,6 +995,8 @@ mod tests {
             u8(u8) other = fn(value) {{ value }};
             u8() accepted = fn {{ u8 result = clamp(7); core.require(result <= 10, {OUTPUT}); result }};
             u8() insufficient = fn {{ u8 result = clamp(7); core.require(result <= 8, {OUTPUT}); result }};
+            u8() lexical_inside = fn {{ u8 input = 7; u8 result = clamp(input); core.require(result <= 10, {OUTPUT}); result }};
+            u8() lexical_outside = fn {{ u8 input = 11; u8 result = clamp(input); core.require(result <= 10, {OUTPUT}); result }};
             u8() outside = fn {{ u8 result = clamp(11); core.require(result <= 10, {OUTPUT}); result }};
             u8() different = fn {{ u8 result = other(7); core.require(result <= 10, {OUTPUT}); result }};
             u8(u8) dynamic = fn(value) {{ u8 result = clamp(value); core.require(result <= 10, {OUTPUT}); result }};
@@ -1003,8 +1011,16 @@ mod tests {
         let identity = (&proof_source, verified.proof_span, "bounded");
         let use_at = |name| use_verified_return_bound(&prepared, &app, name, identity, &verified);
         assert_eq!(use_at("accepted"), Some(ImportedRequirement::Proved));
+        assert_eq!(use_at("lexical_inside"), Some(ImportedRequirement::Proved));
+        let wide_proof = "proof wide for clamp(x) -> (out) where (x <= 255) ensures (out <= 10) {}";
+        let wide_source = source("proof/clamp.fragment.w", "proof-wide-r1");
+        let wide = verified_summary(&app, &text, &app, &wide_source, wide_proof).unwrap();
+        assert_eq!(
+            use_verified_return_bound(&prepared, &app, "dynamic", (&wide_source, wide.proof_span, "wide"), &wide),
+            Some(ImportedRequirement::Proved),
+        );
         assert_eq!(use_at("insufficient"), Some(ImportedRequirement::NotEstablished));
-        for name in ["outside", "different", "dynamic", "wrong_binding", "clamp", "nonexistent"] {
+        for name in ["outside", "lexical_outside", "different", "dynamic", "wrong_binding", "clamp", "nonexistent"] {
             assert_eq!(use_at(name), None);
         }
         let different_source = source("proof/clamp.fragment.w", "proof-r2");
