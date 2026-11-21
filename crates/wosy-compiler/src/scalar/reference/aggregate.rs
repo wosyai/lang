@@ -1163,8 +1163,10 @@ fn prove_read_views(
         }
         let body = bodies.get(&key).ok_or_else(|| format!("missing ordinary raw read body {key:?}"))?;
         let facts = body.facts.ok_or_else(|| format!("missing ordinary raw read facts {key:?}"))?;
-        if matches!(source, ReadSource::Formal(slot) if !facts.read_formals.contains(&slot)
-            || !body.sites.boundary.root_outputs.iter().all(|output| ordinary_value(&output.ty) || output.ty == ScalarType::Unit))
+        let outputs = &body.sites.boundary.root_outputs;
+        let supported_outputs = outputs.iter().all(|output| ordinary_value(&output.ty) || output.ty == ScalarType::Unit)
+            || (checked_scalar_output(outputs) && facts.independent_checked_result);
+        if matches!(source, ReadSource::Formal(slot) if !facts.read_formals.contains(&slot) || !supported_outputs)
             || !body.is_monomorphic
         {
             return Err(format!("unproved ordinary raw read formal {source:?} at {key:?} in {:?}", body.source));
@@ -2167,6 +2169,75 @@ impl ProjectReferenceResults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passive_raw_reader_requires_a_grounded_read_and_an_independent_checked_output() {
+        let text = "%%start
+leaf = overload {
+    *u8(*?u8, *u8) => fn(data, foreign) {
+        u8 value = 0;
+        unsafe { value = core.load<u8>(data); };
+        &value
+    };
+    *u32(*?u32, *u32) => fn(data, foreign) {
+        u32 value = 0;
+        unsafe { value = core.load<u32>(data); };
+        foreign
+    };
+};
+*u8(*?u8, *u8) relay = fn(data, foreign) { leaf(data, foreign) };
+*u8(*?u8) unknown = fn(data) { u8 value = 0; &value };
+*u8(*?u8) consuming = fn(data) {
+    u8 value = 0;
+    unsafe { value = core.load<u8>(data); core.free(data); };
+    &value
+};
+%%end";
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let source = SourceIdentity::new("project".into(), "package".into(), "main.w".into(), "r1".into());
+            let parsed = crate::parse_source(source.clone(), text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let typed = typecheck_scalar_program(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), layout);
+            assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+            let program = typed.program;
+            let calls = resolve_program_call_sites(&program).unwrap();
+            let (updates, errors) = derive_and_converge_program_references(&program, &calls);
+            assert!(errors.is_empty(), "{errors:?}");
+            let mut bodies = BTreeMap::new();
+            let mut declarations = HashMap::new();
+            for (item, result) in &updates {
+                let ScalarItem::Function(function) = &program.items[*item] else { unreachable!() };
+                declarations.insert((&program.source, function.name_span), (0, *item));
+                for (arm, result) in std::iter::once((None, result)).chain(
+                    result.arms.iter().enumerate().map(|(index, result)| (Some(index), result)),
+                ) {
+                    let Some(sites) = calls.function_body(*item, arm) else { continue };
+                    bodies.insert((0, *item, arm), Body {
+                        facts: Some(&result.aggregate),
+                        cfg: &result.cfg,
+                        sites,
+                        source: &program.source,
+                        is_monomorphic: true,
+                        supports_input_result: true,
+                    });
+                }
+            }
+            let mut proven = BTreeSet::new();
+            for (item, arm, expected_error) in [
+                (0, Some(0), None),
+                (0, Some(1), Some("unproved ordinary raw read formal")),
+                (1, None, Some("unproved ordinary raw read formal")),
+                (2, None, Some("no proven load")),
+                (3, None, Some("unproved ordinary raw read use")),
+            ] {
+                let result = prove_read_views(((0, item, arm), ReadSource::Formal(0)), &bodies, &declarations, &mut proven);
+                match expected_error {
+                    Some(expected) => assert!(result.unwrap_err().contains(expected)),
+                    None => result.unwrap(),
+                }
+            }
+        }
+    }
 
     #[test]
     fn aggregate_value_deadlines_preserve_consumers_but_remove_dead_branch_history() {
