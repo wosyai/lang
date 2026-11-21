@@ -2318,47 +2318,18 @@ fn derive_scalar_declarations(
     #[cfg(any(test, feature = "internal-checker"))] mut proofs: Option<&mut Vec<CstNode>>,
 ) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
-    let diagnostics = derive_scalar_diagnostics_from_cst(canonical);
     let source_root = canonical
         .root
         .children()
         .find(|node| node.kind() == SyntaxKind::Root)
         .expect("source root");
-    let structs = source_root
-        .children()
-        .chain(source_root.descendants())
-        .filter(|node| node.kind() == SyntaxKind::StructDecl)
-        .enumerate()
-        .map(|(index, node)| {
-            derive_struct(
-                node,
-                ScalarStructId {
-                    source: canonical.source.clone(),
-                    index,
-                },
-            )
-        })
-        .collect();
-    let enums = source_root
-        .children()
-        .chain(source_root.descendants())
-        .filter(|node| node.kind() == SyntaxKind::EnumDecl)
-        .enumerate()
-        .map(|(index, node)| {
-            derive_enum(
-                node,
-                ScalarEnumId {
-                    source: canonical.source.clone(),
-                    index,
-                },
-            )
-        })
-        .collect();
+    let mut has_named_proofs = false;
     let mut generic_function = false;
     for node in source_root.children() {
         match node.kind() {
-            #[cfg(any(test, feature = "internal-checker"))]
-            SyntaxKind::ProofDecl if proofs.is_some() => {
+            SyntaxKind::ProofDecl => {
+                has_named_proofs = true;
+                #[cfg(any(test, feature = "internal-checker"))]
                 if let Some(proofs) = proofs.as_deref_mut() {
                     proofs.push(node);
                 }
@@ -2414,6 +2385,46 @@ fn derive_scalar_declarations(
             generic_function = false;
         }
     }
+    let pruned = has_named_proofs.then(|| runtime_module_roots(&source_root));
+    let runtime_roots = pruned.as_deref().unwrap_or_else(|| std::slice::from_ref(&source_root));
+    #[cfg(any(test, feature = "internal-checker"))]
+    let include_proof_diagnostics = proofs.is_some();
+    #[cfg(not(any(test, feature = "internal-checker")))]
+    let include_proof_diagnostics = false;
+    let diagnostic_roots = if has_named_proofs && !include_proof_diagnostics {
+        runtime_roots
+    } else {
+        std::slice::from_ref(&canonical.root)
+    };
+    let diagnostics = scalar_diagnostics_in_roots(canonical, diagnostic_roots);
+    let structs = runtime_roots.iter()
+        .flat_map(CstNode::descendants)
+        .filter(|node| node.kind() == SyntaxKind::StructDecl)
+        .enumerate()
+        .map(|(index, node)| {
+            derive_struct(
+                node,
+                ScalarStructId {
+                    source: canonical.source.clone(),
+                    index,
+                },
+            )
+        })
+        .collect();
+    let enums = runtime_roots.iter()
+        .flat_map(CstNode::descendants)
+        .filter(|node| node.kind() == SyntaxKind::EnumDecl)
+        .enumerate()
+        .map(|(index, node)| {
+            derive_enum(
+                node,
+                ScalarEnumId {
+                    source: canonical.source.clone(),
+                    index,
+                },
+            )
+        })
+        .collect();
     ScalarSourceDeclarations {
         source: canonical.source.clone(),
         items,
@@ -2520,11 +2531,24 @@ use typecheck::{
 };
 use typecheck::{split_module_typing, ScalarModuleTyping, ScalarProgramTyping};
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    let mut diagnostics = string_diagnostics(canonical);
-    diagnostics.extend(char_diagnostics(canonical));
-    diagnostics.extend(integer_diagnostics(canonical));
-    diagnostics.extend(float_diagnostics(canonical));
-    diagnostics.extend(fixed_array_length_diagnostics(canonical));
+    let pruned = canonical.root.children()
+        .find(|node| node.kind() == SyntaxKind::Root)
+        .filter(|module| module.children().any(|node| node.kind() == SyntaxKind::ProofDecl))
+        .map(|module| runtime_module_roots(&module));
+    let roots = pruned.as_deref().unwrap_or_else(|| std::slice::from_ref(&canonical.root));
+    scalar_diagnostics_in_roots(canonical, roots)
+}
+
+fn runtime_module_roots(module: &CstNode) -> Vec<CstNode> {
+    module.children().filter(|node| node.kind() != SyntaxKind::ProofDecl).collect()
+}
+
+fn scalar_diagnostics_in_roots(canonical: &CanonicalCstRoot, roots: &[CstNode]) -> Vec<super::Diagnostic> {
+    let mut diagnostics = string_diagnostics(canonical, roots);
+    diagnostics.extend(char_diagnostics(canonical, roots));
+    diagnostics.extend(integer_diagnostics(canonical, roots));
+    diagnostics.extend(float_diagnostics(canonical, roots));
+    diagnostics.extend(fixed_array_length_diagnostics(canonical, roots));
     diagnostics
 }
 
@@ -3894,10 +3918,9 @@ fn derive_callable_array_type(node: &CstNode) -> ScalarType {
     derive_type(node)
 }
 
-fn fixed_array_length_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants()
+fn fixed_array_length_diagnostics(canonical: &CanonicalCstRoot, roots: &[CstNode]) -> Vec<super::Diagnostic> {
+    roots.iter()
+        .flat_map(CstNode::descendants)
         .filter(|node| node.kind() == SyntaxKind::FixedArrayLength)
         .filter_map(|length| {
             let token = direct_token(&length, SyntaxKind::Integer)?;
@@ -4050,10 +4073,9 @@ fn decode_char(value: &str) -> Result<char, (usize, usize)> {
     Ok(character)
 }
 
-fn string_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants_with_tokens()
+fn string_diagnostics(canonical: &CanonicalCstRoot, roots: &[CstNode]) -> Vec<super::Diagnostic> {
+    roots.iter()
+        .flat_map(CstNode::descendants_with_tokens)
         .filter_map(|element| match element {
             NodeOrToken::Token(token) if token.kind() == SyntaxKind::String => {
                 decode_string(token.text())
@@ -4078,10 +4100,9 @@ fn string_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
         .collect()
 }
 
-fn char_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants_with_tokens()
+fn char_diagnostics(canonical: &CanonicalCstRoot, roots: &[CstNode]) -> Vec<super::Diagnostic> {
+    roots.iter()
+        .flat_map(CstNode::descendants_with_tokens)
         .filter_map(|element| match element {
             NodeOrToken::Token(token) if token.kind() == SyntaxKind::Char => {
                 decode_char(token.text())
@@ -4106,10 +4127,9 @@ fn char_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
         .collect()
 }
 
-fn integer_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants_with_tokens()
+fn integer_diagnostics(canonical: &CanonicalCstRoot, roots: &[CstNode]) -> Vec<super::Diagnostic> {
+    roots.iter()
+        .flat_map(CstNode::descendants_with_tokens)
         .filter_map(|element| match element {
             NodeOrToken::Token(token) if token.kind() == SyntaxKind::Integer => {
                 if parse_integer(token.text()).is_none() {
@@ -4153,10 +4173,9 @@ fn parse_float(text: &str) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
-fn float_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants_with_tokens()
+fn float_diagnostics(canonical: &CanonicalCstRoot, roots: &[CstNode]) -> Vec<super::Diagnostic> {
+    roots.iter()
+        .flat_map(CstNode::descendants_with_tokens)
         .filter_map(|element| match element {
             NodeOrToken::Token(token) if token.kind() == SyntaxKind::Float => {
                 parse_float(token.text())

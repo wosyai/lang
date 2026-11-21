@@ -91,15 +91,10 @@ pub enum SyntaxKind {
     AllocationBinding,
     ParenthesizedDereferencePlace,
     CopyModifier,
-    #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
     ProofDecl = 81,
-    #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
     ProofTarget = 82,
-    #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
     ProofOutputs = 83,
-    #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
     ProofWhere = 84,
-    #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
     ProofEnsures = 85,
 }
 
@@ -191,15 +186,10 @@ impl Language for WosyLanguage {
             78 => SyntaxKind::AllocationBinding,
             79 => SyntaxKind::ParenthesizedDereferencePlace,
             80 => SyntaxKind::CopyModifier,
-            #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
             81 => SyntaxKind::ProofDecl,
-            #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
             82 => SyntaxKind::ProofTarget,
-            #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
             83 => SyntaxKind::ProofOutputs,
-            #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
             84 => SyntaxKind::ProofWhere,
-            #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
             85 => SyntaxKind::ProofEnsures,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
@@ -483,7 +473,7 @@ pub fn parse_proof_module(
     text: String,
     configured_comments: &[String],
 ) -> ParseResult {
-    parse_entry(source, text, configured_comments, Rule::proof_module)
+    parse(source, text, configured_comments)
 }
 
 fn parse_entry(
@@ -506,8 +496,8 @@ fn parse_entry(
             add_gap(&mut builder, &text, 0, &comments);
             builder.finish_node();
             let span = ByteSpan::new(0, text.len() as u32);
-            #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
-            let span = if matches!(rule, Rule::proof_fragment | Rule::proof_module) {
+            #[cfg(any(test, feature = "checker-test-support"))]
+            let span = if matches!(rule, Rule::proof_fragment) {
                 match _error.location {
                     pest::error::InputLocation::Pos(at) => ByteSpan::new(at as u32, at as u32),
                     pest::error::InputLocation::Span((start, end)) => {
@@ -776,17 +766,10 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::source => SyntaxKind::Root,
         #[cfg(any(test, feature = "checker-test-support"))]
         Rule::proof_fragment => SyntaxKind::Root,
-        #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
-        Rule::proof_module => SyntaxKind::Root,
-        #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
         Rule::proof_decl => SyntaxKind::ProofDecl,
-        #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
         Rule::proof_target => SyntaxKind::ProofTarget,
-        #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
         Rule::proof_outputs => SyntaxKind::ProofOutputs,
-        #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
         Rule::proof_where => SyntaxKind::ProofWhere,
-        #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
         Rule::proof_ensures => SyntaxKind::ProofEnsures,
         Rule::boundary_start => SyntaxKind::BoundaryStart,
         Rule::boundary_end => SyntaxKind::BoundaryEnd,
@@ -2584,10 +2567,9 @@ mod proof_fragment_tests {
     #[test]
     fn proof_fragment_is_not_enabled_in_ordinary_source() {
         let proof = "proof bounded for clamp_bounded(x) -> (out) ensures (out <= 10) {}";
-        let text = format!("%%start\n{proof}\n%%end");
-        let result = parse(source(), text.clone(), &[]);
+        let result = parse(source(), proof.to_owned(), &[]);
         assert!(!result.is_valid());
-        assert_eq!(result.reconstruct(), text);
+        assert_eq!(result.reconstruct(), proof);
         assert!(!result.root.descendants().any(|node| node.kind() == SyntaxKind::ProofDecl));
     }
 
@@ -2615,7 +2597,9 @@ mod proof_fragment_tests {
         }
         let target = declarations[2].children().find(|node| node.kind() == SyntaxKind::ProofTarget).unwrap();
         assert!(target.children().any(|node| node.kind() == SyntaxKind::QualifiedCall && node.text() == "library.identity"));
-        assert!(!parse(identity, text, &[]).is_valid());
+        let ordinary = parse(identity, text, &[]);
+        assert!(ordinary.is_valid());
+        assert_eq!(ordinary.canonical_cst().snapshot(), result.canonical_cst().snapshot());
     }
 
     #[test]

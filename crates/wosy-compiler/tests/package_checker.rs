@@ -430,6 +430,10 @@ fn explicit_proof_module_checks_unused_pure_callable_over_arbitrary_inputs() {
         proof("invalid", &format!("{base}\nproof invalid for identity(input) -> (out) ensures (out <= 256) {{}}")),
         ScalarModuleProofOutcome::Invalid(_),
     ));
+    assert!(matches!(
+        proof("bounded", &format!("{base}\nproof bounded for identity(input) -> (out) ensures (out <= 255) {{ core.show(out == 1__0); }}")),
+        ScalarModuleProofOutcome::Invalid(diagnostics) if diagnostics.iter().any(|diagnostic| diagnostic.code == "B0010"),
+    ));
     let ordinary = parse_source(identity.clone(), format!("%%start\n{base}\n%%end"), &[]);
     assert!(ordinary.diagnostics.is_empty());
     assert!(prepare_scalar_project(
@@ -437,8 +441,13 @@ fn explicit_proof_module_checks_unused_pure_callable_over_arbitrary_inputs() {
         vec![identity.clone()],
         ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
     ).is_ok());
-    let ordinary_proof = parse_source(identity, format!("%%start\n{declarations}\n%%end"), &[]);
-    assert!(!ordinary_proof.diagnostics.is_empty(), "the ordinary parse/Build entry must remain proof-free");
+    let ordinary_proof = parse_source(identity.clone(), format!("%%start\n{declarations}\n%%end"), &[]);
+    assert!(ordinary_proof.diagnostics.is_empty(), "ordinary parsing recognizes inert module proof declarations");
+    assert!(prepare_scalar_project(
+        vec![(derive_scalar_declarations_from_cst(ordinary_proof.result.canonical_cst()), Vec::new())],
+        vec![identity],
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    ).is_ok());
 }
 
 #[test]

@@ -1078,7 +1078,7 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
-    fn internal_proof_adapter_refuses_unselected_sources_and_build_keeps_ordinary_parser() {
+    fn internal_proof_adapter_refuses_unselected_sources_and_build_erases_named_proofs() {
         let vertex = PackageRelativePath::new("main.w".into()).unwrap();
         let (project, configuration) = routing_test_project("internal-proof-outside-graph", &[
             ("main.w", "%%start\nu8(u8) identity = fn(input) { input };\n%%end"),
@@ -1092,16 +1092,21 @@ mod tests {
         assert_eq!(counts, routing_observations::Counts { extractions: 1, ..Default::default() });
         assert!(!project.root.join(".wosy").exists());
 
-        let text = "%%start\nu8(u8) identity = fn(input) { input };\nproof alpha for identity(input) -> (out) ensures (out <= 255) {}\n%%end";
-        let (project, configuration) = routing_test_project("ordinary-build-stays-proof-free", &[("main.w", text)]);
+        let text = "%%start\nu8(u8) identity = fn(input) { input };\nproof alpha for identity(input) -> (out) ensures (out <= 10) {}\n%%end";
+        let (project, configuration) = routing_test_project("ordinary-build-erases-proof", &[("main.w", text)]);
         let selected = check_loaded_proofs(&project.root, &project, &configuration, ScalarTargetLayout::NATIVE64, vertex, &["alpha"]);
         let (outcomes, _) = selected.expect("valid explicit proof source");
-        assert_eq!(outcomes.unwrap(), [wosy_compiler::ScalarModuleProofOutcome::Proved]);
-        assert!(matches!(
-            load_canonical_project_inputs(&project.root, &project, &configuration, CanonicalLoadPurpose::Build),
-            Err(CanonicalLoadFailure::Syntax { diagnostics, .. }) if diagnostics[0].code == "S0001",
-        ));
+        assert_eq!(outcomes.unwrap(), [wosy_compiler::ScalarModuleProofOutcome::Refuted]);
         assert!(!project.root.join(".wosy").exists());
+        let (built, counts) = routing_observations::observe(|| {
+            compile_project(&project.root, &project, &configuration, ScalarTargetLayout::NATIVE64)
+        });
+        let (llvm, observations) = built.expect("ordinary Build ignores the proof");
+        assert_eq!(observations.len(), 1);
+        assert!(!llvm.contains("alpha"));
+        assert_eq!(counts, routing_observations::Counts {
+            extractions: 1, preparations: 1, builds: 1, single_module_emissions: 1, ..Default::default()
+        });
     }
 
     #[cfg(feature = "internal-checker")]
