@@ -11813,3 +11813,68 @@ unit(bool) inspect = fn(choose) {{
         }
     }
 }
+
+#[test]
+fn deferred_direct_shared_leaf_uses_exact_local_or_formal_root() {
+    for (parameters, formal, setup) in [
+        ("bool", "", "u8 owner = 7; *!u8 parent = &!owner;"),
+        ("*!u8, bool", "parent, ", ""),
+    ] {
+        for (body, result) in [
+            ("u8 prior = *parent; u8 observed = *leaf; *parent = 8; prior; observed;", 0),
+            ("*parent = 8; u8 observed = *leaf; observed;", 1),
+            ("*u8 copy = leaf; u8 observed = *copy; observed;", 2),
+        ] {
+            let text = format!(r#"%%start
+unit({parameters}) inspect = fn({formal}choose) {{
+    {setup}
+    if (choose) {{ u8 ignored = 9; ignored; }};
+    *u8 leaf = &(*parent);
+    {body}
+}};
+%%end"#);
+            let (single, project) = both_reference_functions(&text);
+            let leaf = text.find("&(*parent)").unwrap() as u32;
+            for (items, diagnostics) in [
+                (&single.program.items, &single.diagnostics),
+                (&project.project.modules[0].items, &project.diagnostics),
+            ] {
+                let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+                let cfg = &function.reference_cfg;
+                let point = cfg.initial_points.iter().find(|point| point.source_span.range.start == leaf
+                    && matches!(point.kind, CfgPointKind::Borrow { .. } | CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. })))
+                    .expect("canonical loan or deferred expression");
+                if result != 0 {
+                    assert!(matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))
+                        && point.possible_origins.is_none());
+                    if result == 2 {
+                        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                            && diagnostic.message == "missing required dereference origin"), "{diagnostics:?}");
+                    } else {
+                        let requested = text.find("parent = 8").unwrap() as u32;
+                        assert!(diagnostics.iter().any(|diagnostic| {
+                            diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == requested)
+                                && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == leaf)
+                        }), "{diagnostics:?}");
+                    }
+                    continue;
+                }
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                assert!(matches!(point.kind, CfgPointKind::Borrow { .. }));
+                assert_eq!(point, &cfg.points[point.id.0]);
+                let loan = match (formal.is_empty(), sole_fact(function, point)) {
+                    (true, ReferenceOrigin::Fresh { loan, .. }) => loan,
+                    (false, ReferenceOrigin::BorrowedFrom { parameter: 0, loan }) => loan,
+                    _ => panic!("expected precise root provenance"),
+                };
+                assert_eq!(loan.mode, ScalarReferenceMutability::Shared);
+                let ancestor = loan.parent.as_deref().expect("canonical immediate root");
+                assert_eq!(ancestor.mode, ScalarReferenceMutability::Mutable);
+                assert!(ancestor.parent.is_none());
+                assert!(matches!(loan.origin_place.projections.as_slice(),
+                    [ReferencePlaceProjection::Dereference(parent)] if **parent == *ancestor));
+            }
+        }
+    }
+}
