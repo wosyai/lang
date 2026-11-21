@@ -458,6 +458,7 @@ fn compile_project(
     if !validation.diagnostics().is_empty() {
         return Err("build rejected by semantic diagnostics".to_owned());
     }
+    drop(texts);
     let llvm = if graph.nodes.len() == 1 {
         #[cfg(test)]
         routing_observations::record(|counts| counts.single_module_emissions += 1);
