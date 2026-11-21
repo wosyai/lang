@@ -365,8 +365,12 @@ fn emit_single_module_llvm<'a>(
                 if *ty == ScalarType::Unit {
                     continue;
                 }
-                let llvm_ty = storage_type(&context, ty, &layouts, target_layout)?;
+                let (llvm_ty, alignment) =
+                    storage_type_and_alignment(&context, ty, &layouts, target_layout)?;
                 let global = module.add_global(llvm_ty, None, name);
+                if let Some(alignment) = storage_alignment(alignment)? {
+                    global.set_alignment(alignment);
+                }
                 global.set_linkage(Linkage::Internal);
                 global.set_initializer(&llvm_ty.const_zero());
                 globals.insert(name.clone(), (global, ty.clone()));
@@ -759,8 +763,12 @@ fn emit_project_llvm<'a>(
                         continue;
                     }
                     let name = project_global_name(&source_module.source, name);
-                    let llvm_ty = storage_type(&context, ty, &layouts, target_layout)?;
+                    let (llvm_ty, alignment) =
+                        storage_type_and_alignment(&context, ty, &layouts, target_layout)?;
                     let global = module.add_global(llvm_ty, None, &name);
+                    if let Some(alignment) = storage_alignment(alignment)? {
+                        global.set_alignment(alignment);
+                    }
                     global.set_linkage(Linkage::Internal);
                     global.set_initializer(&llvm_ty.const_zero());
                     globals.insert(name, (global, ty.clone()));
@@ -1365,11 +1373,11 @@ fn definition_function_type<'ctx>(
 mod aggregate_transfer;
 mod memory;
 use memory::{
-    aggregate_type, allocation_layout, basic_type, build_aggregate, builder_error,
+    aggregate_type, align_storage_alloca, allocation_layout, basic_type, build_aggregate, builder_error,
     emit_array_literal, emit_place_value, emit_place_value_in_project, emit_struct_literal,
-    emit_typed_expression, emit_utf8_literal, entry_alloca, extract_output, float_constant,
+    emit_typed_expression, emit_utf8_literal, entry_alloca, entry_storage_alloca, extract_output, float_constant,
     integer_constant, integer_scalar_type, integer_type, integer_width, place_pointer,
-    pointer_integer_type, storage_type, store_value, struct_member_place, structure, take_basic,
+    pointer_integer_type, storage_alignment, storage_type, storage_type_and_alignment, store_value, struct_member_place, structure, take_basic,
     value_type,
 };
 fn emit_binding_value<'ctx, 'module>(
@@ -1497,11 +1505,7 @@ fn store_binding_outputs<'ctx, 'module>(
             state.values.insert(name.clone(), EmitValue::Unit);
             continue;
         }
-        let slot = entry_alloca(
-            state,
-            storage_type(context, ty, state.layouts, state.target_layout)?,
-            name,
-        )?;
+        let slot = entry_storage_alloca(context, state, ty, name)?;
         store_value(context, state, slot, ty, value)?;
         state.storage.insert(name.clone(), (slot, ty.clone()));
         transition_runtime_array_binding_initialization(state, name, ty, &binding.value)?;
@@ -1901,12 +1905,12 @@ fn emit_function<'ctx, 'module>(
             let argument = value
                 .get_nth_param(index as u32)
                 .ok_or_else(|| "missing function parameter".to_owned())?;
+            let (storage, alignment) =
+                storage_type_and_alignment(context, parameter, layouts, target_layout)?;
             let slot = builder
-                .build_alloca(
-                    storage_type(context, parameter, layouts, target_layout)?,
-                    &function.parameters[index],
-                )
+                .build_alloca(storage, &function.parameters[index])
                 .map_err(builder_error)?;
+            align_storage_alloca(slot, alignment)?;
             store_value(
                 context,
                 &mut state,
@@ -2205,12 +2209,12 @@ fn emit_project_function<'ctx, 'module>(
             let argument = value
                 .get_nth_param(index as u32)
                 .ok_or_else(|| "missing function parameter".to_owned())?;
+            let (storage, alignment) =
+                storage_type_and_alignment(context, parameter, layouts, target_layout)?;
             let slot = builder
-                .build_alloca(
-                    storage_type(context, parameter, layouts, target_layout)?,
-                    &function.parameters[index],
-                )
+                .build_alloca(storage, &function.parameters[index])
                 .map_err(builder_error)?;
+            align_storage_alloca(slot, alignment)?;
             store_value(
                 context,
                 &mut state,
@@ -3327,11 +3331,7 @@ fn retain_assignment_destination<'ctx>(
             }) {
                 Some(destination) => Ok(AssignmentDestination::Existing(destination)),
                 None => {
-                    let slot = entry_alloca(
-                        state,
-                        storage_type(context, ty, state.layouts, state.target_layout)?,
-                        name,
-                    )?;
+                    let slot = entry_storage_alloca(context, state, ty, name)?;
                     Ok(AssignmentDestination::NewStorage {
                         name: name.clone(),
                         slot,
@@ -4093,11 +4093,7 @@ fn materialize_assignment_values<'ctx, 'module>(
                 position += 1;
                 continue;
             }
-            let temporary = entry_alloca(
-                state,
-                storage_type(context, &ty, state.layouts, state.target_layout)?,
-                "assignment_value",
-            )?;
+            let temporary = entry_storage_alloca(context, state, &ty, "assignment_value")?;
             store_value(context, state, temporary, &ty, value)?;
             let value = if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
                 EmitValue::Basic(temporary.into())
