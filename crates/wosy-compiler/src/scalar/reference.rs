@@ -3005,7 +3005,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         None
                     };
                     let initializer = self.cursor.filter(|_| self.cursor != before);
-                    if prepared_raw_null && self.aggregate_facts.local_array_copy_allocation.is_some() {
+                    if prepared_raw_null
+                        && (self.aggregate_facts.local_array_copy_allocation.is_some()
+                            || (scope == ReferenceScopeId(0) && calls.call_occurrences.len() == 2
+                                && matches!(self.proof_points.backing_descriptor_install,
+                                    ScalarDescriptorCandidates::One(..))))
+                    {
                         self.aggregate_facts.checked_raw_null_initializers.insert(
                             initializer.expect("prepared raw null evaluation"),
                         );
@@ -3891,8 +3896,113 @@ fn previous_origin_loans(
         .collect()
 }
 
+struct PassiveDescriptorRead {
+    projection: CfgPointId,
+    literal: CfgPointId,
+    call: CfgPointId,
+    field: ScalarStructFieldId,
+}
+
+fn passive_descriptor_read(
+    cfg: &ScalarReferenceCfg,
+    marker: &ScalarDescriptorInstall,
+    facts: &aggregate::AggregateFlowFacts,
+    sites: &FunctionCallSites,
+) -> Option<PassiveDescriptorRead> {
+    if sites.call_occurrences.len() != 2 || !sites.allocation_length_call_targets.is_empty()
+        || facts.literals.len() != 1
+    {
+        return None;
+    }
+    let (&literal, members) = facts.literals.first_key_value()?;
+    let [(member, alias_read)] = members.as_slice() else { return None };
+    let field = sites.structure.literal_fields.get(member)?;
+    if field.structure != marker.structure { return None }
+    let CfgPointKind::Read { binding: alias } = &cfg.points.get(alias_read.0)?.kind else { return None };
+    let binding_for_literal = |point: CfgPointId| match &cfg.points.get(point.0)?.kind {
+        CfgPointKind::Bind { binding } => Some(binding),
+        _ => None,
+    };
+    let mut carrier = None;
+    let mut alias_start = None;
+    for (&bind, &(rhs, _)) in &facts.installations {
+        let binding = binding_for_literal(bind)?;
+        if rhs == literal {
+            if carrier.replace((binding, bind)).is_some() { return None }
+        }
+        if binding == alias {
+            if !facts.checked_raw_null_initializers.contains(&rhs) || alias_start.replace(bind).is_some() { return None }
+        }
+    }
+    let (carrier, carrier_start) = carrier?;
+    let alias_start = alias_start?;
+    if alias == carrier || carrier == &marker.binding || alias == &marker.binding
+        || cfg.points[alias_start.0].scope != ReferenceScopeId(0)
+        || cfg.points[carrier_start.0].scope != ReferenceScopeId(0)
+    {
+        return None;
+    }
+    let mut assignment = None;
+    let mut call = None;
+    let mut carrier_read = None;
+    let mut carrier_move = None;
+    for point in &cfg.points {
+        if point.successors.iter().any(|next| next.0 <= point.id.0) { return None }
+        match &point.kind {
+            CfgPointKind::Assign { target, rhs_point, .. } if &target.binding == alias => {
+                if !target.projections.is_empty() || assignment.replace((point.id, *rhs_point)).is_some() { return None }
+            }
+            CfgPointKind::Assign { target, .. } if &target.binding == carrier => return None,
+            CfgPointKind::Read { binding } if binding == alias && point.id != *alias_read => return None,
+            CfgPointKind::Read { binding } if binding == carrier => {
+                if carrier_read.replace(point.id).is_some() { return None }
+            }
+            CfgPointKind::Move { place, owner, .. } if owner == carrier => {
+                if &place.binding != carrier || !place.projections.is_empty()
+                    || carrier_move.replace(point.id).is_some() { return None }
+            }
+            CfgPointKind::Borrow { place, .. } | CfgPointKind::DeferredMove { place, .. }
+                if &place.binding == carrier || &place.binding == alias => return None,
+            CfgPointKind::Call { output: 0, .. } if point.id == marker.frozen.rhs => {}
+            CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable { .. }, argument_points, .. } => {
+                let [actual] = argument_points.as_slice() else { return None };
+                if call.replace((point.id, *actual)).is_some() { return None }
+            }
+            CfgPointKind::Call { expression, target, .. } => {
+                if !matches!(&cfg.points[marker.frozen.rhs.0].kind,
+                    CfgPointKind::Call { expression: producer, target: source, .. }
+                    if expression == producer && target == source)
+                {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    let (assignment, projection) = assignment?;
+    let (call, operand) = call?;
+    let carrier_read = carrier_read?;
+    if operand != carrier_read || !(alias_start.0 < projection.0 && marker.frozen.install.0 < projection.0
+        && projection.0 < assignment.0 && assignment.0 < alias_read.0 && alias_read.0 < literal.0
+        && literal.0 < carrier_start.0 && carrier_start.0 < carrier_read.0 && carrier_read.0 < call.0)
+        || carrier_move.is_some_and(|point| !(carrier_read.0 < point.0 && point.0 < call.0))
+        || !facts.projected_reads.get(&projection).copied().unwrap_or(false)
+    {
+        return None;
+    }
+    let CfgPointKind::ReadPlace { place: ScalarPlace::Field { field: ScalarFieldReference::Resolved(actual), .. },
+        pointer_point: Some(pointer), reads_origin: false, .. } = &cfg.points.get(projection.0)?.kind else { return None };
+    if actual != field || !matches!(&cfg.points.get(pointer.0)?.kind,
+        CfgPointKind::Read { binding } if binding == &marker.binding)
+    {
+        return None;
+    }
+    Some(PassiveDescriptorRead { projection, literal, call, field: field.clone() })
+}
+
 struct ScalarDescriptorReplay<'a> {
     candidate: &'a ScalarDescriptorInstall,
+    passive: Option<&'a PassiveDescriptorRead>,
     invalid: bool,
     exited: bool,
 }
@@ -3930,21 +4040,27 @@ impl ScalarDescriptorReplay<'_> {
             CfgPointKind::Bind { .. } => {
                 self.invalid |= carries(point.possible_origins.as_ref()) || competing_owner();
             }
-            CfgPointKind::ReadPlace { .. } if candidate.validate_backing => {
-                self.invalid = true;
+            CfgPointKind::ReadPlace { pointer_point, .. } if candidate.validate_backing => {
+                self.invalid |= !self.passive.is_some_and(|proof| proof.projection == point.id)
+                    || !pointer_point.and_then(|pointer| state.point_values.get(pointer)).is_some_and(|origins| {
+                        !origins.is_empty() && origins.iter().all(owns)
+                    });
             }
             CfgPointKind::Borrow { place, .. }
             | CfgPointKind::Move { place, .. }
             | CfgPointKind::DeferredMove { place, .. } => {
                 self.invalid |= place.binding == candidate.binding;
             }
+            CfgPointKind::Evaluate(ScalarExpression::StructLiteral { .. })
+                if self.passive.is_some_and(|proof| proof.literal == point.id) => {}
             CfgPointKind::Evaluate(ScalarExpression::RawAddress { .. } | ScalarExpression::StructLiteral { .. } | ScalarExpression::ArrayLiteral { .. })
             | CfgPointKind::AssignThrough { .. } | CfgPointKind::MoveThrough { .. }
             | CfgPointKind::DeferredMoveThrough { .. } | CfgPointKind::Release { .. } | CfgPointKind::Invalidate { .. } => {
                 self.invalid = true;
             }
             CfgPointKind::Call { output, argument_points, .. } => {
-                self.invalid |= (candidate.validate_backing && *output == 0 && point.id != candidate.frozen.rhs)
+                self.invalid |= (candidate.validate_backing && *output == 0 && point.id != candidate.frozen.rhs
+                    && !self.passive.is_some_and(|proof| proof.call == point.id))
                     || argument_points.iter().any(|&point| carries(state.point_values.get(point)));
             }
             CfgPointKind::ScopeExit if point.scope == ReferenceScopeId(0) => {
@@ -8370,7 +8486,8 @@ fn transfer_function_output_contracts(
             let capture = result.cfg.points.get(marker.capture.0)?;
             matches!(&capture.kind, CfgPointKind::CaptureAssignmentPrevious { writes }
                 if writes.get(marker.output) == Some(&marker.frozen.install))
-                .then_some(ScalarDescriptorReplay { candidate: marker.as_ref(), invalid: false, exited: false })
+                .then_some(ScalarDescriptorReplay { candidate: marker.as_ref(), passive: result.aggregate.passive_descriptor_read.as_deref().filter(|_| marker.validate_backing),
+                    invalid: false, exited: false })
         });
         let transferred = transfer_reference_facts(
             &mut result.cfg,
@@ -8916,6 +9033,10 @@ fn build_function_reference_cfg(
     }
     drop(builder.origin_index);
     let mut aggregate = std::mem::take(&mut builder.aggregate_result);
+    if let ScalarDescriptorCandidates::One(_, marker) = &builder.proof_points.backing_descriptor_install {
+        aggregate.passive_descriptor_read = passive_descriptor_read(
+            &builder.cfg, marker, &builder.aggregate_facts, call_sites).map(Box::new);
+    }
     if prior_children_succeeded && errors.is_empty() && !builder.cfg.points.is_empty() {
         builder.cfg.initial_points = builder.cfg.points.clone();
         if let Some((Some(moved), Some(call))) = builder.formal_forward_shape {
@@ -8974,5 +9095,6 @@ fn build_function_reference_cfg(
     aggregate.calls = builder.aggregate_facts.calls;
     aggregate.formals = builder.aggregate_facts.formals;
     aggregate.read_formals = builder.aggregate_facts.raw_formals.into_keys().collect();
+    aggregate.read_formal_fields = builder.aggregate_facts.read_fields;
     (builder.cfg, errors, builder.proof_points, aggregate)
 }
