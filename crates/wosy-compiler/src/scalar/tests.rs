@@ -12664,3 +12664,90 @@ u8(Pair) inspect = fn(owner) {
         }));
     }
 }
+
+#[test]
+fn known_projected_shared_leaf_does_not_originate_a_loan_from_a_null_parent() {
+    let plain = "%%start\nu8() plain = fn { *u8 pointer = null; *pointer };\n%%end";
+    let checked_read = plain.find("*pointer").unwrap() as u32;
+    let (single, project) = both_reference_functions(plain);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "plain checked null stays a runtime guard: {diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+        let cfg = &function.reference_cfg;
+        let checked = cfg.points.iter().find(|point| point.source_span.range.start == checked_read
+            && matches!(point.kind, CfgPointKind::ReadPlace { pointer_point: Some(_), .. }))
+            .expect("plain checked scalar dereference");
+        let CfgPointKind::ReadPlace { pointer_point: Some(pointer), .. } = &checked.kind else { unreachable!() };
+        let pointer = &cfg.points[pointer.0];
+        assert!(matches!(pointer.kind, CfgPointKind::Read { .. })
+            && pointer.possible_origins.as_ref().is_some_and(|origins| origins.len() == 1
+                && origins.first().is_some_and(|origin|
+                    matches!(cfg.facts.get(origin.0), Some(ReferenceOrigin::Null { .. })))));
+
+    }
+    for (parent, null_kind) in [
+        ("*Pair parent = &owner;", None),
+        ("*Pair parent = null;", Some(false)),
+        ("*Pair parent = &owner; parent = null;", Some(false)),
+        ("*Pair parent = &owner; if (flag) { parent = null; };", Some(true)),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair, bool) inspect = fn(owner, flag) {{
+    owner.left;
+    flag;
+    {parent}
+    *u8 leaf = &(*parent).left;
+    u8 value = *leaf;
+    value;
+}};
+%%end"#);
+        let projected = text.find("&(*parent).left").unwrap() as u32;
+        let holder = text.find("leaf =").unwrap() as u32;
+        let initial_parent = text.find("&owner").map(|offset| offset as u32);
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let expressions = cfg.points.iter().filter(|point| point.source_span.range.start == projected).collect::<Vec<_>>();
+            let bind = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Bind { binding }
+                if binding.declaration_span.start == holder));
+            let read = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Read { binding }
+                if binding.declaration_span.start == holder));
+            let useful_origins = |point: &ReferenceFlowPoint| {
+                point.possible_origins.iter().flatten().copied()
+                    .filter(|origin| matches!(cfg.facts.get(origin.0), Some(ReferenceOrigin::Fresh { .. }
+                        | ReferenceOrigin::BorrowedFrom { .. })))
+                    .collect::<BTreeSet<_>>()
+            };
+            match null_kind {
+                None => {
+                    let expr = expressions.iter().copied().find(|point| {
+                        matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
+                            if loan.mode == ScalarReferenceMutability::Shared
+                                && loan.parent.as_ref().is_some_and(|parent| Some(parent.creation_span.start) == initial_parent))
+                    }).unwrap_or_else(|| panic!("actual projected authority: {diagnostics:?}; {expressions:?}"));
+                    let expected = useful_origins(expr);
+                    assert!(diagnostics.is_empty() && expected.len() == 1, "{diagnostics:?}; {expr:?}");
+                    assert_eq!(useful_origins(bind.expect("child holder")), expected);
+                    assert_eq!(useful_origins(read.expect("actual child read")), expected);
+                }
+                Some(false) => {
+                    assert!(expressions.iter().copied().chain(bind).chain(read)
+                        .all(|point| useful_origins(point).is_empty()), "{parent}: {diagnostics:?}; {expressions:?}; {bind:?}; {read:?}");
+                }
+                Some(true) => {
+                    assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == projected)),
+                        "{parent}: {diagnostics:?}; {expressions:?}");
+                }
+            }
+        }
+    }
+}
