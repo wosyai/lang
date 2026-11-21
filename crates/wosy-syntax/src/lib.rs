@@ -465,6 +465,16 @@ pub fn parse_proof_fragment(
     parse_entry(source, text, configured_comments, Rule::proof_fragment)
 }
 
+#[cfg(any(test, feature = "checker-test-support"))]
+#[doc(hidden)]
+pub fn parse_proof_module(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+) -> ParseResult {
+    parse_entry(source, text, configured_comments, Rule::proof_module)
+}
+
 fn parse_entry(
     source: SourceIdentity,
     text: String,
@@ -486,7 +496,7 @@ fn parse_entry(
             builder.finish_node();
             let span = ByteSpan::new(0, text.len() as u32);
             #[cfg(any(test, feature = "checker-test-support"))]
-            let span = if rule == Rule::proof_fragment {
+            let span = if matches!(rule, Rule::proof_fragment | Rule::proof_module) {
                 match _error.location {
                     pest::error::InputLocation::Pos(at) => ByteSpan::new(at as u32, at as u32),
                     pest::error::InputLocation::Span((start, end)) => {
@@ -754,7 +764,7 @@ fn kind(rule: Rule) -> SyntaxKind {
     match rule {
         Rule::source => SyntaxKind::Root,
         #[cfg(any(test, feature = "checker-test-support"))]
-        Rule::proof_fragment => SyntaxKind::Root,
+        Rule::proof_fragment | Rule::proof_module => SyntaxKind::Root,
         #[cfg(any(test, feature = "checker-test-support"))]
         Rule::proof_decl => SyntaxKind::ProofDecl,
         #[cfg(any(test, feature = "checker-test-support"))]
@@ -2564,6 +2574,46 @@ mod proof_fragment_tests {
         assert!(!result.is_valid());
         assert_eq!(result.reconstruct(), text);
         assert!(!result.root.descendants().any(|node| node.kind() == SyntaxKind::ProofDecl));
+    }
+
+    #[test]
+    fn proof_module_keeps_proofs_as_module_siblings_with_exact_spans() {
+        let first = "proof bounded for identity(x) -> (out) where (x <= 10) ensures (out <= 10) {}";
+        let second = "proof limit for identity(v) -> (r) ensures (r <= 255) {}";
+        let text = format!("%%start\n{first}\nu8(u8) identity = fn(value) {{ value }};\n{second}\n%%end");
+        let identity = source();
+        let result = parse_proof_module(identity.clone(), text.clone(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(result.canonical_cst().source, identity);
+        let module = result.root.children().find(|node| node.kind() == SyntaxKind::Root).unwrap();
+        let declarations: Vec<_> = module.children()
+            .filter(|node| matches!(node.kind(), SyntaxKind::ProofDecl | SyntaxKind::Item))
+            .collect();
+        assert_eq!(declarations.len(), 3);
+        assert!(declarations[1].children().any(|node| node.kind() == SyntaxKind::FunctionDecl));
+        for (node, original) in [(&declarations[0], first), (&declarations[2], second)] {
+            let start = text.find(original).unwrap() as u32;
+            assert_eq!(node.kind(), SyntaxKind::ProofDecl);
+            assert_eq!(byte_span(node), ByteSpan::new(start, start + original.len() as u32));
+            assert_eq!(node.text(), original);
+        }
+        assert!(!parse(identity, text, &[]).is_valid());
+    }
+
+    #[test]
+    fn proof_module_rejects_proofs_in_blocks_or_outside_source_boundaries() {
+        let declaration = "proof bounded for identity(x) -> (out) ensures (out <= 10) {}";
+        for text in [
+            declaration.to_owned(),
+            format!("%%start\nu8(u8) identity = fn(value) {{ {declaration} value }};\n%%end"),
+            format!("%%start\nu8(u8) identity = fn(value) {{ value }};\n%%end\n{declaration}"),
+        ] {
+            let result = parse_proof_module(source(), text.clone(), &[]);
+            assert!(!result.is_valid(), "{text}");
+            assert_eq!(result.reconstruct(), text);
+            assert!(!result.root.descendants().any(|node| node.kind() == SyntaxKind::ProofDecl));
+        }
     }
 
     #[test]

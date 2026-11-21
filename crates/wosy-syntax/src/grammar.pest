@@ -7,6 +7,7 @@ comment_payload = @{ (!("\r" | "\n") ~ ANY)* }
 comment_scan = ${ SOI ~ (string | comment | (!("\"" | "#") ~ ANY))* ~ EOI }
 
 source = { SOI ~ boundary_start ~ (item | error_item)+ ~ boundary_end ~ EOI }
+proof_module = { SOI ~ boundary_start ~ (proof_decl | item | error_item)+ ~ boundary_end ~ EOI }
 proof_fragment = { SOI ~ proof_decl ~ EOI }
 proof_decl = { proof_keyword ~ identifier ~ proof_for_keyword ~ proof_target ~ "->" ~ proof_outputs ~ proof_where? ~ proof_ensures ~ block }
 proof_target = { identifier ~ parameters }
