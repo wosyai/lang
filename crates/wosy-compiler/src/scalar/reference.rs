@@ -4205,7 +4205,7 @@ fn loan_has_ancestor(loan: &ReferenceLoanId, ancestor: &ReferenceLoanId) -> bool
 
 enum LoanAccess<'a> {
     Direct,
-    DirectRead,
+    DirectShared,
     Through(ReferenceOriginId),
     WriteThrough(&'a InvalidationCandidate),
     ReadThrough(&'a ReferenceLoanId),
@@ -4226,7 +4226,7 @@ fn conflicting_live_loan(
         let mut reachable = false;
         for origin in origins {
             if match access {
-                LoanAccess::Direct | LoanAccess::DirectRead | LoanAccess::ReadThrough(_) | LoanAccess::Borrow(_) => false,
+                LoanAccess::Direct | LoanAccess::DirectShared | LoanAccess::ReadThrough(_) | LoanAccess::Borrow(_) => false,
                 LoanAccess::Through(selected) => *origin == selected,
                 LoanAccess::WriteThrough(selected) => *origin == selected.origin,
             } {
@@ -4251,7 +4251,7 @@ fn conflicting_live_loan(
                         && reference_places_overlap(&available_place(&loan.origin_place), &place)
                         && !loan_has_ancestor(new, loan)
                 }
-                LoanAccess::DirectRead => loan_borrows_place(loan, &place, Some(ScalarReferenceMutability::Mutable)),
+                LoanAccess::DirectShared => loan_borrows_place(loan, &place, Some(ScalarReferenceMutability::Mutable)),
                 LoanAccess::Direct | LoanAccess::Through(_) => loan_borrows_place(loan, &place, None),
             };
             if !conflicts_with_access {
@@ -5921,7 +5921,7 @@ fn transfer_reference_facts(
                     {
                         continue;
                     }
-                    let origins = conflicting_live_loan(original_points, &cfg.facts, &state, id, place, LoanAccess::DirectRead);
+                    let origins = conflicting_live_loan(original_points, &cfg.facts, &state, id, place, LoanAccess::DirectShared);
                     if !origins.is_empty() {
                         errors.push(ReferenceAnalysisError::ConflictingPlace { source_span: point.source_span.clone(), origins });
                     }
@@ -6366,13 +6366,20 @@ fn transfer_reference_facts(
                             }
                         };
                         if check && !state.bindings.is_empty() {
+                            let access = if loan.parent.is_none() && loan.mode == ScalarReferenceMutability::Shared
+                                && matches!(reference_root(&place.place), ScalarPlace::Name { .. })
+                            {
+                                LoanAccess::DirectShared
+                            } else {
+                                LoanAccess::Borrow(loan)
+                            };
                             let origins = conflicting_live_loan(
                                 original_points,
                                 &cfg.facts,
                                 &state,
                                 id,
                                 place,
-                                LoanAccess::Borrow(loan),
+                                access,
                             );
                             if !origins.is_empty() {
                                 errors.push(ReferenceAnalysisError::ConflictingPlace {

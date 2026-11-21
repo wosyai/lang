@@ -12641,7 +12641,8 @@ struct copy Pair { u8 left; u8 right; }
 u8(Pair) inspect = fn(owner) {
     *!u8 parent = &!owner.left;
     *u8 child = &(*parent);
-    owner.right + *child
+    *u8 peer = &owner.right;
+    owner.right + *child + *peer
 };
 %%end"#;
     let (single, project) = both_reference_functions(text);
@@ -12750,4 +12751,63 @@ unit(Pair, bool) inspect = fn(owner, flag) {{
             }
         }
     }
+}
+
+#[test]
+fn known_shared_named_reborrow_retains_exclusive_parent_against_new_owner_loans() {
+    let mut missed = Vec::new();
+    for (mode, body, conflict) in [
+        ("", "*Pair peer = &owner; u8 left = (*child).left; u8 right = (*peer).right; left; right;", false),
+        ("!", "u8 left = (*child).left; *Pair peer = &owner; u8 right = (*peer).right; left; right;", false),
+        ("!", "*Pair peer = &(*parent); u8 left = (*child).left; u8 right = (*peer).right; left; right;", false),
+        ("!", "if (flag) { u8 left = (*child).left; left; }; *Pair peer = &owner; (*peer).right;", false),
+        ("!", "*Pair peer = &owner; u8 left = (*child).left; u8 right = (*peer).right; left; right;", true),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair, bool) inspect = fn(owner, flag) {{
+    flag;
+    *{mode}Pair parent = &{mode}owner;
+    *Pair child = &(*parent);
+    {body}
+}};
+%%end"#);
+        let active_child = text.find("&(*parent)").unwrap() as u32;
+        let requested = text.rfind("&owner").map(|offset| offset as u32);
+        let (single, project) = both_reference_functions(&text);
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let held_child = cfg.initial_points.iter().find_map(|point| match &point.kind {
+                CfgPointKind::Borrow { loan, .. } if point.source_span.range.start == active_child
+                    && loan.mode == ScalarReferenceMutability::Shared
+                    && loan.parent.as_deref().is_some_and(|parent|
+                        parent.mode == if mode.is_empty() { ScalarReferenceMutability::Shared } else { ScalarReferenceMutability::Mutable }) => Some(loan),
+                _ => None,
+            }).unwrap_or_else(|| panic!("{validator} {mode} {body}: {diagnostics:?}"));
+            if let Some(requested) = requested {
+                assert!(cfg.initial_points.iter().any(|point| point.source_span.range.start == requested
+                    && matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
+                        if loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
+                            && loan.origin_place.projections.is_empty()
+                            && loan.origin_place.binding == held_child.origin_place.binding)),
+                    "{validator} {mode} {body}: {diagnostics:?}");
+            }
+            if conflict {
+                if !diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| Some(label.span.range.start) == requested)
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == active_child))
+                {
+                    missed.push((validator, body, diagnostics.clone()));
+                }
+            } else {
+                assert!(diagnostics.is_empty(), "{validator} {mode} {body}: {diagnostics:?}");
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{missed:?}");
 }
