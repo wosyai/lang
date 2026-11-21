@@ -96,6 +96,25 @@ impl<'ctx, 'module> GlobalNames<'ctx, 'module> {
 struct ModuleNames<'ctx, 'module> {
     globals: GlobalNames<'ctx, 'module>,
     unit_values: BTreeSet<&'module str>,
+    members: BTreeMap<&'module str, MemberName<'module>>,
+    namespaces: BTreeMap<&'module str, &'module wosy_syntax::SourceIdentity>,
+    externs: BTreeMap<&'module str, &'module crate::scalar::ScalarExtern>,
+}
+
+struct MemberName<'module> {
+    ty: &'module ScalarType,
+    unsigned: bool,
+}
+
+struct ProjectNames<'ctx, 'module> {
+    scopes: Vec<ModuleNames<'ctx, 'module>>,
+    positions: HashMap<&'module wosy_syntax::SourceIdentity, usize>,
+}
+
+impl<'ctx, 'module> ProjectNames<'ctx, 'module> {
+    fn for_module(&self, module: &ScalarModule) -> &ModuleNames<'ctx, 'module> {
+        &self.scopes[self.positions[&module.source]]
+    }
 }
 
 struct EmitState<'ctx, 'module> {
@@ -142,6 +161,7 @@ struct EmitState<'ctx, 'module> {
     globals: &'module GlobalNames<'ctx, 'module>,
     all_globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
     unit_values: &'module BTreeSet<&'module str>,
+    project_names: Option<&'module ProjectNames<'ctx, 'module>>,
     structs: &'module [&'module ScalarStruct],
     layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
     target_layout: ScalarTargetLayout,
@@ -587,6 +607,9 @@ fn emit_single_module_llvm<'a>(
                 .collect(),
         ),
         unit_values: unit_values(items),
+        members: BTreeMap::new(),
+        namespaces: BTreeMap::new(),
+        externs: BTreeMap::new(),
     };
     for (function, cfg, name, item, arm) in definitions {
         let nodes = generic_input.bind_body(0, item, arm, &function.body)?;
@@ -1033,19 +1056,21 @@ fn emit_project_llvm<'a>(
             cfg,
         );
     }
-    let names = modules
+    let scopes = modules
         .iter()
-        .map(|module| ModuleNames {
-            globals: module_globals(module, &globals),
-            unit_values: unit_values(&module.items),
-        })
-        .collect::<Vec<_>>();
+        .map(|module| project_module_names(module, &globals))
+        .collect();
+
     let mut module_positions = HashMap::with_capacity(modules.len());
     let mut ordered_positions = vec![0; project.modules.len()];
     for (position, &(ordinal, module)) in ordered_modules.iter().enumerate() {
         let first_position = *module_positions.entry(&module.source).or_insert(position);
         ordered_positions[ordinal] = first_position;
     }
+    let names = ProjectNames {
+        scopes,
+        positions: module_positions,
+    };
     for (ordinal, source_module, function, cfg, name, item, arm, original) in definitions
         .iter()
         .map(|(ordinal, module, function, cfg, name, item, arm)| {
@@ -1092,7 +1117,8 @@ fn emit_project_llvm<'a>(
             source_module,
             &modules,
             &globals,
-            &names[ordered_positions[ordinal]],
+            &names,
+            &names.scopes[ordered_positions[ordinal]],
             name,
             &module,
             &all_structs,
@@ -1113,7 +1139,6 @@ fn emit_project_llvm<'a>(
         &modules,
         &regions,
         &names,
-        &module_positions,
         initializer_nodes.as_deref(),
         &initializer_symbols,
         &globals,
@@ -1949,6 +1974,7 @@ fn emit_function<'ctx, 'module>(
         globals: &names.globals,
         all_globals: globals,
         unit_values: &names.unit_values,
+        project_names: None,
         structs,
         layouts,
         target_layout,
@@ -2113,6 +2139,7 @@ fn emit_main<'ctx, 'module>(
         globals: &names.globals,
         all_globals: globals,
         unit_values: &names.unit_values,
+        project_names: None,
         structs,
         layouts,
         target_layout,
@@ -2190,6 +2217,7 @@ fn emit_project_function<'ctx, 'module>(
     source_module: &ScalarModule,
     modules: &[&'module ScalarModule],
     globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
+    project_names: &'module ProjectNames<'ctx, 'module>,
     names: &'module ModuleNames<'ctx, 'module>,
     name: &str,
     module: &'module Module<'ctx>,
@@ -2255,6 +2283,7 @@ fn emit_project_function<'ctx, 'module>(
         globals: &names.globals,
         all_globals: globals,
         unit_values: &names.unit_values,
+        project_names: Some(project_names),
         structs,
         layouts,
         target_layout,
@@ -2392,8 +2421,7 @@ fn emit_project_main<'ctx, 'module>(
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     modules: &[&ScalarModule],
     regions: &[&ModuleInitializationRegion],
-    names: &'module [ModuleNames<'ctx, 'module>],
-    module_positions: &HashMap<&wosy_syntax::SourceIdentity, usize>,
+    names: &'module ProjectNames<'ctx, 'module>,
     initializer_nodes: Option<&'module [InitializerCallNodes<'module>]>,
     initializer_symbols: &'module InitializerSymbols,
     globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
@@ -2446,6 +2474,7 @@ fn emit_project_main<'ctx, 'module>(
         globals: &empty_globals,
         all_globals: globals,
         unit_values: &empty_unit_values,
+        project_names: Some(names),
         structs,
         layouts,
         target_layout,
@@ -2460,7 +2489,6 @@ fn emit_project_main<'ctx, 'module>(
         modules,
         regions,
         names,
-        module_positions,
         initializer_nodes,
         &mut vec![false; modules.len()],
     )?;
@@ -2479,8 +2507,7 @@ fn initialize_project_module<'ctx, 'module>(
     position: usize,
     modules: &[&'module ScalarModule],
     regions: &[&ModuleInitializationRegion],
-    names: &'module [ModuleNames<'ctx, 'module>],
-    module_positions: &HashMap<&wosy_syntax::SourceIdentity, usize>,
+    names: &'module ProjectNames<'ctx, 'module>,
     initializer_nodes: Option<&'module [InitializerCallNodes<'module>]>,
     initialized: &mut [bool],
 ) -> Result<(), String> {
@@ -2505,9 +2532,9 @@ fn initialize_project_module<'ctx, 'module>(
     let runtime_array_live = std::mem::take(&mut state.runtime_array_live);
     let automatic_return_result_owners = std::mem::take(&mut state.automatic_return_result_owners);
     let checked_owner_flags = std::mem::take(&mut state.checked_owner_flags);
-    let current_globals = std::mem::replace(&mut state.globals, &names[position].globals);
+    let current_globals = std::mem::replace(&mut state.globals, &names.scopes[position].globals);
     let current_unit_values =
-        std::mem::replace(&mut state.unit_values, &names[position].unit_values);
+        std::mem::replace(&mut state.unit_values, &names.scopes[position].unit_values);
 
     for step in &region.steps {
         match (&step.kind, &module.items[step.item]) {
@@ -2524,7 +2551,7 @@ fn initialize_project_module<'ctx, 'module>(
                 let NamespaceTarget::Bound(target) = target else {
                     return Err(format!("unknown namespace binding {binding}"));
                 };
-                let &position = module_positions
+                let &position = names.positions
                     .get(target)
                     .ok_or_else(|| format!("missing namespace target {}", target.path))?;
                 initialize_project_module(
@@ -2535,7 +2562,6 @@ fn initialize_project_module<'ctx, 'module>(
                     modules,
                     regions,
                     names,
-                    module_positions,
                     initializer_nodes,
                     initialized,
                 )?;
@@ -2568,9 +2594,8 @@ fn initialize_project_module<'ctx, 'module>(
                     .into_int_value();
                     let pointer = emit_runtime_array_allocation(context, state, element, length)?;
                     let (global, _) = state
-                        .all_globals
-                        .get(&project_global_name(&module.source, &receiver.name))
-                        .cloned()
+                        .globals
+                        .get(&receiver.name)
                         .ok_or_else(|| format!("unknown LLVM global {}", receiver.name))?;
                     state
                         .builder
@@ -2594,9 +2619,8 @@ fn initialize_project_module<'ctx, 'module>(
                     }
                     let value = extract_output(state, &value, position)?;
                     let (global, _) = state
-                        .all_globals
-                        .get(&project_global_name(&module.source, name))
-                        .cloned()
+                        .globals
+                        .get(name)
                         .ok_or_else(|| format!("unknown LLVM global {name}"))?;
                     store_value(context, state, global.as_pointer_value(), ty, value)?;
                     if matches!(ty, ScalarType::RuntimeArray { .. }) {
@@ -3453,7 +3477,7 @@ fn emit_assignment<'ctx, 'module>(
         context,
         state,
         &assignment.values,
-        &expected,
+        |position| expected.get(position).and_then(Option::as_ref),
         |state, value, expected| match expected {
             Some(ty) => emit_typed_expression(context, state, value, ty),
             None => emit_expression(context, state, value),
@@ -3532,22 +3556,21 @@ fn emit_project_assignment<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    let names = state.project_names.expect("project emission names");
+    let scope = names.for_module(module);
     let expected = assignment
         .targets
         .iter()
         .map(|target| {
-            if let Some(receiver) = target.receiver.as_ref().filter(|receiver| {
-                module
-                    .namespace_bindings
-                    .iter()
-                    .any(|namespace| namespace.binding == **receiver)
+            if let Some(source) = target.receiver.as_ref().and_then(|receiver| {
+                scope.namespaces.get(receiver.as_str())
             }) {
-                let target_module = project_namespace_target(module, modules, receiver)?;
-                Ok(Some(
-                    project_member_global(state, target_module, &target.target)?.1,
-                ))
+                let position = names.positions.get(*source)
+                    .ok_or_else(|| format!("missing namespace target {}", source.path))?;
+                let (global, ty) = project_member_global(&names.scopes[*position], &target.target)?;
+                Ok((Some(ty.clone()), Some(global)))
             } else {
-                Ok(assignment_target_type(state, target))
+                Ok((assignment_target_type(state, target), None))
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -3555,7 +3578,7 @@ fn emit_project_assignment<'ctx, 'module>(
         context,
         state,
         &assignment.values,
-        &expected,
+        |position| expected.get(position).and_then(|(ty, _)| ty.as_ref()),
         |state, value, expected| match expected {
             Some(ty) => emit_project_typed_expression(context, state, value, ty, module, modules),
             None => emit_project_expression(context, state, value, module, modules),
@@ -3565,19 +3588,13 @@ fn emit_project_assignment<'ctx, 'module>(
         .targets
         .iter()
         .zip(&values)
-        .map(|(target, value)| {
+        .zip(expected)
+        .map(|((target, value), (_, global))| {
             let ty = &value.ty;
             if *ty == ScalarType::Unit {
                 return Ok(AssignmentDestination::Unit);
             }
-            if let Some(receiver) = target.receiver.as_ref().filter(|receiver| {
-                module
-                    .namespace_bindings
-                    .iter()
-                    .any(|namespace| namespace.binding == **receiver)
-            }) {
-                let target_module = project_namespace_target(module, modules, receiver)?;
-                let (global, _) = project_member_global(state, target_module, &target.target)?;
+            if let Some(global) = global {
                 let pointer = global
                     .ok_or_else(|| format!("unknown LLVM member storage {}", target.target))?
                     .as_pointer_value();
@@ -4084,11 +4101,11 @@ fn emit_checked_dereference_guard<'ctx, 'module>(
     Ok(())
 }
 
-fn materialize_assignment_values<'ctx, 'module>(
+fn materialize_assignment_values<'ctx, 'module, 'expected>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     expressions: &[ScalarExpression],
-    expected: &[Option<ScalarType>],
+    expected: impl Fn(usize) -> Option<&'expected ScalarType>,
     emit: impl FnMut(
         &mut EmitState<'ctx, 'module>,
         &ScalarExpression,
@@ -4118,7 +4135,7 @@ fn materialize_assignment_values<'ctx, 'module>(
         let value = emit(
             state,
             expression,
-            expected.get(position).and_then(Option::as_ref),
+            expected(position),
         )?;
         let joined_source = if let ScalarExpression::Name { name, .. } = expression {
             if let Some((owner_slot, _)) = state.joined_return_bindings.get(name) {
@@ -4147,9 +4164,7 @@ fn materialize_assignment_values<'ctx, 'module>(
         let output_types = match &value {
             EmitValue::Aggregate { outputs, .. } => outputs.clone(),
             EmitValue::Unit => vec![ScalarType::Unit],
-            EmitValue::Basic(value) => vec![expected
-                .get(position)
-                .and_then(Option::as_ref)
+            EmitValue::Basic(value) => vec![expected(position)
                 .cloned()
                 .unwrap_or_else(|| basic_value_type(*value))],
         };
@@ -4849,45 +4864,30 @@ fn project_runtime_array_name(source: &wosy_syntax::SourceIdentity, name: &str) 
     project_global_name(source, name)
 }
 
-fn project_namespace_target<'a>(
-    module: &'a ScalarModule,
-    modules: &'a [&ScalarModule],
+fn project_namespace_target<'a, 'ctx, 'module>(
+    names: &'a ProjectNames<'ctx, 'module>,
+    module: &ScalarModule,
     receiver: &str,
-) -> Result<&'a ScalarModule, String> {
-    let namespace = module
-        .namespace_bindings
-        .iter()
-        .find(|namespace| namespace.binding == receiver)
+) -> Result<&'a ModuleNames<'ctx, 'module>, String> {
+    let source = names.for_module(module).namespaces
+        .get(receiver)
         .ok_or_else(|| format!("unknown namespace binding {receiver}"))?;
-    modules
-        .iter()
-        .find(|candidate| candidate.source == namespace.target)
-        .copied()
-        .ok_or_else(|| format!("missing namespace target {}", namespace.target.path))
+    names.positions
+        .get(*source)
+        .map(|&position| &names.scopes[position])
+        .ok_or_else(|| format!("missing namespace target {}", source.path))
 }
 
 fn project_member_global<'ctx, 'module>(
-    state: &EmitState<'ctx, 'module>,
-    target: &ScalarModule,
+    target: &ModuleNames<'ctx, 'module>,
     name: &str,
-) -> Result<(Option<GlobalValue<'ctx>>, ScalarType), String> {
-    let binding = target.items.iter().find_map(|item| match item {
-        ScalarItem::Binding(binding) if binding.name == name => Some(binding),
-        ScalarItem::Binding(_)
-        | ScalarItem::Extern(_)
-        | ScalarItem::Namespace(_)
-        | ScalarItem::Function(_)
-        | ScalarItem::Executable(_) => None,
-    });
-    let binding = binding.ok_or_else(|| format!("unknown LLVM member {name}"))?;
-    let global = state
-        .all_globals
-        .get(&project_global_name(&target.source, name))
-        .map(|(global, _)| *global);
-    if binding.declared_type != ScalarType::Unit && global.is_none() {
+) -> Result<(Option<GlobalValue<'ctx>>, &'module ScalarType), String> {
+    let member = target.members.get(name).ok_or_else(|| format!("unknown LLVM member {name}"))?;
+    let global = target.globals.get(name).map(|(global, _)| *global);
+    if *member.ty != ScalarType::Unit && global.is_none() {
         return Err(format!("unknown LLVM member storage {name}"));
     }
-    Ok((global, binding.declared_type.clone()))
+    Ok((global, member.ty))
 }
 
 fn unit_values(items: &[ScalarItem]) -> BTreeSet<&str> {
@@ -4902,29 +4902,51 @@ fn unit_values(items: &[ScalarItem]) -> BTreeSet<&str> {
         .collect()
 }
 
-fn module_globals<'ctx, 'module>(
+fn project_module_names<'ctx, 'module>(
     module: &'module ScalarModule,
     globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
-) -> GlobalNames<'ctx, 'module> {
-    GlobalNames(
-        module
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                ScalarItem::Binding(binding) => Some(binding),
-                _ => None,
-            })
-            .flat_map(|binding| {
-                std::iter::once(binding.name.as_str())
-                    .chain(binding.receivers.iter().map(|receiver| receiver.name.as_str()))
-            })
-            .filter_map(|name| {
-                globals
-                    .get(&project_global_name(&module.source, name))
-                    .map(|global| (name, global))
-            })
-            .collect(),
-    )
+) -> ModuleNames<'ctx, 'module> {
+    let mut names = ModuleNames {
+        globals: GlobalNames(BTreeMap::new()),
+        unit_values: BTreeSet::new(),
+        members: BTreeMap::new(),
+        namespaces: BTreeMap::new(),
+        externs: BTreeMap::new(),
+    };
+    for namespace in &module.namespace_bindings {
+        names.namespaces.entry(namespace.binding.as_str()).or_insert(&namespace.target);
+    }
+    for item in &module.items {
+        let binding = match item {
+            ScalarItem::Binding(binding) => binding,
+            ScalarItem::Extern(declaration) => {
+                names.externs.entry(declaration.binding.as_str()).or_insert(declaration);
+                continue;
+            }
+            _ => continue,
+        };
+        let ty = &binding.declared_type;
+        let unsigned = matches!(
+            ty,
+            ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::U128
+        );
+        let member = names.members.entry(binding.name.as_str()).or_insert(MemberName {
+            ty,
+            unsigned: false,
+        });
+        member.unsigned |= unsigned;
+        if *ty == ScalarType::Unit {
+            names.unit_values.insert(binding.name.as_str());
+        }
+        for name in std::iter::once(binding.name.as_str())
+            .chain(binding.receivers.iter().map(|receiver| receiver.name.as_str()))
+        {
+            if let Some(global) = globals.get(&project_global_name(&module.source, name)) {
+                names.globals.0.insert(name, global);
+            }
+        }
+    }
+    names
 }
 
 #[cfg(test)]
