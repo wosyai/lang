@@ -303,7 +303,6 @@ pub(super) struct IntegerReturningPath<'a> {
     pub(super) axes: Vec<&'a ReferenceBindingId>,
 }
 
-#[cfg(test)]
 pub(super) struct IntegerBranchProof<'a> {
     pub(super) guard: CheckerPredicate,
     pub(super) then_claim: IntegerReturn<'a>,
@@ -321,7 +320,6 @@ fn binding_satisfies(
     Some(state.0.iter().all(|row| row[index].every(relation, bound)))
 }
 
-#[cfg(test)]
 fn shows_return_equality(
     state: &IntegerInputs,
     axes: &[&ReferenceBindingId],
@@ -364,7 +362,6 @@ impl IntegerReturningPath<'_> {
         }
     }
 
-    #[cfg(test)]
     fn shows_branch(self, proof: &IntegerBranchProof<'_>) -> Option<bool> {
         let (yes, no) = match &proof.guard {
             CheckerPredicate::Boolean(true) => (self.state, IntegerInputs::default()),
@@ -541,7 +538,7 @@ pub(super) fn check_integer_return_bound<'a>(
     operator: &BinaryOperator,
     bound: &BigInt,
 ) -> Option<Result<bool, IntegerCheckFailure<'a>>> {
-    match check_integer_return_bound_in_scope(calls, operator, bound, None, #[cfg(test)] None)? {
+    match check_integer_return_bound_in_scope(calls, operator, bound, None, None)? {
         Ok(ProofCoverage::Applicable(holds)) => Some(Ok(holds)),
         Ok(ProofCoverage::NoApplicableInputs) => None,
         Err(failure) => Some(Err(failure)),
@@ -554,10 +551,9 @@ pub(super) fn check_integer_return_bound_where<'a>(
     bound: &BigInt,
     entry_filter: &[CheckerPredicate],
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
-    check_integer_return_bound_in_scope(calls, operator, bound, Some(entry_filter), #[cfg(test)] None)
+    check_integer_return_bound_in_scope(calls, operator, bound, Some(entry_filter), None)
 }
 
-#[cfg(test)]
 pub(super) fn check_integer_return_bound_with_shows<'a>(
     calls: &'a FunctionCallSites,
     operator: &BinaryOperator,
@@ -573,7 +569,7 @@ fn check_integer_return_bound_in_scope<'a>(
     operator: &BinaryOperator,
     bound: &BigInt,
     entry_filter: Option<&[CheckerPredicate]>,
-    #[cfg(test)] proof: Option<&IntegerBranchProof<'_>>,
+    proof: Option<&IntegerBranchProof<'_>>,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let relation = IntegerRelation::from_operator(operator)?;
     let paths = match observe_integer_returns_in_scope(calls, entry_filter, None)? {
@@ -585,7 +581,6 @@ fn check_integer_return_bound_in_scope<'a>(
         if !path.output_satisfies(relation, bound)? {
             return Some(Ok(ProofCoverage::Applicable(false)));
         }
-        #[cfg(test)]
         if let Some(proof) = proof {
             if !path.shows_branch(proof)? {
                 return Some(Ok(ProofCoverage::Applicable(false)));

@@ -562,3 +562,30 @@ fn explicit_module_proof_uses_all_and_only_resolved_actual_call_contexts() {
         ScalarModuleProofOutcome::Unsupported,
     );
 }
+
+#[test]
+fn explicit_unused_proof_checks_show_claims_against_each_return_partition() {
+    let identity = source();
+    let proof = |steps: &str, invocation: &str| check_scalar_module_proof(
+        identity.clone(),
+        "bounded",
+        vec![ScalarProofModuleInput {
+            source: identity.clone(),
+            text: format!(
+                "%%start\nu8(u8) clamp = fn(value) {{ if (value > 10) {{ 10 }} else {{ value }} }};\n                unit() start = fn {{ u8 r = clamp(7); core.require(r <= 10, {OUTPUT}); }};\n                {invocation}\n                proof bounded for clamp(input) -> (out) ensures (out <= 10) {{ {steps} }}\n%%end",
+            ),
+            namespaces: Vec::new(),
+        }],
+        vec![identity.clone()],
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    );
+    let valid = "if (input > 10) { core.show(out == 10); } else { core.show(out == input); }";
+    assert_eq!(proof(valid, ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(proof(&valid.replace("> 10", "> 11"), ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(proof(&valid.replace("out == 10", "out == 9"), ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(
+        proof(&valid.replace("core.show(out == input);", "core.show(out == input); core.show(out == input);"), ""),
+        ScalarModuleProofOutcome::Unsupported,
+    );
+    assert_eq!(proof(valid, "start();"), ScalarModuleProofOutcome::Unsupported);
+}
