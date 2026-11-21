@@ -23,6 +23,25 @@ pub(crate) struct CallablePointFacts {
     pub(super) installs: HashMap<OccurrenceOrdinal, FrozenInstall>,
     pub(super) definitions: HashMap<(BlockOrdinal, usize, usize), BindingDefinition>,
     pub(super) formals: HashMap<usize, super::ReferenceBindingId>,
+    pub(super) scalar_descriptor_install: ScalarDescriptorCandidates,
+}
+
+#[derive(Default)]
+pub(super) enum ScalarDescriptorCandidates {
+    #[default]
+    None,
+    One(OccurrenceOrdinal, Box<ScalarDescriptorInstall>),
+    Multiple,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScalarDescriptorInstall {
+    pub(crate) frozen: FrozenInstall,
+    pub(crate) capture: super::CfgPointId,
+    pub(crate) binding: super::ReferenceBindingId,
+    pub(crate) call: OccurrenceOrdinal,
+    pub(crate) output: usize,
+    pub(crate) structure: super::ScalarStructId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

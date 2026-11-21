@@ -236,6 +236,7 @@ impl AggregateEdgeState {
 
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
+    pub(super) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
     pub(super) array_invalid: bool,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     pub(super) array_returns: BTreeSet<Option<BTreeSet<CfgPointId>>>,
@@ -291,7 +292,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
+        self.scalar_descriptor_assignment.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
             || self.returning_leaf || !self.calls.is_empty() || !self.returns.is_empty() || !self.formals.is_empty() || !self.inputs.is_empty() || !self.raw_terminals.is_empty() || !self.read_formals.is_empty()
     }
 }
@@ -943,6 +944,7 @@ pub(crate) enum ClosedInput {
 
 #[derive(Debug, Default)]
 pub(crate) struct ClosedBody {
+    pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
     pub(crate) returning: Option<ClosedReturn>,
     pub(crate) calls: BTreeMap<usize, ClosedCall>,
     pub(crate) scope_exits: BTreeMap<usize, CfgPointId>,
@@ -1179,8 +1181,14 @@ fn closed_aggregates<'a>(
     let mut array_callsites = Vec::new();
     let mut array_leaves = BTreeSet::new();
     let mut array_neighbors = BTreeMap::<BodyKey, BTreeSet<BodyKey>>::new();
+    let mut result = ClosedAggregates::default();
     for (&key, body) in &bodies {
         if let Some(facts) = body.facts {
+            if body.is_monomorphic {
+                if let Some(proof) = facts.scalar_descriptor_assignment {
+                    result.bodies.entry(key).or_default().scalar_descriptor_assignment = Some(proof);
+                }
+            }
             if body.is_monomorphic && !facts.array_rebinds.is_empty() {
                 array_callsites.push((key, body.cfg, facts));
             }
@@ -1256,7 +1264,7 @@ fn closed_aggregates<'a>(
             }
         }
     }
-    let mut result = ClosedAggregates::default();
+
     for (key, cfg, facts) in array_callsites {
         for &(call, _) in facts.array_rebinds.values() {
             let Some((ordinal, _, _)) = facts.array_calls.get(&call) else { continue };
@@ -1714,7 +1722,7 @@ fn closed_aggregates<'a>(
             ));
         }
         if returning || !plan.calls.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()
-            || !plan.same_array_rebinds.is_empty()
+            || !plan.same_array_rebinds.is_empty() || plan.scalar_descriptor_assignment.is_some()
         {
             result.bodies.insert(key, plan);
         }

@@ -651,6 +651,10 @@ impl<'a> CallableBodyCallNodes<'a> {
             .map(|ordinal| ordinal.0)
     }
 
+    pub(crate) fn place_ordinal(&self, place: &ScalarPlace) -> Option<usize> {
+        self.proof_nodes.places.get(&std::ptr::from_ref(place)).map(|ordinal| ordinal.0)
+    }
+
     pub(crate) fn binding_position(&self, binding: &ScalarBinding) -> Option<(usize, usize)> {
         self.proof_nodes
             .bindings

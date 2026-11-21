@@ -3446,6 +3446,7 @@ fn emit_assignment<'ctx, 'module>(
         )?;
         transition_runtime_array_assignment(context, state, target, runtime_array)?;
         store_value(context, state, destination, &ty, value)?;
+        aggregate_transfer::enroll_scalar_descriptor(state, target, expression, position, &ty, call_flag)?;
     }
     Ok(EmitValue::Unit)
 }
@@ -3567,6 +3568,7 @@ fn emit_project_assignment<'ctx, 'module>(
         )?;
         transition_runtime_array_assignment(context, state, target, runtime_array)?;
         store_value(context, state, destination, &ty, value)?;
+        aggregate_transfer::enroll_scalar_descriptor(state, target, expression, position, &ty, call_flag)?;
     }
     Ok(EmitValue::Unit)
 }

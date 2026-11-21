@@ -450,3 +450,105 @@ if (false) { accept_packet(make_packet(3)); };
         assert!(failure.contains("aggregate owning initializer receiver is not supported"), "{failure}");
     }
 }
+
+#[test]
+fn grouped_scalar_descriptor_assignment_preserves_checked_owner_routes() {
+    let text = r#"%%start
+struct copy Packet { i32 value; }
+
+(*Packet, i32)(i32) manufacture = fn(input) {
+	Packet packet = { .value = input; };
+	&packet, 3
+};
+(*Packet, i32)() absent = fn { null, 5 };
+(*Packet, i32)(*Packet, bool) choose_packet = fn(other, fresh) {
+	Packet packet = { .value = 9; };
+	if (fresh) { &packet, 5 } else { other, 6 }
+};
+i32(i32) use_fresh = fn(input) {
+	*Packet received = null;
+	i32 marker = 0;
+	received, marker = manufacture(input);
+	if (received != null) { (*received).value + marker } else { 0 }
+};
+i32() use_null = fn {
+	*Packet received = null;
+	i32 marker = 0;
+	received, marker = absent();
+	marker
+};
+i32(*Packet, bool) use_mixed = fn(other, fresh) {
+	*Packet received = null;
+	i32 marker = 0;
+	received, marker = choose_packet(other, fresh);
+	if (received != null) { (*received).value + marker } else { marker }
+};
+i32(i32) use_declared = fn(input) {
+	*Packet received, i32 marker = manufacture(input);
+	if (received != null) { (*received).value + marker } else { 0 }
+};
+i32(i32) use_reassigned = fn(input) {
+	*Packet received = null;
+	i32 marker = 0;
+	received, marker = manufacture(input);
+	received, marker = manufacture(input);
+	marker
+};
+i32(i32) use_address = fn(input) {
+	*Packet received = null;
+	i32 marker = 0;
+	received, marker = manufacture(input);
+	if (received != null) { unsafe { &?(*received).value; }; };
+	marker
+};
+i32(*Packet) look = fn(value) { if (value != null) { (*value).value } else { 0 } };
+i32(i32) use_opaque = fn(input) {
+	*Packet received = null;
+	i32 marker = 0;
+	received, marker = manufacture(input);
+	look(received) + marker
+};
+%%end"#;
+
+    let app = source("grouped_descriptor", "src/main.w");
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())],
+            vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:#?}", build.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "grouped-descriptor");
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+
+        let render = |name| {
+            let symbol = function_with_suffix(&module, name);
+            use inkwell::values::AnyValue;
+            module.get_function(&symbol).unwrap().print_to_string().to_string()
+        };
+        let producer = function_with_suffix(&module, "manufacture");
+        let allocate = direct_calls(&module, &producer);
+        assert_eq!(allocate.iter().filter(|name| *name == "__wosy_core_alloc").count(), 1);
+        for caller in ["use_fresh", "use_mixed", "use_declared"] {
+            let ir = render(caller);
+            let free = ir.find("call void @__wosy_core_free").expect("missing lexical descriptor release");
+            assert_eq!(ir.matches("call void @__wosy_core_free").count(), 1, "{ir}");
+            assert!(ir[..free].contains("load i32"), "{ir}");
+            assert!(ir[free..].contains("ret i32"), "{ir}");
+            assert!(ir[..free].contains("return_result_owner"), "{ir}");
+            if caller == "use_mixed" {
+                assert!(ir[..free].contains("checked_return_owned_0"), "{ir}");
+                assert!(ir[..free].contains("return_result_owned"), "{ir}");
+            }
+        }
+        for caller in ["use_null", "use_reassigned", "use_address", "use_opaque"] {
+            let ir = render(caller);
+            assert!(!ir.contains("call void @__wosy_core_free"), "{caller}: {ir}");
+        }
+    }
+}

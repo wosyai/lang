@@ -62,6 +62,7 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     failure_allocation: Option<(PointerValue<'ctx>, PointerValue<'ctx>, String)>,
     failure_arm_visited: bool,
     committed: bool,
+    scalar_descriptor_enrolled: bool,
     receipts: BTreeMap<usize, PointerValue<'ctx>>,
     input: Option<(usize, PointerValue<'ctx>)>,
 }
@@ -105,6 +106,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             failure_allocation: None,
             failure_arm_visited: false,
             committed: false,
+            scalar_descriptor_enrolled: false,
             receipts: BTreeMap::new(),
         }))
     }
@@ -239,6 +241,50 @@ pub(super) fn release_failure_allocation<'ctx>(
         return Ok(());
     }
     super::ownership::release_proven_local_array(context, state, base, live)
+}
+
+pub(super) fn enroll_scalar_descriptor<'ctx>(
+    state: &mut EmitState<'ctx, '_>,
+    target: &crate::scalar::ScalarAssignmentTarget,
+    expression: &ScalarExpression,
+    position: usize,
+    ty: &ScalarType,
+    flag: Option<inkwell::values::IntValue<'ctx>>,
+) -> Result<(), String> {
+    let Some(aggregate) = &mut state.aggregate else { return Ok(()) };
+    let Some((destination, call, output)) = aggregate.plan.scalar_descriptor_assignment else { return Ok(()) };
+    let nodes = state.body_call_nodes.ok_or_else(|| "missing bound descriptor assignment".to_owned())?;
+    if nodes.place_ordinal(&target.place) != Some(destination) {
+        return Ok(());
+    }
+    let (crate::ScalarPlace::Name { name, .. }, ScalarExpression::Call { span, .. },
+        ScalarType::CheckedReference { inner, .. }) = (&target.place, expression, ty) else {
+        return Err("descriptor assignment changed its validated shape".into());
+    };
+    if position != output || nodes.expression_ordinal(expression) != Some(call)
+        || std::mem::replace(&mut aggregate.scalar_descriptor_enrolled, true)
+    {
+        return Err("invalid descriptor assignment commit".into());
+    }
+    if state.joined_return_bindings.contains_key(name)
+        || state.automatic_return_result_owners.contains_key(name)
+    {
+        return Err("descriptor assignment overlaps another owner".into());
+    }
+    match state.checked_call_owners.get(&(span.start, span.end, output)) {
+        Some(CheckedCallOwner::Fresh) => {}
+        Some(CheckedCallOwner::Mixed) if flag.is_some() => {}
+        _ => return Err("missing validated checked descriptor owner".into()),
+    }
+    if let Some(flag) = flag {
+        state.checked_owner_flags.insert(name.clone(), flag);
+    }
+    state.automatic_return_result_owners.insert(name.clone(), ScalarAutomaticReturnResult {
+        aggregate_type: inner.as_ref().clone(),
+        allocation_identity: ScalarAllocationIdentity { binding: name.clone() },
+        state: ScalarAutomaticReturnResultState::Live,
+    });
+    Ok(())
 }
 
 fn call_action(
@@ -582,6 +628,9 @@ pub(super) fn finish_return<'ctx>(
         && (!aggregate.failure_arm_visited || aggregate.failure_allocation.is_some())
     {
         return Err("unconsumed local array failure allocation".into());
+    }
+    if aggregate.plan.scalar_descriptor_assignment.is_some() && !aggregate.scalar_descriptor_enrolled {
+        return Err("descriptor assignment did not commit ownership".into());
     }
     if !aggregate.receipts.is_empty() || aggregate.input.is_some() {
         return Err("unreleased closed aggregate receipt".into());
