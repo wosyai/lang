@@ -6933,6 +6933,52 @@ fn emits_project_short_circuit_cfg_with_qualified_rhs() {
 }
 
 #[test]
+fn preserves_large_aggregate_byte_offsets_in_literals_and_resolved_accesses() {
+    let padding = vec!["0"; 127].join(", ");
+    let middle = vec!["0"; 126].join(", ");
+    let text = format!(
+        "%%start\nstruct Wide {{ u8[127] padding; u8 a; u8 b; u8[126] middle; u8 c; u8 d; }}\nu8() probe = fn {{ Wide item = {{ .padding = [{padding}]; .a = 11; .b = 17; .middle = [{middle}]; .c = 23; .d = 31; }}; *Wide view = &item; (*view).a + (*view).b + (*view).c + (*view).d }};\n%%end"
+    );
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    for (layout, width) in [
+        (ScalarTargetLayout::WASM32, "i32"),
+        (ScalarTargetLayout::NATIVE64, "i64"),
+    ] {
+        let parsed = parse_source(source.clone(), text.clone(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for llvm in [
+            emit_scalar_llvm(&single).unwrap().to_text(),
+            emit_scalar_project_llvm(&project).unwrap().to_text(),
+        ] {
+            for (offset, index_width) in [(127, "i8"), (128, width), (255, width), (256, width)] {
+                let position = format!(", {index_width} {offset}");
+                for base in ["%struct_literal", "%deref"] {
+                    assert!(
+                        llvm.lines().any(|line| {
+                            line.contains(&format!("getelementptr inbounds i8, ptr {base}"))
+                                && line.ends_with(&position)
+                        }),
+                        "byte offset {offset} from {base}: {llvm}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn emits_wasm32_struct_layout_literals_and_field_addresses() {
     let source = SourceIdentity::new(
         "project".into(),

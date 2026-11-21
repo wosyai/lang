@@ -389,6 +389,28 @@ pub(super) fn place_pointer<'ctx, 'module>(
     }
 }
 
+fn byte_layout_field_pointer<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    base: PointerValue<'ctx>,
+    offset: u64,
+    name: &str,
+) -> Result<PointerValue<'ctx>, String> {
+    let byte = context.i8_type();
+    let index = if offset <= i8::MAX as u64 {
+        byte.const_int(offset, false)
+    } else {
+        let index = pointer_integer_type(context, state.target_layout);
+        let width = index.get_bit_width();
+        if width <= u64::BITS && offset >> (width - 1) != 0 {
+            return Err("LLVM struct field byte offset exceeds target index range".to_owned());
+        }
+        index.const_int(offset, false)
+    };
+    unsafe { state.builder.build_in_bounds_gep(byte, base, &[index], name) }
+        .map_err(builder_error)
+}
+
 pub(super) fn resolved_field_pointer<'ctx>(
     context: &'ctx Context,
     state: &EmitState<'ctx, '_>,
@@ -401,21 +423,12 @@ pub(super) fn resolved_field_pointer<'ctx>(
         .get(field.index)
         .filter(|candidate| candidate.id == *field)
         .ok_or_else(|| format!("unknown LLVM struct field {}", field.index))?;
-    let byte_type = context.i8_type();
-    let offset = byte_type.const_int(
-        state
-            .layouts
-            .field(field)
-            .and_then(|result| result.offset)
-            .ok_or_else(|| format!("LLVM struct field {} has no valid offset", field.index))?,
-        false,
-    );
-    unsafe {
-        state
-            .builder
-            .build_in_bounds_gep(byte_type, base, &[offset], resolved.name.as_str())
-    }
-    .map_err(builder_error)
+    let offset = state
+        .layouts
+        .field(field)
+        .and_then(|result| result.offset)
+        .ok_or_else(|| format!("LLVM struct field {} has no valid offset", field.index))?;
+    byte_layout_field_pointer(context, state, base, offset, resolved.name.as_str())
 }
 
 pub(super) fn emit_place_value<'ctx, 'module>(
@@ -550,24 +563,13 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
             .get_mut(field.name.as_str())
             .and_then(|(_, value)| value.take())
             .ok_or_else(|| format!("missing LLVM struct literal field {}", field.name))?;
-        let pointer = unsafe {
-            state.builder.build_in_bounds_gep(
-                context.i8_type(),
-                destination,
-                &[context.i8_type().const_int(
-                    state
-                        .layouts
-                        .field(&field.id)
-                        .and_then(|result| result.offset)
-                        .ok_or_else(|| {
-                            format!("LLVM struct field {} has no valid offset", field.id.index)
-                        })?,
-                    false,
-                )],
-                field.name.as_str(),
-            )
-        }
-        .map_err(builder_error)?;
+        let offset = state
+            .layouts
+            .field(&field.id)
+            .and_then(|result| result.offset)
+            .ok_or_else(|| format!("LLVM struct field {} has no valid offset", field.id.index))?;
+        let pointer =
+            byte_layout_field_pointer(context, state, destination, offset, field.name.as_str())?;
         store_value(context, state, pointer, &field.ty, value)?;
     }
     Ok(EmitValue::Basic(destination.into()))
@@ -684,22 +686,12 @@ pub(super) fn emit_utf8_literal<'ctx, 'module>(
         storage_type(context, expected, state.layouts, state.target_layout)?,
         "utf8_literal",
     )?;
-    let data = unsafe {
-        state.builder.build_in_bounds_gep(
-            byte_type,
-            destination,
-            &[byte_type.const_int(
-                state
-                    .layouts
-                    .field(&structure.fields[0].id)
-                    .and_then(|result| result.offset)
-                    .ok_or_else(|| "std.utf8 data field has no valid offset".to_owned())?,
-                false,
-            )],
-            "data",
-        )
-    }
-    .map_err(builder_error)?;
+    let data_offset = state
+        .layouts
+        .field(&structure.fields[0].id)
+        .and_then(|result| result.offset)
+        .ok_or_else(|| "std.utf8 data field has no valid offset".to_owned())?;
+    let data = byte_layout_field_pointer(context, state, destination, data_offset, "data")?;
     let address = state
         .builder
         .build_ptr_to_int(
@@ -712,22 +704,12 @@ pub(super) fn emit_utf8_literal<'ctx, 'module>(
         .builder
         .build_store(data, address)
         .map_err(builder_error)?;
-    let length = unsafe {
-        state.builder.build_in_bounds_gep(
-            byte_type,
-            destination,
-            &[byte_type.const_int(
-                state
-                    .layouts
-                    .field(&structure.fields[1].id)
-                    .and_then(|result| result.offset)
-                    .ok_or_else(|| "std.utf8 length field has no valid offset".to_owned())?,
-                false,
-            )],
-            "length",
-        )
-    }
-    .map_err(builder_error)?;
+    let length_offset = state
+        .layouts
+        .field(&structure.fields[1].id)
+        .and_then(|result| result.offset)
+        .ok_or_else(|| "std.utf8 length field has no valid offset".to_owned())?;
+    let length = byte_layout_field_pointer(context, state, destination, length_offset, "length")?;
     state
         .builder
         .build_store(
