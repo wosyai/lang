@@ -31,7 +31,7 @@ pub use scalar::{
 
 #[cfg(feature = "internal-checker")]
 #[doc(hidden)]
-pub use scalar::{check_scalar_module_proof, check_scalar_module_proofs, check_scalar_package, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarCheckerTextFile};
+pub use scalar::{check_loaded_scalar_module_proofs, check_scalar_module_proof, check_scalar_module_proofs, ScalarProofDeclarations, check_scalar_package, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarCheckerTextFile};
 
 mod llvm;
 
@@ -348,7 +348,25 @@ pub fn parse_source(
     text: String,
     configured_comments: &[String],
 ) -> ParseOutput {
-    let result = wosy_syntax::parse(source, text, configured_comments);
+    parsed_source_output(wosy_syntax::parse(source, text, configured_comments))
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn parse_proof_source(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+) -> Result<(String, ScalarProofDeclarations), ParseOutput> {
+    let output = parsed_source_output(wosy_syntax::parse_proof_module(source, text, configured_comments));
+    if !output.result.is_valid() {
+        return Err(output);
+    }
+    let proof = scalar::derive_scalar_proof_declarations_from_cst(output.result.canonical_cst());
+    Ok((output.result.text, proof))
+}
+
+fn parsed_source_output(result: ParseResult) -> ParseOutput {
     let diagnostics = result
         .errors
         .iter()

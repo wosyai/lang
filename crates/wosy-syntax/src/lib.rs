@@ -91,15 +91,15 @@ pub enum SyntaxKind {
     AllocationBinding,
     ParenthesizedDereferencePlace,
     CopyModifier,
-    #[cfg(any(test, feature = "checker-test-support"))]
+    #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
     ProofDecl = 81,
-    #[cfg(any(test, feature = "checker-test-support"))]
+    #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
     ProofTarget = 82,
-    #[cfg(any(test, feature = "checker-test-support"))]
+    #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
     ProofOutputs = 83,
-    #[cfg(any(test, feature = "checker-test-support"))]
+    #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
     ProofWhere = 84,
-    #[cfg(any(test, feature = "checker-test-support"))]
+    #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
     ProofEnsures = 85,
 }
 
@@ -191,15 +191,15 @@ impl Language for WosyLanguage {
             78 => SyntaxKind::AllocationBinding,
             79 => SyntaxKind::ParenthesizedDereferencePlace,
             80 => SyntaxKind::CopyModifier,
-            #[cfg(any(test, feature = "checker-test-support"))]
+            #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
             81 => SyntaxKind::ProofDecl,
-            #[cfg(any(test, feature = "checker-test-support"))]
+            #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
             82 => SyntaxKind::ProofTarget,
-            #[cfg(any(test, feature = "checker-test-support"))]
+            #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
             83 => SyntaxKind::ProofOutputs,
-            #[cfg(any(test, feature = "checker-test-support"))]
+            #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
             84 => SyntaxKind::ProofWhere,
-            #[cfg(any(test, feature = "checker-test-support"))]
+            #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
             85 => SyntaxKind::ProofEnsures,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
@@ -506,7 +506,7 @@ fn parse_entry(
             add_gap(&mut builder, &text, 0, &comments);
             builder.finish_node();
             let span = ByteSpan::new(0, text.len() as u32);
-            #[cfg(any(test, feature = "checker-test-support"))]
+            #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
             let span = if matches!(rule, Rule::proof_fragment | Rule::proof_module) {
                 match _error.location {
                     pest::error::InputLocation::Pos(at) => ByteSpan::new(at as u32, at as u32),
@@ -775,16 +775,18 @@ fn kind(rule: Rule) -> SyntaxKind {
     match rule {
         Rule::source => SyntaxKind::Root,
         #[cfg(any(test, feature = "checker-test-support"))]
-        Rule::proof_fragment | Rule::proof_module => SyntaxKind::Root,
-        #[cfg(any(test, feature = "checker-test-support"))]
+        Rule::proof_fragment => SyntaxKind::Root,
+        #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
+        Rule::proof_module => SyntaxKind::Root,
+        #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
         Rule::proof_decl => SyntaxKind::ProofDecl,
-        #[cfg(any(test, feature = "checker-test-support"))]
+        #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
         Rule::proof_target => SyntaxKind::ProofTarget,
-        #[cfg(any(test, feature = "checker-test-support"))]
+        #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
         Rule::proof_outputs => SyntaxKind::ProofOutputs,
-        #[cfg(any(test, feature = "checker-test-support"))]
+        #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
         Rule::proof_where => SyntaxKind::ProofWhere,
-        #[cfg(any(test, feature = "checker-test-support"))]
+        #[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
         Rule::proof_ensures => SyntaxKind::ProofEnsures,
         Rule::boundary_start => SyntaxKind::BoundaryStart,
         Rule::boundary_end => SyntaxKind::BoundaryEnd,

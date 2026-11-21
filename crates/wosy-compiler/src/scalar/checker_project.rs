@@ -28,7 +28,7 @@ use super::{
 };
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
-use wosy_syntax::{CstNode, CstToken, SyntaxKind};
+use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
 #[cfg(test)]
 use wosy_syntax::{byte_span, ProofFragmentParse};
 
@@ -822,6 +822,30 @@ pub struct ScalarProofModuleInput {
     pub namespaces: Vec<ScalarNamespaceBinding>,
 }
 
+#[doc(hidden)]
+pub struct ScalarProofDeclarations {
+    declarations: ScalarSourceDeclarations,
+    definitions: Vec<CstNode>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ScalarProofDeclarations {
+    pub fn declarations(&self) -> &ScalarSourceDeclarations {
+        &self.declarations
+    }
+}
+
+pub(crate) fn derive_scalar_proof_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarProofDeclarations {
+    let mut definitions = Vec::new();
+    let declarations = super::derive_scalar_declarations(canonical, Some(&mut definitions));
+    ScalarProofDeclarations { declarations, definitions }
+}
+
+struct ModuleProofCatalog {
+    source: SourceIdentity,
+    definitions: Vec<CstNode>,
+}
+
 struct ModuleProofs {
     definitions: Vec<CstNode>,
     first_query: usize,
@@ -865,7 +889,29 @@ impl PreparedProofModule {
         inputs: ScalarPreparationInputs,
     ) -> Result<Self, ProjectCheck> {
         let mut declarations = Vec::with_capacity(modules.len());
-        let mut proofs = HashMap::new();
+        let mut proofs = Vec::new();
+        for module in modules {
+            let parsed = wosy_syntax::parse_proof_module(module.source, module.text, &[]);
+            if !parsed.is_valid() {
+                return Err(ProjectCheck::InvalidProof);
+            }
+            let ScalarProofDeclarations { declarations: module_declarations, definitions } =
+                derive_scalar_proof_declarations_from_cst(parsed.canonical_cst());
+            if !definitions.is_empty() {
+                proofs.push(ModuleProofCatalog { source: module_declarations.source().clone(), definitions });
+            }
+            declarations.push((module_declarations, module.namespaces));
+        }
+        Self::prepare_declarations(source, declarations, proofs, initialization_order, inputs)
+    }
+
+    fn prepare_declarations(
+        source: SourceIdentity,
+        declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+        catalogs: Vec<ModuleProofCatalog>,
+        initialization_order: Vec<SourceIdentity>,
+        inputs: ScalarPreparationInputs,
+    ) -> Result<Self, ProjectCheck> {
         let mut graph_sources: HashMap<_, _> = initialization_order.iter().map(|source| (source, false)).collect();
         if graph_sources.len() != initialization_order.len() {
             return Err(ProjectCheck::AmbiguousRoot);
@@ -873,28 +919,26 @@ impl PreparedProofModule {
         if !graph_sources.contains_key(&source) {
             return Err(ProjectCheck::MissingRoot);
         }
-        for module in modules {
-            let parsed = wosy_syntax::parse_proof_module(module.source, module.text, &[]);
-            if !parsed.is_valid() {
-                return Err(ProjectCheck::InvalidProof);
-            }
-            let canonical = parsed.canonical_cst();
-            let seen = graph_sources.get_mut(&canonical.source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
+        for (module, namespaces) in &declarations {
+            let seen = graph_sources.get_mut(module.source()).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
             if std::mem::replace(seen, true) {
                 return Err(ProjectCheck::AmbiguousRoot);
             }
-            if module.namespaces.iter().any(|edge| !graph_sources.contains_key(&edge.target)) {
+            if namespaces.iter().any(|edge| !graph_sources.contains_key(&edge.target)) {
                 return Err(ProjectCheck::RootSourceOutsideInitOrder);
             }
-            let mut module_proofs = Vec::new();
-            let module_declarations = super::derive_scalar_declarations(canonical, Some(&mut module_proofs));
-            if !module_proofs.is_empty() {
-                proofs.insert(canonical.source.clone(), ModuleProofs { definitions: module_proofs, first_query: 0 });
-            }
-            declarations.push((module_declarations, module.namespaces));
         }
         if graph_sources.values().any(|seen| !seen) {
             return Err(ProjectCheck::MissingRoot);
+        }
+        let mut proofs = HashMap::new();
+        for catalog in catalogs {
+            if !graph_sources.contains_key(&catalog.source) {
+                return Err(ProjectCheck::RootSourceOutsideInitOrder);
+            }
+            if proofs.insert(catalog.source, ModuleProofs { definitions: catalog.definitions, first_query: 0 }).is_some() {
+                return Err(ProjectCheck::AmbiguousRoot);
+            }
         }
         let mut targets = Vec::new();
         for (source, proofs) in &mut proofs {
@@ -1057,6 +1101,28 @@ pub fn check_scalar_module_proofs(
     }
     let prepared = PreparedProofModule::prepare_project(proof_source, modules, initialization_order, inputs)
         .map_err(|error| module_proof_outcome(Err(error)))?;
+    Ok(prepared.check_module_proofs(proof_names))
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn check_loaded_scalar_module_proofs(
+    proof_names: &[&str],
+    mut declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    (proof, namespaces): (ScalarProofDeclarations, Vec<ScalarNamespaceBinding>),
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+) -> Result<Vec<ScalarModuleProofOutcome>, ScalarModuleProofOutcome> {
+    if proof_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ScalarProofDeclarations { declarations: proof_declarations, definitions } = proof;
+    let source = proof_declarations.source().clone();
+    let catalog = ModuleProofCatalog { source: source.clone(), definitions };
+    declarations.push((proof_declarations, namespaces));
+    let prepared = PreparedProofModule::prepare_declarations(
+        source, declarations, vec![catalog], initialization_order, inputs,
+    ).map_err(|error| module_proof_outcome(Err(error)))?;
     Ok(prepared.check_module_proofs(proof_names))
 }
 

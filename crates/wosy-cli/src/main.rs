@@ -265,13 +265,32 @@ struct CanonicalProjectInputs {
     initialization_order: Vec<SourceIdentity>,
     graph: wosy_project::SourceGraph,
     texts: BTreeMap<ProjectSourceIdentity, String>,
+    #[cfg(feature = "internal-checker")]
+    proof: Option<(wosy_compiler::ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
 }
 
-#[derive(Clone, Copy)]
 enum CanonicalLoadPurpose {
     Build,
     #[cfg(feature = "internal-checker")]
     Check,
+    #[cfg(feature = "internal-checker")]
+    Proof(PackageRelativePath),
+}
+
+enum CanonicalSourceDeclarations {
+    Ordinary(wosy_compiler::ScalarSourceDeclarations),
+    #[cfg(feature = "internal-checker")]
+    Proof(wosy_compiler::ScalarProofDeclarations),
+}
+
+impl CanonicalSourceDeclarations {
+    fn declarations(&self) -> &wosy_compiler::ScalarSourceDeclarations {
+        match self {
+            Self::Ordinary(declarations) => declarations,
+            #[cfg(feature = "internal-checker")]
+            Self::Proof(proof) => proof.declarations(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -318,6 +337,14 @@ impl CanonicalLoadFailure {
     }
 }
 
+fn canonical_syntax_failure(output: wosy_compiler::ParseOutput) -> CanonicalLoadFailure {
+    CanonicalLoadFailure::Syntax {
+        source: output.result.source,
+        text: output.result.text,
+        diagnostics: output.diagnostics,
+    }
+}
+
 fn load_canonical_project_inputs(
     root: &std::path::Path,
     project: &ProjectContext,
@@ -358,21 +385,30 @@ fn load_canonical_project_inputs(
             path.as_path().to_string_lossy().replace('\\', "/"),
             revision.clone(),
         );
-        let output = parse_source(source, text, &project.comment_categories);
-        if !output.diagnostics.is_empty() {
-            return Err(CanonicalLoadFailure::Syntax {
-                source: output.result.source, text: output.result.text, diagnostics: output.diagnostics,
-            });
-        }
-        let source = &output.result.source;
-        if matches!(purpose, CanonicalLoadPurpose::Build) {
-            persist_cst(root, &output)?;
-        }
+        let (text, declarations) = match &purpose {
+            #[cfg(feature = "internal-checker")]
+            CanonicalLoadPurpose::Proof(selected) if package == project.package && selected == &path => {
+                let (text, proof) = wosy_compiler::parse_proof_source(source, text, &project.comment_categories)
+                    .map_err(canonical_syntax_failure)?;
+                (text, CanonicalSourceDeclarations::Proof(proof))
+            }
+            _ => {
+                let output = parse_source(source, text, &project.comment_categories);
+                if !output.diagnostics.is_empty() {
+                    return Err(canonical_syntax_failure(output));
+                }
+                if matches!(purpose, CanonicalLoadPurpose::Build) {
+                    persist_cst(root, &output)?;
+                }
+                let declarations = derive_scalar_declarations_from_cst(output.result.canonical_cst());
+                (output.result.text, CanonicalSourceDeclarations::Ordinary(declarations))
+            }
+        };
         #[cfg(test)]
         routing_observations::record(|counts| counts.extractions += 1);
-        let declarations = derive_scalar_declarations_from_cst(output.result.canonical_cst());
+        let source = declarations.declarations().source();
         let mut namespace_edges = Vec::new();
-        for namespace in declarations.namespaces() {
+        for namespace in declarations.declarations().namespaces() {
             let module_path = serde_json::from_str::<String>(&namespace.path)
                 .map_err(|error| format!("invalid namespace path: {error}"))?;
             let module_path = PackageRelativePath::new(module_path.into())?;
@@ -428,7 +464,7 @@ fn load_canonical_project_inputs(
             namespace_edges,
         });
         declarations_by_path.insert((package, path), declarations);
-        texts.insert(graph_source, output.result.text);
+        texts.insert(graph_source, text);
     }
     drop((discovered, pending));
 
@@ -446,6 +482,8 @@ fn load_canonical_project_inputs(
         Err(error) => return Err(CanonicalLoadFailure::Graph { error, texts }),
     };
     let mut project_declarations = Vec::new();
+    #[cfg(feature = "internal-checker")]
+    let mut proof = None;
     let mut source_by_path = BTreeMap::new();
     let mut derivation_diagnostics = Vec::new();
     for node in &graph.nodes {
@@ -464,7 +502,7 @@ fn load_canonical_project_inputs(
                     node.source.path.as_path().display()
                 )
             })?;
-        derivation_diagnostics.extend_from_slice(declarations.diagnostics());
+        derivation_diagnostics.extend_from_slice(declarations.declarations().diagnostics());
         let namespace_bindings = node
             .namespace_edges
             .iter()
@@ -481,7 +519,11 @@ fn load_canonical_project_inputs(
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        project_declarations.push((declarations, namespace_bindings));
+        match declarations {
+            CanonicalSourceDeclarations::Ordinary(declarations) => project_declarations.push((declarations, namespace_bindings)),
+            #[cfg(feature = "internal-checker")]
+            CanonicalSourceDeclarations::Proof(declarations) => proof = Some((declarations, namespace_bindings)),
+        }
     }
     if !derivation_diagnostics.is_empty() {
         return Err(CanonicalLoadFailure::Derivation { diagnostics: derivation_diagnostics, texts });
@@ -505,6 +547,8 @@ fn load_canonical_project_inputs(
         initialization_order,
         graph,
         texts,
+        #[cfg(feature = "internal-checker")]
+        proof,
     })
 }
 
@@ -533,6 +577,37 @@ fn check_loaded_project(
     Ok((outcome, texts))
 }
 
+#[cfg(feature = "internal-checker")]
+type InternalProofResults = Result<
+    (Result<Vec<wosy_compiler::ScalarModuleProofOutcome>, wosy_compiler::ScalarModuleProofOutcome>, BTreeMap<ProjectSourceIdentity, String>),
+    CanonicalLoadFailure,
+>;
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_loaded_proofs(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    proof_file: PackageRelativePath,
+    proof_names: &[&str],
+) -> InternalProofResults {
+    if proof_names.is_empty() {
+        return Ok((Ok(Vec::new()), BTreeMap::new()));
+    }
+    let loaded = load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Proof(proof_file))?;
+    let Some(proof) = loaded.proof else {
+        return Err(CanonicalLoadFailure::Input("selected proof source is outside the canonical target graph".to_owned()));
+    };
+    #[cfg(test)]
+    routing_observations::record(|counts| counts.checks += 1);
+    let outcomes = wosy_compiler::check_loaded_scalar_module_proofs(
+        proof_names, loaded.declarations, proof, loaded.initialization_order, ScalarPreparationInputs { target_layout },
+    );
+    Ok((outcomes, loaded.texts))
+}
+
 fn compile_project(
     root: &std::path::Path,
     project: &ProjectContext,
@@ -544,6 +619,7 @@ fn compile_project(
         initialization_order,
         graph,
         texts,
+        ..
     } = load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Build)
         .map_err(CanonicalLoadFailure::report_build)?;
     #[cfg(test)]
@@ -966,6 +1042,66 @@ mod tests {
             resolved_packages: BTreeMap::new(),
         };
         (project, configuration)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_proof_adapter_loads_explicit_reachable_module_once_without_outputs() {
+        use wosy_compiler::ScalarModuleProofOutcome;
+        let sources = [
+            ("main.w", "%%start\nlib = namespace app \"lib.w\"; u8 value = lib.project(7);\n%%end"),
+            ("lib.w", r#"%%start
+                u8(u8) project = fn(input) { input };
+                proof established for project(input) -> (out) ensures (out <= 7) {}
+                proof contradicted for project(input) -> (out) ensures (out <= 6) {}
+            %%end"#),
+        ];
+        let (project, configuration) = routing_test_project("internal-proof-graph", &sources);
+        let (result, counts) = routing_observations::observe(|| {
+            check_loaded_proofs(
+                &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+                PackageRelativePath::new("lib.w".into()).unwrap(),
+                &["contradicted", "established", "contradicted"],
+            )
+        });
+        let (outcomes, texts) = result.expect("canonical proof inputs");
+        assert_eq!(outcomes.unwrap(), [
+            ScalarModuleProofOutcome::Refuted,
+            ScalarModuleProofOutcome::Proved,
+            ScalarModuleProofOutcome::Refuted,
+        ]);
+        assert_eq!(texts.len(), sources.len());
+        assert!(texts.values().any(|value| value == sources[1].1));
+        assert_eq!(counts, routing_observations::Counts { extractions: 2, checks: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_proof_adapter_refuses_unselected_sources_and_build_keeps_ordinary_parser() {
+        let vertex = PackageRelativePath::new("main.w".into()).unwrap();
+        let (project, configuration) = routing_test_project("internal-proof-outside-graph", &[
+            ("main.w", "%%start\nu8(u8) identity = fn(input) { input };\n%%end"),
+            ("stray.w", "this source is not in the target graph"),
+        ]);
+        let (result, counts) = routing_observations::observe(|| check_loaded_proofs(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+            PackageRelativePath::new("stray.w".into()).unwrap(), &["unselected"],
+        ));
+        assert!(matches!(result, Err(CanonicalLoadFailure::Input(_))));
+        assert_eq!(counts, routing_observations::Counts { extractions: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
+
+        let text = "%%start\nu8(u8) identity = fn(input) { input };\nproof alpha for identity(input) -> (out) ensures (out <= 255) {}\n%%end";
+        let (project, configuration) = routing_test_project("ordinary-build-stays-proof-free", &[("main.w", text)]);
+        let selected = check_loaded_proofs(&project.root, &project, &configuration, ScalarTargetLayout::NATIVE64, vertex, &["alpha"]);
+        let (outcomes, _) = selected.expect("valid explicit proof source");
+        assert_eq!(outcomes.unwrap(), [wosy_compiler::ScalarModuleProofOutcome::Proved]);
+        assert!(matches!(
+            load_canonical_project_inputs(&project.root, &project, &configuration, CanonicalLoadPurpose::Build),
+            Err(CanonicalLoadFailure::Syntax { diagnostics, .. }) if diagnostics[0].code == "S0001",
+        ));
+        assert!(!project.root.join(".wosy").exists());
     }
 
     #[cfg(feature = "internal-checker")]
