@@ -1,3 +1,5 @@
+use num_bigint::BigInt;
+
 use super::{
     checker_flow::CheckerPredicate, control::CheckedCallSignature, typecheck::expression_span,
     ByteSpan, ScalarExpression,
@@ -18,15 +20,18 @@ pub(super) struct PreparedCheckerDirective {
     pub(super) output: CheckedLiteralOutput,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CheckedLiteralOutput {
     pub(super) stdout: ByteSpan,
     pub(super) stderr: ByteSpan,
     pub(super) code: ByteSpan,
     pub(super) files: ByteSpan,
+    pub(super) stdout_bytes: Box<[u8]>,
+    pub(super) stderr_bytes: Box<[u8]>,
+    pub(super) code_value: BigInt,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CheckedDirectiveMarker {
     pub(super) operation: CheckerOperation,
     pub(super) output: CheckedLiteralOutput,
@@ -123,13 +128,13 @@ impl CheckerDirectiveShapeErrorKind {
 
 impl CheckerOutput<'_> {
     pub(super) fn explicit_literal(&self) -> Option<CheckedLiteralOutput> {
-        let ScalarExpression::Utf8 { span: stdout, .. } = self.stdout? else {
+        let ScalarExpression::Utf8 { span: stdout, value: stdout_bytes } = self.stdout? else {
             return None;
         };
-        let ScalarExpression::Utf8 { span: stderr, .. } = self.stderr? else {
+        let ScalarExpression::Utf8 { span: stderr, value: stderr_bytes } = self.stderr? else {
             return None;
         };
-        let ScalarExpression::Integer { span: code, .. } = self.code? else {
+        let ScalarExpression::Integer { span: code, value: code_value } = self.code? else {
             return None;
         };
         if !self.files.as_ref()?.is_empty() {
@@ -140,6 +145,9 @@ impl CheckerOutput<'_> {
             stderr: *stderr,
             code: *code,
             files: self.files_literal?,
+            stdout_bytes: stdout_bytes.as_slice().into(),
+            stderr_bytes: stderr_bytes.as_slice().into(),
+            code_value: code_value.clone(),
         })
     }
 }
@@ -898,6 +906,54 @@ mod tests {
                     *predicate == CheckerPredicate::Boolean(guard)
                 }));
                 assert_eq!(check_integer_requirements(body), if guard { None } else { Some(Ok(())) });
+            });
+        }
+    }
+
+    #[test]
+    fn checked_failure_retains_exact_literal_payload_and_source_spans() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+
+        let source = r#"
+            unit() check_value = fn {
+                core.require(false, {
+                    .stdout = "café\n☕";
+                    .stderr = "erro\t\"";
+                    .code = 340282366920938463463374607431768211456;
+                    .files = [];
+                });
+            };
+        "#;
+        check_source(source, |body| {
+            let failure = check_integer_requirements(body).unwrap().unwrap_err();
+            let payload = &body.structure.checker_directives[&failure.directive].output;
+            assert_eq!(payload.stdout_bytes.as_ref(), "café\n☕".as_bytes());
+            assert_eq!(payload.stderr_bytes.as_ref(), b"erro\t\"");
+            assert_eq!(payload.code_value, BigInt::from(u128::MAX) + 1);
+            let offset = "%%start\n".len();
+            let spelling = |span: ByteSpan| {
+                &source[span.start as usize - offset..span.end as usize - offset]
+            };
+            assert_eq!(spelling(payload.stdout), r#""café\n☕""#);
+            assert_eq!(spelling(payload.stderr), r#""erro\t\"""#);
+            assert_eq!(spelling(payload.code), "340282366920938463463374607431768211456");
+            assert_eq!(spelling(payload.files), "[]");
+        });
+    }
+
+    #[test]
+    fn output_payload_requires_explicit_literals_and_empty_files() {
+        for source in [
+            r#"core.require(false, { .stdout = write(); .stderr = ""; .code = 1; .files = []; })"#,
+            r#"core.require(false, { .stdout = ""; .stderr = ""; .code = 1; })"#,
+            r#"core.require(false, {
+                .stdout = ""; .stderr = ""; .code = 1;
+                .files = [{ .path = "out.txt"; .text = "test"; }];
+            })"#,
+        ] {
+            with_expression(source, |expression| {
+                let directive = CheckerDirective::from_expression(expression).unwrap().unwrap();
+                assert!(directive.output.explicit_literal().is_none());
             });
         }
     }
