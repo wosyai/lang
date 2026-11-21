@@ -12551,3 +12551,27 @@ unit(Pair) inspect = fn(owner) {{
         }
     }
 }
+
+#[test]
+fn known_projected_shared_leaf_rejects_nonlocal_authority_and_result_forms() {
+    let declarations = "struct copy Nested { u8 value; }\nstruct copy Pair { u8 left; Nested nested; u8[2] bytes; }";
+    let standard = "*Pair parent = &owner; *u8 leaf = &(*parent).left;";
+    for (name, definitions, target) in [
+        ("return", format!("*u8(Pair) inspect = fn(owner) {{ {standard} leaf }};"), "&(*parent).left"),
+        ("call", format!("unit(*u8) consume = fn(value) {{ value; }}; unit(Pair) inspect = fn(owner) {{ {standard} consume(leaf); }};"), "&(*parent).left"),
+        ("raw owner", format!("unit(Pair) inspect = fn(owner) {{ unsafe {{ &?owner; }}; {standard} u8 value = *leaf; value; }};"), "&(*parent).left"),
+        ("borrowed formal", "unit(*Pair) inspect = fn(parent) { *u8 leaf = &(*parent).left; u8 value = *leaf; value; };".into(), "&(*parent).left"),
+        ("raw parent", "unit(*?Pair) inspect = fn(parent) { *u8 leaf = &(*parent).left; u8 value = *leaf; value; };".into(), "&(*parent).left"),
+        ("aggregate leaf", "unit(Pair) inspect = fn(owner) { *Pair parent = &owner; *Nested leaf = &(*parent).nested; leaf; };".into(), "&(*parent).nested"),
+        ("indexed leaf", "unit(Pair) inspect = fn(owner) { *Pair parent = &owner; *u8 leaf = &(*parent).bytes[0]; leaf; };".into(), "&(*parent).bytes"),
+    ] {
+        let text = format!("%%start\n{declarations}\n{definitions}\n%%end");
+        let range = text.find(target).expect("projected expression") as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == range)),
+                "{name}: {diagnostics:?}");
+        }
+    }
+}
