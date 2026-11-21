@@ -2239,6 +2239,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         } else {
             None
         };
+        let checked_pointee = matches!(pointer_type, Some(ScalarType::CheckedReference { .. }));
         let reads_checked_aggregate = matches!(pointer_type,
             Some(ScalarType::CheckedReference { inner, .. })
                 if matches!(inner.as_ref(), ScalarType::Struct(_) | ScalarType::Array { .. }));
@@ -2288,11 +2289,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
             candidates,
             reads_origin: reads_checked_value,
         };
-        if reads_checked_value || reads_checked_aggregate {
-            self.uncomputed_point(event, span, scope);
+        let uncomputed = reads_checked_value || reads_checked_aggregate;
+        let point = self.point_with_origins(
+            event,
+            span,
+            scope,
+            (!uncomputed).then(BTreeSet::new),
+        );
+        if checked_pointee && pointer_point.is_some() {
+            self.proof_points.checked_pointee_reads.push(point);
+        }
+        if uncomputed {
             Ok(ReferenceValue::Uncomputed)
         } else {
-            self.point(event, span, scope, BTreeSet::new());
             Ok(ReferenceValue::Other)
         }
     }
@@ -3868,6 +3877,7 @@ enum LoanAccess<'a> {
     Direct,
     Through(ReferenceOriginId),
     WriteThrough(&'a InvalidationCandidate),
+    ReadThrough(&'a ReferenceLoanId),
 }
 
 fn conflicting_live_loan(
@@ -3884,7 +3894,7 @@ fn conflicting_live_loan(
         let mut reachable = false;
         for origin in origins {
             if match access {
-                LoanAccess::Direct => false,
+                LoanAccess::Direct | LoanAccess::ReadThrough(_) => false,
                 LoanAccess::Through(selected) => *origin == selected,
                 LoanAccess::WriteThrough(selected) => *origin == selected.origin,
             } {
@@ -3894,10 +3904,18 @@ fn conflicting_live_loan(
                 ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. } => loan,
                 _ => continue,
             };
-            if !loan_borrows_place(loan, &place)
-                || matches!(access, LoanAccess::WriteThrough(selected)
-                    if loan_has_ancestor(&selected.loan, loan))
-            {
+            let conflicts_with_access = match access {
+                LoanAccess::ReadThrough(selected) => {
+                    loan.mode == ScalarReferenceMutability::Mutable
+                        && loan_has_ancestor(loan, selected)
+                        && reference_places_overlap(&available_place(&loan.origin_place), &place)
+                }
+                LoanAccess::WriteThrough(selected) => {
+                    loan_borrows_place(loan, &place) && !loan_has_ancestor(&selected.loan, loan)
+                }
+                LoanAccess::Direct | LoanAccess::Through(_) => loan_borrows_place(loan, &place),
+            };
+            if !conflicts_with_access {
                 continue;
             }
             if !reachable {
@@ -4334,15 +4352,17 @@ struct ReferenceTransferCfg<'a> {
     points: &'a mut [ReferenceFlowPoint],
     facts: &'a mut Vec<ReferenceOrigin>,
     allocations: &'a BTreeSet<ReferenceBindingId>,
+    checked_pointee_reads: &'a [CfgPointId],
 }
 
-impl<'a> From<&'a mut ScalarReferenceCfg> for ReferenceTransferCfg<'a> {
-    fn from(cfg: &'a mut ScalarReferenceCfg) -> Self {
+impl<'a> ReferenceTransferCfg<'a> {
+    fn new(cfg: &'a mut ScalarReferenceCfg, checked_pointee_reads: &'a [CfgPointId]) -> Self {
         Self {
             initial_points: &cfg.initial_points,
             points: &mut cfg.points,
             facts: &mut cfg.facts,
             allocations: &cfg.allocations,
+            checked_pointee_reads,
         }
     }
 }
@@ -4611,6 +4631,7 @@ fn transfer_reference_facts(
                         if !*reads_origin {
                             point.possible_origins = Some(origins.clone());
                         }
+                        let checked_pointee = cfg.checked_pointee_reads.binary_search(&id).is_ok();
                         for origin in origins {
                             match &cfg.facts[origin.0] {
                                 ReferenceOrigin::Fresh { loan, .. }
@@ -4622,6 +4643,22 @@ fn transfer_reference_facts(
                                         Some(loan),
                                         &mut resolved.projections,
                                     );
+                                    if checked_pointee {
+                                        let origins = conflicting_live_loan(
+                                            original_points,
+                                            &cfg.facts,
+                                            &state,
+                                            id,
+                                            &resolved,
+                                            LoanAccess::ReadThrough(loan),
+                                        );
+                                        if !origins.is_empty() {
+                                            errors.push(ReferenceAnalysisError::ConflictingPlace {
+                                                source_span: point.source_span.clone(),
+                                                origins,
+                                            });
+                                        }
+                                    }
                                     candidates.push(resolved);
                                 }
                                 ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => {
@@ -8759,7 +8796,7 @@ fn transfer_function_output_contracts<'a>(
                     invalid: false, exited: false })
         });
         let transferred = transfer_reference_facts(
-            (&mut result.cfg).into(),
+            ReferenceTransferCfg::new(&mut result.cfg, &result.proof_points.checked_pointee_reads),
             &BTreeMap::new(),
             inputs,
             None,
@@ -9053,6 +9090,7 @@ fn derive_function_specialized_copy_policies(
                     points: &mut points,
                     facts: &mut facts,
                     allocations: &template_cfg.allocations,
+                    checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
                 },
                 &deferred,
                 &HashMap::new(),
@@ -9366,7 +9404,13 @@ fn build_function_reference_cfg(
             call_sites,
             &mut aggregate,
         ));
-        let provisional = transfer_reference_facts((&mut builder.cfg).into(), &BTreeMap::new(), &HashMap::new(), flow, None);
+        let provisional = transfer_reference_facts(
+            ReferenceTransferCfg::new(&mut builder.cfg, &builder.proof_points.checked_pointee_reads),
+            &BTreeMap::new(),
+            &HashMap::new(),
+            flow,
+            None,
+        );
         if provisional.is_empty() {
             for &(end, _) in &builder.aggregate_facts.checked_producer_arms {
                 aggregate.checked_producer_backing.entry(end).or_insert(aggregate::CheckedProducerBacking::Unknown);

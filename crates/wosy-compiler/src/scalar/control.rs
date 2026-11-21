@@ -22,6 +22,7 @@ pub(crate) struct CallablePointFacts {
     pub(super) evaluations: HashMap<OccurrenceOrdinal, super::CfgPointId>,
     pub(super) installs: HashMap<OccurrenceOrdinal, FrozenInstall>,
     pub(super) definitions: HashMap<(BlockOrdinal, usize, usize), BindingDefinition>,
+    pub(super) checked_pointee_reads: Vec<super::CfgPointId>,
     pub(super) formals: HashMap<usize, super::ReferenceBindingId>,
     pub(super) scalar_descriptor_install: ScalarDescriptorCandidates,
     pub(super) backing_descriptor_install: ScalarDescriptorCandidates,

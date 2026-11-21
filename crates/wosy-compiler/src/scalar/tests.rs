@@ -1706,6 +1706,73 @@ unit(*!u8) check_parent = fn(parent) {
 }
 
 #[test]
+fn parent_pointee_read_rejects_a_mutable_child_with_a_later_use() {
+    let text = "%%start
+unit(*!u8) check_read = fn(parent) {
+    *!u8 child = &!(*parent);
+    u8 observed = *parent;
+    u8 through_child = *child;
+    observed;
+    through_child;
+};
+%%end";
+    let read = text.find("*parent;").unwrap() as u32;
+    let child = text.find("&!(*parent)").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one suspension diagnostic: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(diagnostic.message, "read or move of unavailable place");
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(read, read + 7));
+        assert_eq!(
+            diagnostic.labels[1].span.range,
+            ByteSpan::new(child, child + "&!(*parent)".len() as u32),
+        );
+        assert_eq!(
+            diagnostic.labels[1].kind,
+            super::super::DiagnosticLabelKind::Secondary,
+        );
+    }
+}
+
+#[test]
+fn parent_and_child_pointee_reads_respect_last_use_sharing_and_unrelated_origins() {
+    for body in [
+        "unit(*!u8) check_read = fn(parent) {
+            *!u8 child = &!(*parent);
+            u8 before = *child;
+            u8 after = *parent;
+            before; after;
+        };",
+        "unit(*!u8) check_read = fn(parent) {
+            *u8 child = &(*parent);
+            u8 through_parent = *parent;
+            u8 through_child = *child;
+            through_parent; through_child;
+        };",
+        "unit(*!u8) check_read = fn(parent) {
+            *!u8 child = &!(*parent);
+            u8 first = *child;
+            u8 second = *child;
+            first; second;
+        };",
+        "unit(*!u8, *!u8) check_read = fn(parent, unrelated) {
+            *!u8 child = &!(*parent);
+            u8 other = *unrelated;
+            u8 through_child = *child;
+            other; through_child;
+        };",
+    ] {
+        let text = format!("%%start\n{body}\n%%end");
+        let (single, project) = both_reference_functions(&text);
+        assert!(single.diagnostics.is_empty(), "{body}: {:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{body}: {:?}", project.diagnostics);
+    }
+}
+
+#[test]
 fn checked_aggregate_conflicts_label_the_initiating_loan_in_both_pipelines() {
     for (text, primary, origin) in [
             ("%%start\nstruct Payload { u8 value; }\nunit() f = fn { Payload specimen = { .value = 1; }; *!Payload writer = &!specimen; Payload taken = *writer; Payload again = *writer; taken; again; };\n%%end", "*writer; taken", "&!specimen"),
