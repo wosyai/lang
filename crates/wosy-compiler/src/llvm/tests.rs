@@ -3606,6 +3606,9 @@ fn releases_runtime_array_backing_after_copying_primitive_returns() {
 u8(u64) indexed = fn(length) { u8[length] bytes; bytes[0] = 7; bytes[0] };
 u8(u64) copied = fn(length) { u8[length] bytes; bytes[0] = 7; u8 result = bytes[0]; result };
 u8(u64) indirect = fn(length) { u8[length] bytes; bytes[0] = 7; *u8 view = &bytes[0]; *view };
+enum Event { none; started; }
+Event(u64) enum_indexed = fn(length) { Event[length] events; events[0] = Event::started; events[0] };
+Event(u64) enum_copied = fn(length) { Event[length] events; events[0] = Event::started; Event result = events[0]; result };
 %%end";
     let source = SourceIdentity::new(
         "project".into(),
@@ -3627,7 +3630,13 @@ u8(u64) indirect = fn(length) { u8[length] bytes; bytes[0] = 7; *u8 view = &byte
             (false, emit_scalar_llvm(&single).unwrap().to_text()),
             (true, emit_scalar_project_llvm(&project).unwrap().to_text()),
         ] {
-            for name in ["indexed", "copied", "indirect"] {
+            for (name, output) in [
+                ("indexed", "i8"),
+                ("copied", "i8"),
+                ("indirect", "i8"),
+                ("enum_indexed", "i32"),
+                ("enum_copied", "i32"),
+            ] {
                 let symbol = if project_route {
                     project_function_name(&source, name)
                 } else {
@@ -3642,9 +3651,11 @@ u8(u64) indirect = fn(length) { u8[length] bytes; bytes[0] = 7; *u8 view = &byte
                 assert_eq!(body.matches(allocation).count(), 1, "{name}: {body}");
                 assert_eq!(body.matches(release).count(), 1, "{name}: {body}");
                 let allocation = body.find(allocation).unwrap();
-                let loaded = body.rfind("load i8, ptr").expect("result load");
+                let loaded = body
+                    .rfind(&format!("load {output}, ptr"))
+                    .expect("result load");
                 let release = body.find(release).unwrap();
-                let returned = body.find("ret i8 ").expect("primitive return");
+                let returned = body.find(&format!("ret {output} ")).expect("value return");
                 assert!(
                     allocation < loaded && loaded < release && release < returned,
                     "{name}: {body}"
