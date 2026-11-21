@@ -11,8 +11,8 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 use wosy_compiler::{
-    analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_llvm,
-    emit_scalar_build_single_module_llvm, parse_source, prepare_scalar_project, publication,
+    analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_llvm_text,
+    emit_scalar_build_single_module_llvm_text, parse_source, prepare_scalar_project, publication,
     serialize_publication, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
 use wosy_project::{
@@ -161,6 +161,7 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
         &source_identity,
         &llvm,
     )?;
+    drop(llvm);
     let executable = output_dir.join("main");
     let pending_manifest = output_dir.join("artifact-manifest.pending.json");
     let pending = wosy_project::ArtifactManifest {
@@ -488,19 +489,18 @@ fn compile_project(
     let llvm = if graph.nodes.len() == 1 {
         #[cfg(test)]
         routing_observations::record(|counts| counts.single_module_emissions += 1);
-        emit_scalar_build_single_module_llvm(&validation)?
+        emit_scalar_build_single_module_llvm_text(&validation)?
     } else {
         #[cfg(test)]
         routing_observations::record(|counts| counts.project_emissions += 1);
-        emit_scalar_build_project_llvm(&validation)?
-    }
-    .to_text();
+        emit_scalar_build_project_llvm_text(&validation)?
+    };
     let source_observations = graph
         .nodes
-        .iter()
+        .into_iter()
         .map(|node| SourceObservation {
-            source: node.source.clone(),
-            content_revision: node.content_revision.clone(),
+            source: node.source,
+            content_revision: node.content_revision,
         })
         .collect();
     Ok((llvm, source_observations))

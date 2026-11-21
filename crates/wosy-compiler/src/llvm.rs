@@ -309,7 +309,20 @@ fn declare_core_runtime<'ctx>(context: &'ctx Context, module: &Module<'ctx>) {
     );
 }
 
+#[derive(Clone, Copy)]
+enum PartitionMetadata {
+    Full,
+    ExternsOnly,
+}
+
 pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, String> {
+    emit_scalar_llvm_with_metadata(validation, PartitionMetadata::Full)
+}
+
+fn emit_scalar_llvm_with_metadata(
+    validation: &ScalarValidation,
+    metadata: PartitionMetadata,
+) -> Result<LlvmPartition, String> {
     if !validation.diagnostics.is_empty() {
         return Err("cannot emit LLVM for an invalid scalar program".into());
     }
@@ -325,11 +338,28 @@ pub fn emit_scalar_llvm(validation: &ScalarValidation) -> Result<LlvmPartition, 
         GenericInitializerInput::RawStandalone(&prepared),
         &|reservations| prepared.aggregate(reservations),
         &|_, _, function| Some(&function.reference_cfg),
+        metadata,
     )
 }
 
 pub fn emit_scalar_build_single_module_llvm(
     validation: &ScalarBuildValidation<'_>,
+) -> Result<LlvmPartition, String> {
+    emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::Full)
+}
+
+pub fn emit_scalar_build_single_module_llvm_text(
+    validation: &ScalarBuildValidation<'_>,
+) -> Result<String, String> {
+    Ok(
+        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly)?
+            .into_text(),
+    )
+}
+
+fn emit_scalar_build_single_module_with_metadata(
+    validation: &ScalarBuildValidation<'_>,
+    metadata: PartitionMetadata,
 ) -> Result<LlvmPartition, String> {
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar program".into());
@@ -358,6 +388,7 @@ pub fn emit_scalar_build_single_module_llvm(
         GenericInitializerInput::PreparedRows(prepared),
         &|reservations| validation.aggregate(reservations),
         &|item, arm, _| validation.reference_cfg(0, item, arm),
+        metadata,
     )
 }
 
@@ -375,6 +406,7 @@ fn emit_single_module_llvm<'a>(
         Option<usize>,
         &'a ScalarFunction,
     ) -> Option<&'a ScalarReferenceCfg>,
+    metadata: PartitionMetadata,
 ) -> Result<LlvmPartition, String> {
     let prepared_render = generic_input.prepared_render();
     let initializer_nodes = Some(initialization_region.bind_call_nodes(items)?);
@@ -663,6 +695,7 @@ fn emit_single_module_llvm<'a>(
         &functions,
         &signatures,
         &externs,
+        metadata,
     )
 }
 
@@ -675,18 +708,38 @@ pub fn emit_scalar_project_llvm(
     let prepared = crate::PreparedScalarProject::new(validation.project.clone())
         .map_err(|_| "cannot emit LLVM for an invalid scalar project".to_owned())?;
     let build = crate::analyze_scalar_build(&prepared);
-    emit_scalar_build_project_with_policy(&build, EmissionPolicy::RawCompatibility)
+    emit_scalar_build_project_with_policy(
+        &build,
+        EmissionPolicy::RawCompatibility,
+        PartitionMetadata::Full,
+    )
 }
 
 pub fn emit_scalar_build_project_llvm(
     validation: &ScalarBuildValidation<'_>,
 ) -> Result<LlvmPartition, String> {
-    emit_scalar_build_project_with_policy(validation, EmissionPolicy::Prepared)
+    emit_scalar_build_project_with_policy(
+        validation,
+        EmissionPolicy::Prepared,
+        PartitionMetadata::Full,
+    )
+}
+
+pub fn emit_scalar_build_project_llvm_text(
+    validation: &ScalarBuildValidation<'_>,
+) -> Result<String, String> {
+    Ok(emit_scalar_build_project_with_policy(
+        validation,
+        EmissionPolicy::Prepared,
+        PartitionMetadata::ExternsOnly,
+    )?
+    .into_text())
 }
 
 fn emit_scalar_build_project_with_policy(
     validation: &ScalarBuildValidation<'_>,
     policy: EmissionPolicy,
+    metadata: PartitionMetadata,
 ) -> Result<LlvmPartition, String> {
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar project".into());
@@ -705,6 +758,7 @@ fn emit_scalar_build_project_with_policy(
             EmissionPolicy::RawCompatibility => None,
             EmissionPolicy::Prepared => Some(validation),
         },
+        metadata,
     )
 }
 
@@ -720,6 +774,7 @@ fn emit_project_llvm<'a>(
         &'a ScalarFunction,
     ) -> Option<&'a ScalarReferenceCfg>,
     project_build: Option<&'a ScalarBuildValidation<'a>>,
+    metadata: PartitionMetadata,
 ) -> Result<LlvmPartition, String> {
     let mut module_ordinals = HashMap::with_capacity(project.modules.len());
     for (ordinal, module) in project.modules.iter().enumerate() {
@@ -1153,14 +1208,27 @@ fn emit_project_llvm<'a>(
         &functions,
         &signatures,
         &externs,
+        metadata,
     )
 }
 
 pub fn emit_scalar_llvm_text(validation: &ScalarValidation) -> Result<String, String> {
-    Ok(emit_scalar_llvm(validation)?.to_text())
+    Ok(emit_scalar_llvm_with_metadata(validation, PartitionMetadata::ExternsOnly)?.into_text())
 }
 
 impl LlvmPartition {
+    fn into_text(mut self) -> String {
+        if !self.declarations.is_empty() || self.text.contains("\r\n") {
+            return self.to_text();
+        }
+        if let Some(index) = extra_source_filename_blank(&self.text) {
+            let offset = self.text.match_indices('\n').nth(index)
+                .expect("blank LLVM header line has a newline").0;
+            self.text.remove(offset);
+        }
+        self.text
+    }
+
     pub fn to_text(&self) -> String {
         if !self.declarations.is_empty() {
             let mut declarations = self
@@ -1243,12 +1311,7 @@ impl LlvmPartition {
             }
             serialized
         } else {
-            let mut lines = self.text.lines().enumerate();
-            let excluded = lines.find(|(_, line)| line.starts_with("source_filename"))
-                .and_then(|(index, _)| {
-                    (matches!(lines.next(), Some((_, ""))) && matches!(lines.next(), Some((_, ""))))
-                        .then_some(index + 2)
-                });
+            let excluded = extra_source_filename_blank(&self.text);
             if excluded.is_none() && !self.text.contains("\r\n") {
                 return self.text.clone();
             }
@@ -1269,6 +1332,13 @@ impl LlvmPartition {
             serialized
         }
     }
+}
+
+fn extra_source_filename_blank(text: &str) -> Option<usize> {
+    let mut lines = text.lines().enumerate();
+    let (index, _) = lines.find(|(_, line)| line.starts_with("source_filename"))?;
+    (matches!(lines.next(), Some((_, ""))) && matches!(lines.next(), Some((_, ""))))
+        .then_some(index + 2)
 }
 
 struct LlvmQuotedAttribute<'a>(&'a str);
@@ -1318,38 +1388,42 @@ fn finish_partition<'ctx>(
     functions: &BTreeMap<String, FunctionValue<'ctx>>,
     signatures: &BTreeMap<String, ScalarType>,
     externs: &[LlvmExternIdentity],
+    metadata: PartitionMetadata,
 ) -> Result<LlvmPartition, String> {
     module.verify().map_err(|error| error.to_string())?;
     let text = module.print_to_string().to_string();
-    let metadata = functions
-        .iter()
-        .filter_map(|(name, function)| {
-            let (result, parameters) = if name == "main" {
-                (LlvmValueType::I32, &[][..])
-            } else {
-                let ScalarType::Callable { outputs, parameters } = signatures.get(name)? else {
-                    return None;
+    let metadata = match metadata {
+        PartitionMetadata::ExternsOnly => Vec::new(),
+        PartitionMetadata::Full => functions
+            .iter()
+            .filter_map(|(name, function)| {
+                let (result, parameters) = if name == "main" {
+                    (LlvmValueType::I32, &[][..])
+                } else {
+                    let ScalarType::Callable { outputs, parameters } = signatures.get(name)? else {
+                        return None;
+                    };
+                    (function_value_result(outputs).ok()?, parameters.as_slice())
                 };
-                (function_value_result(outputs).ok()?, parameters.as_slice())
-            };
-            let parameters = parameters
-                .iter()
-                .enumerate()
-                .map(|(index, ty)| {
-                    let parameter = function.get_nth_param(index as u32)?;
-                    let name = parameter.get_name();
-                    Some((name.to_string_lossy().to_string(), value_type(ty).ok()?))
+                let parameters = parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, ty)| {
+                        let parameter = function.get_nth_param(index as u32)?;
+                        let name = parameter.get_name();
+                        Some((name.to_string_lossy().to_string(), value_type(ty).ok()?))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(LlvmFunction {
+                    name: name.clone(),
+                    result,
+                    parameters,
+                    attributes: Vec::new(),
+                    body: String::new(),
                 })
-                .collect::<Option<Vec<_>>>()?;
-            Some(LlvmFunction {
-                name: name.clone(),
-                result,
-                parameters,
-                attributes: Vec::new(),
-                body: String::new(),
             })
-        })
-        .collect();
+            .collect(),
+    };
     let first_external_group = if externs.is_empty() {
         0
     } else {

@@ -7,8 +7,10 @@ use wosy_syntax::{
 
 mod scalar;
 pub use llvm::{
-    emit_scalar_build_project_llvm, emit_scalar_build_single_module_llvm, emit_scalar_llvm,
-    emit_scalar_llvm_text, emit_scalar_project_llvm, LlvmFunction, LlvmPartition, LlvmValueType,
+    emit_scalar_build_project_llvm, emit_scalar_build_project_llvm_text,
+    emit_scalar_build_single_module_llvm, emit_scalar_build_single_module_llvm_text,
+    emit_scalar_llvm, emit_scalar_llvm_text, emit_scalar_project_llvm, LlvmFunction, LlvmPartition,
+    LlvmValueType,
 };
 pub use scalar::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, derive_scalar_diagnostics_from_cst,
