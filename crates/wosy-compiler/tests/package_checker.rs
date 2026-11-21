@@ -255,3 +255,36 @@ fn direct_initializer_failure_across_namespace_dispatch_keeps_its_own_source() {
     assert_eq!(failure.source, lib);
     assert_eq!(failure.operation, ScalarCheckerOperation::Require);
 }
+
+
+#[test]
+fn main_initializer_compares_only_canonical_typed_integer_literals() {
+    for condition in [
+        "2 == 2", "-3 != -2", "-2147483648 < -1", "4 <= 4", "7 > 6", "2147483647 >= 0",
+    ] {
+        assert_eq!(
+            check_scoped(&format!("core.require({condition}, {OUTPUT});"), ScalarCheckerScope::MainFlowOnly),
+            ScalarCheckerOutcome::Passed,
+            "true condition {condition}",
+        );
+    }
+    for condition in ["-3 == 4", "2 != 2", "7 < 6", "4 <= 3", "-9 > -8", "6 >= 7"] {
+        let text = format!("core.narrow({condition}, {OUTPUT});");
+        let ScalarCheckerOutcome::Failed(failure) = check(&text) else {
+            panic!("expected first failure for {condition}");
+        };
+        assert_eq!(failure.operation, ScalarCheckerOperation::Narrow);
+        let canonical = format!("%%start\n{text}\n%%end");
+        assert_eq!(&canonical[failure.condition.start as usize..failure.condition.end as usize], condition);
+    }
+    for condition in ["1 + 1 == 2", "1.0 < 2.0", "!(1 < 2)"] {
+        match check(&format!("core.require({condition}, {OUTPUT});")) {
+            ScalarCheckerOutcome::Unsupported => (),
+            ScalarCheckerOutcome::Invalid(diagnostics) => {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"), "{condition}: {diagnostics:?}");
+            }
+            other => panic!("expected {condition} to fail closed, got {other:?}"),
+        }
+    }
+    assert!(matches!(check(&format!("core.require(2147483648 >= 0, {OUTPUT});")), ScalarCheckerOutcome::Invalid(_)));
+}

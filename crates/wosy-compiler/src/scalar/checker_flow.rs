@@ -49,16 +49,7 @@ impl<'a> IntegerComparison<'a> {
         let ScalarExpression::Name { name, .. } = left.as_ref() else {
             return None;
         };
-        let bound = match right.as_ref() {
-            ScalarExpression::Integer { value, .. } => Cow::Borrowed(value),
-            ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } => {
-                let ScalarExpression::Integer { value, .. } = operand.as_ref() else {
-                    return None;
-                };
-                Cow::Owned(-value)
-            }
-            _ => return None,
-        };
+        let bound = concrete_integer_literal(right)?;
         Some(Self { left, right, name, operator, bound })
     }
 
@@ -77,6 +68,19 @@ impl<'a> IntegerComparison<'a> {
             operator: self.operator.clone(),
             bound: self.bound.into_owned(),
         })
+    }
+}
+
+pub(super) fn concrete_integer_literal(expression: &ScalarExpression) -> Option<Cow<'_, BigInt>> {
+    match expression {
+        ScalarExpression::Integer { value, .. } => Some(Cow::Borrowed(value)),
+        ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } => {
+            let ScalarExpression::Integer { value, .. } = operand.as_ref() else {
+                return None;
+            };
+            Some(Cow::Owned(-value))
+        }
+        _ => None,
     }
 }
 

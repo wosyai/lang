@@ -34,7 +34,6 @@ impl IntegerRelation {
         Some(Self { less, equal, greater })
     }
 
-    #[cfg(test)]
     pub(super) fn accepts(self, comparison: Ordering) -> bool {
         match comparison {
             Ordering::Less => self.less,

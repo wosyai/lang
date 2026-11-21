@@ -6759,9 +6759,23 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         expression: &ScalarExpression,
         names: &BTreeMap<String, WalkBinding>,
     ) -> Option<super::checker_flow::CheckerPredicate> {
-        use super::checker_flow::{CheckerPredicate, IntegerComparison};
+        use super::checker_flow::{concrete_integer_literal, CheckerPredicate, IntegerComparison};
         if let ScalarExpression::Boolean { value, .. } = expression {
             return Some(CheckerPredicate::Boolean(*value));
+        }
+        if matches!(self.mode, WalkMode::ModuleInitialization { .. }) {
+            let ScalarExpression::Binary { operator, left, right, .. } = expression else {
+                return None;
+            };
+            let relation = super::symbolic_integer::IntegerRelation::from_operator(operator)?;
+            let left_type = self.occurrence_typing.checked_expression_type(left)?;
+            let right_type = self.occurrence_typing.checked_expression_type(right)?;
+            if left_type != right_type || !is_integer_type(left_type) {
+                return None;
+            }
+            let left = concrete_integer_literal(left)?;
+            let right = concrete_integer_literal(right)?;
+            return Some(CheckerPredicate::Boolean(relation.accepts(left.as_ref().cmp(right.as_ref()))));
         }
         let WalkMode::Callable(callable) = &self.mode else {
             return None;
