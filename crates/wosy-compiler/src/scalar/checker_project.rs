@@ -20,7 +20,7 @@ use super::{
     typecheck_scalar_project_in_mode, BinaryOperator, ByteSpan, ConcreteCallSelection,
     ReferenceBindingId, ResolvedCallTarget, ScalarBlock, ScalarBlockItem, ScalarExpression, ScalarFunction,
     ScalarItem, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarProject,
-    ScalarSourceDeclarations, ScalarTargetLayout, ScalarType,
+    ScalarSourceDeclarations, ScalarTargetLayout, ScalarType, UnaryOperator,
 };
 use crate::Diagnostic;
 use wosy_syntax::{byte_span, CstNode, CstToken, ProofFragmentParse, SourceIdentity, SyntaxKind};
@@ -1003,13 +1003,16 @@ fn proof_entry_filters(
     body: &FunctionCallSites,
 ) -> Result<Vec<CheckerPredicate>, ProjectCheck> {
     let mut filters = Vec::new();
-    let mut pending = vec![expression];
-    while let Some(expression) = pending.pop() {
-        if let ScalarExpression::Binary { operator: BinaryOperator::And, left, right, .. } = expression {
-            pending.push(right);
-            pending.push(left);
-        } else {
-            filters.push(proof_input_condition(expression, inputs, body)?);
+    let mut pending = vec![(expression, false)];
+    while let Some((expression, negated)) = pending.pop() {
+        match expression {
+            ScalarExpression::Unary { operator: UnaryOperator::LogicalNot, operand, .. } =>
+                pending.push((operand, !negated)),
+            ScalarExpression::Binary { operator: BinaryOperator::And, left, right, .. } if !negated => {
+                pending.push((right, false));
+                pending.push((left, false));
+            }
+            _ => filters.push(proof_input_condition(expression, inputs, body, negated)?),
         }
     }
     Ok(filters)
@@ -1019,11 +1022,23 @@ fn proof_input_condition(
     expression: &ScalarExpression,
     inputs: &[String],
     body: &FunctionCallSites,
+    negated: bool,
 ) -> Result<CheckerPredicate, ProjectCheck> {
     if let ScalarExpression::Boolean { value, .. } = expression {
-        return Ok(CheckerPredicate::Boolean(*value));
+        return Ok(CheckerPredicate::Boolean(*value != negated));
     }
-    let condition = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
+    let mut condition = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
+    if negated {
+        condition.operator = match condition.operator {
+            BinaryOperator::Equal => &BinaryOperator::NotEqual,
+            BinaryOperator::NotEqual => &BinaryOperator::Equal,
+            BinaryOperator::Less => &BinaryOperator::GreaterEqual,
+            BinaryOperator::LessEqual => &BinaryOperator::Greater,
+            BinaryOperator::Greater => &BinaryOperator::LessEqual,
+            BinaryOperator::GreaterEqual => &BinaryOperator::Less,
+            _ => return Err(ProjectCheck::Unsupported),
+        };
+    }
     let index = inputs.iter().position(|input| input == condition.name)
         .ok_or(ProjectCheck::InvalidProof)?;
     let ty = &body.boundary.parameters[index].ty;
@@ -1061,7 +1076,7 @@ fn proof_show_branch<'a>(
     }) {
         return Err(ProjectCheck::Unsupported);
     }
-    let guard = proof_input_condition(condition, inputs, body)?;
+    let guard = proof_input_condition(condition, inputs, body, false)?;
     Ok(IntegerBranchProof {
         guard,
         then_claim: proof_show_claim(then_branch, inputs, output, ty, body, bindings)?,
@@ -1890,6 +1905,36 @@ mod tests {
     }
 
     #[test]
+    fn proof_where_accepts_only_negations_that_keep_an_exact_conjunctive_scope() {
+        let app = source("src/main.w", "negated-input");
+        let callable = "%%start\nu8(u8) identity = fn(value) { value };\n%%end";
+        for (guard, bound, expected) in [
+            ("!(x == 6)", "out != 6", ProjectCheck::Proved),
+            ("!(x != 6)", "out == 6", ProjectCheck::Proved),
+            ("!(x < 3)", "out >= 3", ProjectCheck::Proved),
+            ("!(x <= 3)", "out > 3", ProjectCheck::Proved),
+            ("!(x > 10)", "out <= 10", ProjectCheck::Proved),
+            ("!(x >= 10)", "out < 10", ProjectCheck::Proved),
+            ("!(x >= 10)", "out < 9", ProjectCheck::Refuted),
+            ("!(x < 3) && !(x > 10)", "out <= 10", ProjectCheck::Proved),
+            ("!(!(x >= 3 && x <= 10))", "out <= 10", ProjectCheck::Proved),
+            ("!false && x <= 10", "out <= 10", ProjectCheck::Proved),
+            ("!true && x <= 10", "out <= 10", ProjectCheck::NoApplicableInputs),
+            ("!(x > 3 && x < 10)", "out <= 10", ProjectCheck::Unsupported),
+            ("!false && !(x > 10 || x < 3)", "out <= 10", ProjectCheck::Unsupported),
+            ("!true && !(x == x)", "out <= 10", ProjectCheck::Unsupported),
+            ("!true && !(x + 1 == 4)", "out <= 10", ProjectCheck::InvalidProof),
+            ("!x", "out <= 10", ProjectCheck::InvalidProof),
+        ] {
+            assert_eq!(
+                prove(&app, callable, &format!("proof bounded for identity(x) -> (out) where ({guard}) ensures ({bound}) {{}}")),
+                expected,
+                "guard {guard}",
+            );
+        }
+    }
+
+    #[test]
     fn canonical_empty_clamp_proof_binds_aliases_by_position() {
         let app = source("src/main.w", "clamp");
         let callable = "%%start\nu8(u8) clamp = fn(value) { if (value > 10) { 10 } else { value } };\n%%end";
@@ -2141,7 +2186,7 @@ mod tests {
     fn compound_bound_requires_every_guard_at_the_actual_incoming_argument() {
         let app = source("src/main.w", "conjunctive-consumer");
         let proof_source = source("proof/identity.fragment.w", "compound-r1");
-        let proof = "proof bounded for identity(x) -> (out) where (x <= 10 && x >= 3 && x != 6) ensures (out <= 10) {}";
+        let proof = "proof bounded for identity(x) -> (out) where (!(x > 10) && !(x < 3) && !(x == 6)) ensures (out <= 10) {}";
         let text = format!(r#"%%start
             u8(u8) identity = fn(value) {{ value }};
             u8() accepted = fn {{ u8 result = identity(7); core.require(result <= 10, {OUTPUT}); result }};
