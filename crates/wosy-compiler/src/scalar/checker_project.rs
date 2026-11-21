@@ -215,6 +215,12 @@ struct PreparedProofModule {
     prepared: PreparedCheckerProject,
 }
 
+struct VerifiedModuleReturnBound<'a> {
+    issuer: &'a PreparedProofModule,
+    proof: &'a CstNode,
+    bound: VerifiedReturnBound,
+}
+
 impl PreparedProofModule {
     fn prepare(source: SourceIdentity, text: String, inputs: ScalarPreparationInputs) -> Result<Self, ProjectCheck> {
         let parsed = wosy_syntax::parse_proof_module(source, text, &[]);
@@ -250,7 +256,7 @@ impl PreparedProofModule {
         Ok((byte_span(proof), outcome))
     }
 
-    fn verify(&self, proof_name: &str) -> Option<VerifiedReturnBound> {
+    fn verify(&self, proof_name: &str) -> Option<VerifiedModuleReturnBound<'_>> {
         let proof = self.select(proof_name).ok()?;
         let (_, verified) = check_selected_proof(
             &self.prepared,
@@ -258,7 +264,25 @@ impl PreparedProofModule {
             proof,
             Some(ProofSummaryOrigin::ModuleDeclaration(&self.source)),
         ).ok()?;
-        verified
+        Some(VerifiedModuleReturnBound { issuer: self, proof, bound: verified? })
+    }
+
+    fn apply(
+        &self,
+        caller_name: &str,
+        proof_name: &str,
+        verified: &VerifiedModuleReturnBound<'_>,
+    ) -> Option<ImportedRequirement> {
+        let bound = &verified.bound;
+        if !std::ptr::eq(self, verified.issuer)
+            || bound.proof_venue != ProofVenue::ModuleDeclaration
+            || bound.proof_source != self.source
+            || bound.proof_name != proof_name
+            || bound.proof_span != byte_span(verified.proof)
+        {
+            return None;
+        }
+        apply_verified_return_bound(&self.prepared, &self.source, caller_name, bound)
     }
 }
 
@@ -465,6 +489,15 @@ fn use_verified_return_bound(
     {
         return None;
     }
+    apply_verified_return_bound(prepared, caller_source, caller_name, verified)
+}
+
+fn apply_verified_return_bound(
+    prepared: &PreparedCheckerProject,
+    caller_source: &SourceIdentity,
+    caller_name: &str,
+    verified: &VerifiedReturnBound,
+) -> Option<ImportedRequirement> {
     let (project, calls) = prepared.parts();
     let (module, item, function) = select_checked_root(project, caller_source, caller_name).ok()?;
     if project.modules[module].target_layout != verified.target_layout
@@ -876,7 +909,7 @@ mod tests {
         let empty = "proof empty for clamp(x) -> (out) where (false) ensures (out <= 10) {}";
         let text = format!("%%start\nu8(u8) clamp = fn(value) {{ if (value > 10) {{ 10 }} else {{ value }} }};\n{proof}\n{false_proof}\n{empty}\n%%end");
         let module = PreparedProofModule::prepare(file.clone(), text.clone(), inputs()).unwrap();
-        let artifact = module.verify("bounded").unwrap();
+        let artifact = module.verify("bounded").unwrap().bound;
         let proof_start = text.find(proof).unwrap() as u32;
         let target_start = text.find("clamp").unwrap() as u32;
         assert_eq!(artifact.proof_venue, ProofVenue::ModuleDeclaration);
@@ -899,13 +932,54 @@ mod tests {
             bound: BigInt::from(10),
         }));
         for name in ["smaller", "empty", "absent"] {
-            assert_eq!(module.verify(name), None);
+            assert!(module.verify(name).is_none());
         }
         let detached = wosy_syntax::parse_proof_fragment(file.clone(), proof.into(), &[]);
         assert_eq!(verify_return_bound(&module.prepared, &file, &detached), None);
         let duplicate = text.replace("proof smaller", "proof bounded");
         let module = PreparedProofModule::prepare(source("src/main.w", "duplicate-proof"), duplicate, inputs()).unwrap();
-        assert_eq!(module.verify("bounded"), None);
+        assert!(module.verify("bounded").is_none());
+    }
+
+    #[test]
+    fn module_consumes_only_its_own_verified_bound_at_a_supported_guarded_call() {
+        let file = source("src/main.w", "module-bridge-r1");
+        let text = format!(r#"%%start
+            u8(u8) clamp = fn(value) {{ if (value > 10) {{ 10 }} else {{ value }} }};
+            proof bounded for clamp(x) -> (out) where (x <= 10) ensures (out <= 10) {{}}
+            proof smaller for clamp(x) -> (out) ensures (out <= 9) {{}}
+            u8() inside = fn {{ u8 input = 7; u8 result = clamp(input); core.require(result <= 10, {OUTPUT}); result }};
+            u8() outside = fn {{ u8 input = 11; u8 result = clamp(input); core.require(result <= 10, {OUTPUT}); result }};
+            u8() too_narrow = fn {{ u8 result = clamp(7); core.require(result <= 8, {OUTPUT}); result }};
+            u8() unsupported = fn {{ u8 result = clamp(6 + 1); core.require(result <= 10, {OUTPUT}); result }};
+        %%end"#);
+        let module = PreparedProofModule::prepare(file.clone(), text.clone(), inputs()).unwrap();
+        let verified = module.verify("bounded").unwrap();
+        assert_eq!(module.apply("inside", "bounded", &verified), Some(ImportedRequirement::Proved));
+        assert_eq!(module.apply("too_narrow", "bounded", &verified), Some(ImportedRequirement::NotEstablished));
+        for name in ["outside", "unsupported", "clamp"] {
+            assert_eq!(module.apply(name, "bounded", &verified), None);
+        }
+        assert!(module.verify("smaller").is_none());
+        assert_eq!(module.apply("inside", "smaller", &verified), None);
+        let same_source = PreparedProofModule::prepare(file.clone(), text.clone(), inputs()).unwrap();
+        assert_eq!(same_source.apply("inside", "bounded", &verified), None);
+        let stale_source = source("src/main.w", "module-bridge-r2");
+        let changed = PreparedProofModule::prepare(stale_source, text, inputs()).unwrap();
+        assert_eq!(changed.apply("inside", "bounded", &verified), None);
+        let detached = wosy_syntax::parse_proof_fragment(
+            source("proof/detached.w", "detached-r1"),
+            "proof bound for clamp(x) -> (out) where (x <= 10) ensures (out <= 10) {}".into(),
+            &[],
+        );
+        let fragment_bound = verify_return_bound(&module.prepared, &file, &detached).unwrap();
+        let identity = (&fragment_bound.proof_source, fragment_bound.proof_span, "bound");
+        assert_eq!(
+            use_verified_return_bound(&module.prepared, &file, "inside", identity, &fragment_bound),
+            Some(ImportedRequirement::Proved),
+        );
+        let identity = (&verified.bound.proof_source, verified.bound.proof_span, "bounded");
+        assert_eq!(use_verified_return_bound(&module.prepared, &file, "inside", identity, &verified.bound), None);
     }
 
     #[test]
