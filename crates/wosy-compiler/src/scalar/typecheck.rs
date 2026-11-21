@@ -7016,14 +7016,13 @@ impl StaticUseAnalyzer {
             }
             ScalarBlockItem::Expression(expression) => self.expression(expression, visible),
             ScalarBlockItem::Assignment(assignment) => {
-                self.expression(&assignment.value, visible);
-                for value in &assignment.values {
+                for (_, value) in assignment.rhs().evaluations() {
                     self.expression(value, visible);
                 }
-                if let Some(receiver) = &assignment.receiver {
-                    self.use_name(receiver, visible);
-                } else {
-                    self.use_name(&assignment.target, visible);
+                for (position, target) in assignment.targets.iter().enumerate() {
+                    if position == 0 || !matches!(&target.place, ScalarPlace::Name { .. }) {
+                        self.place(&target.place, visible);
+                    }
                 }
             }
         }
