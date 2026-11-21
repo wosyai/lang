@@ -45,9 +45,14 @@ pub(super) enum DeferredReborrowRoot {
     },
 }
 
-pub(super) struct PendingNamedReborrow {
+pub(super) struct PendingReborrowSite {
     pub(super) point: super::CfgPointId,
     pub(super) read: super::CfgPointId,
+    pub(super) holder: Option<super::CfgPointId>,
+}
+
+pub(super) struct PendingNamedReborrow {
+    pub(super) sites: Vec<PendingReborrowSite>,
     pub(super) entry: super::CfgPointId,
     pub(super) handle: super::ReferenceBindingId,
     pub(super) root: DeferredReborrowRoot,

@@ -11251,3 +11251,97 @@ unit(bool) inspect = fn(choose) {{
         }
     }
 }
+
+#[test]
+fn deferred_same_root_siblings_use_the_exact_last_use_and_peer_span() {
+    for (uses, overlapping) in [
+        ("u8 left_value = *left; *!u8 right = &!(*parent); u8 right_value = *right;", false),
+        ("*!u8 right = &!(*parent); u8 left_value = *left; u8 right_value = *right;", true),
+    ] {
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 inside = 9; inside; }};
+    *!u8 left = &!(*parent);
+    {uses}
+    u8 resumed = *parent;
+    left_value; right_value; resumed;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let starts = text.match_indices("&!(*parent)").map(|(start, spelling)|
+            ByteSpan::new(start as u32, (start + spelling.len()) as u32)
+        ).collect::<Vec<_>>();
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if overlapping {
+                let [diagnostic] = diagnostics.as_slice() else { panic!("expected exact sibling conflict: {diagnostics:?}") };
+                assert_eq!(diagnostic.code, "B0003");
+                assert_eq!(diagnostic.message, "read or move of unavailable place");
+                let [current, peer] = diagnostic.labels.as_slice() else { panic!("expected current and peer labels") };
+                assert_eq!(current.span.range, starts[1]);
+                assert_eq!(peer.span.range, starts[0]);
+                assert!(cfg.initial_points.iter().all(|point| !starts.contains(&point.source_span.range)
+                    || !matches!(point.kind, CfgPointKind::Borrow { .. })));
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let children = cfg.points.iter().filter(|point| starts.contains(&point.source_span.range)
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).collect::<Vec<_>>();
+            let [first, second] = children.as_slice() else { panic!("expected two exact canonical children") };
+            assert!(first.id < second.id);
+            for &point in &children {
+                assert_eq!(&cfg.initial_points[point.id.0], point);
+            }
+            let ReferenceOrigin::Fresh { allocation: left, loan: left_loan } = sole_fact(function, first) else {
+                panic!("expected first local child");
+            };
+            let ReferenceOrigin::Fresh { allocation: right, loan: right_loan } = sole_fact(function, second) else {
+                panic!("expected second local child");
+            };
+            assert_eq!(left, right);
+            assert_eq!(left_loan.parent, right_loan.parent);
+            assert_ne!(left_loan.creation_span, right_loan.creation_span);
+        }
+    }
+}
+
+#[test]
+fn deferred_same_root_siblings_do_not_freeze_a_transported_child() {
+    let text = r#"%%start
+unit(bool) inspect = fn(choose) {
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) { u8 inside = 9; inside; };
+    *!u8 left = &!(*parent);
+    *!u8 transported = left;
+    u8 left_value = *transported;
+    *!u8 right = &!(*parent);
+    u8 right_value = *right;
+    left_value; right_value;
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    let starts = text.match_indices("&!(*parent)").map(|(start, _)| start as u32).collect::<Vec<_>>();
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0003"
+                && diagnostic.message == "missing required dereference origin"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == starts[0])
+        }), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected typed borrower") };
+        let unresolved = function.reference_cfg.initial_points.iter().filter(|point|
+            starts.contains(&point.source_span.range.start) && point.possible_origins.is_none()
+                && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))
+        ).count();
+        assert_eq!(unresolved, 2);
+    }
+}
