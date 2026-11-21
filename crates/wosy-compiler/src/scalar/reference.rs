@@ -280,7 +280,8 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     checked_scalar_storage: BTreeSet<ReferenceBindingId>,
     checked_result_origins: BTreeSet<ReferenceOriginId>,
     proof_points: CallablePointFacts,
-    formal_reborrow_roots: Vec<(ReferenceBindingId, usize, CfgPointId, ReferenceOriginId)>,
+    deferred_reborrow_roots: Vec<(ReferenceBindingId, super::control::DeferredReborrowRoot, CfgPointId, ReferenceOriginId)>,
+    deferred_local_reborrow: bool,
     pub(super) source: SourceIdentity,
     pub(super) function_span: ByteSpan,
     pub(super) names: BTreeMap<String, ReferenceBindingId>,
@@ -364,7 +365,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
             checked_scalar_storage: BTreeSet::new(),
             checked_result_origins: BTreeSet::new(),
             proof_points: CallablePointFacts::default(),
-            formal_reborrow_roots: Vec::new(),
+            deferred_reborrow_roots: Vec::new(),
+            deferred_local_reborrow: deferred_named_reborrow_allowed(function, call_sites)
+                && call_sites.call_occurrences.is_empty()
+                && call_sites.boundary.parameters.iter().all(|slot| aggregate::ordinary_value(&slot.ty)),
             source: source.clone(),
             function_span: function.span,
             names: BTreeMap::new(),
@@ -1964,13 +1968,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             };
                             if *mutability == ScalarReferenceMutability::Mutable
                                 && matches!(place, ScalarPlace::Dereference { .. })
-                                && self.proof_points.pending_formal_reborrow.is_none()
+                                && self.proof_points.pending_named_reborrow.is_none()
                             {
-                                if let Some((_, parameter, entry, origin)) = self.formal_reborrow_roots
-                                    .iter().find(|(formal, _, _, _)| *formal == binding)
+                                let read = self.cursor.expect("named checked read");
+                                if let Some((_, root, entry, origin)) = self.deferred_reborrow_roots
+                                    .iter().find(|(handle, root, entry, _)| *handle == binding
+                                        && (matches!(root, super::control::DeferredReborrowRoot::Formal { .. })
+                                            || self.cfg.points[entry.0].scope == scope))
                                 {
-                                    let (parameter, entry, origin) = (*parameter, *entry, *origin);
-                                    let read = self.cursor.expect("named checked read");
+                                    let (root, entry, origin) = (root.clone(), *entry, *origin);
                                     if matches!(&self.cfg.points[read.0].kind,
                                         CfgPointKind::Read { binding: read_binding } if *read_binding == binding)
                                         && self.cfg.points[read.0].possible_origins.is_none()
@@ -1978,8 +1984,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                         let point = self.point_with_origins(
                                             CfgPointKind::Evaluate(expression.clone()), span, scope, None,
                                         );
-                                        self.proof_points.pending_formal_reborrow = Some(super::control::PendingFormalReborrow {
-                                            point, read, entry, formal: binding, parameter, origin,
+                                        self.proof_points.pending_named_reborrow = Some(super::control::PendingNamedReborrow {
+                                            point, read, entry, handle: binding, root, origin,
                                         });
                                         self.aggregate_facts.receipt_loan_sinks.insert(point, vec![read]);
                                         return Ok(ReferenceValue::Uncomputed);
@@ -3065,6 +3071,37 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Some((outputs.primary, primary))
     }
 
+    fn direct_local_reborrow_root(
+        &self,
+        binding: &ReferenceBindingId,
+        ty: &ScalarType,
+        bind: CfgPointId,
+        value: CfgPointId,
+    ) -> Option<(super::control::DeferredReborrowRoot, ReferenceOriginId)> {
+        if !self.deferred_local_reborrow || !matches!(ty,
+            ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner }
+                if aggregate::ordinary_value(inner))
+        {
+            return None;
+        }
+        let origins = self.cfg.points[bind.0].possible_origins.as_ref()?;
+        let origin = *origins.first().filter(|_| origins.len() == 1)?;
+        let source = &self.cfg.points[value.0];
+        let CfgPointKind::Borrow { place, loan } = &source.kind else { return None };
+        let owner = &place.binding;
+        if loan.parent.is_some() || loan.mode != ScalarReferenceMutability::Mutable
+            || !self.binding_types.get(owner).is_some_and(aggregate::ordinary_value)
+            || self.call_sites.boundary.parameters.iter().any(|formal| formal.span == owner.declaration_span)
+            || !place.projections.is_empty()
+            || !matches!(&place.place, ScalarPlace::Name { name, .. } if self.names.get(name) == Some(owner))
+            || owner.block_span != binding.block_span || source.scope != self.cfg.points[bind.0].scope
+            || !matches!(self.cfg.facts.get(origin.0), Some(ReferenceOrigin::Fresh { loan: fact, .. }) if fact == loan)
+        {
+            return None;
+        }
+        Some((super::control::DeferredReborrowRoot::Local { owner: owner.clone(), borrow: value }, origin))
+    }
+
     fn record_binding_definition(
         &mut self,
         position: BlockPosition,
@@ -3082,6 +3119,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             || frozen == &self.cfg.points[value.0].possible_origins
                         {
                             self.proof_points.checked_binding_initializers.push((bind, value));
+                            if let Some((root, origin)) = self.direct_local_reborrow_root(binding, ty, bind, value) {
+                                self.deferred_reborrow_roots.push((binding.clone(), root, bind, origin));
+                            }
                         }
                     }
                 }
@@ -4594,8 +4634,8 @@ impl ScalarDescriptorReplay<'_> {
 
 struct ReferenceTransferCfg<'a> {
     initial_points: &'a [ReferenceFlowPoint],
-    pending_formal_reborrow: Option<&'a super::control::PendingFormalReborrow>,
-    resolve_pending_formal_reborrow: bool,
+    pending_named_reborrow: Option<&'a super::control::PendingNamedReborrow>,
+    resolve_pending_named_reborrow: bool,
     raw_address_exposures: &'a [(CfgPointId, Option<ReferenceBindingId>)],
     points: &'a mut [ReferenceFlowPoint],
     facts: &'a mut Vec<ReferenceOrigin>,
@@ -4612,8 +4652,8 @@ impl<'a> ReferenceTransferCfg<'a> {
     fn new(cfg: &'a mut ScalarReferenceCfg, proof: Option<&'a CallablePointFacts>) -> Self {
         Self {
             initial_points: &cfg.initial_points,
-            pending_formal_reborrow: proof.and_then(|proof| proof.pending_formal_reborrow.as_ref()),
-            resolve_pending_formal_reborrow: false,
+            pending_named_reborrow: proof.and_then(|proof| proof.pending_named_reborrow.as_ref()),
+            resolve_pending_named_reborrow: false,
             raw_address_exposures: proof.map_or(&[], |proof| &proof.raw_address_exposures),
             points: &mut cfg.points,
             facts: &mut cfg.facts,
@@ -4628,29 +4668,77 @@ impl<'a> ReferenceTransferCfg<'a> {
     }
 }
 
-fn exact_live_formal_reborrow(
+fn deferred_named_reborrow_allowed(function: &ScalarFunction, calls: &FunctionCallSites) -> bool {
+    function.generic_parameters.is_empty()
+        && matches!(&function.signature, ScalarType::Callable { outputs, .. }
+            if matches!(outputs.outputs.as_slice(), [] | [ScalarOutput { ty: ScalarType::Unit, .. }]))
+        && matches!(calls.named_place_roots, NamedPlaceRootFacts::Prepared(_))
+        && calls.structure.module_storage_uses.is_empty()
+}
+
+fn deferred_reborrow_owner(pending: &super::control::PendingNamedReborrow) -> &ReferenceBindingId {
+    match &pending.root {
+        super::control::DeferredReborrowRoot::Formal { .. } => &pending.handle,
+        super::control::DeferredReborrowRoot::Local { owner, .. } => owner,
+    }
+}
+
+fn deferred_reborrow_fact<'a>(
+    pending: &super::control::PendingNamedReborrow,
+    facts: &'a [ReferenceOrigin],
+) -> Option<(&'a ReferenceOrigin, &'a ReferenceLoanId)> {
+    let fact = facts.get(pending.origin.0)?;
+    let loan = match (&pending.root, fact) {
+        (super::control::DeferredReborrowRoot::Formal { parameter: expected },
+            ReferenceOrigin::BorrowedFrom { parameter, loan }) if expected == parameter => loan,
+        (super::control::DeferredReborrowRoot::Local { .. }, ReferenceOrigin::Fresh { loan, .. }) => loan,
+        _ => return None,
+    };
+    (loan.parent.is_none() && loan.mode == ScalarReferenceMutability::Mutable
+        && loan.origin_place.binding == *deferred_reborrow_owner(pending)).then_some((fact, loan))
+}
+
+fn deferred_reborrow_child(origin: &ReferenceOrigin, loan: ReferenceLoanId) -> ReferenceOrigin {
+    match origin {
+        ReferenceOrigin::BorrowedFrom { parameter, .. } => ReferenceOrigin::BorrowedFrom { parameter: *parameter, loan },
+        ReferenceOrigin::Fresh { allocation, .. } => ReferenceOrigin::Fresh { allocation: allocation.clone(), loan },
+        _ => unreachable!("validated deferred reborrow root"),
+    }
+}
+
+fn is_deferred_reborrow_child(parent: &ReferenceOrigin, child: &ReferenceOrigin, loan: &ReferenceLoanId) -> bool {
+    match (parent, child) {
+        (ReferenceOrigin::BorrowedFrom { parameter: root, .. },
+            ReferenceOrigin::BorrowedFrom { parameter, loan: observed }) => root == parameter && loan == observed,
+        (ReferenceOrigin::Fresh { allocation: root, .. },
+            ReferenceOrigin::Fresh { allocation, loan: observed }) => root == allocation && loan == observed,
+        _ => false,
+    }
+}
+
+fn exact_live_named_reborrow(
     state: &ReferenceEdgeState,
-    pending: &super::control::PendingFormalReborrow,
+    pending: &super::control::PendingNamedReborrow,
     facts: &[ReferenceOrigin],
 ) -> bool {
     let exact = |origins: Option<&BTreeSet<ReferenceOriginId>>| {
         origins.is_some_and(|origins| origins.len() == 1 && origins.contains(&pending.origin))
     };
     if !exact(state.point_values.get(pending.read))
-        || !exact(state.bindings.get(&pending.formal))
-        || state.released.contains(&pending.formal)
-        || state.invalidated.contains(&pending.formal)
-        || state.uninitialized.contains(&pending.formal)
-        || !unavailable_checked_handles(state, &pending.formal, &[], CheckedHandleStorage::Lexical).is_empty()
+        || !exact(state.bindings.get(&pending.handle))
+        || state.released.contains(&pending.handle)
+        || state.invalidated.contains(&pending.handle)
+        || state.uninitialized.contains(&pending.handle)
+        || !unavailable_checked_handles(state, &pending.handle, &[], CheckedHandleStorage::Lexical).is_empty()
     {
         return false;
     }
-    matches!(facts.get(pending.origin.0),
-        Some(ReferenceOrigin::BorrowedFrom { parameter, loan })
-            if *parameter == pending.parameter && loan.parent.is_none()
-                && loan.mode == ScalarReferenceMutability::Mutable
-                && loan.origin_place.binding == pending.formal
-                && !unavailable_place(state, &loan.origin_place))
+    let owner = deferred_reborrow_owner(pending);
+    !state.released.contains(owner)
+        && !state.invalidated.contains(owner)
+        && !state.uninitialized.contains(owner)
+        && deferred_reborrow_fact(pending, facts)
+            .is_some_and(|(_, loan)| !unavailable_place(state, &loan.origin_place))
 }
 
 fn transfer_reference_facts(
@@ -4677,9 +4765,11 @@ fn transfer_reference_facts(
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
     let mut strictly_forward = true;
     let mut aggregate_expiry_allowed = aggregate.is_some();
-    let pending = cfg.pending_formal_reborrow;
+    let pending = cfg.pending_named_reborrow;
+    let mut local_definition = None;
     let mut pending_allowed = pending.is_some_and(|pending| !cfg.raw_address_exposures.iter()
-        .any(|(_, root)| root.as_ref().is_none_or(|root| *root == pending.formal)));
+        .any(|(_, root)| root.as_ref().is_none_or(|root| *root == pending.handle
+            || root == deferred_reborrow_owner(pending))));
     for (index, point) in original_points.iter().enumerate() {
         strictly_forward = strictly_forward && point.id.0 == index
             && point.successors.iter().all(|successor| successor.0 > index && successor.0 < original_points.len());
@@ -4687,14 +4777,28 @@ fn transfer_reference_facts(
             && !matches!(&point.kind, CfgPointKind::MoveThrough { place, .. }
                 if !matches!(place, ScalarPlace::Dereference { .. }));
         if let Some(pending) = pending.filter(|_| pending_allowed) {
-            pending_allowed = !match &point.kind {
+            if let super::control::DeferredReborrowRoot::Local { owner, borrow } = &pending.root {
+                if matches!(&point.kind, CfgPointKind::Bind { binding } if binding == owner) {
+                    if point.id < *borrow && point.scope == original_points[borrow.0].scope
+                        && !cfg.allocations.contains(owner) && local_definition.is_none()
+                    {
+                        local_definition = Some(point.id);
+                    } else {
+                        pending_allowed = false;
+                    }
+                }
+            }
+            pending_allowed &= !match &point.kind {
                 CfgPointKind::Call { .. } | CfgPointKind::Invalidate { .. } | CfgPointKind::Release { .. } => true,
-                CfgPointKind::Assign { target, .. } => target.binding == pending.formal,
+                CfgPointKind::Assign { target, .. } => target.binding == pending.handle
+                    || &target.binding == deferred_reborrow_owner(pending),
                 CfgPointKind::AssignThrough { .. }
                 | CfgPointKind::MoveThrough { .. }
                 | CfgPointKind::DeferredMoveThrough { .. } => point.id < pending.point,
                 CfgPointKind::Borrow { place, loan } => loan.parent.is_none()
-                    && place.binding == pending.formal,
+                    && (place.binding == pending.handle
+                        || (&place.binding == deferred_reborrow_owner(pending)
+                            && !matches!(pending.root, super::control::DeferredReborrowRoot::Local { borrow, .. } if borrow == point.id))),
                 _ => false,
             };
         }
@@ -4802,19 +4906,32 @@ fn transfer_reference_facts(
             let mut point = original_points[id.0].clone();
             let valid = pending_allowed && strictly_forward
                 && matches!(&original_points[pending.entry.0].kind,
-                    CfgPointKind::Bind { binding } if *binding == pending.formal)
+                    CfgPointKind::Bind { binding } if *binding == pending.handle)
                 && original_points[pending.entry.0].possible_origins.as_ref()
                     .is_some_and(|origins| origins.len() == 1 && origins.contains(&pending.origin))
+                && match &pending.root {
+                    super::control::DeferredReborrowRoot::Formal { .. } => true,
+                    super::control::DeferredReborrowRoot::Local { owner, borrow } => {
+                        let initializer = &original_points[borrow.0];
+                        local_definition.is_some()
+                            && *borrow < pending.entry
+                            && initializer.scope == original_points[pending.entry.0].scope
+                            && initializer.scope == point.scope
+                            && matches!(&initializer.kind, CfgPointKind::Borrow { place, loan }
+                                if place.binding == *owner && loan.parent.is_none())
+                            && initializer.possible_origins.as_ref()
+                                .is_some_and(|origins| origins.len() == 1 && origins.contains(&pending.origin))
+                    }
+                }
                 && !states.is_empty()
-                && states.iter().all(|state| exact_live_formal_reborrow(state, pending, cfg.facts));
+                && states.iter().all(|state| exact_live_named_reborrow(state, pending, cfg.facts));
             if valid {
-                if cfg.resolve_pending_formal_reborrow {
+                if cfg.resolve_pending_named_reborrow {
                     let CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { place, mutability, .. }) = &point.kind else {
-                        unreachable!("provisional formal reborrow expression")
+                        unreachable!("provisional named reborrow expression")
                     };
-                    let ReferenceOrigin::BorrowedFrom { loan: parent, .. } = &cfg.facts[pending.origin.0] else {
-                        unreachable!("validated formal origin")
-                    };
+                    let (root, parent) = deferred_reborrow_fact(pending, cfg.facts)
+                        .expect("validated deferred reborrow root");
                     let mut origin_place = parent.origin_place.clone();
                     origin_place.place = place.clone();
                     collect_reference_projections(place, Some(parent), &mut origin_place.projections);
@@ -4824,7 +4941,7 @@ fn transfer_reference_facts(
                         creation_span: point.source_span.range,
                         parent: Some(Box::new(parent.clone())),
                     };
-                    let child = ReferenceOrigin::BorrowedFrom { parameter: pending.parameter, loan: loan.clone() };
+                    let child = deferred_reborrow_child(root, loan.clone());
                     let child_id = match cfg.facts.iter().position(|origin| *origin == child) {
                         Some(index) => ReferenceOriginId(index),
                         None => {
@@ -4838,12 +4955,12 @@ fn transfer_reference_facts(
                     return point;
                 }
                 if matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
-                    if matches!(&cfg.facts[pending.origin.0],
-                        ReferenceOrigin::BorrowedFrom { loan: parent, .. } if loan.parent.as_deref() == Some(parent))
-                    && point.possible_origins.as_ref().is_some_and(|origins| {
-                        origins.len() == 1 && origins.first().is_some_and(|child| matches!(cfg.facts.get(child.0),
-                            Some(ReferenceOrigin::BorrowedFrom { parameter, loan: child_loan })
-                                if *parameter == pending.parameter && child_loan == loan))
+                    if deferred_reborrow_fact(pending, cfg.facts).is_some_and(|(root, parent)| {
+                        loan.parent.as_deref() == Some(parent)
+                            && point.possible_origins.as_ref().is_some_and(|origins| {
+                                origins.len() == 1 && origins.first().is_some_and(|child|
+                                    cfg.facts.get(child.0).is_some_and(|child| is_deferred_reborrow_child(root, child, loan)))
+                            })
                     }))
                 {
                     return point;
@@ -4851,7 +4968,7 @@ fn transfer_reference_facts(
             }
             errors.push(ReferenceAnalysisError::MissingOrigin {
                 source_span: point.source_span.clone(),
-                binding_id: pending.formal.clone(),
+                binding_id: pending.handle.clone(),
                 reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
             });
             point.possible_origins = Some(BTreeSet::new());
@@ -9573,8 +9690,8 @@ fn derive_function_specialized_copy_policies(
             let transferred = transfer_reference_facts(
                 ReferenceTransferCfg {
                     initial_points: &template_cfg.initial_points,
-                    pending_formal_reborrow: template_result.proof_points.pending_formal_reborrow.as_ref(),
-                    resolve_pending_formal_reborrow: false,
+                    pending_named_reborrow: template_result.proof_points.pending_named_reborrow.as_ref(),
+                    resolve_pending_named_reborrow: false,
                     raw_address_exposures: &template_result.proof_points.raw_address_exposures,
                     points: &mut points,
                     facts: &mut facts,
@@ -9837,13 +9954,9 @@ fn build_function_reference_cfg(
             let formal_parent = matches!(ty, ScalarType::CheckedReference {
                 mutability: ScalarReferenceMutability::Mutable, inner,
             } if aggregate::ordinary_value(inner))
-                && function.generic_parameters.is_empty()
-                && matches!(&function.signature, ScalarType::Callable { parameters, outputs }
-                    if matches!(outputs.outputs.as_slice(), [] | [ScalarOutput { ty: ScalarType::Unit, .. }])
-                        && parameters.iter().enumerate().all(|(index, ty)|
-                        index == slot.ordinal || aggregate::ordinary_value(ty)))
-                && matches!(call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(_))
-                && call_sites.structure.module_storage_uses.is_empty();
+                && deferred_named_reborrow_allowed(function, call_sites)
+                && call_sites.boundary.parameters.iter().all(|parameter|
+                    parameter.ordinal == slot.ordinal || aggregate::ordinary_value(&parameter.ty));
             let formal = formal_parent.then(|| binding.clone());
             let entry = builder.point(
                 CfgPointKind::Bind { binding },
@@ -9852,7 +9965,9 @@ fn build_function_reference_cfg(
                 BTreeSet::from([id]),
             );
             if let Some(formal) = formal {
-                builder.formal_reborrow_roots.push((formal, slot.ordinal, entry, id));
+                builder.deferred_reborrow_roots.push((
+                    formal, super::control::DeferredReborrowRoot::Formal { parameter: slot.ordinal }, entry, id,
+                ));
             }
         }
     }
@@ -9913,7 +10028,7 @@ fn build_function_reference_cfg(
             &mut aggregate,
         ));
         let mut provisional_cfg = ReferenceTransferCfg::new(&mut builder.cfg, Some(&builder.proof_points));
-        provisional_cfg.resolve_pending_formal_reborrow = true;
+        provisional_cfg.resolve_pending_named_reborrow = true;
         let provisional = transfer_reference_facts(
             provisional_cfg,
             &BTreeMap::new(),
@@ -9921,14 +10036,14 @@ fn build_function_reference_cfg(
             flow,
             None,
         );
-        if let Some(pending) = &builder.proof_points.pending_formal_reborrow {
+        if let Some(pending) = &builder.proof_points.pending_named_reborrow {
             let solved = &builder.cfg.points[pending.point.0];
             if matches!(solved.kind, CfgPointKind::Borrow { .. }) && provisional.is_empty() {
                 builder.cfg.initial_points[pending.point.0] = solved.clone();
             } else {
                 errors.push(ReferenceAnalysisError::MissingOrigin {
                     source_span: solved.source_span.clone(),
-                    binding_id: pending.formal.clone(),
+                    binding_id: pending.handle.clone(),
                     reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
                 });
             }

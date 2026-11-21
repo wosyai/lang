@@ -11178,3 +11178,76 @@ unit(*!u8, bool) inspect = fn(parent, choose) {{
         }
     }
 }
+
+#[test]
+fn deferred_local_reborrow_retains_the_exact_same_block_allocation() {
+    let text = r#"%%start
+unit(bool) inspect = fn(choose) {
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) { u8 inside = 9; inside; };
+    *!u8 child = &!(*parent);
+    u8 before = *child;
+    before;
+    u8 after = *parent;
+    after;
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected local borrower") };
+        let cfg = &function.reference_cfg;
+        let find = |start: &str| {
+            let span = text.find(start).unwrap() as u32;
+            cfg.points.iter().find(|point| point.source_span.range.start == span
+                && matches!(point.kind, CfgPointKind::Borrow { .. })
+            ).expect("canonical borrow")
+        };
+        let root = find("&!owner");
+        let child = find("&!(*parent)");
+        assert_eq!(&cfg.initial_points[child.id.0], child);
+        let ReferenceOrigin::Fresh { allocation, loan } = sole_fact(function, root) else {
+            panic!("expected allocation root");
+        };
+        let ReferenceOrigin::Fresh { allocation: child_allocation, loan: child_loan } = sole_fact(function, child) else {
+            panic!("expected same rooted child");
+        };
+        assert_eq!(allocation, child_allocation);
+        assert_eq!(child_loan.parent.as_deref(), Some(loan));
+        assert_eq!(loan.origin_place.binding.declaration_span.start, text.find("owner =").unwrap() as u32);
+    }
+}
+
+#[test]
+fn deferred_local_reborrow_refuses_owner_mutation_and_owner_or_handle_exposure() {
+    for (before, after) in [("owner = 8;", ""), ("unsafe { &?owner; };", ""), ("", "&parent;")] {
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    {before}
+    *!u8 parent = &!owner;
+    {after}
+    if (choose) {{ u8 inside = 9; inside; }};
+    &!(*parent);
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let target = text.find("&!(*parent)").unwrap() as u32;
+        let ScalarItem::Function(function) = &single.program.items[0] else { panic!("expected typed local") };
+        assert!(function.reference_cfg.initial_points.iter().any(|point|
+            point.source_span.range.start == target && point.possible_origins.is_none()
+                && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))
+        ), "{before} {after}: expected a genuine refused pending event");
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "missing required dereference origin"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == target)
+            }), "{before} {after}: {diagnostics:?}");
+        }
+    }
+}
