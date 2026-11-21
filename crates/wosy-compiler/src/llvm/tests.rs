@@ -8808,3 +8808,70 @@ u8(bool) inspect = fn(choose) {
         }), "{:?}", denied.diagnostics());
     }
 }
+
+#[test]
+fn emits_deferred_whole_owner_store_only_after_all_borrower_uses() {
+    let source = r#"%%start
+u8(bool) update = fn(choose) {
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) { bool marker = true; marker; };
+    *u8 leaf = &(*parent);
+    *u8 alias = leaf;
+    u8 observed = *alias;
+    owner = 11;
+    observed; owner
+};
+%%end"#;
+    let invalid = source.replace(
+        "u8 observed = *alias;\n    owner = 11;",
+        "owner = 11;\n    u8 observed = *alias;",
+    );
+    let borrow = invalid.find("&(*parent)").unwrap() as u32;
+    let write = invalid.find("owner = 11").unwrap() as u32;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for partition in [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ] {
+            let ir = partition.expect("whole-owner assignment LLVM").to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+                ir.as_bytes(), "checked-whole-owner-assignment",
+            );
+            let module = context.create_module_from_ir(buffer).expect("parse whole-owner assignment LLVM");
+            module.verify().expect("verify whole-owner assignment LLVM");
+            let lines = ir.lines().map(str::trim).collect::<Vec<_>>();
+            let returned = lines.iter().find_map(|line| line.strip_prefix("ret i8 "))
+                .expect("return owner scalar");
+            let (load, owner_slot) = lines.iter().enumerate().find_map(|(index, line)| {
+                let (value, address) = line.split_once(" = load i8, ptr ")?;
+                (value == returned).then_some((index, address.split(',').next()?))
+            }).expect("result loads the owner place");
+            let (store, new_value) = lines[..load].iter().enumerate().rev().find_map(|(index, line)| {
+                let (value, address) = line.strip_prefix("store i8 ")?.split_once(", ptr ")?;
+                (address.split(',').next()? == owner_slot).then_some((index, value))
+            }).expect("direct write to the returned owner place");
+            if new_value != "11" {
+                let (rhs, slot) = lines[..store].iter().enumerate().find_map(|(index, line)| {
+                    let (value, address) = line.split_once(" = load i8, ptr ")?;
+                    (value == new_value).then_some((index, address.split(',').next()?))
+                }).expect("prepared RHS for direct owner store");
+                assert!(lines[..rhs].iter().any(|line| {
+                    line.strip_prefix("store i8 11, ptr ").and_then(|address| address.split(',').next()) == Some(slot)
+                }), "{ir}");
+            }
+        }
+
+        let prepared = prepare_initializer_test(&invalid, layout);
+        let denied = analyze_scalar_build(&prepared);
+        assert!(denied.diagnostics().iter().any(|diagnostic| {
+            diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == write)
+                && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == borrow)
+        }), "{:?}", denied.diagnostics());
+    }
+}
