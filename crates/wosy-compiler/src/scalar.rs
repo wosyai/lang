@@ -2786,11 +2786,6 @@ fn typecheck_scalar_project_with_occurrences(
                         else {
                             continue;
                         };
-                        let multi_result_tail =
-                            outputs.outputs.len() > 1 && function.body.tail_conditional().is_some();
-                        inference.set_callable_assignment_output_capture(
-                            !is_overload || multi_result_tail,
-                        );
                         if function.parameters.len() != parameters.len() {
                             diagnostics.push(module_diagnostic(
                                 module,
@@ -2946,7 +2941,6 @@ fn typecheck_scalar_project_with_occurrences(
                             );
                         }
                     }
-                    inference.set_callable_assignment_output_capture(true);
                 }
                 ScalarItem::Executable(executable) => {
                     let mut scope = declarations.clone();

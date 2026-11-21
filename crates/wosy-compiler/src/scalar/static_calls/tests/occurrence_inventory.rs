@@ -314,7 +314,7 @@ fn preparation_publishes_stable_callable_owned_expression_place_and_call_ordinal
         assert!(group.projected_outputs().next().is_none());
         assert!(matches!(
             group.destinations().next().unwrap().replacement,
-            crate::scalar::control::AssignmentReplacement::Missing
+            crate::scalar::control::AssignmentReplacement::Resolved(ScalarType::U8)
         ));
         assert_eq!(
             group
@@ -372,23 +372,11 @@ fn preparation_publishes_stable_callable_owned_expression_place_and_call_ordinal
         drop(scope);
         let mut installed = before.clone();
         let errors = results.install(&mut installed);
-        assert_eq!(
-            errors,
-            vec![ReferenceAnalysisError::MissingContext {
-                source_span: SourceSpan::new(before.source.clone(), ByteSpan::new(338, 342)),
-                reason: ReferenceAnalysisErrorReason::MissingResolvedBinding,
-            }]
-        );
+        assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(prepared.program, before);
         let finished = prepared.finish();
         assert_eq!(finished.program, installed);
-        assert_eq!(
-            finished.diagnostics,
-            errors
-                .iter()
-                .map(ReferenceAnalysisError::diagnostic)
-                .collect::<Vec<_>>()
-        );
+        assert!(finished.diagnostics.is_empty(), "{:?}", finished.diagnostics);
         let public = derive_scalar_program_from_cst_with_layout(parsed.canonical_cst(), target);
         assert_eq!(finished.program, public.program);
         assert_eq!(finished.diagnostics, public.diagnostics);
