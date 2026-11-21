@@ -8787,6 +8787,16 @@ fn build_function_reference_cfg(
             if aggregate::array_roundtrip_signature(parameters, outputs))
         {
             builder.aggregate_facts.array_formal = Some(builder.names[name].clone());
+            builder.aggregate_result.array_neutral = matches!(&function.signature, ScalarType::Callable {
+                parameters, outputs
+            } if matches!(parameters.first(), Some(ScalarType::RuntimeArray { element, .. })
+                    if aggregate::ordinary_value(element))
+                && parameters[1..].iter().all(aggregate::ordinary_value)
+                && outputs.outputs.len() == 1)
+                && call_sites.call_occurrences.is_empty()
+                && call_sites.allocation_length_call_targets.is_empty()
+                && call_sites.callable_escapes.is_empty()
+                && call_sites.structure.module_storage_uses.is_empty();
         }
         if let ScalarType::Struct(id) = ty {
             builder.aggregate_facts.formals.insert(slot.ordinal, builder.names[name].clone());
