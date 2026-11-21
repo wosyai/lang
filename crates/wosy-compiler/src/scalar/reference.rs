@@ -5777,6 +5777,18 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
     ) -> Result<OccurrenceOrdinal, ReferenceAnalysisError> {
+        self.expression_at_with_initializer_statement(expression, names, types, parent, edge, false)
+    }
+
+    fn expression_at_with_initializer_statement(
+        &mut self,
+        expression: &ScalarExpression,
+        names: &BTreeMap<String, WalkBinding>,
+        types: &BTreeMap<String, ScalarType>,
+        parent: OccurrenceParent,
+        edge: OccurrenceEdge,
+        initializer_statement: bool,
+    ) -> Result<OccurrenceOrdinal, ReferenceAnalysisError> {
         let ordinal = self.record_occurrence(
             OccurrenceRole::Expression,
             expression_span(expression),
@@ -5990,7 +6002,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     .insert(ordinal, identity);
             }
         }
-        self.expression_children(expression, names, types, ordinal)?;
+        self.expression_children(expression, names, types, ordinal, initializer_statement)?;
         Ok(ordinal)
     }
 }
@@ -6249,6 +6261,7 @@ impl StructuralWalker<'_, '_> {
         names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
         ordinal: OccurrenceOrdinal,
+        initializer_statement: bool,
     ) -> Result<(), ReferenceAnalysisError> {
         let parent = OccurrenceParent::Expression(ordinal);
         match expression {
@@ -6324,14 +6337,19 @@ impl StructuralWalker<'_, '_> {
                         self.structural_calls.push(ordinal);
                     }
                 }
+                let immediate = initializer_statement
+                    && matches!(arguments.as_slice(), [ScalarExpression::Call { .. }]);
                 for (position, argument) in arguments.iter().enumerate() {
-                    self.expression(
+                    let argument = self.expression_at(
                         argument,
                         names,
                         types,
                         parent,
                         OccurrenceEdge::CallArgument(position),
                     )?;
+                    if immediate {
+                        self.structure.initializer_immediate.insert(ordinal, argument);
+                    }
                 }
             }
             ScalarExpression::Binary {
@@ -6379,6 +6397,7 @@ impl StructuralWalker<'_, '_> {
                     types,
                     parent,
                     OccurrenceEdge::ThenBranch,
+                    initializer_statement,
                 )?;
                 let else_block = self.block(
                     else_branch,
@@ -6386,6 +6405,7 @@ impl StructuralWalker<'_, '_> {
                     types,
                     parent,
                     OccurrenceEdge::ElseBranch,
+                    initializer_statement,
                 )?;
                 assert!(self
                     .conditionals
@@ -6414,6 +6434,7 @@ impl StructuralWalker<'_, '_> {
                     types,
                     parent,
                     OccurrenceEdge::ThenBranch,
+                    initializer_statement,
                 )?;
                 assert!(self
                     .conditionals
@@ -6429,7 +6450,7 @@ impl StructuralWalker<'_, '_> {
                     .is_none());
             }
             ScalarExpression::Block(block) => {
-                self.block(block, names, types, parent, OccurrenceEdge::BlockBody)?;
+                self.block(block, names, types, parent, OccurrenceEdge::BlockBody, false)?;
             }
             ScalarExpression::RawAddress { place, .. }
             | ScalarExpression::CheckedAddress { place, .. }
@@ -6611,6 +6632,7 @@ impl StructuralWalker<'_, '_> {
         outer_types: &BTreeMap<String, ScalarType>,
         parent: OccurrenceParent,
         edge: OccurrenceEdge,
+        initializer_statement: bool,
     ) -> Result<BlockOrdinal, ReferenceAnalysisError> {
         let ordinal = BlockOrdinal(self.structure.blocks.len());
         self.reserve_legacy_blocks
@@ -6623,7 +6645,7 @@ impl StructuralWalker<'_, '_> {
             .edges
             .insert((parent, edge), OccurrenceNode::Block(ordinal))
             .is_none());
-        self.block_items(block, outer, outer_types, ordinal)?;
+        self.block_items(block, outer, outer_types, ordinal, initializer_statement)?;
         Ok(ordinal)
     }
 
@@ -6633,6 +6655,7 @@ impl StructuralWalker<'_, '_> {
         outer: &BTreeMap<String, WalkBinding>,
         outer_types: &BTreeMap<String, ScalarType>,
         ordinal: BlockOrdinal,
+        initializer_statement: bool,
     ) -> Result<(), ReferenceAnalysisError> {
         let mut items = Vec::new();
         let mut scope = WalkScope {
@@ -6649,6 +6672,7 @@ impl StructuralWalker<'_, '_> {
                 },
                 block.span,
                 &mut scope,
+                initializer_statement,
             )?);
         }
         self.structure.blocks[ordinal.0].items = items;
@@ -6816,6 +6840,7 @@ impl StructuralWalker<'_, '_> {
         position: BlockPosition,
         block_span: ByteSpan,
         scope: &mut WalkScope,
+        initializer_statement: bool,
     ) -> Result<BlockItem, ReferenceAnalysisError> {
         let BlockPosition {
             block: ordinal,
@@ -6839,7 +6864,14 @@ impl StructuralWalker<'_, '_> {
                         }
                     }
                 };
-                let producer = self.expression_at(expression, names, types, parent, edge)?;
+                let producer = self.expression_at_with_initializer_statement(
+                    expression,
+                    names,
+                    types,
+                    parent,
+                    edge,
+                    initializer_statement && matches!(&role, ScalarBlockItemRole::Ordinary),
+                )?;
                 match role {
                     ScalarBlockItemRole::FinalOutput { output, metadata } => {
                         let mut slot = FinalOutputSlot {
@@ -7195,23 +7227,15 @@ fn walk_module_initialization(
                     ScalarBlockItem::Expression(expression) => expression_span(expression),
                     ScalarBlockItem::Assignment(assignment) => assignment.span,
                 };
+                let initializer_statement = matches!(&walker.mode, WalkMode::ModuleInitialization { .. });
                 let node = walker.block_item(
                     item,
                     ScalarBlockItemRole::Ordinary,
                     position,
                     span,
                     &mut WalkScope::default(),
+                    initializer_statement,
                 )?;
-                if let (ScalarBlockItem::Expression(ScalarExpression::Call { arguments, .. }),
-                    BlockItemKind::Evaluation { expression: consumer }) = (item, &node.kind)
-                {
-                    if let ([ScalarExpression::Call { .. }], Some(&OccurrenceNode::Expression(producer))) =
-                        (arguments.as_slice(), walker.structure.edges.get(&(
-                            OccurrenceParent::Expression(*consumer), OccurrenceEdge::CallArgument(0))))
-                    {
-                        walker.structure.initializer_immediate.insert(*consumer, producer);
-                    }
-                }
                 if let (Some(previous), BlockItemKind::Evaluation { expression: consumer }) =
                     (previous_install, &node.kind)
                 {
@@ -7353,7 +7377,7 @@ fn resolve_function_call_sites(
         );
     }
     let root = resolver.structure.root;
-    resolver.block_items(&function.body, &parameter_names, &parameter_types, root)?;
+    resolver.block_items(&function.body, &parameter_names, &parameter_types, root, false)?;
     let root_conditional = resolver.structure.blocks[root.0]
         .items
         .last()

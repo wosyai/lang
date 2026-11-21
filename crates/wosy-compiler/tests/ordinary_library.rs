@@ -362,3 +362,91 @@ fn runtime_array_read_line_graph_emits_the_actual_stdlib_ranges() {
         }
     }
 }
+
+#[test]
+fn closed_initializer_owner_stays_in_its_conditional_branch() {
+    let app = source("workbench", "src/conditional_receipt.w");
+    let text = r#"%%start
+struct Packet { *?u8 data; u64 length; }
+Packet(u64) make_packet = fn(length) {
+    u8[length] backing;
+    backing[0] = 19;
+    *?u8 data = null;
+    unsafe { data = &?backing[0]; };
+    Packet packet = { .data = data; .length = length; };
+    packet
+};
+u64(Packet) accept_packet = fn(incoming) { incoming.length };
+bool enabled = true;
+if (enabled) {
+    if (enabled) { accept_packet(make_packet(2)); };
+};
+if (false) { accept_packet(make_packet(3)); };
+%%end"#;
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepare = |text: &str| {
+            prepare_scalar_project(
+                vec![(declarations(&app, text), Vec::new())],
+                vec![app.clone()],
+                ScalarPreparationInputs { target_layout },
+            )
+            .unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics))
+        };
+        let prepared = prepare(text);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "conditional-receipt");
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+
+        let producer = module.get_function(&function_with_suffix(&module, "make_packet")).unwrap();
+        let consumer = module.get_function(&function_with_suffix(&module, "accept_packet")).unwrap();
+        let release = module.get_function("__wosy_core_free").unwrap();
+        let mut pairs = 0;
+        for block in module.get_function("main").unwrap().get_basic_blocks() {
+            let calls: Vec<_> = block.get_instructions()
+                .filter(|instruction| instruction.get_opcode() == InstructionOpcode::Call)
+                .map(|instruction| (instruction, CallSiteValue::try_from(instruction).unwrap()))
+                .filter(|(_, call)| matches!(call.get_called_fn_value(), Some(fun)
+                    if fun == producer || fun == consumer || fun == release))
+                .collect();
+            if calls.is_empty() {
+                continue;
+            }
+            assert!(block.get_name().to_str().unwrap().starts_with("if.then"));
+            let [(_, make), (accept_instruction, accept)] = calls.as_slice() else {
+                panic!("{target_layout:?}: unpaired conditional transfer");
+            };
+            assert_eq!(make.get_called_fn_value(), Some(producer));
+            assert_eq!(accept.get_called_fn_value(), Some(consumer));
+            let returned_base = make.try_as_basic_value().basic().unwrap();
+            let passed_base = accept_instruction.get_operand(accept.count_arguments() - 1)
+                .unwrap().value().unwrap();
+            assert_eq!(returned_base, passed_base);
+            pairs += 1;
+        }
+        assert_eq!(pairs, 2);
+        let releases: Vec<_> = consumer.get_basic_blocks().into_iter()
+            .flat_map(|block| block.get_instructions())
+            .filter(|instruction| instruction.get_opcode() == InstructionOpcode::Call)
+            .filter(|instruction| CallSiteValue::try_from(*instruction).unwrap().get_called_fn_value()
+                == Some(release))
+            .collect();
+        let [free] = releases.as_slice() else {
+            panic!("{target_layout:?}: expected one terminal release");
+        };
+        assert_eq!(free.get_operand(0).unwrap().value(), consumer.get_last_param());
+
+        let unproved = text.replace(
+            "if (false) { accept_packet(make_packet(3)); };",
+            "if (accept_packet(make_packet(3)) == 3) { accept_packet(make_packet(4)); };",
+        );
+        let prepared = prepare(&unproved);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let failure = emit_scalar_build_project_llvm(&build).err().expect("unproved condition emitted");
+        assert!(failure.contains("aggregate owning initializer receiver is not supported"), "{failure}");
+    }
+}
