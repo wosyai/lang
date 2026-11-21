@@ -1461,6 +1461,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 right,
                 ..
             } => {
+                let mut checked_comparison = None;
                 if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
                     let region = &calls.short_circuits[&ordinal];
                     self.expression(left, scope, region.left)?;
@@ -1483,13 +1484,39 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             }
                         }
                     }
+                    if calls.call_occurrences.len() == 2
+                        && self.aggregate_facts.passive_checked_comparisons.len() < 3
+                        && matches!(self.proof_points.backing_descriptor_install, ScalarDescriptorCandidates::One(..))
+                        && matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual)
+                    {
+                        let right_point = self.cursor.expect("evaluated right scalar operand");
+                        for (view, view_ordinal, null_expression, null_ordinal) in [
+                            (left_point, left_ordinal, right.as_ref(), right_ordinal),
+                            (right_point, right_ordinal, left.as_ref(), left_ordinal),
+                        ] {
+                            if matches!(&self.cfg.points[view.0].kind, CfgPointKind::Read { .. })
+                                && matches!(calls.structure.checked_types.expressions.get(&view_ordinal),
+                                    Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner })
+                                        if aggregate::ordinary_value(inner))
+                            {
+                                if let ScalarExpression::Name { span, .. } = null_expression {
+                                    if matches!(self.prepared_name_identity(null_ordinal, *span)?, Some(PlainNameIdentity::Null)) {
+                                        checked_comparison = Some((view, *operator == BinaryOperator::NotEqual));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                self.point(
+                let point = self.point(
                     CfgPointKind::Evaluate(expression.clone()),
                     span,
                     scope,
                     BTreeSet::new(),
                 );
+                if let Some(comparison) = checked_comparison {
+                    self.aggregate_facts.passive_checked_comparisons.insert(point, comparison);
+                }
                 Ok(ReferenceValue::Other)
             }
             ScalarExpression::Unary { operand, .. } => {
@@ -3951,7 +3978,14 @@ fn previous_origin_loans(
         .collect()
 }
 
+struct PassiveCheckedReader {
+    binding: ReferenceBindingId,
+    bind: CfgPointId,
+    dereference: CfgPointId,
+}
+
 struct PassiveDescriptorRead {
+    checked_reader: Option<PassiveCheckedReader>,
     projection: CfgPointId,
     scalar_projection: Option<CfgPointId>,
     literal: CfgPointId,
@@ -3964,6 +3998,8 @@ fn passive_descriptor_read(
     marker: &ScalarDescriptorInstall,
     facts: &aggregate::AggregateFlowFacts,
     sites: &FunctionCallSites,
+    proofs: &CallablePointFacts,
+    binding_types: &HashMap<ReferenceBindingId, ScalarType>,
     structs: &[ScalarStruct],
 ) -> Option<PassiveDescriptorRead> {
     if sites.call_occurrences.len() != 2 || !sites.allocation_length_call_targets.is_empty()
@@ -4073,7 +4109,80 @@ fn passive_descriptor_read(
     {
         return None;
     }
-    Some(PassiveDescriptorRead { projection, scalar_projection, literal, call, field: field.clone() })
+    let reader_site = sites.call_occurrences.iter().find(|site|
+        cfg.primary_call_points.get(&site.ordinal) == Some(&call))?;
+    let signature = sites.checked_call_signatures.get(&reader_site.ordinal)?;
+    let checked_reader = match signature.outputs.outputs.as_slice() {
+        outputs if outputs.iter().all(|output| aggregate::ordinary_value(&output.ty) || output.ty == ScalarType::Unit) => None,
+        [output @ ScalarOutput { ty: ScalarType::CheckedReference {
+            mutability: ScalarReferenceMutability::Shared, inner,
+        }, .. }] if aggregate::ordinary_value(inner) => Some(passive_checked_reader(
+            cfg, call, &output.ty, facts, proofs, binding_types)?),
+        _ => return None,
+    };
+    Some(PassiveDescriptorRead { checked_reader, projection, scalar_projection, literal, call, field: field.clone() })
+}
+
+fn passive_checked_reader(
+    cfg: &ScalarReferenceCfg,
+    call: CfgPointId,
+    ty: &ScalarType,
+    facts: &aggregate::AggregateFlowFacts,
+    proofs: &CallablePointFacts,
+    binding_types: &HashMap<ReferenceBindingId, ScalarType>,
+) -> Option<PassiveCheckedReader> {
+    let mut bindings = proofs.definitions.values().filter_map(|definition| match definition {
+        BindingDefinition::Initialized { bind, value } if *value == call => Some(*bind),
+        _ => None,
+    });
+    let bind = bindings.next()?;
+    let point = cfg.points.get(bind.0)?;
+    let CfgPointKind::Bind { binding } = &point.kind else { return None };
+    if bindings.next().is_some() || point.scope != ReferenceScopeId(0) || binding_types.get(binding) != Some(ty) {
+        return None;
+    }
+
+    let mut dereference = None;
+    for point in &cfg.points[bind.0 + 1..] {
+        match &point.kind {
+            CfgPointKind::ReadPlace { place: ScalarPlace::Dereference { .. }, pointer_point: Some(pointer),
+                reads_origin: false, .. }
+                if matches!(&cfg.points.get(pointer.0)?.kind, CfgPointKind::Read { binding: actual } if actual == binding) =>
+            {
+                if dereference.replace((point, *pointer)).is_some() { return None }
+            }
+            CfgPointKind::Assign { target, .. } | CfgPointKind::Borrow { place: target, .. }
+            | CfgPointKind::Move { place: target, .. } | CfgPointKind::DeferredMove { place: target, .. }
+                if &target.binding == binding => return None,
+            _ => {}
+        }
+    }
+    let (dereference, pointer) = dereference?;
+    let mut guarded = false;
+    for point in &cfg.points[bind.0 + 1..dereference.id.0] {
+        let CfgPointKind::Branch { .. } = &point.kind else { continue };
+        let compare = &cfg.points[point.id.0 - 1];
+        let Some(&(read, true)) = facts.passive_checked_comparisons.get(&compare.id) else { continue };
+        if !compare.successors.contains(&point.id)
+            || !matches!(&cfg.points[read.0].kind, CfgPointKind::Read { binding: actual } if actual == binding)
+        {
+            continue;
+        }
+        let Some(then) = point.successors.first().and_then(|then| cfg.points.get(then.0)) else { continue };
+        if matches!(&then.kind, CfgPointKind::ScopeEnter) && then.scope == dereference.scope
+            && then.id.0 < dereference.id.0
+        {
+            guarded = true;
+            break;
+        }
+    }
+    if !guarded || cfg.points[bind.0 + 1..].iter().any(|point| {
+        matches!(&point.kind, CfgPointKind::Read { binding: actual } if actual == binding)
+            && point.id != pointer && !facts.passive_checked_comparisons.values().any(|(read, _)| *read == point.id)
+    }) {
+        return None;
+    }
+    Some(PassiveCheckedReader { binding: binding.clone(), bind, dereference: dereference.id })
 }
 
 struct ScalarDescriptorReplay<'a> {
@@ -4100,6 +4209,15 @@ impl ScalarDescriptorReplay<'_> {
         let competing_owner = || candidate.validate_backing && point.possible_origins.as_ref().is_some_and(|origins| {
             origins.iter().any(|id| matches!(&facts[id.0], ReferenceOrigin::Fresh { .. }))
         });
+        let reader = self.passive.and_then(|proof| proof.checked_reader.as_ref().map(|reader| (reader, proof.call)));
+        let reader_origins = |origins: Option<&BTreeSet<ReferenceOriginId>>, reader_call: CfgPointId| {
+            origins.is_some_and(|origins| !origins.is_empty() && origins.iter().all(|id| match &facts[id.0] {
+                ReferenceOrigin::Fresh { loan, .. } => matches!(loan.origin_place.binding.kind,
+                    ReferenceBindingKind::CallOutput { point, output: 0 } if point == reader_call),
+                ReferenceOrigin::Null { .. } => true,
+                _ => false,
+            }))
+        };
         match &point.kind {
             CfgPointKind::Assign { target, rhs_point, previous_origins, .. } if point.id == candidate.frozen.install => {
                 self.invalid |= target.binding != candidate.binding || *rhs_point != candidate.frozen.rhs
@@ -4113,8 +4231,18 @@ impl ScalarDescriptorReplay<'_> {
             CfgPointKind::Assign { target, .. } => {
                 self.invalid |= target.binding == candidate.binding || carries(point.possible_origins.as_ref()) || competing_owner();
             }
+            CfgPointKind::Bind { binding } if reader.is_some_and(|(reader, _)| reader.bind == point.id) => {
+                let (reader, call) = reader.expect("exact passive reader binding");
+                self.invalid |= binding != &reader.binding || !reader_origins(point.possible_origins.as_ref(), call);
+            }
             CfgPointKind::Bind { .. } => {
                 self.invalid |= carries(point.possible_origins.as_ref()) || competing_owner();
+            }
+            CfgPointKind::ReadPlace { pointer_point, .. }
+                if reader.is_some_and(|(reader, _)| reader.dereference == point.id) =>
+            {
+                let (_, call) = reader.expect("exact passive reader dereference");
+                self.invalid |= !reader_origins(pointer_point.and_then(|p| state.point_values.get(p)), call);
             }
             CfgPointKind::ReadPlace { pointer_point, .. } if candidate.validate_backing => {
                 self.invalid |= !self.passive.is_some_and(|proof| proof.projection == point.id
@@ -4143,6 +4271,9 @@ impl ScalarDescriptorReplay<'_> {
             CfgPointKind::ScopeExit if point.scope == ReferenceScopeId(0) => {
                 self.exited = true;
                 self.invalid |= !carries(state.bindings.get(&candidate.binding));
+                if let Some((reader, call)) = reader {
+                    self.invalid |= !reader_origins(state.bindings.get(&reader.binding), call);
+                }
             }
             _ => {}
         }
@@ -9123,7 +9254,8 @@ fn build_function_reference_cfg(
     let mut aggregate = std::mem::take(&mut builder.aggregate_result);
     if let ScalarDescriptorCandidates::One(_, marker) = &builder.proof_points.backing_descriptor_install {
         aggregate.passive_descriptor_read = passive_descriptor_read(
-            &builder.cfg, marker, &builder.aggregate_facts, call_sites, builder.structs).map(Box::new);
+            &builder.cfg, marker, &builder.aggregate_facts, call_sites,
+            &builder.proof_points, &builder.binding_types, builder.structs).map(Box::new);
     }
     if prior_children_succeeded && errors.is_empty() && !builder.cfg.points.is_empty() {
         builder.cfg.initial_points = builder.cfg.points.clone();

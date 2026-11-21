@@ -598,6 +598,17 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
         .replace(".data = content; .length = count;", ".data = content; .length = size;");
     let repeated_projection = projecting_length.replace("size = (*received).length;",
         "size = (*received).length; size = (*received).length;");
+    let checked_reader = projecting_length
+        .replace("u8(Packet) read_payload", "*u8(Packet) read_payload")
+        .replace("        byte\n    };", "        if (byte == 0) { &byte } else { null }\n    };")
+        .replace("u8(Packet) => fn(input)", "*u8(Packet) => fn(input)")
+        .replace("u8 byte = reader(carrier);", r#"*u8 value = reader(carrier);
+        u8 byte = 0;
+        if (value != null) { byte = *value; };"#);
+    let unsupported_guard = checked_reader.replace("if (value != null) { byte = *value; };",
+        "if (!(value == null)) { byte = *value; };");
+    let overwritten_reader = checked_reader.replace("u8 byte = 0;\n        if (value != null)",
+        "value = null; u8 byte = 0;\n        if (value != null)");
     let consuming = passive.replace("byte = core.load<u8>(input.data);",
         "byte = core.load<u8>(input.data); core.free(input.data);");
     let nonreturning = passive.replace("byte = core.load<u8>(input.data);",
@@ -644,6 +655,7 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
         .replace("i32(u64, bool) inspect_checked", "(*Packet, bool)(u64, bool) pass_checked = fn(count, flag) {\n\t*Packet forwarded, bool marker = make_checked(count, flag);\n\tforwarded, marker\n};\ni32(u64, bool) inspect_checked");
     let wrapper = wrap(&mixed_descriptor);
     let wrapper_passive = wrap(&projecting_length);
+    let wrapper_checked_reader = wrap(&checked_reader);
     let wrapper_consuming = wrap(&consuming);
     let wrapper_aliased = wrapper.replace("forwarded, marker\n};", "*Packet moved = forwarded; moved, marker\n};");
     let wrapper_overwritten = wrapper.replace("forwarded, marker\n};", "forwarded = null; forwarded, marker\n};");
@@ -655,6 +667,8 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
             (positive, true, false), (unproved.as_str(), false, false),
             (passive.as_str(), true, false), (projecting_length.as_str(), true, false),
             (repeated_projection.as_str(), false, false), (consuming.as_str(), false, false),
+            (checked_reader.as_str(), true, false), (unsupported_guard.as_str(), false, false),
+            (overwritten_reader.as_str(), false, false),
             (ambiguous_alias.as_str(), false, false), (nonreturning.as_str(), false, false),
             (length_call.as_str(), false, false),
             (module_sink.as_str(), false, false), (qualified_sink.as_str(), false, true),
@@ -665,7 +679,8 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
             (missing_failure_receipt.as_str(), false, false), (competing_formal.as_str(), false, false),
             (wrapper.as_str(), true, false), (wrapper_aliased.as_str(), false, false),
             (wrapper_overwritten.as_str(), false, false), (wrapper_two_callers.as_str(), false, false),
-            (wrapper_passive.as_str(), true, false), (wrapper_consuming.as_str(), false, false),
+            (wrapper_passive.as_str(), true, false), (wrapper_checked_reader.as_str(), true, false),
+            (wrapper_consuming.as_str(), false, false),
         ] {
             let (inputs, order) = if qualified {
                 (vec![(declarations(&app, text), vec![namespace("imported", &values)]),
@@ -719,8 +734,9 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
                     assert!(producer_ir.contains("store ptr null, ptr"), "{producer_ir}");
                     assert!(consumer_ir.contains("icmp ne ptr %checked_backing_base, null"), "{consumer_ir}");
                 }
-                assert_eq!(consumer_ir.matches("call void @__wosy_core_free").count(), 2, "{consumer_ir}");
-                assert!(consumer_ir.contains("call void @__wosy_core_free(ptr %checked_backing_base)"), "{consumer_ir}");
+                let expected_releases = if text == checked_reader || text == wrapper_checked_reader { 3 } else { 2 };
+                assert_eq!(consumer_ir.matches("call void @__wosy_core_free").count(), expected_releases, "{consumer_ir}");
+                assert_eq!(consumer_ir.matches("call void @__wosy_core_free(ptr %checked_backing_base)").count(), 1, "{consumer_ir}");
             } else {
                 assert_eq!(producer.count_params(), if text == competing_formal.as_str() { 3 } else { 2 });
                 assert!(!consumer_ir.contains("checked_backing_call"), "{consumer_ir}");
