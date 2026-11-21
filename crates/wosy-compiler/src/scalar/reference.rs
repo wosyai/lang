@@ -4175,12 +4175,21 @@ fn reference_read_reachable(
     false
 }
 
-fn loan_borrows_place(loan: &ReferenceLoanId, place: &ReferencePlaceId) -> bool {
-    reference_places_overlap(&available_place(&loan.origin_place), place)
-        || loan
-            .parent
-            .as_ref()
-            .is_some_and(|parent| loan_borrows_place(parent, place))
+fn loan_borrows_place(
+    loan: &ReferenceLoanId,
+    place: &ReferencePlaceId,
+    mode: Option<ScalarReferenceMutability>,
+) -> bool {
+    let mut candidate = Some(loan);
+    while let Some(current) = candidate {
+        if mode.is_none_or(|mode| current.mode == mode)
+            && reference_places_overlap(&available_place(&current.origin_place), place)
+        {
+            return true;
+        }
+        candidate = current.parent.as_deref();
+    }
+    false
 }
 
 fn loan_has_ancestor(loan: &ReferenceLoanId, ancestor: &ReferenceLoanId) -> bool {
@@ -4234,7 +4243,7 @@ fn conflicting_live_loan(
                         && reference_places_overlap(&available_place(&loan.origin_place), &place)
                 }
                 LoanAccess::WriteThrough(selected) => {
-                    loan_borrows_place(loan, &place) && !loan_has_ancestor(&selected.loan, loan)
+                    loan_borrows_place(loan, &place, None) && !loan_has_ancestor(&selected.loan, loan)
                 }
                 LoanAccess::Borrow(new) => {
                     (new.mode == ScalarReferenceMutability::Mutable
@@ -4242,9 +4251,8 @@ fn conflicting_live_loan(
                         && reference_places_overlap(&available_place(&loan.origin_place), &place)
                         && !loan_has_ancestor(new, loan)
                 }
-                LoanAccess::DirectRead => loan.mode == ScalarReferenceMutability::Mutable
-                    && loan_borrows_place(loan, &place),
-                LoanAccess::Direct | LoanAccess::Through(_) => loan_borrows_place(loan, &place),
+                LoanAccess::DirectRead => loan_borrows_place(loan, &place, Some(ScalarReferenceMutability::Mutable)),
+                LoanAccess::Direct | LoanAccess::Through(_) => loan_borrows_place(loan, &place, None),
             };
             if !conflicts_with_access {
                 continue;

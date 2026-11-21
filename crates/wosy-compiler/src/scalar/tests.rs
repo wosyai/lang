@@ -12575,3 +12575,92 @@ fn known_projected_shared_leaf_rejects_nonlocal_authority_and_result_forms() {
         }
     }
 }
+
+#[test]
+fn known_shared_named_reborrow_preserves_mutable_ancestor_through_last_child_use() {
+    let mut missed = Vec::new();
+    for (mode, body, conflict) in [
+        ("", "Pair snapshot = owner; u8 seen = (*child).left; snapshot.right; seen;", None),
+        ("!", "u8 seen = (*child).left; Pair snapshot = owner; snapshot.right; seen;", None),
+        ("!", "Pair snapshot = owner; u8 seen = (*child).left; snapshot.right; seen;", Some("owner; u8 seen")),
+        ("!", "if (flag) { u8 seen = (*child).left; seen; }; Pair snapshot = owner; snapshot.right;", None),
+        ("!", "u8 direct = owner.right; u8 seen = (*child).left; direct; seen;", Some("owner.right; u8 seen")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair, bool) inspect = fn(owner, flag) {{
+    flag;
+    *{mode}Pair parent = &{mode}owner;
+    *Pair child = &(*parent);
+    {body}
+}};
+%%end"#);
+        let root = text.find(&format!("&{mode}owner")).unwrap() as u32;
+        let child = text.find("&(*parent)").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let borrow = function.reference_cfg.initial_points.iter().find(|point| {
+                point.source_span.range.start == child
+                    && matches!(&point.kind, CfgPointKind::Borrow { place, loan }
+                        if loan.mode == ScalarReferenceMutability::Shared
+                            && loan.parent.as_deref().is_some_and(|parent| {
+                                parent.creation_span.start == root
+                                    && parent.origin_place.binding == place.binding
+                                    && parent.mode == if mode.is_empty() {
+                                        ScalarReferenceMutability::Shared
+                                    } else {
+                                        ScalarReferenceMutability::Mutable
+                                    }
+                            }))
+            }).unwrap_or_else(|| panic!("actual whole-name checked reborrow: {diagnostics:?}"));
+            if let Some(conflict) = conflict {
+                let start = text.find(conflict).unwrap() as u32;
+                if !diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == start)
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range))
+                {
+                    missed.push((validator, conflict, diagnostics.clone()));
+                }
+            } else {
+                assert!(diagnostics.is_empty(), "{validator} {mode} {body}: {diagnostics:?}");
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{missed:?}");
+}
+
+#[test]
+fn known_shared_child_of_mutable_field_preserves_disjoint_owner_reads() {
+    let text = r#"%%start
+struct copy Pair { u8 left; u8 right; }
+u8(Pair) inspect = fn(owner) {
+    *!u8 parent = &!owner.left;
+    *u8 child = &(*parent);
+    owner.right + *child
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    let child_span = text.find("&(*parent)").unwrap() as u32;
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+        assert!(function.reference_cfg.points.iter().any(|point| {
+            point.source_span.range.start == child_span
+                && matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
+                    if loan.mode == ScalarReferenceMutability::Shared
+                        && loan.parent.as_deref().is_some_and(|parent| {
+                            parent.mode == ScalarReferenceMutability::Mutable
+                                && matches!(parent.origin_place.projections.as_slice(),
+                                    [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] if field.index == 0)
+                        }))
+        }));
+    }
+}
