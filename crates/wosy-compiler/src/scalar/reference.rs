@@ -3681,9 +3681,13 @@ fn transfer_reference_facts(
         .collect::<BTreeSet<_>>();
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
     let mut strictly_forward = true;
+    let mut aggregate_expiry_allowed = aggregate.is_some();
     for (index, point) in original_points.iter().enumerate() {
         strictly_forward = strictly_forward && point.id.0 == index
             && point.successors.iter().all(|successor| successor.0 > index && successor.0 < original_points.len());
+        aggregate_expiry_allowed = aggregate_expiry_allowed && strictly_forward
+            && !matches!(&point.kind, CfgPointKind::MoveThrough { place, .. }
+                if !matches!(place, ScalarPlace::Dereference { .. }));
         let dependencies = match &point.kind {
             CfgPointKind::Invalidate { address_point, .. }
             | CfgPointKind::Release {
@@ -3716,6 +3720,9 @@ fn transfer_reference_facts(
             last_use[dependency.0] = point.id.0;
         }
     }
+    let aggregate_deadlines = aggregate.as_ref()
+        .filter(|_| aggregate_expiry_allowed)
+        .map(|(facts, _, _)| facts.value_deadlines(&last_use));
     let mut call_contracts = BTreeMap::new();
     let mut observed = vec![None::<ReferenceFlowPoint>; cfg.points.len()];
     let mut incoming = vec![Vec::<ReferenceEdgeState>::new(); cfg.points.len()];
@@ -3748,6 +3755,8 @@ fn transfer_reference_facts(
             forward_cursor = id.0 + 1;
             id
         };
+        let common_aggregate_cutoff = aggregate_deadlines.as_ref()
+            .and_then(|_| original_points[id.0].successors.iter().copied().min());
         let states = std::mem::take(&mut incoming[id.0]);
         if let Some(single_observation) = &mut forward_single_observation {
             if matches!(&original_points[id.0].kind, CfgPointKind::MoveThrough { place, .. }
@@ -3771,7 +3780,7 @@ fn transfer_reference_facts(
             if let (Some((facts, sites, result)), Some(flow)) =
                 (&mut aggregate, &mut state.aggregate)
             {
-                facts.visit(&original_points[id.0], flow, result, sites);
+                facts.visit(&original_points[id.0], flow, result, sites, aggregate_deadlines.as_deref());
             }
             let mut move_alternatives = Vec::new();
             cfg.points[id.0] = original_points[id.0].clone();
@@ -4824,6 +4833,18 @@ fn transfer_reference_facts(
             } else {
                 observed[id.0] = Some(point.clone());
             }
+            if let (Some(cutoff), Some(last_use), Some(flow)) =
+                (common_aggregate_cutoff, &aggregate_deadlines, &mut state.aggregate)
+            {
+                flow.expire_before(cutoff, last_use);
+            }
+            let prune_for_successor = |next: &mut ReferenceEdgeState, successor| {
+                if common_aggregate_cutoff.is_some_and(|cutoff| cutoff < successor) {
+                    if let (Some(last_use), Some(flow)) = (&aggregate_deadlines, &mut next.aggregate) {
+                        flow.expire_before(successor, last_use);
+                    }
+                }
+            };
             let mut state = Some(state);
             let mut successors = point.successors.iter().peekable();
             while let Some(successor) = successors.next() {
@@ -4837,6 +4858,7 @@ fn transfer_reference_facts(
                     if successor.0 <= id.0 {
                         next.point_values.clear_from(*successor);
                     }
+                    prune_for_successor(&mut next, *successor);
                     if fallback.as_ref().is_none_or(|(visited, _, _)| !visited[successor.0].contains(&next))
                         && !slot.contains(&next) {
                         slot.push(next);
@@ -4850,6 +4872,7 @@ fn transfer_reference_facts(
                         if successor.0 <= id.0 {
                             next.point_values.clear_from(*successor);
                         }
+                        prune_for_successor(&mut next, *successor);
                         if fallback.as_ref().is_none_or(|(visited, _, _)| !visited[successor.0].contains(&next))
                             && !slot.contains(&next) {
                             slot.push(next);

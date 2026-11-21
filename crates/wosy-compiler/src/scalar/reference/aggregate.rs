@@ -173,6 +173,7 @@ pub(super) fn ordinary_value(ty: &ScalarType) -> bool {
 #[derive(Clone, Default, PartialEq)]
 pub(super) struct AggregateEdgeState {
     values: BTreeMap<CfgPointId, Value>,
+    earliest_value_use: Option<usize>,
     bindings:
         BTreeMap<ReferenceBindingId, (Option<Value>, ReferenceScopeId, Option<BlockPosition>)>,
     moved: BTreeSet<OwnerSource>,
@@ -193,6 +194,39 @@ struct LocalArrayLife {
 }
 
 impl AggregateEdgeState {
+    pub(super) fn expire_before(&mut self, successor: CfgPointId, last_use: &[usize]) {
+        if self.earliest_value_use.is_none_or(|deadline| deadline >= successor.0) {
+            return;
+        }
+        let mut earliest = None::<usize>;
+        self.values.retain(|producer, _| {
+            let deadline = last_use[producer.0];
+            if deadline < successor.0 {
+                return false;
+            }
+            earliest = Some(earliest.map_or(deadline, |old| old.min(deadline)));
+            true
+        });
+        self.earliest_value_use = earliest;
+    }
+
+    fn record_value(&mut self, id: CfgPointId, value: Option<Value>, deadlines: Option<&[usize]>) {
+        if let Some(deadlines) = deadlines {
+            if let Some(value) = value {
+                let deadline = deadlines[id.0];
+                if deadline > id.0 {
+                    let previous = self.values.insert(id, value);
+                    debug_assert!(previous.is_none());
+                    self.earliest_value_use = Some(self.earliest_value_use.map_or(deadline, |old| old.min(deadline)));
+                }
+            }
+        } else if let Some(value) = value {
+            self.values.insert(id, value);
+        } else {
+            self.values.remove(&id);
+        }
+    }
+
     fn forget_plain(&mut self, binding: &ReferenceBindingId) {
         if let Some((value @ Some(Value::Plain(_)), _, _)) = self.bindings.get_mut(binding) {
             *value = None;
@@ -283,6 +317,29 @@ pub(super) fn returning_leaf_point(kind: &CfgPointKind) -> bool {
 }
 
 impl AggregateFlowFacts {
+    pub(super) fn value_deadlines<'a>(&self, ordinary_last_use: &'a [usize]) -> std::borrow::Cow<'a, [usize]> {
+        let mut deadlines = std::borrow::Cow::Borrowed(ordinary_last_use);
+        let mut record = |producer: CfgPointId, consumer: CfgPointId| {
+            if deadlines[producer.0] < consumer.0 {
+                deadlines.to_mut()[producer.0] = consumer.0;
+            }
+        };
+        for (&consumer, inputs) in &self.opaque_container_inputs {
+            for &producer in inputs {
+                record(producer, consumer);
+            }
+        }
+        for (&consumer, inputs) in &self.literals {
+            for &(_, producer) in inputs {
+                record(producer, consumer);
+            }
+        }
+        for (&consumer, &(producer, _)) in &self.installations {
+            record(producer, consumer);
+        }
+        deadlines
+    }
+
     pub(super) fn entry_state(&self) -> AggregateEdgeState {
         let mut state = AggregateEdgeState {
             array_formal_live: self.array_formal.is_some(),
@@ -318,6 +375,7 @@ impl AggregateFlowFacts {
         state: &mut AggregateEdgeState,
         result: &mut AggregateFlowResult,
         sites: &FunctionCallSites,
+        value_deadlines: Option<&[usize]>,
     ) {
         let id = point.id;
         if let Some(local) = &mut state.local_array {
@@ -859,10 +917,8 @@ impl AggregateFlowFacts {
                     result.read_invalid.entry(source).or_insert(id);
                 }
             }
-            state.values.insert(id, value);
-        } else {
-            state.values.remove(&id);
         }
+        state.record_value(id, value, value_deadlines);
     }
 }
 
@@ -1703,5 +1759,44 @@ impl ProjectReferenceResults {
             |(module, item, arm), _| self.function_result(module, item, arm).map(|result| (Some(&result.aggregate), &result.cfg)),
             reservations.modules.iter().filter_map(|module| calls.modules.get(*module)?.as_ref().ok().map(|module| &module.initialization)),
         )
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_value_deadlines_preserve_consumers_but_remove_dead_branch_history() {
+        let mut facts = AggregateFlowFacts::default();
+        let ordinary = [0, 1, 2, 3, 4, 5, 6, 7];
+        assert!(matches!(facts.value_deadlines(&ordinary), std::borrow::Cow::Borrowed(_)));
+        facts.opaque_container_inputs.insert(CfgPointId(4), vec![CfgPointId(0)]);
+        facts.literals.insert(CfgPointId(5), vec![(OccurrenceOrdinal(0), CfgPointId(1))]);
+        facts.installations.insert(CfgPointId(6), (CfgPointId(2), BlockPosition { block: BlockOrdinal(0), item: 0 }));
+        let deadlines = facts.value_deadlines(&ordinary);
+        assert_eq!(deadlines.as_ref(), &[4, 5, 6, 3, 4, 5, 6, 7]);
+
+        let mut state = AggregateEdgeState::default();
+        state.record_value(CfgPointId(0), Some(Value::RawFormal(0)), Some(&deadlines));
+        state.record_value(CfgPointId(1), Some(Value::View(OwnerSource::Allocation(CfgPointId(1)))), Some(&deadlines));
+        state.record_value(CfgPointId(2), Some(Value::Unknown), Some(&deadlines));
+        state.pending_temporaries.insert(CfgPointId(0), ReferenceScopeId(0));
+        let mut other = state.clone();
+        state.record_value(CfgPointId(3), Some(Value::Plain(CfgPointId(3))), Some(&deadlines));
+        other.record_value(CfgPointId(3), Some(Value::Unknown), Some(&deadlines));
+        assert!(state == other);
+
+        state.expire_before(CfgPointId(4), &deadlines);
+        assert_eq!(state.earliest_value_use, Some(4));
+        assert_eq!(state.values.keys().copied().collect::<Vec<_>>(), vec![CfgPointId(0), CfgPointId(1), CfgPointId(2)]);
+        state.expire_before(CfgPointId(6), &deadlines);
+        assert_eq!(state.earliest_value_use, Some(6));
+        assert_eq!(state.values.keys().copied().collect::<Vec<_>>(), vec![CfgPointId(2)]);
+        state.expire_before(CfgPointId(7), &deadlines);
+        assert_eq!(state.earliest_value_use, None);
+        assert!(state.values.is_empty());
+        assert_eq!(state.pending_temporaries.get(&CfgPointId(0)), Some(&ReferenceScopeId(0)));
     }
 }
