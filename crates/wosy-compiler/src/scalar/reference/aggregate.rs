@@ -298,6 +298,33 @@ impl AggregateEdgeState {
     }
 }
 
+type LiveReceipt = (OwnerSource, ReferenceBindingId);
+
+#[derive(Default)]
+struct ScopeEndpoint {
+    possible: BTreeSet<LiveReceipt>,
+    // None means no path has been observed, not a path with no live receipts.
+    always: Option<BTreeSet<LiveReceipt>>,
+}
+
+impl ScopeEndpoint {
+    fn observe(&mut self, live: BTreeSet<LiveReceipt>) {
+        self.possible.extend(live.iter().cloned());
+        if let Some(always) = &mut self.always {
+            always.retain(|receipt| live.contains(receipt));
+        } else {
+            self.always = Some(live);
+        }
+    }
+
+    fn receipt(&self, owner: OwnerSource) -> Option<bool> {
+        let mut bindings = self.possible.iter().filter(|(source, _)| *source == owner);
+        let receipt = bindings.next()?;
+        Some(bindings.next().is_none()
+            && self.always.as_ref().is_some_and(|always| always.contains(receipt)))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
     pub(super) checked_backing_forward_candidate: Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>,
@@ -318,7 +345,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) allocation_slots: BTreeMap<CfgPointId, (usize, usize)>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) returns: BTreeMap<CfgPointId, BTreeSet<Option<OwnerSource>>>,
-    pub(super) endpoints: BTreeMap<(CfgPointId, usize), BTreeSet<Option<OwnerSource>>>,
+    endpoints: BTreeMap<(CfgPointId, usize), ScopeEndpoint>,
     pub(super) unsupported: BTreeSet<CfgPointId>,
     abandoned_temporaries: BTreeMap<CfgPointId, CfgPointId>,
     crossed_temporary_calls: BTreeMap<CfgPointId, BTreeSet<CfgPointId>>,
@@ -348,6 +375,12 @@ pub(super) struct AggregateFlowResult {
 }
 
 impl AggregateFlowResult {
+    fn owner_endpoints(&self, owner: OwnerSource) -> impl Iterator<Item = ((CfgPointId, usize), bool)> + '_ {
+        self.endpoints.iter().filter_map(move |(&endpoint, receipts)| {
+            receipts.receipt(owner).map(|always| (endpoint, always))
+        })
+    }
+
     fn invalidate_raw(&mut self, point: CfgPointId) {
         self.raw_invalid = Some(self.raw_invalid.map_or(point, |previous| previous.min(point)));
     }
@@ -1107,20 +1140,24 @@ impl AggregateFlowFacts {
                     None
                 }
                 CfgPointKind::ScopeExit => {
-                    state.bindings.retain(|_, (value, owner_scope, position)| {
+                    let exit = self.scope_exits.get(&id);
+                    let mut live = BTreeSet::new();
+                    state.bindings.retain(|binding, (value, owner_scope, position)| {
                         if *owner_scope != point.scope {
                             return true;
                         }
-                        if let (Some(Value::Aggregate { backing, .. }), Some(exit)) =
-                            (value, self.scope_exits.get(&id))
-                        {
-                            if position.is_some() || matches!(backing, OwnerSource::Formal(_)) {
-                                result.endpoints.entry((id, exit.0)).or_default()
-                                    .insert((!state.moved.contains(backing)).then_some(*backing));
+                        if let Some(Value::Aggregate { backing, .. }) = value {
+                            if exit.is_some() && !state.moved.contains(backing)
+                                && (position.is_some() || matches!(backing, OwnerSource::Formal(_)))
+                            {
+                                live.insert((*backing, binding.clone()));
                             }
                         }
                         false
                     });
+                    if let Some(exit) = exit {
+                        result.endpoints.entry((id, exit.0)).or_default().observe(live);
+                    }
                     None
                 }
                 _ => None,
@@ -2104,8 +2141,7 @@ fn closed_aggregates<'a>(
         if facts.read_active.contains(&read_owner) {
             prove_read_views((callee, read_owner), &bodies, &declarations, &mut proven_read_views)?;
         }
-        let origin = Some(OwnerSource::Formal(slot));
-        let mut exits = facts.endpoints.iter().filter(|(_, owners)| owners.contains(&origin));
+        let mut exits = facts.owner_endpoints(OwnerSource::Formal(slot));
         let release = if let Some(&next) = forward_edges.get(&(callee, slot)) {
             if exits.next().is_some() {
                 return Err(format!("aggregate owning formal has both release and transfer in {:?} at slot {slot}", body.source));
@@ -2113,10 +2149,10 @@ fn closed_aggregates<'a>(
             forward_predecessors.entry(next).or_default().push((callee, slot));
             None
         } else {
-            let Some((&endpoint, observed)) = exits.next() else {
+            let Some((endpoint, always)) = exits.next() else {
                 return Err(format!("aggregate owning input has no proved formal exit in {:?} at slot {slot}", body.source));
             };
-            if observed.len() != 1 || exits.next().is_some() {
+            if !always || exits.next().is_some() {
                 return Err(format!("aggregate owning input has ambiguous formal exit in {:?} at slot {slot}", body.source));
             }
             terminal_formals.push((callee, slot));
@@ -2334,23 +2370,20 @@ fn closed_aggregates<'a>(
                 continue;
             }
             if discharged_by_inputs.contains(&(key, point)) {
-                if facts.endpoints.values().any(|owners| owners.contains(&Some(OwnerSource::Call(point)))) {
+                if facts.owner_endpoints(OwnerSource::Call(point)).next().is_some() {
                     return Err(format!("aggregate input transfer does not cover every owning path in {:?}", body.source));
                 }
                 plan.calls.insert(call.0, ClosedCall::Receive);
                 continue;
             }
-            let mut endpoints = facts
-                .endpoints
-                .iter()
-                .filter(|(_, alternatives)| alternatives.contains(&Some(OwnerSource::Call(point))));
-            let Some((&(exit, block), alternatives)) = endpoints.next() else {
+            let mut endpoints = facts.owner_endpoints(OwnerSource::Call(point));
+            let Some(((exit, block), always)) = endpoints.next() else {
                 return Err(format!(
                     "aggregate owning call has no proved endpoint in {:?}",
                     body.source
                 ));
             };
-            if alternatives.len() != 1 || endpoints.next().is_some() {
+            if !always || endpoints.next().is_some() {
                 return Err(format!(
                     "aggregate owning call has ambiguous endpoint in {:?}",
                     body.source
@@ -2568,6 +2601,34 @@ pick = overload {
             assert!(prove_read_views(((0, selection, Some(2)), ReadSource::Carrier(0)),
                 &bodies, &declarations, &mut proven).unwrap_err().contains("unproved ordinary raw read formal"));
         }
+    }
+
+    #[test]
+    fn scope_receipts_reject_disagreement_between_paths() {
+        let span = ByteSpan::new(0, 8);
+        let left = ReferenceBindingId {
+            source: SourceIdentity::new("project".into(), "package".into(), "main.w".into(), "r1".into()),
+            function_span: span,
+            declaration_span: ByteSpan::new(1, 2),
+            block_span: span,
+            kind: ReferenceBindingKind::Declared,
+        };
+        let right = ReferenceBindingId { declaration_span: ByteSpan::new(3, 4), ..left.clone() };
+        let a = OwnerSource::Call(CfgPointId(1));
+        let b = OwnerSource::Call(CfgPointId(2));
+        let mut exit = ScopeEndpoint::default();
+        exit.observe(BTreeSet::from([(a, left.clone()), (b, right.clone())]));
+        exit.observe(BTreeSet::from([(b, right.clone())]));
+        assert_eq!(exit.receipt(a), Some(false));
+        assert_eq!(exit.receipt(b), Some(true));
+        exit.observe(BTreeSet::from([(b, left.clone())]));
+        assert_eq!(exit.receipt(b), Some(false));
+
+        let mut empty_first = ScopeEndpoint::default();
+        empty_first.observe(BTreeSet::new());
+        empty_first.observe(BTreeSet::from([(a, left)]));
+        assert_eq!(empty_first.receipt(a), Some(false));
+        assert_eq!(empty_first.receipt(b), None);
     }
 
     #[test]
