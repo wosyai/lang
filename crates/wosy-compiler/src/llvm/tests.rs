@@ -5157,6 +5157,83 @@ wide(1.5, 2.0);
 }
 
 #[test]
+fn infers_float_width_for_literal_arithmetic_in_conversion_operands() {
+    let text = r#"%%start
+i32(f32) cell = fn(x) {
+    core.float_to_sint_trunc<i32>((x + 344.0) / 56.0)
+};
+i32(f32) opposite = fn(x) {
+    core.float_to_sint_trunc<i32>((2.0 + 3.0) - x)
+};
+u64(f64) wide = fn(x) {
+    core.float_to_uint_trunc<u64>(x * 2.0 % 7.0)
+};
+u64(f64) wide_opposite = fn(x) {
+    core.float_to_uint_trunc<u64>(10.0 / x)
+};
+i32 a = cell(7.0);
+i32 b = opposite(2.0);
+u64 c = wide(3.0);
+u64 d = wide_opposite(2.0);
+%%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let standalone = derive_scalar_program_with_layout(
+            &parse_source(source, text.into(), &[]).result,
+            layout,
+        );
+        assert!(standalone.diagnostics.is_empty(), "{:?}", standalone.diagnostics);
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for partition in [
+            emit_scalar_llvm(&standalone),
+            emit_scalar_build_single_module_llvm(&checked),
+            emit_scalar_build_project_llvm(&checked),
+        ] {
+            let ir = partition.unwrap().to_text();
+            for operation in [
+                "fadd float", "fdiv float", "fsub float", "fptosi float",
+                "fmul double", "frem double", "fdiv double", "fptoui double",
+            ] {
+                assert!(ir.contains(operation), "{layout:?}, missing {operation}: {ir}");
+            }
+            for forbidden in ["fpext", "fptrunc", "fptosi double", "fptoui float"] {
+                assert!(!ir.contains(forbidden), "{layout:?}, unexpected {forbidden}: {ir}");
+            }
+        }
+    }
+}
+
+#[test]
+fn reports_ambiguous_or_mixed_float_literal_arithmetic_before_emission() {
+    for argument in ["1.0 + (2.0 * 3.0)", "x + 1.0", "1.0 + x"] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let text = format!(
+            "%%start\ni32(i32) convert = fn(x) {{ core.float_to_sint_trunc<i32>({argument}) }};\nconvert(2);\n%%end",
+        );
+        let parsed = parse_source(source.clone(), text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let standalone = derive_scalar_program(&parsed.result);
+        let project = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        );
+        let project_diagnostics = match project {
+            Ok(prepared) => analyze_scalar_build(&prepared).diagnostics().to_vec(),
+            Err(error) => error.diagnostics.clone(),
+        };
+        for diagnostics in [standalone.diagnostics, project_diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic|
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "floating-point arithmetic requires a matching f32 or f64 context"
+            ), "{argument}: {diagnostics:?}");
+        }
+    }
+}
+
+#[test]
 fn emits_bitcast_for_single_file_and_project() {
     let source = SourceIdentity::new(
         "project".into(),

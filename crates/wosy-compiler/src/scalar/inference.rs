@@ -193,6 +193,7 @@ pub(super) struct ScalarInferenceBuilder<'a> {
     owners: &'a ScalarAssignmentOwners,
     assignments: HashMap<ResolvedAssignmentOutputId, ScalarType>,
     occurrences: PreparationOccurrenceTyping,
+    float_literal_shapes: HashMap<*const ScalarExpression, bool>,
     in_module_initialization: bool,
     suppress_checked_occurrences: bool,
 }
@@ -203,6 +204,7 @@ impl<'a> ScalarInferenceBuilder<'a> {
             owners,
             assignments: HashMap::new(),
             occurrences: PreparationOccurrenceTyping::default(),
+            float_literal_shapes: HashMap::new(),
             in_module_initialization: false,
             suppress_checked_occurrences: true,
         }
@@ -227,6 +229,22 @@ impl<'a> ScalarInferenceBuilder<'a> {
             },
             self.occurrences,
         )
+    }
+
+    pub(super) fn memoized_float_literal_shape(
+        &mut self,
+        expression: &ScalarExpression,
+        classify: impl FnOnce(&mut Self) -> bool,
+    ) -> bool {
+        // These are the same preparation-local AST addresses used for checked
+        // occurrence facts. Shape is independent of type context and probing.
+        let key = std::ptr::from_ref(expression);
+        if let Some(&shape) = self.float_literal_shapes.get(&key) {
+            return shape;
+        }
+        let shape = classify(self);
+        self.float_literal_shapes.insert(key, shape);
+        shape
     }
 
     pub(super) fn without_checked_occurrences(

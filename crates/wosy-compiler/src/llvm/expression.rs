@@ -2063,6 +2063,9 @@ fn float_conversion_source_type(
     expression: &ScalarExpression,
     project_module: Option<&ScalarModule>,
 ) -> Result<ScalarType, String> {
+    if let Some(ty) = checked_float_type(state, expression) {
+        return Ok(ty.clone());
+    }
     let ty = match expression {
         ScalarExpression::Member { .. }
             if state.prepared_render && state.initializer_nodes.is_some() =>
