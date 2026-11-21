@@ -11714,7 +11714,8 @@ unit(bool) inspect = fn(choose) {
     if (choose) { u8 inside = 9; inside; };
     *!u8 child = &!(*parent);
     *u8 shared = &(*child);
-    *u8 alias = shared;
+    *u8 alias = null;
+    alias = shared;
     u8 seen = *alias;
     seen;
 };
@@ -11823,7 +11824,7 @@ fn deferred_direct_shared_leaf_uses_exact_local_or_formal_root() {
         for (body, result) in [
             ("u8 prior = *parent; u8 observed = *leaf; *parent = 8; prior; observed;", 0),
             ("*parent = 8; u8 observed = *leaf; observed;", 1),
-            ("*u8 copy = leaf; u8 observed = *copy; observed;", 2),
+            ("*u8 copy = null; copy = leaf; u8 observed = *copy; observed;", 2),
         ] {
             let text = format!(r#"%%start
 unit({parameters}) inspect = fn({formal}choose) {{
@@ -11960,5 +11961,70 @@ fn deferred_shared_reborrow_does_not_infer_escape_for_checked_reference_result()
         let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
         assert!(function.reference_cfg.initial_points.iter().all(|point| point.source_span.range.start != leaf
             || !matches!(point.kind, CfgPointKind::Borrow { .. })));
+    }
+}
+
+#[test]
+fn deferred_shared_leaf_copy_keeps_one_loan_live_under_either_binding() {
+    for root in ["parent", "child"] {
+        for (body, expected) in [
+            ("u8 seen = *alias; *parent = 11; seen;", 0),
+            ("*parent = 11; u8 seen = *alias; seen;", 1),
+            ("u8 prior = *alias; *parent = 11; u8 seen = *leaf; prior; seen;", 1),
+            ("*u8 copy = alias; u8 seen = *copy; seen;", 2),
+            ("*u8 copy = null; copy = alias; u8 seen = *copy; seen;", 2),
+        ] {
+            let child = if root == "child" { "*!u8 child = &!(*parent);" } else { "" };
+            let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 marker = 9; marker; }};
+    {child}
+    *u8 leaf = &(*{root});
+    *u8 alias = leaf;
+    {body}
+}};
+%%end"#);
+            let (single, project) = both_reference_functions(&text);
+            let leaf = text.find(&format!("&(*{root})")).unwrap() as u32;
+            let alias_read = (text.find("alias = leaf").unwrap() + "alias = ".len()) as u32;
+            for (items, diagnostics) in [
+                (&single.program.items, &single.diagnostics),
+                (&project.project.modules[0].items, &project.diagnostics),
+            ] {
+                let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+                let cfg = &function.reference_cfg;
+                if expected != 0 {
+                    assert!(cfg.initial_points.iter().any(|point| {
+                        point.source_span.range.start == leaf && point.possible_origins.is_none()
+                            && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))
+                    }), "{root}, case {body}: {diagnostics:?}");
+                    if expected == 2 {
+                        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                            && diagnostic.message == "missing required dereference origin"), "{diagnostics:?}");
+                    } else {
+                        let write = text.find("parent = 11").unwrap() as u32;
+                        assert!(diagnostics.iter().any(|diagnostic| {
+                            diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == write)
+                                && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == leaf)
+                        }), "{diagnostics:?}");
+                    }
+                    continue;
+                }
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                let borrow = cfg.points.iter().find(|point| point.source_span.range.start == leaf
+                    && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("sealed loan");
+                assert_eq!(&cfg.initial_points[borrow.id.0], borrow);
+                let read = cfg.points.iter().find(|point| point.source_span.range.start == alias_read
+                    && matches!(point.kind, CfgPointKind::Read { .. })).expect("exact alias initializer");
+                let [bind] = read.successors.as_slice() else { panic!("immediate alias binding") };
+                let bind = &cfg.points[bind.0];
+                assert!(matches!(bind.kind, CfgPointKind::Bind { .. }));
+                assert_eq!(borrow.possible_origins, read.possible_origins);
+                assert_eq!(borrow.possible_origins, bind.possible_origins);
+            }
+        }
     }
 }

@@ -4824,9 +4824,9 @@ fn transfer_reference_facts(
     let mut local_definition = None;
     let mut child_holders = HashMap::new();
     let mut pending_allowed = pending.is_some_and(|pending| {
-        if pending.sites.len() > 1 || pending.sites.first().is_some_and(|site|
-            is_pending_shared_reborrow(&original_points[site.point.0]))
-        {
+        let has_shared = pending.sites.iter().any(|site|
+            is_pending_shared_reborrow(&original_points[site.point.0]));
+        if pending.sites.len() > 1 || has_shared {
             for site in &pending.sites {
                 let Some(holder) = site.holder else { return false };
                 let point = &original_points[holder.0];
@@ -4836,6 +4836,29 @@ fn transfer_reference_facts(
                 let CfgPointKind::Bind { binding } = &point.kind else { return false };
                 if child_holders.insert(binding, site.point).is_some() {
                     return false;
+                }
+            }
+        }
+        if has_shared {
+            for &(bind, value) in cfg.checked_binding_initializers {
+                let target = &original_points[bind.0];
+                let read = &original_points[value.0];
+                let (CfgPointKind::Bind { binding: destination }, CfgPointKind::Read { binding: source }) =
+                    (&target.kind, &read.kind) else { continue };
+                if value >= bind || read.scope != target.scope || read.successors.as_slice() != [bind]
+                    || child_holders.contains_key(destination)
+                {
+                    continue;
+                }
+                let Some(producer) = child_holders.get(source).copied() else { continue };
+                let Ok(index) = pending.sites.binary_search_by_key(&producer, |site| site.point) else { continue };
+                let Some(holder) = pending.sites[index].holder else { continue };
+                let holder = &original_points[holder.0];
+                if holder.id < value && holder.scope == read.scope
+                    && matches!(&holder.kind, CfgPointKind::Bind { binding } if binding == source)
+                    && is_pending_shared_reborrow(&original_points[producer.0])
+                {
+                    child_holders.insert(destination, producer);
                 }
             }
         }
@@ -4894,6 +4917,13 @@ fn transfer_reference_facts(
                 CfgPointKind::Read { binding } if child_holders.contains_key(binding) =>
                     original_points.get(index + 1).is_none_or(|next| {
                         if exact_child_store(next).is_some() {
+                            return false;
+                        }
+                        if matches!(&next.kind, CfgPointKind::Bind { binding: destination }
+                            if child_holders.get(destination) == child_holders.get(binding))
+                            && cfg.checked_binding_initializers.binary_search_by_key(&next.id, |&(bind, _)| bind)
+                                .ok().is_some_and(|index| cfg.checked_binding_initializers[index].1 == point.id)
+                        {
                             return false;
                         }
                         if point.successors.as_slice() == [next.id]
