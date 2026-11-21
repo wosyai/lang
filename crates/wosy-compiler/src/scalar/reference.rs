@@ -4303,8 +4303,26 @@ impl ScalarDescriptorReplay<'_> {
     }
 }
 
+struct ReferenceTransferCfg<'a> {
+    initial_points: &'a [ReferenceFlowPoint],
+    points: &'a mut [ReferenceFlowPoint],
+    facts: &'a mut Vec<ReferenceOrigin>,
+    allocations: &'a BTreeSet<ReferenceBindingId>,
+}
+
+impl<'a> From<&'a mut ScalarReferenceCfg> for ReferenceTransferCfg<'a> {
+    fn from(cfg: &'a mut ScalarReferenceCfg) -> Self {
+        Self {
+            initial_points: &cfg.initial_points,
+            points: &mut cfg.points,
+            facts: &mut cfg.facts,
+            allocations: &cfg.allocations,
+        }
+    }
+}
+
 fn transfer_reference_facts(
-    cfg: &mut ScalarReferenceCfg,
+    cfg: ReferenceTransferCfg<'_>,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
     contracts: &HashMap<CfgPointId, &[ReferenceOrigin]>,
     mut aggregate: Option<(
@@ -4314,7 +4332,7 @@ fn transfer_reference_facts(
     )>,
     mut descriptor: Option<&mut ScalarDescriptorReplay<'_>>,
 ) -> Vec<ReferenceAnalysisError> {
-    let original_points = cfg.points.clone();
+    let original_points = cfg.initial_points;
     let grouped_installs = original_points
         .iter()
         .filter_map(|point| match &point.kind {
@@ -4415,20 +4433,27 @@ fn transfer_reference_facts(
                 single_observation[id.0] = states.len() == 1;
             }
         }
+        let mut ran_point = false;
         for mut state in states {
-            if let Some((visited, _, _)) = &mut fallback {
+            let reset_point = if let Some((visited, _, _)) = &mut fallback {
                 if visited[id.0].contains(&state) {
                     continue;
                 }
+                let already_visited = !visited[id.0].is_empty();
                 visited[id.0].push(state.clone());
-            }
+                already_visited
+            } else {
+                std::mem::replace(&mut ran_point, true)
+            };
             if let (Some((facts, sites, result)), Some(flow)) =
                 (&mut aggregate, &mut state.aggregate)
             {
                 facts.visit(&original_points[id.0], flow, result, sites, aggregate_deadlines.as_deref());
             }
             let mut move_alternatives = Vec::new();
-            cfg.points[id.0] = original_points[id.0].clone();
+            if reset_point {
+                cfg.points[id.0] = original_points[id.0].clone();
+            }
             let invalidation_address = match &cfg.points[id.0].kind {
                 CfgPointKind::Invalidate {
                     address_point,
@@ -4730,7 +4755,7 @@ fn transfer_reference_facts(
             if let Some(candidates) = affected {
                 for candidate in candidates {
                     let origins = conflicting_live_loan(
-                        &original_points,
+                        original_points,
                         &cfg.facts,
                         &state,
                         id,
@@ -4918,7 +4943,7 @@ fn transfer_reference_facts(
                     let place = available_place(place);
                     let mut origins = unavailable_origins(&state, &place);
                     origins.extend(conflicting_live_loan(
-                        &original_points,
+                        original_points,
                         &cfg.facts,
                         &state,
                         id,
@@ -4945,7 +4970,7 @@ fn transfer_reference_facts(
                         let place = available_place(&candidate.place);
                         let mut origins = unavailable_origins(&state, &place);
                         origins.extend(conflicting_live_loan(
-                            &original_points,
+                            original_points,
                             &cfg.facts,
                             &state,
                             id,
@@ -4978,7 +5003,7 @@ fn transfer_reference_facts(
                     let target = available_place(target);
                     if !target.projections.is_empty() {
                         let origins = conflicting_live_loan(
-                            &original_points,
+                            original_points,
                             &cfg.facts,
                             &state,
                             id,
@@ -5001,7 +5026,7 @@ fn transfer_reference_facts(
                     for candidate in candidates {
                         let target = available_place(&candidate.place);
                         let origins = conflicting_live_loan(
-                            &original_points,
+                            original_points,
                             &cfg.facts,
                             &state,
                             id,
@@ -8551,7 +8576,6 @@ struct ReferenceContractReplay {
 
 fn collect_function_output_contracts<'a>(
     source: &'a SourceIdentity,
-    function: &ScalarFunction,
     result: &mut FunctionReferenceResult,
     declaration_span: ByteSpan,
     body: ReferenceCallableBody,
@@ -8562,14 +8586,8 @@ fn collect_function_output_contracts<'a>(
     let mut checked_successor_result = result.aggregate.checked_successor_contract;
     let mut raw_read_forward_result = result.aggregate.raw_read_forward_contract;
     let start = contracts.len();
-    for point in &result.cfg.points {
-        let CfgPointKind::ReturnOutput { output, value_point, .. } = point.kind else {
-            continue;
-        };
-        if !matches!(&function.signature, ScalarType::Callable { outputs, .. } if matches!(outputs.outputs[output].ty, ScalarType::CheckedReference { .. }))
-        {
-            continue;
-        }
+    for &CheckedContractReturn { point, output, value_point } in &result.checked_contract_returns {
+        let point = &result.cfg.points[point.0];
         if checked_successor_result || raw_read_forward_result {
             let exact_forward = !saw_checked && output == 0
                 && point.possible_origins.as_ref().is_some_and(|origins| !origins.is_empty()
@@ -8606,11 +8624,10 @@ fn collect_function_output_contracts<'a>(
     if result.aggregate.independent_checked_result && contracts.len() == start + 1 {
         contracts[start].independent_static = true;
     }
-    for (index, arm) in function.overload_arms.iter().enumerate() {
+    for (index, arm) in result.arms.iter_mut().enumerate() {
         collect_function_output_contracts(
             source,
             arm,
-            &mut result.arms[index],
             declaration_span,
             ReferenceCallableBody::Overload(index),
             contracts,
@@ -8692,7 +8709,7 @@ fn transfer_function_output_contracts<'a>(
                     invalid: false, exited: false })
         });
         let transferred = transfer_reference_facts(
-            &mut result.cfg,
+            (&mut result.cfg).into(),
             &BTreeMap::new(),
             inputs,
             None,
@@ -8767,7 +8784,6 @@ fn resolve_reference_output_contracts(
                 };
                 collect_function_output_contracts(
                     module.source,
-                    function,
                     result,
                     function.name_span,
                     ReferenceCallableBody::Declaration,
@@ -8978,9 +8994,21 @@ fn derive_function_specialized_copy_policies(
             }
         }
         if !deferred.is_empty() {
-            let mut concrete_cfg = template_result.cfg.clone();
-            concrete_cfg.points = concrete_cfg.initial_points.clone();
-            let transferred = transfer_reference_facts(&mut concrete_cfg, &deferred, &HashMap::new(), None, None);
+            let template_cfg = &template_result.cfg;
+            let mut points = template_cfg.initial_points.clone();
+            let mut facts = template_cfg.facts.clone();
+            let transferred = transfer_reference_facts(
+                ReferenceTransferCfg {
+                    initial_points: &template_cfg.initial_points,
+                    points: &mut points,
+                    facts: &mut facts,
+                    allocations: &template_cfg.allocations,
+                },
+                &deferred,
+                &HashMap::new(),
+                None,
+                None,
+            );
             errors.extend(transferred.into_iter().map(|error| {
                 ReferenceAnalysisError::MissingContext {
                     source_span: point.source_span.clone(),
@@ -8992,8 +9020,36 @@ fn derive_function_specialized_copy_policies(
     (FunctionPolicyResult { policies, arms }, errors)
 }
 
+struct CheckedContractReturn {
+    point: CfgPointId,
+    output: usize,
+    value_point: CfgPointId,
+}
+
+impl CheckedContractReturn {
+    fn collect(signature: &ScalarType, points: &[ReferenceFlowPoint]) -> Vec<Self> {
+        let ScalarType::Callable { outputs, .. } = signature else {
+            return Vec::new();
+        };
+        if !outputs.outputs.iter().any(|output| matches!(output.ty, ScalarType::CheckedReference { .. })) {
+            return Vec::new();
+        }
+        points.iter().filter_map(|point| {
+            let CfgPointKind::ReturnOutput { output, value_point, .. } = point.kind else {
+                return None;
+            };
+            matches!(outputs.outputs[output].ty, ScalarType::CheckedReference { .. }).then_some(Self {
+                point: point.id,
+                output,
+                value_point,
+            })
+        }).collect()
+    }
+}
+
 struct FunctionReferenceResult {
     cfg: ScalarReferenceCfg,
+    checked_contract_returns: Vec<CheckedContractReturn>,
     proof_points: CallablePointFacts,
     aggregate: aggregate::AggregateFlowResult,
     arms: Vec<FunctionReferenceResult>,
@@ -9074,6 +9130,7 @@ fn derive_function_reference_result(
         build_function_reference_cfg(builder, function, errors.len() == entry_errors);
     errors.extend(current_errors);
     FunctionReferenceResult {
+        checked_contract_returns: CheckedContractReturn::collect(&function.signature, &cfg.initial_points),
         cfg,
         arms,
         proof_points,
@@ -9259,7 +9316,7 @@ fn build_function_reference_cfg(
             call_sites,
             &mut aggregate,
         ));
-        let provisional = transfer_reference_facts(&mut builder.cfg, &BTreeMap::new(), &HashMap::new(), flow, None);
+        let provisional = transfer_reference_facts((&mut builder.cfg).into(), &BTreeMap::new(), &HashMap::new(), flow, None);
         if provisional.is_empty() {
             for &(end, _) in &builder.aggregate_facts.checked_producer_arms {
                 aggregate.checked_producer_backing.entry(end).or_insert(aggregate::CheckedProducerBacking::Unknown);
