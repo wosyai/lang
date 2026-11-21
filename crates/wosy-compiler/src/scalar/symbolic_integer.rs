@@ -53,6 +53,13 @@ impl IntegerSet {
         Self(vec![Interval { first: value.clone(), last: value.clone() }])
     }
 
+    pub(super) fn singleton_value(&self) -> Option<&BigInt> {
+        match self.0.as_slice() {
+            [interval] if interval.first == interval.last => Some(&interval.first),
+            _ => None,
+        }
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

@@ -5,7 +5,7 @@ use num_bigint::BigInt;
 use super::{
     checker_directive::CheckerOperation,
     control::{AssignmentReplacement, BindingInitialization, BindingRegion, BlockItemKind, BlockPosition, ConditionalRegion},
-    reference::{BlockOrdinal, CheckerIntegerCallArgument, DirectDestinationIdentity, FunctionCallSites, OccurrenceOrdinal, PlainNameIdentity},
+    reference::{BlockOrdinal, CheckerIntegerCallArgument, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, PlainNameIdentity},
     symbolic_integer::{IntegerRelation, IntegerSet},
     typecheck::is_integer_type,
     BinaryOperator, ReferenceBindingId, ScalarExpression, ScalarType,
@@ -110,6 +110,12 @@ impl<'a> IntegerRoots<'a> {
 pub(super) struct IntegerInputs(Vec<IntegerRow>);
 
 impl IntegerInputs {
+    fn singleton_at(&self, axis: usize) -> Option<&BigInt> {
+        let (first, rest) = self.0.split_first()?;
+        let value = first[axis].singleton_value()?;
+        rest.iter().all(|row| row[axis].singleton_value() == Some(value)).then_some(value)
+    }
+
     fn split(
         self,
         roots: &IntegerRoots<'_>,
@@ -360,7 +366,31 @@ pub(super) fn check_integer_requirements(
         .map(|result| result.map(drop))
 }
 
-type ActualCallHandler<'a, 'handler> = dyn FnMut(&'a FunctionCallSites, OccurrenceOrdinal) -> bool + 'handler;
+pub(super) type ExactIntegerArgument<'a> = (&'a ScalarType, &'a BigInt);
+
+pub(super) fn exact_integer_call_argument<'a>(
+    structure: &'a OccurrenceStructure,
+    call: OccurrenceOrdinal,
+    lexical: impl FnOnce(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
+) -> Option<ExactIntegerArgument<'a>> {
+    let OccurrenceNode::Expression(argument) = structure.edges.get(&(
+        OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(0),
+    ))? else {
+        return None;
+    };
+    let ty = structure.checked_types.expressions.get(argument)?;
+    if !is_integer_type(ty) {
+        return None;
+    }
+    let value = match structure.checker_integer_literals.get(argument) {
+        Some(value) => value,
+        None => lexical(*argument, ty)?,
+    };
+    Some((ty, value))
+}
+
+type ActualCallHandler<'a, 'handler> =
+    dyn FnMut(&'a FunctionCallSites, OccurrenceOrdinal, Option<ExactIntegerArgument<'_>>) -> bool + 'handler;
 
 pub(super) fn check_integer_requirements_at_entry<'a>(
     calls: &'a FunctionCallSites,
@@ -565,7 +595,18 @@ fn walk_integer_block<'a>(
                         CheckerOperation::Require | CheckerOperation::Narrow => path = passing,
                     }
                 } else if structure.checker_direct_targets.contains_key(&expression) {
-                    if !handle_call.as_mut()?(calls, expression) {
+                    let handle = handle_call.as_mut()?;
+                    let argument = exact_integer_call_argument(structure, expression, |ordinal, ty| {
+                        let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(ordinal)? else {
+                            return None;
+                        };
+                        let (axis, binding_type) = roots.lookup(binding)?;
+                        if binding_type != ty {
+                            return None;
+                        }
+                        path.singleton_at(axis)
+                    });
+                    if !handle(calls, expression, argument) {
                         return None;
                     }
                 } else {
@@ -737,4 +778,19 @@ fn integer_local<'a>(
     };
     let value = calls.structure.checker_integer_literals.get(&outputs.primary)?;
     Some((identity, &receiver.ty, value))
+}
+
+
+#[test]
+fn actual_call_projection_accepts_only_the_same_singleton_in_every_row() {
+    let one = BigInt::from(1);
+    let two = BigInt::from(2);
+    let coordinate = |value| Rc::new(IntegerSet::singleton(value));
+    let same = IntegerInputs(vec![vec![coordinate(&one)], vec![coordinate(&one)]]);
+    assert_eq!(same.singleton_at(0), Some(&one));
+    let distinct = IntegerInputs(vec![vec![coordinate(&one)], vec![coordinate(&two)]]);
+    assert_eq!(distinct.singleton_at(0), None);
+    let broad = IntegerInputs(vec![vec![Rc::new(IntegerSet::from_type(&ScalarType::U8).unwrap())]]);
+    assert_eq!(broad.singleton_at(0), None);
+    assert_eq!(IntegerInputs::default().singleton_at(0), None);
 }

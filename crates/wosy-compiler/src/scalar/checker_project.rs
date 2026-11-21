@@ -6,7 +6,8 @@ use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation},
     checker_flow::{
         check_integer_requirements, check_integer_requirements_at_entry, check_integer_return_bound, check_integer_return_bound_where,
-        check_integer_return_bound_with_shows, proves_requirement_with_imported_root_local,
+        check_integer_return_bound_with_shows, exact_integer_call_argument, proves_requirement_with_imported_root_local,
+        ExactIntegerArgument,
         CheckerPredicate, ImportedLocal, IntegerBranchProof,
         IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
@@ -211,7 +212,8 @@ fn walk_package_initialization(
             return Err(ProjectCheck::Unsupported);
         };
         let signature = topology.checked_call_signatures.get(call).ok_or(ProjectCheck::MissingRootOccurrences)?;
-        actual.run(structure, *call, signature, &declaration.source, declaration.range)?;
+        let argument = exact_integer_call_argument(structure, *call, |_, _| None);
+        actual.run(structure, *call, signature, argument, &declaration.source, declaration.range)?;
     }
     visits[ordinal] = InitializationVisit::Completed;
     Ok(())
@@ -224,8 +226,15 @@ struct ActualCalls<'a> {
     reached: HashSet<(usize, usize)>,
 }
 
+const MAX_ACTUAL_CALL_DEPTH: usize = 64;
+
 impl ActualCalls<'_> {
-    fn nested(&mut self, caller: &FunctionCallSites, call: OccurrenceOrdinal) -> Result<(), ProjectCheck> {
+    fn nested(
+        &mut self,
+        caller: &FunctionCallSites,
+        call: OccurrenceOrdinal,
+        argument: Option<ExactIntegerArgument<'_>>,
+    ) -> Result<(), ProjectCheck> {
         let site = caller.resolved_call_site(call).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let ResolvedCallTarget::ModuleCallable {
             source,
@@ -235,7 +244,7 @@ impl ActualCalls<'_> {
             return Err(ProjectCheck::Unsupported);
         };
         let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::MissingRootOccurrences)?;
-        self.run(&caller.structure, call, signature, source, *declaration_span)
+        self.run(&caller.structure, call, signature, argument, source, *declaration_span)
     }
 
     fn run(
@@ -243,6 +252,7 @@ impl ActualCalls<'_> {
         structure: &OccurrenceStructure,
         call: OccurrenceOrdinal,
         signature: &CheckedCallSignature,
+        projected: Option<ExactIntegerArgument<'_>>,
         target_source: &SourceIdentity,
         target_span: ByteSpan,
     ) -> Result<(), ProjectCheck> {
@@ -260,29 +270,24 @@ impl ActualCalls<'_> {
         }
         let body = self.calls.function_body(target_module, target_item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let argument;
-        let exact: &[&BigInt] = match (signature.parameters.as_slice(), body.boundary.parameters.as_slice()) {
-            ([], []) => &[],
-            ([parameter], [slot]) if *parameter == slot.ty && is_integer_type(parameter) => {
-                let Some(OccurrenceNode::Expression(input)) = structure.edges.get(&(
-                    OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(0),
-                )) else {
-                    return Err(ProjectCheck::Unsupported);
-                };
-                if structure.checked_types.expressions.get(input) != Some(parameter) {
-                    return Err(ProjectCheck::Unsupported);
-                }
-                argument = [structure.checker_integer_literals.get(input).ok_or(ProjectCheck::Unsupported)?];
+        let exact: &[&BigInt] = match (signature.parameters.as_slice(), body.boundary.parameters.as_slice(), projected) {
+            ([], [], None) => &[],
+            ([parameter], [slot], Some((ty, value))) if *parameter == slot.ty && parameter == ty => {
+                argument = [value];
                 &argument
             }
             _ => return Err(ProjectCheck::Unsupported),
         };
         let target = (target_module, target_item);
+        if self.active.len() == MAX_ACTUAL_CALL_DEPTH {
+            return Err(ProjectCheck::Unsupported);
+        }
         if !self.active.insert(target) {
             return Err(ProjectCheck::Unsupported);
         }
         let mut nested_error = None;
-        let checked = check_integer_requirements_at_entry(body, exact, &mut |caller, occurrence| {
-            match self.nested(caller, occurrence) {
+        let checked = check_integer_requirements_at_entry(body, exact, &mut |caller, occurrence, argument| {
+            match self.nested(caller, occurrence, argument) {
                 Ok(()) => true,
                 Err(error) => {
                     nested_error = Some(error);
@@ -1562,7 +1567,7 @@ mod tests {
                 local = namespace demo "src/local.w";
                 dep = namespace dependency "src/lib.w";
                 unit(u8) actual = fn(value) {{
-                    if (value == 0) {{ local.unreachable_to_caller(value); }};
+                    if (value == 0) {{ local.unreachable_to_caller(value + 1); }};
                     core.require(value <= 10, {OUTPUT});
                 }};
                 actual({argument});
@@ -1653,6 +1658,47 @@ mod tests {
         let text = "%%start\nunit() cycle = fn { cycle(); };\ncycle();\n%%end";
         let prepared = prepare_proof_target(&file, text).unwrap();
         assert_eq!(check_package_roots(&prepared), Err(ProjectCheck::Unsupported));
+    }
+
+    #[test]
+    fn actual_nested_calls_use_exact_lexical_values_at_the_call_site() {
+        let file = source("src/main.w", "actual-lexical");
+        let text = |replacement: u8| format!(r#"%%start
+            unit(u8) gate = fn(value) {{ if (value == 0) {{}}; core.require(value <= 10, {OUTPUT}); }};
+            unit(u8) enter = fn(input) {{
+                gate(input);
+                u8 local = 7;
+                gate(local);
+                input = {replacement};
+                gate(input);
+            }};
+            enter(9);
+        %%end"#);
+        let prepared = prepare_proof_target(&file, &text(10)).unwrap();
+        assert_eq!(check_package_roots(&prepared), Ok(()));
+        let failed = prepare_proof_target(&source("src/main.w", "actual-lexical-overwrite"), &text(11)).unwrap();
+        let Err(ProjectCheck::Failed { state, .. }) = check_package_roots(&failed) else {
+            panic!("expected overwritten singleton at actual nested call");
+        };
+        assert!(state.includes(&[11]));
+        assert!(!state.includes(&[9]));
+    }
+
+    #[test]
+    fn actual_nested_acyclic_depth_is_bounded_privately() {
+        fn chain(count: usize) -> String {
+            let mut text = "%%start\nunit() f0 = fn {};\n".to_owned();
+            for index in 1..count {
+                text.push_str(&format!("unit() f{index} = fn {{ f{}(); }};\n", index - 1));
+            }
+            text.push_str(&format!("f{}();\n%%end", count - 1));
+            text
+        }
+        for (depth, expected) in [(MAX_ACTUAL_CALL_DEPTH, Ok(())), (MAX_ACTUAL_CALL_DEPTH + 1, Err(ProjectCheck::Unsupported))] {
+            let source = source("src/main.w", &format!("depth-{depth}"));
+            let prepared = prepare_proof_target(&source, &chain(depth)).unwrap();
+            assert_eq!(check_package_roots(&prepared), expected);
+        }
     }
 
     #[test]
