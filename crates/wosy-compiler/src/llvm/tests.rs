@@ -4152,6 +4152,26 @@ fn serializes_imports_in_metadata_order_without_changing_body_lines() {
 }
 
 #[test]
+fn serializes_without_externs_preserving_line_endings_and_separator() {
+    let cases = [
+        ("", ""),
+        ("first\nsecond", "first\nsecond"),
+        ("\r\nfirst\r\nlast\r", "\nfirst\nlast\r"),
+        ("source_filename = \"m\"\n\n\nbody\n", "source_filename = \"m\"\n\nbody\n"),
+        ("source_filename = \"m\"\r\n\r\n\r\n", "source_filename = \"m\"\n\n"),
+    ];
+    for (raw, expected) in cases {
+        let partition = LlvmPartition {
+            module_name: "test".into(),
+            declarations: Vec::new(),
+            functions: Vec::new(),
+            text: raw.into(),
+        };
+        assert_eq!(partition.to_text(), expected);
+    }
+}
+
+#[test]
 fn preserves_callable_return_metadata_for_every_output_form() {
     let context = Context::create();
     let sequence = |types: Vec<ScalarType>| ScalarOutputSequence {
