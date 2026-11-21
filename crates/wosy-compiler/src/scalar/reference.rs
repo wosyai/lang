@@ -3863,6 +3863,19 @@ fn unavailable_checked_handles(
         .collect()
 }
 
+fn reinitialize_checked_handles(state: &mut ReferenceEdgeState, target: &ReferencePlaceId) {
+    if target.projections.is_empty() {
+        state.moved_checked_handles.remove(&target.binding);
+    } else if let Some(moved) = state.moved_checked_handles.get_mut(&target.binding) {
+        if is_lexical_field_path(&target.projections) {
+            moved.retain(|(path, _)| !path.starts_with(&target.projections));
+            if moved.is_empty() {
+                state.moved_checked_handles.remove(&target.binding);
+            }
+        }
+    }
+}
+
 fn reference_read_reachable(
     points: &[ReferenceFlowPoint],
     from: CfgPointId,
@@ -5160,6 +5173,16 @@ fn transfer_reference_facts(
                     });
                 }
                 CfgPointKind::AssignThrough { candidates, .. } => {
+                    if !state.moved_checked_handles.is_empty() {
+                        if let Some((first, alternatives)) = candidates.split_first() {
+                            let target = available_place(&first.place);
+                            if alternatives.iter().all(|candidate| {
+                                reference_places_same(&target, &available_place(&candidate.place))
+                            }) {
+                                reinitialize_checked_handles(&mut state, &target);
+                            }
+                        }
+                    }
                     for candidate in candidates {
                         let target = available_place(&candidate.place);
                         let origins = conflicting_live_loan(
@@ -5312,8 +5335,8 @@ fn transfer_reference_facts(
                     ..
                 } => {
                     let binding = &target.binding;
+                    reinitialize_checked_handles(&mut state, target);
                     if target.projections.is_empty() {
-                        state.moved_checked_handles.remove(binding);
                         state.bindings.remove(binding);
                         state
                             .projected
@@ -5322,14 +5345,6 @@ fn transfer_reference_facts(
                         state.released.remove(binding);
                         state.invalidated.remove(binding);
                     } else {
-                        if let Some(moved) = state.moved_checked_handles.get_mut(binding) {
-                            if is_lexical_field_path(&target.projections) {
-                                moved.retain(|(path, _)| !path.starts_with(&target.projections));
-                                if moved.is_empty() {
-                                    state.moved_checked_handles.remove(binding);
-                                }
-                            }
-                        }
                         for origins in state.bindings.values_mut() {
                             origins.retain(|origin| !previous_origins.contains(origin));
                         }

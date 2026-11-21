@@ -1836,6 +1836,59 @@ unit(u8, u8) check_field = fn(value, replacement) {
 }
 
 #[test]
+fn definite_checked_alias_write_reinitializes_a_moved_handle_field() {
+    let text = "%%start
+struct Bag { *!u8 handle; u8 other; }
+unit(u8, u8) check_field = fn(value, replacement) {
+    Bag parcel = { .handle = null; .other = 1; };
+    parcel.handle = &!value;
+    *!u8 taken = parcel.handle;
+    *taken = 3;
+    *!Bag writer = &!parcel;
+    (*writer).handle = &!replacement;
+    *!u8 renewed = parcel.handle;
+    *renewed = 4;
+};
+%%end";
+    let (single, project) = both_reference_functions(text);
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+}
+
+#[test]
+fn conditional_checked_alias_write_does_not_reinitialize_an_unwritten_handle_field() {
+    let text = "%%start
+struct Bag { *!u8 handle; u8 other; }
+unit(u8, u8, bool) check_field = fn(value, replacement, choose) {
+    Bag parcel = { .handle = null; .other = 1; };
+    Bag other = { .handle = null; .other = 2; };
+    parcel.handle = &!value;
+    *!u8 taken = parcel.handle;
+    *taken = 3;
+    *!Bag writer = null;
+    if (choose) { writer = &!parcel; } else { writer = &!other; };
+    (*writer).handle = &!replacement;
+    parcel.handle;
+};
+%%end";
+    let moved = text.find("taken = parcel.handle").unwrap() + "taken = ".len();
+    let read = text.rfind("parcel.handle").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one unavailable-place diagnostic: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(diagnostic.message, "read or move of unavailable place");
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(read, read + 13));
+        assert_eq!(
+            diagnostic.labels[1].span.range,
+            ByteSpan::new(moved as u32, moved as u32 + 13),
+        );
+    }
+}
+
+#[test]
 fn incompatible_fresh_checked_borrows_report_the_earlier_live_loan() {
     for (first, second, still_live) in [
         ("*!u8 first = &!value;", "*!u8 second = &!value;", "first"),
