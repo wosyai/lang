@@ -355,7 +355,7 @@ impl IntegerReturningPath<'_> {
         binding_satisfies(&self.state, &self.axes, binding, relation, bound)
     }
 
-    fn output_satisfies(&self, relation: IntegerRelation, bound: &BigInt) -> Option<bool> {
+    pub(super) fn output_satisfies(&self, relation: IntegerRelation, bound: &BigInt) -> Option<bool> {
         match self.value {
             IntegerReturn::Alias(binding) => self.binding_satisfies(binding, relation, bound),
             IntegerReturn::Const(value) => Some(relation.accepts(value.cmp(bound))),
@@ -491,12 +491,35 @@ pub(super) fn observe_integer_returns(
     }
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) fn observe_arbitrary_integer_returns<'a>(
+    calls: &'a FunctionCallSites,
+    entry_filter: Option<&[CheckerPredicate]>,
+) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
+    observe_integer_returns_in_scope(calls, entry_filter, None)
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+thread_local! {
+    static INTEGER_OBSERVATIONS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+pub(super) fn take_integer_observations() -> (usize, usize) {
+    INTEGER_OBSERVATIONS.with(|observations| observations.replace((0, 0)))
+}
+
 fn observe_integer_returns_in_scope<'a>(
     calls: &'a FunctionCallSites,
     entry_filter: Option<&[CheckerPredicate]>,
     exact_arguments: Option<&[&BigInt]>,
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
     let tail = integer_tail_type(calls)?;
+    #[cfg(all(test, feature = "internal-checker"))]
+    INTEGER_OBSERVATIONS.with(|observations| {
+        let (arbitrary, actual) = observations.get();
+        observations.set(if exact_arguments.is_some() { (arbitrary, actual + 1) } else { (arbitrary + 1, actual) });
+    });
     let mut paths = Vec::new();
     match run_integer_callable(calls, Some(tail), entry_filter, Some(&mut paths), #[cfg(test)] None, exact_arguments, None)? {
         Ok(ProofCoverage::Applicable(_)) if !paths.is_empty() => {
@@ -533,6 +556,7 @@ pub(super) fn exact_integer_return_at_entry(
     rest.iter().all(|path| singleton(path) == Some(value)).then(|| value.clone())
 }
 
+#[cfg(test)]
 pub(super) fn check_integer_return_bound<'a>(
     calls: &'a FunctionCallSites,
     operator: &BinaryOperator,
@@ -545,6 +569,7 @@ pub(super) fn check_integer_return_bound<'a>(
     }
 }
 
+#[cfg(test)]
 pub(super) fn check_integer_return_bound_where<'a>(
     calls: &'a FunctionCallSites,
     operator: &BinaryOperator,

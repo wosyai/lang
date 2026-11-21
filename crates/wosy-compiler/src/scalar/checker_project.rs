@@ -1,11 +1,13 @@
 use std::{borrow::Cow, collections::{HashMap, HashSet}};
 
 use num_bigint::BigInt;
+#[cfg(feature = "internal-checker")]
+use std::hash::{Hash, Hasher};
 
 use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
-        check_integer_requirement_activity, check_integer_requirements_at_entry, check_integer_return_bound, check_integer_return_bound_where, check_integer_return_bound_with_shows, concrete_integer_literal, exact_integer_call_argument,
+        check_integer_requirement_activity, check_integer_requirements_at_entry, check_integer_return_bound_with_shows, concrete_integer_literal, exact_integer_call_argument,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument,
         IntegerBranchProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
@@ -22,10 +24,12 @@ use super::{
 #[cfg(test)]
 use super::{
     checker_flow::{
-        check_integer_requirements, proves_requirement_with_imported_root_local, ImportedLocal,
+        check_integer_requirements, check_integer_return_bound, check_integer_return_bound_where, proves_requirement_with_imported_root_local, ImportedLocal,
     },
     symbolic_integer::IntegerSet,
 };
+#[cfg(feature = "internal-checker")]
+use super::checker_flow::observe_arbitrary_integer_returns;
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
 use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
@@ -1139,6 +1143,28 @@ fn module_proof_outcome(result: Result<ProjectCheck, ProjectCheck>) -> ScalarMod
 }
 
 #[cfg(feature = "internal-checker")]
+#[derive(PartialEq, Eq)]
+struct ExactGuardGroup<'a>(Option<&'a [CheckerPredicate]>);
+
+#[cfg(feature = "internal-checker")]
+impl Hash for ExactGuardGroup<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.map(<[_]>::len).hash(state);
+        for predicate in self.0.unwrap_or_default() {
+            std::mem::discriminant(predicate).hash(state);
+            match predicate {
+                CheckerPredicate::Boolean(value) => value.hash(state),
+                CheckerPredicate::Integer(predicate) => {
+                    predicate.binding.hash(state);
+                    std::mem::discriminant(&predicate.operator).hash(state);
+                    predicate.bound.hash(state);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 struct PlannedModuleProof<'a> {
     target: (usize, usize),
     typed: TypedProofPostcondition<'a>,
@@ -1206,16 +1232,49 @@ impl PreparedProofModule {
         if initialization.visits[proof_module] != InitializationVisit::Completed {
             return;
         }
+        let mut arbitrary_groups = HashMap::<_, Vec<_>>::new();
         for ((index, plan), observer) in plans.iter().zip(observers.proofs) {
             if initialization.visits[plan.target.0] != InitializationVisit::Completed {
                 continue;
             }
-            let result = if initialization.reached.contains(&plan.target) {
-                observer.outcome()
+            if initialization.reached.contains(&plan.target) {
+                outcomes[*index] = module_proof_outcome(observer.outcome());
+            } else if plan.steps.items.is_empty() {
+                let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
+                arbitrary_groups.entry(key).or_default().push((*index, plan));
             } else {
-                plan.verify_arbitrary()
-            };
-            outcomes[*index] = module_proof_outcome(result);
+                outcomes[*index] = module_proof_outcome(plan.verify_arbitrary_with_steps());
+            }
+        }
+        for ((_, guard), group) in arbitrary_groups {
+            let body = group[0].1.typed.body;
+            if !valid_arbitrary_proof_body(body) {
+                continue;
+            }
+            match observe_arbitrary_integer_returns(body, guard.0) {
+                Some(Ok(ProofCoverage::Applicable(paths))) => {
+                    for (index, plan) in group {
+                        let mut holds = Some(true);
+                        for path in &paths {
+                            holds = path.output_satisfies(plan.relation, &plan.typed.bound);
+                            if holds != Some(true) {
+                                break;
+                            }
+                        }
+                        outcomes[index] = match holds {
+                            Some(true) => ScalarModuleProofOutcome::Proved,
+                            Some(false) => ScalarModuleProofOutcome::Refuted,
+                            None => ScalarModuleProofOutcome::Unsupported,
+                        };
+                    }
+                }
+                Some(Ok(ProofCoverage::NoApplicableInputs)) if guard.0.is_some() => {
+                    for (index, _) in group {
+                        outcomes[index] = ScalarModuleProofOutcome::NoApplicableInputs;
+                    }
+                }
+                _ => (),
+            }
         }
     }
 }
@@ -1235,21 +1294,13 @@ impl PlannedModuleProof<'_> {
         }
     }
 
-    fn verify_arbitrary(&self) -> Result<ProjectCheck, ProjectCheck> {
+    fn verify_arbitrary_with_steps(&self) -> Result<ProjectCheck, ProjectCheck> {
         let TypedProofPostcondition { target, body, result_type, input_names, output, operator, bound } = &self.typed;
-        if !body.structure.checker_directives.is_empty() || !body.call_occurrences.is_empty()
-            || !body.allocation_length_calls.is_empty() || !body.assignments.is_empty()
-        {
+        if !valid_arbitrary_proof_body(body) {
             return Err(ProjectCheck::Unsupported);
         }
-        let checked = if !self.steps.items.is_empty() {
-            let proof = proof_show_branch::<false>(&self.steps, input_names, output, result_type, body)?;
-            check_integer_return_bound_with_shows(body, operator, bound, self.filter.as_deref(), &proof)
-        } else if let Some(filter) = self.filter.as_deref() {
-            check_integer_return_bound_where(body, operator, bound, filter)
-        } else {
-            check_integer_return_bound(body, operator, bound).map(|result| result.map(ProofCoverage::Applicable))
-        };
+        let proof = proof_show_branch::<false>(&self.steps, input_names, output, result_type, body)?;
+        let checked = check_integer_return_bound_with_shows(body, operator, bound, self.filter.as_deref(), &proof);
         match checked {
             Some(Ok(ProofCoverage::Applicable(true))) => Ok(ProjectCheck::Proved),
             Some(Ok(ProofCoverage::Applicable(false))) => Ok(ProjectCheck::Refuted),
@@ -1258,6 +1309,12 @@ impl PlannedModuleProof<'_> {
             None => Err(ProjectCheck::Unsupported),
         }
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn valid_arbitrary_proof_body(body: &FunctionCallSites) -> bool {
+    body.structure.checker_directives.is_empty() && body.call_occurrences.is_empty()
+        && body.allocation_length_calls.is_empty() && body.assignments.is_empty()
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1900,6 +1957,39 @@ mod tests {
     use crate::{derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project, ScalarTargetLayout};
 
     const OUTPUT: &str = r#"{ .stdout = ""; .stderr = "unexpected state"; .code = 1; .files = []; }"#;
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn named_proof_batch_observes_each_exact_typed_arbitrary_entry_domain_once() {
+        use super::super::checker_flow::take_integer_observations;
+        let file = source("src/main.w", "shared-symbolic-batch");
+        let text = r#"%%start
+            u8(u8) dormant = fn(value) { value };
+            u8(u8) live = fn(value) { value };
+            u8 actual = live(7);
+            proof cap for dormant(x) -> (out) where (x <= 10) ensures (out <= 10) {}
+            proof too_low for dormant(y) -> (out) where (y <= 10) ensures (out < 10) {}
+            proof tighter for dormant(z) -> (out) where (z <= 5) ensures (out <= 5) {}
+            proof real for live(x) -> (out) ensures (out <= 7) {}
+            proof real_fails for live(x) -> (out) ensures (out < 7) {}
+        %%end"#;
+        let _ = take_integer_observations();
+        let outcomes = check_scalar_module_proofs(
+            file.clone(),
+            &["cap", "real", "tighter", "too_low", "real_fails"],
+            vec![ScalarProofModuleInput { source: file.clone(), text: text.into(), namespaces: Vec::new() }],
+            vec![file],
+            inputs(),
+        ).unwrap();
+        assert_eq!(take_integer_observations(), (2, 1));
+        assert_eq!(outcomes, [
+            ScalarModuleProofOutcome::Proved,
+            ScalarModuleProofOutcome::Proved,
+            ScalarModuleProofOutcome::Proved,
+            ScalarModuleProofOutcome::Refuted,
+            ScalarModuleProofOutcome::Refuted,
+        ]);
+    }
 
     fn source(path: &str, revision: &str) -> SourceIdentity {
         SourceIdentity::new("local".into(), "demo".into(), path.into(), revision.into())
