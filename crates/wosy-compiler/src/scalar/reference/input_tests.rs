@@ -358,3 +358,149 @@ fn child_errors_keep_source_order_partial_cfgs_and_suppress_parent_initial_trans
         assert_eq!(installed, expected);
     }
 }
+
+#[test]
+fn projected_reborrow_authority_requires_a_canonical_live_parent_on_each_edge() {
+    let text = r#"%%start
+struct copy Pair { u8 left; u8 right; }
+unit(Pair) inspect = fn(owner) {
+    *!Pair parent = &!owner;
+    *!Pair child = &!(*parent);
+    child;
+};
+%%end"#;
+    let parsed = parse_source(source(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let validated = crate::derive_scalar_program(&parsed.result);
+    assert!(validated.diagnostics.is_empty(), "{:?}", validated.diagnostics);
+    let ScalarItem::Function(function) = &validated.program.items[0] else { panic!("typed callable") };
+    let cfg = &function.reference_cfg;
+    let (origin, parent) = cfg.facts.iter().enumerate().find_map(|(index, fact)| match fact {
+        ReferenceOrigin::Fresh { loan, .. } if loan.parent.is_none() => Some((ReferenceOriginId(index), loan)),
+        _ => None,
+    }).expect("ordinary canonical whole owner borrow");
+    let read = cfg.initial_points.iter().find(|point| {
+        matches!(point.kind, CfgPointKind::Read { .. })
+            && point.source_span.range.start == text.rfind("parent)").unwrap() as u32
+    }).expect("ordinary canonical parent read");
+    let CfgPointKind::Read { binding } = &read.kind else { unreachable!() };
+    let borrow = cfg.initial_points.iter().find(|point| matches!(&point.kind,
+        CfgPointKind::Borrow { loan, .. } if loan.parent.as_deref() == Some(parent)))
+        .expect("ordinary child borrow to use as a transfer topology");
+    let holder = cfg.initial_points.iter().find(|point| point.id > borrow.id
+        && matches!(point.kind, CfgPointKind::Bind { .. })).expect("ordinary child holder");
+    let child_id = *borrow.possible_origins.as_ref().and_then(|origins| origins.first())
+        .expect("ordinary child fact");
+    let owner = &parent.origin_place;
+    let span = read.source_span.range;
+    let field = ScalarFieldReference::Resolved(ScalarStructFieldId {
+        structure: validated.program.structs[0].id.clone(),
+        index: 0,
+    });
+    let mut child = parent.clone();
+    child.parent = Some(Box::new(parent.clone()));
+    child.origin_place.projections = vec![
+        ReferencePlaceProjection::Dereference(Box::new(parent.clone())),
+        ReferencePlaceProjection::Field(field.clone()),
+    ];
+    child.origin_place.place = ScalarPlace::Field {
+        base: Box::new(ScalarPlace::Dereference {
+            pointer: Box::new(ScalarExpression::Name { name: "parent".into(), span }),
+            span,
+        }),
+        field,
+        span,
+    };
+    let authority = super::super::control::NamedReborrowParent {
+        pointer: read.id,
+        borrow: borrow.id,
+        origin,
+    };
+    let origins = BTreeSet::from([origin]);
+    let mut present = ReferenceEdgeState::default();
+    present.bindings.insert(binding.clone(), origins.clone());
+    present.point_values = ReferencePointValues(vec![(read.id, origins)]);
+    let allowed = |state: &ReferenceEdgeState, child: &ReferenceLoanId| {
+        exact_projected_reborrow_parent_on_edge(state, &cfg.initial_points, &cfg.facts, &authority, child)
+    };
+    assert!(allowed(&present, &child));
+    let absent = ReferenceEdgeState { point_values: ReferencePointValues::default(), ..present.clone() };
+    let mut ambiguous = present.clone();
+    ambiguous.point_values.0[0].1.insert(ReferenceOriginId(cfg.facts.len()));
+    let mut replaced = present.clone();
+    replaced.bindings.insert(binding.clone(), BTreeSet::from([ReferenceOriginId(cfg.facts.len())]));
+    let mut released = present.clone();
+    released.released.insert(owner.binding.clone());
+    let mut mismatched = child.clone();
+    mismatched.origin_place.binding = binding.clone();
+    let mut unproven_field = child.clone();
+    unproven_field.origin_place.projections.pop();
+    assert!(!allowed(&absent, &child));
+    assert!(!allowed(&ambiguous, &child));
+    assert!(!allowed(&replaced, &child));
+    assert!(!allowed(&released, &child));
+    assert!(!allowed(&present, &mismatched));
+    assert!(!allowed(&present, &unproven_field));
+
+    let mut projected = cfg.clone();
+    projected.initial_points[borrow.id.0].kind = CfgPointKind::Borrow {
+        place: child.origin_place.clone(),
+        loan: child.clone(),
+    };
+    let ReferenceOrigin::Fresh { loan, .. } = &mut projected.facts[child_id.0] else {
+        panic!("actual whole reborrow fact");
+    };
+    *loan = child;
+    projected.points = projected.initial_points.clone();
+    for proven in [true, false] {
+        let mut cfg = projected.clone();
+        let mut proof = super::super::control::CallablePointFacts::default();
+        proof.checked_binding_initializers.push((holder.id, borrow.id));
+        if proven {
+            proof.named_reborrow_parents.push(super::super::control::NamedReborrowParent {
+                borrow: borrow.id,
+                pointer: read.id,
+                origin,
+            });
+        }
+        let errors = transfer_reference_facts(
+            ReferenceTransferCfg::new(&mut cfg, Some(&proof)),
+            &BTreeMap::new(), &HashMap::new(), None, None,
+        );
+        if proven {
+            assert!(errors.is_empty(), "{errors:?}");
+            for id in [borrow.id, holder.id] {
+                assert!(cfg.points[id.0].possible_origins.as_ref().is_some_and(|set| {
+                    set.len() == 1 && set.contains(&child_id)
+                }), "{:?}", cfg.points[id.0]);
+            }
+        } else {
+            assert!(errors.iter().any(|error| matches!(error,
+                ReferenceAnalysisError::MissingContext { source_span,
+                    reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin }
+                    if source_span == &borrow.source_span)), "{errors:?}");
+            for id in [borrow.id, holder.id] {
+                assert!(cfg.points[id.0].possible_origins.as_ref().is_none_or(BTreeSet::is_empty),
+                    "{:?}", cfg.points[id.0]);
+            }
+        }
+    }
+}
+
+#[test]
+fn projected_reborrow_authority_does_not_enable_new_source_syntax() {
+    let text = r#"%%start
+struct copy Pair { u8 left; u8 right; }
+u8(Pair) inspect = fn(owner) {
+    *!Pair parent = &!owner;
+    *!u8 child = &!(*parent).left;
+    *child
+};
+%%end"#;
+    let parsed = parse_source(source(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let validated = crate::derive_scalar_program(&parsed.result);
+    assert!(validated.diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+        && diagnostic.message == "checked address requires a storage name or direct storage field"),
+        "{:?}", validated.diagnostics);
+}

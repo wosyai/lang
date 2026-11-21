@@ -4818,6 +4818,48 @@ fn exact_live_reborrow_holder(
         && unavailable_checked_handles(state, binding, &[], CheckedHandleStorage::Lexical).is_empty()
 }
 
+
+fn direct_checked_field_base(place: &ScalarPlace) -> Option<(&ScalarExpression, &ScalarFieldReference)> {
+    let ScalarPlace::Field { base, field, .. } = place else { return None };
+    let ScalarPlace::Dereference { pointer, .. } = base.as_ref() else { return None };
+    Some((pointer, field))
+}
+
+fn exact_projected_reborrow_parent_on_edge(
+    state: &ReferenceEdgeState,
+    points: &[ReferenceFlowPoint],
+    facts: &[ReferenceOrigin],
+    authority: &super::control::NamedReborrowParent,
+    loan: &ReferenceLoanId,
+) -> bool {
+    let Some((ScalarExpression::Name { span, .. }, field @ ScalarFieldReference::Resolved(_))) =
+        direct_checked_field_base(&loan.origin_place.place)
+    else { return false };
+    let [ReferencePlaceProjection::Dereference(projected_parent), ReferencePlaceProjection::Field(projected_field)] =
+        loan.origin_place.projections.as_slice()
+    else { return false };
+    let Some(ReferenceOrigin::Fresh { loan: parent, .. }) = facts.get(authority.origin.0)
+    else { return false };
+    let Some(read) = points.get(authority.pointer.0) else { return false };
+    let CfgPointKind::Read { binding } = &read.kind else { return false };
+    let owner = &parent.origin_place;
+    if authority.pointer >= authority.borrow || &read.source_span.range != span
+        || parent.parent.is_some() || !owner.projections.is_empty()
+        || !matches!(owner.place, ScalarPlace::Name { .. })
+        || owner.binding == *binding || owner.binding != loan.origin_place.binding
+        || loan.parent.as_deref() != Some(parent) || projected_parent.as_ref() != parent
+        || field != projected_field
+        || (loan.mode == ScalarReferenceMutability::Mutable && parent.mode != ScalarReferenceMutability::Mutable)
+    {
+        return false;
+    }
+    state.point_values.get(authority.pointer)
+        .is_some_and(|origins| origins.len() == 1 && origins.contains(&authority.origin))
+        && exact_live_reborrow_holder(state, binding, authority.origin)
+        && !state.released.contains(&owner.binding) && !state.invalidated.contains(&owner.binding)
+        && !state.uninitialized.contains(&owner.binding) && !unavailable_place(state, owner)
+}
+
 fn transfer_reference_facts(
     cfg: ReferenceTransferCfg<'_>,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
@@ -5233,6 +5275,14 @@ fn transfer_reference_facts(
             point
         });
         let initial_point = effective_point.as_ref().unwrap_or(&original_points[id.0]);
+        let named_parent = || cfg.named_reborrow_parents
+            .binary_search_by_key(&id, |parent| parent.borrow)
+            .ok().map(|index| &cfg.named_reborrow_parents[index]);
+        let projected_loan = match &initial_point.kind {
+            CfgPointKind::Borrow { place, loan } if direct_checked_field_base(&place.place).is_some() => Some(loan),
+            _ => None,
+        };
+        let projected_authority = projected_loan.and_then(|_| named_parent());
         if effective_point.is_some() {
             cfg.points[id.0] = initial_point.clone();
         }
@@ -5248,10 +5298,17 @@ fn transfer_reference_facts(
             } else {
                 std::mem::replace(&mut ran_point, true)
             };
-            if let (Some((facts, sites, result)), Some(flow)) =
-                (&mut aggregate, &mut state.aggregate)
-            {
-                facts.visit(initial_point, flow, result, sites, aggregate_deadlines.as_deref());
+            let projected_rejected = projected_loan.is_some_and(|loan| {
+                !projected_authority.is_some_and(|authority| {
+                    exact_projected_reborrow_parent_on_edge(&state, original_points, cfg.facts, authority, loan)
+                })
+            });
+            if !projected_rejected {
+                if let (Some((facts, sites, result)), Some(flow)) =
+                    (&mut aggregate, &mut state.aggregate)
+                {
+                    facts.visit(initial_point, flow, result, sites, aggregate_deadlines.as_deref());
+                }
             }
             let mut move_alternatives = Vec::new();
             if reset_point {
@@ -6201,27 +6258,33 @@ fn transfer_reference_facts(
                 }
                 CfgPointKind::Evaluate(_)
                 | CfgPointKind::Borrow { .. }
-                | CfgPointKind::Call { .. } => {
+                | CfgPointKind::Call { .. } => 'value: {
                     if let CfgPointKind::Borrow { place, loan } = &point.kind {
-                        if state.released.contains(&place.binding) {
-                            errors.push(ReferenceAnalysisError::MissingContext {
-                                source_span: point.source_span.clone(),
-                                reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
-                            });
-                        }
-                        let check = if loan.parent.is_none() {
-                            is_lexical_field_path(&place.projections)
+                        let check = if projected_loan.is_some() {
+                            if projected_rejected {
+                                errors.push(ReferenceAnalysisError::MissingContext {
+                                    source_span: point.source_span.clone(),
+                                    reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                                });
+                                point.possible_origins = None;
+                                break 'value None;
+                            }
+                            true
                         } else {
-                            pending_here.is_some_and(|(_, site)| selected_parent.is_some_and(|(origin, _)|
-                                state.point_values.get(site.read).is_some_and(|origins| origins.contains(&origin))))
-                                || cfg.named_reborrow_parents
-                                .binary_search_by_key(&id, |parent| parent.borrow)
-                                .ok()
-                                .is_some_and(|index| {
-                                    let parent = &cfg.named_reborrow_parents[index];
-                                    state.point_values.get(parent.pointer)
-                                        .is_some_and(|origins| origins.contains(&parent.origin))
-                                })
+                            if state.released.contains(&place.binding) {
+                                errors.push(ReferenceAnalysisError::MissingContext {
+                                    source_span: point.source_span.clone(),
+                                    reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                                });
+                            }
+                            if loan.parent.is_none() {
+                                is_lexical_field_path(&place.projections)
+                            } else {
+                                pending_here.is_some_and(|(_, site)| selected_parent.is_some_and(|(origin, _)|
+                                    state.point_values.get(site.read).is_some_and(|origins| origins.contains(&origin))))
+                                    || named_parent().is_some_and(|parent| state.point_values.get(parent.pointer)
+                                        .is_some_and(|origins| origins.contains(&parent.origin)))
+                            }
                         };
                         if check && !state.bindings.is_empty() {
                             let origins = conflicting_live_loan(
