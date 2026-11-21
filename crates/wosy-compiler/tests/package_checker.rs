@@ -2,7 +2,8 @@
 
 use wosy_compiler::{
     check_scalar_package, derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project,
-    ScalarCheckerOperation, ScalarCheckerOutcome, ScalarPreparationInputs, ScalarTargetLayout,
+    ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarNamespaceBinding,
+    ScalarPreparationInputs, ScalarTargetLayout,
 };
 use wosy_syntax::SourceIdentity;
 
@@ -13,6 +14,10 @@ fn source() -> SourceIdentity {
 }
 
 fn check(text: &str) -> ScalarCheckerOutcome {
+    check_scoped(text, ScalarCheckerScope::default())
+}
+
+fn check_scoped(text: &str, scope: ScalarCheckerScope) -> ScalarCheckerOutcome {
     let identity = source();
     let text = format!("%%start\n{text}\n%%end");
     let parsed = parse_source(identity.clone(), text, &[]);
@@ -22,6 +27,7 @@ fn check(text: &str) -> ScalarCheckerOutcome {
         vec![(declarations, Vec::new())],
         vec![identity],
         ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        scope,
     )
 }
 
@@ -110,6 +116,7 @@ fn malformed_initialization_order_cannot_be_reported_as_no_checks() {
             vec![(declarations(&app), vec![]), (declarations(&other), vec![])],
             vec![app.clone(), other.clone(), app],
             ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+            ScalarCheckerScope::default(),
         ),
         ScalarCheckerOutcome::Unsupported,
     );
@@ -141,4 +148,57 @@ fn selected_failure_returns_only_authored_utf8_text_files_and_their_spans() {
     assert_eq!(at(first.path_span), r#""Out/Report.txt""#);
     assert_eq!(at(first.text_span), r#""ação\nline 2\t☕""#);
     assert!(at(failure.files_span).contains("empty.txt"));
+}
+
+
+#[test]
+fn main_flow_scope_omits_unused_roots_but_preserves_reachable_failures() {
+    let unused = format!("unit() never_called = fn {{ core.require(false, {OUTPUT}); }};");
+    let main = "unit() start = fn {}; start();";
+    for text in [unused.clone(), format!("{unused} {main}")] {
+        assert!(matches!(check(&text), ScalarCheckerOutcome::Failed(_)));
+        assert_eq!(check_scoped(&text, ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::NoChecks);
+    }
+    let main = format!("unit() start = fn {{ core.require(false, {OUTPUT}); }}; start();");
+    let combined = format!("{unused} {main}");
+    let default = check(&combined);
+    assert!(matches!(default, ScalarCheckerOutcome::Failed(ref failure) if failure.directive.start > unused.len() as u32));
+    assert_eq!(check_scoped(&combined, ScalarCheckerScope::MainFlowOnly), default);
+}
+
+
+#[test]
+fn main_flow_scope_still_checks_selected_namespace_dispatch() {
+    let app = source();
+    let library = SourceIdentity::new("local".into(), "demo".into(), "src/lib.w".into(), "phase4".into());
+    let app_text = format!(
+        "lib = namespace demo \"src/lib.w\"; unit() never_called = fn {{ core.require(false, {OUTPUT}); }};",
+    );
+    let load = |source: &SourceIdentity, text: &str, target: Option<&SourceIdentity>| {
+        let parsed = parse_source(source.clone(), format!("%%start\n{text}\n%%end"), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let parsed = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let bindings = target.map(|target| {
+            let namespace = parsed.namespaces().into_iter().next().unwrap();
+            ScalarNamespaceBinding {
+                binding: namespace.binding.clone(),
+                target: target.clone(),
+                span: namespace.span,
+            }
+        }).into_iter().collect();
+        (parsed, bindings)
+    };
+    let observe = |target, lib_text, lib_target| check_scalar_package(
+        vec![load(&app, &app_text, target), load(&library, lib_text, lib_target)],
+        vec![app.clone(), library.clone()],
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ScalarCheckerScope::MainFlowOnly,
+    );
+    let callable = "unit() harmless = fn {};";
+    assert_eq!(observe(Some(&library), callable, None), ScalarCheckerOutcome::NoChecks);
+    assert!(matches!(observe(None, callable, None), ScalarCheckerOutcome::Invalid(_) | ScalarCheckerOutcome::Unsupported));
+    assert!(matches!(
+        observe(Some(&library), "root = namespace demo \"src/main.w\";", Some(&app)),
+        ScalarCheckerOutcome::Invalid(_) | ScalarCheckerOutcome::Unsupported,
+    ));
 }

@@ -37,6 +37,13 @@ use wosy_syntax::SourceIdentity;
 #[cfg(test)]
 use wosy_syntax::{byte_span, CstNode, CstToken, ProofFragmentParse, SyntaxKind};
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ScalarCheckerScope {
+    #[default]
+    CurrentPackage,
+    MainFlowOnly,
+}
+
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScalarCheckerOperation {
@@ -76,6 +83,7 @@ pub fn check_scalar_package(
     declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
+    scope: ScalarCheckerScope,
 ) -> ScalarCheckerOutcome {
     let mut raw_sources = HashSet::with_capacity(initialization_order.len());
     if initialization_order.is_empty()
@@ -85,7 +93,7 @@ pub fn check_scalar_package(
         return ScalarCheckerOutcome::Unsupported;
     }
     let result = prepare_checker_project(declarations, initialization_order, inputs)
-        .and_then(|prepared| check_package_roots_with_activity(&prepared));
+        .and_then(|prepared| check_package_roots_with_activity(&prepared, scope));
     match result {
         Ok(true) => ScalarCheckerOutcome::Passed,
         Ok(false) => ScalarCheckerOutcome::NoChecks,
@@ -210,10 +218,12 @@ fn has_callable_obligations(body: &FunctionCallSites) -> bool {
 
 #[cfg(test)]
 fn check_package_roots(prepared: &PreparedCheckerProject) -> Result<(), ProjectCheck> {
-    check_package_roots_with_activity(prepared).map(drop)
+    check_package_roots_with_activity(prepared, ScalarCheckerScope::CurrentPackage).map(drop)
 }
 
-fn check_package_roots_with_activity(prepared: &PreparedCheckerProject) -> Result<bool, ProjectCheck> {
+fn check_package_roots_with_activity(
+    prepared: &PreparedCheckerProject, scope: ScalarCheckerScope,
+) -> Result<bool, ProjectCheck> {
     let (project, calls) = prepared.parts();
     let (root, ordinals) = package_initialization_order(project)?;
     let mut potential_obligations = false;
@@ -235,6 +245,9 @@ fn check_package_roots_with_activity(prepared: &PreparedCheckerProject) -> Resul
     }
     let CheckedInitialization { visits, reached, ordinals, mut had_obligations } =
         check_package_initialization_with_order(prepared, root, ordinals)?;
+    if scope == ScalarCheckerScope::MainFlowOnly {
+        return Ok(had_obligations);
+    }
     for source in &project.initialization_order {
         if source.project != root.project || source.package != root.package {
             continue;

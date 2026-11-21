@@ -521,13 +521,14 @@ fn check_loaded_project(
     project: &ProjectContext,
     configuration: &ProjectConfiguration,
     target_layout: ScalarTargetLayout,
+    scope: wosy_compiler::ScalarCheckerScope,
 ) -> InternalCheckResult {
     let CanonicalProjectInputs { declarations, initialization_order, texts, .. } =
         load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Check)?;
     #[cfg(test)]
     routing_observations::record(|counts| counts.checks += 1);
     let outcome = wosy_compiler::check_scalar_package(
-        declarations, initialization_order, ScalarPreparationInputs { target_layout },
+        declarations, initialization_order, ScalarPreparationInputs { target_layout }, scope,
     );
     Ok((outcome, texts))
 }
@@ -981,7 +982,10 @@ mod tests {
         ];
         let (project, configuration) = routing_test_project("internal-checked-graph", &sources);
         let (result, counts) = routing_observations::observe(|| {
-            check_loaded_project(&project.root, &project, &configuration, ScalarTargetLayout::NATIVE64)
+            check_loaded_project(
+                &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+                wosy_compiler::ScalarCheckerScope::default(),
+            )
         });
         let (outcome, texts) = result.expect("canonical checker input");
         let ScalarCheckerOutcome::Failed(failure) = outcome else { panic!("expected authored dependency failure"); };
@@ -1007,7 +1011,10 @@ mod tests {
         for (name, text) in samples {
             let (project, configuration) = routing_test_project(name, &[("main.w", text)]);
             let (result, counts) = routing_observations::observe(|| {
-                check_loaded_project(&project.root, &project, &configuration, ScalarTargetLayout::NATIVE64)
+                check_loaded_project(
+                &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+                wosy_compiler::ScalarCheckerScope::default(),
+            )
             });
             if name == "checker-parse-rejection" {
                 let Err(CanonicalLoadFailure::Syntax { source, diagnostics, .. }) = result else { panic!("expected typed syntax error"); };
@@ -1025,6 +1032,34 @@ mod tests {
             assert_eq!(counts.builds, 0);
             assert!(!project.root.join(".wosy").exists());
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_checker_adapter_forwards_main_flow_scope_without_public_flag() {
+        use wosy_compiler::{ScalarCheckerOutcome, ScalarCheckerScope};
+        let (project, configuration) = routing_test_project("internal-main-flow", &[(
+            "main.w", r#"%%start
+                unit() unused = fn {
+                    core.require(false, { .stdout = ""; .stderr = "unused"; .code = 4; .files = []; });
+                };
+                unit() main_flow = fn {};
+                main_flow();
+            %%end"#,
+        )]);
+        let observed = |scope| {
+            let (result, counts) = routing_observations::observe(|| {
+                check_loaded_project(
+                    &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64, scope,
+                )
+            });
+            assert_eq!(counts, routing_observations::Counts { extractions: 1, checks: 1, ..Default::default() });
+            result.expect("valid source").0
+        };
+        assert!(matches!(observed(ScalarCheckerScope::default()), ScalarCheckerOutcome::Failed(_)));
+        assert_eq!(observed(ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::NoChecks);
+        assert!(!project.root.join(".wosy").exists());
+        assert!(Arguments::try_parse_from(["wosy", "check", "--main-flow-only"]).is_err());
     }
 
     #[test]
