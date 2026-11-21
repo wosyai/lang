@@ -625,6 +625,23 @@ struct Packet { *?u8 data; u64 length; }
 		&descriptor, true
 	} else { null, false }
 };
+(*Packet, bool)(u64, bool, bool) make_nullable = fn(count, present, backed) {
+	u8[count] bytes;
+	if (present) {
+		*?u8 data = null;
+		if (backed) { unsafe { data = &?bytes[0]; }; };
+		Packet descriptor = { .data = data; .length = count; };
+		&descriptor, true
+	} else { null, false }
+};
+(*Packet, bool)(u64, bool) make_local_null = fn(count, present) {
+	u8[count] bytes;
+	if (present) {
+		*?u8 data = null;
+		Packet descriptor = { .data = data; .length = count; };
+		&descriptor, true
+	} else { null, false }
+};
 bool() unknown_effect = fn { true };
 (*Packet, bool)(u64, bool) make_conflicted = fn(count, present) {
 	u8[count] bytes;
@@ -681,12 +698,16 @@ bool() unknown_effect = fn { true };
             let proof = &result.aggregate.checked_producer_backing;
             assert_eq!(proof.len(), 2, "{function:?}");
             let positive = match function.name.as_str() {
-                "make_backed" => {
+                "make_backed" | "make_nullable" | "make_local_null" => {
                     let allocation = result.cfg.points.iter().find_map(|point| match &point.kind {
                         CfgPointKind::Bind { binding } if result.cfg.allocations.contains(binding) => Some(point.id),
                         _ => None,
                     }).expect("actual typed local runtime array allocation");
-                    CheckedProducerBacking::FreshWithAllocation(allocation)
+                    match function.name.as_str() {
+                        "make_backed" => CheckedProducerBacking::FreshWithAllocation(allocation),
+                        "make_nullable" => CheckedProducerBacking::FreshWithNullableAllocation(allocation),
+                        _ => CheckedProducerBacking::FreshWithExplicitNullAndLiveAllocation(allocation),
+                    }
                 }
                 "make_empty" => CheckedProducerBacking::FreshWithoutBacking,
                 "make_conflicted" | "make_nonlocal" => CheckedProducerBacking::Unknown,
@@ -696,6 +717,6 @@ bool() unknown_effect = fn { true };
             assert!(proof.values().any(|result| *result == CheckedProducerBacking::NoDescriptor), "{proof:?}");
             checked += 1;
         }
-        assert_eq!(checked, 4);
+        assert_eq!(checked, 6);
     }
 }

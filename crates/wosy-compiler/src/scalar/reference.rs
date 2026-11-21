@@ -1546,6 +1546,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let mut null_view = false;
                 let mut carrier = structure_id.is_some();
                 let mut raw_fields = 0;
+                let mut nullable = structure_id.is_some() && self.aggregate_facts.local_array_copy_allocation.is_some();
+                let mut nullable_read = None;
                 for (position, field) in fields.iter().enumerate() {
                     let ordinal =
                         self.expression_ordinal(parent, OccurrenceEdge::AggregateField(position));
@@ -1559,6 +1561,31 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 ScalarType::RawPointer(_) => { raw_fields += 1; true }
                                 ty => aggregate::ordinary_value(ty),
                             });
+                    }
+                    if nullable {
+                        nullable = match (member, member_type, &field.value) {
+                            (Some(member), Some(ScalarType::RawPointer(_)), ScalarExpression::Name { span, .. })
+                                if Some(&member.structure) == structure_id && nullable_read.is_none() =>
+                            {
+                                let point = self.cursor.filter(|point| Some(*point) != before);
+                                match (point, self.prepared_name_identity(ordinal, *span)?) {
+                                    (Some(point), Some(PlainNameIdentity::Lexical(binding)))
+                                        if matches!(&self.cfg.points[point.0].kind, CfgPointKind::Read { binding: actual } if actual == binding) =>
+                                    {
+                                        nullable_read = Some(binding.clone());
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            }
+                            (Some(member), Some(ty), ScalarExpression::Name { span, .. })
+                                if Some(&member.structure) == structure_id && aggregate::ordinary_value(ty) =>
+                                matches!(self.prepared_name_identity(ordinal, *span)?, Some(PlainNameIdentity::Lexical(_))),
+                            (Some(member), Some(ty), ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }
+                                | ScalarExpression::Integer { .. } | ScalarExpression::Float { .. })
+                                if Some(&member.structure) == structure_id => aggregate::ordinary_value(ty),
+                            _ => false,
+                        };
                     }
                     if plain {
                         plain = match (&field.value, member.filter(|field| Some(&field.structure) == structure_id).and(member_type)) {
@@ -1588,6 +1615,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     scope,
                     BTreeSet::new(),
                 );
+                if let Some(read) = nullable_read.filter(|_| nullable && carrier && raw_fields == 1) {
+                    self.aggregate_facts.checked_nullable_literals.insert(literal, read);
+                }
                 if carrier && raw_fields == 1 {
                     self.aggregate_facts.carrier_literals.insert(literal);
                 }
@@ -2942,16 +2972,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         block: ordinal,
                         item: item_index,
                     };
-                    let raw_null = match primary {
+                    let (raw_null, prepared_raw_null) = match primary {
                         ScalarExpression::Name { name, span }
                             if matches!(receiver.ty, ScalarType::RawPointer(_)) =>
                         {
                             match self.prepared_name_identity(primary_ordinal, *span)? {
-                                Some(identity) => matches!(identity, PlainNameIdentity::Null),
-                                None => name == "null",
+                                Some(PlainNameIdentity::Null) => (true, true),
+                                Some(_) => (false, false),
+                                None => (name == "null", false),
                             }
                         }
-                        _ => false,
+                        _ => (false, false),
                     };
                     let before = self.cursor;
                     let value = if raw_null {
@@ -2974,6 +3005,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         None
                     };
                     let initializer = self.cursor.filter(|_| self.cursor != before);
+                    if prepared_raw_null && self.aggregate_facts.local_array_copy_allocation.is_some() {
+                        self.aggregate_facts.checked_raw_null_initializers.insert(
+                            initializer.expect("prepared raw null evaluation"),
+                        );
+                    }
                     if self.capture_call_points && raw_null {
                         self.proof_points
                             .evaluations

@@ -34,6 +34,9 @@ pub(super) struct AggregateFlowFacts {
     pub(super) local_array_nulls: BTreeSet<CfgPointId>,
     pub(super) local_array_failure_arms: BTreeMap<CfgPointId, BlockOrdinal>,
     pub(super) checked_producer_arms: Vec<(CfgPointId, CheckedProducerTerminal)>,
+    pub(super) checked_nullable_literals: BTreeMap<CfgPointId, ReferenceBindingId>,
+    pub(super) checked_raw_null_initializers: BTreeSet<CfgPointId>,
+    pub(super) checked_raw_bindings: BTreeSet<CfgPointId>,
     pub(super) checked_backing_free_literals: BTreeSet<CfgPointId>,
     pub(super) checked_producer_nonlocal_installs: BTreeSet<CfgPointId>,
 }
@@ -64,6 +67,11 @@ impl AggregateFlowFacts {
             }
             ScalarType::RawPointer(_) | ScalarType::Struct(_) if !allocation => {
                 if let Some(initializer) = initializer {
+                    if self.local_array_copy_allocation.is_some()
+                        && matches!(ty, ScalarType::RawPointer(_)) && self.checked_raw_null_initializers.contains(&initializer)
+                    {
+                        self.checked_raw_bindings.insert(point);
+                    }
                     self.installations.insert(point, (initializer, position));
                 }
             }
@@ -90,7 +98,19 @@ pub(super) enum CheckedProducerBacking {
     NoDescriptor,
     FreshWithoutBacking,
     FreshWithAllocation(CfgPointId),
+    FreshWithNullableAllocation(CfgPointId),
+    FreshWithExplicitNullAndLiveAllocation(CfgPointId),
     Unknown,
+}
+
+impl CheckedProducerBacking {
+    fn proven_allocation(self) -> Option<CfgPointId> {
+        match self {
+            Self::FreshWithAllocation(base) | Self::FreshWithNullableAllocation(base)
+            | Self::FreshWithExplicitNullAndLiveAllocation(base) => Some(base),
+            Self::NoDescriptor | Self::FreshWithoutBacking | Self::Unknown => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -113,6 +133,8 @@ enum Value {
     ReadOffset(ReadSource),
     RawCell { point: CfgPointId, owner: Option<usize> },
     Plain(CfgPointId),
+    CheckedRawNull,
+    CheckedNullDescriptor,
     View(OwnerSource),
     Aggregate {
         backing: OwnerSource,
@@ -248,7 +270,7 @@ impl AggregateEdgeState {
     }
 
     fn forget_plain(&mut self, binding: &ReferenceBindingId) {
-        if let Some((value @ Some(Value::Plain(_)), _, _)) = self.bindings.get_mut(binding) {
+        if let Some((value @ Some(Value::Plain(_) | Value::CheckedRawNull | Value::CheckedNullDescriptor), _, _)) = self.bindings.get_mut(binding) {
             *value = None;
         }
     }
@@ -445,9 +467,13 @@ impl AggregateFlowFacts {
                                 !self.array_installs.contains(&id) || !selected_recommit(*rhs_point)
                             } else {
                                 !state.bindings.contains_key(&target.binding)
+                                    || self.views.get(rhs_point) != Some(&allocation)
                                     || state.values.get(rhs_point) != Some(&Value::View(OwnerSource::Allocation(allocation)))
                             }
                     }
+                    CfgPointKind::Bind { .. } => self.installations.get(&id).is_some_and(|(rhs, _)| {
+                        state.values.get(rhs) == Some(&Value::View(OwnerSource::Allocation(allocation)))
+                    }),
                     CfgPointKind::Move { place, owner, .. } | CfgPointKind::DeferredMove { place, owner, .. } => {
                         self.checked_producer_arms.iter().any(|(_, terminal)| matches!(terminal,
                             CheckedProducerTerminal::Fresh { descriptor, .. }
@@ -510,6 +536,8 @@ impl AggregateFlowFacts {
                         CheckedProducerBacking::FreshWithAllocation(base),
                     Some(Value::Plain(origin)) if !local.viewed && self.checked_backing_free_literals.contains(&origin) =>
                         CheckedProducerBacking::FreshWithoutBacking,
+                    Some(Value::CheckedNullDescriptor) if local.live && !local.viewed =>
+                        CheckedProducerBacking::FreshWithExplicitNullAndLiveAllocation(allocation),
                     _ => CheckedProducerBacking::Unknown,
                 };
                 if local.checked_borrow.replace((id, backing)).is_some() {
@@ -533,9 +561,15 @@ impl AggregateFlowFacts {
                 };
                 result.checked_producer_backing.entry(id)
                     .and_modify(|known| {
-                        if *known != backing {
-                            *known = CheckedProducerBacking::Unknown;
-                        }
+                        use CheckedProducerBacking::*;
+                        *known = match (*known, backing) {
+                            (left, right) if left == right => left,
+                            (FreshWithAllocation(a) | FreshWithNullableAllocation(a), FreshWithExplicitNullAndLiveAllocation(b))
+                            | (FreshWithExplicitNullAndLiveAllocation(a) | FreshWithNullableAllocation(a), FreshWithAllocation(b))
+                            | (FreshWithAllocation(a) | FreshWithExplicitNullAndLiveAllocation(a), FreshWithNullableAllocation(b))
+                                if a == b => FreshWithNullableAllocation(a),
+                            _ => Unknown,
+                        };
                     })
                     .or_insert(backing);
             }
@@ -669,7 +703,7 @@ impl AggregateFlowFacts {
                         Value::Unknown
                     }
                     Some(Value::Unknown) => Value::Unknown,
-                    Some(Value::Plain(_) | Value::ScalarCell) | None => continue,
+                    Some(Value::Plain(_) | Value::CheckedRawNull | Value::CheckedNullDescriptor | Value::ScalarCell) | None => continue,
                 };
                 member = Some(if let Some(previous) = member {
                     result.account_raw(id, Some(&previous));
@@ -678,6 +712,13 @@ impl AggregateFlowFacts {
                 } else {
                     next
                 });
+            }
+            if member.is_none() && !self.checked_producer_arms.is_empty() {
+                if self.checked_nullable_literals.get(&id).is_some_and(|binding|
+                    matches!(state.bindings.get(binding), Some((Some(Value::CheckedRawNull), _, _))))
+                {
+                    member = Some(Value::CheckedNullDescriptor);
+                }
             }
             member
         } else {
@@ -689,6 +730,7 @@ impl AggregateFlowFacts {
                 }
                 CfgPointKind::Read { binding } => {
                     state.bindings.get(binding).and_then(|(value, _, _)| *value)
+                        .filter(|value| !matches!(value, Value::CheckedRawNull | Value::CheckedNullDescriptor))
                 }
                 CfgPointKind::ReadPlace { candidates, .. }
                     if self.projected_reads.contains_key(&id) =>
@@ -718,6 +760,7 @@ impl AggregateFlowFacts {
                                 Some(Value::View(*backing))
                             }
                             (Value::Aggregate { .. }, []) => Some(*value),
+                            (Value::CheckedRawNull | Value::CheckedNullDescriptor, _) => None,
                             (_, []) => Some(*value),
                             (Value::Plain(_), _) => None,
                             _ => {
@@ -751,10 +794,12 @@ impl AggregateFlowFacts {
                             Some(Value::Aggregate { backing: OwnerSource::Formal(_), field: Some(_) }) if self.carrier_literals.contains(&rhs) => {}
                             value => result.account_raw(id, value),
                         }
-                        state.bindings.insert(
-                            binding.clone(),
-                            (state.values.get(&rhs).copied().filter(|value| !matches!(value, Value::Plain(origin) if *origin != rhs)), point.scope, Some(position)),
-                        );
+                        let value = if !self.checked_producer_arms.is_empty() && self.checked_raw_bindings.contains(&id) {
+                            Some(Value::CheckedRawNull)
+                        } else {
+                            state.values.get(&rhs).copied().filter(|value| !matches!(value, Value::Plain(origin) if *origin != rhs))
+                        };
+                        state.bindings.insert(binding.clone(), (value, point.scope, Some(position)));
                     }
                     None
                 }
@@ -787,7 +832,7 @@ impl AggregateFlowFacts {
                         {
                             *value = None;
                         }
-                    } else if let Some((value @ Some(Value::Plain(_)), _, _)) = state.bindings.get_mut(&target.binding) {
+                    } else if let Some((value @ Some(Value::Plain(_) | Value::CheckedRawNull | Value::CheckedNullDescriptor), _, _)) = state.bindings.get_mut(&target.binding) {
                         *value = None;
                     } else if state
                         .bindings
@@ -1009,7 +1054,7 @@ impl AggregateFlowFacts {
                             None
                         }
                         Some(Value::RawFormal(_) | Value::ReadOffset(_) | Value::RawCell { .. }) => None,
-                        Some(Value::Plain(_) | Value::ScalarCell) | None => None,
+                        Some(Value::Plain(_) | Value::CheckedRawNull | Value::CheckedNullDescriptor | Value::ScalarCell) | None => None,
                     };
                     result.returns.entry(id).or_default().insert(returning);
                     None
@@ -1702,11 +1747,9 @@ fn closed_aggregates<'a>(
             }
             let mut arms = facts.checked_producer_backing.iter();
             let ((first, left), (last, right)) = (arms.next()?, arms.next()?);
-            let (CheckedProducerBacking::FreshWithAllocation(left), CheckedProducerBacking::FreshWithAllocation(right)) = (left, right) else {
-                return None;
-            };
-            if left != right { return None }
-            let CfgPointKind::Bind { binding } = &body.cfg.points.get(left.0)?.kind else { return None };
+            let base = left.proven_allocation()?;
+            if right.proven_allocation() != Some(base) { return None }
+            let CfgPointKind::Bind { binding } = &body.cfg.points.get(base.0)?.kind else { return None };
             for &(call, ref destination) in facts.array_rebinds.values() {
                 if destination != binding { continue }
                 let (ordinal, _, _) = facts.array_calls.get(&call)?;
@@ -1724,7 +1767,7 @@ fn closed_aggregates<'a>(
                     return None;
                 }
             }
-            let allocation = *facts.allocation_slots.get(left)?;
+            let allocation = *facts.allocation_slots.get(&base)?;
             let arms = [*facts.checked_producer_blocks.get(first)?, *facts.checked_producer_blocks.get(last)?];
             Some((key, ClosedCheckedBacking { allocation, arms }))
         });
