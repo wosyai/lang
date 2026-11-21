@@ -192,3 +192,87 @@ fd_read = [
 ]
 stdout = "expected/read_line_limit_eof.stdout"
 exact = true
+
+[[assert]]
+source = "project/src/read_line_limit_eof.w"
+fd_read = [
+  { capacity = 1, bytes = [65], errno = 0 },
+  { capacity = 1, bytes = [13], errno = 0 },
+  { capacity = 1, bytes = [], errno = 0 },
+]
+stdout = "expected/read_line_limit_eof.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_standalone_cr.w"
+fd_read = [
+  { capacity = 1, bytes = [13], errno = 0 },
+  { capacity = 1, bytes = [], errno = 0 },
+]
+stdout = "expected/read_line_standalone_cr.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_standalone_cr.w"
+fd_read = [
+  { capacity = 1, bytes = [65], errno = 0 },
+  { capacity = 1, bytes = [13], errno = 0 },
+  { capacity = 1, bytes = [], errno = 0 },
+]
+stdout = "expected/read_line_standalone_cr.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_zero_capacity.w"
+fd_read = [{ capacity = 1, bytes = [10], errno = 0 }]
+stdout = "expected/read_line_crlf.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_zero_capacity.w"
+fd_read = [
+  { capacity = 1, bytes = [13], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/read_line_crlf.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_zero_capacity.w"
+fd_read = [
+  { capacity = 1, bytes = [13], errno = 0 },
+  { capacity = 1, bytes = [], errno = 0 },
+]
+stdout = "expected/read_line_limit_eof.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_zero_capacity.w"
+fd_read = [
+  { capacity = 1, bytes = [13], errno = 0 },
+  { capacity = 1, bytes = [], errno = 5 },
+]
+stdout = "expected/read_line_io_error.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_zero_capacity.w"
+fd_read = [
+  { capacity = 1, bytes = [13], errno = 0 },
+  { capacity = 1, bytes = [120], errno = 0 },
+  { capacity = 1, bytes = [], errno = 5 },
+]
+stdout = "expected/read_line_io_error.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/read_line_zero_capacity_next.w"
+fd_read = [
+  { capacity = 1, bytes = [13], errno = 0 },
+  { capacity = 1, bytes = [120], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+  { capacity = 1, bytes = [120], errno = 0 },
+  { capacity = 1, bytes = [10], errno = 0 },
+]
+stdout = "expected/read_line_zero_capacity_next.stdout"
+exact = true

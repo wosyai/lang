@@ -59,3 +59,11 @@ command = ["wosy", "run", "app"]
 exit = 0
 file = "partition.normalized.ll"
 contents = "expected/partition_u128.ll"
+
+[[assert]]
+source = "project/src/format_decimal_chunks.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/format_decimal_chunks.stdout"
+stderr = "expected/empty"
+exact = true
