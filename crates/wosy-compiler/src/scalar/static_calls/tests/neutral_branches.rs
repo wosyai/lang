@@ -1,5 +1,5 @@
 use super::*;
-use crate::scalar::control::{BlockPosition, ConditionalRegion};
+use crate::scalar::control::ConditionalRegion;
 use reference::{
     FunctionCallSites, OccurrenceEdge as Edge, OccurrenceNode as Node, OccurrenceParent as Parent,
 };
@@ -29,7 +29,7 @@ fn assert_arm(row: &FunctionCallSites, arm: reference::BlockOrdinal, syntax: &Sc
 
 #[test]
 fn prepared_branch_regions_preserve_polarity_continuations_and_inherited_query_effect_order() {
-    let text = "%%start\nu8 visits = 0;\nbool(bool) tick = fn(flag) { visits = visits + 1; flag };\nu8(u8) number = fn(value) { visits = visits + 1; value };\nbool(bool, bool) conjunction = fn(left, right) { tick(left) && tick(right) };\nbool(bool, bool) disjunction = fn(left, right) { tick(left) || tick(right) };\nu8(bool, u8) choose = fn(flag, value) { if (tick(tick(flag))) { number(value) } else { number(value) } };\nunit(bool) route = fn(flag) { if (tick(flag)) { tick(flag); }; bool running = flag; while (tick(running)) { running = false; } running; };\n%%end";
+    let text = "%%start\nu8 visits = 0;\nbool(bool) tick = fn(flag) { visits = visits + 1; flag };\nu8(u8) number = fn(value) { visits = visits + 1; value };\nbool(bool, bool) conjunction = fn(left, right) { tick(left) && tick(right) };\nbool(bool, bool) disjunction = fn(left, right) { tick(left) || tick(right) };\nu8(bool, u8) choose = fn(flag, value) { if (tick(tick(flag))) { number(value) } else { number(value) } };\nunit(bool) route = fn(flag) { if (tick(flag)) { tick(flag); }; bool running = flag; if (tick(running)) { running = false; }; running; };\n%%end";
     for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
         let parsed = parsed(text);
         let declarations = derive_scalar_declarations_from_cst(parsed.canonical_cst());
@@ -160,30 +160,25 @@ fn prepared_branch_regions_preserve_polarity_continuations_and_inherited_query_e
             route.structure.edges[&(Parent::Expression(unit_ordinal), Edge::Condition)],
             Node::Expression(test)
         );
-        let ScalarBlockItem::While(loop_syntax) = &route_syntax.body.items[2] else {
-            panic!("while item ordinal")
+        let ScalarBlockItem::Expression(ScalarExpression::UnitIf {
+            condition,
+            then_branch,
+            ..
+        }) = &route_syntax.body.items[2] else {
+            panic!("second unit conditional");
         };
-        let loop_region = route.loops[&(route.structure.root, 2)];
-        assert_eq!(loop_region.span, loop_syntax.span);
-        assert_eq!(
-            loop_region.body_to_test(),
-            (loop_region.body, loop_region.test)
-        );
-        assert_eq!(
-            loop_region.on_false,
-            BlockPosition {
-                block: route.structure.root,
-                item: 3
-            }
-        );
-        assert_eq!(
-            route.structure.edges[&(root, Edge::WhileCondition { item: 2 })],
-            Node::Expression(loop_region.test)
-        );
-        assert_eq!(
-            route.structure.edges[&(root, Edge::WhileBody { item: 2 })],
-            Node::Block(loop_region.body)
-        );
+        let Node::Expression(ordinal) = route.structure.edges[&(root, Edge::ExpressionItem { item: 2 })]
+        else {
+            panic!("unit item ordinal");
+        };
+        let ConditionalRegion::Unit { condition: test, then_block, fallthrough, .. } =
+            route.conditionals[&ordinal]
+        else {
+            panic!("second unit fallthrough region");
+        };
+        assert_eq!(fallthrough, ordinal);
+        assert_eq!(route.occurrences[test.0].span, expression_span(condition));
+        assert_eq!(route.structure.blocks[then_block.0].span, then_branch.span);
         let before = prepared.program.clone();
         let stages = Scope::new();
         let results = prepared.analyze();
@@ -237,23 +232,11 @@ fn prepared_branch_regions_preserve_polarity_continuations_and_inherited_query_e
             unreachable!()
         };
         let points = &function.reference_cfg.points;
-        let test = points
-            .iter()
-            .find(|point| matches!(point.kind, CfgPointKind::LoopTest { .. }))
-            .unwrap();
-        let body_end = points
-            .iter()
-            .find(|point| {
-                matches!(point.kind, CfgPointKind::ScopeExit)
-                    && point.source_span.range == loop_syntax.body.span
-            })
-            .unwrap();
-        assert!(body_end.successors.contains(&test.id));
         let branch = points
             .iter()
             .find(|point| {
                 matches!(point.kind, CfgPointKind::Branch { .. })
-                    && point.source_span.range == expression_span(&loop_syntax.condition)
+                    && point.source_span.range == expression_span(condition)
             })
             .unwrap();
         assert_eq!(branch.successors.len(), 2);

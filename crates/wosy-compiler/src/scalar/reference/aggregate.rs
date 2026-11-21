@@ -352,7 +352,7 @@ impl AggregateFlowFacts {
                         | ResolvedCallTarget::LocalCallable(_)
                         | ResolvedCallTarget::CallableField { .. },
                     ..
-                } | CfgPointKind::Return | CfgPointKind::LoopTest { .. } => {
+                } | CfgPointKind::Return => {
                     for producer in state.pending_temporaries.keys() {
                         result.abandoned_temporaries.entry(*producer).or_insert(id);
                     }

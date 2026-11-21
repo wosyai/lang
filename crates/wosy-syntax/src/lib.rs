@@ -50,8 +50,7 @@ pub enum SyntaxKind {
     QualifiedMember,
     AssignmentTarget,
     LocalBinding,
-    While,
-    Assignment,
+    Assignment = 41,
     TopLevelItem,
     StructDecl,
     StructField,
@@ -141,7 +140,6 @@ impl Language for WosyLanguage {
             37 => SyntaxKind::QualifiedMember,
             38 => SyntaxKind::AssignmentTarget,
             39 => SyntaxKind::LocalBinding,
-            40 => SyntaxKind::While,
             41 => SyntaxKind::Assignment,
             42 => SyntaxKind::TopLevelItem,
             43 => SyntaxKind::StructDecl,
@@ -397,10 +395,7 @@ fn build_pair(
     errors: &mut Vec<SyntaxError>,
 ) {
     let span = pair.as_span();
-    if matches!(
-        pair.as_rule(),
-        Rule::error_item | Rule::malformed_generic_decl | Rule::trailing_while_semicolon
-    ) {
+    if matches!(pair.as_rule(), Rule::error_item | Rule::malformed_generic_decl) {
         let range = ByteSpan::new(span.start() as u32, span.end() as u32);
         builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Error));
         add_gap(builder, span.as_str(), span.start(), comments);
@@ -648,7 +643,6 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::if_expr => SyntaxKind::IfExpr,
         Rule::unit_if_expr => SyntaxKind::UnitIfExpr,
         Rule::unsafe_expr => SyntaxKind::Unsafe,
-        Rule::while_expr => SyntaxKind::While,
         Rule::assignment => SyntaxKind::Assignment,
         Rule::top_level_item => SyntaxKind::TopLevelItem,
         Rule::struct_decl => SyntaxKind::StructDecl,
@@ -1778,53 +1772,47 @@ mod tests {
     }
 
     #[test]
-    fn local_binding_assignment_and_direct_block_while_are_structural() {
-        let text = "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t}\n};\n%%end";
+    fn local_binding_assignment_and_ordinary_while_call_are_structural() {
+        let text = "%%start\ni32(i32) while = fn(start) {\n\ti32 value = start;\n\tvalue = value + 1;\n\tvalue\n};\ni32 result = while(2);\n%%end";
         let result = parse(identity(), text.into(), &[]);
-        assert!(result.is_valid());
+        assert!(result.is_valid(), "{:?}", result.errors);
         assert_eq!(result.reconstruct(), text);
-        assert!(result
+        for kind in [
+            SyntaxKind::LocalBinding,
+            SyntaxKind::Assignment,
+            SyntaxKind::Call,
+        ] {
+            assert!(result.root.descendants().any(|node| node.kind() == kind));
+        }
+        let call = result
             .root
             .descendants()
-            .any(|node| node.kind() == SyntaxKind::LocalBinding));
-        assert!(result
-            .root
-            .descendants()
-            .any(|node| node.kind() == SyntaxKind::Assignment));
-        assert!(result
-            .root
-            .descendants()
-            .any(|node| node.kind() == SyntaxKind::While));
-        let while_node = result
-            .root
-            .descendants()
-            .find(|node| node.kind() == SyntaxKind::While)
-            .expect("while node");
-        assert_eq!(byte_span(&while_node), ByteSpan::new(57, 100));
-        let trailing_semicolon =
-            "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t};\n};\n%%end";
-        let rejected = parse(identity(), trailing_semicolon.into(), &[]);
-        assert!(!rejected.is_valid());
-        assert_eq!(rejected.errors.len(), 1);
-        let semicolon = trailing_semicolon
-            .find("\n\t};\n")
-            .expect("trailing semicolon") as u32
-            + 3;
+            .find(|node| node.kind() == SyntaxKind::Call)
+            .unwrap();
+        assert_eq!(call.text().to_string(), "while(2)");
+        assert_eq!(WosyLanguage::kind_to_raw(SyntaxKind::LocalBinding).0, 39);
+        assert_eq!(WosyLanguage::kind_to_raw(SyntaxKind::Assignment).0, 41);
         assert_eq!(
-            rejected.errors[0].span,
-            ByteSpan::new(semicolon, semicolon + 1)
+            WosyLanguage::kind_from_raw(rowan::SyntaxKind(41)),
+            SyntaxKind::Assignment
         );
-        assert!(rejected
-            .root
-            .descendants()
-            .any(|node| node.kind() == SyntaxKind::FunctionDecl));
-        assert!(rejected
-            .root
-            .descendants()
-            .any(|node| node.kind() == SyntaxKind::While));
+        assert!(serde_json::from_str::<SyntaxKind>(r#""While""#).is_err());
+    }
 
-        let expression_statement = "%%start\nunit() main = fn {\n\tprint();\n};\n%%end";
-        assert!(parse(identity(), expression_statement.into(), &[]).is_valid());
+    #[test]
+    fn retired_while_block_form_is_rejected_losslessly() {
+        for text in [
+            "%%start\nunit() repeat = fn { while (true) {} };\n%%end",
+            "%%start\nunit() repeat = fn { while (true) {}; };\n%%end",
+        ] {
+            let result = parse(identity(), text.into(), &[]);
+            assert!(!result.is_valid());
+            assert_eq!(result.reconstruct(), text);
+            let start = text.find("while").unwrap() as u32;
+            assert!(result.errors.iter().any(|error| {
+                error.span.start <= start && error.span.end > start
+            }));
+        }
     }
 
     #[test]
@@ -1909,7 +1897,7 @@ mod tests {
 
     #[test]
     fn unterminated_control_flow_precedes_final_output_list() {
-        let text = "%%start\ni32(i32, i32) f = fn(input) {\n\twhile (input < 2) {\n\t\tinput = input + 1;\n\t}\n\tif (input == 2) {\n\t\tinput;\n\t} else {\n\t\tinput;\n\t}\n\tinput, input + 1\n};\n%%end";
+        let text = "%%start\ni32(i32, i32) f = fn(input) {\n\tif (input < 2) {\n\t\tinput = input + 1;\n\t}\n\tif (input == 2) {\n\t\tinput;\n\t} else {\n\t\tinput;\n\t}\n\tinput, input + 1\n};\n%%end";
         let result = parse(identity(), text.into(), &[]);
         assert!(result.is_valid(), "{:?}", result.errors);
         assert_eq!(result.reconstruct(), text);

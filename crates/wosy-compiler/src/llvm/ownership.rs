@@ -730,9 +730,6 @@ pub(super) fn return_bindings(block: &ScalarBlock) -> BTreeMap<String, ScalarExp
             ScalarBlockItem::Expression(expression) => {
                 extend_return_bindings_from_expression(&mut bindings, expression);
             }
-            ScalarBlockItem::While(while_expression) => {
-                extend_return_bindings_from_expression(&mut bindings, &while_expression.condition);
-            }
         }
     }
     bindings

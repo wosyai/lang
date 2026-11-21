@@ -31,7 +31,6 @@ use crate::{
     BinaryOperator, ScalarAssignment, ScalarBlock, ScalarBlockItem, ScalarBuildValidation,
     ScalarExpression, ScalarFunction, ScalarItem, ScalarModule, ScalarProject,
     ScalarProjectValidation, ScalarStruct, ScalarTargetLayout, ScalarType, ScalarValidation,
-    ScalarWhile,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2683,7 +2682,6 @@ fn emit_block_at<'ctx, 'module>(
             }
             ScalarBlockItem::Expression(expression) => emit_expression(context, state, expression)?,
             ScalarBlockItem::Assignment(assignment) => emit_assignment(context, state, assignment)?,
-            ScalarBlockItem::While(expression) => emit_while(context, state, expression)?,
         };
     }
     if !block.final_output_values.is_empty() || matches!(emission, BlockEmission::TailArm(_)) {
@@ -2760,9 +2758,6 @@ fn emit_project_block_at<'ctx, 'module>(
             }
             ScalarBlockItem::Assignment(assignment) => {
                 emit_project_assignment(context, state, assignment, module, modules)?
-            }
-            ScalarBlockItem::While(expression) => {
-                emit_project_while(context, state, expression, module, modules)?
             }
         };
     }
@@ -4142,7 +4137,6 @@ fn emit_block_item<'ctx, 'module>(
         }
         ScalarBlockItem::Expression(expression) => emit_expression(context, state, expression),
         ScalarBlockItem::Assignment(assignment) => emit_assignment(context, state, assignment),
-        ScalarBlockItem::While(expression) => emit_while(context, state, expression),
     }
 }
 
@@ -4251,96 +4245,7 @@ fn emit_project_block_item<'ctx, 'module>(
         ScalarBlockItem::Assignment(assignment) => {
             emit_project_assignment(context, state, assignment, module, modules)
         }
-        ScalarBlockItem::While(expression) => {
-            emit_project_while(context, state, expression, module, modules)
-        }
     }
-}
-
-fn emit_while<'ctx, 'module>(
-    context: &'ctx Context,
-    state: &mut EmitState<'ctx, 'module>,
-    expression: &ScalarWhile,
-) -> Result<EmitValue<'ctx>, String> {
-    let function = state
-        .builder
-        .get_insert_block()
-        .ok_or_else(|| "missing insertion block".to_owned())?
-        .get_parent()
-        .ok_or_else(|| "missing function".to_owned())?;
-    let condition_block =
-        context.append_basic_block(function, &format!("while.cond.{}", state.next_block));
-    state.next_block += 1;
-    let body = context.append_basic_block(function, &format!("while.body.{}", state.next_block));
-    state.next_block += 1;
-    let exit = context.append_basic_block(function, &format!("while.exit.{}", state.next_block));
-    state.next_block += 1;
-    state
-        .builder
-        .build_unconditional_branch(condition_block)
-        .map_err(builder_error)?;
-    state.builder.position_at_end(condition_block);
-    let condition =
-        take_basic(emit_expression(context, state, &expression.condition)?)?.into_int_value();
-    state
-        .builder
-        .build_conditional_branch(condition, body, exit)
-        .map_err(builder_error)?;
-    state.builder.position_at_end(body);
-    let _ = emit_block(context, state, &expression.body)?;
-    state
-        .builder
-        .build_unconditional_branch(condition_block)
-        .map_err(builder_error)?;
-    state.builder.position_at_end(exit);
-    Ok(EmitValue::Unit)
-}
-
-fn emit_project_while<'ctx, 'module>(
-    context: &'ctx Context,
-    state: &mut EmitState<'ctx, 'module>,
-    expression: &ScalarWhile,
-    module: &ScalarModule,
-    modules: &[&ScalarModule],
-) -> Result<EmitValue<'ctx>, String> {
-    let function = state
-        .builder
-        .get_insert_block()
-        .ok_or_else(|| "missing insertion block".to_owned())?
-        .get_parent()
-        .ok_or_else(|| "missing function".to_owned())?;
-    let condition =
-        context.append_basic_block(function, &format!("while.cond.{}", state.next_block));
-    state.next_block += 1;
-    let body = context.append_basic_block(function, &format!("while.body.{}", state.next_block));
-    state.next_block += 1;
-    let exit = context.append_basic_block(function, &format!("while.exit.{}", state.next_block));
-    state.next_block += 1;
-    state
-        .builder
-        .build_unconditional_branch(condition)
-        .map_err(builder_error)?;
-    state.builder.position_at_end(condition);
-    let value = take_basic(emit_project_expression(
-        context,
-        state,
-        &expression.condition,
-        module,
-        modules,
-    )?)?
-    .into_int_value();
-    state
-        .builder
-        .build_conditional_branch(value, body, exit)
-        .map_err(builder_error)?;
-    state.builder.position_at_end(body);
-    let _ = emit_project_block(context, state, &expression.body, module, modules)?;
-    state
-        .builder
-        .build_unconditional_branch(condition)
-        .map_err(builder_error)?;
-    state.builder.position_at_end(exit);
-    Ok(EmitValue::Unit)
 }
 
 mod expression;

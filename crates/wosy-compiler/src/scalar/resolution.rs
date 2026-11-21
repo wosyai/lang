@@ -110,9 +110,6 @@ fn resolve_item_types(item: &mut ScalarBlockItem, names: &BTreeMap<String, Scala
         ScalarBlockItem::Expression(ScalarExpression::Block(block)) => {
             resolve_block_types(block, names, &[])
         }
-        ScalarBlockItem::While(while_expression) => {
-            resolve_block_types(&mut while_expression.body, names, &[])
-        }
         ScalarBlockItem::Expression(_) | ScalarBlockItem::Assignment(_) => {}
     }
 }
@@ -134,10 +131,6 @@ fn resolve_block_types(
                 for initializer in secondary_binding_initializers_mut(binding) {
                     resolve_expression_types(initializer, names, generics);
                 }
-            }
-            ScalarBlockItem::While(while_expression) => {
-                resolve_expression_types(&mut while_expression.condition, names, generics);
-                resolve_block_types(&mut while_expression.body, names, generics);
             }
             ScalarBlockItem::Expression(expression) => {
                 resolve_expression_types(expression, names, generics)
@@ -460,26 +453,6 @@ fn resolve_item_places(
                     owners,
                 );
             }
-        }
-        ScalarBlockItem::While(while_expression) => {
-            resolve_expression_places(
-                &mut while_expression.condition,
-                scope,
-                program,
-                names,
-                unsafe_context,
-                overloads,
-                owners,
-            );
-            resolve_block_places(
-                &mut while_expression.body,
-                scope,
-                program,
-                names,
-                unsafe_context,
-                overloads,
-                owners,
-            );
         }
     }
 }
@@ -957,20 +930,6 @@ fn resolve_item_types_project(
         ScalarBlockItem::Expression(expression) => {
             resolve_expression_types_project(expression, declarations, current_module, generics);
         }
-        ScalarBlockItem::While(while_expression) => {
-            resolve_expression_types_project(
-                &mut while_expression.condition,
-                declarations,
-                current_module,
-                generics,
-            );
-            resolve_block_types_project(
-                &mut while_expression.body,
-                declarations,
-                current_module,
-                generics,
-            );
-        }
         ScalarBlockItem::Assignment(assignment) => {
             for value in &mut assignment.values {
                 resolve_expression_types_project(value, declarations, current_module, generics);
@@ -1364,32 +1323,6 @@ fn resolve_item_module_places(
                     owners,
                 );
             }
-        }
-        ScalarBlockItem::While(while_expression) => {
-            resolve_expression_module_places(
-                &mut while_expression.condition,
-                scope,
-                module,
-                modules,
-                names,
-                unsafe_context,
-                declarations,
-                current_module,
-                overloads,
-                owners,
-            );
-            resolve_block_module_places(
-                &mut while_expression.body,
-                scope,
-                module,
-                modules,
-                names,
-                unsafe_context,
-                declarations,
-                current_module,
-                overloads,
-                owners,
-            );
         }
     }
 }
