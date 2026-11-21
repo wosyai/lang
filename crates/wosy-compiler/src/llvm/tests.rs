@@ -43,6 +43,51 @@ fn prepare_initializer_test(
 }
 
 #[test]
+fn text_only_emission_matches_structured_partitions_on_both_targets() {
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        for external_items in [
+            "",
+            "scene = extern wasm \"showcase\" { unit(u8) mesh; };\nscene.mesh(7);",
+        ] {
+            let text = format!(
+                "%%start\nu8[2] row = [1, 2];\nu8[2][2] grid = [row, row];\nu8(u8) ordinary = fn(value) {{ value }};\nu8 result = ordinary(7);\n{external_items}\n%%end"
+            );
+            let parsed = parse_source(source.clone(), text.clone(), &[]);
+            let raw = derive_scalar_program_with_layout(&parsed.result, layout);
+            let raw_partition = emit_scalar_llvm(&raw).unwrap();
+            assert!(raw_partition.functions.iter().any(|function| function.parameters.len() == 1));
+            assert_eq!(
+                crate::emit_scalar_llvm_text(&raw).unwrap(),
+                raw_partition.to_text()
+            );
+            let prepared = prepare_initializer_test(&text, layout);
+            let validation = analyze_scalar_build(&prepared);
+            assert!(validation.diagnostics().is_empty(), "{:?}", validation.diagnostics());
+            for (partition, text) in [
+                (
+                    emit_scalar_build_single_module_llvm(&validation).unwrap(),
+                    crate::emit_scalar_build_single_module_llvm_text(&validation).unwrap(),
+                ),
+                (
+                    emit_scalar_build_project_llvm(&validation).unwrap(),
+                    crate::emit_scalar_build_project_llvm_text(&validation).unwrap(),
+                ),
+            ] {
+                assert!(partition.functions.iter().any(|function| function.parameters.len() == 1));
+                assert_eq!(partition.declarations.is_empty(), external_items.is_empty());
+                assert_eq!(text, partition.to_text());
+            }
+        }
+    }
+}
+
+#[test]
 fn raw_address_of_checked_dereference_preserves_the_referent() {
     let text = "%%start
 unit(*?u8) read_into = fn(destination) { destination; };
@@ -643,6 +688,7 @@ fn emit_initializer_test_input(
             input,
             &|reservations| build.aggregate(reservations),
             &|item, arm, _| build.reference_cfg(0, item, arm),
+            super::PartitionMetadata::Full,
         ),
         super::emit_project_llvm(
             project,
@@ -651,6 +697,7 @@ fn emit_initializer_test_input(
             &|reservations| build.aggregate(reservations),
             &|module, item, arm, _| build.reference_cfg(module, item, arm),
             None,
+            super::PartitionMetadata::Full,
         ),
     ]
 }
@@ -1062,6 +1109,7 @@ fn prepared_initializer_namespace_member_uses_selected_storage_on_both_layouts()
                 &|reservations| build.aggregate(reservations),
                 &|module, item, arm, _| build.reference_cfg(module, item, arm),
                 None,
+                super::PartitionMetadata::Full,
             )
         };
         let region = prepared.initialization_region(0).unwrap();
@@ -1147,6 +1195,7 @@ i32 nested = unsafe { echo(33) };
                 input,
                 &|reservations| build.aggregate(reservations),
                 &|item, arm, _| build.reference_cfg(0, item, arm),
+                super::PartitionMetadata::Full,
             )
             .unwrap()
             .to_text(),
@@ -1157,6 +1206,7 @@ i32 nested = unsafe { echo(33) };
                 &|reservations| build.aggregate(reservations),
                 &|module, item, arm, _| build.reference_cfg(module, item, arm),
                 None,
+                super::PartitionMetadata::Full,
             )
             .unwrap()
             .to_text(),
@@ -2894,6 +2944,7 @@ select = overload {
                 }
             },
             None,
+            super::PartitionMetadata::Full,
         )
         .unwrap_err();
         assert!(
@@ -6617,6 +6668,7 @@ fn detached_project_llvm_initializes_interleaved_namespace_diamond_once() {
             &|reservations| build.aggregate(reservations),
             &|module, item, arm, _| build.reference_cfg(module, item, arm),
             None,
+            super::PartitionMetadata::Full,
         )
         .unwrap_err();
         assert_eq!(
