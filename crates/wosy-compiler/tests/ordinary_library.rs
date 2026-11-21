@@ -639,6 +639,15 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
         .replace("i32(u64, bool) inspect_checked = fn(count, flag)",
             "i32(u64, bool, u8[]) inspect_checked = fn(count, flag, buffer)")
         .replace("make_checked(count, flag)", "make_checked(count, flag, buffer)");
+    let wrap = |text: &str| text.replace("received, status = make_checked(count, flag);",
+        "received, status = pass_checked(count, flag);")
+        .replace("i32(u64, bool) inspect_checked", "(*Packet, bool)(u64, bool) pass_checked = fn(count, flag) {\n\t*Packet forwarded, bool marker = make_checked(count, flag);\n\tforwarded, marker\n};\ni32(u64, bool) inspect_checked");
+    let wrapper = wrap(&mixed_descriptor);
+    let wrapper_passive = wrap(&projecting_length);
+    let wrapper_consuming = wrap(&consuming);
+    let wrapper_aliased = wrapper.replace("forwarded, marker\n};", "*Packet moved = forwarded; moved, marker\n};");
+    let wrapper_overwritten = wrapper.replace("forwarded, marker\n};", "forwarded = null; forwarded, marker\n};");
+    let wrapper_two_callers = wrapper.replace("%%end", "i32(u64, bool) other = fn(count, flag) { *Packet received, bool status = pass_checked(count, flag); if (received != null && status) { 3 } else { 0 } };\n%%end");
     let app = source("private_checked_backing", "src/main.w");
     let values = source("package", "src/values.w");
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
@@ -654,6 +663,9 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
             (aliased_nullable.as_str(), false, false), (nullable_descriptor.as_str(), false, false),
             (mixed_descriptor.as_str(), true, false), (competing_mixed.as_str(), false, false),
             (missing_failure_receipt.as_str(), false, false), (competing_formal.as_str(), false, false),
+            (wrapper.as_str(), true, false), (wrapper_aliased.as_str(), false, false),
+            (wrapper_overwritten.as_str(), false, false), (wrapper_two_callers.as_str(), false, false),
+            (wrapper_passive.as_str(), true, false), (wrapper_consuming.as_str(), false, false),
         ] {
             let (inputs, order) = if qualified {
                 (vec![(declarations(&app, text), vec![namespace("imported", &values)]),
@@ -678,11 +690,28 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
             let producer = module.get_function(&function_with_suffix(&module, "make_checked")).unwrap();
             let consumer = module.get_function(&function_with_suffix(&module, "inspect_checked")).unwrap();
             let consumer_ir = consumer.print_to_string().to_string();
+            if text.contains("pass_checked") {
+                let wrapper = module.get_function(&function_with_suffix(&module, "pass_checked")).unwrap();
+                let wrapper_ir = wrapper.print_to_string().to_string();
+                if expected_transport {
+                    assert_eq!(wrapper.get_linkage(), inkwell::module::Linkage::Internal);
+                    let original_slot = wrapper.get_nth_param(wrapper.count_params() - 1).unwrap().print_to_string().to_string();
+                    let calls = wrapper_ir.lines().filter(|line| line.contains("checked_backing_call = call")).collect::<Vec<_>>();
+                    assert_eq!(calls.len(), 1, "{wrapper_ir}");
+                    assert!(calls[0].contains(&format!("{})", original_slot.trim())), "{wrapper_ir}");
+                    assert!(!wrapper_ir.contains("checked_backing_out"), "{wrapper_ir}");
+                    assert!(!wrapper_ir.contains("checked_backing_base"), "{wrapper_ir}");
+                    assert!(!wrapper_ir.contains("@__wosy_core_free"), "{wrapper_ir}");
+                } else {
+                    assert_ne!(wrapper.get_linkage(), inkwell::module::Linkage::Internal);
+                    assert!(!wrapper_ir.contains("checked_backing_call"), "{wrapper_ir}");
+                }
+            }
             if expected_transport {
                 let producer_ir = producer.print_to_string().to_string();
                 assert_eq!(producer.count_params(), 3);
                 assert_eq!(producer.get_linkage(), inkwell::module::Linkage::Internal);
-                let mixed = text == mixed_descriptor;
+                let mixed = text == mixed_descriptor || text == wrapper.as_str();
                 assert_eq!(producer_ir.matches("store ptr %allocation, ptr").count(), if mixed { 1 } else { 2 }, "{producer_ir}");
                 assert_eq!(producer_ir.matches("call void @__wosy_core_free").count(), usize::from(mixed), "{producer_ir}");
                 if mixed {
