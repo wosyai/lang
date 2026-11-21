@@ -201,17 +201,29 @@ ReadLineStatus(u8) _read_line_zero_capacity = fn(first) {
 	u64 count = zero;
 	bool complete = false;
 	unsafe { count, complete = read_into(&?*view, one); };
-	if (!complete) { status = ReadLineStatus::io_error; reading = false; };
-	if (complete && count == zero) { reading = false; };
-	if (complete && count != zero && *view == lf) { pending_cr = false; reading = false; };
-	if (complete && count != zero && *view != lf && pending_cr) {
-		status = _read_line_capacity_status(length, max_bytes, status);
-		if (length < max_bytes) { bytes[length] = cr; length = length + one; };
-	};
-	if (complete && count != zero && *view != lf) { pending_cr = *view == cr; };
-	if (complete && count != zero && *view != lf && *view != cr) {
-		status = _read_line_capacity_status(length, max_bytes, status);
-		if (length < max_bytes) { bytes[length] = *view; length = length + one; };
+	if (!complete) {
+		status = ReadLineStatus::io_error;
+		reading = false;
+	} else {
+		if (count == zero) {
+			reading = false;
+		} else {
+			u8 byte = *view;
+			if (byte == lf) {
+				pending_cr = false;
+				reading = false;
+			} else {
+				if (pending_cr) {
+					status = _read_line_capacity_status(length, max_bytes, status);
+					if (length < max_bytes) { bytes[length] = cr; length = length + one; };
+				};
+				pending_cr = byte == cr;
+				if (!pending_cr) {
+					status = _read_line_capacity_status(length, max_bytes, status);
+					if (length < max_bytes) { bytes[length] = byte; length = length + one; };
+				};
+			};
+		};
 	};
 	if (status == ReadLineStatus::limit_exceeded) { reading = false; };
 	bytes, length, pending_cr, reading, status
