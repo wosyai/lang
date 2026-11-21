@@ -1781,6 +1781,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     BTreeSet::new(),
                 );
                 let root = self.place_root(place, place_ordinal);
+                let exposed = match (&calls.named_place_roots, root.place) {
+                    (NamedPlaceRootFacts::Prepared(roots), ScalarPlace::Name { .. }) => {
+                        match roots.get(&root.ordinal) {
+                            Some(NamedPlaceRootIdentity::Lexical(binding)) => Some(binding.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                self.proof_points.raw_address_exposures.push((value, exposed));
                 if let Some(&pointer) = self.dereference_points.get(&root.ordinal) {
                     self.aggregate_facts.receipt_loan_sinks.insert(value, vec![pointer]);
                 } else if let ScalarPlace::Name { span, .. } = root.place {

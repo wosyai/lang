@@ -510,3 +510,49 @@ fn prepared_address_creation_uses_root_and_pointer_facts_on_both_routes_and_layo
         }
     }
 }
+
+#[test]
+fn raw_address_exposure_records_exact_lexical_roots_and_an_unknown_dereference() {
+    let text = r#"%%start
+unit(u8[2], u64, *?u8) inspect = fn(cells, index, view) {
+    u8 cell = 7;
+    unsafe {
+        &?cells[index];
+        &?cell;
+        &?*view;
+    };
+};
+%%end"#;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let (results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let [(0, result)] = results.as_slice() else { panic!("expected one source body") };
+        let [(indexed, Some(cells)), (direct, Some(cell)), (dereference, None)] =
+            result.proof_points.raw_address_exposures.as_slice()
+        else {
+            panic!("expected two lexical roots and one unknown exposure");
+        };
+        let ScalarItem::Function(function) = &program.items[0] else { panic!("expected function") };
+        assert_eq!(cells.declaration_span, function.parameter_spans[0]);
+        assert_eq!(cell.declaration_span.start, text.find("cell =").unwrap() as u32);
+        assert_eq!(cells.source, program.source);
+        assert_eq!(cell.source, program.source);
+        assert!(indexed < direct && direct < dereference);
+        for (id, text_start) in [(indexed, "&?cells[index]"), (direct, "&?cell;"), (dereference, "&?*view")] {
+            let point = &result.cfg.points[id.0];
+            assert!(matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::RawAddress { .. })));
+            assert_eq!(point.source_span.range.start, text.find(text_start).unwrap() as u32);
+        }
+        let public = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
+    }
+}
