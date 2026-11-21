@@ -258,6 +258,10 @@ fn resolve_scoped_type(
             length_span: *length_span,
             span: *span,
         },
+        ScalarType::RuntimeArray { element, span } => ScalarType::RuntimeArray {
+            element: Box::new(resolve_scoped_type(element, names, generics)),
+            span: *span,
+        },
         ScalarType::Callable {
             outputs,
             parameters,
@@ -1083,6 +1087,12 @@ fn resolve_scoped_type_in_project(
             )),
             length: *length,
             length_span: *length_span,
+            span: *span,
+        },
+        ScalarType::RuntimeArray { element, span } => ScalarType::RuntimeArray {
+            element: Box::new(resolve_scoped_type_in_project(
+                element, declarations, current_module, generics,
+            )),
             span: *span,
         },
         ScalarType::Callable {

@@ -1032,12 +1032,12 @@ fn uneven_checked_dereference_move_preserves_both_parent_loans() {
 #[test]
 fn singleton_checked_field_move_excludes_only_its_traversed_loan() {
     let move_text = "Payload moved = (*writer).nested;";
-    let overlap_text = "*Payload alias = &(*writer).nested;";
+    let overlap_text = "*Holder alias = &(*writer);";
     let second_text = "Payload again = (*writer).nested;";
     for (body, conflict) in [
         (format!("{move_text} i32 observed = (*writer).sibling; observed; moved"), None),
-        (format!("{overlap_text} {move_text} i32 seen = (*alias).value; seen; moved"),
-            Some((move_text, "(*writer).nested", overlap_text, "&(*writer).nested"))),
+        (format!("{overlap_text} {move_text} i32 seen = (*alias).sibling; seen; moved"),
+            Some((move_text, "(*writer).nested", overlap_text, "&(*writer)"))),
         (format!("{move_text} {second_text} again; moved"),
             Some((second_text, "(*writer).nested", move_text, "(*writer).nested"))),
     ] {

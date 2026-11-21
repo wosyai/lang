@@ -2443,7 +2443,7 @@ leaf = overload {
 };
 *u8(*?u8, *u8) relay = fn(data, foreign) { leaf(data, foreign) };
 *u32(*?u32, *u32) borrowed_relay = fn(data, foreign) { leaf(data, foreign) };
-*u8(*?u8) unknown = fn(data) { u8 value = 0; &value };
+*u8(*?u8) unknown = fn(data) { u8 value = 0; if (data == null) { value = 0; }; &value };
 *u8(*?u8) consuming = fn(data) {
     u8 value = 0;
     unsafe { value = core.load<u8>(data); core.free(data); };
@@ -2500,30 +2500,30 @@ leaf = overload {
     #[test]
     fn passive_carrier_consumes_a_whole_move_in_the_exact_selected_reader() {
         let text = "%%start
-struct Input { *?u8 data; u64 length; }
-struct Other { *?u32 data; u64 length; }
-struct Ambiguous { *?u8 data; *?u8 spare; }
-*u8(Input) read = fn(input) {
+struct InputBuffer { *?u8 data; u64 length; }
+struct OtherBuffer { *?u32 data; u64 length; }
+struct AmbiguousBuffer { *?u8 data; *?u8 spare; }
+*u8(InputBuffer) read = fn(input) {
     u8 out = 0;
     if (input.data != null) {
         unsafe { out = core.load<u8>(input.data); };
     };
     &out
 };
-*u32(Other) consume = fn(input) {
+*u32(OtherBuffer) consume = fn(input) {
     u32 out = 0;
     unsafe { out = core.load<u32>(input.data); core.free(input.data); };
     &out
 };
-*u8(Ambiguous) ambiguous = fn(input) {
+*u8(AmbiguousBuffer) ambiguous = fn(input) {
     u8 out = 0;
     unsafe { out = core.load<u8>(input.data); };
     &out
 };
 pick = overload {
-    *u8(Input) => fn(input) { read(input) };
-    *u32(Other) => fn(input) { consume(input) };
-    *u8(Ambiguous) => fn(input) { ambiguous(input) };
+    *u8(InputBuffer) => fn(input) { read(input) };
+    *u32(OtherBuffer) => fn(input) { consume(input) };
+    *u8(AmbiguousBuffer) => fn(input) { ambiguous(input) };
 };
 %%end";
         for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {

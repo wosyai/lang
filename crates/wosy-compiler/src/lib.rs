@@ -220,8 +220,11 @@ enum ReadLineStatus { line; eof; }
 
         let serialized = serde_json::to_vec(&output.result.canonical_cst().snapshot())
             .expect("serialize canonical CST snapshot");
-        let snapshot: CanonicalCstSnapshot =
-            serde_json::from_slice(&serialized).expect("deserialize canonical CST snapshot");
+        let mut deserializer = serde_json::Deserializer::from_slice(&serialized);
+        deserializer.disable_recursion_limit();
+        let snapshot = <CanonicalCstSnapshot as serde::Deserialize>::deserialize(&mut deserializer)
+            .expect("deserialize canonical CST snapshot");
+        deserializer.end().expect("canonical CST snapshot ends");
         let canonical = CanonicalCstRoot::from_snapshot(snapshot);
         assert_eq!(
             canonical.root.text().to_string(),

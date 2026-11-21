@@ -148,7 +148,7 @@ fn actual_project_specialization_reuses_one_inventory_and_retains_imported_arm_p
         assert_eq!(scope.counts().module_copies, 0);
         assert_eq!(scope.counts().module_constructions, 0);
         assert_eq!(scope.counts().cfg_copies, 2);
-        assert_eq!(scope.counts().struct_copies, 4);
+        assert_eq!(scope.counts().struct_copies, 2);
         assert_eq!(stages.counts().copy_specialization, 2);
         drop(stages);
         drop(scope);
