@@ -498,7 +498,7 @@ i32(i32) use_address = fn(input) {
 	*Packet received = null;
 	i32 marker = 0;
 	received, marker = manufacture(input);
-	if (received != null) { unsafe { &?(*received).value; }; };
+	if (received != null) { unsafe { &?*received; }; };
 	marker
 };
 i32(*Packet) look = fn(value) { if (value != null) { (*value).value } else { 0 } };
