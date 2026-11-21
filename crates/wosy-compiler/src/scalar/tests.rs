@@ -1996,6 +1996,76 @@ fn explicit_named_reborrow_accepts_sharing_last_use_ancestors_and_exclusive_arms
 }
 
 #[test]
+fn post_join_parent_reads_preserve_the_authoritative_origin_input() {
+    for (body, expected) in [
+        (
+            "u8 first = 1; *!u8 parent = &!first;
+             if (choose) { u8 inside = 9; inside; };",
+            &["&!first"][..],
+        ),
+        (
+            "u8 first = 1; u8 second = 2; *!u8 parent = null;
+             if (choose) { parent = &!first; } else { parent = &!second; };",
+            &["&!first", "&!second"][..],
+        ),
+    ] {
+        let text = format!("%%start
+unit(bool) check_join = fn(choose) {{
+    {body}
+    u8 observed = *parent;
+    observed;
+}};
+%%end");
+        let read = text.find("*parent;").unwrap() as u32;
+        let expected = expected
+            .iter()
+            .map(|spelling| text.find(spelling).unwrap() as u32)
+            .collect::<BTreeSet<_>>();
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("expected callable");
+            };
+            let cfg = &function.reference_cfg;
+            let pointer = cfg
+                .initial_points
+                .iter()
+                .find_map(|point| match &point.kind {
+                    CfgPointKind::ReadPlace { pointer_point: Some(pointer), .. }
+                        if point.source_span.range.start == read => Some(*pointer),
+                    _ => None,
+                })
+                .expect("canonical checked-pointee read pointer");
+            let original = &cfg.initial_points[pointer.0];
+            let CfgPointKind::Read { binding } = &original.kind else {
+                panic!("expected named parent read");
+            };
+            let parent = text.find("parent =").unwrap() as u32;
+            assert_eq!(binding.declaration_span, ByteSpan::new(parent, parent + 6));
+            assert!(original.possible_origins.is_none());
+            let origins = cfg.points[pointer.0].possible_origins.as_ref().unwrap();
+            let found = origins
+                .iter()
+                .map(|origin| match &cfg.facts[origin.0] {
+                    ReferenceOrigin::Fresh { loan, .. } => {
+                        assert!(loan.parent.is_none());
+                        assert_eq!(loan.mode, ScalarReferenceMutability::Mutable);
+                        loan.creation_span.start
+                    }
+                    other => panic!("unexpected origin {other:?}"),
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(origins.len(), expected.len());
+            assert_eq!(found, expected);
+        }
+    }
+}
+
+#[test]
 fn checked_aggregate_conflicts_label_the_initiating_loan_in_both_pipelines() {
     for (text, primary, origin) in [
             ("%%start\nstruct Payload { u8 value; }\nunit() f = fn { Payload specimen = { .value = 1; }; *!Payload writer = &!specimen; Payload taken = *writer; Payload again = *writer; taken; again; };\n%%end", "*writer; taken", "&!specimen"),
