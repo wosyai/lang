@@ -424,7 +424,7 @@ fn explicit_proof_module_checks_unused_pure_callable_over_arbitrary_inputs() {
     assert_eq!(proof("restricted", &declarations), ScalarModuleProofOutcome::Proved);
     assert_eq!(
         proof("bounded", &format!("{declarations}\nu8 real = identity(7);")),
-        ScalarModuleProofOutcome::Unsupported,
+        ScalarModuleProofOutcome::Proved,
     );
     assert!(matches!(
         proof("invalid", &format!("{base}\nproof invalid for identity(input) -> (out) ensures (out <= 256) {{}}")),
@@ -547,6 +547,8 @@ fn explicit_module_proof_uses_all_and_only_resolved_actual_call_contexts() {
         ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
     );
     assert_eq!(proof("use(5); use(7);", "", "out <= 7"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(proof("u8 first = project(5); u8 second = project(7);", "", "out <= 7"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(proof("u8 first = project(5); u8 second = project(7);", "", "out <= 6"), ScalarModuleProofOutcome::Refuted);
     assert_eq!(proof("", "", "out <= 7"), ScalarModuleProofOutcome::Refuted);
     assert_eq!(proof("use(5); use(7);", "", "out <= 6"), ScalarModuleProofOutcome::Refuted);
     assert_eq!(
@@ -558,7 +560,7 @@ fn explicit_module_proof_uses_all_and_only_resolved_actual_call_contexts() {
         ScalarModuleProofOutcome::Proved,
     );
     assert_eq!(
-        proof("use(5); u8 unknown = project(1);", "", "out <= 5"),
+        proof("use(5); u8 unknown = project(1); unknown = 2;", "", "out <= 5"),
         ScalarModuleProofOutcome::Unsupported,
     );
 }
@@ -566,13 +568,13 @@ fn explicit_module_proof_uses_all_and_only_resolved_actual_call_contexts() {
 #[test]
 fn explicit_unused_proof_checks_show_claims_against_each_return_partition() {
     let identity = source();
-    let proof = |steps: &str, invocation: &str| check_scalar_module_proof(
+    let proof = |steps: &str, invocation: &str, goal: u8| check_scalar_module_proof(
         identity.clone(),
         "bounded",
         vec![ScalarProofModuleInput {
             source: identity.clone(),
             text: format!(
-                "%%start\nu8(u8) clamp = fn(value) {{ if (value > 10) {{ 10 }} else {{ value }} }};\n                unit() start = fn {{ u8 r = clamp(7); core.require(r <= 10, {OUTPUT}); }};\n                {invocation}\n                proof bounded for clamp(input) -> (out) ensures (out <= 10) {{ {steps} }}\n%%end",
+                "%%start\nu8(u8) clamp = fn(value) {{ if (value > 10) {{ 10 }} else {{ value }} }};\n                unit() start = fn {{ u8 r = clamp(7); core.require(r <= 10, {OUTPUT}); }};\n                {invocation}\n                proof bounded for clamp(input) -> (out) ensures (out <= {goal}) {{ {steps} }}\n%%end",
             ),
             namespaces: Vec::new(),
         }],
@@ -580,12 +582,27 @@ fn explicit_unused_proof_checks_show_claims_against_each_return_partition() {
         ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
     );
     let valid = "if (input > 10) { core.show(out == 10); } else { core.show(out == input); }";
-    assert_eq!(proof(valid, ""), ScalarModuleProofOutcome::Proved);
-    assert_eq!(proof(&valid.replace("> 10", "> 11"), ""), ScalarModuleProofOutcome::Refuted);
-    assert_eq!(proof(&valid.replace("out == 10", "out == 9"), ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(proof(valid, "", 10), ScalarModuleProofOutcome::Proved);
+    assert_eq!(proof(&valid.replace("> 10", "> 11"), "", 10), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(proof(&valid.replace("out == 10", "out == 9"), "", 10), ScalarModuleProofOutcome::Refuted);
     assert_eq!(
-        proof(&valid.replace("core.show(out == input);", "core.show(out == input); core.show(out == input);"), ""),
+        proof(&valid.replace("core.show(out == input);", "core.show(out == input); core.show(out == input);"), "", 10),
         ScalarModuleProofOutcome::Unsupported,
     );
-    assert_eq!(proof(valid, "start();"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(proof(valid, "start();", 10), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(proof(valid, "", 9), ScalarModuleProofOutcome::Refuted);
+}
+
+#[test]
+fn main_initializer_installs_pure_scalar_call_results_from_prepared_bindings() {
+    let base = "i8(i8) bounded = fn(value) { if (value < 0) { value } else { 0 } };";
+    let text = format!("{base} i8 result = bounded(-128); core.require(result == -128, {OUTPUT});");
+    assert_eq!(check_scoped(&text, ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::Passed);
+    let text = format!("{base} i8 result = bounded(10); core.narrow(result == 10, {OUTPUT});");
+    assert!(matches!(
+        check(&text),
+        ScalarCheckerOutcome::Failed(failure) if failure.operation == ScalarCheckerOperation::Narrow,
+    ));
+    let text = format!("{base} i8 argument = -128; i8 result = bounded(argument); core.require(result < 0, {OUTPUT});");
+    assert_eq!(check(&text), ScalarCheckerOutcome::Unsupported);
 }

@@ -373,9 +373,19 @@ fn walk_package_initialization(
             }
             let value = match (&receiver.ty, &binding.value) {
                 (ScalarType::Bool, ScalarExpression::Boolean { value, .. }) => InitializerValue::Boolean(*value),
-                (ty, expression) if is_integer_type(ty) => InitializerValue::Integer(
-                    concrete_integer_literal(expression).ok_or(ProjectCheck::Unsupported)?,
-                ),
+                (ty, expression) if is_integer_type(ty) => {
+                    if let Some(value) = concrete_integer_literal(expression) {
+                        InitializerValue::Integer(value)
+                    } else if matches!(expression, ScalarExpression::Call { .. }) {
+                        let ActualCallResult::Integer(value) =
+                            run_initializer_call(topology, actual, outputs.primary, ty)? else {
+                                return Err(ProjectCheck::Unsupported);
+                            };
+                        InitializerValue::Integer(Cow::Owned(value))
+                    } else {
+                        return Err(ProjectCheck::Unsupported);
+                    }
+                }
                 _ => return Err(ProjectCheck::Unsupported),
             };
             storage.insert(receiver.span, value);
@@ -439,16 +449,27 @@ fn check_initializer_expression(
         }
         return Ok(());
     }
+    run_initializer_call(topology, actual, expression, &ScalarType::Unit).map(drop)
+}
+
+fn run_initializer_call(
+    topology: &ModuleInitializationTopology,
+    actual: &mut ActualCalls<'_, impl ActualIntegerObserver>,
+    occurrence: OccurrenceOrdinal,
+    expected: &ScalarType,
+) -> Result<ActualCallResult, ProjectCheck> {
     let Some(ModuleInitializationCallTarget::Direct {
         declaration,
         concrete: ConcreteCallSelection::Declaration,
-    }) = topology.call_targets.get(&expression) else {
+    }) = topology.call_targets.get(&occurrence) else {
         return Err(ProjectCheck::Unsupported);
     };
-    let signature = topology.checked_call_signatures.get(&expression).ok_or(ProjectCheck::MissingRootOccurrences)?;
-    let argument = exact_integer_call_argument(structure, expression, |_, _| None);
-    actual.run(structure, expression, signature, argument, &declaration.source, declaration.range, &ScalarType::Unit)?;
-    Ok(())
+    let signature = topology.checked_call_signatures.get(&occurrence).ok_or(ProjectCheck::MissingRootOccurrences)?;
+    let argument = exact_integer_call_argument(&topology.structure, occurrence, |_, _| None);
+    if *expected != ScalarType::Unit && argument.is_none() {
+        return Err(ProjectCheck::Unsupported);
+    }
+    actual.run(&topology.structure, occurrence, signature, argument, &declaration.source, declaration.range, expected)
 }
 
 enum InitializerValue<'a> {
