@@ -34,6 +34,7 @@ impl IntegerRelation {
         Some(Self { less, equal, greater })
     }
 
+    #[cfg(test)]
     pub(super) fn accepts(self, comparison: Ordering) -> bool {
         match comparison {
             Ordering::Less => self.less,
@@ -64,6 +65,7 @@ impl IntegerSet {
         self.0.is_empty()
     }
 
+    #[cfg(test)]
     pub(super) fn every(&self, relation: IntegerRelation, bound: &BigInt) -> bool {
         self.0.iter().all(|interval| {
             (relation.less || &interval.first >= bound)

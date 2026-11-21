@@ -51,11 +51,13 @@ pub(super) struct CheckerOutput<'a> {
     files_literal: Option<ByteSpan>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct CheckerFileOutput<'a> {
     pub(super) path: &'a ScalarExpression,
     pub(super) content: CheckerFileContent<'a>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum CheckerFileContent<'a> {
     State(&'a ScalarExpression),
     Text(&'a ScalarExpression),

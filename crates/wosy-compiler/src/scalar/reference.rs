@@ -6039,7 +6039,7 @@ pub(super) struct ModuleStorageInstall {
     pub(super) consumer: Option<OccurrenceOrdinal>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-checker"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CheckerIntegerCallOrigin {
     pub(super) binding: ReferenceBindingId,
@@ -6048,7 +6048,7 @@ pub(super) struct CheckerIntegerCallOrigin {
     pub(super) argument: CheckerIntegerCallArgument,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-checker"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum CheckerIntegerCallArgument {
     Literal(BigInt),
@@ -6061,17 +6061,17 @@ pub(super) struct OccurrenceStructure {
     pub(super) blocks: Vec<BlockRegion>,
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_directives: HashMap<OccurrenceOrdinal, super::checker_directive::PreparedCheckerDirective>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_branches: HashMap<OccurrenceOrdinal, super::checker_flow::CheckerPredicate>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_literals: HashMap<OccurrenceOrdinal, BigInt>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_direct_targets: HashMap<OccurrenceOrdinal, (usize, usize)>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_call_locals: HashMap<(BlockOrdinal, usize), CheckerIntegerCallOrigin>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
@@ -6092,17 +6092,17 @@ impl OccurrenceStructure {
             blocks: vec![BlockRegion::new(span, Vec::new())],
             edges: HashMap::new(),
             checked_types: CheckedOccurrenceTypes::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "internal-checker"))]
             checker_directives: HashMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "internal-checker"))]
             checker_branches: HashMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "internal-checker"))]
             checker_integer_literals: HashMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "internal-checker"))]
             checker_direct_targets: HashMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "internal-checker"))]
             checker_integer_locals: HashMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "internal-checker"))]
             checker_integer_call_locals: HashMap::new(),
             literal_fields: HashMap::new(),
             module_storage_uses: HashMap::new(),
@@ -6169,7 +6169,7 @@ pub(super) struct RootOutputType {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct CallableBoundary {
     pub(super) parameters: Vec<ParameterSlot>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_parameter_bindings: Option<Vec<ReferenceBindingId>>,
     pub(super) results: Vec<DeclaredResultSlot>,
     pub(super) root_outputs: Vec<RootOutputType>,
@@ -6753,7 +6753,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         self.expression_at_with_initializer_statement(expression, names, types, parent, edge, false)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     fn checker_predicate(
         &self,
         expression: &ScalarExpression,
@@ -6807,7 +6807,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             );
             self.structure.checked_types.expressions.insert(ordinal, ty);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "internal-checker"))]
         if let Some(marker) = self.occurrence_typing.take_checker_directive(expression) {
             use super::checker_directive::PreparedCheckerDirective;
             let ScalarExpression::Call { arguments, .. } = expression else {
@@ -6827,7 +6827,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             );
             return Ok(ordinal);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "internal-checker"))]
         if self.occurrence_typing.checker_directives_enabled()
             && matches!(edge, OccurrenceEdge::Condition)
             && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)
@@ -6836,7 +6836,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 self.structure.checker_branches.insert(ordinal, predicate);
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "internal-checker"))]
         if self.occurrence_typing.checker_directives_enabled()
             && (matches!(
                 edge,
@@ -7063,7 +7063,7 @@ impl CallableTargetResolver<'_> {
         names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
         signature: Option<&CheckedCallSignature>,
-        #[cfg(test)] ordinary_origin: &mut Option<(usize, usize)>,
+        #[cfg(any(test, feature = "internal-checker"))] ordinary_origin: Option<&mut Option<(usize, usize)>>,
     ) -> Result<(ResolvedCallTarget, bool), ReferenceAnalysisError> {
         let ScalarExpression::Call {
             receiver,
@@ -7124,9 +7124,11 @@ impl CallableTargetResolver<'_> {
                             checked_overload_selection(signature, origin)?.clone(),
                         ),
                     }),
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "internal-checker"))]
                     CallDeclaration::Function(source, declaration_span, CallFunctionKind::Ordinary, origin) => {
-                        *ordinary_origin = Some(origin);
+                        if let Some(ordinary_origin) = ordinary_origin {
+                            *ordinary_origin = Some(origin);
+                        }
                         Some(ResolvedCallTarget::ModuleCallable {
                             source: source.clone(),
                             declaration_span,
@@ -7163,13 +7165,13 @@ impl CallableWalk<'_> {
         types: &BTreeMap<String, ScalarType>,
         signature: Option<&CheckedCallSignature>,
         reserve_legacy: bool,
-        #[cfg(test)] ordinary_origin: &mut Option<(usize, usize)>,
+        #[cfg(any(test, feature = "internal-checker"))] ordinary_origin: Option<&mut Option<(usize, usize)>>,
     ) -> Result<(), ReferenceAnalysisError> {
         use std::collections::btree_map::Entry;
 
         let (target, declared_unsafe) = self
             .target_resolver
-            .resolve(expression, names, types, signature, #[cfg(test)] ordinary_origin)?;
+            .resolve(expression, names, types, signature, #[cfg(any(test, feature = "internal-checker"))] ordinary_origin)?;
         if declared_unsafe {
             self.declared_unsafe_calls.insert(ordinal.0);
         }
@@ -7239,7 +7241,7 @@ fn initialization_call_target(
     names: &BTreeMap<String, WalkBinding>,
     types: &BTreeMap<String, ScalarType>,
     signature: Option<&CheckedCallSignature>,
-    #[cfg(test)] ordinary_origin: &mut Option<(usize, usize)>,
+    #[cfg(any(test, feature = "internal-checker"))] ordinary_origin: Option<&mut Option<(usize, usize)>>,
 ) -> Result<ModuleInitializationCallTarget, ReferenceAnalysisError> {
     use ModuleInitializationCallTarget as Target;
     let ScalarExpression::Call {
@@ -7292,8 +7294,10 @@ fn initialization_call_target(
                             .collect(),
                     },
                     CallFunctionKind::Ordinary => {
-                        #[cfg(test)]
-                        { *ordinary_origin = Some(origin); }
+                        #[cfg(any(test, feature = "internal-checker"))]
+                        if let Some(ordinary_origin) = ordinary_origin {
+                            *ordinary_origin = Some(origin);
+                        }
                         Target::Direct {
                             declaration,
                             concrete: ConcreteCallSelection::Declaration,
@@ -7336,7 +7340,7 @@ impl StructuralWalker<'_, '_> {
                 }
                 match &mut self.mode {
                     WalkMode::Callable(callable) => {
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "internal-checker"))]
                         let mut ordinary_origin = None;
                         callable.register_call(
                             ordinal,
@@ -7345,14 +7349,12 @@ impl StructuralWalker<'_, '_> {
                             types,
                             self.checked_call_signatures.get(&ordinal),
                             self.reserve_legacy_occurrences[ordinal.0],
-                            #[cfg(test)]
-                            &mut ordinary_origin,
+                            #[cfg(any(test, feature = "internal-checker"))]
+                            self.occurrence_typing.checker_directives_enabled().then_some(&mut ordinary_origin),
                         )?;
-                        #[cfg(test)]
-                        if self.occurrence_typing.checker_directives_enabled() {
-                            if let Some(origin) = ordinary_origin {
-                                self.structure.checker_direct_targets.insert(ordinal, origin);
-                            }
+                        #[cfg(any(test, feature = "internal-checker"))]
+                        if let Some(origin) = ordinary_origin {
+                            self.structure.checker_direct_targets.insert(ordinal, origin);
                         }
                     }
                     WalkMode::CallableAllocationLength(resolver) => {
@@ -7361,8 +7363,8 @@ impl StructuralWalker<'_, '_> {
                             names,
                             types,
                             self.checked_call_signatures.get(&ordinal),
-                            #[cfg(test)]
-                            &mut None,
+                            #[cfg(any(test, feature = "internal-checker"))]
+                            None,
                         )?;
                         self.structural_calls.push(ordinal);
                         assert!(self
@@ -7374,7 +7376,7 @@ impl StructuralWalker<'_, '_> {
                         source,
                         declarations,
                     } => {
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "internal-checker"))]
                         let mut ordinary_origin = None;
                         let target = initialization_call_target(
                             source,
@@ -7383,14 +7385,12 @@ impl StructuralWalker<'_, '_> {
                             names,
                             types,
                             self.checked_call_signatures.get(&ordinal),
-                            #[cfg(test)]
-                            &mut ordinary_origin,
+                            #[cfg(any(test, feature = "internal-checker"))]
+                            self.occurrence_typing.checker_directives_enabled().then_some(&mut ordinary_origin),
                         )?;
-                        #[cfg(test)]
-                        if self.occurrence_typing.checker_directives_enabled() {
-                            if let Some(origin) = ordinary_origin {
-                                self.structure.checker_direct_targets.insert(ordinal, origin);
-                            }
+                        #[cfg(any(test, feature = "internal-checker"))]
+                        if let Some(origin) = ordinary_origin {
+                            self.structure.checker_direct_targets.insert(ordinal, origin);
                         }
                         if self.reserve_legacy_occurrences[ordinal.0]
                             && matches!(
@@ -7875,7 +7875,7 @@ impl StructuralWalker<'_, '_> {
         Ok(BindingOutputs { primary, secondary })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     fn checker_integer_call_argument(
         &self,
         binding: &ScalarBinding,
@@ -7937,7 +7937,7 @@ impl StructuralWalker<'_, '_> {
         } else {
             BindingInitialization::Outputs(self.binding_outputs(binding, position, scope)?)
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "internal-checker"))]
         let mut checker_local = match (&initialization, &self.mode) {
             (BindingInitialization::Outputs(outputs), WalkMode::Callable(callable))
                 if self.occurrence_typing.checker_directives_enabled()
@@ -7970,7 +7970,7 @@ impl StructuralWalker<'_, '_> {
                     block_span,
                     introduced_by_assignment: false,
                 };
-                #[cfg(test)]
+                #[cfg(any(test, feature = "internal-checker"))]
                 if let Some((callable, from_call)) = checker_local.take() {
                     let binding = lexical.reference_id(callable.source, callable.function_span);
                     let key = (position.block, position.item);
@@ -8526,7 +8526,7 @@ fn resolve_function_call_sites(
             ty: parameters[ordinal].clone(),
         })
         .collect::<Vec<_>>();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     let mut checker_parameter_bindings = resolver
         .occurrence_typing
         .checker_directives_enabled()
@@ -8537,7 +8537,7 @@ fn resolve_function_call_sites(
             block_span: function.body.span,
             introduced_by_assignment: false,
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "internal-checker"))]
         if let Some(bindings) = &mut checker_parameter_bindings {
             bindings.push(binding.reference_id(source, function.span));
         }
@@ -8573,7 +8573,7 @@ fn resolve_function_call_sites(
     };
     let boundary = CallableBoundary {
         parameters,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "internal-checker"))]
         checker_parameter_bindings,
         results: outputs
             .outputs

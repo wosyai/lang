@@ -5,11 +5,13 @@ use num_bigint::BigInt;
 use super::{
     checker_directive::CheckerOperation,
     control::{AssignmentReplacement, BindingInitialization, BindingRegion, BlockItemKind, BlockPosition, ConditionalRegion},
-    reference::{BlockOrdinal, CheckerIntegerCallArgument, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, PlainNameIdentity},
-    symbolic_integer::{IntegerRelation, IntegerSet},
+    reference::{BlockOrdinal, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, PlainNameIdentity},
+    symbolic_integer::IntegerSet,
     typecheck::is_integer_type,
     BinaryOperator, ReferenceBindingId, ScalarExpression, ScalarType, UnaryOperator,
 };
+#[cfg(test)]
+use super::{reference::CheckerIntegerCallArgument, symbolic_integer::IntegerRelation};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum CheckerPredicate {
@@ -79,6 +81,7 @@ impl<'a> IntegerComparison<'a> {
     }
 }
 
+#[cfg(test)]
 pub(super) struct ImportedLocal<'a> {
     pub(super) position: usize,
     pub(super) values: IntegerSet,
@@ -91,6 +94,8 @@ struct IntegerRoots<'a> {
     axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
     by_binding: HashMap<&'a ReferenceBindingId, usize>,
     parameters: usize,
+    reached_obligation: bool,
+    #[cfg(test)]
     imported_local: Option<ImportedLocal<'a>>,
 }
 
@@ -232,18 +237,22 @@ impl IntegerInputs {
         self.0.is_empty()
     }
 
+    #[cfg(test)]
     pub(super) fn row_count(&self) -> usize {
         self.0.len()
     }
 
+    #[cfg(test)]
     pub(super) fn includes(&self, coordinates: &[u128]) -> bool {
         self.includes_coordinates(coordinates)
     }
 
+    #[cfg(test)]
     pub(super) fn includes_signed(&self, coordinates: &[i128]) -> bool {
         self.includes_coordinates(coordinates)
     }
 
+    #[cfg(test)]
     fn includes_coordinates<T: Copy + Into<BigInt>>(&self, coordinates: &[T]) -> bool {
         self.0.iter().any(|row| {
             row.len() == coordinates.len()
@@ -286,12 +295,14 @@ pub(super) struct IntegerReturningPath<'a> {
     pub(super) axes: Vec<&'a ReferenceBindingId>,
 }
 
+#[cfg(test)]
 pub(super) struct IntegerBranchProof<'a> {
     pub(super) guard: CheckerPredicate,
     pub(super) then_claim: IntegerReturn<'a>,
     pub(super) else_claim: IntegerReturn<'a>,
 }
 
+#[cfg(test)]
 fn binding_satisfies(
     state: &IntegerInputs,
     axes: &[&ReferenceBindingId],
@@ -303,6 +314,7 @@ fn binding_satisfies(
     Some(state.0.iter().all(|row| row[index].every(relation, bound)))
 }
 
+#[cfg(test)]
 fn shows_return_equality(
     state: &IntegerInputs,
     axes: &[&ReferenceBindingId],
@@ -328,6 +340,7 @@ fn shows_return_equality(
     }
 }
 
+#[cfg(test)]
 impl IntegerReturningPath<'_> {
     pub(super) fn binding_satisfies(
         &self,
@@ -374,11 +387,18 @@ pub(super) enum ProofCoverage<T> {
     NoApplicableInputs,
 }
 
+#[cfg(test)]
 pub(super) fn check_integer_requirements(
     calls: &FunctionCallSites,
 ) -> Option<Result<(), IntegerCheckFailure<'_>>> {
-    run_integer_callable(calls, integer_tail_type(calls), None, None, None, None, None)
-        .map(|result| result.map(drop))
+    check_integer_requirement_activity(calls).map(|result| result.map(drop))
+}
+
+pub(super) fn check_integer_requirement_activity(
+    calls: &FunctionCallSites,
+) -> Option<Result<bool, IntegerCheckFailure<'_>>> {
+    run_integer_callable(calls, integer_tail_type(calls), None, None, #[cfg(test)] None, None, None)
+        .map(|result| result.map(|coverage| matches!(coverage, ProofCoverage::Applicable(true))))
 }
 
 pub(super) type ExactIntegerArgument<'a> = (&'a ScalarType, &'a BigInt);
@@ -436,11 +456,12 @@ pub(super) fn check_integer_requirements_at_entry<'a>(
     calls: &'a FunctionCallSites,
     arguments: &[&BigInt],
     handle_call: &mut ActualCallHandler<'a, '_>,
-) -> Option<Result<(), IntegerCheckFailure<'a>>> {
-    run_integer_callable(calls, None, None, None, None, Some(arguments), Some(handle_call))
-        .map(|result| result.map(drop))
+) -> Option<Result<bool, IntegerCheckFailure<'a>>> {
+    run_integer_callable(calls, None, None, None, #[cfg(test)] None, Some(arguments), Some(handle_call))
+        .map(|result| result.map(|coverage| matches!(coverage, ProofCoverage::Applicable(true))))
 }
 
+#[cfg(test)]
 pub(super) fn proves_requirement_with_imported_root_local(
     calls: &FunctionCallSites,
     local: ImportedLocal<'_>,
@@ -449,12 +470,13 @@ pub(super) fn proves_requirement_with_imported_root_local(
         return None;
     }
     match run_integer_callable(calls, integer_tail_type(calls), None, None, Some(local), None, None)? {
-        Ok(ProofCoverage::Applicable(())) => Some(true),
+        Ok(ProofCoverage::Applicable(_)) => Some(true),
         Ok(ProofCoverage::NoApplicableInputs) => None,
         Err(_) => Some(false),
     }
 }
 
+#[cfg(test)]
 pub(super) fn observe_integer_returns(
     calls: &FunctionCallSites,
 ) -> Option<Result<Vec<IntegerReturningPath<'_>>, IntegerCheckFailure<'_>>> {
@@ -472,11 +494,11 @@ fn observe_integer_returns_in_scope<'a>(
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
     let tail = integer_tail_type(calls)?;
     let mut paths = Vec::new();
-    match run_integer_callable(calls, Some(tail), entry_filter, Some(&mut paths), None, exact_arguments, None)? {
-        Ok(ProofCoverage::Applicable(())) if !paths.is_empty() => {
+    match run_integer_callable(calls, Some(tail), entry_filter, Some(&mut paths), #[cfg(test)] None, exact_arguments, None)? {
+        Ok(ProofCoverage::Applicable(_)) if !paths.is_empty() => {
             Some(Ok(ProofCoverage::Applicable(paths)))
         }
-        Ok(ProofCoverage::Applicable(())) => None,
+        Ok(ProofCoverage::Applicable(_)) => None,
         Ok(ProofCoverage::NoApplicableInputs) => Some(Ok(ProofCoverage::NoApplicableInputs)),
         Err(failure) => Some(Err(failure)),
     }
@@ -507,6 +529,7 @@ pub(super) fn exact_integer_return_at_entry(
     rest.iter().all(|path| singleton(path) == Some(value)).then(|| value.clone())
 }
 
+#[cfg(test)]
 pub(super) fn check_integer_return_bound<'a>(
     calls: &'a FunctionCallSites,
     operator: &BinaryOperator,
@@ -519,6 +542,7 @@ pub(super) fn check_integer_return_bound<'a>(
     }
 }
 
+#[cfg(test)]
 pub(super) fn check_integer_return_bound_where<'a>(
     calls: &'a FunctionCallSites,
     operator: &BinaryOperator,
@@ -528,6 +552,7 @@ pub(super) fn check_integer_return_bound_where<'a>(
     check_integer_return_bound_in_scope(calls, operator, bound, Some(entry_filter), None)
 }
 
+#[cfg(test)]
 pub(super) fn check_integer_return_bound_with_shows<'a>(
     calls: &'a FunctionCallSites,
     operator: &BinaryOperator,
@@ -538,6 +563,7 @@ pub(super) fn check_integer_return_bound_with_shows<'a>(
     check_integer_return_bound_in_scope(calls, operator, bound, entry_filter, Some(proof))
 }
 
+#[cfg(test)]
 fn check_integer_return_bound_in_scope<'a>(
     calls: &'a FunctionCallSites,
     operator: &BinaryOperator,
@@ -579,15 +605,16 @@ fn run_integer_callable<'a>(
     tail: Option<&'a ScalarType>,
     entry_filter: Option<&[CheckerPredicate]>,
     returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
-    imported_local: Option<ImportedLocal<'a>>,
+    #[cfg(test)] imported_local: Option<ImportedLocal<'a>>,
     exact_arguments: Option<&[&BigInt]>,
     mut handle_call: Option<&mut ActualCallHandler<'a, '_>>,
-) -> Option<Result<ProofCoverage<()>, IntegerCheckFailure<'a>>> {
+) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let boundary = &calls.boundary;
     let checker_parameters = boundary.checker_parameter_bindings.as_deref()?;
     debug_assert_eq!(boundary.parameters.len(), checker_parameters.len());
     let mut roots = IntegerRoots {
         parameters: boundary.parameters.len(),
+        #[cfg(test)]
         imported_local,
         ..IntegerRoots::default()
     };
@@ -622,12 +649,13 @@ fn run_integer_callable<'a>(
         }
     }
     let result = walk_integer_block(calls, &mut roots, calls.structure.root, IntegerInputs(vec![row]), tail, returns, &mut handle_call)?;
+    #[cfg(test)]
     if roots.imported_local.is_some() {
         return None;
     }
     match result {
         IntegerControl::Continue(_) | IntegerControl::Returned => {
-            Some(Ok(ProofCoverage::Applicable(())))
+            Some(Ok(ProofCoverage::Applicable(roots.reached_obligation)))
         }
         IntegerControl::Fail(failure) => Some(Err(failure)),
     }
@@ -652,6 +680,7 @@ fn walk_integer_block<'a>(
             BlockItemKind::Evaluation { expression } => {
                 if let Some(directive) = structure.checker_directives.get(&expression) {
                     let (passing, failing, _) = path.split(roots, directive.predicate.as_ref()?)?;
+                    roots.reached_obligation = true;
                     match directive.operation {
                         CheckerOperation::Require if !failing.is_unreachable() => {
                             return Some(IntegerControl::Fail(IntegerCheckFailure {
@@ -749,6 +778,7 @@ fn walk_integer_block<'a>(
                 path = path.overwrite(axis, value);
             }
             BlockItemKind::Binding(ref binding) => {
+                #[cfg(test)]
                 if block == structure.root
                     && roots.imported_local.as_ref().is_some_and(|local| local.position == item.position)
                 {

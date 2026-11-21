@@ -87,9 +87,9 @@ pub(super) struct PreparationOccurrenceTyping {
     folded_expressions: HashMap<*const ScalarExpression, FoldedOccurrence>,
     places: HashMap<*const ScalarPlace, ScalarType>,
     resolved_namespace_places: HashMap<*const ScalarPlace, SourceIdentity>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     checker_directives: HashMap<*const ScalarExpression, super::checker_directive::CheckedDirectiveMarker>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     checker_enabled: bool,
 }
 
@@ -106,20 +106,23 @@ pub(super) enum CheckedMember {
 }
 
 impl PreparationOccurrenceTyping {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) fn checker_directives_enabled(&self) -> bool {
         self.checker_enabled
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) fn take_checker_directive(
         &mut self,
         expression: &ScalarExpression,
     ) -> Option<super::checker_directive::CheckedDirectiveMarker> {
+        if !self.checker_enabled {
+            return None;
+        }
         self.checker_directives.remove(&std::ptr::from_ref(expression))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) fn checked_expression_type(
         &self,
         expression: &ScalarExpression,
@@ -302,17 +305,17 @@ impl<'a> ScalarInferenceBuilder<'a> {
         is_raw
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) fn enable_checker_directives(&mut self, enabled: bool) {
         self.occurrences.checker_enabled = enabled;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) fn checker_directives_enabled(&self) -> bool {
         self.occurrences.checker_enabled
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) fn record_checker_directive(
         &mut self,
         expression: &ScalarExpression,

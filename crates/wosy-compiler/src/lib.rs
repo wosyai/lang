@@ -29,6 +29,10 @@ pub use scalar::{
     ScalarValidation, UnaryOperator,
 };
 
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub use scalar::{check_scalar_package, ScalarCheckerFailure, ScalarCheckerOperation, ScalarCheckerOutcome};
+
 mod llvm;
 
 pub const COMPILER_IDENTITY: &str = concat!("wosy-compiler-", env!("CARGO_PKG_VERSION"));

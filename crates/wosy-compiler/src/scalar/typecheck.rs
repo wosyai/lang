@@ -3305,7 +3305,7 @@ fn check_expression_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     if inference.checker_directives_enabled() {
         if let Some(directive) = super::checker_directive::CheckerDirective::from_expression(expression) {
             let directive = match directive {

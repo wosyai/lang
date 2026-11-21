@@ -2538,14 +2538,14 @@ fn typecheck_scalar_project_with_occurrences(
 ) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
     typecheck_scalar_project_in_mode(
         project,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "internal-checker"))]
         false,
     )
 }
 
 fn typecheck_scalar_project_in_mode(
     project: ScalarProject,
-    #[cfg(test)] checker_directives: bool,
+    #[cfg(any(test, feature = "internal-checker"))] checker_directives: bool,
 ) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
     let mut project = project;
     let mut diagnostics = Vec::new();
@@ -2609,7 +2609,7 @@ fn typecheck_scalar_project_in_mode(
         let items: &[ScalarItem] = module_items[ordinal];
         let overloads = overloads.typing(ordinal);
         let mut inference = ScalarInferenceBuilder::for_validation(&owners[ordinal]);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "internal-checker"))]
         inference.enable_checker_directives(checker_directives);
         validate_unit_if_positions_in_module(items, module.source, &mut diagnostics);
         for structure in module.structs {
@@ -3704,14 +3704,16 @@ pub(crate) mod control;
 mod occurrence_obligations;
 mod reference;
 mod static_calls;
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-checker"))]
 mod checker_directive;
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-checker"))]
 mod checker_flow;
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-checker"))]
 mod checker_project;
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-checker"))]
 mod symbolic_integer;
+#[cfg(feature = "internal-checker")]
+pub use checker_project::{check_scalar_package, ScalarCheckerFailure, ScalarCheckerOperation, ScalarCheckerOutcome};
 pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};
 pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{

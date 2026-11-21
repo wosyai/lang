@@ -5,38 +5,128 @@ use num_bigint::BigInt;
 use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation},
     checker_flow::{
-        check_integer_requirements, check_integer_requirements_at_entry, check_integer_return_bound, check_integer_return_bound_where,
-        check_integer_return_bound_with_shows, exact_integer_call_argument, exact_integer_return_at_entry,
-        proves_requirement_with_imported_root_local, ActualCallResult, ExactIntegerArgument,
-        CheckerPredicate, ImportedLocal, IntegerBranchProof,
-        IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
+        check_integer_requirement_activity, check_integer_requirements_at_entry, exact_integer_call_argument,
+        exact_integer_return_at_entry, ActualCallResult, ExactIntegerArgument,
+        IntegerCheckFailure, IntegerInputs,
     },
-    control::{BlockItemKind, CheckedCallSignature, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, NamespaceTarget},
-    derive_block, derive_expression, project_from_declarations,
-    reference::{CheckerTargetQuery, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, ProjectCallSiteResults, ResolvedCheckerTarget},
+    control::{CheckedCallSignature, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, NamespaceTarget},
+    project_from_declarations,
+    reference::{FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, ProjectCallSiteResults},
     static_calls::prepare_project_occurrences,
+    typecheck::is_integer_type,
+    typecheck_scalar_project_in_mode, ByteSpan, ConcreteCallSelection, ReferenceBindingId, ResolvedCallTarget,
+    ScalarBlockItem, ScalarExpression, ScalarItem, ScalarNamespaceBinding, ScalarPreparationInputs,
+    ScalarProject, ScalarSourceDeclarations, ScalarType,
+};
+#[cfg(test)]
+use super::{
+    checker_flow::{
+        check_integer_requirements, check_integer_return_bound, check_integer_return_bound_where, check_integer_return_bound_with_shows,
+        proves_requirement_with_imported_root_local, CheckerPredicate, ImportedLocal, IntegerBranchProof,
+        IntegerComparison, IntegerReturn, ProofCoverage,
+    },
+    control::BlockItemKind,
+    derive_block, derive_expression, BinaryOperator,
+    reference::{CheckerTargetQuery, DirectDestinationIdentity, ResolvedCheckerTarget},
     symbolic_integer::{IntegerRelation, IntegerSet},
-    typecheck::{integer_literal_fits_type, is_integer_type, typecheck_proof_where},
-    typecheck_scalar_project_in_mode, BinaryOperator, ByteSpan, ConcreteCallSelection,
-    ReferenceBindingId, ResolvedCallTarget, ScalarBlock, ScalarBlockItem, ScalarExpression, ScalarFunction,
-    ScalarItem, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarProject,
-    ScalarSourceDeclarations, ScalarTargetLayout, ScalarType, UnaryOperator,
+    typecheck::{integer_literal_fits_type, typecheck_proof_where},
+    ScalarBlock, ScalarFunction, ScalarTargetLayout, UnaryOperator,
 };
 use crate::Diagnostic;
-use wosy_syntax::{byte_span, CstNode, CstToken, ProofFragmentParse, SourceIdentity, SyntaxKind};
+use wosy_syntax::SourceIdentity;
+#[cfg(test)]
+use wosy_syntax::{byte_span, CstNode, CstToken, ProofFragmentParse, SyntaxKind};
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScalarCheckerOperation {
+    Require,
+    Narrow,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Debug, PartialEq)]
+pub struct ScalarCheckerFailure {
+    pub source: SourceIdentity,
+    pub operation: ScalarCheckerOperation,
+    pub directive: ByteSpan,
+    pub condition: ByteSpan,
+    pub stdout_span: ByteSpan,
+    pub stderr_span: ByteSpan,
+    pub code_span: ByteSpan,
+    pub empty_files_span: ByteSpan,
+    pub stdout: Box<[u8]>,
+    pub stderr: Box<[u8]>,
+    pub code: BigInt,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Debug, PartialEq)]
+pub enum ScalarCheckerOutcome {
+    Passed,
+    NoChecks,
+    Unsupported,
+    Invalid(Vec<Diagnostic>),
+    Failed(ScalarCheckerFailure),
+}
+
+#[cfg(feature = "internal-checker")]
+pub fn check_scalar_package(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+) -> ScalarCheckerOutcome {
+    let mut raw_sources = HashSet::with_capacity(initialization_order.len());
+    if initialization_order.is_empty()
+        || initialization_order.len() != declarations.len()
+        || !initialization_order.iter().all(|source| raw_sources.insert(source))
+    {
+        return ScalarCheckerOutcome::Unsupported;
+    }
+    let result = prepare_checker_project(declarations, initialization_order, inputs)
+        .and_then(|prepared| check_package_roots_with_activity(&prepared));
+    match result {
+        Ok(true) => ScalarCheckerOutcome::Passed,
+        Ok(false) => ScalarCheckerOutcome::NoChecks,
+        Err(ProjectCheck::Invalid(diagnostics)) => ScalarCheckerOutcome::Invalid(diagnostics),
+        Err(ProjectCheck::Failed { source, operation, directive, condition, output, .. }) =>
+            ScalarCheckerOutcome::Failed(ScalarCheckerFailure {
+                source,
+                operation: match operation {
+                    CheckerOperation::Require => ScalarCheckerOperation::Require,
+                    CheckerOperation::Narrow => ScalarCheckerOperation::Narrow,
+                },
+                directive,
+                condition,
+                stdout_span: output.stdout,
+                stderr_span: output.stderr,
+                code_span: output.code,
+                empty_files_span: output.files,
+                stdout: output.stdout_bytes,
+                stderr: output.stderr_bytes,
+                code: output.code_value,
+            }),
+        Err(_) => ScalarCheckerOutcome::Unsupported,
+    }
+}
 
 #[derive(Debug, PartialEq)]
 enum ProjectCheck {
     Invalid(Vec<Diagnostic>),
+    #[cfg(test)]
     InvalidProof,
     MissingRoot,
     AmbiguousRoot,
     RootSourceOutsideInitOrder,
     MissingRootOccurrences,
     Unsupported,
+    #[cfg(test)]
     NoChecks,
+    #[cfg(test)]
     NoApplicableInputs,
+    #[cfg(test)]
     Proved,
+    #[cfg(test)]
     Refuted,
     Failed {
         source: SourceIdentity,
@@ -49,7 +139,9 @@ enum ProjectCheck {
     },
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(test)]
 struct VerifiedReturnBound {
     proof_venue: ProofVenue,
     proof_source: SourceIdentity,
@@ -65,12 +157,15 @@ struct VerifiedReturnBound {
     guards: Vec<VerifiedEntryGuard>,
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(test)]
 enum ProofVenue {
     DetachedFragment,
     ModuleDeclaration,
 }
 
+#[cfg(test)]
 enum ProofSummaryOrigin<'a> {
     DetachedFragment(&'a SourceIdentity),
     ModuleDeclaration {
@@ -79,7 +174,9 @@ enum ProofSummaryOrigin<'a> {
     },
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(test)]
 enum VerifiedEntryGuard {
     Boolean(bool),
     Integer {
@@ -102,12 +199,40 @@ struct CheckedInitialization<'a> {
     visits: Vec<InitializationVisit>,
     reached: HashSet<(usize, usize)>,
     ordinals: HashMap<&'a SourceIdentity, usize>,
+    had_obligations: bool,
 }
 
+fn has_callable_obligations(body: &FunctionCallSites) -> bool {
+    !body.structure.checker_directives.is_empty() || body.arms.iter().any(has_callable_obligations)
+}
+
+#[cfg(test)]
 fn check_package_roots(prepared: &PreparedCheckerProject) -> Result<(), ProjectCheck> {
+    check_package_roots_with_activity(prepared).map(drop)
+}
+
+fn check_package_roots_with_activity(prepared: &PreparedCheckerProject) -> Result<bool, ProjectCheck> {
     let (project, calls) = prepared.parts();
-    let CheckedInitialization { visits, reached, ordinals } = check_package_initialization(prepared)?;
-    let root = project.initialization_order.first().ok_or(ProjectCheck::MissingRoot)?;
+    let (root, ordinals) = package_initialization_order(project)?;
+    let mut potential_obligations = false;
+    for (module, source_module) in project.modules.iter().enumerate() {
+        let region = calls.initialization_region(module).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        let ModuleInitializationDetail::Occurrences(topology) = &region.detail else {
+            return Err(ProjectCheck::MissingRootOccurrences);
+        };
+        potential_obligations |= !topology.structure.checker_directives.is_empty();
+        for (item, declaration) in source_module.items.iter().enumerate() {
+            if matches!(declaration, ScalarItem::Function(_)) {
+                let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+                potential_obligations |= has_callable_obligations(body);
+            }
+        }
+    }
+    if !potential_obligations {
+        return Ok(false);
+    }
+    let CheckedInitialization { visits, reached, ordinals, mut had_obligations } =
+        check_package_initialization_with_order(prepared, root, ordinals)?;
     for source in &project.initialization_order {
         if source.project != root.project || source.package != root.package {
             continue;
@@ -124,44 +249,66 @@ fn check_package_roots(prepared: &PreparedCheckerProject) -> Result<(), ProjectC
             if reached.contains(&(ordinal, item)) {
                 continue;
             }
+            let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            if !has_callable_obligations(body) {
+                continue;
+            }
             if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
                 return Err(ProjectCheck::Unsupported);
             }
-            let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
             if !matches!(body.boundary.results.as_slice(), [result]
                 if result.ty == ScalarType::Unit || is_integer_type(&result.ty))
             {
                 return Err(ProjectCheck::Unsupported);
             }
-            match check_integer_requirements(body) {
-                Some(Ok(())) => {}
+            match check_integer_requirement_activity(body) {
+                Some(Ok(active)) => had_obligations |= active,
                 Some(Err(failure)) => return Err(project_failure(body, source, failure)),
                 None => return Err(ProjectCheck::Unsupported),
             }
         }
     }
-    Ok(())
+    Ok(had_obligations)
 }
 
-fn check_package_initialization(
-    prepared: &PreparedCheckerProject,
-) -> Result<CheckedInitialization<'_>, ProjectCheck> {
-    let (project, calls) = prepared.parts();
+fn package_initialization_order(
+    project: &ScalarProject,
+) -> Result<(&SourceIdentity, HashMap<&SourceIdentity, usize>), ProjectCheck> {
     let ordinals: HashMap<_, _> = project.modules.iter().enumerate()
         .map(|(ordinal, module)| (&module.source, ordinal)).collect();
     if ordinals.len() != project.modules.len() {
         return Err(ProjectCheck::AmbiguousRoot);
     }
     let root = project.initialization_order.first().ok_or(ProjectCheck::MissingRoot)?;
-    if project.initialization_order.len() != ordinals.len()
-        || !project.initialization_order.iter().all(|source| ordinals.contains_key(source))
-    {
+    if project.initialization_order.len() != ordinals.len() {
         return Err(ProjectCheck::RootSourceOutsideInitOrder);
     }
+    let mut seen = vec![false; ordinals.len()];
+    for source in &project.initialization_order {
+        let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
+        if std::mem::replace(&mut seen[ordinal], true) {
+            return Err(ProjectCheck::AmbiguousRoot);
+        }
+    }
+    Ok((root, ordinals))
+}
+
+#[cfg(test)]
+fn check_package_initialization(prepared: &PreparedCheckerProject) -> Result<CheckedInitialization<'_>, ProjectCheck> {
+    let (root, ordinals) = package_initialization_order(prepared.parts().0)?;
+    check_package_initialization_with_order(prepared, root, ordinals)
+}
+
+fn check_package_initialization_with_order<'a>(
+    prepared: &'a PreparedCheckerProject,
+    root: &'a SourceIdentity,
+    ordinals: HashMap<&'a SourceIdentity, usize>,
+) -> Result<CheckedInitialization<'a>, ProjectCheck> {
+    let (project, calls) = prepared.parts();
     let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
-    let mut actual = ActualCalls { project, calls, active: HashSet::new(), reached: HashSet::new() };
+    let mut actual = ActualCalls { project, calls, active: HashSet::new(), reached: HashSet::new(), had_obligations: false };
     walk_package_initialization(project, calls, &ordinals, &mut visits, &mut actual, root)?;
-    Ok(CheckedInitialization { visits, reached: actual.reached, ordinals })
+    Ok(CheckedInitialization { visits, reached: actual.reached, ordinals, had_obligations: actual.had_obligations })
 }
 
 fn walk_package_initialization(
@@ -224,6 +371,7 @@ struct ActualCalls<'a> {
     calls: &'a ProjectCallSiteResults,
     active: HashSet<(usize, usize)>,
     reached: HashSet<(usize, usize)>,
+    had_obligations: bool,
 }
 
 const MAX_ACTUAL_CALL_DEPTH: usize = 64;
@@ -299,7 +447,10 @@ impl ActualCalls<'_> {
                 }
             });
             match checked {
-                Some(Ok(())) => Ok(ActualCallResult::Unit),
+                Some(Ok(active)) => {
+                    self.had_obligations |= active;
+                    Ok(ActualCallResult::Unit)
+                }
                 Some(Err(failure)) => Err(project_failure(body, &owner.source, failure)),
                 None => Err(nested_error.unwrap_or(ProjectCheck::Unsupported)),
             }
@@ -322,6 +473,7 @@ impl ActualCalls<'_> {
     }
 }
 
+#[cfg(test)]
 fn check_closed_project_callable(
     declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
@@ -380,17 +532,31 @@ mod prepared {
         initialization_order: Vec<SourceIdentity>,
         inputs: ScalarPreparationInputs,
     ) -> Result<PreparedCheckerProject, ProjectCheck> {
-        prepare_checker_project_with_queries(declarations, initialization_order, inputs, &[])
+        prepare_checker_project_impl(declarations, initialization_order, inputs, #[cfg(test)] &[])
     }
 
+    #[cfg(test)]
     pub(super) fn prepare_checker_project_with_queries(
         declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
         initialization_order: Vec<SourceIdentity>,
         inputs: ScalarPreparationInputs,
         queries: &[CheckerTargetQuery<'_>],
     ) -> Result<PreparedCheckerProject, ProjectCheck> {
+        prepare_checker_project_impl(declarations, initialization_order, inputs, queries)
+    }
+
+    fn prepare_checker_project_impl(
+        declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+        initialization_order: Vec<SourceIdentity>,
+        inputs: ScalarPreparationInputs,
+        #[cfg(test)] queries: &[CheckerTargetQuery<'_>],
+    ) -> Result<PreparedCheckerProject, ProjectCheck> {
         let (project, calls) = project_from_declarations(declarations, initialization_order, inputs)
-            .and_then(|project| prepare_project_occurrences(typecheck_scalar_project_in_mode(project, true), queries))
+            .and_then(|project| prepare_project_occurrences(
+                typecheck_scalar_project_in_mode(project, true),
+                #[cfg(test)]
+                queries,
+            ))
             .map_err(|rejected| ProjectCheck::Invalid(rejected.into_inspection().diagnostics))?;
         Ok(PreparedCheckerProject { project, calls })
     }
@@ -398,6 +564,7 @@ mod prepared {
 
 use prepared::prepare_checker_project;
 
+#[cfg(test)]
 fn select_checked_root<'a>(
     project: &'a ScalarProject,
     source: &SourceIdentity,
@@ -443,10 +610,12 @@ fn project_failure(
     }
 }
 
+#[cfg(test)]
 fn child(parent: &CstNode, kind: SyntaxKind) -> Result<CstNode, ProjectCheck> {
     parent.children().find(|node| node.kind() == kind).ok_or(ProjectCheck::InvalidProof)
 }
 
+#[cfg(test)]
 fn identifiers(parent: &CstNode) -> impl Iterator<Item = String> + '_ {
     parent.children_with_tokens().filter_map(|element| {
         let token = element.into_token()?;
@@ -454,35 +623,41 @@ fn identifiers(parent: &CstNode) -> impl Iterator<Item = String> + '_ {
     })
 }
 
+#[cfg(test)]
 struct ProofModuleInput {
     source: SourceIdentity,
     text: String,
     namespaces: Vec<ScalarNamespaceBinding>,
 }
 
+#[cfg(test)]
 struct ModuleProofs {
     definitions: Vec<CstNode>,
     first_query: usize,
 }
 
+#[cfg(test)]
 struct PreparedProofModule {
     source: SourceIdentity,
     proofs: HashMap<SourceIdentity, ModuleProofs>,
     prepared: PreparedCheckerProject,
 }
 
+#[cfg(test)]
 struct SelectedModuleProof<'a> {
     node: &'a CstNode,
     function: (usize, usize, &'a ScalarFunction),
     target: &'a ResolvedCallTarget,
 }
 
+#[cfg(test)]
 struct VerifiedModuleReturnBound<'a> {
     issuer: &'a PreparedProofModule,
     proof: &'a CstNode,
     bound: VerifiedReturnBound,
 }
 
+#[cfg(test)]
 impl PreparedProofModule {
     fn prepare(source: SourceIdentity, text: String, inputs: ScalarPreparationInputs) -> Result<Self, ProjectCheck> {
         Self::prepare_project(
@@ -642,6 +817,7 @@ impl PreparedProofModule {
     }
 }
 
+#[cfg(test)]
 fn proof_target_tokens(declaration: &CstNode) -> Result<(Option<CstToken>, CstToken), ProjectCheck> {
     let target = child(declaration, SyntaxKind::ProofTarget)?;
     let qualified = child(&target, SyntaxKind::QualifiedCall)?;
@@ -656,6 +832,7 @@ fn proof_target_tokens(declaration: &CstNode) -> Result<(Option<CstToken>, CstTo
     }
 }
 
+#[cfg(test)]
 fn check_proof_fragment(
     prepared: &PreparedCheckerProject,
     target_source: &SourceIdentity,
@@ -666,6 +843,7 @@ fn check_proof_fragment(
         .unwrap_or_else(|error| error)
 }
 
+#[cfg(test)]
 fn verify_return_bound(
     prepared: &PreparedCheckerProject,
     target_source: &SourceIdentity,
@@ -676,6 +854,7 @@ fn verify_return_bound(
         .and_then(|(_, bound)| bound)
 }
 
+#[cfg(test)]
 fn check_proof_fragment_impl(
     prepared: &PreparedCheckerProject,
     target_source: &SourceIdentity,
@@ -699,6 +878,7 @@ fn check_proof_fragment_impl(
     check_selected_proof(prepared, function, &declaration, &root.source, summary_source)
 }
 
+#[cfg(test)]
 fn check_selected_proof(
     prepared: &PreparedCheckerProject,
     (module, item, function): (usize, usize, &ScalarFunction),
@@ -785,6 +965,7 @@ fn check_selected_proof(
     Ok((outcome, verified))
 }
 
+#[cfg(test)]
 fn issue_return_bound(
     origin: ProofSummaryOrigin<'_>,
     declaration: &CstNode,
@@ -860,12 +1041,15 @@ fn issue_return_bound(
     })
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(test)]
 enum ImportedRequirement {
     Proved,
     NotEstablished,
 }
 
+#[cfg(test)]
 fn use_verified_return_bound(
     prepared: &PreparedCheckerProject,
     caller_source: &SourceIdentity,
@@ -881,6 +1065,7 @@ fn use_verified_return_bound(
     apply_verified_return_bound(prepared, caller_source, caller_name, verified)
 }
 
+#[cfg(test)]
 fn apply_verified_return_bound(
     prepared: &PreparedCheckerProject,
     caller_source: &SourceIdentity,
@@ -960,6 +1145,7 @@ fn apply_verified_return_bound(
     })
 }
 
+#[cfg(test)]
 fn pure_proof_input_expression(expression: &ScalarExpression) -> bool {
     match expression {
         ScalarExpression::Name { name, .. } => name != "null",
@@ -973,6 +1159,7 @@ fn pure_proof_input_expression(expression: &ScalarExpression) -> bool {
     }
 }
 
+#[cfg(test)]
 fn typed_proof_where(
     declaration: &CstNode,
     source: &SourceIdentity,
@@ -997,6 +1184,7 @@ fn typed_proof_where(
     Ok(Some(expression))
 }
 
+#[cfg(test)]
 fn proof_entry_filters(
     expression: &ScalarExpression,
     inputs: &[String],
@@ -1018,6 +1206,7 @@ fn proof_entry_filters(
     Ok(filters)
 }
 
+#[cfg(test)]
 fn proof_input_condition(
     expression: &ScalarExpression,
     inputs: &[String],
@@ -1054,6 +1243,7 @@ fn proof_input_condition(
     Ok(CheckerPredicate::Integer(predicate))
 }
 
+#[cfg(test)]
 fn proof_show_branch<'a>(
     steps: &'a ScalarBlock,
     inputs: &[String],
@@ -1084,6 +1274,7 @@ fn proof_show_branch<'a>(
     })
 }
 
+#[cfg(test)]
 fn proof_show_claim<'a>(
     arm: &'a ScalarBlock,
     inputs: &[String],
@@ -1131,6 +1322,7 @@ fn proof_show_claim<'a>(
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use num_bigint::BigInt;
