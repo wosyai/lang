@@ -11647,3 +11647,88 @@ unit(bool) inspect = fn(choose) {
             !starts.contains(&point.source_span.range.start) || !matches!(point.kind, CfgPointKind::Borrow { .. })));
     }
 }
+
+#[test]
+fn deferred_nested_shared_leaf_allows_reads_but_blocks_live_ancestor_writes() {
+    for (body, conflict) in [
+        ("u8 ancestor = *child; u8 seen = *shared; *child = 8; ancestor; seen;", None),
+        ("*child = 8; u8 seen = *shared; seen;", Some("child = 8")),
+        ("*parent = 8; u8 seen = *shared; seen;", Some("parent = 8")),
+    ] {
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 inside = 9; inside; }};
+    *!u8 child = &!(*parent);
+    *u8 shared = &(*child);
+    {body}
+    u8 resumed = *parent;
+    resumed;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let direct = text.find("&!(*parent)").unwrap() as u32;
+        let leaf = text.find("&(*child)").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if let Some(spelling) = conflict {
+                let requested = text.find(spelling).unwrap() as u32;
+                let diagnostic = diagnostics.iter().find(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == requested)
+                }).unwrap_or_else(|| panic!("expected shared-loan conflict: {diagnostics:?}"));
+                assert!(diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == leaf));
+                assert!(cfg.initial_points.iter().all(|point| !matches!(point.kind, CfgPointKind::Borrow { .. })
+                    || ![direct, leaf].contains(&point.source_span.range.start)));
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let find = |start| cfg.points.iter().find(|point| point.source_span.range.start == start
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("sealed loan");
+            let shared = find(leaf);
+            assert_eq!(&cfg.initial_points[shared.id.0], shared);
+            let ReferenceOrigin::Fresh { loan: child, allocation } = sole_fact(function, find(direct)) else {
+                panic!("expected exact child")
+            };
+            let ReferenceOrigin::Fresh { loan, allocation: leaf_allocation } = sole_fact(function, shared) else {
+                panic!("expected exact leaf")
+            };
+            assert_eq!(leaf_allocation, allocation);
+            assert_eq!(loan.mode, ScalarReferenceMutability::Shared);
+            assert_eq!(loan.parent.as_deref(), Some(child));
+        }
+    }
+}
+
+#[test]
+fn deferred_nested_shared_leaf_does_not_seal_a_transported_handle() {
+    let text = r#"%%start
+unit(bool) inspect = fn(choose) {
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) { u8 inside = 9; inside; };
+    *!u8 child = &!(*parent);
+    *u8 shared = &(*child);
+    *u8 alias = shared;
+    u8 seen = *alias;
+    seen;
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    let sites = [text.find("&!(*parent)").unwrap() as u32, text.find("&(*child)").unwrap() as u32];
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+            && diagnostic.message == "missing required dereference origin"), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+        assert!(function.reference_cfg.initial_points.iter().all(|point|
+            !sites.contains(&point.source_span.range.start) || !matches!(point.kind, CfgPointKind::Borrow { .. })));
+    }
+}

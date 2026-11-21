@@ -1966,13 +1966,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
                                 )),
                             };
-                            if *mutability == ScalarReferenceMutability::Mutable
-                                && matches!(place, ScalarPlace::Dereference { .. })
-                            {
+                            if matches!(place, ScalarPlace::Dereference { .. }) {
                                 let read = self.cursor.expect("named checked read");
                                 let pending = self.proof_points.pending_named_reborrow.as_ref();
                                 let direct = self.deferred_reborrow_roots.iter().find(|(handle, root, entry, _)| {
-                                    *handle == binding
+                                    *mutability == ScalarReferenceMutability::Mutable
+                                        && *handle == binding
                                         && (matches!(root, super::control::DeferredReborrowRoot::Formal { .. })
                                             || self.cfg.points[entry.0].scope == scope)
                                 });
@@ -3143,7 +3142,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         {
                             self.proof_points.checked_binding_initializers.push((bind, value));
                             if receiver == 0 && matches!(ty,
-                                ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner }
+                                ScalarType::CheckedReference { inner, .. }
                                     if aggregate::ordinary_value(inner))
                             {
                                 if let Some(site) = self.proof_points.pending_named_reborrow.as_mut()
