@@ -6323,8 +6323,24 @@ impl FunctionCallSites {
     }
 }
 
+#[cfg(test)]
+pub(super) struct CheckerTargetQuery<'a> {
+    pub(super) source: &'a SourceIdentity,
+    pub(super) receiver: Option<&'a str>,
+    pub(super) name: &'a str,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ResolvedCheckerTarget {
+    pub(super) target: ResolvedCallTarget,
+    pub(super) declaration: (usize, usize),
+}
+
 pub(super) struct ProjectCallSiteResults {
     modules: Vec<Result<ModuleCallSites, ReferenceAnalysisError>>,
+    #[cfg(test)]
+    pub(super) checker_targets: Vec<Option<ResolvedCheckerTarget>>,
 }
 
 #[cfg(test)]
@@ -6393,7 +6409,7 @@ impl ProjectCallSiteResults {
 
 #[cfg(test)]
 pub(super) fn resolve_project_call_sites(modules: &[ScalarModule]) -> ProjectCallSiteResults {
-    resolve_project_call_sites_impl(modules, OccurrenceTypingInputs::StructuralOnly)
+    resolve_project_call_sites_impl(modules, OccurrenceTypingInputs::StructuralOnly, &[])
 }
 
 pub(super) fn resolve_project_call_sites_with_occurrences(
@@ -6404,6 +6420,25 @@ pub(super) fn resolve_project_call_sites_with_occurrences(
     resolve_project_call_sites_impl(
         modules,
         OccurrenceTypingInputs::Typed(occurrence_typing.into_iter()),
+        #[cfg(test)]
+        &[],
+    )
+}
+
+#[cfg(test)]
+pub(super) fn resolve_project_call_sites_with_checker_targets(
+    modules: &[ScalarModule],
+    occurrence_typing: Vec<PreparationOccurrenceTyping>,
+    checker_targets: &[CheckerTargetQuery<'_>],
+) -> ProjectCallSiteResults {
+    if checker_targets.is_empty() {
+        return resolve_project_call_sites_with_occurrences(modules, occurrence_typing);
+    }
+    assert_eq!(modules.len(), occurrence_typing.len());
+    resolve_project_call_sites_impl(
+        modules,
+        OccurrenceTypingInputs::Typed(occurrence_typing.into_iter()),
+        checker_targets,
     )
 }
 
@@ -6416,6 +6451,7 @@ enum OccurrenceTypingInputs {
 fn resolve_project_call_sites_impl(
     modules: &[ScalarModule],
     mut occurrence_inputs: OccurrenceTypingInputs,
+    #[cfg(test)] checker_targets: &[CheckerTargetQuery<'_>],
 ) -> ProjectCallSiteResults {
     let views = modules
         .iter()
@@ -6423,6 +6459,22 @@ fn resolve_project_call_sites_impl(
         .collect::<Vec<_>>();
     let declarations = CallDeclarationIndex::new(&views);
     ProjectCallSiteResults {
+        #[cfg(test)]
+        checker_targets: checker_targets.iter().map(|query| {
+            let CallDeclaration::Function(source, declaration_span, CallFunctionKind::Ordinary, declaration) =
+                declarations.callable(query.source, query.receiver, query.name)?
+            else {
+                return None;
+            };
+            Some(ResolvedCheckerTarget {
+                target: ResolvedCallTarget::ModuleCallable {
+                    source: source.clone(),
+                    declaration_span,
+                    concrete: ConcreteCallSelection::Declaration,
+                },
+                declaration,
+            })
+        }).collect(),
         modules: modules
             .iter()
             .map(|module| {

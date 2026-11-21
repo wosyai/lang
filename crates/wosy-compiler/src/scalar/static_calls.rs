@@ -182,6 +182,7 @@ impl ScalarProjectPreparationRejection {
 
 pub(super) fn prepare_project_occurrences(
     (validation, occurrence_typing): (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>),
+    #[cfg(test)] checker_targets: &[reference::CheckerTargetQuery<'_>],
 ) -> Result<(ScalarProject, reference::ProjectCallSiteResults), ScalarProjectPreparationRejection> {
     if !validation.diagnostics.is_empty() {
         return Err(ScalarProjectPreparationRejection::extraction_or_typing(
@@ -189,9 +190,11 @@ pub(super) fn prepare_project_occurrences(
         ));
     }
     let project = validation.project;
-    let calls = reference::resolve_project_call_sites_with_occurrences(
-        &project.modules,
-        occurrence_typing,
+    #[cfg(not(test))]
+    let calls = reference::resolve_project_call_sites_with_occurrences(&project.modules, occurrence_typing);
+    #[cfg(test)]
+    let calls = reference::resolve_project_call_sites_with_checker_targets(
+        &project.modules, occurrence_typing, checker_targets,
     );
     let diagnostics = calls
         .lookup_errors()
@@ -220,8 +223,11 @@ impl PreparedScalarProject {
     }
 
     pub(crate) fn new(project: ScalarProject) -> Result<Self, ScalarProjectPreparationRejection> {
-        let (project, calls) =
-            prepare_project_occurrences(typecheck_scalar_project_with_occurrences(project))?;
+        let (project, calls) = prepare_project_occurrences(
+            typecheck_scalar_project_with_occurrences(project),
+            #[cfg(test)]
+            &[],
+        )?;
         Ok(Self { project, calls })
     }
 

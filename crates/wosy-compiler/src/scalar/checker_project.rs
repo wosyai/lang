@@ -12,7 +12,7 @@ use super::{
     },
     control::BlockItemKind,
     derive_block, derive_expression, project_from_declarations,
-    reference::{DirectDestinationIdentity, FunctionCallSites, ProjectCallSiteResults},
+    reference::{CheckerTargetQuery, DirectDestinationIdentity, FunctionCallSites, ProjectCallSiteResults},
     static_calls::prepare_project_occurrences,
     symbolic_integer::{IntegerRelation, IntegerSet},
     typecheck::{integer_literal_fits_type, is_integer_type},
@@ -144,8 +144,17 @@ mod prepared {
         initialization_order: Vec<SourceIdentity>,
         inputs: ScalarPreparationInputs,
     ) -> Result<PreparedCheckerProject, ProjectCheck> {
+        prepare_checker_project_with_queries(declarations, initialization_order, inputs, &[])
+    }
+
+    pub(super) fn prepare_checker_project_with_queries(
+        declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+        initialization_order: Vec<SourceIdentity>,
+        inputs: ScalarPreparationInputs,
+        queries: &[CheckerTargetQuery<'_>],
+    ) -> Result<PreparedCheckerProject, ProjectCheck> {
         let (project, calls) = project_from_declarations(declarations, initialization_order, inputs)
-            .and_then(|project| prepare_project_occurrences(typecheck_scalar_project_in_mode(project, true)))
+            .and_then(|project| prepare_project_occurrences(typecheck_scalar_project_in_mode(project, true), queries))
             .map_err(|rejected| ProjectCheck::Invalid(rejected.into_inspection().diagnostics))?;
         Ok(PreparedCheckerProject { project, calls })
     }
@@ -1090,6 +1099,53 @@ mod tests {
             inputs(),
         );
         assert!(matches!(result, Err(ProjectCheck::RootSourceOutsideInitOrder)));
+    }
+
+    #[test]
+    fn checker_target_queries_share_canonical_ordinary_namespace_resolution() {
+        let app = source("src/main.w", "query-app");
+        let lib = source("src/lib.w", "query-lib");
+        let stale = source("src/main.w", "stale-app");
+        let app_text = "%%start\nlib = namespace demo \"src/lib.w\";\nu8() value = fn { 7 };\nu8() caller = fn { lib.value() };\n%%end";
+        let lib_text = "%%start\nu8() value = fn { 9 };\nu8() _hidden = fn { 11 };\n%%end";
+        let namespace_start = app_text.find("lib =").unwrap() as u32;
+        let namespace_end = app_text.find(';').unwrap() as u32 + 1;
+        let query = |source, receiver, name| CheckerTargetQuery { source, receiver, name };
+        let prepared = prepared::prepare_checker_project_with_queries(
+            vec![
+                (declarations(&app, app_text), vec![ScalarNamespaceBinding {
+                    binding: "lib".into(), target: lib.clone(),
+                    span: ByteSpan::new(namespace_start, namespace_end),
+                }]),
+                (declarations(&lib, lib_text), Vec::new()),
+            ],
+            vec![lib.clone(), app.clone()],
+            inputs(),
+            &[
+                query(&app, None, "value"),
+                query(&app, Some("lib"), "value"),
+                query(&app, Some("lib"), "_hidden"),
+                query(&app, Some("unknown"), "value"),
+                query(&stale, Some("lib"), "value"),
+            ],
+        ).unwrap();
+        let (project, calls) = prepared.parts();
+        let [Some(local), Some(imported), None, None, None] = calls.checker_targets.as_slice() else {
+            panic!("expected exact local and imported callable only");
+        };
+        for (row, source) in [(local, &app), (imported, &lib)] {
+            let (module, item, function) = select_checked_root(project, source, "value").unwrap();
+            assert_eq!(row.declaration, (module, item));
+            assert_eq!(row.target, ResolvedCallTarget::ModuleCallable {
+                source: source.clone(), declaration_span: function.name_span,
+                concrete: ConcreteCallSelection::Declaration,
+            });
+        }
+        let (module, item, _) = select_checked_root(project, &app, "caller").unwrap();
+        let caller = calls.function_body(module, item, None).unwrap();
+        let occurrence = &caller.call_occurrences[0];
+        let resolved = caller.resolved_call_site(occurrence.ordinal).unwrap();
+        assert_eq!(resolved.target, imported.target);
     }
 
     #[test]
