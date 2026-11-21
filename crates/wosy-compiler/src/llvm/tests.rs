@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use inkwell::context::Context;
+use inkwell::values::{BasicValue, BasicValueEnum, InstructionOpcode, InstructionValue};
 
 use super::emit_scalar_llvm;
 use super::emit_scalar_project_llvm;
@@ -8999,40 +9000,42 @@ u8(bool) update = fn(choose) {
     }
 }
 
+fn known_field_operand<'ctx>(instruction: InstructionValue<'ctx>, index: u32) -> Option<BasicValueEnum<'ctx>> {
+    instruction.get_operand(index).and_then(|operand| operand.value())
+}
+
+fn known_field_stored_value<'ctx>(
+    instructions: &[InstructionValue<'ctx>], slot: BasicValueEnum<'ctx>,
+) -> Option<BasicValueEnum<'ctx>> {
+    let mut stores = instructions.iter().copied().filter(|instruction| {
+        instruction.get_opcode() == InstructionOpcode::Store && known_field_operand(*instruction, 1) == Some(slot)
+    });
+    let store = stores.next()?;
+    if stores.next().is_some() { return None; }
+    known_field_operand(store, 0)
+}
+
+fn known_checked_field_path<'ctx>(
+    instructions: &[InstructionValue<'ctx>], address: BasicValueEnum<'ctx>,
+) -> Option<(BasicValueEnum<'ctx>, u64)> {
+    let dereference = address.as_instruction_value()?;
+    if dereference.get_opcode() != InstructionOpcode::IntToPtr { return None; }
+    let handle_load = known_field_operand(dereference, 0)?.as_instruction_value()?;
+    if handle_load.get_opcode() != InstructionOpcode::Load { return None; }
+    let handle = known_field_stored_value(instructions, known_field_operand(handle_load, 0)?)?.as_instruction_value()?;
+    if handle.get_opcode() != InstructionOpcode::PtrToInt { return None; }
+    known_direct_field_path(known_field_operand(handle, 0)?)
+}
+
+fn known_direct_field_path(address: BasicValueEnum<'_>) -> Option<(BasicValueEnum<'_>, u64)> {
+    let field = address.as_instruction_value()?;
+    if field.get_opcode() != InstructionOpcode::GetElementPtr { return None; }
+    let BasicValueEnum::IntValue(offset) = known_field_operand(field, 1)? else { return None };
+    Some((known_field_operand(field, 0)?, offset.get_zero_extended_constant()?))
+}
+
 #[test]
 fn emits_known_disjoint_checked_field_writes_through_the_ordinary_driver() {
-    use inkwell::values::{BasicValue, BasicValueEnum, InstructionOpcode, InstructionValue};
-
-    fn operand<'ctx>(instruction: InstructionValue<'ctx>, index: u32) -> Option<BasicValueEnum<'ctx>> {
-        instruction.get_operand(index).and_then(|operand| operand.value())
-    }
-
-    fn sole_stored_value<'ctx>(
-        instructions: &[InstructionValue<'ctx>], slot: BasicValueEnum<'ctx>,
-    ) -> Option<BasicValueEnum<'ctx>> {
-        let mut stores = instructions.iter().copied().filter(|instruction| {
-            instruction.get_opcode() == InstructionOpcode::Store && operand(*instruction, 1) == Some(slot)
-        });
-        let store = stores.next()?;
-        if stores.next().is_some() { return None; }
-        operand(store, 0)
-    }
-
-    fn field_path<'ctx>(
-        instructions: &[InstructionValue<'ctx>], address: BasicValueEnum<'ctx>,
-    ) -> Option<(BasicValueEnum<'ctx>, u64)> {
-        let dereference = address.as_instruction_value()?;
-        if dereference.get_opcode() != InstructionOpcode::IntToPtr { return None; }
-        let handle_load = operand(dereference, 0)?.as_instruction_value()?;
-        if handle_load.get_opcode() != InstructionOpcode::Load { return None; }
-        let handle = sole_stored_value(instructions, operand(handle_load, 0)?)?.as_instruction_value()?;
-        if handle.get_opcode() != InstructionOpcode::PtrToInt { return None; }
-        let field = operand(handle, 0)?.as_instruction_value()?;
-        if field.get_opcode() != InstructionOpcode::GetElementPtr { return None; }
-        let BasicValueEnum::IntValue(offset) = operand(field, 1)? else { return None };
-        Some((operand(field, 0)?, offset.get_zero_extended_constant()?))
-    }
-
     fn constant_byte(value: BasicValueEnum<'_>) -> Option<u64> {
         let BasicValueEnum::IntValue(value) = value else { return None };
         if value.get_type().get_bit_width() != 8 { return None; }
@@ -9076,12 +9079,12 @@ u8(Pair) update = fn(owner) {
             }).collect::<Vec<_>>();
             let mut writes = instructions.iter().copied().filter_map(|instruction| {
                 if instruction.get_opcode() != InstructionOpcode::Store { return None; }
-                let path = field_path(&instructions, operand(instruction, 1)?)?;
-                let value = operand(instruction, 0)?;
+                let path = known_checked_field_path(&instructions, known_field_operand(instruction, 1)?)?;
+                let value = known_field_operand(instruction, 0)?;
                 let literal = constant_byte(value).or_else(|| {
                     let reload = value.as_instruction_value()?;
                     if reload.get_opcode() != InstructionOpcode::Load { return None; }
-                    constant_byte(sole_stored_value(&instructions, operand(reload, 0)?)?)
+                    constant_byte(known_field_stored_value(&instructions, known_field_operand(reload, 0)?)?)
                 })?;
                 Some((path, literal))
             }).collect::<Vec<_>>();
@@ -9093,13 +9096,13 @@ u8(Pair) update = fn(owner) {
             let result = instructions.iter().copied().find(|instruction| {
                 instruction.get_opcode() == InstructionOpcode::Return
             }).expect("field result");
-            let result = operand(result, 0).and_then(|value| value.as_instruction_value()).expect("computed field sum");
+            let result = known_field_operand(result, 0).and_then(|value| value.as_instruction_value()).expect("computed field sum");
             assert_eq!(result.get_opcode(), InstructionOpcode::Add);
             let mut reads = [0, 1].map(|index| {
-                let read = operand(result, index).and_then(|value| value.as_instruction_value())
+                let read = known_field_operand(result, index).and_then(|value| value.as_instruction_value())
                     .expect("add consumes the checked field read");
                 assert_eq!(read.get_opcode(), InstructionOpcode::Load);
-                field_path(&instructions, operand(read, 0).expect("read address"))
+                known_checked_field_path(&instructions, known_field_operand(read, 0).expect("read address"))
                     .expect("read resolves to an actual checked field path")
             });
             reads.sort_by_key(|(_, offset)| *offset);
@@ -9111,6 +9114,69 @@ u8(Pair) update = fn(owner) {
             diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
                 && diagnostic.labels.first().is_some_and(|label| label.span.range.start == write)
                 && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == borrow)
+        }), "{:?}", denied.diagnostics());
+    }
+}
+
+#[test]
+fn emits_known_copy_read_disjoint_from_live_checked_field_through_the_ordinary_driver() {
+    let source = r#"%%start
+struct copy Pair { u8 left; u8 right; }
+u8(Pair) inspect = fn(owner) {
+    *!u8 leaf = &!owner.left;
+    owner.right + *leaf
+};
+%%end"#;
+    let invalid = source.replace("owner.right +", "owner.left +");
+    let source_read = invalid.find("owner.left +").unwrap() as u32;
+    let loan = invalid.find("&!owner.left").unwrap() as u32;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for partition in [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ] {
+            let ir = partition.expect("ordinary disjoint Copy read LLVM").to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+                ir.as_bytes(), "known-disjoint-copy-read",
+            );
+            let module = context.create_module_from_ir(buffer).expect("parse disjoint Copy read LLVM");
+            module.verify().expect("verify disjoint Copy read LLVM");
+            let routine = module.get_functions().find(|routine| {
+                matches!(routine.get_type().get_return_type(), Some(inkwell::types::BasicTypeEnum::IntType(ty))
+                    if ty.get_bit_width() == 8)
+            }).expect("typed byte result");
+            let instructions = routine.get_basic_blocks().iter().flat_map(|block| {
+                std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction())
+            }).collect::<Vec<_>>();
+            let result = instructions.iter().copied().find(|instruction| {
+                instruction.get_opcode() == InstructionOpcode::Return
+            }).expect("returned byte sum");
+            let result = known_field_operand(result, 0).and_then(|value| value.as_instruction_value())
+                .expect("returned add value");
+            assert_eq!(result.get_opcode(), InstructionOpcode::Add);
+            let [direct, checked] = [0, 1].map(|index| {
+                let consumed = known_field_operand(result, index).and_then(|value| value.as_instruction_value())
+                    .expect("add consumes field read");
+                assert_eq!(consumed.get_opcode(), InstructionOpcode::Load);
+                known_field_operand(consumed, 0).expect("actual field address")
+            });
+            let direct = known_direct_field_path(direct).expect("direct owner field");
+            let checked = known_checked_field_path(&instructions, checked).expect("checked owner field");
+            assert_eq!((direct.1, checked.1), (1, 0));
+            assert_eq!(direct.0, checked.0, "both returned reads use the same owner");
+
+        }
+
+        let prepared = prepare_initializer_test(&invalid, layout);
+        let denied = analyze_scalar_build(&prepared);
+        assert!(denied.diagnostics().iter().any(|diagnostic| {
+            diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == source_read)
+                && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == loan)
         }), "{:?}", denied.diagnostics());
     }
 }
