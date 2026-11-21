@@ -197,6 +197,43 @@ fn identifiers(parent: &CstNode) -> impl Iterator<Item = String> + '_ {
     })
 }
 
+struct PreparedProofModule {
+    source: SourceIdentity,
+    proofs: Vec<CstNode>,
+    prepared: PreparedCheckerProject,
+}
+
+impl PreparedProofModule {
+    fn prepare(source: SourceIdentity, text: String, inputs: ScalarPreparationInputs) -> Result<Self, ProjectCheck> {
+        let parsed = wosy_syntax::parse_proof_module(source, text, &[]);
+        if !parsed.is_valid() {
+            return Err(ProjectCheck::InvalidProof);
+        }
+        let canonical = parsed.canonical_cst();
+        let root = child(&canonical.root, SyntaxKind::Root)?;
+        let proofs = root.children().filter(|node| node.kind() == SyntaxKind::ProofDecl).collect();
+        let declarations = super::derive_scalar_declarations_from_cst(canonical);
+        let source = canonical.source.clone();
+        let prepared = prepare_checker_project(vec![(declarations, Vec::new())], vec![source.clone()], inputs)?;
+        Ok(Self { source, proofs, prepared })
+    }
+
+    fn check(&self, proof_name: &str) -> Result<(ByteSpan, ProjectCheck), ProjectCheck> {
+        let mut selected = self.proofs.iter().filter(|proof| {
+            proof.children_with_tokens()
+                .filter_map(|element| element.into_token())
+                .find(|token| token.kind() == SyntaxKind::Identifier)
+                .is_some_and(|token| token.text() == proof_name)
+        });
+        let proof = selected.next().ok_or(ProjectCheck::MissingRoot)?;
+        if selected.next().is_some() {
+            return Err(ProjectCheck::AmbiguousRoot);
+        }
+        let (outcome, _) = check_selected_proof(&self.prepared, &self.source, proof, None)?;
+        Ok((byte_span(proof), outcome))
+    }
+}
+
 fn check_proof_fragment(
     prepared: &PreparedCheckerProject,
     target_source: &SourceIdentity,
@@ -228,18 +265,29 @@ fn check_proof_fragment_impl(
     }
     let root = fragment.canonical_cst();
     let declaration = child(&child(&root.root, SyntaxKind::Root)?, SyntaxKind::ProofDecl)?;
-    let steps = derive_block(&child(&declaration, SyntaxKind::Block)?);
-    let target = child(&declaration, SyntaxKind::ProofTarget)?;
+    let summary_source = retain_bound.then_some(&root.source)
+        .filter(|source| !prepared.parts().0.modules.iter().any(|module| &module.source == *source));
+    check_selected_proof(prepared, target_source, &declaration, summary_source)
+}
+
+fn check_selected_proof(
+    prepared: &PreparedCheckerProject,
+    target_source: &SourceIdentity,
+    declaration: &CstNode,
+    summary_source: Option<&SourceIdentity>,
+) -> Result<(ProjectCheck, Option<VerifiedReturnBound>), ProjectCheck> {
+    let steps = derive_block(&child(declaration, SyntaxKind::Block)?);
+    let target = child(declaration, SyntaxKind::ProofTarget)?;
     let name = identifiers(&target).next().ok_or(ProjectCheck::InvalidProof)?;
     let input_names = identifiers(&child(&target, SyntaxKind::Parameters)?).collect::<Vec<_>>();
-    let outputs = child(&declaration, SyntaxKind::ProofOutputs)?;
+    let outputs = child(declaration, SyntaxKind::ProofOutputs)?;
     let output_names = identifiers(&child(&outputs, SyntaxKind::Parameters)?).collect::<Vec<_>>();
     let mut unique = HashSet::new();
     if !input_names.iter().chain(&output_names).all(|name| unique.insert(name.as_str())) {
         return Err(ProjectCheck::InvalidProof);
     }
     let ensures = derive_expression(&child(
-        &child(&declaration, SyntaxKind::ProofEnsures)?,
+        &child(declaration, SyntaxKind::ProofEnsures)?,
         SyntaxKind::Expression,
     )?);
     let ensures = IntegerComparison::from_expression(&ensures).ok_or(ProjectCheck::Unsupported)?;
@@ -295,20 +343,18 @@ fn check_proof_fragment_impl(
         Some(Ok(ProofCoverage::NoApplicableInputs)) => ProjectCheck::NoApplicableInputs,
         Some(Err(failure)) => project_failure(body, &target.source, failure),
     };
-    let verified = (retain_bound
-        && outcome == ProjectCheck::Proved
-        && !project.modules.iter().any(|module| module.source == root.source))
-        .then(|| issue_return_bound(
-            &root.source,
-            &declaration,
+    let verified = summary_source.filter(|_| outcome == ProjectCheck::Proved).and_then(|source| {
+        issue_return_bound(
+            source,
+            declaration,
             &target.source,
             function,
             body,
             target.target_layout,
             &ensures,
             filter.as_ref(),
-        ))
-        .flatten();
+        )
+    });
     Ok((outcome, verified))
 }
 
@@ -749,6 +795,38 @@ mod tests {
         let (outcome, artifact) = check_proof_fragment_impl(&prepared, &app, &refuted, true).unwrap();
         assert_eq!(outcome, ProjectCheck::Refuted);
         assert_eq!(artifact, None);
+    }
+
+    #[test]
+    fn canonical_module_selects_proofs_in_their_actual_source_at_most_once() {
+        let file = source("src/main.w", "mixed-proofs");
+        let first = "proof bounded for clamp(x) -> (out) ensures (out <= 10) {}";
+        let second = "proof smaller for clamp(x) -> (out) ensures (out <= 9) {}";
+        let third = "proof not_here for elsewhere(x) -> (out) ensures (out <= 10) {}";
+        let text = format!("%%start\n{first}\nu8(u8) clamp = fn(value) {{ if (value > 10) {{ 10 }} else {{ value }} }};\n{second}\n{third}\n%%end");
+        let module = PreparedProofModule::prepare(file.clone(), text.clone(), inputs()).unwrap();
+        assert_eq!(module.source, file);
+        assert_eq!(module.prepared.parts().0.modules[0].items.len(), 1);
+        for (name, proof, expected) in [
+            ("bounded", first, ProjectCheck::Proved),
+            ("smaller", second, ProjectCheck::Refuted),
+        ] {
+            let start = text.find(proof).unwrap() as u32;
+            assert_eq!(module.check(name), Ok((ByteSpan::new(start, start + proof.len() as u32), expected)));
+        }
+        assert_eq!(module.check("not_here"), Err(ProjectCheck::MissingRoot));
+        assert_eq!(module.check("absent"), Err(ProjectCheck::MissingRoot));
+        let duplicate = text.replace("proof smaller", "proof bounded");
+        let module = PreparedProofModule::prepare(source("src/main.w", "duplicate"), duplicate, inputs()).unwrap();
+        assert_eq!(module.check("bounded"), Err(ProjectCheck::AmbiguousRoot));
+    }
+
+    #[test]
+    fn invalid_module_cannot_offer_recovered_or_partially_valid_proofs() {
+        let declaration = "proof bounded for identity(x) -> (out) ensures (out <= 10) {}";
+        let text = format!("%%start\n{declaration}\nu8(u8) identity = fn(value) {{ nonsense nonsense; {declaration} value }};\n%%end");
+        let result = PreparedProofModule::prepare(source("src/main.w", "invalid-proofs"), text, inputs());
+        assert!(matches!(result, Err(ProjectCheck::InvalidProof)));
     }
 
     #[test]
