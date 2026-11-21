@@ -620,6 +620,8 @@ struct Packet { *?u8 data; u64 length; }
 };
 (*Packet, bool)(u64, bool) make_empty = fn(count, present) {
 	u8[count] bytes;
+	u8 observed = bytes[0];
+	observed;
 	if (present) {
 		Packet descriptor = { .data = null; .length = 0; };
 		&descriptor, true
@@ -636,6 +638,8 @@ struct Packet { *?u8 data; u64 length; }
 };
 (*Packet, bool)(u64, bool) make_local_null = fn(count, present) {
 	u8[count] bytes;
+	u8 observed = bytes[0];
+	observed;
 	if (present) {
 		*?u8 data = null;
 		Packet descriptor = { .data = data; .length = count; };

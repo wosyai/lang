@@ -4965,8 +4965,8 @@ fn transfer_reference_facts(
                         state.moved.push((place, point.source_span.clone()));
                     }
                 }
-                CfgPointKind::MoveThrough { candidates, .. }
-                | CfgPointKind::DeferredMoveThrough { candidates, .. }
+                CfgPointKind::MoveThrough { place: through, candidates, .. }
+                | CfgPointKind::DeferredMoveThrough { place: through, candidates, .. }
                     if matches!(point.kind, CfgPointKind::MoveThrough { .. })
                         || deferred_policies.get(&id.0) == Some(&CopyPolicy::Move) =>
                 {
@@ -4988,12 +4988,19 @@ fn transfer_reference_facts(
                                 origins,
                             });
                         }
+                        let move_origin = || {
+                            if matches!(through, ScalarPlace::Dereference { .. }) {
+                                SourceSpan::new(candidate.place.source.clone(), candidate.loan.creation_span)
+                            } else {
+                                point.source_span.clone()
+                            }
+                        };
                         if singleton {
                             if !state.moved.iter().any(|(moved, _)| moved == &place) {
-                                state.moved.push((place, point.source_span.clone()));
+                                state.moved.push((place, move_origin()));
                             }
                         } else if !move_alternatives.iter().any(|(moved, _)| moved == &place) {
-                            move_alternatives.push((place, point.source_span.clone()));
+                            move_alternatives.push((place, move_origin()));
                         }
                     }
                 }

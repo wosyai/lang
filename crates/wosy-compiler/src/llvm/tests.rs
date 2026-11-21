@@ -3729,8 +3729,8 @@ fn transfers_runtime_array_ownership_through_a_returned_aggregate_pointer() {
 fn primitive_return_lanes_do_not_release_backing_escaped_by_sibling() {
     let text = "%%start
 struct Packet { *?u8 data; u64 length; }
-(u8, *Packet)(u64) scalar_first = fn(length) { u8[length] bytes; bytes[0] = 7; *?u8 data = null; unsafe { data = &?bytes[0]; }; Packet packet = { .data = data; .length = length; }; bytes[0], &packet };
-(*Packet, u8)(u64) pointer_first = fn(length) { u8[length] bytes; bytes[0] = 7; *?u8 data = null; unsafe { data = &?bytes[0]; }; Packet packet = { .data = data; .length = length; }; &packet, bytes[0] };
+(u8, *Packet)(u64) scalar_first = fn(length) { u8[length] bytes; bytes[0] = 7; *?u8 data = null; unsafe { data = &?bytes[0]; }; Packet result = { .data = data; .length = length; }; bytes[0], &result };
+(*Packet, u8)(u64) pointer_first = fn(length) { u8[length] bytes; bytes[0] = 7; *?u8 data = null; unsafe { data = &?bytes[0]; }; Packet result = { .data = data; .length = length; }; &result, bytes[0] };
 %%end";
     let source = SourceIdentity::new(
         "project".into(),
