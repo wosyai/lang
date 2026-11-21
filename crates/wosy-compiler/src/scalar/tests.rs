@@ -1889,6 +1889,92 @@ unit(u8, u8, bool) check_field = fn(value, replacement, choose) {
 }
 
 #[test]
+fn checked_alias_product_read_rejects_a_moved_field() {
+    let text = "%%start
+struct Bag { *!u8 handle; u8 other; }
+unit(u8) check = fn(value) {
+    Bag parcel = { .handle = null; .other = 1; };
+    parcel.handle = &!value;
+    *!u8 taken = parcel.handle;
+    *taken = 2;
+    *!Bag writer = &!parcel;
+    Bag whole = *writer;
+    whole.other;
+};
+%%end";
+    let moved = text.find("taken = parcel.handle").unwrap() as u32 + "taken = ".len() as u32;
+    let read = text.find("*writer;").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one unavailable-place diagnostic: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(diagnostic.message, "read or move of unavailable place");
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(read, read + 7));
+        assert_eq!(diagnostic.labels[1].span.range, ByteSpan::new(moved, moved + 13));
+    }
+}
+
+#[test]
+fn checked_alias_write_does_not_restore_the_transferred_parameter_handle() {
+    let text = "%%start
+unit(*!u8) check = fn(parent) {
+    *!u8 received = parent;
+    *received = 3;
+    parent;
+};
+%%end";
+    let moved = text.find("parent;").unwrap() as u32;
+    let read = text.rfind("parent;").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one unavailable-place diagnostic: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(diagnostic.message, "read or move of unavailable place");
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(read, read + 6));
+        assert_eq!(diagnostic.labels[1].span.range, ByteSpan::new(moved, moved + 6));
+    }
+}
+
+#[test]
+fn checked_alias_product_reads_preserve_siblings_restored_fields_and_transferred_pointees() {
+    for body in [
+        "unit(u8) check = fn(value) {
+            Bag parcel = { .handle = null; .other = 1; };
+            parcel.handle = &!value;
+            *!u8 taken = parcel.handle;
+            *taken = 2;
+            *!Bag writer = &!parcel;
+            u8 sibling = (*writer).other;
+            sibling;
+        };",
+        "unit(u8, u8) check = fn(value, replacement) {
+            Bag parcel = { .handle = null; .other = 1; };
+            parcel.handle = &!value;
+            *!u8 taken = parcel.handle;
+            *taken = 2;
+            *!Bag writer = &!parcel;
+            (*writer).handle = &!replacement;
+            Bag whole = *writer;
+            whole.other;
+        };",
+        "unit(*!Bag) check = fn(parent) {
+            *!Bag received = parent;
+            Bag whole = *received;
+            whole.other;
+        };",
+    ] {
+        let text = format!("%%start\nstruct Bag {{ *!u8 handle; u8 other; }}\n{body}\n%%end");
+        let (single, project) = both_reference_functions(&text);
+        assert!(single.diagnostics.is_empty(), "{body}: {:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{body}: {:?}", project.diagnostics);
+    }
+}
+
+#[test]
 fn incompatible_fresh_checked_borrows_report_the_earlier_live_loan() {
     for (first, second, still_live) in [
         ("*!u8 first = &!value;", "*!u8 second = &!value;", "first"),

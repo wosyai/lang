@@ -3848,27 +3848,44 @@ fn is_lexical_field_path(path: &[ReferencePlaceProjection]) -> bool {
     })
 }
 
+#[derive(Clone, Copy)]
+enum CheckedHandleStorage {
+    Lexical,
+    Pointee,
+}
+
 fn unavailable_checked_handles(
     state: &ReferenceEdgeState,
     binding: &ReferenceBindingId,
     path: &[ReferencePlaceProjection],
+    storage: CheckedHandleStorage,
 ) -> Vec<SourceSpan> {
     state
         .moved_checked_handles
         .get(binding)
         .into_iter()
         .flatten()
-        .filter(|(moved, _)| moved.starts_with(path) || path.starts_with(moved))
+        .filter(|(moved, _)| {
+            (matches!(storage, CheckedHandleStorage::Lexical) || !moved.is_empty())
+                && (moved.starts_with(path) || path.starts_with(moved))
+        })
         .map(|(_, origin)| origin.clone())
         .collect()
 }
 
-fn reinitialize_checked_handles(state: &mut ReferenceEdgeState, target: &ReferencePlaceId) {
-    if target.projections.is_empty() {
+fn reinitialize_checked_handles(
+    state: &mut ReferenceEdgeState,
+    target: &ReferencePlaceId,
+    storage: CheckedHandleStorage,
+) {
+    if target.projections.is_empty() && matches!(storage, CheckedHandleStorage::Lexical) {
         state.moved_checked_handles.remove(&target.binding);
     } else if let Some(moved) = state.moved_checked_handles.get_mut(&target.binding) {
         if is_lexical_field_path(&target.projections) {
-            moved.retain(|(path, _)| !path.starts_with(&target.projections));
+            moved.retain(|(path, _)| {
+                (matches!(storage, CheckedHandleStorage::Pointee) && path.is_empty())
+                    || !path.starts_with(&target.projections)
+            });
             if moved.is_empty() {
                 state.moved_checked_handles.remove(&target.binding);
             }
@@ -5034,20 +5051,40 @@ fn transfer_reference_facts(
                     _ => unreachable!("assignment previous origins"),
                 }
             }
-            let (read_places, lexical_read) = match &point.kind {
+            let (read_places, handle_storage) = match &point.kind {
                 CfgPointKind::ReadPlace { candidates, pointer_point, .. } => {
-                    (candidates.as_slice(), pointer_point.is_none())
+                    let storage = if state.moved_checked_handles.is_empty() {
+                        None
+                    } else if pointer_point.is_none() {
+                        Some(CheckedHandleStorage::Lexical)
+                    } else if cfg.checked_pointee_reads.binary_search(&id).is_ok() {
+                        Some(CheckedHandleStorage::Pointee)
+                    } else {
+                        None
+                    };
+                    (candidates.as_slice(), storage)
                 }
-                _ => (&[][..], false),
+                _ => (&[][..], None),
             };
             for place in read_places {
-                if lexical_read && is_lexical_field_path(&place.projections) {
-                    let origins = unavailable_checked_handles(&state, &place.binding, &place.projections);
-                    if !origins.is_empty() {
-                        errors.push(ReferenceAnalysisError::ConflictingPlace {
-                            source_span: point.source_span.clone(),
-                            origins,
-                        });
+                if let Some(storage) = handle_storage {
+                    let normalized;
+                    let storage_place = if matches!(storage, CheckedHandleStorage::Pointee) {
+                        normalized = available_place(place);
+                        &normalized
+                    } else {
+                        place
+                    };
+                    if is_lexical_field_path(&storage_place.projections) {
+                        let origins = unavailable_checked_handles(
+                            &state, &storage_place.binding, &storage_place.projections, storage,
+                        );
+                        if !origins.is_empty() {
+                            errors.push(ReferenceAnalysisError::ConflictingPlace {
+                                source_span: point.source_span.clone(),
+                                origins,
+                            });
+                        }
                     }
                 }
                 if unavailable_place(&state, place)
@@ -5179,7 +5216,7 @@ fn transfer_reference_facts(
                             if alternatives.iter().all(|candidate| {
                                 reference_places_same(&target, &available_place(&candidate.place))
                             }) {
-                                reinitialize_checked_handles(&mut state, &target);
+                                reinitialize_checked_handles(&mut state, &target, CheckedHandleStorage::Pointee);
                             }
                         }
                     }
@@ -5248,7 +5285,7 @@ fn transfer_reference_facts(
                     }
                 }
                 CfgPointKind::Read { binding } => {
-                    let origins = unavailable_checked_handles(&state, binding, &[]);
+                    let origins = unavailable_checked_handles(&state, binding, &[], CheckedHandleStorage::Lexical);
                     if !origins.is_empty() {
                         errors.push(ReferenceAnalysisError::ConflictingPlace {
                             source_span: point.source_span.clone(),
@@ -5335,7 +5372,7 @@ fn transfer_reference_facts(
                     ..
                 } => {
                     let binding = &target.binding;
-                    reinitialize_checked_handles(&mut state, target);
+                    reinitialize_checked_handles(&mut state, target, CheckedHandleStorage::Lexical);
                     if target.projections.is_empty() {
                         state.bindings.remove(binding);
                         state
