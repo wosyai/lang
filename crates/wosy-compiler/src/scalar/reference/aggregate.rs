@@ -30,6 +30,9 @@ pub(super) struct AggregateFlowFacts {
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     pub(super) array_return_move: Option<CfgPointId>,
     pub(super) array_installs: BTreeSet<CfgPointId>,
+    pub(super) local_array_copy_allocation: Option<CfgPointId>,
+    pub(super) local_array_nulls: BTreeSet<CfgPointId>,
+    pub(super) local_array_failure_arms: BTreeMap<CfgPointId, BlockOrdinal>,
 }
 
 impl AggregateFlowFacts {
@@ -46,8 +49,13 @@ impl AggregateFlowFacts {
             unreachable!("aggregate ownership binding point");
         };
         match ty {
-            ScalarType::RuntimeArray { .. } if allocation => {
+            ScalarType::RuntimeArray { element, .. } if allocation => {
                 self.allocations.insert(binding.clone(), point);
+                if self.allocations.len() == 1 && ordinary_value(element) {
+                    self.local_array_copy_allocation = Some(point);
+                } else {
+                    self.local_array_copy_allocation = None;
+                }
                 self.allocation_slots
                     .insert(point, (position.block.0, position.item));
             }
@@ -173,6 +181,15 @@ pub(super) struct AggregateEdgeState {
     array_formal_live: bool,
     array_formal_pending: Option<CfgPointId>,
     array_dependencies: BTreeSet<CfgPointId>,
+    local_array: Option<LocalArrayLife>,
+}
+
+#[derive(Clone, Default, PartialEq)]
+struct LocalArrayLife {
+    live: bool,
+    pending: Option<CfgPointId>,
+    invalid: bool,
+    has_rebind: bool,
 }
 
 impl AggregateEdgeState {
@@ -189,6 +206,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     pub(super) array_returns: BTreeSet<Option<BTreeSet<CfgPointId>>>,
     pub(super) array_rebinds: BTreeMap<CfgPointId, (CfgPointId, ReferenceBindingId)>,
+    pub(super) local_array_failure_arms: BTreeMap<usize, Option<CfgPointId>>,
     pub(super) allocation_slots: BTreeMap<CfgPointId, (usize, usize)>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) returns: BTreeMap<CfgPointId, BTreeSet<Option<OwnerSource>>>,
@@ -268,6 +286,8 @@ impl AggregateFlowFacts {
     pub(super) fn entry_state(&self) -> AggregateEdgeState {
         let mut state = AggregateEdgeState {
             array_formal_live: self.array_formal.is_some(),
+            local_array: (self.local_array_copy_allocation.is_some() && !self.local_array_failure_arms.is_empty())
+                .then(LocalArrayLife::default),
             ..AggregateEdgeState::default()
         };
         for (&slot, binding) in &self.formals {
@@ -300,6 +320,59 @@ impl AggregateFlowFacts {
         sites: &FunctionCallSites,
     ) {
         let id = point.id;
+        if let Some(local) = &mut state.local_array {
+            let (binding, &allocation) = self.allocations.first_key_value().expect("local array demand");
+            if id == allocation {
+                local.invalid |= local.live || local.pending.is_some() || point.scope != ReferenceScopeId(0);
+                local.live = true;
+            }
+            if self.views.get(&id) == Some(&allocation) {
+                local.invalid = true;
+            }
+            match &point.kind {
+                CfgPointKind::Borrow { place, .. } if &place.binding == binding => local.invalid = true,
+                CfgPointKind::Move { place, owner, .. } if owner == binding => {
+                    if local.live && local.pending.is_none() && place.projections.is_empty() && &place.binding == binding {
+                        local.live = false;
+                        local.pending = Some(id);
+                    } else {
+                        local.invalid = true;
+                    }
+                }
+                CfgPointKind::DeferredMove { owner, .. } if owner == binding => local.invalid = true,
+                CfgPointKind::MoveThrough { .. } | CfgPointKind::DeferredMoveThrough { .. }
+                | CfgPointKind::Invalidate { .. } | CfgPointKind::Release { .. } => local.invalid = true,
+                CfgPointKind::Call { output: 0, .. } if local.pending.is_some() => {
+                    if !self.array_calls.get(&id).is_some_and(|(_, moved, actual)| actual == binding && Some(*moved) == local.pending) {
+                        local.invalid = true;
+                    }
+                }
+                CfgPointKind::Assign { target, rhs_point, .. } if &target.binding == binding && target.projections.is_empty() => {
+                    if self.array_installs.contains(&id) && self.array_calls.get(rhs_point)
+                        .is_some_and(|(_, moved, actual)| actual == binding && Some(*moved) == local.pending)
+                    {
+                        local.pending = None;
+                        local.live = true;
+                        local.has_rebind = true;
+                    } else {
+                        local.invalid = true;
+                    }
+                }
+                _ => {}
+            }
+            if let Some(&arm) = self.local_array_failure_arms.get(&id) {
+                let witness = (local.live && !local.invalid && local.pending.is_none() && local.has_rebind)
+                    .then_some(allocation);
+                result.local_array_failure_arms
+                    .entry(arm.0)
+                    .and_modify(|known| {
+                        if *known != witness {
+                            *known = None;
+                        }
+                    })
+                    .or_insert(witness);
+            }
+        }
         if let CfgPointKind::Assign { target, rhs_point, .. } = &point.kind {
             if self.array_installs.contains(&id) && target.projections.is_empty() && self.array_calls.get(rhs_point)
                 .is_some_and(|(_, _, binding)| *binding == target.binding)
@@ -821,6 +894,7 @@ pub(crate) struct ClosedBody {
     pub(crate) input: Option<usize>,
     pub(crate) input_mixed: bool,
     pub(crate) same_array_rebinds: BTreeSet<usize>,
+    pub(crate) local_array_failure: Option<((usize, usize), usize)>,
     pub(crate) input_release: Option<CfgPointId>,
     pub(crate) input_calls: BTreeMap<usize, (usize, ClosedInput)>,
 }
@@ -1137,6 +1211,26 @@ fn closed_aggregates<'a>(
                 result.bodies.entry(key).or_default().same_array_rebinds.insert(ordinal.0);
             }
         }
+        if facts.local_array_failure_arms.is_empty() {
+            continue;
+        }
+        let Some(plan) = result.bodies.get_mut(&key) else { continue };
+        let mut failed = facts.local_array_failure_arms.iter().filter_map(|(arm, site)| {
+            site.map(|site| (arm, site))
+        });
+        let Some((arm, allocation)) = failed.next() else { continue };
+        if failed.next().is_some() {
+            continue;
+        }
+        let CfgPointKind::Bind { binding } = &cfg.points[allocation.0].kind else { continue };
+        let mut matching = facts.array_rebinds.values().filter(|(_, target)| target == binding);
+        if !matching.all(|(point, _)| {
+            facts.array_calls.get(point).is_some_and(|(ordinal, _, _)| plan.same_array_rebinds.contains(&ordinal.0))
+        }) {
+            continue;
+        }
+        let Some(&position) = facts.allocation_slots.get(&allocation) else { continue };
+        plan.local_array_failure = Some((position, *arm));
     }
     if outgoing.is_empty() {
         return Ok(result);
