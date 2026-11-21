@@ -12422,3 +12422,53 @@ unit(Pair) inspect = fn(owner) {
         assert_eq!(conflicts, 1, "{diagnostics:?}");
     }
 }
+
+#[test]
+fn known_whole_loan_checks_direct_owner_copy_reads_and_writes_until_last_use() {
+    let mut missed = Vec::new();
+    for (mode, body, conflict) in [
+        ("", "Pair snapshot = owner; u8 seen = (*holder).left; snapshot.right; seen;", None),
+        ("!", "u8 seen = (*holder).left; Pair snapshot = owner; snapshot.right; seen;", None),
+        ("!", "u8 seen = (*holder).left; owner = { .left = 7; .right = 8; }; owner.right; seen;", None),
+        ("", "u8 seen = (*holder).left; owner = { .left = 7; .right = 8; }; owner.right; seen;", None),
+        ("!", "Pair snapshot = owner; u8 seen = (*holder).left; snapshot.right; seen;", Some("owner; u8 seen")),
+        ("!", "u8 direct = owner.right; u8 seen = (*holder).left; direct; seen;", Some("owner.right; u8 seen")),
+        ("!", "owner = { .left = 7; .right = 8; }; u8 seen = (*holder).left; seen;", Some("owner =")),
+        ("", "owner = { .left = 7; .right = 8; }; u8 seen = (*holder).left; seen;", Some("owner =")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *{mode}Pair holder = &{mode}owner;
+    {body}
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let loan = text.find(&format!("&{mode}owner")).unwrap() as u32;
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let borrow = function.reference_cfg.initial_points.iter().find(|point| point.source_span.range.start == loan
+                && matches!(&point.kind, CfgPointKind::Borrow { loan, .. } if loan.parent.is_none()
+                    && loan.origin_place.projections.is_empty()
+                    && matches!(loan.origin_place.place, ScalarPlace::Name { .. })
+                    && loan.mode == if mode.is_empty() { ScalarReferenceMutability::Shared } else { ScalarReferenceMutability::Mutable }))
+                .unwrap_or_else(|| panic!("known direct whole loan: {diagnostics:?}"));
+            if let Some(conflict) = conflict {
+                let start = text.find(conflict).unwrap() as u32;
+                if !diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == start)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range)
+                }) {
+                    missed.push((validator, mode, conflict, diagnostics.clone()));
+                }
+            } else {
+                assert!(diagnostics.is_empty(), "{validator} {mode}; {body}: {diagnostics:?}");
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{missed:?}");
+}

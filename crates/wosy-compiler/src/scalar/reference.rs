@@ -4883,7 +4883,7 @@ fn transfer_reference_facts(
         .collect::<BTreeSet<_>>();
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
     let mut strictly_forward = true;
-    let mut known_field_owners = None::<HashMap<&ReferenceBindingId, Option<ReferencePlaceId>>>;
+    let mut known_lexical_owners = None::<HashMap<&ReferenceBindingId, Option<ReferencePlaceId>>>;
     let mut aggregate_expiry_allowed = aggregate.is_some();
     let pending = cfg.pending_named_reborrow;
     let mut local_definition = None;
@@ -4959,9 +4959,15 @@ fn transfer_reference_facts(
                 if !matches!(place, ScalarPlace::Dereference { .. }));
         match &point.kind {
             CfgPointKind::Borrow { place, loan } if loan.parent.is_none()
-                && !place.projections.is_empty() && is_lexical_field_path(&place.projections) =>
+                && is_lexical_field_path(&place.projections)
+                && (!place.projections.is_empty() || (
+                    matches!(place.place, ScalarPlace::Name { .. })
+                        && matches!(loan.origin_place.place, ScalarPlace::Name { .. })
+                        && loan.origin_place.projections.is_empty()
+                        && loan.origin_place.binding == place.binding
+                )) =>
             {
-                let owner = known_field_owners.get_or_insert_with(HashMap::new).entry(&place.binding).or_insert(None);
+                let owner = known_lexical_owners.get_or_insert_with(HashMap::new).entry(&place.binding).or_insert(None);
                 let root = reference_root(&place.place);
                 if owner.is_none() && loan.mode == ScalarReferenceMutability::Mutable
                     && matches!(root, ScalarPlace::Name { .. })
@@ -5815,7 +5821,7 @@ fn transfer_reference_facts(
                 }
                 _ => (&[][..], None),
             };
-            if let Some(owners) = &known_field_owners {
+            if let Some(owners) = &known_lexical_owners {
                 let (whole, projected) = match &point.kind {
                     CfgPointKind::Read { binding } => (owners.get(binding).and_then(Option::as_ref), &[][..]),
                     CfgPointKind::ReadPlace { candidates, pointer_point: None, .. } => (None, candidates.as_slice()),
@@ -5971,7 +5977,7 @@ fn transfer_reference_facts(
                 CfgPointKind::Assign { target, .. } => {
                     let target = available_place(target);
                     if !target.projections.is_empty()
-                        || (matches!(target.place, ScalarPlace::Name { .. }) && known_field_owners.as_ref()
+                        || (matches!(target.place, ScalarPlace::Name { .. }) && known_lexical_owners.as_ref()
                             .is_some_and(|owners| owners.contains_key(&target.binding)))
                         || (pending_allowed
                             && pending.is_some_and(|pending| deferred_local_owner_store(pending, point, original_points)))
