@@ -40,6 +40,51 @@ mod plain_names;
 
 mod lexical_members;
 
+#[test]
+fn origin_index_preserves_first_ids_and_exact_identity_within_span_buckets() {
+    let span = ByteSpan::new(3, 4);
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let binding = ReferenceBindingId {
+        source: source.clone(),
+        function_span: span,
+        declaration_span: span,
+        block_span: span,
+        kind: ReferenceBindingKind::Declared,
+    };
+    let borrowed = |mode| ReferenceOrigin::BorrowedFrom {
+        parameter: 0,
+        loan: ReferenceLoanId {
+            mode,
+            origin_place: ReferencePlaceId {
+                source: source.clone(),
+                function_span: span,
+                declaration_span: span,
+                block_span: span,
+                binding: binding.clone(),
+                projections: Vec::new(),
+                place: ScalarPlace::Name { name: "slot".into(), span },
+            },
+            creation_span: span,
+            parent: None,
+        },
+    };
+    let shared = borrowed(ScalarReferenceMutability::Shared);
+    let mutable = borrowed(ScalarReferenceMutability::Mutable);
+    let null = ReferenceOrigin::Null { span };
+    let invalid = ReferenceOrigin::Invalid { origin_span: span, conflict_span: span };
+    let mut facts = Vec::new();
+    let mut index = ReferenceOriginIndex::default();
+    assert_eq!(index.intern(&mut facts, shared.clone()), ReferenceOriginId(0));
+    assert_eq!(index.intern(&mut facts, shared.clone()), ReferenceOriginId(0));
+    assert_eq!(index.intern(&mut facts, null.clone()), ReferenceOriginId(1));
+    assert_eq!(index.intern(&mut facts, mutable.clone()), ReferenceOriginId(2));
+    assert_eq!(index.intern(&mut facts, shared.clone()), ReferenceOriginId(0));
+    assert_eq!(index.intern(&mut facts, mutable.clone()), ReferenceOriginId(2));
+    assert_eq!(index.intern(&mut facts, invalid.clone()), ReferenceOriginId(3));
+    assert_eq!(index.intern(&mut facts, invalid.clone()), ReferenceOriginId(3));
+    assert_eq!(facts, vec![shared, null, mutable, invalid]);
+}
+
 fn assert_project_reference_results(
     left: &ProjectReferenceResults,
     right: &ProjectReferenceResults,

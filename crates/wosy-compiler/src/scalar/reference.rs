@@ -198,6 +198,78 @@ fn derive_and_converge_program_references(
     (updates, errors)
 }
 
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+enum ReferenceOriginKey {
+    Fresh((u32, u32), (u32, u32)),
+    BorrowedFrom(usize, (u32, u32)),
+    Null((u32, u32)),
+    Invalid((u32, u32), (u32, u32)),
+}
+
+impl ReferenceOriginKey {
+    fn of(fact: &ReferenceOrigin) -> Self {
+        let range = |span: ByteSpan| (span.start, span.end);
+        match fact {
+            ReferenceOrigin::Fresh { allocation, loan } => {
+                Self::Fresh(range(loan.creation_span), range(allocation.creation_span))
+            }
+            ReferenceOrigin::BorrowedFrom { parameter, loan } => {
+                Self::BorrowedFrom(*parameter, range(loan.creation_span))
+            }
+            ReferenceOrigin::Null { span } => Self::Null(range(*span)),
+            ReferenceOrigin::Invalid { origin_span, conflict_span } => {
+                Self::Invalid(range(*origin_span), range(*conflict_span))
+            }
+        }
+    }
+}
+
+enum ReferenceOriginBucket {
+    Single(ReferenceOriginId),
+    Shared(Vec<ReferenceOriginId>),
+}
+
+#[derive(Default)]
+struct ReferenceOriginIndex {
+    by_key: BTreeMap<ReferenceOriginKey, ReferenceOriginBucket>,
+}
+
+impl ReferenceOriginIndex {
+    fn intern(
+        &mut self,
+        facts: &mut Vec<ReferenceOrigin>,
+        origin: ReferenceOrigin,
+    ) -> ReferenceOriginId {
+        use std::collections::btree_map::Entry;
+
+        let id = ReferenceOriginId(facts.len());
+        match self.by_key.entry(ReferenceOriginKey::of(&origin)) {
+            Entry::Occupied(mut entry) => {
+                let bucket = entry.get_mut();
+                match bucket {
+                    ReferenceOriginBucket::Single(first) => {
+                        if facts[first.0] == origin {
+                            return *first;
+                        }
+                        *bucket = ReferenceOriginBucket::Shared(vec![*first, id]);
+                    }
+                    ReferenceOriginBucket::Shared(ids) => {
+                        if let Some(previous) = ids.iter().copied().find(|id| facts[id.0] == origin) {
+                            return previous;
+                        }
+                        ids.push(id);
+                    }
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(ReferenceOriginBucket::Single(id));
+            }
+        }
+        facts.push(origin);
+        id
+    }
+}
+
 pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
     aggregate_facts: aggregate::AggregateFlowFacts,
@@ -220,6 +292,7 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     pub(super) enums: &'a [ScalarEnum],
     pub(super) generic_parameters: BTreeSet<String>,
     pub(super) dereference_points: HashMap<OccurrenceOrdinal, CfgPointId>,
+    origin_index: ReferenceOriginIndex,
     pub(super) cfg: ScalarReferenceCfg,
     pub(super) next_scope: usize,
     pub(super) cursor: Option<CfgPointId>,
@@ -307,6 +380,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 .map(|parameter| parameter.name.clone())
                 .collect(),
             dereference_points: HashMap::new(),
+            origin_index: ReferenceOriginIndex::default(),
             cfg: ScalarReferenceCfg {
                 primary_call_points: HashMap::new(),
                 facts: Vec::new(),
@@ -436,13 +510,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
     }
 
     fn intern(&mut self, origin: ReferenceOrigin) -> ReferenceOriginId {
-        if let Some(index) = self.cfg.facts.iter().position(|fact| fact == &origin) {
-            ReferenceOriginId(index)
-        } else {
-            let id = ReferenceOriginId(self.cfg.facts.len());
-            self.cfg.facts.push(origin);
-            id
-        }
+        self.origin_index.intern(&mut self.cfg.facts, origin)
     }
 
     fn point(
@@ -8653,6 +8721,7 @@ fn build_function_reference_cfg(
             }
         }
     }
+    drop(builder.origin_index);
     let mut aggregate = std::mem::take(&mut builder.aggregate_result);
     if prior_children_succeeded && errors.is_empty() && !builder.cfg.points.is_empty() {
         builder.cfg.initial_points = builder.cfg.points.clone();
