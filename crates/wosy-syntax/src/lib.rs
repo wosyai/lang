@@ -91,6 +91,16 @@ pub enum SyntaxKind {
     AllocationBinding,
     ParenthesizedDereferencePlace,
     CopyModifier,
+    #[cfg(test)]
+    ProofDecl = 81,
+    #[cfg(test)]
+    ProofTarget = 82,
+    #[cfg(test)]
+    ProofOutputs = 83,
+    #[cfg(test)]
+    ProofWhere = 84,
+    #[cfg(test)]
+    ProofEnsures = 85,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -181,6 +191,16 @@ impl Language for WosyLanguage {
             78 => SyntaxKind::AllocationBinding,
             79 => SyntaxKind::ParenthesizedDereferencePlace,
             80 => SyntaxKind::CopyModifier,
+            #[cfg(test)]
+            81 => SyntaxKind::ProofDecl,
+            #[cfg(test)]
+            82 => SyntaxKind::ProofTarget,
+            #[cfg(test)]
+            83 => SyntaxKind::ProofOutputs,
+            #[cfg(test)]
+            84 => SyntaxKind::ProofWhere,
+            #[cfg(test)]
+            85 => SyntaxKind::ProofEnsures,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -432,22 +452,54 @@ impl ParseResult {
 }
 
 pub fn parse(source: SourceIdentity, text: String, configured_comments: &[String]) -> ParseResult {
+    parse_entry(source, text, configured_comments, Rule::source)
+}
+
+#[cfg(test)]
+fn parse_proof_fragment(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+) -> ParseResult {
+    parse_entry(source, text, configured_comments, Rule::proof_fragment)
+}
+
+fn parse_entry(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+    rule: Rule,
+) -> ParseResult {
     let mut errors = Vec::new();
     let comments = scan_comments(&text, configured_comments, &mut errors);
     let mut builder = GreenNodeBuilder::new();
     builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Root));
-    let parsed = WosyParser::parse(Rule::source, &text);
-    if let Ok(mut pairs) = parsed {
-        let pair = pairs.next().expect("source pair");
-        build_pair(&mut builder, pair, &text, &comments, &mut errors);
-    } else {
-        builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Error));
-        add_gap(&mut builder, &text, 0, &comments);
-        builder.finish_node();
-        errors.push(SyntaxError {
-            span: ByteSpan::new(0, text.len() as u32),
-            message: "source does not match the base grammar".to_owned(),
-        });
+    match WosyParser::parse(rule, &text) {
+        Ok(mut pairs) => {
+            let pair = pairs.next().expect("grammar entry pair");
+            build_pair(&mut builder, pair, &text, &comments, &mut errors);
+        }
+        Err(_error) => {
+            builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Error));
+            add_gap(&mut builder, &text, 0, &comments);
+            builder.finish_node();
+            let span = ByteSpan::new(0, text.len() as u32);
+            #[cfg(test)]
+            let span = if rule == Rule::proof_fragment {
+                match _error.location {
+                    pest::error::InputLocation::Pos(at) => ByteSpan::new(at as u32, at as u32),
+                    pest::error::InputLocation::Span((start, end)) => {
+                        ByteSpan::new(start as u32, end as u32)
+                    }
+                }
+            } else {
+                span
+            };
+            errors.push(SyntaxError {
+                span,
+                message: "source does not match the base grammar".to_owned(),
+            });
+        }
     }
     builder.finish_node();
     let root = CstNode::new_root(builder.finish());
@@ -700,6 +752,18 @@ fn collect_comments(
 fn kind(rule: Rule) -> SyntaxKind {
     match rule {
         Rule::source => SyntaxKind::Root,
+        #[cfg(test)]
+        Rule::proof_fragment => SyntaxKind::Root,
+        #[cfg(test)]
+        Rule::proof_decl => SyntaxKind::ProofDecl,
+        #[cfg(test)]
+        Rule::proof_target => SyntaxKind::ProofTarget,
+        #[cfg(test)]
+        Rule::proof_outputs => SyntaxKind::ProofOutputs,
+        #[cfg(test)]
+        Rule::proof_where => SyntaxKind::ProofWhere,
+        #[cfg(test)]
+        Rule::proof_ensures => SyntaxKind::ProofEnsures,
         Rule::boundary_start => SyntaxKind::BoundaryStart,
         Rule::boundary_end => SyntaxKind::BoundaryEnd,
         Rule::extern_decl => SyntaxKind::ExternDecl,
@@ -2429,5 +2493,102 @@ mod tests {
         assert_eq!(literals[1].0, "2E+3");
         assert_eq!(literals[0].1, ByteSpan::new(16, 28));
         assert_eq!(literals[1].1, ByteSpan::new(38, 42));
+    }
+}
+
+#[cfg(test)]
+mod proof_fragment_tests {
+    use super::*;
+
+    fn source() -> SourceIdentity {
+        SourceIdentity::new("local".into(), "demo".into(), "proof.w".into(), "test".into())
+    }
+
+    fn proof(result: &ParseResult) -> CstNode {
+        assert!(result.is_valid(), "{:?}", result.errors);
+        result
+            .canonical_cst()
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ProofDecl)
+            .expect("canonical proof declaration")
+    }
+
+    #[test]
+    fn proof_fragment_reuses_canonical_binders_expressions_and_block() {
+        let text = r#"proof bounded for clamp_bounded(x) -> (out)
+    where (x <= 10)
+    ensures (out <= 10) {
+    core.show(out == x);
+}"#;
+        let result = parse_proof_fragment(source(), text.to_owned(), &[]);
+        let proof = proof(&result);
+        assert_eq!(result.reconstruct(), text);
+        assert!(proof.children_with_tokens().any(|element| {
+            element.into_token().is_some_and(|token| {
+                token.kind() == SyntaxKind::Identifier && token.text() == "bounded"
+            })
+        }));
+        let children = proof.children().collect::<Vec<_>>();
+        let [target, outputs, entry, goal, body] = children.as_slice() else {
+            panic!("expected five structural children");
+        };
+        assert_eq!(target.kind(), SyntaxKind::ProofTarget);
+        assert_eq!(outputs.kind(), SyntaxKind::ProofOutputs);
+        assert_eq!(entry.kind(), SyntaxKind::ProofWhere);
+        assert_eq!(goal.kind(), SyntaxKind::ProofEnsures);
+        assert_eq!(body.kind(), SyntaxKind::Block);
+        assert!(target.children().any(|node| node.kind() == SyntaxKind::Parameters && node.text() == "(x)"));
+        assert!(outputs.children().any(|node| node.kind() == SyntaxKind::Parameters && node.text() == "(out)"));
+        assert!(entry.children().any(|node| node.kind() == SyntaxKind::Expression && node.text() == "x <= 10"));
+        assert!(goal.children().any(|node| node.kind() == SyntaxKind::Expression && node.text() == "out <= 10"));
+        assert!(body.descendants().any(|node| node.kind() == SyntaxKind::Call && node.text() == "core.show(out == x)"));
+    }
+
+    #[test]
+    fn proof_fragment_retains_empty_body_without_where() {
+        let text = "proof bounded for clamp_bounded(x) -> (out) ensures (out <= 10) {}";
+        let result = parse_proof_fragment(source(), text.to_owned(), &[]);
+        let proof = proof(&result);
+        assert_eq!(result.reconstruct(), text);
+        assert!(!proof.children().any(|node| node.kind() == SyntaxKind::ProofWhere));
+        assert!(proof.children().any(|node| node.kind() == SyntaxKind::Block && node.text() == "{}"));
+    }
+
+    #[test]
+    fn proof_fragment_is_not_enabled_in_ordinary_source() {
+        let proof = "proof bounded for clamp_bounded(x) -> (out) ensures (out <= 10) {}";
+        let text = format!("%%start\n{proof}\n%%end");
+        let result = parse(source(), text.clone(), &[]);
+        assert!(!result.is_valid());
+        assert_eq!(result.reconstruct(), text);
+        assert!(!result.root.descendants().any(|node| node.kind() == SyntaxKind::ProofDecl));
+    }
+
+    #[test]
+    fn proof_fragment_rejects_partial_and_malformed_input() {
+        for text in [
+            "proofbounded for clamp_bounded(x) -> (out) ensures (out <= 10) {}",
+            "proof bounded forclamp_bounded(x) -> (out) ensures (out <= 10) {}",
+            "proof bounded for clamp_bounded(x) -> (out) where () ensures (out <= 10) {}",
+            "proof bounded for clamp_bounded(u8 x) -> (out) ensures (out <= 10) {}",
+            "proof bounded for clamp_bounded(x) -> (u8 out) ensures (out <= 10) {}",
+            "proof bounded for clamp_bounded(x) -> out ensures (out <= 10) {}",
+            "proof bounded for clamp_bounded(x) -> (out) {}",
+            "proof bounded for clamp_bounded(x) -> (out) ensures (out <= 10) {} trailing",
+        ] {
+            let result = parse_proof_fragment(source(), text.to_owned(), &[]);
+            assert!(!result.is_valid(), "{text}");
+            assert_eq!(result.reconstruct(), text);
+            let [error] = result.errors.as_slice() else {
+                panic!("expected one grammar error: {:?}", result.errors);
+            };
+            assert!(error.span.start <= error.span.end);
+            assert!(text.is_char_boundary(error.span.start as usize));
+            assert!(text.is_char_boundary(error.span.end as usize));
+            if let Some(start) = text.find("trailing") {
+                assert_eq!(error.span, ByteSpan::new(start as u32, start as u32));
+            }
+        }
     }
 }

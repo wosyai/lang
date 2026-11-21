@@ -7,6 +7,17 @@ comment_payload = @{ (!("\r" | "\n") ~ ANY)* }
 comment_scan = ${ SOI ~ (string | comment | (!("\"" | "#") ~ ANY))* ~ EOI }
 
 source = { SOI ~ boundary_start ~ (item | error_item)+ ~ boundary_end ~ EOI }
+proof_fragment = { SOI ~ proof_decl ~ EOI }
+proof_decl = { proof_keyword ~ identifier ~ proof_for_keyword ~ proof_target ~ "->" ~ proof_outputs ~ proof_where? ~ proof_ensures ~ block }
+proof_target = { identifier ~ parameters }
+proof_outputs = { parameters }
+proof_where = { proof_where_keyword ~ "(" ~ expression ~ ")" }
+proof_ensures = { proof_ensures_keyword ~ "(" ~ expression ~ ")" }
+proof_keyword = @{ "proof" ~ !proof_keyword_suffix }
+proof_for_keyword = @{ "for" ~ !proof_keyword_suffix }
+proof_where_keyword = @{ "where" ~ !proof_keyword_suffix }
+proof_ensures_keyword = @{ "ensures" ~ !proof_keyword_suffix }
+proof_keyword_suffix = _{ ASCII_ALPHANUMERIC | "_" }
 boundary_start = { "%%start" }
 boundary_end = { "%%end" }
 item = { enum_decl | struct_decl | namespace_decl | extern_decl | generic_function_decl | malformed_generic_decl | function_decl | overload_decl | binding_decl | top_level_item }
