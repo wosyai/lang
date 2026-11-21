@@ -964,6 +964,125 @@ fn joined_checked_dereference_move_preserves_both_parent_loans() {
 }
 
 #[test]
+fn uneven_checked_dereference_move_preserves_both_parent_loans() {
+    let delay = "u64 tick = 1; tick = tick + 1; tick = tick + 1; tick = tick + 1; tick = tick + 1; tick = tick + 1; tick;";
+    for (then_arm, else_arm) in [
+        ("writer = first;".to_owned(), format!("{delay} writer = second;")),
+        (format!("{delay} writer = first;"), "writer = second;".to_owned()),
+    ] {
+        let text = format!(
+            "%%start\nstruct Payload {{ i32 value; }}\nstruct Holder {{ Payload nested; i32 sibling; }}\nPayload(*!Holder, *!Holder, bool) choose = fn(first, second, flag) {{ *!Holder writer = first; if (flag) {{ {then_arm} }} else {{ {else_arm} }}; Payload moved = (*writer).nested; i32 observed = (*writer).sibling; observed; moved }};\n%%end"
+        );
+        let single = validate_text(&text);
+        let parsed = parse_source(source(), text.clone(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else { panic!("function") };
+            let start = text.find("(*writer).nested").unwrap() as u32;
+            let event = function.reference_cfg.points.iter().find(|point| {
+                point.source_span.range.start == start
+                    && matches!(point.kind, CfgPointKind::MoveThrough { .. })
+            }).expect("joined projected move");
+            let CfgPointKind::MoveThrough { candidates, ty, .. } = &event.kind else {
+                unreachable!()
+            };
+            assert!(matches!(ty, ScalarType::Struct(_)));
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(
+                candidates.iter().map(|candidate| candidate.place.binding.declaration_span)
+                    .collect::<HashSet<_>>(),
+                HashSet::from([function.parameter_spans[0], function.parameter_spans[1]])
+            );
+            assert_eq!(
+                event.possible_origins.as_ref().unwrap(),
+                &candidates.iter().map(|candidate| candidate.origin).collect::<BTreeSet<_>>()
+            );
+            for candidate in candidates {
+                assert!(matches!(
+                    &candidate.place.projections[..],
+                    [ReferencePlaceProjection::Dereference(loan), ReferencePlaceProjection::Field(_)]
+                        if loan.as_ref() == &candidate.loan
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn singleton_checked_field_move_excludes_only_its_traversed_loan() {
+    let move_text = "Payload moved = (*writer).nested;";
+    let overlap_text = "*Payload alias = &(*writer).nested;";
+    let second_text = "Payload again = (*writer).nested;";
+    for (body, conflict) in [
+        (format!("{move_text} i32 observed = (*writer).sibling; observed; moved"), None),
+        (format!("{overlap_text} {move_text} i32 seen = (*alias).value; seen; moved"),
+            Some((move_text, "(*writer).nested", overlap_text, "&(*writer).nested"))),
+        (format!("{move_text} {second_text} again; moved"),
+            Some((second_text, "(*writer).nested", move_text, "(*writer).nested"))),
+    ] {
+        let text = format!(
+            "%%start\nstruct Payload {{ i32 value; }}\nstruct Holder {{ Payload nested; i32 sibling; }}\nPayload(Holder) take = fn(value) {{ *!Holder writer = &!value; {body} }};\n%%end"
+        );
+        let single = validate_text(&text);
+        let parsed = parse_source(source(), text.clone(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(
+                derive_scalar_program(&parsed.result).program,
+                Vec::new(),
+            )],
+            vec![source()],
+        ));
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let start = |site: &str, spelling: &str| {
+                (text.find(site).unwrap() + site.find(spelling).unwrap()) as u32
+            };
+            if let Some((primary, primary_spelling, origin, origin_spelling)) = conflict {
+                let primary = start(primary, primary_spelling);
+                let origin = start(origin, origin_spelling);
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003"
+                        && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels[0].span.range.start == primary
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == origin)
+                }), "{body}: {diagnostics:?}");
+                if origin == start(move_text, "(*writer).nested") {
+                    assert!(!diagnostics.iter().any(|diagnostic| {
+                        diagnostic.labels[0].span.range.start == origin
+                    }), "first move reported a conflict: {diagnostics:?}");
+                }
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else { panic!("function") };
+            let move_start = start(move_text, "(*writer).nested");
+            let event = function.reference_cfg.points.iter().find(|point| {
+                point.source_span.range.start == move_start
+                    && matches!(&point.kind, CfgPointKind::Move { place, .. } if !place.projections.is_empty())
+            }).expect("canonical singleton projected move");
+            let CfgPointKind::Move { place, owner, .. } = &event.kind else { unreachable!() };
+            assert_eq!(place.binding, *owner);
+            assert_eq!(owner.declaration_span, function.parameter_spans[0]);
+            assert_eq!(event.possible_origins.as_ref().map(BTreeSet::len), Some(1));
+        }
+    }
+}
+
+#[test]
 fn copyable_checked_dereference_remains_a_read_in_both_validators() {
     let text = "%%start\nstruct copy Point { i32 value; }\ni32(Point) take = fn(value) { *Point reader = &value; (*reader).value };\ni32(i32) read_scalar = fn(value) { *i32 reader = &value; *reader };\n%%end";
     let single = validate_text(text);

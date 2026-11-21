@@ -814,11 +814,13 @@ pub(super) fn build_aggregate<'ctx, 'module>(
 
 pub(super) fn extract_output<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
-    value: EmitValue<'ctx>,
+    value: &EmitValue<'ctx>,
     position: usize,
 ) -> Result<EmitValue<'ctx>, String> {
-    let EmitValue::Aggregate { value, outputs } = value else {
-        return Ok(value);
+    let (value, outputs) = match value {
+        EmitValue::Unit => return Ok(EmitValue::Unit),
+        EmitValue::Basic(value) => return Ok(EmitValue::Basic(*value)),
+        EmitValue::Aggregate { value, outputs } => (*value, outputs),
     };
     let ty = outputs
         .get(position)

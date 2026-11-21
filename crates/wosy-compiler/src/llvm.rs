@@ -1469,7 +1469,7 @@ fn store_binding_outputs<'ctx, 'module>(
     }
     let receivers = binding_receivers(binding);
     for (position, (name, ty)) in receivers.iter().enumerate() {
-        let value = extract_output(state, value.clone(), position)?;
+        let value = extract_output(state, &value, position)?;
         if *ty == ScalarType::Unit {
             state.values.insert(name.clone(), EmitValue::Unit);
             continue;
@@ -2040,7 +2040,7 @@ fn emit_main<'ctx, 'module>(
                     if *ty == ScalarType::Unit {
                         continue;
                     }
-                    let value = extract_output(&mut state, value.clone(), position)?;
+                    let value = extract_output(&mut state, &value, position)?;
                     let (global, _) = state
                         .globals
                         .get(name)
@@ -2500,7 +2500,7 @@ fn initialize_project_module<'ctx, 'module>(
                     if *ty == ScalarType::Unit {
                         continue;
                     }
-                    let value = extract_output(state, value.clone(), position)?;
+                    let value = extract_output(state, &value, position)?;
                     let (global, _) = state
                         .all_globals
                         .get(&project_global_name(&module.source, name))
@@ -4048,7 +4048,7 @@ fn materialize_assignment_values<'ctx, 'module>(
                 .unwrap_or_else(|| basic_value_type(*value))],
         };
         for (output_position, ty) in output_types.into_iter().enumerate() {
-            let value = extract_output(state, value.clone(), output_position)?;
+            let value = extract_output(state, &value, output_position)?;
             if ty == ScalarType::Unit {
                 values.push(AssignmentValue {
                     value: EmitValue::Unit,

@@ -3506,29 +3506,33 @@ fn conflicting_live_loan(
     consuming_origin: Option<ReferenceOriginId>,
 ) -> Vec<SourceSpan> {
     let place = available_place(place);
-    state
-        .bindings
-        .iter()
-        .filter(|(binding, _)| reference_read_reachable(points, point, binding))
-        .flat_map(|(_, origins)| origins.iter())
-        .filter_map(|origin| {
+    let mut conflicts = Vec::new();
+    for (binding, origins) in &state.bindings {
+        let mut reachable = false;
+        for origin in origins {
             if Some(*origin) == consuming_origin {
-                return None;
+                continue;
             }
-            match &facts[origin.0] {
-                ReferenceOrigin::Fresh { loan, .. }
-                | ReferenceOrigin::BorrowedFrom { loan, .. }
-                    if loan_borrows_place(loan, &place) =>
-                {
-                    Some(SourceSpan::new(
-                        loan.origin_place.source.clone(),
-                        loan.creation_span,
-                    ))
+            let loan = match &facts[origin.0] {
+                ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. } => loan,
+                _ => continue,
+            };
+            if !loan_borrows_place(loan, &place) {
+                continue;
+            }
+            if !reachable {
+                if !reference_read_reachable(points, point, binding) {
+                    break;
                 }
-                _ => None,
+                reachable = true;
             }
-        })
-        .collect()
+            conflicts.push(SourceSpan::new(
+                loan.origin_place.source.clone(),
+                loan.creation_span,
+            ));
+        }
+    }
+    conflicts
 }
 
 fn write_projected_reference(
@@ -3704,7 +3708,6 @@ fn transfer_reference_facts(
     let mut errors = Vec::new();
     while let Some(id) = ready.pop_front() {
         queued[id.0] = false;
-        let multiple_paths = incoming[id.0].len() > 1;
         for mut state in std::mem::take(&mut incoming[id.0]) {
             if visited[id.0].contains(&state) {
                 continue;
@@ -3940,11 +3943,9 @@ fn transfer_reference_facts(
             if let Some(origins) = move_pointer {
                 match origins.filter(|origins| !origins.is_empty()) {
                     Some(origins) => {
-                        let (place, ty) = match &point.kind {
-                            CfgPointKind::MoveThrough { place, ty, .. }
-                            | CfgPointKind::DeferredMoveThrough { place, ty, .. } => {
-                                (place.clone(), ty.clone())
-                            }
+                        let place = match &point.kind {
+                            CfgPointKind::MoveThrough { place, .. }
+                            | CfgPointKind::DeferredMoveThrough { place, .. } => place.clone(),
                             _ => unreachable!(),
                         };
                         let mut candidates = Vec::new();
@@ -3973,21 +3974,8 @@ fn transfer_reference_facts(
                                 loan: loan.clone(),
                             });
                         }
-                        let all_candidates_resolved = candidates.len() == origins.len();
                         point.possible_origins = Some(origins);
-                        if !matches!(place, ScalarPlace::Dereference { .. })
-                            && candidates.len() == 1
-                            && all_candidates_resolved
-                            && !multiple_paths
-                            && matches!(point.kind, CfgPointKind::MoveThrough { .. })
-                        {
-                            let candidate = &candidates[0];
-                            point.kind = CfgPointKind::Move {
-                                place: candidate.place.clone(),
-                                ty,
-                                owner: candidate.place.binding.clone(),
-                            };
-                        } else if let CfgPointKind::MoveThrough {
+                        if let CfgPointKind::MoveThrough {
                             candidates: event_candidates,
                             ..
                         } = &mut point.kind
@@ -4273,6 +4261,7 @@ fn transfer_reference_facts(
                     if matches!(point.kind, CfgPointKind::MoveThrough { .. })
                         || deferred_policies.get(&id.0) == Some(&CopyPolicy::Move) =>
                 {
+                    let singleton = candidates.len() == 1;
                     for candidate in candidates {
                         let place = available_place(&candidate.place);
                         let mut origins = unavailable_origins(&state, &place);
@@ -4290,14 +4279,12 @@ fn transfer_reference_facts(
                                 origins,
                             });
                         }
-                        if !move_alternatives.iter().any(|(moved, _)| moved == &place) {
-                            move_alternatives.push((
-                                place,
-                                SourceSpan::new(
-                                    candidate.place.source.clone(),
-                                    candidate.loan.creation_span,
-                                ),
-                            ));
+                        if singleton {
+                            if !state.moved.iter().any(|(moved, _)| moved == &place) {
+                                state.moved.push((place, point.source_span.clone()));
+                            }
+                        } else if !move_alternatives.iter().any(|(moved, _)| moved == &place) {
+                            move_alternatives.push((place, point.source_span.clone()));
                         }
                     }
                 }
@@ -4782,10 +4769,16 @@ fn transfer_reference_facts(
             } else {
                 observed[id.0] = Some(point.clone());
             }
-            for successor in &point.successors {
+            let mut state = Some(state);
+            let mut successors = point.successors.iter().peekable();
+            while let Some(successor) = successors.next() {
                 let slot = &mut incoming[successor.0];
                 if move_alternatives.is_empty() {
-                    let mut next = state.clone();
+                    let mut next = if successors.peek().is_none() {
+                        state.take().expect("one state for the final successor")
+                    } else {
+                        state.as_ref().expect("state for remaining successors").clone()
+                    };
                     if successor.0 <= id.0 {
                         next.point_values.clear_from(*successor);
                     }
@@ -4794,7 +4787,7 @@ fn transfer_reference_facts(
                     }
                 } else {
                     for (place, origin) in &move_alternatives {
-                        let mut next = state.clone();
+                        let mut next = state.as_ref().expect("state for move alternatives").clone();
                         if !next.moved.iter().any(|(moved, _)| moved == place) {
                             next.moved.push((place.clone(), origin.clone()));
                         }
@@ -4814,9 +4807,24 @@ fn transfer_reference_facts(
         }
     }
     for (point, observed) in cfg.points.iter_mut().zip(observed) {
-        if let Some(observed) = observed {
-            *point = observed;
-        }
+        let Some(mut observed) = observed else { continue };
+        observed.kind = match observed.kind {
+            CfgPointKind::MoveThrough { place, ty, mut candidates, .. }
+                if !matches!(place, ScalarPlace::Dereference { .. })
+                    && candidates.len() == 1
+                    && visited[observed.id.0].len() == 1
+                    && observed.possible_origins.as_ref().is_some_and(|origins| origins.len() == 1) =>
+            {
+                let candidate = candidates.pop().unwrap();
+                CfgPointKind::Move {
+                    owner: candidate.place.binding.clone(),
+                    place: candidate.place,
+                    ty,
+                }
+            }
+            kind => kind,
+        };
+        *point = observed;
     }
     let mut unique = Vec::new();
     for error in errors {
