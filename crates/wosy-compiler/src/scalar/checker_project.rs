@@ -89,16 +89,62 @@ enum VerifiedEntryGuard {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InitializationVisit {
     Unseen,
     Started,
     Completed,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CheckedInitialization<'a> {
+    visits: Vec<InitializationVisit>,
+    reached: HashSet<(usize, usize)>,
+    ordinals: HashMap<&'a SourceIdentity, usize>,
+}
+
+fn check_package_roots(prepared: &PreparedCheckerProject) -> Result<(), ProjectCheck> {
+    let (project, calls) = prepared.parts();
+    let CheckedInitialization { visits, reached, ordinals } = check_package_initialization(prepared)?;
+    let root = project.initialization_order.first().ok_or(ProjectCheck::MissingRoot)?;
+    for source in &project.initialization_order {
+        if source.project != root.project || source.package != root.package {
+            continue;
+        }
+        let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
+        if visits[ordinal] != InitializationVisit::Completed {
+            continue;
+        }
+        let module = &project.modules[ordinal];
+        for (item, declaration) in module.items.iter().enumerate() {
+            let ScalarItem::Function(function) = declaration else {
+                continue;
+            };
+            if reached.contains(&(ordinal, item)) {
+                continue;
+            }
+            if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
+                return Err(ProjectCheck::Unsupported);
+            }
+            let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            if !matches!(body.boundary.results.as_slice(), [result]
+                if result.ty == ScalarType::Unit || is_integer_type(&result.ty))
+            {
+                return Err(ProjectCheck::Unsupported);
+            }
+            match check_integer_requirements(body) {
+                Some(Ok(())) => {}
+                Some(Err(failure)) => return Err(project_failure(body, source, failure)),
+                None => return Err(ProjectCheck::Unsupported),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check_package_initialization(
     prepared: &PreparedCheckerProject,
-) -> Result<HashSet<(usize, usize)>, ProjectCheck> {
+) -> Result<CheckedInitialization<'_>, ProjectCheck> {
     let (project, calls) = prepared.parts();
     let ordinals: HashMap<_, _> = project.modules.iter().enumerate()
         .map(|(ordinal, module)| (&module.source, ordinal)).collect();
@@ -114,7 +160,7 @@ fn check_package_initialization(
     let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
     let mut reached = HashSet::new();
     walk_package_initialization(project, calls, &ordinals, &mut visits, &mut reached, root)?;
-    Ok(reached)
+    Ok(CheckedInitialization { visits, reached, ordinals })
 }
 
 fn walk_package_initialization(
@@ -1398,7 +1444,7 @@ mod tests {
             need_small({argument});
         %%end"#);
         let package = prepare_proof_target(&file, &text("7")).unwrap();
-        assert_eq!(check_package_initialization(&package), Ok(HashSet::from([(0, 0), (0, 1)])));
+        assert_eq!(check_package_initialization(&package).map(|result| result.reached), Ok(HashSet::from([(0, 0), (0, 1)])));
         let (_, calls) = package.parts();
         assert!(matches!(check_integer_requirements(calls.function_body(0, 0, None).unwrap()), Some(Err(_))));
         let failure = prepare_proof_target(&source("src/main.w", "initializer-refuted"), &text("11")).unwrap();
@@ -1450,7 +1496,62 @@ mod tests {
             assert_eq!(&source, first_failure);
         }
         let prepared = prepare(7, 7);
-        assert_eq!(check_package_initialization(&prepared), Ok(HashSet::from([(0, 0), (1, 0)])));
+        assert_eq!(check_package_initialization(&prepared).map(|result| result.reached), Ok(HashSet::from([(0, 0), (1, 0)])));
+    }
+
+    #[test]
+    fn unused_symbolic_roots_follow_exact_initialization_and_exclude_dependencies() {
+        let app = source("src/main.w", "unused-root");
+        let lib = source("src/local.w", "unused-local");
+        let dependency = SourceIdentity::new("local".into(), "dependency".into(), "src/lib.w".into(), "unused-dep".into());
+        let prepare = |argument: &str, private_limit: u8, dead_limit: u8| {
+            let app_text = format!(r#"%%start
+                local = namespace demo "src/local.w";
+                dep = namespace dependency "src/lib.w";
+                unit(u8) actual = fn(value) {{
+                    if (value == 0) {{ local.unreachable_to_caller(7); }};
+                    core.require(value <= 10, {OUTPUT});
+                }};
+                actual({argument});
+            %%end"#);
+            let lib_text = format!(r#"%%start
+                unit(u8) _unused = fn(value) {{ if (value == 0) {{}}; core.require(value <= {private_limit}, {OUTPUT}); }};
+                unit(u8) unreachable_to_caller = fn(value) {{ if (value == 0) {{}}; core.require(value <= {dead_limit}, {OUTPUT}); }};
+            %%end"#);
+            let dependency_text = format!(r#"%%start
+                unit(u8) not_an_own_root = fn(value) {{ if (value == 0) {{}}; core.require(value <= 10, {OUTPUT}); }};
+            %%end"#);
+            let namespace = |name: &str, target: &SourceIdentity| {
+                let start = app_text.find(&format!("{name} =")).unwrap();
+                let end = start + app_text[start..].find(';').unwrap() + 1;
+                ScalarNamespaceBinding { binding: name.into(), target: target.clone(), span: ByteSpan::new(start as u32, end as u32) }
+            };
+            prepare_checker_project(
+                vec![
+                    (declarations(&app, &app_text), vec![namespace("local", &lib), namespace("dep", &dependency)]),
+                    (declarations(&lib, &lib_text), Vec::new()),
+                    (declarations(&dependency, &dependency_text), Vec::new()),
+                ],
+                vec![app.clone(), lib.clone(), dependency.clone()],
+                inputs(),
+            ).unwrap()
+        };
+        let supported = prepare("7", 255, 255);
+        assert_eq!(check_package_roots(&supported), Ok(()));
+        let unused_failure = prepare("7", 10, 255);
+        let Err(ProjectCheck::Failed { source, .. }) = check_package_roots(&unused_failure) else {
+            panic!("expected unused same-package root to fail");
+        };
+        assert_eq!(source, lib);
+        let dead_callee = prepare("7", 255, 10);
+        let Err(ProjectCheck::Failed { source, .. }) = check_package_roots(&dead_callee) else {
+            panic!("a syntactic dead call must not exclude its symbolic root");
+        };
+        assert_eq!(source, lib);
+        for argument in ["0", "3 + 4"] {
+            let unsupported = prepare(argument, 10, 255);
+            assert_eq!(check_package_roots(&unsupported), Err(ProjectCheck::Unsupported));
+        }
     }
 
     #[test]
