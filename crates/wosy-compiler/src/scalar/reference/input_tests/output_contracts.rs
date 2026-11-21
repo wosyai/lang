@@ -239,5 +239,43 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
         }
         assert_eq!(pointers[1], pointers[2]);
         assert!(replays.iter().all(|replay| replay.errors.is_empty()));
+
+        let right_call = replays[3].module_calls[0];
+        updates[3].1.aggregate.checked_successor_candidate = Some(right_call);
+        let metadata_only = ReferenceOutputContracts::new(vec![
+            row(span(0), 0, origins.clone()),
+            row(span(0), 0, Vec::new()),
+            ReferenceOutputContract {
+                independent_static: false,
+                ..row(span(1), 0, origins.clone())
+            },
+            row(span(1), 1, Vec::new()),
+        ]);
+        let removed = ReferenceOutputContracts::new(vec![
+            row(span(1), 0, origins.clone()),
+            row(span(1), 1, Vec::new()),
+        ]);
+        for (from, to, successor) in [
+            (&current, &current, true),
+            (&current, &metadata_only, false),
+            (&metadata_only, &removed, true),
+        ] {
+            let mut cursor = 0;
+            let mut inputs = HashMap::new();
+            let left_before = updates[2].1.cfg.points.as_ptr();
+            let right_before = updates[3].1.cfg.points.as_ptr();
+            for (_, result) in &mut updates {
+                transfer_function_output_contracts(
+                    result, from, to, &mut inputs, &mut replays, &mut cursor,
+                );
+            }
+            assert_eq!(cursor, replays.len());
+            assert_eq!(updates[3].1.cfg.points.as_ptr(), right_before);
+            assert_eq!(updates[3].1.aggregate.checked_successor_contract, successor);
+            assert_eq!(
+                updates[2].1.cfg.points.as_ptr() != left_before,
+                std::ptr::eq(to, &removed),
+            );
+        }
     }
 }

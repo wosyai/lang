@@ -637,11 +637,9 @@ fn emit_single_module_llvm<'a>(
     finish_partition(
         ManuallyDrop::into_inner(module),
         source.path.clone(),
-        &context,
         &functions,
         &signatures,
         &externs,
-        target_layout,
     )
 }
 
@@ -1127,11 +1125,9 @@ fn emit_project_llvm<'a>(
     finish_partition(
         ManuallyDrop::into_inner(module),
         module_name,
-        &context,
         &functions,
         &signatures,
         &externs,
-        target_layout,
     )
 }
 
@@ -1262,38 +1258,22 @@ fn declaration_attributes(declarations: &[LlvmFunction]) -> Vec<&LlvmFunctionAtt
 fn finish_partition<'ctx>(
     module: inkwell::module::Module<'ctx>,
     module_name: String,
-    context: &'ctx Context,
     functions: &BTreeMap<String, FunctionValue<'ctx>>,
     signatures: &BTreeMap<String, ScalarType>,
     externs: &[LlvmExternIdentity],
-    target_layout: ScalarTargetLayout,
 ) -> Result<LlvmPartition, String> {
     module.verify().map_err(|error| error.to_string())?;
     let text = module.print_to_string().to_string();
     let metadata = functions
         .iter()
         .filter_map(|(name, function)| {
-            let signature = if name == "main" {
-                ScalarType::Callable {
-                    outputs: crate::ScalarOutputSequence {
-                        outputs: vec![crate::ScalarOutput {
-                            ty: ScalarType::I32,
-                            span: wosy_syntax::ByteSpan::new(0, 0),
-                        }],
-                        span: wosy_syntax::ByteSpan::new(0, 0),
-                    },
-                    parameters: Vec::new(),
-                }
+            let (result, parameters) = if name == "main" {
+                (LlvmValueType::I32, &[][..])
             } else {
-                signatures.get(name)?.clone()
-            };
-            let (_, result) = function_type(context, &signature, target_layout).ok()?;
-            let ScalarType::Callable {
-                outputs: _,
-                parameters,
-            } = signature
-            else {
-                return None;
+                let ScalarType::Callable { outputs, parameters } = signatures.get(name)? else {
+                    return None;
+                };
+                (function_value_result(outputs).ok()?, parameters.as_slice())
             };
             let parameters = parameters
                 .iter()
@@ -1319,14 +1299,13 @@ fn finish_partition<'ctx>(
         .filter_map(|(group, extern_identity)| {
             let function = functions.get(&extern_identity.internal_name)?;
             let ScalarType::Callable {
-                outputs: _,
+                outputs,
                 parameters,
             } = &extern_identity.signature
             else {
                 return None;
             };
-            let (_, result) =
-                function_type(context, &extern_identity.signature, target_layout).ok()?;
+            let result = function_value_result(outputs).ok()?;
             let parameters = parameters
                 .iter()
                 .enumerate()
@@ -1375,34 +1354,35 @@ fn function_type<'ctx>(
         .iter()
         .map(|ty| basic_type(context, ty, target_layout).map(Into::into))
         .collect::<Result<Vec<BasicMetadataTypeEnum>, _>>()?;
+    let ty = match outputs.outputs.as_slice() {
+        [] => context.void_type().fn_type(&parameters, false),
+        [output] if output.ty == ScalarType::Unit => {
+            context.void_type().fn_type(&parameters, false)
+        }
+        [output] => basic_type(context, &output.ty, target_layout)?.fn_type(&parameters, false),
+        _ => aggregate_type(context, outputs, target_layout)?.fn_type(&parameters, false),
+    };
+    Ok((ty, function_value_result(outputs)?))
+}
+
+fn function_value_result(
+    outputs: &crate::ScalarOutputSequence,
+) -> Result<LlvmValueType, String> {
     match outputs.outputs.as_slice() {
-        [] => Ok((
-            context.void_type().fn_type(&parameters, false),
-            LlvmValueType::Void,
-        )),
-        [output] if output.ty == ScalarType::Unit => Ok((
-            context.void_type().fn_type(&parameters, false),
-            LlvmValueType::Void,
-        )),
-        [output] => Ok((
-            basic_type(context, &output.ty, target_layout)?.fn_type(&parameters, false),
-            value_type(&output.ty)?,
-        )),
-        _ => Ok((
-            aggregate_type(context, outputs, target_layout)?.fn_type(&parameters, false),
-            LlvmValueType::Aggregate(
-                outputs
-                    .outputs
-                    .iter()
-                    .map(|output| {
-                        if output.ty == ScalarType::Unit {
-                            Ok(LlvmValueType::I8)
-                        } else {
-                            value_type(&output.ty)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
+        [] => Ok(LlvmValueType::Void),
+        [output] => value_type(&output.ty),
+        _ => Ok(LlvmValueType::Aggregate(
+            outputs
+                .outputs
+                .iter()
+                .map(|output| {
+                    if output.ty == ScalarType::Unit {
+                        Ok(LlvmValueType::I8)
+                    } else {
+                        value_type(&output.ty)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         )),
     }
 }
