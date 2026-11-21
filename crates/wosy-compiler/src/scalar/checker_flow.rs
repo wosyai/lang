@@ -117,6 +117,11 @@ impl IntegerInputs {
         if ty != &predicate.ty {
             return None;
         }
+        let (passing, failing) = self.split_axis(index, predicate)?;
+        Some((passing, failing, Some(index)))
+    }
+
+    fn split_axis(self, index: usize, predicate: &IntegerPredicate) -> Option<(Self, Self)> {
         let mut passing = Self::default();
         let mut failing = Self::default();
         for mut row in self.0 {
@@ -133,7 +138,7 @@ impl IntegerInputs {
                 failing.0.push(alternate);
             }
         }
-        Some((passing, failing, Some(index)))
+        Some((passing, failing))
     }
 
     fn join(mut self, mut other: Self, axis: Option<usize>) -> Self {
@@ -253,6 +258,48 @@ pub(super) struct IntegerReturningPath<'a> {
     pub(super) axes: Vec<&'a ReferenceBindingId>,
 }
 
+pub(super) struct IntegerBranchProof<'a> {
+    pub(super) guard: CheckerPredicate,
+    pub(super) then_claim: IntegerReturn<'a>,
+    pub(super) else_claim: IntegerReturn<'a>,
+}
+
+fn binding_satisfies(
+    state: &IntegerInputs,
+    axes: &[&ReferenceBindingId],
+    binding: &ReferenceBindingId,
+    relation: IntegerRelation,
+    bound: &BigInt,
+) -> Option<bool> {
+    let index = axes.iter().position(|known| *known == binding)?;
+    Some(state.0.iter().all(|row| row[index].every(relation, bound)))
+}
+
+fn shows_return_equality(
+    state: &IntegerInputs,
+    axes: &[&ReferenceBindingId],
+    value: &IntegerReturn<'_>,
+    claim: &IntegerReturn<'_>,
+) -> Option<bool> {
+    if state.is_unreachable() {
+        return Some(true);
+    }
+    match (value, claim) {
+        (IntegerReturn::Const(actual), IntegerReturn::Const(expected)) => Some(actual == expected),
+        (IntegerReturn::Alias(actual), IntegerReturn::Alias(expected)) => {
+            (actual == expected).then_some(true)
+        }
+        (IntegerReturn::Const(value), IntegerReturn::Alias(binding))
+        | (IntegerReturn::Alias(binding), IntegerReturn::Const(value)) => binding_satisfies(
+            state,
+            axes,
+            binding,
+            IntegerRelation::from_operator(&BinaryOperator::Equal)?,
+            value,
+        ),
+    }
+}
+
 impl IntegerReturningPath<'_> {
     pub(super) fn binding_satisfies(
         &self,
@@ -260,8 +307,7 @@ impl IntegerReturningPath<'_> {
         relation: IntegerRelation,
         bound: &BigInt,
     ) -> Option<bool> {
-        let index = self.axes.iter().position(|known| *known == binding)?;
-        Some(self.state.0.iter().all(|row| row[index].every(relation, bound)))
+        binding_satisfies(&self.state, &self.axes, binding, relation, bound)
     }
 
     fn output_satisfies(&self, relation: IntegerRelation, bound: &BigInt) -> Option<bool> {
@@ -270,6 +316,22 @@ impl IntegerReturningPath<'_> {
             IntegerReturn::Const(value) => Some(relation.accepts(value.cmp(bound))),
         }
     }
+
+    fn shows_branch(self, proof: &IntegerBranchProof<'_>) -> Option<bool> {
+        let (yes, no) = match &proof.guard {
+            CheckerPredicate::Boolean(true) => (self.state, IntegerInputs::default()),
+            CheckerPredicate::Boolean(false) => (IntegerInputs::default(), self.state),
+            CheckerPredicate::Integer(predicate) => {
+                let index = self.axes.iter().position(|binding| **binding == predicate.binding)?;
+                self.state.split_axis(index, predicate)?
+            }
+        };
+        Some(
+            shows_return_equality(&yes, &self.axes, &self.value, &proof.then_claim)?
+                && shows_return_equality(&no, &self.axes, &self.value, &proof.else_claim)?,
+        )
+    }
+
 }
 
 enum IntegerControl<'a> {
@@ -322,7 +384,7 @@ pub(super) fn check_integer_return_bound<'a>(
     operator: &BinaryOperator,
     bound: &BigInt,
 ) -> Option<Result<bool, IntegerCheckFailure<'a>>> {
-    match check_integer_return_bound_in_scope(calls, operator, bound, None)? {
+    match check_integer_return_bound_in_scope(calls, operator, bound, None, None)? {
         Ok(ProofCoverage::Applicable(holds)) => Some(Ok(holds)),
         Ok(ProofCoverage::NoApplicableInputs) => None,
         Err(failure) => Some(Err(failure)),
@@ -335,7 +397,17 @@ pub(super) fn check_integer_return_bound_where<'a>(
     bound: &BigInt,
     entry_filter: &CheckerPredicate,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
-    check_integer_return_bound_in_scope(calls, operator, bound, Some(entry_filter))
+    check_integer_return_bound_in_scope(calls, operator, bound, Some(entry_filter), None)
+}
+
+pub(super) fn check_integer_return_bound_with_shows<'a>(
+    calls: &'a FunctionCallSites,
+    operator: &BinaryOperator,
+    bound: &BigInt,
+    entry_filter: Option<&CheckerPredicate>,
+    proof: &IntegerBranchProof<'_>,
+) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
+    check_integer_return_bound_in_scope(calls, operator, bound, entry_filter, Some(proof))
 }
 
 fn check_integer_return_bound_in_scope<'a>(
@@ -343,6 +415,7 @@ fn check_integer_return_bound_in_scope<'a>(
     operator: &BinaryOperator,
     bound: &BigInt,
     entry_filter: Option<&CheckerPredicate>,
+    proof: Option<&IntegerBranchProof<'_>>,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let relation = IntegerRelation::from_operator(operator)?;
     let paths = match observe_integer_returns_in_scope(calls, entry_filter)? {
@@ -353,6 +426,11 @@ fn check_integer_return_bound_in_scope<'a>(
     for path in paths {
         if !path.output_satisfies(relation, bound)? {
             return Some(Ok(ProofCoverage::Applicable(false)));
+        }
+        if let Some(proof) = proof {
+            if !path.shows_branch(proof)? {
+                return Some(Ok(ProofCoverage::Applicable(false)));
+            }
         }
     }
     Some(Ok(ProofCoverage::Applicable(true)))

@@ -4,13 +4,15 @@ use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation},
     checker_flow::{
         check_integer_requirements, check_integer_return_bound, check_integer_return_bound_where,
-        CheckerPredicate, IntegerCheckFailure, IntegerComparison, IntegerInputs, ProofCoverage,
+        check_integer_return_bound_with_shows, CheckerPredicate, IntegerBranchProof,
+        IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
-    derive_expression, project_from_declarations,
-    reference::{FunctionCallSites, ProjectCallSiteResults},
+    derive_block, derive_expression, project_from_declarations,
+    reference::{DirectDestinationIdentity, FunctionCallSites, ProjectCallSiteResults},
     static_calls::prepare_project_occurrences,
     typecheck::{integer_literal_fits_type, is_integer_type},
-    typecheck_scalar_project_in_mode, ByteSpan, ReferenceBindingId, ScalarExpression, ScalarFunction,
+    typecheck_scalar_project_in_mode, BinaryOperator, ByteSpan, ReferenceBindingId, ScalarBlock,
+    ScalarBlockItem, ScalarExpression, ScalarFunction,
     ScalarItem, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarProject,
     ScalarSourceDeclarations, ScalarType,
 };
@@ -143,17 +145,17 @@ fn identifiers(parent: &CstNode) -> impl Iterator<Item = String> + '_ {
     })
 }
 
-fn check_empty_proof_fragment(
+fn check_proof_fragment(
     declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
     fragment: &ParseResult,
 ) -> ProjectCheck {
-    check_empty_proof_fragment_impl(declarations, initialization_order, inputs, fragment)
+    check_proof_fragment_impl(declarations, initialization_order, inputs, fragment)
         .unwrap_or_else(|error| error)
 }
 
-fn check_empty_proof_fragment_impl(
+fn check_proof_fragment_impl(
     declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
@@ -164,9 +166,7 @@ fn check_empty_proof_fragment_impl(
     }
     let root = fragment.canonical_cst();
     let declaration = child(&child(&root.root, SyntaxKind::Root)?, SyntaxKind::ProofDecl)?;
-    if child(&declaration, SyntaxKind::Block)?.children().next().is_some() {
-        return Err(ProjectCheck::Unsupported);
-    }
+    let steps = derive_block(&child(&declaration, SyntaxKind::Block)?);
     let target = child(&declaration, SyntaxKind::ProofTarget)?;
     let name = identifiers(&target).next().ok_or(ProjectCheck::InvalidProof)?;
     let input_names = identifiers(&child(&target, SyntaxKind::Parameters)?).collect::<Vec<_>>();
@@ -213,26 +213,13 @@ fn check_empty_proof_fragment_impl(
         .find(|node| node.kind() == SyntaxKind::ProofWhere)
         .map(|where_clause| {
             let expression = derive_expression(&child(&where_clause, SyntaxKind::Expression)?);
-            if let ScalarExpression::Boolean { value, .. } = expression {
-                return Ok(CheckerPredicate::Boolean(value));
-            }
-            let condition = IntegerComparison::from_expression(&expression).ok_or(ProjectCheck::Unsupported)?;
-            let index = input_names.iter().position(|input| input == condition.name)
-                .ok_or(ProjectCheck::InvalidProof)?;
-            let ty = &boundary.parameters[index].ty;
-            if !is_integer_type(ty) {
-                return Err(ProjectCheck::Unsupported);
-            }
-            if !integer_literal_fits_type(condition.bound, ty) {
-                return Err(ProjectCheck::InvalidProof);
-            }
-            let bindings = boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
-            let predicate = condition.typed(ty, ty, bindings[index].clone())
-                .ok_or(ProjectCheck::Unsupported)?;
-            Ok(CheckerPredicate::Integer(predicate))
+            proof_input_condition(&expression, &input_names, body)
         })
         .transpose()?;
-    let checked = if let Some(filter) = filter.as_ref() {
+    let checked = if !steps.items.is_empty() {
+        let proof = proof_show_branch(&steps, &input_names, output, &result.ty, body)?;
+        check_integer_return_bound_with_shows(body, ensures.operator, ensures.bound, filter.as_ref(), &proof)
+    } else if let Some(filter) = filter.as_ref() {
         check_integer_return_bound_where(body, ensures.operator, ensures.bound, filter)
     } else {
         check_integer_return_bound(body, ensures.operator, ensures.bound)
@@ -245,6 +232,107 @@ fn check_empty_proof_fragment_impl(
         Some(Ok(ProofCoverage::NoApplicableInputs)) => ProjectCheck::NoApplicableInputs,
         Some(Err(failure)) => project_failure(body, &root.source, failure),
     })
+}
+
+fn proof_input_condition(
+    expression: &ScalarExpression,
+    inputs: &[String],
+    body: &FunctionCallSites,
+) -> Result<CheckerPredicate, ProjectCheck> {
+    if let ScalarExpression::Boolean { value, .. } = expression {
+        return Ok(CheckerPredicate::Boolean(*value));
+    }
+    let condition = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
+    let index = inputs.iter().position(|input| input == condition.name)
+        .ok_or(ProjectCheck::InvalidProof)?;
+    let ty = &body.boundary.parameters[index].ty;
+    if !is_integer_type(ty) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    if !integer_literal_fits_type(condition.bound, ty) {
+        return Err(ProjectCheck::InvalidProof);
+    }
+    let bindings = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
+    let predicate = condition.typed(ty, ty, bindings[index].clone())
+        .ok_or(ProjectCheck::Unsupported)?;
+    Ok(CheckerPredicate::Integer(predicate))
+}
+
+fn proof_show_branch<'a>(
+    steps: &'a ScalarBlock,
+    inputs: &[String],
+    output: &str,
+    ty: &ScalarType,
+    body: &'a FunctionCallSites,
+) -> Result<IntegerBranchProof<'a>, ProjectCheck> {
+    let [ScalarBlockItem::Expression(ScalarExpression::If {
+        condition, then_branch, else_branch, ..
+    })] = steps.items.as_slice() else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    let bindings = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
+    if body.assignments.values().flat_map(|group| group.destinations()).any(|destination| {
+        match body.prepared_direct_destination(destination.destination) {
+            Some(DirectDestinationIdentity::Existing(binding)) => bindings.contains(binding),
+            Some(DirectDestinationIdentity::Module(_) | DirectDestinationIdentity::Introduce { .. }) => false,
+            None => true,
+        }
+    }) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let guard = proof_input_condition(condition, inputs, body)?;
+    Ok(IntegerBranchProof {
+        guard,
+        then_claim: proof_show_claim(then_branch, inputs, output, ty, body, bindings)?,
+        else_claim: proof_show_claim(else_branch, inputs, output, ty, body, bindings)?,
+    })
+}
+
+fn proof_show_claim<'a>(
+    arm: &'a ScalarBlock,
+    inputs: &[String],
+    output: &str,
+    ty: &ScalarType,
+    body: &FunctionCallSites,
+    bindings: &'a [ReferenceBindingId],
+) -> Result<IntegerReturn<'a>, ProjectCheck> {
+    let [ScalarBlockItem::Expression(ScalarExpression::Call {
+        receiver, name, arguments, type_arguments, ..
+    })] = arm.items.as_slice() else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    if receiver.as_deref() != Some("core")
+        || name != "show"
+        || !type_arguments.is_empty()
+        || arm.terminated_items.as_slice() != [true]
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let [ScalarExpression::Binary {
+        operator: BinaryOperator::Equal, left, right, ..
+    }] = arguments.as_slice() else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    let ScalarExpression::Name { name, .. } = left.as_ref() else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    if name != output {
+        return Err(ProjectCheck::Unsupported);
+    }
+    match right.as_ref() {
+        ScalarExpression::Integer { value, .. } if integer_literal_fits_type(value, ty) => {
+            Ok(IntegerReturn::Const(value))
+        }
+        ScalarExpression::Integer { .. } => Err(ProjectCheck::InvalidProof),
+        ScalarExpression::Name { name, .. } => {
+            let index = inputs.iter().position(|input| input == name).ok_or(ProjectCheck::Unsupported)?;
+            if body.boundary.parameters[index].ty != *ty {
+                return Err(ProjectCheck::InvalidProof);
+            }
+            Ok(IntegerReturn::Alias(&bindings[index]))
+        }
+        _ => Err(ProjectCheck::Unsupported),
+    }
 }
 
 mod tests {
@@ -402,7 +490,7 @@ mod tests {
 
     fn prove(source: &SourceIdentity, callable: &str, proof: &str) -> ProjectCheck {
         let fragment = wosy_syntax::parse_proof_fragment(source.clone(), proof.to_owned(), &[]);
-        check_empty_proof_fragment(
+        check_proof_fragment(
             vec![(declarations(source, callable), Vec::new())],
             vec![source.clone()],
             inputs(),
@@ -472,7 +560,7 @@ mod tests {
             &[],
         );
         assert_eq!(
-            check_empty_proof_fragment(
+            check_proof_fragment(
                 vec![(declarations(&app, callable), Vec::new())],
                 vec![app],
                 inputs(),
@@ -480,6 +568,48 @@ mod tests {
             ),
             ProjectCheck::MissingRoot,
         );
+    }
+
+    #[test]
+    fn documented_clamp_proof_checks_shows_against_actual_return_partitions() {
+        let app = source("src/main.w", "clamp");
+        let callable = "%%start\nu8(u8) clamp = fn(value) { if (value > 10) { 10 } else { value } };\n%%end";
+        let proof = r#"
+            proof clamp_bounded for clamp(x) -> (out) ensures (out <= 10) {
+                if (x > 10) { core.show(out == 10); }
+                else { core.show(out == x); }
+            }
+        "#;
+        assert_eq!(prove(&app, callable, proof), ProjectCheck::Proved);
+        assert_eq!(
+            prove(&app, callable, &proof.replace("x > 10", "x > 11")),
+            ProjectCheck::Refuted,
+        );
+        assert_eq!(
+            prove(&app, callable, &proof.replace("out == 10", "out == 9")),
+            ProjectCheck::Refuted,
+        );
+        assert_eq!(
+            prove(&app, callable, &proof.replace("core.show(out == x);", "core.show(out == x); core.show(out == x);")),
+            ProjectCheck::Unsupported,
+        );
+    }
+
+    #[test]
+    fn show_alias_proof_does_not_treat_an_overwritten_input_as_its_entry_value() {
+        let app = source("src/main.w", "overwrite");
+        let callable = "%%start\nu8(u8) overwrite = fn(value) { if (value > 0) {}; value = 0; value };\n%%end";
+        assert_eq!(
+            prove(&app, callable, "proof bounded for overwrite(x) -> (out) ensures (out <= 10) {}"),
+            ProjectCheck::Proved,
+        );
+        let proof = r#"
+            proof bounded for overwrite(x) -> (out) ensures (out <= 10) {
+                if (x > 10) { core.show(out == 0); }
+                else { core.show(out == x); }
+            }
+        "#;
+        assert_eq!(prove(&app, callable, proof), ProjectCheck::Unsupported);
     }
 
 }
