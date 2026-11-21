@@ -8732,3 +8732,79 @@ u8(bool) update = fn(choose) {
         }
     }
 }
+
+#[test]
+fn emits_deferred_shared_copy_only_when_its_use_precedes_the_ancestor_store() {
+    let source = r#"%%start
+u8(bool) inspect = fn(choose) {
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) { bool marker = true; marker; };
+    *u8 leaf = &(*parent);
+    *u8 alias = leaf;
+    u8 observed = *alias;
+    *parent = 11;
+    observed + *parent
+};
+%%end"#;
+    let invalid = source.replace(
+        "u8 observed = *alias;\n    *parent = 11;",
+        "*parent = 11;\n    u8 observed = *alias;",
+    );
+    let borrow = invalid.find("&(*parent)").unwrap() as u32;
+    let write = invalid.find("parent = 11").unwrap() as u32;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for partition in [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ] {
+            let ir = partition.expect("shared copy LLVM").to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+                ir.as_bytes(), "checked-shared-copy",
+            );
+            let module = context.create_module_from_ir(buffer).expect("parse shared copy LLVM");
+            module.verify().expect("verify shared copy LLVM");
+            let lines = ir.lines().map(str::trim).collect::<Vec<_>>();
+            let (add, (before, after)) = lines.iter().enumerate().find_map(|(index, line)| {
+                let (_, operands) = line.split_once(" = add i8 ")?;
+                Some((index, operands.split_once(", ")?))
+            }).expect("combine the before and after reads");
+            let operand_load = |operand| lines.iter().enumerate().find_map(|(index, line)| {
+                let (value, pointer) = line.split_once(" = load i8, ptr ")?;
+                (value == operand).then_some((index, pointer.split(',').next()?))
+            });
+            let (reload, spill) = operand_load(before).expect("saved result of shared read");
+            let (save, saved) = lines.iter().enumerate().find_map(|(index, line)| {
+                let (value, pointer) = line.strip_prefix("store i8 ")?.split_once(", ptr ")?;
+                (pointer.split(',').next()? == spill).then_some((index, value))
+            }).expect("copy shared read into the ordinary local");
+            let (before, _) = operand_load(saved).expect("read through shared alias");
+            let (after, _) = operand_load(after).expect("read through resumed parent");
+            let (stage, slot) = lines.iter().enumerate().find_map(|(index, line)| {
+                let slot = line.strip_prefix("store i8 11, ptr ")?.split(',').next()?;
+                Some((index, slot))
+            }).expect("evaluate RHS of the resumed parent store");
+            let (assignment_load, assignment_value) = lines.iter().enumerate().find_map(|(index, line)| {
+                let (value, pointer) = line.split_once(" = load i8, ptr ")?;
+                (index > stage && pointer.split(',').next()? == slot).then_some((index, value))
+            }).expect("load the prepared assignment RHS");
+            let write_prefix = format!("store i8 {assignment_value}, ptr ");
+            let write = lines.iter().position(|line| line.starts_with(&write_prefix))
+                .expect("write through resumed parent");
+            assert!(before < save && save < stage && stage < assignment_load
+                && assignment_load < write && write < reload && reload < after && after < add, "{ir}");
+        }
+
+        let prepared = prepare_initializer_test(&invalid, layout);
+        let denied = analyze_scalar_build(&prepared);
+        assert!(denied.diagnostics().iter().any(|diagnostic| {
+            diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == write)
+                && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == borrow)
+        }), "{:?}", denied.diagnostics());
+    }
+}
