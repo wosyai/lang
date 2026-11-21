@@ -170,12 +170,27 @@ i32(*!u8, i32) _read_line_discard_continue = fn(view, outcome) {
 	if (outcome == 0) { _read_line_discard_continue(view, _read_line_discard_step(view)) } else { outcome }
 };
 
-ReadLineStatus() _read_line_discard = fn {
+ReadLineStatus(u8) _read_line_zero_capacity = fn(first) {
 	u8[1] scratch = [0];
 	*!u8 view = &!scratch[0];
-	i32 first = _read_line_discard_step(view);
-	i32 outcome = _read_line_discard_continue(view, first);
-	if (outcome == 2) { ReadLineStatus::io_error } else { ReadLineStatus::limit_exceeded }
+	ReadLineStatus status = ReadLineStatus::limit_exceeded;
+	bool discard = true;
+	if (first == 13) {
+		u64 zero = core.int_extend<u64>(0);
+		u64 one = core.int_extend<u64>(1);
+		u64 count = zero;
+		bool complete = false;
+		unsafe { count, complete = read_into(&?*view, one); };
+		if (!complete) { status = ReadLineStatus::io_error; discard = false; };
+		if (complete && count == zero) { discard = false; };
+		if (complete && count != zero && *view == 10) { status = ReadLineStatus::line; discard = false; };
+	};
+	if (discard) {
+		i32 first_outcome = _read_line_discard_step(view);
+		i32 outcome = _read_line_discard_continue(view, first_outcome);
+		if (outcome == 2) { status = ReadLineStatus::io_error; };
+	};
+	status
 };
 
 (u8[], u64, bool, bool, ReadLineStatus)(u8[], *!u8, u64, u64, bool, bool, ReadLineStatus) _read_line_allocated_step = fn(bytes, view, max_bytes, length, pending_cr, reading, status) {
@@ -237,6 +252,10 @@ ReadLineStatus() _read_line_discard = fn {
 		i32 outcome = _read_line_discard_continue(view, first_outcome);
 		if (outcome == 2) { status = ReadLineStatus::io_error; };
 	};
+	if (status == ReadLineStatus::line && pending_cr) {
+		status = _read_line_capacity_status(length, max_bytes, status);
+		if (length < max_bytes) { bytes[length] = 13; length = length + one; };
+	};
 	if (status == ReadLineStatus::line) {
 		u64 remaining = zero;
 		u8 minimum = 128;
@@ -268,14 +287,20 @@ ReadLineStatus() _read_line_discard = fn {
 		unsafe { count, complete = read_into(&?scratch[0], one); };
 		if (!complete) { status = ReadLineStatus::io_error; };
 		if (complete && count == zero) { status = ReadLineStatus::eof; };
-		if (complete && count != zero && scratch[0] == 10) {
-			utf8 empty = { .data = null; .length = zero; };
-			text = &empty;
-			status = ReadLineStatus::line;
-		};
-		if (complete && count != zero && scratch[0] != 10 && max_bytes == zero) { status = _read_line_discard(); };
-		if (complete && count != zero && scratch[0] != 10 && max_bytes != zero) {
-			text, status = _read_line_allocated(max_bytes, scratch[0], scratch[0] == 13);
+		if (complete && count != zero) {
+			u8 first = scratch[0];
+			if (first != 10) {
+				if (max_bytes == zero) {
+					status = _read_line_zero_capacity(first);
+				} else {
+					text, status = _read_line_allocated(max_bytes, first, first == 13);
+				};
+			};
+			if (first == 10 || (max_bytes == zero && status == ReadLineStatus::line)) {
+				utf8 empty = { .data = null; .length = zero; };
+				text = &empty;
+				status = ReadLineStatus::line;
+			};
 		};
 		text, status
 	}
@@ -290,11 +315,6 @@ u8(u8) _parse_digit_value = fn(byte) {
 	if (byte >= 97 && byte <= 102) { value = byte - lower_base; };
 	if (byte >= 65 && byte <= 70) { value = byte - upper_base; };
 	value
-};
-
-bool(u8, u8) _parse_is_digit_valid = fn(byte, radix) {
-	u8 value = _parse_digit_value(byte);
-	value < radix
 };
 
 bool(u8) _parse_is_underscore = fn(byte) {
@@ -334,7 +354,7 @@ u8(u8, u8) _parse_radix_from_prefix = fn(first, second) {
 	radix
 };
 
-(u128, bool, bool, bool)(*?u8, u64, u64, u64, u8, u128, u128, bool, bool, bool) _parse_range_integer = fn(data, start, lo, hi, radix, maximum, result, valid, saw_digit, last_underscore) {
+(u128, bool, bool, bool)(*?u8, u64, u64, u64, u128, u128, u128, u128, bool, bool, bool) _parse_range_integer = fn(data, start, lo, hi, radix, limit, remainder, result, valid, saw_digit, last_underscore) {
 	u64 one = core.int_extend<u64>(1);
 	if (lo < hi && valid) {
 		u64 length = hi - lo;
@@ -345,12 +365,9 @@ u8(u8, u8) _parse_radix_from_prefix = fn(first, second) {
 			unsafe { byte = core.load<u8>(core.offset<u8>(data, position)); };
 			bool underscore = _parse_is_underscore(byte);
 			u8 digit = _parse_digit_value(byte);
-			bool digit_ok = _parse_is_digit_valid(byte, radix);
-			if (digit_ok) {
-				u128 digit_wide = core.int_extend<u128>(digit);
-				u128 radix_wide = core.int_extend<u128>(radix);
-				u128 limit = (maximum - digit_wide) / radix_wide;
-				if (result > limit) { valid = false; } else { result = result * radix_wide + digit_wide; };
+			u128 digit_wide = core.int_extend<u128>(digit);
+			if (digit_wide < radix) {
+				if (result > limit || (result == limit && digit_wide > remainder)) { valid = false; } else { result = result * radix + digit_wide; };
 				last_underscore = false;
 				saw_digit = true;
 			} else {
@@ -361,9 +378,9 @@ u8(u8, u8) _parse_radix_from_prefix = fn(first, second) {
 		} else {
 			u64 two = core.int_extend<u64>(2);
 			u64 mid = lo + length / two;
-			result, valid, saw_digit, last_underscore = _parse_range_integer(data, start, lo, mid, radix, maximum, result, valid, saw_digit, last_underscore);
+			result, valid, saw_digit, last_underscore = _parse_range_integer(data, start, lo, mid, radix, limit, remainder, result, valid, saw_digit, last_underscore);
 			if (valid) {
-				result, valid, saw_digit, last_underscore = _parse_range_integer(data, start, mid, hi, radix, maximum, result, valid, saw_digit, last_underscore);
+				result, valid, saw_digit, last_underscore = _parse_range_integer(data, start, mid, hi, radix, limit, remainder, result, valid, saw_digit, last_underscore);
 			};
 		};
 	};
@@ -372,11 +389,14 @@ u8(u8, u8) _parse_radix_from_prefix = fn(first, second) {
 
 (u128, bool)(*?u8, u64, u64, u8) _parse_accumulate_u128 = fn(data, start, end, radix) {
 	u128 maximum = 340282366920938463463374607431768211455;
+	u128 radix_wide = core.int_extend<u128>(radix);
+	u128 limit = maximum / radix_wide;
+	u128 remainder = maximum - limit * radix_wide;
 	u128 result = core.int_extend<u128>(0);
 	bool valid = true;
 	bool saw_digit = false;
 	bool last_underscore = false;
-	result, valid, saw_digit, last_underscore = _parse_range_integer(data, start, start, end, radix, maximum, result, valid, saw_digit, last_underscore);
+	result, valid, saw_digit, last_underscore = _parse_range_integer(data, start, start, end, radix_wide, limit, remainder, result, valid, saw_digit, last_underscore);
 	if (!saw_digit) { valid = false; };
 	if (last_underscore) { valid = false; };
 	result, valid
@@ -384,11 +404,14 @@ u8(u8, u8) _parse_radix_from_prefix = fn(first, second) {
 
 (u128, bool)(*?u8, u64, u64, u8) _parse_accumulate_i128_neg = fn(data, start, end, radix) {
 	u128 maximum = 170141183460469231731687303715884105728;
+	u128 radix_wide = core.int_extend<u128>(radix);
+	u128 limit = maximum / radix_wide;
+	u128 remainder = maximum - limit * radix_wide;
 	u128 result = core.int_extend<u128>(0);
 	bool valid = true;
 	bool saw_digit = false;
 	bool last_underscore = false;
-	result, valid, saw_digit, last_underscore = _parse_range_integer(data, start, start, end, radix, maximum, result, valid, saw_digit, last_underscore);
+	result, valid, saw_digit, last_underscore = _parse_range_integer(data, start, start, end, radix_wide, limit, remainder, result, valid, saw_digit, last_underscore);
 	if (!saw_digit) { valid = false; };
 	if (last_underscore) { valid = false; };
 	result, valid
@@ -1593,73 +1616,21 @@ utf8(i64) _format_i64 = fn(value) {
 	text
 };
 
-i128(i128, u64, u64) _format_scale_i128 = fn(scale, step, steps) {
-	if (step < steps) {
-		u64 one = core.int_extend<u64>(1);
-		i128 twice = scale + scale;
-		i128 fourth = twice + twice;
-		i128 eighth = fourth + fourth;
-		_format_scale_i128(eighth + twice, step + one, steps)
-	} else {
-		scale
-	}
-};
-
-(i128, u8)(i128, i128, u8) _format_subtract_i128 = fn(remaining, scale, digit) {
-	if (remaining >= scale) {
-		u8 one_digit = 1;
-		i128 rest, u8 next_digit = _format_subtract_i128(remaining - scale, scale, digit + one_digit);
-		rest, next_digit
-	} else {
-		remaining, digit
-	}
-};
-
-u64(u8[], u64, u64, u64, i128, bool, u64) _format_digits_i128 = fn(scratch, position, digits, last, remaining, started, emit) {
-	if (position < digits) {
-		u64 one = core.int_extend<u64>(1);
-		u64 zero_count = core.int_extend<u64>(0);
-		u8 zero_digit = 48;
-		i128 one_wide = core.int_extend<i128>(1);
-		u64 steps = last - position;
-		i128 scale = _format_scale_i128(one_wide, zero_count, steps);
-		u8 digit = zero_digit;
-		remaining, digit = _format_subtract_i128(remaining, scale, digit);
-		if (started || digit != zero_digit || position == last) {
-			scratch[emit] = digit;
-			emit = emit + one;
-			started = true;
-		};
-		_format_digits_i128(scratch, position + one, digits, last, remaining, started, emit)
-	} else {
-		emit
-	}
-};
-
 utf8(i128) _format_i128 = fn(value) {
 	u8[40] scratch;
-	u64 digits = core.int_extend<u64>(39);
-	u64 one = core.int_extend<u64>(1);
-	u64 zero_count = core.int_extend<u64>(0);
-	u64 last = core.int_extend<u64>(38);
-	u8 minus = 45;
+	u64 capacity = core.int_extend<u64>(40);
 	i128 zero = core.int_extend<i128>(0);
-	i128 minimum = -170141183460469231731687303715884105728;
-	u64 emit = zero_count;
-	i128 remaining = value;
 	bool negative = value < zero;
-	if (negative) {
-		scratch[0] = minus;
-		emit = one;
-		if (value == minimum) { remaining = zero - (value + 1); } else { remaining = zero - value; };
+	u128 magnitude = if (negative) {
+		i128 before_last = zero - (value + 1);
+		core.bitcast<u128>(before_last) + 1
+	} else {
+		core.bitcast<u128>(value)
 	};
-	emit = _format_digits_i128(scratch, zero_count, digits, last, remaining, false, emit);
-	if (value == minimum) {
-		scratch[emit - one] = 56;
-	};
+	u64 length = _format_wide_decimal(scratch, magnitude, negative, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
-	utf8 text = { .data = data; .length = emit; };
+	utf8 text = { .data = data; .length = length; };
 	text
 };
 
@@ -1739,18 +1710,6 @@ utf8(u64) _format_u64 = fn(value) {
 	text
 };
 
-u128(u128, u64, u64) _format_scale_u128 = fn(scale, step, steps) {
-	if (step < steps) {
-		u64 one = core.int_extend<u64>(1);
-		u128 twice = scale + scale;
-		u128 fourth = twice + twice;
-		u128 eighth = fourth + fourth;
-		_format_scale_u128(eighth + twice, step + one, steps)
-	} else {
-		scale
-	}
-};
-
 (u128, u8)(u128, u128, u8) _format_subtract_u128 = fn(remaining, scale, digit) {
 	if (remaining >= scale) {
 		u8 one_digit = 1;
@@ -1761,36 +1720,66 @@ u128(u128, u64, u64) _format_scale_u128 = fn(scale, step, steps) {
 	}
 };
 
-u64(u8[], u64, u64, u64, u128, bool, u64) _format_digits_u128 = fn(scratch, position, capacity, last, remaining, started, emit) {
-	if (position < capacity) {
-		u64 one = core.int_extend<u64>(1);
-		u64 zero = core.int_extend<u64>(0);
-		u8 zero_digit = 48;
-		u128 one_wide = core.int_extend<u128>(1);
-		u64 steps = last - position;
-		u128 scale = _format_scale_u128(one_wide, zero, steps);
-		u8 digit = zero_digit;
-		remaining, digit = _format_subtract_u128(remaining, scale, digit);
-		if (started || digit != zero_digit || position == last) {
-			scratch[emit] = digit;
-			emit = emit + one;
-			started = true;
-		};
-		_format_digits_u128(scratch, position + one, capacity, last, remaining, started, emit)
+u64(u8[], u64, u64, u64, u64, u8, bool, bool, u64) _format_decimal_chunks = fn(scratch, index, remaining, upper, width, leading, has_upper, negative, capacity) {
+	u64 zero = 0;
+	u64 one = core.int_extend<u64>(1);
+	u8 zero_digit = 48;
+	if (remaining != zero || width != zero) {
+		u64 ten = 10;
+		u64 quotient = remaining / ten;
+		u64 remainder = remaining - quotient * ten;
+		u8 digit = core.int_trunc<u8>(remainder);
+		index = index - one;
+		scratch[index] = zero_digit + digit;
+		if (width != zero) { width = width - one; };
+		_format_decimal_chunks(scratch, index, quotient, upper, width, leading, has_upper, negative, capacity)
 	} else {
-		emit
+		if (has_upper) {
+			u64 padded = if (leading != 0) { core.int_extend<u64>(19) } else { zero };
+			_format_decimal_chunks(scratch, index, upper, zero, padded, leading, false, negative, capacity)
+		} else {
+			if (leading != 0) {
+				index = index - one;
+				scratch[index] = zero_digit + leading;
+			};
+			if (negative) {
+				index = index - one;
+				scratch[index] = 45;
+			};
+			u64 length = capacity - index;
+			_format_compact_bytes(scratch, zero, index, capacity);
+			length
+		}
 	}
+};
+
+u64(u8[], u128, bool, u64) _format_wide_decimal = fn(scratch, value, negative, capacity) {
+	u128 chunk_base = 10000000000000000000;
+	u64 remaining = 0;
+	u64 upper = 0;
+	u64 width = core.int_extend<u64>(1);
+	u8 leading = 0;
+	bool has_upper = value >= chunk_base;
+	if (has_upper) {
+		u128 quotient = value / chunk_base;
+		u128 remainder = value - quotient * chunk_base;
+		remaining = core.int_trunc<u64>(remainder);
+		quotient, leading = _format_subtract_u128(quotient, chunk_base, leading);
+		upper = core.int_trunc<u64>(quotient);
+		width = core.int_extend<u64>(19);
+	} else {
+		remaining = core.int_trunc<u64>(value);
+	};
+	_format_decimal_chunks(scratch, capacity, remaining, upper, width, leading, has_upper, negative, capacity)
 };
 
 utf8(u128) _format_u128 = fn(value) {
 	u8[39] scratch;
 	u64 capacity = core.int_extend<u64>(39);
-	u64 zero = core.int_extend<u64>(0);
-	u64 last = core.int_extend<u64>(38);
-	u64 emit = _format_digits_u128(scratch, zero, capacity, last, value, false, zero);
+	u64 length = _format_wide_decimal(scratch, value, false, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
-	utf8 text = { .data = data; .length = emit; };
+	utf8 text = { .data = data; .length = length; };
 	text
 };
 
