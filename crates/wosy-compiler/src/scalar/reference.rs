@@ -6084,6 +6084,8 @@ pub(super) struct RootOutputType {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct CallableBoundary {
     pub(super) parameters: Vec<ParameterSlot>,
+    #[cfg(test)]
+    pub(super) checker_parameter_bindings: Vec<ReferenceBindingId>,
     pub(super) results: Vec<DeclaredResultSlot>,
     pub(super) root_outputs: Vec<RootOutputType>,
     pub(super) generics: Vec<ScalarGenericParameter>,
@@ -8252,16 +8254,20 @@ fn resolve_function_call_sites(
             ty: parameters[ordinal].clone(),
         })
         .collect::<Vec<_>>();
+    #[cfg(test)]
+    let mut checker_parameter_bindings = Vec::new();
     for slot in &parameters {
+        let binding = WalkBinding {
+            declaration_span: slot.span,
+            block_span: function.body.span,
+            introduced_by_assignment: false,
+        };
+        #[cfg(test)]
+        if resolver.occurrence_typing.checker_directives_enabled() {
+            checker_parameter_bindings.push(binding.reference_id(source, function.span));
+        }
         parameter_types.insert(slot.name.clone(), slot.ty.clone());
-        parameter_names.insert(
-            slot.name.clone(),
-            WalkBinding {
-                declaration_span: slot.span,
-                block_span: function.body.span,
-                introduced_by_assignment: false,
-            },
-        );
+        parameter_names.insert(slot.name.clone(), binding);
     }
     let root = resolver.structure.root;
     resolver.block_items(&function.body, &parameter_names, &parameter_types, root, false)?;
@@ -8292,6 +8298,8 @@ fn resolve_function_call_sites(
     };
     let boundary = CallableBoundary {
         parameters,
+        #[cfg(test)]
+        checker_parameter_bindings,
         results: outputs
             .outputs
             .iter()

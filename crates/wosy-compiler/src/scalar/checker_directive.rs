@@ -445,6 +445,10 @@ mod tests {
             panic!("expected unit branch topology")
         };
         let branch = &body.structure.checker_integer_branches[condition_ordinal];
+        assert_eq!(
+            body.boundary.checker_parameter_bindings.as_slice(),
+            std::slice::from_ref(&branch.binding),
+        );
         let directive_for = |block, item| {
             let OccurrenceNode::Expression(ordinal) = body.structure.edges
                 [&(OccurrenceParent::Block(block), OccurrenceEdge::ExpressionItem { item })]

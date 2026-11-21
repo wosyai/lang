@@ -120,18 +120,15 @@ pub(super) fn check_integer_requirements(
     let [parameter] = calls.boundary.parameters.as_slice() else {
         return None;
     };
-    let structure = &calls.structure;
-    let predicates = structure.checker_integer_branches.iter().chain(
-        structure.checker_directives.iter().filter_map(|(ordinal, directive)| {
-            Some((ordinal, directive.integer_predicate.as_ref()?))
-        }),
-    );
-    let (_, first) = predicates
-        .filter(|(_, predicate)| {
-            predicate.binding.declaration_span == parameter.span && predicate.ty == parameter.ty
-        })
-        .min_by_key(|(ordinal, _)| ordinal.0)?;
-    match walk_integer_block(calls, structure.root, first.root()?)? {
+    let [binding] = calls.boundary.checker_parameter_bindings.as_slice() else {
+        return None;
+    };
+    let root = IntegerPath {
+        binding: binding.clone(),
+        ty: parameter.ty.clone(),
+        values: IntegerSet::from_type(&parameter.ty)?,
+    };
+    match walk_integer_block(calls, calls.structure.root, root)? {
         IntegerControl::Continue(_) => Some(Ok(())),
         IntegerControl::Fail(failure) => Some(Err(failure)),
     }
