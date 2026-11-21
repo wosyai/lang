@@ -23,8 +23,7 @@ entry:
   store i64 0, ptr %address, align 4
   %count = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i32 42, ptr %count, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr @pair, align 1
+  call void @llvm.memmove.p0.p0.i64(ptr align 1 @pair, ptr align 1 %struct_literal, i64 16, i1 false)
   store i32 -2, ptr @quotient, align 4
   store i32 -1, ptr @remainder, align 4
   %call = call i32 @negate(i32 7)
@@ -35,3 +34,8 @@ entry:
   store i32 %rem, ptr @computed_remainder, align 4
   ret i32 0
 }
+
+; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)
+declare void @llvm.memmove.p0.p0.i64(ptr nocapture writeonly, ptr nocapture readonly, i64, i1 immarg) #0
+
+attributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }

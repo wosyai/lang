@@ -1300,6 +1300,18 @@ fn declaration_attributes(declarations: &[LlvmFunction]) -> Vec<&LlvmFunctionAtt
     attributes
 }
 
+fn first_external_attribute_group(text: &str) -> u32 {
+    const PREFIX: &str = "\nattributes #";
+    text.match_indices(PREFIX)
+        .filter_map(|(start, _)| {
+            text[start + PREFIX.len()..]
+                .split_once(" = ")
+                .and_then(|(group, _)| group.parse::<u32>().ok())
+        })
+        .max()
+        .map_or(0, |group| group + 1)
+}
+
 fn finish_partition<'ctx>(
     module: inkwell::module::Module<'ctx>,
     module_name: String,
@@ -1338,6 +1350,11 @@ fn finish_partition<'ctx>(
             })
         })
         .collect();
+    let first_external_group = if externs.is_empty() {
+        0
+    } else {
+        first_external_attribute_group(&text)
+    };
     let declarations = externs
         .iter()
         .enumerate()
@@ -1367,7 +1384,7 @@ fn finish_partition<'ctx>(
                 result,
                 parameters,
                 attributes: vec![LlvmFunctionAttributes {
-                    group: group as u32,
+                    group: first_external_group + group as u32,
                     wasm_import_module: extern_identity.import_module.clone(),
                     wasm_import_name: extern_identity.import_name.clone(),
                 }],
@@ -2152,11 +2169,13 @@ fn emit_main<'ctx, 'module>(
                 if aggregate_transfer::emit_initializer_binding(context, &mut state, binding, None)? {
                     continue;
                 }
-                let value = emit_binding_value(context, &mut state, binding)?;
                 if binding.is_allocation {
-                    store_binding_outputs(context, &mut state, binding, value)?;
+                    initialize_runtime_array_global(context, &mut state, binding, |state, length| {
+                        emit_typed_expression(context, state, length, &ScalarType::U64)
+                    })?;
                     continue;
                 }
+                let value = emit_binding_value(context, &mut state, binding)?;
                 for (position, (name, ty)) in binding_receivers(binding).iter().enumerate() {
                     if *ty == ScalarType::Unit {
                         continue;
@@ -2500,6 +2519,40 @@ fn emit_project_main<'ctx, 'module>(
     Ok(())
 }
 
+fn initialize_runtime_array_global<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    binding: &crate::ScalarBinding,
+    emit_length: impl FnOnce(
+        &mut EmitState<'ctx, 'module>,
+        &ScalarExpression,
+    ) -> Result<EmitValue<'ctx>, String>,
+) -> Result<(), String> {
+    let receiver = binding
+        .receivers
+        .first()
+        .ok_or_else(|| "runtime allocation has no receiver".to_owned())?;
+    let ScalarType::RuntimeArray { element, .. } = &receiver.ty else {
+        return Err("allocation binding requires a runtime array type".to_owned());
+    };
+    let length = receiver
+        .allocation_length
+        .as_ref()
+        .ok_or_else(|| "runtime allocation has no length".to_owned())?;
+    let length = take_basic(emit_length(state, length)?)?.into_int_value();
+    let pointer = emit_runtime_array_allocation(context, state, element, length)?;
+    let (global, _) = state
+        .globals
+        .get(&receiver.name)
+        .ok_or_else(|| format!("unknown LLVM global {}", receiver.name))?;
+    let storage = global.as_pointer_value();
+    state.builder.build_store(storage, pointer).map_err(builder_error)?;
+    state.storage.insert(receiver.name.clone(), (storage, receiver.ty.clone()));
+    state.runtime_array_owners.insert(receiver.name.clone(), true);
+    state.runtime_array_allocations.insert(receiver.name.clone(), false);
+    Ok(())
+}
+
 fn initialize_project_module<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -2570,49 +2623,15 @@ fn initialize_project_module<'ctx, 'module>(
                 if aggregate_transfer::emit_initializer_binding(context, state, binding, Some((module, modules)))? {
                     continue;
                 }
-                let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 if binding.is_allocation {
-                    let receiver = binding
-                        .receivers
-                        .first()
-                        .ok_or_else(|| "runtime allocation has no receiver".to_owned())?;
-                    let ScalarType::RuntimeArray { element, .. } = &receiver.ty else {
-                        return Err("allocation binding requires a runtime array type".to_owned());
-                    };
-                    let length = receiver
-                        .allocation_length
-                        .as_ref()
-                        .ok_or_else(|| "runtime allocation has no length".to_owned())?;
-                    let length = take_basic(emit_project_typed_expression(
-                        context,
-                        state,
-                        length,
-                        &ScalarType::U64,
-                        module,
-                        modules,
-                    )?)?
-                    .into_int_value();
-                    let pointer = emit_runtime_array_allocation(context, state, element, length)?;
-                    let (global, _) = state
-                        .globals
-                        .get(&receiver.name)
-                        .ok_or_else(|| format!("unknown LLVM global {}", receiver.name))?;
-                    state
-                        .builder
-                        .build_store(global.as_pointer_value(), pointer)
-                        .map_err(builder_error)?;
-                    state.storage.insert(
-                        receiver.name.clone(),
-                        (global.as_pointer_value(), receiver.ty.clone()),
-                    );
-                    state
-                        .runtime_array_owners
-                        .insert(receiver.name.clone(), true);
-                    state
-                        .runtime_array_allocations
-                        .insert(receiver.name.clone(), false);
+                    initialize_runtime_array_global(context, state, binding, |state, length| {
+                        emit_project_typed_expression(
+                            context, state, length, &ScalarType::U64, module, modules,
+                        )
+                    })?;
                     continue;
                 }
+                let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 for (position, (name, ty)) in binding_receivers(binding).iter().enumerate() {
                     if *ty == ScalarType::Unit {
                         continue;
@@ -2702,11 +2721,28 @@ fn initialize_project_module<'ctx, 'module>(
 #[derive(Clone, Copy)]
 enum BlockEmission<'a> {
     Ordinary,
+    ContextualNumeric(&'a ScalarType),
     Return(&'a crate::ScalarOutputSequence),
     TailArm(&'a crate::ScalarOutputSequence),
 }
 
 impl<'a> BlockEmission<'a> {
+    fn expected_numeric(self) -> Option<&'a ScalarType> {
+        match self {
+            Self::ContextualNumeric(ty) => Some(ty),
+            Self::Return(outputs) | Self::TailArm(outputs) => match outputs.outputs.as_slice() {
+                [output]
+                    if integer_width(&output.ty).is_some()
+                        || matches!(output.ty, ScalarType::F32 | ScalarType::F64) =>
+                {
+                    Some(&output.ty)
+                }
+                _ => None,
+            },
+            Self::Ordinary => None,
+        }
+    }
+
     fn ordered_outputs(self) -> Option<&'a crate::ScalarOutputSequence> {
         match self {
             Self::Return(outputs) | Self::TailArm(outputs) if outputs.outputs.len() > 1 => {
@@ -2965,7 +3001,8 @@ fn emit_final_outputs<'ctx, 'module>(
             }
             return Ok(value);
         }
-        let value = emit_typed_expression(context, state, expression, &output.ty)?;
+        let ty = emission.expected_numeric().unwrap_or(&output.ty);
+        let value = emit_typed_expression(context, state, expression, ty)?;
         if !state
             .branch_return_outputs
             .contains_key(&(block.span.start, block.span.end))
@@ -3066,8 +3103,9 @@ fn emit_project_final_outputs<'ctx, 'module>(
             }
             return Ok(value);
         }
+        let ty = emission.expected_numeric().unwrap_or(&output.ty);
         let value =
-            emit_project_typed_expression(context, state, expression, &output.ty, module, modules)?;
+            emit_project_typed_expression(context, state, expression, ty, module, modules)?;
         if !state
             .branch_return_outputs
             .contains_key(&(block.span.start, block.span.end))

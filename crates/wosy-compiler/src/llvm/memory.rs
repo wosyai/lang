@@ -1,7 +1,9 @@
+use inkwell::attributes::AttributeLoc;
 use inkwell::values::BasicValue;
 
 use super::expression::{
-    emit_expression, emit_project_expression, emit_project_typed_expression, emit_unary_value,
+    emit_contextual_numeric, emit_expression, emit_project_expression, emit_project_typed_expression,
+    emit_unary_value, ExpressionPath,
 };
 use super::*;
 
@@ -694,9 +696,18 @@ pub(super) fn emit_typed_expression<'ctx, 'module>(
         (ScalarExpression::Integer { value, .. }, ty) if integer_width(ty).is_some() => Ok(
             EmitValue::Basic(integer_constant(context, ty, value)?.into()),
         ),
-        (ScalarExpression::Float { value, .. }, ty) => Ok(EmitValue::Basic(
-            float_constant(context, ty, *value)?.into(),
-        )),
+        (ScalarExpression::If { .. } | ScalarExpression::Block(_), ty)
+            if integer_width(ty).is_some() =>
+        {
+            emit_contextual_numeric(context, state, expression, ty, ExpressionPath::Single)
+        }
+        (_, ScalarType::F32 | ScalarType::F64) => emit_contextual_numeric(
+            context,
+            state,
+            expression,
+            expected,
+            ExpressionPath::Single,
+        ),
         _ => emit_expression(context, state, expression),
     }
 }
@@ -768,6 +779,42 @@ pub(super) fn emit_utf8_literal<'ctx, 'module>(
     Ok(EmitValue::Basic(destination.into()))
 }
 
+pub(super) fn copy_fixed_aggregate<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    destination: PointerValue<'ctx>,
+    source: PointerValue<'ctx>,
+    ty: &ScalarType,
+) -> Result<(), String> {
+    let (size, _) = allocation_layout(ty, state.layouts, state.target_layout)?;
+    if size == 0 {
+        return Ok(());
+    }
+    if state.target_layout == ScalarTargetLayout::WASM32 {
+        u32::try_from(size).map_err(|_| "fixed aggregate copy exceeds Wasm32 address space")?;
+        let function = state
+            .builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| "missing function for fixed aggregate copy".to_owned())?;
+        if function
+            .get_string_attribute(AttributeLoc::Function, "target-features")
+            .is_none()
+        {
+            function.add_attribute(
+                AttributeLoc::Function,
+                context.create_string_attribute("target-features", "+bulk-memory"),
+            );
+        }
+    }
+    let size = pointer_integer_type(context, state.target_layout).const_int(size, false);
+    state
+        .builder
+        .build_memmove(destination, 1, source, 1, size)
+        .map_err(builder_error)
+        .map(|_| ())
+}
+
 pub(super) fn store_value<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -777,16 +824,7 @@ pub(super) fn store_value<'ctx, 'module>(
 ) -> Result<(), String> {
     if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
         let source = take_basic(value)?.into_pointer_value();
-        let aggregate = storage_type(context, ty, state.layouts, state.target_layout)?;
-        let value = state
-            .builder
-            .build_load(aggregate, source, "struct_value")
-            .map_err(builder_error)?;
-        state
-            .builder
-            .build_store(destination, value)
-            .map_err(builder_error)
-            .map(|_| ())
+        copy_fixed_aggregate(context, state, destination, source, ty)
     } else {
         state
             .builder

@@ -175,8 +175,10 @@ pub(super) fn emit_expression<'ctx, 'module>(
                 .into(),
         )),
         ScalarExpression::InvalidInteger { .. } => Err("invalid integer literal".to_owned()),
-        ScalarExpression::Float { .. } => {
-            Err("floating-point literal requires an expected type".to_owned())
+        ScalarExpression::Float { value, .. } => {
+            let ty = checked_float_type(state, expression)
+                .ok_or_else(|| "floating-point literal requires an expected type".to_owned())?;
+            Ok(EmitValue::Basic(float_constant(context, ty, *value)?.into()))
         }
         ScalarExpression::InvalidFloat { .. } => Err("invalid floating-point literal".to_owned()),
         ScalarExpression::Boolean { value, .. } => Ok(EmitValue::Basic(
@@ -345,9 +347,20 @@ pub(super) fn emit_project_typed_expression<'ctx, 'module>(
         ScalarExpression::Integer { value, .. } if integer_width(expected).is_some() => Ok(
             EmitValue::Basic(integer_constant(context, expected, value)?.into()),
         ),
-        ScalarExpression::Float { value, .. } => Ok(EmitValue::Basic(
-            float_constant(context, expected, *value)?.into(),
-        )),
+        ScalarExpression::If { .. } | ScalarExpression::Block(_)
+            if integer_width(expected).is_some() =>
+        {
+            emit_contextual_numeric(
+                context, state, expression, expected, ExpressionPath::Project { module, modules },
+            )
+        }
+        _ if matches!(expected, ScalarType::F32 | ScalarType::F64) => emit_contextual_numeric(
+            context,
+            state,
+            expression,
+            expected,
+            ExpressionPath::Project { module, modules },
+        ),
         ScalarExpression::StructLiteral { fields, .. } => {
             emit_struct_literal(context, state, expected, fields)
         }
@@ -610,8 +623,10 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                 .into(),
         )),
         ScalarExpression::InvalidInteger { .. } => Err("invalid integer literal".to_owned()),
-        ScalarExpression::Float { .. } => {
-            Err("floating-point literal requires an expected type".to_owned())
+        ScalarExpression::Float { value, .. } => {
+            let ty = checked_float_type(state, expression)
+                .ok_or_else(|| "floating-point literal requires an expected type".to_owned())?;
+            Ok(EmitValue::Basic(float_constant(context, ty, *value)?.into()))
         }
         ScalarExpression::InvalidFloat { .. } => Err("invalid floating-point literal".to_owned()),
         ScalarExpression::Boolean { value, .. } => Ok(EmitValue::Basic(
@@ -644,19 +659,13 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             right,
             ..
         } => {
-            let unsigned = match prepared_initializer_unsigned(state, left)? {
-                Some(unsigned) => unsigned,
-                None => project_expression_is_unsigned(state, left, module),
-            };
-            let left = emit_project_expression(context, state, left, module, modules)?;
-            emit_binary_with_rhs(
+            emit_binary_expression(
                 context,
                 state,
                 operator,
                 left,
                 right,
                 ExpressionPath::Project { module, modules },
-                unsigned,
             )
         }
         ScalarExpression::If {
@@ -2266,20 +2275,7 @@ fn emit_binary<'ctx, 'module>(
     left: &ScalarExpression,
     right: &ScalarExpression,
 ) -> Result<EmitValue<'ctx>, String> {
-    let unsigned = match prepared_initializer_unsigned(state, left)? {
-        Some(unsigned) => unsigned,
-        None => expression_is_unsigned(state, left),
-    };
-    let left = emit_expression(context, state, left)?;
-    emit_binary_with_rhs(
-        context,
-        state,
-        operator,
-        left,
-        right,
-        ExpressionPath::Single,
-        unsigned,
-    )
+    emit_binary_expression(context, state, operator, left, right, ExpressionPath::Single)
 }
 
 fn prepared_initializer_unsigned(
@@ -2381,12 +2377,124 @@ fn project_expression_is_unsigned<'ctx, 'module>(
     }
 }
 
-enum ExpressionPath<'a> {
+#[derive(Clone, Copy)]
+pub(super) enum ExpressionPath<'a> {
     Single,
     Project {
         module: &'a ScalarModule,
         modules: &'a [&'a ScalarModule],
     },
+}
+
+impl ExpressionPath<'_> {
+    fn emit<'ctx, 'module>(
+        self,
+        context: &'ctx Context,
+        state: &mut EmitState<'ctx, 'module>,
+        expression: &ScalarExpression,
+    ) -> Result<EmitValue<'ctx>, String> {
+        match self {
+            Self::Single => emit_expression(context, state, expression),
+            Self::Project { module, modules } => {
+                emit_project_expression(context, state, expression, module, modules)
+            }
+        }
+    }
+
+    fn emit_block<'ctx, 'module>(
+        self,
+        context: &'ctx Context,
+        state: &mut EmitState<'ctx, 'module>,
+        block: &ScalarBlock,
+        emission: BlockEmission<'_>,
+    ) -> Result<EmitValue<'ctx>, String> {
+        match self {
+            Self::Single => emit_block_at(context, state, block, emission),
+            Self::Project { module, modules } => {
+                emit_project_block_at(context, state, block, module, modules, emission)
+            }
+        }
+    }
+}
+
+fn checked_float_type<'a>(
+    state: &EmitState<'_, 'a>,
+    expression: &ScalarExpression,
+) -> Option<&'a ScalarType> {
+    state
+        .body_call_nodes
+        .and_then(|nodes| nodes.checked_expression_type(expression))
+        .filter(|ty| matches!(ty, ScalarType::F32 | ScalarType::F64))
+        .or_else(|| {
+            state
+                .initializer_nodes
+                .and_then(|nodes| nodes.checked_float_type(expression))
+        })
+}
+
+pub(super) fn emit_contextual_numeric<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
+    expected: &ScalarType,
+    path: ExpressionPath<'_>,
+) -> Result<EmitValue<'ctx>, String> {
+    let float = matches!(expected, ScalarType::F32 | ScalarType::F64);
+    match expression {
+        ScalarExpression::Float { value, .. } if float => {
+            Ok(EmitValue::Basic(float_constant(context, expected, *value)?.into()))
+        }
+        ScalarExpression::Binary { operator, left, right, .. }
+            if float && matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract
+                | BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder) =>
+        {
+            let left = emit_contextual_numeric(context, state, left, expected, path)?;
+            let right = emit_contextual_numeric(context, state, right, expected, path)?;
+            emit_binary_values(state, operator, left, right, false)
+        }
+        ScalarExpression::If { condition, then_branch, else_branch, .. } => {
+            let condition = take_basic(path.emit(context, state, condition)?)?.into_int_value();
+            emit_if_value(context, state, condition, then_branch, else_branch, |state, block| {
+                path.emit_block(context, state, block, BlockEmission::ContextualNumeric(expected))
+            })
+        }
+        ScalarExpression::Block(block) => {
+            path.emit_block(context, state, block, BlockEmission::ContextualNumeric(expected))
+        }
+        _ => path.emit(context, state, expression),
+    }
+}
+
+fn emit_binary_expression<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    operator: &BinaryOperator,
+    left: &ScalarExpression,
+    right: &ScalarExpression,
+    path: ExpressionPath<'_>,
+) -> Result<EmitValue<'ctx>, String> {
+    if let ScalarExpression::Float { value, .. } = left {
+        if checked_float_type(state, left).is_none()
+            && !matches!(operator, BinaryOperator::And | BinaryOperator::Or)
+        {
+            let right = path.emit(context, state, right)?;
+            let EmitValue::Basic(BasicValueEnum::FloatValue(right)) = right else {
+                return Err("floating-point literal requires an expected type".to_owned());
+            };
+            let ty = if right.get_type() == context.f32_type() { ScalarType::F32 } else { ScalarType::F64 };
+            let left = EmitValue::Basic(float_constant(context, &ty, *value)?.into());
+            return emit_binary_values(state, operator, left, EmitValue::Basic(right.into()), false);
+        }
+    }
+    let unsigned = match prepared_initializer_unsigned(state, left)? {
+        Some(unsigned) => unsigned,
+        None => match path {
+            ExpressionPath::Single => expression_is_unsigned(state, left),
+            ExpressionPath::Project { module, .. } => project_expression_is_unsigned(state, left, module),
+        },
+    };
+    let left = path.emit(context, state, left)?;
+    emit_binary_with_rhs(context, state, operator, left, right, path, unsigned)
 }
 
 fn emit_binary_with_rhs<'ctx, 'module>(

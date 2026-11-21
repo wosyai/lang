@@ -18,6 +18,7 @@ pub(crate) struct InitializerCallNodes<'a> {
     source: &'a SourceIdentity,
     targets: HashMap<*const ScalarExpression, (usize, &'a ModuleInitializationCallTarget)>,
     members: HashMap<*const ScalarExpression, BoundInitializerMember<'a>>,
+    float_types: HashMap<*const ScalarExpression, &'a ScalarType>,
     items: PhantomData<&'a [ScalarItem]>,
 }
 
@@ -42,6 +43,7 @@ impl<'a> InitializerCallNodes<'a> {
             source: &region.source,
             targets: HashMap::with_capacity(topology.calls.len()),
             members: HashMap::with_capacity(topology.identities.members.len()),
+            float_types: HashMap::new(),
             items: PhantomData,
         };
         let mut bind_call = |ordinal: OccurrenceOrdinal, expression: &'a ScalarExpression| {
@@ -82,12 +84,21 @@ impl<'a> InitializerCallNodes<'a> {
             nodes.targets.insert(std::ptr::from_ref(expression), (ordinal.0, target));
             Ok(())
         };
+        let mut bind_type = |ordinal, expression: &'a ScalarExpression| {
+            if matches!(expression, ScalarExpression::Float { .. }) {
+                if let Some(ty @ (ScalarType::F32 | ScalarType::F64)) =
+                    topology.structure.checked_types.expressions.get(&ordinal)
+                {
+                    nodes.float_types.insert(std::ptr::from_ref(expression), ty);
+                }
+            }
+        };
         Binder {
             structure: &topology.structure,
             source: &region.source,
             region: "initializer",
             bind_call: &mut bind_call,
-            bind_type: None,
+            bind_type: Some(&mut bind_type),
             bind_named_place: None,
             proof_nodes: None,
         }
@@ -99,6 +110,10 @@ impl<'a> InitializerCallNodes<'a> {
             ));
         }
         Ok(nodes)
+    }
+
+    pub(crate) fn checked_float_type(&self, expression: &ScalarExpression) -> Option<&'a ScalarType> {
+        self.float_types.get(&std::ptr::from_ref(expression)).copied()
     }
 
     pub(crate) fn target(

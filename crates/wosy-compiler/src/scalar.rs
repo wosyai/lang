@@ -4429,12 +4429,24 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 _ => panic!("unary operator grammar"),
             };
             let operand = derive_element(children.get(1).expect("unary operand"));
+            let span = ByteSpan::new(
+                operator_token.text_range().start().into(),
+                span_of(&operand).end,
+            );
+            if matches!(operator, UnaryOperator::Negate) {
+                if let ScalarExpression::Float { value, spelling, .. } = &operand {
+                    if !spelling.starts_with('-') {
+                        return ScalarExpression::Float {
+                            value: -*value,
+                            spelling: format!("-{spelling}"),
+                            span,
+                        };
+                    }
+                }
+            }
             ScalarExpression::Unary {
                 operator,
-                span: ByteSpan::new(
-                    operator_token.text_range().start().into(),
-                    span_of(&operand).end,
-                ),
+                span,
                 operand: Box::new(operand),
             }
         }

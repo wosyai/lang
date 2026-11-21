@@ -1,15 +1,15 @@
 ; ModuleID = 'src/main.w'
 source_filename = "src/main.w"
 
-declare i32 @wosy_extern__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f77617369__776173695f736e617073686f745f7072657669657731__5f66645f72656164(i32, i32, i32, i32) #0
-declare i32 @wosy_extern__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f77617369__776173695f736e617073686f745f7072657669657731__66645f7772697465(i32, i32, i32, i32) #1
-declare i32 @wosy_extern__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f77617369__776173695f736e617073686f745f7072657669657731__5f706f6c6c5f6f6e656f6666(i32, i32, i32, i32) #2
-declare void @wosy_extern__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f77617369__776173695f736e617073686f745f7072657669657731__5f70726f635f65786974(i32) #3
+declare i32 @wosy_extern__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f77617369__776173695f736e617073686f745f7072657669657731__5f66645f72656164(i32, i32, i32, i32) #2
+declare i32 @wosy_extern__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f77617369__776173695f736e617073686f745f7072657669657731__66645f7772697465(i32, i32, i32, i32) #3
+declare i32 @wosy_extern__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f77617369__776173695f736e617073686f745f7072657669657731__5f706f6c6c5f6f6e656f6666(i32, i32, i32, i32) #4
+declare void @wosy_extern__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f77617369__776173695f736e617073686f745f7072657669657731__5f70726f635f65786974(i32) #5
 
-attributes #0 = { "wasm-import-module"="wasi_snapshot_preview1" "wasm-import-name"="fd_read" }
-attributes #1 = { "wasm-import-module"="wasi_snapshot_preview1" "wasm-import-name"="fd_write" }
-attributes #2 = { "wasm-import-module"="wasi_snapshot_preview1" "wasm-import-name"="poll_oneoff" }
-attributes #3 = { "wasm-import-module"="wasi_snapshot_preview1" "wasm-import-name"="proc_exit" }
+attributes #2 = { "wasm-import-module"="wasi_snapshot_preview1" "wasm-import-name"="fd_read" }
+attributes #3 = { "wasm-import-module"="wasi_snapshot_preview1" "wasm-import-name"="fd_write" }
+attributes #4 = { "wasm-import-module"="wasi_snapshot_preview1" "wasm-import-name"="poll_oneoff" }
+attributes #5 = { "wasm-import-module"="wasi_snapshot_preview1" "wasm-import-name"="proc_exit" }
 
 @wosy_fn__706f696e7465722d636173742d61646472657373__7372632f6d61696e2e77__33323965326631396465376631643564346538393762323936633365323035303163386537373733623737643237333833383435663532653033376461313836__676c6f62616c5f6279746573 = internal global [4 x i8] zeroinitializer
 @wosy_utf8_literal_0 = private constant [1 x i8] c"\0A"
@@ -93,20 +93,20 @@ entry:
   ret void
 }
 
-define internal { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__7072696e74(ptr %text, ptr %0) {
+define internal { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__7072696e74(ptr %text, ptr %0) #0 {
 entry:
-  %assignment_value50 = alloca i1, align 1
-  %assignment_value44 = alloca i64, align 8
-  %assignment_value42 = alloca i1, align 1
-  %assignment_value40 = alloca i64, align 8
-  %assignment_value38 = alloca i1, align 1
-  %assignment_value32 = alloca i64, align 8
-  %assignment_value22 = alloca i32, align 4
+  %assignment_value48 = alloca i1, align 1
+  %assignment_value42 = alloca i64, align 8
+  %assignment_value40 = alloca i1, align 1
+  %assignment_value38 = alloca i64, align 8
+  %assignment_value36 = alloca i1, align 1
+  %assignment_value30 = alloca i64, align 8
+  %assignment_value20 = alloca i32, align 4
   %assignment_value = alloca i32, align 4
   %count = alloca i32, align 4
   %result = alloca i32, align 4
   %byte_count = alloca [4 x i8], align 4
-  %struct_literal10 = alloca [4 x i8], align 4
+  %struct_literal9 = alloca [4 x i8], align 4
   %iovec = alloca [8 x i8], align 4
   %struct_literal = alloca [8 x i8], align 4
   %success = alloca i32, align 4
@@ -116,8 +116,7 @@ entry:
   %zero = alloca i64, align 8
   %reported = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %reported, align 4
   store i64 0, ptr %zero, align 4
   %length = getelementptr inbounds i8, ptr %text1, i8 8
@@ -139,25 +138,23 @@ entry:
   store i32 %place4, ptr %data7, align 4
   %length8 = getelementptr inbounds i8, ptr %struct_literal, i8 4
   store i32 %int_trunc, ptr %length8, align 4
-  %struct_value9 = load [8 x i8], ptr %struct_literal, align 1
-  store [8 x i8] %struct_value9, ptr %iovec, align 1
-  %value = getelementptr inbounds i8, ptr %struct_literal10, i8 0
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %iovec, ptr align 1 %struct_literal, i32 8, i1 false)
+  %value = getelementptr inbounds i8, ptr %struct_literal9, i8 0
   store i32 0, ptr %value, align 4
-  %struct_value11 = load [4 x i8], ptr %struct_literal10, align 1
-  store [4 x i8] %struct_value11, ptr %byte_count, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %byte_count, ptr align 1 %struct_literal9, i32 4, i1 false)
   store i32 0, ptr %result, align 4
   store i32 0, ptr %count, align 4
-  %length12 = getelementptr inbounds i8, ptr %text1, i8 8
-  %place13 = load i64, ptr %length12, align 4
-  %zero14 = load i64, ptr %zero, align 4
-  %ne = icmp ne i64 %place13, %zero14
+  %length10 = getelementptr inbounds i8, ptr %text1, i8 8
+  %place11 = load i64, ptr %length10, align 4
+  %zero12 = load i64, ptr %zero, align 4
+  %ne = icmp ne i64 %place11, %zero12
   br i1 %ne, label %short_circuit.rhs, label %short_circuit.merge
 
 short_circuit.rhs:                                ; preds = %entry
-  %length15 = getelementptr inbounds i8, ptr %text1, i8 8
-  %place16 = load i64, ptr %length15, align 4
-  %maximum17 = load i64, ptr %maximum, align 4
-  %le = icmp ule i64 %place16, %maximum17
+  %length13 = getelementptr inbounds i8, ptr %text1, i8 8
+  %place14 = load i64, ptr %length13, align 4
+  %maximum15 = load i64, ptr %maximum, align 4
+  %le = icmp ule i64 %place14, %maximum15
   br label %short_circuit.merge
 
 short_circuit.merge:                              ; preds = %short_circuit.rhs, %entry
@@ -166,67 +163,67 @@ short_circuit.merge:                              ; preds = %short_circuit.rhs, 
 
 if.then:                                          ; preds = %short_circuit.merge
   %address = ptrtoint ptr %iovec to i32
-  %address18 = ptrtoint ptr %byte_count to i32
-  %call = call i32 @wosy_fn__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__66645f77726974655f6f6e6365(i32 1, i32 %address, i32 %address18)
+  %address16 = ptrtoint ptr %byte_count to i32
+  %call = call i32 @wosy_fn__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__66645f77726974655f6f6e6365(i32 1, i32 %address, i32 %address16)
   store i32 %call, ptr %assignment_value, align 4
-  %assignment_value19 = load i32, ptr %assignment_value, align 4
-  store i32 %assignment_value19, ptr %result, align 4
-  %value20 = getelementptr inbounds i8, ptr %byte_count, i8 0
-  %place21 = load i32, ptr %value20, align 4
-  store i32 %place21, ptr %assignment_value22, align 4
-  %assignment_value23 = load i32, ptr %assignment_value22, align 4
-  store i32 %assignment_value23, ptr %count, align 4
-  %result24 = load i32, ptr %result, align 4
-  %success25 = load i32, ptr %success, align 4
-  %eq26 = icmp eq i32 %result24, %success25
-  br i1 %eq26, label %if.then27, label %if.else28
+  %assignment_value17 = load i32, ptr %assignment_value, align 4
+  store i32 %assignment_value17, ptr %result, align 4
+  %value18 = getelementptr inbounds i8, ptr %byte_count, i8 0
+  %place19 = load i32, ptr %value18, align 4
+  store i32 %place19, ptr %assignment_value20, align 4
+  %assignment_value21 = load i32, ptr %assignment_value20, align 4
+  store i32 %assignment_value21, ptr %count, align 4
+  %result22 = load i32, ptr %result, align 4
+  %success23 = load i32, ptr %success, align 4
+  %eq24 = icmp eq i32 %result22, %success23
+  br i1 %eq24, label %if.then25, label %if.else26
 
 if.else:                                          ; preds = %short_circuit.merge
-  store i64 0, ptr %assignment_value44, align 4
-  %assignment_value45 = load i64, ptr %assignment_value44, align 4
-  store i64 %assignment_value45, ptr %reported, align 4
-  %length46 = getelementptr inbounds i8, ptr %text1, i8 8
-  %place47 = load i64, ptr %length46, align 4
-  %zero48 = load i64, ptr %zero, align 4
-  %eq49 = icmp eq i64 %place47, %zero48
-  store i1 %eq49, ptr %assignment_value50, align 1
-  %assignment_value51 = load i1, ptr %assignment_value50, align 1
-  store i1 %assignment_value51, ptr %complete, align 1
+  store i64 0, ptr %assignment_value42, align 4
+  %assignment_value43 = load i64, ptr %assignment_value42, align 4
+  store i64 %assignment_value43, ptr %reported, align 4
+  %length44 = getelementptr inbounds i8, ptr %text1, i8 8
+  %place45 = load i64, ptr %length44, align 4
+  %zero46 = load i64, ptr %zero, align 4
+  %eq47 = icmp eq i64 %place45, %zero46
+  store i1 %eq47, ptr %assignment_value48, align 1
+  %assignment_value49 = load i1, ptr %assignment_value48, align 1
+  store i1 %assignment_value49, ptr %complete, align 1
   br label %if.merge
 
-if.merge:                                         ; preds = %if.else, %if.merge29
-  %reported52 = load i64, ptr %reported, align 4
-  %complete53 = load i1, ptr %complete, align 1
-  %output = insertvalue { i64, i1 } zeroinitializer, i64 %reported52, 0
-  %output54 = insertvalue { i64, i1 } %output, i1 %complete53, 1
+if.merge:                                         ; preds = %if.else, %if.merge27
+  %reported50 = load i64, ptr %reported, align 4
+  %complete51 = load i1, ptr %complete, align 1
+  %output = insertvalue { i64, i1 } zeroinitializer, i64 %reported50, 0
+  %output52 = insertvalue { i64, i1 } %output, i1 %complete51, 1
   %aggregate_formal_owned = icmp ne ptr %0, null
   br i1 %aggregate_formal_owned, label %aggregate.formal.release, label %aggregate.formal.end
 
-if.then27:                                        ; preds = %if.then
-  %count30 = load i32, ptr %count, align 4
-  %int_extend31 = zext i32 %count30 to i64
-  store i64 %int_extend31, ptr %assignment_value32, align 4
-  %assignment_value33 = load i64, ptr %assignment_value32, align 4
-  store i64 %assignment_value33, ptr %reported, align 4
-  %reported34 = load i64, ptr %reported, align 4
-  %length35 = getelementptr inbounds i8, ptr %text1, i8 8
-  %place36 = load i64, ptr %length35, align 4
-  %eq37 = icmp eq i64 %reported34, %place36
-  store i1 %eq37, ptr %assignment_value38, align 1
-  %assignment_value39 = load i1, ptr %assignment_value38, align 1
-  store i1 %assignment_value39, ptr %complete, align 1
-  br label %if.merge29
+if.then25:                                        ; preds = %if.then
+  %count28 = load i32, ptr %count, align 4
+  %int_extend29 = zext i32 %count28 to i64
+  store i64 %int_extend29, ptr %assignment_value30, align 4
+  %assignment_value31 = load i64, ptr %assignment_value30, align 4
+  store i64 %assignment_value31, ptr %reported, align 4
+  %reported32 = load i64, ptr %reported, align 4
+  %length33 = getelementptr inbounds i8, ptr %text1, i8 8
+  %place34 = load i64, ptr %length33, align 4
+  %eq35 = icmp eq i64 %reported32, %place34
+  store i1 %eq35, ptr %assignment_value36, align 1
+  %assignment_value37 = load i1, ptr %assignment_value36, align 1
+  store i1 %assignment_value37, ptr %complete, align 1
+  br label %if.merge27
 
-if.else28:                                        ; preds = %if.then
-  store i64 0, ptr %assignment_value40, align 4
-  %assignment_value41 = load i64, ptr %assignment_value40, align 4
-  store i64 %assignment_value41, ptr %reported, align 4
-  store i1 false, ptr %assignment_value42, align 1
-  %assignment_value43 = load i1, ptr %assignment_value42, align 1
-  store i1 %assignment_value43, ptr %complete, align 1
-  br label %if.merge29
+if.else26:                                        ; preds = %if.then
+  store i64 0, ptr %assignment_value38, align 4
+  %assignment_value39 = load i64, ptr %assignment_value38, align 4
+  store i64 %assignment_value39, ptr %reported, align 4
+  store i1 false, ptr %assignment_value40, align 1
+  %assignment_value41 = load i1, ptr %assignment_value40, align 1
+  store i1 %assignment_value41, ptr %complete, align 1
+  br label %if.merge27
 
-if.merge29:                                       ; preds = %if.else28, %if.then27
+if.merge27:                                       ; preds = %if.else26, %if.then25
   br label %if.merge
 
 aggregate.formal.release:                         ; preds = %if.merge
@@ -234,23 +231,23 @@ aggregate.formal.release:                         ; preds = %if.merge
   br label %aggregate.formal.end
 
 aggregate.formal.end:                             ; preds = %aggregate.formal.release, %if.merge
-  ret { i64, i1 } %output54
+  ret { i64, i1 } %output52
 }
 
-define { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__657072696e74(ptr %text) {
+define { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__657072696e74(ptr %text) #0 {
 entry:
-  %assignment_value50 = alloca i1, align 1
-  %assignment_value44 = alloca i64, align 8
-  %assignment_value42 = alloca i1, align 1
-  %assignment_value40 = alloca i64, align 8
-  %assignment_value38 = alloca i1, align 1
-  %assignment_value32 = alloca i64, align 8
-  %assignment_value22 = alloca i32, align 4
+  %assignment_value48 = alloca i1, align 1
+  %assignment_value42 = alloca i64, align 8
+  %assignment_value40 = alloca i1, align 1
+  %assignment_value38 = alloca i64, align 8
+  %assignment_value36 = alloca i1, align 1
+  %assignment_value30 = alloca i64, align 8
+  %assignment_value20 = alloca i32, align 4
   %assignment_value = alloca i32, align 4
   %count = alloca i32, align 4
   %result = alloca i32, align 4
   %byte_count = alloca [4 x i8], align 4
-  %struct_literal10 = alloca [4 x i8], align 4
+  %struct_literal9 = alloca [4 x i8], align 4
   %iovec = alloca [8 x i8], align 4
   %struct_literal = alloca [8 x i8], align 4
   %success = alloca i32, align 4
@@ -260,8 +257,7 @@ entry:
   %zero = alloca i64, align 8
   %reported = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %reported, align 4
   store i64 0, ptr %zero, align 4
   %length = getelementptr inbounds i8, ptr %text1, i8 8
@@ -283,25 +279,23 @@ entry:
   store i32 %place4, ptr %data7, align 4
   %length8 = getelementptr inbounds i8, ptr %struct_literal, i8 4
   store i32 %int_trunc, ptr %length8, align 4
-  %struct_value9 = load [8 x i8], ptr %struct_literal, align 1
-  store [8 x i8] %struct_value9, ptr %iovec, align 1
-  %value = getelementptr inbounds i8, ptr %struct_literal10, i8 0
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %iovec, ptr align 1 %struct_literal, i32 8, i1 false)
+  %value = getelementptr inbounds i8, ptr %struct_literal9, i8 0
   store i32 0, ptr %value, align 4
-  %struct_value11 = load [4 x i8], ptr %struct_literal10, align 1
-  store [4 x i8] %struct_value11, ptr %byte_count, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %byte_count, ptr align 1 %struct_literal9, i32 4, i1 false)
   store i32 0, ptr %result, align 4
   store i32 0, ptr %count, align 4
-  %length12 = getelementptr inbounds i8, ptr %text1, i8 8
-  %place13 = load i64, ptr %length12, align 4
-  %zero14 = load i64, ptr %zero, align 4
-  %ne = icmp ne i64 %place13, %zero14
+  %length10 = getelementptr inbounds i8, ptr %text1, i8 8
+  %place11 = load i64, ptr %length10, align 4
+  %zero12 = load i64, ptr %zero, align 4
+  %ne = icmp ne i64 %place11, %zero12
   br i1 %ne, label %short_circuit.rhs, label %short_circuit.merge
 
 short_circuit.rhs:                                ; preds = %entry
-  %length15 = getelementptr inbounds i8, ptr %text1, i8 8
-  %place16 = load i64, ptr %length15, align 4
-  %maximum17 = load i64, ptr %maximum, align 4
-  %le = icmp ule i64 %place16, %maximum17
+  %length13 = getelementptr inbounds i8, ptr %text1, i8 8
+  %place14 = load i64, ptr %length13, align 4
+  %maximum15 = load i64, ptr %maximum, align 4
+  %le = icmp ule i64 %place14, %maximum15
   br label %short_circuit.merge
 
 short_circuit.merge:                              ; preds = %short_circuit.rhs, %entry
@@ -310,66 +304,66 @@ short_circuit.merge:                              ; preds = %short_circuit.rhs, 
 
 if.then:                                          ; preds = %short_circuit.merge
   %address = ptrtoint ptr %iovec to i32
-  %address18 = ptrtoint ptr %byte_count to i32
-  %call = call i32 @wosy_fn__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__66645f77726974655f6f6e6365(i32 2, i32 %address, i32 %address18)
+  %address16 = ptrtoint ptr %byte_count to i32
+  %call = call i32 @wosy_fn__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__66645f77726974655f6f6e6365(i32 2, i32 %address, i32 %address16)
   store i32 %call, ptr %assignment_value, align 4
-  %assignment_value19 = load i32, ptr %assignment_value, align 4
-  store i32 %assignment_value19, ptr %result, align 4
-  %value20 = getelementptr inbounds i8, ptr %byte_count, i8 0
-  %place21 = load i32, ptr %value20, align 4
-  store i32 %place21, ptr %assignment_value22, align 4
-  %assignment_value23 = load i32, ptr %assignment_value22, align 4
-  store i32 %assignment_value23, ptr %count, align 4
-  %result24 = load i32, ptr %result, align 4
-  %success25 = load i32, ptr %success, align 4
-  %eq26 = icmp eq i32 %result24, %success25
-  br i1 %eq26, label %if.then27, label %if.else28
+  %assignment_value17 = load i32, ptr %assignment_value, align 4
+  store i32 %assignment_value17, ptr %result, align 4
+  %value18 = getelementptr inbounds i8, ptr %byte_count, i8 0
+  %place19 = load i32, ptr %value18, align 4
+  store i32 %place19, ptr %assignment_value20, align 4
+  %assignment_value21 = load i32, ptr %assignment_value20, align 4
+  store i32 %assignment_value21, ptr %count, align 4
+  %result22 = load i32, ptr %result, align 4
+  %success23 = load i32, ptr %success, align 4
+  %eq24 = icmp eq i32 %result22, %success23
+  br i1 %eq24, label %if.then25, label %if.else26
 
 if.else:                                          ; preds = %short_circuit.merge
-  store i64 0, ptr %assignment_value44, align 4
-  %assignment_value45 = load i64, ptr %assignment_value44, align 4
-  store i64 %assignment_value45, ptr %reported, align 4
-  %length46 = getelementptr inbounds i8, ptr %text1, i8 8
-  %place47 = load i64, ptr %length46, align 4
-  %zero48 = load i64, ptr %zero, align 4
-  %eq49 = icmp eq i64 %place47, %zero48
-  store i1 %eq49, ptr %assignment_value50, align 1
-  %assignment_value51 = load i1, ptr %assignment_value50, align 1
-  store i1 %assignment_value51, ptr %complete, align 1
+  store i64 0, ptr %assignment_value42, align 4
+  %assignment_value43 = load i64, ptr %assignment_value42, align 4
+  store i64 %assignment_value43, ptr %reported, align 4
+  %length44 = getelementptr inbounds i8, ptr %text1, i8 8
+  %place45 = load i64, ptr %length44, align 4
+  %zero46 = load i64, ptr %zero, align 4
+  %eq47 = icmp eq i64 %place45, %zero46
+  store i1 %eq47, ptr %assignment_value48, align 1
+  %assignment_value49 = load i1, ptr %assignment_value48, align 1
+  store i1 %assignment_value49, ptr %complete, align 1
   br label %if.merge
 
-if.merge:                                         ; preds = %if.else, %if.merge29
-  %reported52 = load i64, ptr %reported, align 4
-  %complete53 = load i1, ptr %complete, align 1
-  %output = insertvalue { i64, i1 } zeroinitializer, i64 %reported52, 0
-  %output54 = insertvalue { i64, i1 } %output, i1 %complete53, 1
-  ret { i64, i1 } %output54
+if.merge:                                         ; preds = %if.else, %if.merge27
+  %reported50 = load i64, ptr %reported, align 4
+  %complete51 = load i1, ptr %complete, align 1
+  %output = insertvalue { i64, i1 } zeroinitializer, i64 %reported50, 0
+  %output52 = insertvalue { i64, i1 } %output, i1 %complete51, 1
+  ret { i64, i1 } %output52
 
-if.then27:                                        ; preds = %if.then
-  %count30 = load i32, ptr %count, align 4
-  %int_extend31 = zext i32 %count30 to i64
-  store i64 %int_extend31, ptr %assignment_value32, align 4
-  %assignment_value33 = load i64, ptr %assignment_value32, align 4
-  store i64 %assignment_value33, ptr %reported, align 4
-  %reported34 = load i64, ptr %reported, align 4
-  %length35 = getelementptr inbounds i8, ptr %text1, i8 8
-  %place36 = load i64, ptr %length35, align 4
-  %eq37 = icmp eq i64 %reported34, %place36
-  store i1 %eq37, ptr %assignment_value38, align 1
-  %assignment_value39 = load i1, ptr %assignment_value38, align 1
-  store i1 %assignment_value39, ptr %complete, align 1
-  br label %if.merge29
+if.then25:                                        ; preds = %if.then
+  %count28 = load i32, ptr %count, align 4
+  %int_extend29 = zext i32 %count28 to i64
+  store i64 %int_extend29, ptr %assignment_value30, align 4
+  %assignment_value31 = load i64, ptr %assignment_value30, align 4
+  store i64 %assignment_value31, ptr %reported, align 4
+  %reported32 = load i64, ptr %reported, align 4
+  %length33 = getelementptr inbounds i8, ptr %text1, i8 8
+  %place34 = load i64, ptr %length33, align 4
+  %eq35 = icmp eq i64 %reported32, %place34
+  store i1 %eq35, ptr %assignment_value36, align 1
+  %assignment_value37 = load i1, ptr %assignment_value36, align 1
+  store i1 %assignment_value37, ptr %complete, align 1
+  br label %if.merge27
 
-if.else28:                                        ; preds = %if.then
-  store i64 0, ptr %assignment_value40, align 4
-  %assignment_value41 = load i64, ptr %assignment_value40, align 4
-  store i64 %assignment_value41, ptr %reported, align 4
-  store i1 false, ptr %assignment_value42, align 1
-  %assignment_value43 = load i1, ptr %assignment_value42, align 1
-  store i1 %assignment_value43, ptr %complete, align 1
-  br label %if.merge29
+if.else26:                                        ; preds = %if.then
+  store i64 0, ptr %assignment_value38, align 4
+  %assignment_value39 = load i64, ptr %assignment_value38, align 4
+  store i64 %assignment_value39, ptr %reported, align 4
+  store i1 false, ptr %assignment_value40, align 1
+  %assignment_value41 = load i1, ptr %assignment_value40, align 1
+  store i1 %assignment_value41, ptr %complete, align 1
+  br label %if.merge27
 
-if.merge29:                                       ; preds = %if.else28, %if.then27
+if.merge27:                                       ; preds = %if.else26, %if.then25
   br label %if.merge
 }
 
@@ -1002,7 +996,7 @@ self_tail.else:                                   ; preds = %self_tail.header
   ret i32 %outcome6
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f7a65726f5f6361706163697479(i8 %first) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f7a65726f5f6361706163697479(i8 %first) #0 {
 entry:
   %assignment_value60 = alloca i32, align 4
   %outcome = alloca i32, align 4
@@ -1027,8 +1021,7 @@ entry:
   store i8 %first, ptr %first1, align 1
   %array_element = getelementptr inbounds [1 x i8], ptr %array_literal, i32 0, i32 0
   store i8 0, ptr %array_element, align 1
-  %struct_value = load [1 x i8], ptr %array_literal, align 1
-  store [1 x i8] %struct_value, ptr %scratch, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %scratch, ptr align 1 %array_literal, i32 1, i1 false)
   %array_element2 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
   %address = ptrtoint ptr %array_element2 to i32
   store i32 %address, ptr %view, align 4
@@ -1585,7 +1578,7 @@ if.merge64:                                       ; preds = %if.then63, %if.else
   br label %if.merge15
 }
 
-define { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f616c6c6f6361746564(i64 %max_bytes, i8 %first, i1 %pending_cr) {
+define { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f616c6c6f6361746564(i64 %max_bytes, i8 %first, i1 %pending_cr) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -1635,8 +1628,7 @@ entry:
   store i64 1, ptr %one, align 4
   %array_element = getelementptr inbounds [1 x i8], ptr %array_literal, i32 0, i32 0
   store i8 0, ptr %array_element, align 1
-  %struct_value = load [1 x i8], ptr %array_literal, align 1
-  store [1 x i8] %struct_value, ptr %scratch, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %scratch, ptr align 1 %array_literal, i32 1, i1 false)
   %max_bytes4 = load i64, ptr %max_bytes1, align 4
   %allocation = call ptr @__wosy_core_alloc(i64 %max_bytes4, i64 1)
   %allocation_failed = icmp eq ptr %allocation, null
@@ -1844,13 +1836,13 @@ if.then115:                                       ; preds = %if.merge82
   br i1 %ne119, label %if.then120, label %if.else121
 
 if.else:                                          ; preds = %if.merge82
-  %status139 = load i32, ptr %status, align 4
-  %output140 = insertvalue { i32, i32 } zeroinitializer, i32 %status139, 1
+  %status138 = load i32, ptr %status, align 4
+  %output139 = insertvalue { i32, i32 } zeroinitializer, i32 %status138, 1
   %allocation_live = load i1, ptr %bytes_live, align 1
   br i1 %allocation_live, label %release.live, label %release.next
 
 if.merge116:                                      ; preds = %release.next, %if.merge122
-  %if = phi { i32, i32 } [ %output138, %if.merge122 ], [ %output140, %release.next ]
+  %if = phi { i32, i32 } [ %output137, %if.merge122 ], [ %output139, %release.next ]
   %return_output = extractvalue { i32, i32 } %if, 0
   %return_result_is_null = icmp eq i32 %return_output, 0
   br i1 %return_result_is_null, label %return_result_null_0, label %return_result_copy_1
@@ -1879,12 +1871,11 @@ if.merge122:                                      ; preds = %if.else121, %if.the
   store i32 %data130, ptr %data132, align 4
   %length133 = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %length131, ptr %length133, align 4
-  %struct_value134 = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value134, ptr %text, align 1
-  %address135 = ptrtoint ptr %text to i32
-  %status136 = load i32, ptr %status, align 4
-  %output137 = insertvalue { i32, i32 } zeroinitializer, i32 %address135, 0
-  %output138 = insertvalue { i32, i32 } %output137, i32 %status136, 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  %address134 = ptrtoint ptr %text to i32
+  %status135 = load i32, ptr %status, align 4
+  %output136 = insertvalue { i32, i32 } zeroinitializer, i32 %address134, 0
+  %output137 = insertvalue { i32, i32 } %output136, i32 %status135, 1
   br label %if.merge116
 
 release.live:                                     ; preds = %if.else
@@ -1899,35 +1890,34 @@ return_result_null_0:                             ; preds = %if.merge116
   br label %return_result_merge_2
 
 return_result_copy_1:                             ; preds = %if.merge116
-  %allocation142 = call ptr @__wosy_core_alloc(i64 16, i64 8)
-  %allocation_failed143 = icmp eq ptr %allocation142, null
-  br i1 %allocation_failed143, label %allocation_panic141, label %allocation_continue144
+  %allocation141 = call ptr @__wosy_core_alloc(i64 16, i64 8)
+  %allocation_failed142 = icmp eq ptr %allocation141, null
+  br i1 %allocation_failed142, label %allocation_panic140, label %allocation_continue143
 
-return_result_merge_2:                            ; preds = %allocation_continue144, %return_result_null_0
-  %return_result = phi i32 [ 0, %return_result_null_0 ], [ %return_result_address, %allocation_continue144 ]
-  %return_output145 = extractvalue { i32, i32 } %if, 1
-  %output146 = insertvalue { i32, i32 } zeroinitializer, i32 %return_result, 0
-  %output147 = insertvalue { i32, i32 } %output146, i32 %return_output145, 1
-  ret { i32, i32 } %output147
+return_result_merge_2:                            ; preds = %allocation_continue143, %return_result_null_0
+  %return_result = phi i32 [ 0, %return_result_null_0 ], [ %return_result_address, %allocation_continue143 ]
+  %return_output144 = extractvalue { i32, i32 } %if, 1
+  %output145 = insertvalue { i32, i32 } zeroinitializer, i32 %return_result, 0
+  %output146 = insertvalue { i32, i32 } %output145, i32 %return_output144, 1
+  ret { i32, i32 } %output146
 
-allocation_panic141:                              ; preds = %return_result_copy_1
+allocation_panic140:                              ; preds = %return_result_copy_1
   call void @__wosy_core_system_panic()
   unreachable
 
-allocation_continue144:                           ; preds = %return_result_copy_1
+allocation_continue143:                           ; preds = %return_result_copy_1
   %return_result_source = inttoptr i32 %return_output to ptr
-  %return_result_value = load [16 x i8], ptr %return_result_source, align 1
-  store [16 x i8] %return_result_value, ptr %allocation142, align 1
-  %return_result_address = ptrtoint ptr %allocation142 to i32
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %allocation141, ptr align 1 %return_result_source, i32 16, i1 false)
+  %return_result_address = ptrtoint ptr %allocation141 to i32
   br label %return_result_merge_2
 }
 
-define { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__726561645f6c696e65(i64 %max_bytes, ptr %0) {
+define { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__726561645f6c696e65(i64 %max_bytes, ptr %0) #0 {
 entry:
-  %status80 = alloca i32, align 4
+  %status77 = alloca i32, align 4
   %text = alloca i32, align 4
-  %empty52 = alloca [16 x i8], align 8
-  %struct_literal48 = alloca [16 x i8], align 8
+  %empty51 = alloca [16 x i8], align 8
+  %struct_literal47 = alloca [16 x i8], align 8
   %status = alloca i32, align 4
   %empty = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -1961,8 +1951,7 @@ if.then:                                          ; preds = %entry
 if.else:                                          ; preds = %entry
   %array_element = getelementptr inbounds [1 x i8], ptr %array_literal, i32 0, i32 0
   store i8 0, ptr %array_element, align 1
-  %struct_value = load [1 x i8], ptr %array_literal, align 1
-  store [1 x i8] %struct_value, ptr %scratch, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %scratch, ptr align 1 %array_literal, i32 1, i1 false)
   %zero5 = load i64, ptr %zero, align 4
   store i64 %zero5, ptr %count, align 4
   store i1 false, ptr %complete, align 1
@@ -1983,10 +1972,10 @@ if.else:                                          ; preds = %entry
   br i1 %not, label %if.then13, label %if.else14
 
 if.merge:                                         ; preds = %if.merge15, %if.then
-  %return_owner_093 = phi i1 [ false, %if.then ], [ %return_owner_091, %if.merge15 ]
-  %if94 = phi { i32, i32 } [ { i32 0, i32 4 }, %if.then ], [ %if92, %if.merge15 ]
-  store i1 %return_owner_093, ptr %0, align 1
-  ret { i32, i32 } %if94
+  %return_owner_090 = phi i1 [ false, %if.then ], [ %return_owner_088, %if.merge15 ]
+  %if91 = phi { i32, i32 } [ { i32 0, i32 4 }, %if.then ], [ %if89, %if.merge15 ]
+  store i1 %return_owner_090, ptr %0, align 1
+  ret { i32, i32 } %if91
 
 if.then13:                                        ; preds = %if.else
   br label %if.merge15
@@ -1998,8 +1987,8 @@ if.else14:                                        ; preds = %if.else
   br i1 %eq, label %if.then18, label %if.else19
 
 if.merge15:                                       ; preds = %if.merge20, %if.then13
-  %return_owner_091 = phi i1 [ false, %if.then13 ], [ %return_owner_089, %if.merge20 ]
-  %if92 = phi { i32, i32 } [ { i32 0, i32 2 }, %if.then13 ], [ %if90, %if.merge20 ]
+  %return_owner_088 = phi i1 [ false, %if.then13 ], [ %return_owner_086, %if.merge20 ]
+  %if89 = phi { i32, i32 } [ { i32 0, i32 2 }, %if.then13 ], [ %if87, %if.merge20 ]
   br label %if.merge
 
 if.then18:                                        ; preds = %if.else14
@@ -2014,8 +2003,8 @@ if.else19:                                        ; preds = %if.else14
   br i1 %eq23, label %if.then24, label %if.else25
 
 if.merge20:                                       ; preds = %if.merge26, %if.then18
-  %return_owner_089 = phi i1 [ false, %if.then18 ], [ %return_owner_087, %if.merge26 ]
-  %if90 = phi { i32, i32 } [ { i32 0, i32 1 }, %if.then18 ], [ %if88, %if.merge26 ]
+  %return_owner_086 = phi i1 [ false, %if.then18 ], [ %return_owner_084, %if.merge26 ]
+  %if87 = phi { i32, i32 } [ { i32 0, i32 1 }, %if.then18 ], [ %if85, %if.merge26 ]
   br label %if.merge15
 
 if.then24:                                        ; preds = %if.else19
@@ -2024,24 +2013,23 @@ if.then24:                                        ; preds = %if.else19
   store i32 0, ptr %data, align 4
   %length = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %zero27, ptr %length, align 4
-  %struct_value28 = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value28, ptr %empty, align 1
-  %address29 = ptrtoint ptr %empty to i32
-  %output30 = insertvalue { i32, i32 } zeroinitializer, i32 %address29, 0
-  %output31 = insertvalue { i32, i32 } %output30, i32 0, 1
-  %return_output = extractvalue { i32, i32 } %output31, 0
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %empty, ptr align 1 %struct_literal, i32 16, i1 false)
+  %address28 = ptrtoint ptr %empty to i32
+  %output29 = insertvalue { i32, i32 } zeroinitializer, i32 %address28, 0
+  %output30 = insertvalue { i32, i32 } %output29, i32 0, 1
+  %return_output = extractvalue { i32, i32 } %output30, 0
   %return_result_is_null = icmp eq i32 %return_output, 0
   br i1 %return_result_is_null, label %return_result_null_0, label %return_result_copy_1
 
 if.else25:                                        ; preds = %if.else19
-  %max_bytes35 = load i64, ptr %max_bytes1, align 4
-  %zero36 = load i64, ptr %zero, align 4
-  %eq37 = icmp eq i64 %max_bytes35, %zero36
-  br i1 %eq37, label %if.then38, label %if.else39
+  %max_bytes34 = load i64, ptr %max_bytes1, align 4
+  %zero35 = load i64, ptr %zero, align 4
+  %eq36 = icmp eq i64 %max_bytes34, %zero35
+  br i1 %eq36, label %if.then37, label %if.else38
 
-if.merge26:                                       ; preds = %if.merge40, %return_result_merge_2
-  %return_owner_087 = phi i1 [ true, %return_result_merge_2 ], [ %return_owner_085, %if.merge40 ]
-  %if88 = phi { i32, i32 } [ %output34, %return_result_merge_2 ], [ %if86, %if.merge40 ]
+if.merge26:                                       ; preds = %if.merge39, %return_result_merge_2
+  %return_owner_084 = phi i1 [ true, %return_result_merge_2 ], [ %return_owner_082, %if.merge39 ]
+  %if85 = phi { i32, i32 } [ %output33, %return_result_merge_2 ], [ %if83, %if.merge39 ]
   br label %if.merge20
 
 return_result_null_0:                             ; preds = %if.then24
@@ -2054,9 +2042,9 @@ return_result_copy_1:                             ; preds = %if.then24
 
 return_result_merge_2:                            ; preds = %allocation_continue, %return_result_null_0
   %return_result = phi i32 [ 0, %return_result_null_0 ], [ %return_result_address, %allocation_continue ]
-  %return_output32 = extractvalue { i32, i32 } %output31, 1
-  %output33 = insertvalue { i32, i32 } zeroinitializer, i32 %return_result, 0
-  %output34 = insertvalue { i32, i32 } %output33, i32 %return_output32, 1
+  %return_output31 = extractvalue { i32, i32 } %output30, 1
+  %output32 = insertvalue { i32, i32 } zeroinitializer, i32 %return_result, 0
+  %output33 = insertvalue { i32, i32 } %output32, i32 %return_output31, 1
   br label %if.merge26
 
 allocation_panic:                                 ; preds = %return_result_copy_1
@@ -2065,90 +2053,87 @@ allocation_panic:                                 ; preds = %return_result_copy_
 
 allocation_continue:                              ; preds = %return_result_copy_1
   %return_result_source = inttoptr i32 %return_output to ptr
-  %return_result_value = load [16 x i8], ptr %return_result_source, align 1
-  store [16 x i8] %return_result_value, ptr %allocation, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %allocation, ptr align 1 %return_result_source, i32 16, i1 false)
   %return_result_address = ptrtoint ptr %allocation to i32
   br label %return_result_merge_2
 
-if.then38:                                        ; preds = %if.else25
-  %first41 = load i8, ptr %first, align 1
-  %call42 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f7a65726f5f6361706163697479(i8 %first41)
-  store i32 %call42, ptr %status, align 4
-  %status43 = load i32, ptr %status, align 4
-  %eq44 = icmp eq i32 %status43, 0
-  br i1 %eq44, label %if.then45, label %if.else46
+if.then37:                                        ; preds = %if.else25
+  %first40 = load i8, ptr %first, align 1
+  %call41 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f7a65726f5f6361706163697479(i8 %first40)
+  store i32 %call41, ptr %status, align 4
+  %status42 = load i32, ptr %status, align 4
+  %eq43 = icmp eq i32 %status42, 0
+  br i1 %eq43, label %if.then44, label %if.else45
 
-if.else39:                                        ; preds = %if.else25
-  %max_bytes73 = load i64, ptr %max_bytes1, align 4
-  %first74 = load i8, ptr %first, align 1
-  %first75 = load i8, ptr %first, align 1
-  %eq76 = icmp eq i8 %first75, 13
-  %call77 = call { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f616c6c6f6361746564(i64 %max_bytes73, i8 %first74, i1 %eq76)
-  %output78 = extractvalue { i32, i32 } %call77, 0
-  store i32 %output78, ptr %text, align 4
-  %output79 = extractvalue { i32, i32 } %call77, 1
-  store i32 %output79, ptr %status80, align 4
-  %text81 = load i32, ptr %text, align 4
-  %status82 = load i32, ptr %status80, align 4
-  %output83 = insertvalue { i32, i32 } zeroinitializer, i32 %text81, 0
-  %output84 = insertvalue { i32, i32 } %output83, i32 %status82, 1
-  br label %if.merge40
+if.else38:                                        ; preds = %if.else25
+  %max_bytes70 = load i64, ptr %max_bytes1, align 4
+  %first71 = load i8, ptr %first, align 1
+  %first72 = load i8, ptr %first, align 1
+  %eq73 = icmp eq i8 %first72, 13
+  %call74 = call { i32, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f726561645f6c696e655f616c6c6f6361746564(i64 %max_bytes70, i8 %first71, i1 %eq73)
+  %output75 = extractvalue { i32, i32 } %call74, 0
+  store i32 %output75, ptr %text, align 4
+  %output76 = extractvalue { i32, i32 } %call74, 1
+  store i32 %output76, ptr %status77, align 4
+  %text78 = load i32, ptr %text, align 4
+  %status79 = load i32, ptr %status77, align 4
+  %output80 = insertvalue { i32, i32 } zeroinitializer, i32 %text78, 0
+  %output81 = insertvalue { i32, i32 } %output80, i32 %status79, 1
+  br label %if.merge39
 
-if.merge40:                                       ; preds = %if.else39, %if.merge47
-  %return_owner_085 = phi i1 [ %return_owner_0, %if.merge47 ], [ true, %if.else39 ]
-  %if86 = phi { i32, i32 } [ %if, %if.merge47 ], [ %output84, %if.else39 ]
+if.merge39:                                       ; preds = %if.else38, %if.merge46
+  %return_owner_082 = phi i1 [ %return_owner_0, %if.merge46 ], [ true, %if.else38 ]
+  %if83 = phi { i32, i32 } [ %if, %if.merge46 ], [ %output81, %if.else38 ]
   br label %if.merge26
 
-if.then45:                                        ; preds = %if.then38
-  %zero49 = load i64, ptr %zero, align 4
-  %data50 = getelementptr inbounds i8, ptr %struct_literal48, i8 0
-  store i32 0, ptr %data50, align 4
-  %length51 = getelementptr inbounds i8, ptr %struct_literal48, i8 8
-  store i64 %zero49, ptr %length51, align 4
-  %struct_value53 = load [16 x i8], ptr %struct_literal48, align 1
-  store [16 x i8] %struct_value53, ptr %empty52, align 1
-  %address54 = ptrtoint ptr %empty52 to i32
-  %status55 = load i32, ptr %status, align 4
-  %output56 = insertvalue { i32, i32 } zeroinitializer, i32 %address54, 0
-  %output57 = insertvalue { i32, i32 } %output56, i32 %status55, 1
-  %return_output58 = extractvalue { i32, i32 } %output57, 0
-  %return_result_is_null59 = icmp eq i32 %return_output58, 0
-  br i1 %return_result_is_null59, label %return_result_null_3, label %return_result_copy_4
+if.then44:                                        ; preds = %if.then37
+  %zero48 = load i64, ptr %zero, align 4
+  %data49 = getelementptr inbounds i8, ptr %struct_literal47, i8 0
+  store i32 0, ptr %data49, align 4
+  %length50 = getelementptr inbounds i8, ptr %struct_literal47, i8 8
+  store i64 %zero48, ptr %length50, align 4
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %empty51, ptr align 1 %struct_literal47, i32 16, i1 false)
+  %address52 = ptrtoint ptr %empty51 to i32
+  %status53 = load i32, ptr %status, align 4
+  %output54 = insertvalue { i32, i32 } zeroinitializer, i32 %address52, 0
+  %output55 = insertvalue { i32, i32 } %output54, i32 %status53, 1
+  %return_output56 = extractvalue { i32, i32 } %output55, 0
+  %return_result_is_null57 = icmp eq i32 %return_output56, 0
+  br i1 %return_result_is_null57, label %return_result_null_3, label %return_result_copy_4
 
-if.else46:                                        ; preds = %if.then38
-  %status71 = load i32, ptr %status, align 4
-  %output72 = insertvalue { i32, i32 } zeroinitializer, i32 %status71, 1
-  br label %if.merge47
+if.else45:                                        ; preds = %if.then37
+  %status68 = load i32, ptr %status, align 4
+  %output69 = insertvalue { i32, i32 } zeroinitializer, i32 %status68, 1
+  br label %if.merge46
 
-if.merge47:                                       ; preds = %if.else46, %return_result_merge_5
-  %return_owner_0 = phi i1 [ true, %return_result_merge_5 ], [ false, %if.else46 ]
-  %if = phi { i32, i32 } [ %output70, %return_result_merge_5 ], [ %output72, %if.else46 ]
-  br label %if.merge40
+if.merge46:                                       ; preds = %if.else45, %return_result_merge_5
+  %return_owner_0 = phi i1 [ true, %return_result_merge_5 ], [ false, %if.else45 ]
+  %if = phi { i32, i32 } [ %output67, %return_result_merge_5 ], [ %output69, %if.else45 ]
+  br label %if.merge39
 
-return_result_null_3:                             ; preds = %if.then45
+return_result_null_3:                             ; preds = %if.then44
   br label %return_result_merge_5
 
-return_result_copy_4:                             ; preds = %if.then45
-  %allocation61 = call ptr @__wosy_core_alloc(i64 16, i64 8)
-  %allocation_failed62 = icmp eq ptr %allocation61, null
-  br i1 %allocation_failed62, label %allocation_panic60, label %allocation_continue63
+return_result_copy_4:                             ; preds = %if.then44
+  %allocation59 = call ptr @__wosy_core_alloc(i64 16, i64 8)
+  %allocation_failed60 = icmp eq ptr %allocation59, null
+  br i1 %allocation_failed60, label %allocation_panic58, label %allocation_continue61
 
-return_result_merge_5:                            ; preds = %allocation_continue63, %return_result_null_3
-  %return_result67 = phi i32 [ 0, %return_result_null_3 ], [ %return_result_address66, %allocation_continue63 ]
-  %return_output68 = extractvalue { i32, i32 } %output57, 1
-  %output69 = insertvalue { i32, i32 } zeroinitializer, i32 %return_result67, 0
-  %output70 = insertvalue { i32, i32 } %output69, i32 %return_output68, 1
-  br label %if.merge47
+return_result_merge_5:                            ; preds = %allocation_continue61, %return_result_null_3
+  %return_result64 = phi i32 [ 0, %return_result_null_3 ], [ %return_result_address63, %allocation_continue61 ]
+  %return_output65 = extractvalue { i32, i32 } %output55, 1
+  %output66 = insertvalue { i32, i32 } zeroinitializer, i32 %return_result64, 0
+  %output67 = insertvalue { i32, i32 } %output66, i32 %return_output65, 1
+  br label %if.merge46
 
-allocation_panic60:                               ; preds = %return_result_copy_4
+allocation_panic58:                               ; preds = %return_result_copy_4
   call void @__wosy_core_system_panic()
   unreachable
 
-allocation_continue63:                            ; preds = %return_result_copy_4
-  %return_result_source64 = inttoptr i32 %return_output58 to ptr
-  %return_result_value65 = load [16 x i8], ptr %return_result_source64, align 1
-  store [16 x i8] %return_result_value65, ptr %allocation61, align 1
-  %return_result_address66 = ptrtoint ptr %allocation61 to i32
+allocation_continue61:                            ; preds = %return_result_copy_4
+  %return_result_source62 = inttoptr i32 %return_output56 to ptr
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %allocation59, ptr align 1 %return_result_source62, i32 16, i1 false)
+  %return_result_address63 = ptrtoint ptr %allocation59 to i32
   br label %return_result_merge_5
 }
 
@@ -3312,7 +3297,7 @@ if.merge15:                                       ; preds = %if.then14, %short_c
   ret i1 %fits18
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f7538(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f7538(ptr %text) #0 {
 entry:
   %assignment_value65 = alloca i32, align 4
   %assignment_value63 = alloca i8, align 1
@@ -3339,8 +3324,7 @@ entry:
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %zero, align 4
   store i64 1, ptr %one, align 4
   store i64 2, ptr %two, align 4
@@ -3507,7 +3491,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753136(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753136(ptr %text) #0 {
 entry:
   %assignment_value65 = alloca i32, align 4
   %assignment_value63 = alloca i16, align 2
@@ -3534,8 +3518,7 @@ entry:
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %zero, align 4
   store i64 1, ptr %one, align 4
   store i64 2, ptr %two, align 4
@@ -3702,7 +3685,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753332(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753332(ptr %text) #0 {
 entry:
   %assignment_value65 = alloca i32, align 4
   %assignment_value63 = alloca i32, align 4
@@ -3729,8 +3712,7 @@ entry:
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %zero, align 4
   store i64 1, ptr %one, align 4
   store i64 2, ptr %two, align 4
@@ -3897,7 +3879,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753634(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753634(ptr %text) #0 {
 entry:
   %assignment_value66 = alloca i32, align 4
   %assignment_value64 = alloca i64, align 8
@@ -3924,8 +3906,7 @@ entry:
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %zero, align 4
   store i64 1, ptr %one, align 4
   store i64 2, ptr %two, align 4
@@ -4093,7 +4074,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f75313238(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f75313238(ptr %text) #0 {
 entry:
   %assignment_value64 = alloca i32, align 4
   %assignment_value62 = alloca i128, align 8
@@ -4120,8 +4101,7 @@ entry:
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %zero, align 4
   store i64 1, ptr %one, align 4
   store i64 2, ptr %two, align 4
@@ -4287,7 +4267,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f6938(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f6938(ptr %text) #0 {
 entry:
   %assignment_value108 = alloca i32, align 4
   %assignment_value106 = alloca i8, align 1
@@ -4326,8 +4306,7 @@ entry:
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %zero, align 4
   store i64 1, ptr %one, align 4
   store i64 2, ptr %two, align 4
@@ -4561,7 +4540,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693136(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693136(ptr %text) #0 {
 entry:
   %assignment_value108 = alloca i32, align 4
   %assignment_value106 = alloca i16, align 2
@@ -4600,8 +4579,7 @@ entry:
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %zero, align 4
   store i64 1, ptr %one, align 4
   store i64 2, ptr %two, align 4
@@ -4835,7 +4813,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693332(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693332(ptr %text) #0 {
 entry:
   %assignment_value108 = alloca i32, align 4
   %assignment_value106 = alloca i32, align 4
@@ -4874,8 +4852,7 @@ entry:
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %zero, align 4
   store i64 1, ptr %one, align 4
   store i64 2, ptr %two, align 4
@@ -5109,7 +5086,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693634(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693634(ptr %text) #0 {
 entry:
   %assignment_value108 = alloca i32, align 4
   %assignment_value106 = alloca i64, align 8
@@ -5148,8 +5125,7 @@ entry:
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %zero, align 4
   store i64 1, ptr %one, align 4
   store i64 2, ptr %two, align 4
@@ -5383,7 +5359,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69313238(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69313238(ptr %text) #0 {
 entry:
   %assignment_value123 = alloca i32, align 4
   %assignment_value121 = alloca i128, align 8
@@ -5429,8 +5405,7 @@ entry:
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %zero, align 4
   store i64 1, ptr %one, align 4
   store i64 2, ptr %two, align 4
@@ -7483,7 +7458,7 @@ if.merge297:                                      ; preds = %if.then296, %short_
   ret { double, i1 } %output303
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f663332(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f663332(ptr %text) #0 {
 entry:
   %assignment_value54 = alloca i32, align 4
   %out = alloca float, align 4
@@ -7510,8 +7485,7 @@ entry:
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %zero, align 4
   store i64 1, ptr %one, align 4
   store double 0x7FEFFFFFFFFFFFFF, ptr %f64_max, align 8
@@ -7668,7 +7642,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f663634(ptr %text) {
+define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f663634(ptr %text) #0 {
 entry:
   %assignment_value45 = alloca i32, align 4
   %out = alloca double, align 8
@@ -7690,8 +7664,7 @@ entry:
   %one = alloca i64, align 8
   %zero = alloca i64, align 8
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   store i64 0, ptr %zero, align 4
   store i64 1, ptr %one, align 4
   store double 0.000000e+00, ptr %zero_value, align 8
@@ -7827,7 +7800,7 @@ allocation_continue:                              ; preds = %return_result_copy_
   br label %return_result_merge_2
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f626f6f6c(i1 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f626f6f6c(i1 %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -7914,14 +7887,12 @@ if.merge:                                         ; preds = %if.then, %allocatio
   store i32 %data33, ptr %data35, align 4
   %length36 = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %length34, ptr %length36, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value37 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value37, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f63686172(i32 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f63686172(i32 %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -8182,10 +8153,8 @@ if.merge92:                                       ; preds = %if.then91, %if.merg
   store i32 %data139, ptr %data141, align 4
   %length142 = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %length140, ptr %length142, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value143 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value143, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 }
 
@@ -9021,7 +8990,7 @@ if.merge:                                         ; preds = %if.then, %entry
   ret void
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6938(i8 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f6938(i8 %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -9099,14 +9068,12 @@ if.merge:                                         ; preds = %if.then, %allocatio
   store i32 %data22, ptr %data24, align 4
   %length25 = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %length23, ptr %length25, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value26 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value26, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f693136(i16 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f693136(i16 %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -9184,14 +9151,12 @@ if.merge:                                         ; preds = %if.then, %allocatio
   store i32 %data22, ptr %data24, align 4
   %length25 = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %length23, ptr %length25, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value26 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value26, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f693332(i32 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f693332(i32 %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -9269,14 +9234,12 @@ if.merge:                                         ; preds = %if.then, %allocatio
   store i32 %data22, ptr %data24, align 4
   %length25 = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %length23, ptr %length25, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value26 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value26, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f693634(i64 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f693634(i64 %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -9354,14 +9317,12 @@ if.merge:                                         ; preds = %if.then, %allocatio
   store i32 %data22, ptr %data24, align 4
   %length25 = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %length23, ptr %length25, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value26 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value26, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f69313238(i128 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f69313238(i128 %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -9427,14 +9388,12 @@ if.merge:                                         ; preds = %if.else, %if.then
   store i32 %data14, ptr %data16, align 4
   %length17 = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %length15, ptr %length17, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value18 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value18, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f7538(i8 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f7538(i8 %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -9506,14 +9465,12 @@ if.merge:                                         ; preds = %if.then, %allocatio
   store i32 %data19, ptr %data21, align 4
   %length22 = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %length20, ptr %length22, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value23 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value23, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f753136(i16 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f753136(i16 %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -9585,14 +9542,12 @@ if.merge:                                         ; preds = %if.then, %allocatio
   store i32 %data19, ptr %data21, align 4
   %length22 = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %length20, ptr %length22, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value23 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value23, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f753332(i32 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f753332(i32 %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -9664,14 +9619,12 @@ if.merge:                                         ; preds = %if.then, %allocatio
   store i32 %data19, ptr %data21, align 4
   %length22 = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %length20, ptr %length22, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value23 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value23, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f753634(i64 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f753634(i64 %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -9743,10 +9696,8 @@ if.merge:                                         ; preds = %if.then, %allocatio
   store i32 %data19, ptr %data21, align 4
   %length22 = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %length20, ptr %length22, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value23 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value23, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 }
 
@@ -10099,7 +10050,7 @@ if.merge:                                         ; preds = %if.else, %if.then
   ret i64 %call42
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f75313238(i128 %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f75313238(i128 %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -10135,10 +10086,8 @@ allocation_continue:                              ; preds = %entry
   store i32 %data5, ptr %data7, align 4
   %length8 = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %length6, ptr %length8, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value9 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value9, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 }
 
@@ -10762,7 +10711,7 @@ if.merge61:                                       ; preds = %if.then60, %if.else
   br label %if.merge
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f663332(float %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f663332(float %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -10958,10 +10907,8 @@ if.merge23:                                       ; preds = %if.merge150, %if.me
   store i32 %data182, ptr %data184, align 4
   %length = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %emit183, ptr %length, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value185 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value185, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 
 if.then29:                                        ; preds = %if.then22
@@ -11515,7 +11462,7 @@ if.merge61:                                       ; preds = %if.then60, %if.else
   br label %if.merge
 }
 
-define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f663634(double %value, ptr %0) {
+define internal ptr @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f666f726d61745f663634(double %value, ptr %0) #0 {
 entry:
   %text = alloca [16 x i8], align 8
   %struct_literal = alloca [16 x i8], align 8
@@ -11707,10 +11654,8 @@ if.merge22:                                       ; preds = %if.merge149, %if.me
   store i32 %data181, ptr %data183, align 4
   %length = getelementptr inbounds i8, ptr %struct_literal, i8 8
   store i64 %emit182, ptr %length, align 4
-  %struct_value = load [16 x i8], ptr %struct_literal, align 1
-  store [16 x i8] %struct_value, ptr %text, align 1
-  %struct_value184 = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value184, ptr %0, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text, ptr align 1 %struct_literal, i32 16, i1 false)
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %0, ptr align 1 %text, i32 16, i1 false)
   ret ptr %allocation
 
 if.then28:                                        ; preds = %if.then21
@@ -11886,11 +11831,11 @@ if.merge149:                                      ; preds = %if.then148, %if.mer
 
 
 
-define { i64, i1 } @wosy_fn__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f66645f726561645f6f6e6365(i32 %destination, i64 %capacity) {
+define { i64, i1 } @wosy_fn__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f66645f726561645f6f6e6365(i32 %destination, i64 %capacity) #0 {
 entry:
-  %assignment_value15 = alloca i1, align 1
-  %assignment_value13 = alloca i64, align 8
-  %assignment_value11 = alloca i1, align 1
+  %assignment_value14 = alloca i1, align 1
+  %assignment_value12 = alloca i64, align 8
+  %assignment_value10 = alloca i1, align 1
   %assignment_value = alloca i64, align 8
   %complete = alloca i1, align 1
   %reported = alloca i64, align 8
@@ -11910,49 +11855,47 @@ entry:
   store i32 %destination3, ptr %data, align 4
   %length = getelementptr inbounds i8, ptr %struct_literal, i8 4
   store i32 %int_trunc, ptr %length, align 4
-  %struct_value = load [8 x i8], ptr %struct_literal, align 1
-  store [8 x i8] %struct_value, ptr %_iovec, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %_iovec, ptr align 1 %struct_literal, i32 8, i1 false)
   %value = getelementptr inbounds i8, ptr %struct_literal5, i8 0
   store i32 0, ptr %value, align 4
-  %struct_value6 = load [4 x i8], ptr %struct_literal5, align 1
-  store [4 x i8] %struct_value6, ptr %_byte_count, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %_byte_count, ptr align 1 %struct_literal5, i32 4, i1 false)
   %address = ptrtoint ptr %_iovec to i32
-  %address7 = ptrtoint ptr %_byte_count to i32
-  %call = call i32 @wosy_extern__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f77617369__776173695f736e617073686f745f7072657669657731__5f66645f72656164(i32 0, i32 %address, i32 1, i32 %address7)
+  %address6 = ptrtoint ptr %_byte_count to i32
+  %call = call i32 @wosy_extern__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f77617369__776173695f736e617073686f745f7072657669657731__5f66645f72656164(i32 0, i32 %address, i32 1, i32 %address6)
   store i32 %call, ptr %_result, align 4
   store i64 0, ptr %reported, align 4
   store i1 false, ptr %complete, align 1
-  %_result8 = load i32, ptr %_result, align 4
-  %eq = icmp eq i32 %_result8, 0
+  %_result7 = load i32, ptr %_result, align 4
+  %eq = icmp eq i32 %_result7, 0
   br i1 %eq, label %if.then, label %if.else
 
 if.then:                                          ; preds = %entry
-  %value9 = getelementptr inbounds i8, ptr %_byte_count, i8 0
-  %place = load i32, ptr %value9, align 4
+  %value8 = getelementptr inbounds i8, ptr %_byte_count, i8 0
+  %place = load i32, ptr %value8, align 4
   %int_extend = zext i32 %place to i64
   store i64 %int_extend, ptr %assignment_value, align 4
-  %assignment_value10 = load i64, ptr %assignment_value, align 4
-  store i64 %assignment_value10, ptr %reported, align 4
-  store i1 true, ptr %assignment_value11, align 1
-  %assignment_value12 = load i1, ptr %assignment_value11, align 1
-  store i1 %assignment_value12, ptr %complete, align 1
+  %assignment_value9 = load i64, ptr %assignment_value, align 4
+  store i64 %assignment_value9, ptr %reported, align 4
+  store i1 true, ptr %assignment_value10, align 1
+  %assignment_value11 = load i1, ptr %assignment_value10, align 1
+  store i1 %assignment_value11, ptr %complete, align 1
   br label %if.merge
 
 if.else:                                          ; preds = %entry
-  store i64 0, ptr %assignment_value13, align 4
-  %assignment_value14 = load i64, ptr %assignment_value13, align 4
-  store i64 %assignment_value14, ptr %reported, align 4
-  store i1 false, ptr %assignment_value15, align 1
-  %assignment_value16 = load i1, ptr %assignment_value15, align 1
-  store i1 %assignment_value16, ptr %complete, align 1
+  store i64 0, ptr %assignment_value12, align 4
+  %assignment_value13 = load i64, ptr %assignment_value12, align 4
+  store i64 %assignment_value13, ptr %reported, align 4
+  store i1 false, ptr %assignment_value14, align 1
+  %assignment_value15 = load i1, ptr %assignment_value14, align 1
+  store i1 %assignment_value15, ptr %complete, align 1
   br label %if.merge
 
 if.merge:                                         ; preds = %if.else, %if.then
-  %reported17 = load i64, ptr %reported, align 4
-  %complete18 = load i1, ptr %complete, align 1
-  %output = insertvalue { i64, i1 } zeroinitializer, i64 %reported17, 0
-  %output19 = insertvalue { i64, i1 } %output, i1 %complete18, 1
-  ret { i64, i1 } %output19
+  %reported16 = load i64, ptr %reported, align 4
+  %complete17 = load i1, ptr %complete, align 1
+  %output = insertvalue { i64, i1 } zeroinitializer, i64 %reported16, 0
+  %output18 = insertvalue { i64, i1 } %output, i1 %complete17, 1
+  ret { i64, i1 } %output18
 }
 
 define i32 @wosy_fn__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__66645f77726974655f6f6e6365(i32 %descriptor, i32 %iovec_address, i32 %byte_count_address) {
@@ -12068,10 +12011,10 @@ entry:
   ret void
 }
 
-define void @wosy_fn__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__736c6565705f6e73(i64 %nanoseconds) {
+define void @wosy_fn__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__736c6565705f6e73(i64 %nanoseconds) #0 {
 entry:
   %fired = alloca [4 x i8], align 4
-  %struct_literal21 = alloca [4 x i8], align 4
+  %struct_literal20 = alloca [4 x i8], align 4
   %event = alloca [32 x i8], align 8
   %struct_literal3 = alloca [32 x i8], align 8
   %sub = alloca [48 x i8], align 8
@@ -12125,8 +12068,7 @@ entry:
   store i8 0, ptr %_pad_16, align 1
   %_pad_17 = getelementptr inbounds i8, ptr %struct_literal, i8 47
   store i8 0, ptr %_pad_17, align 1
-  %struct_value = load [48 x i8], ptr %struct_literal, align 1
-  store [48 x i8] %struct_value, ptr %sub, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %sub, ptr align 1 %struct_literal, i32 48, i1 false)
   %userdata4 = getelementptr inbounds i8, ptr %struct_literal3, i8 0
   store i64 0, ptr %userdata4, align 4
   %error = getelementptr inbounds i8, ptr %struct_literal3, i8 8
@@ -12159,16 +12101,14 @@ entry:
   store i8 0, ptr %_pad_1018, align 1
   %_pad_1119 = getelementptr inbounds i8, ptr %struct_literal3, i8 31
   store i8 0, ptr %_pad_1119, align 1
-  %struct_value20 = load [32 x i8], ptr %struct_literal3, align 1
-  store [32 x i8] %struct_value20, ptr %event, align 1
-  %value = getelementptr inbounds i8, ptr %struct_literal21, i8 0
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %event, ptr align 1 %struct_literal3, i32 32, i1 false)
+  %value = getelementptr inbounds i8, ptr %struct_literal20, i8 0
   store i32 0, ptr %value, align 4
-  %struct_value22 = load [4 x i8], ptr %struct_literal21, align 1
-  store [4 x i8] %struct_value22, ptr %fired, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %fired, ptr align 1 %struct_literal20, i32 4, i1 false)
   %address = ptrtoint ptr %sub to i32
-  %address23 = ptrtoint ptr %event to i32
-  %address24 = ptrtoint ptr %fired to i32
-  %call = call i32 @wosy_extern__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f77617369__776173695f736e617073686f745f7072657669657731__5f706f6c6c5f6f6e656f6666(i32 %address, i32 %address23, i32 1, i32 %address24)
+  %address21 = ptrtoint ptr %event to i32
+  %address22 = ptrtoint ptr %fired to i32
+  %call = call i32 @wosy_extern__737464__7372632f776173692f70726576696577312e77__33646430646165626662636338353638356539383066353032626235623166376635316565646131613130313432626637646534396536666635373831373138__5f77617369__776173695f736e617073686f745f7072657669657731__5f706f6c6c5f6f6e656f6666(i32 %address, i32 %address21, i32 1, i32 %address22)
   ret void
 }
 
@@ -12298,115 +12238,103 @@ entry:
   ret ptr %aggregate_original_base
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3330__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3330__(ptr %text) #0 {
 entry:
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f7538(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3331__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3331__(ptr %text) #0 {
 entry:
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753136(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f33313330__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f33313330__(ptr %text) #0 {
 entry:
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f663332(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f33313331__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f33313331__(ptr %text) #0 {
 entry:
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f663634(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3332__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3332__(ptr %text) #0 {
 entry:
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753332(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3333__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3333__(ptr %text) #0 {
 entry:
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f753634(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3334__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3334__(ptr %text) #0 {
 entry:
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f75313238(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3335__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3335__(ptr %text) #0 {
 entry:
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f6938(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3336__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3336__(ptr %text) #0 {
 entry:
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693136(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3337__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3337__(ptr %text) #0 {
 entry:
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693332(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3338__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3338__(ptr %text) #0 {
 entry:
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f693634(ptr %text1)
   ret i32 %call
 }
 
-define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3339__(ptr %text) {
+define i32 @wosy_generic__776f73795f6f7665726c6f61645f5f3737366637333739356636363665356635663337333333373334333633343566356633373333333733323336333333323636333633323336363633363636333733343337333333373334333733323336333133373330333236353337333735663566333333303336333433333337333333383333333433333334333333373336333433363332333333323336333433363332333333313333333633363333333333373336333533333332333633323333333533363331333333333336333333363333333333353336333633333330333333333333333633333336333633313336333633333338333333323336333533333330333333383333333733333339333633313333333833333339333333333336333433333330333333383336333433333335333633353333333933333333333633343336333333333338333333373333333333333339333633343333333533333332333633313333333033333337333633313566356633373330333633313337333233373333333633355f5f3339__(ptr %text) #0 {
 entry:
   %text1 = alloca [16 x i8], align 8
-  %struct_value = load [16 x i8], ptr %text, align 1
-  store [16 x i8] %struct_value, ptr %text1, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 %text1, ptr align 1 %text, i32 16, i1 false)
   %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__5f70617273655f69313238(ptr %text1)
   ret i32 %call
 }
 
-define i32 @main() {
+define i32 @main() #0 {
 entry:
   %array_literal = alloca [4 x i8], align 1
   %array_element = getelementptr inbounds [4 x i8], ptr %array_literal, i32 0, i32 0
@@ -12417,11 +12345,13 @@ entry:
   store i8 30, ptr %array_element2, align 1
   %array_element3 = getelementptr inbounds [4 x i8], ptr %array_literal, i32 0, i32 3
   store i8 40, ptr %array_element3, align 1
-  %struct_value = load [4 x i8], ptr %array_literal, align 1
-  store [4 x i8] %struct_value, ptr @wosy_fn__706f696e7465722d636173742d61646472657373__7372632f6d61696e2e77__33323965326631396465376631643564346538393762323936633365323035303163386537373733623737643237333833383435663532653033376461313836__676c6f62616c5f6279746573, align 1
+  call void @llvm.memmove.p0.p0.i32(ptr align 1 @wosy_fn__706f696e7465722d636173742d61646472657373__7372632f6d61696e2e77__33323965326631396465376631643564346538393762323936633365323035303163386537373733623737643237333833383435663532653033376461313836__676c6f62616c5f6279746573, ptr align 1 %array_literal, i32 4, i1 false)
   call void @wosy_fn__706f696e7465722d636173742d61646472657373__7372632f6d61696e2e77__33323965326631396465376631643564346538393762323936633365323035303163386537373733623737643237333833383435663532653033376461313836__72756e()
   ret i32 0
 }
+
+; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)
+declare void @llvm.memmove.p0.p0.i32(ptr nocapture writeonly, ptr nocapture readonly, i32, i1 immarg) #1
 
 declare ptr @__wosy_core_alloc(i64, i64)
 
@@ -12656,3 +12586,6 @@ declare ptr @__wosy_core_alloc.112(i64, i64)
 declare void @__wosy_core_free.113(ptr)
 
 declare void @__wosy_core_system_panic.114()
+
+attributes #0 = { "target-features"="+bulk-memory" }
+attributes #1 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }

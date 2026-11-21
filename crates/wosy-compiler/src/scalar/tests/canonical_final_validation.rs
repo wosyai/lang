@@ -366,3 +366,83 @@ fn canonical_final_validation_uses_changed_item_with_original_slot_diagnostic_sp
         }
     }
 }
+
+#[test]
+fn reads_every_assignment_destination_projection_and_rhs_on_both_routes() {
+    for text in [
+        "%%start\nu8[2] values = [1, 1];\nunit(u64) set = fn(index) { values[index] = 2; };\nset(1);\n%%end",
+        "%%start\nunit(u64, u8, u8) set = fn(index, first, second) { u8[2] left = [1, 1]; u8[2] right = [1, 1]; left[index] = first; left[0], right[1] = first, second; };\nset(0, 2, 3);\n%%end",
+        "%%start\nstruct Buffer { u8[2] bytes; }\nunit(u64, *!Buffer, u8) store = fn(offset, writer, input) { (*writer).bytes[offset] = input; };\n%%end",
+    ] {
+        let root = source();
+        let parsed = parse_source(root.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let cst = parsed.result.canonical_cst();
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let single = derive_scalar_program_from_cst_with_layout(cst, target_layout);
+            assert!(single.diagnostics.is_empty(), "{text}: {:?}", single.diagnostics);
+            let prepared = prepare_scalar_project(
+                vec![(derive_scalar_declarations_from_cst(cst), Vec::new())],
+                vec![root.clone()],
+                ScalarPreparationInputs { target_layout },
+            ).unwrap_or_else(|failure| panic!("{text}: {:?}", failure.diagnostics));
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{text}: {:?}", checked.diagnostics());
+        }
+    }
+}
+
+#[test]
+fn dynamic_second_destination_index_is_used_even_when_distinctness_is_rejected() {
+    let text = "%%start\nu8[2] values = [1, 1];\nunit(u64, u8, u8) set = fn(index, first, second) { u8[2] local = [1, 1]; local[0], values[index] = first, second; };\n%%end";
+    let root = source();
+    let parsed = parse_source(root.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let cst = parsed.result.canonical_cst();
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_from_cst_with_layout(cst, target_layout);
+        let Err(project) = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(cst), Vec::new())],
+            vec![root.clone()],
+            ScalarPreparationInputs { target_layout },
+        ) else {
+            panic!("{target_layout:?}: expected a distinctness diagnostic");
+        };
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{target_layout:?}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.code, "B0002");
+            assert_eq!(diagnostic.message, "assignment targets require a distinctness proof");
+        }
+    }
+}
+
+#[test]
+fn assignment_rhs_is_checked_once_for_nested_unused_bindings() {
+    let text = "%%start\ni32() assign = fn { i32 result = 0; result = if (true) { i32 unused_inner = 1; 2 } else { 3 }; result };\n%%end";
+    let declaration = "i32 unused_inner = 1;";
+    let root = source();
+    let parsed = parse_source(root.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let cst = parsed.result.canonical_cst();
+    let start = text.find(declaration).unwrap() as u32;
+    let span = ByteSpan::new(start, start + declaration.len() as u32);
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let single = derive_scalar_program_from_cst_with_layout(cst, target_layout);
+        let Err(project) = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(cst), Vec::new())],
+            vec![root.clone()],
+            ScalarPreparationInputs { target_layout },
+        ) else {
+            panic!("{target_layout:?}: prepared build accepted unread binding");
+        };
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{target_layout:?}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.code, "B0009");
+            assert_eq!(diagnostic.labels[0].span.range, span);
+        }
+    }
+}

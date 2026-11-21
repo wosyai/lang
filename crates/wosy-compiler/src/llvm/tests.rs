@@ -1319,8 +1319,8 @@ fn checked_aggregate_reads_materialize_sized_values_on_both_targets_and_pipeline
                 .expect("project LLVM")
                 .to_text(),
         ] {
-            assert!(llvm.contains("load [8 x i8], ptr %deref"), "{llvm}");
-            assert!(llvm.contains("load [2 x i8], ptr %deref"), "{llvm}");
+            assert!(fixed_aggregate_move_count(&llvm, "%deref", 8) != 0, "{llvm}");
+            assert!(fixed_aggregate_move_count(&llvm, "%deref", 2) != 0, "{llvm}");
             assert!(
                 llvm.contains("getelementptr inbounds i8, ptr %deref, i8 4"),
                 "{llvm}"
@@ -1365,10 +1365,10 @@ fn checked_aggregate_return_reads_in_caller_on_both_targets_and_pipelines() {
                 .expect("project LLVM")
                 .to_text(),
         ] {
-            assert!(llvm.contains("load [8 x i8], ptr %deref"), "{llvm}");
-            assert!(llvm.contains("load [2 x i8], ptr %deref"), "{llvm}");
+            assert!(fixed_aggregate_move_count(&llvm, "%deref", 8) != 0, "{llvm}");
+            assert!(fixed_aggregate_move_count(&llvm, "%deref", 2) != 0, "{llvm}");
             assert!(
-                llvm.contains("%return_result_value = load [2 x i8]"),
+                fixed_aggregate_move_count(&llvm, "%return_result_source", 2) != 0,
                 "{llvm}"
             );
         }
@@ -1403,24 +1403,8 @@ fn validated_return_origins_materialize_local_pointees_and_forward_existing_owne
                 .to_text(),
         ] {
             assert!(llvm.contains("return_result_value = load i8"), "{llvm}");
-            assert!(
-                llvm.contains("return_result_value = load [1 x i8]"),
-                "{llvm}"
-            );
-            assert!(
-                llvm.contains("return_result_value = load [2 x i8]"),
-                "{llvm}"
-            );
-            assert!(
-                llvm.contains("return_result_value = load [2 x [1 x i8]]"),
-                "{llvm}"
-            );
-            assert_eq!(
-                llvm.matches("load [1 x i8], ptr %return_result_source")
-                    .count(),
-                3,
-                "{llvm}"
-            );
+            assert_eq!(fixed_aggregate_move_count(&llvm, "%return_result_source", 1), 3, "{llvm}");
+            assert_eq!(fixed_aggregate_move_count(&llvm, "%return_result_source", 2), 2, "{llvm}");
             assert_eq!(
                 llvm.matches("call void @__wosy_core_free(ptr %return_result_release)")
                     .count(),
@@ -1530,7 +1514,7 @@ fn mixed_fresh_and_borrowed_return_materializes_only_fresh_branch() {
                 .to_text(),
         ] {
             assert_eq!(
-                llvm.matches("return_result_value = load [1 x i8]").count(),
+                fixed_aggregate_move_count(&llvm, "%return_result_source", 1),
                 1,
                 "{llvm}"
             );
@@ -1854,8 +1838,8 @@ fn move_only_checked_aggregate_is_consumed_as_one_sized_value() {
                 .expect("project LLVM")
                 .to_text(),
         ] {
-            assert!(llvm.contains("load [1 x i8], ptr %deref"), "{llvm}");
-            assert!(llvm.contains("load [2 x [1 x i8]], ptr %deref"), "{llvm}");
+            assert!(fixed_aggregate_move_count(&llvm, "%deref", 1) != 0, "{llvm}");
+            assert!(fixed_aggregate_move_count(&llvm, "%deref", 2) != 0, "{llvm}");
             assert!(
                 !llvm.contains("call void @__wosy_core_free(ptr %deref"),
                 "{llvm}"
@@ -3418,6 +3402,66 @@ fn emits_project_multiple_unit_conditionals_in_a_branch_once() {
     );
 }
 
+fn fixed_aggregate_move_count(ir: &str, source: &str, bytes: u64) -> usize {
+    let source = format!(", ptr align 1 {source}");
+    let size = format!(" {bytes}, i1 false)");
+    ir.lines()
+        .filter(|line| {
+            line.contains("call void @llvm.memmove")
+                && line.contains(&source)
+                && line.ends_with(&size)
+        })
+        .count()
+}
+
+#[test]
+fn emits_bulk_transfer_for_large_fixed_array_literals_on_both_targets() {
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let text = "%%start
+f32[6] point = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+POINTS
+%%end"
+        .replace(
+            "POINTS",
+            &[("point", "row", 24), ("row", "plane", 24), ("plane", "layer", 24), ("layer", "grid", 12)]
+                .into_iter()
+                .scan(String::from("f32[6]"), |ty, (item, name, count)| {
+                    ty.push_str(&format!("[{count}]"));
+                    Some(format!("{ty} {name} = [{}];", vec![item; count].join(", ")))
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source.clone(), text.clone(), &[]);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let single_ir = emit_scalar_llvm(&single).unwrap().to_text();
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program, Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        let project_ir = emit_scalar_project_llvm(&project).unwrap().to_text();
+        for ir in [single_ir, project_ir] {
+            assert_eq!(fixed_aggregate_move_count(&ir, "%array_literal", 3_981_312), 1, "{ir}");
+            assert!(ir.lines().all(|line| !line.contains("load [") && !line.contains("store [")), "{ir}");
+            if layout == ScalarTargetLayout::WASM32 {
+                assert!(ir.contains("@llvm.memmove.p0.p0.i32"), "{ir}");
+                assert!(ir.contains("\"target-features\"=\"+bulk-memory\""), "{ir}");
+            } else {
+                assert!(ir.contains("@llvm.memmove.p0.p0.i64"), "{ir}");
+                assert!(!ir.contains("+bulk-memory"), "{ir}");
+            }
+        }
+    }
+}
+
 #[test]
 fn emits_recursive_fixed_array_index_reads_and_addresses_for_both_targets() {
     let source = SourceIdentity::new(
@@ -3660,6 +3704,53 @@ Event(u64) enum_copied = fn(length) { Event[length] events; events[0] = Event::s
                     allocation < loaded && loaded < release && release < returned,
                     "{name}: {body}"
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn publishes_runtime_array_storage_for_ordinary_module_calls_before_root_cleanup() {
+    let text = "%%start\nu64 length = 2;\nu8[length] values;\nvalues[0] = 7;\nu8() read = fn { values[0] };\nunit(u8) write = fn(value) { values[0] = value; };\nu8 first = read();\nwrite(9);\nu8 second = read();\n%%end";
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, target_layout);
+        let source = &prepared.project().modules[0].source;
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        let standalone = derive_scalar_program_with_layout(&parsed.result, target_layout);
+        assert!(standalone.diagnostics.is_empty(), "{:?}", standalone.diagnostics);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for (partition, global, read, write) in [
+            (emit_scalar_llvm(&standalone), "values".to_owned(), "read".to_owned(), "write".to_owned()),
+            (emit_scalar_build_single_module_llvm(&build), "values".to_owned(), "read".to_owned(), "write".to_owned()),
+            (
+                emit_scalar_build_project_llvm(&build),
+                project_global_name(source, "values"),
+                project_function_name(source, "read"),
+                project_function_name(source, "write"),
+            ),
+        ] {
+            let text = partition.unwrap().to_text();
+            let body = |definition: &str| {
+                text.split_once(definition).unwrap_or_else(|| panic!("{definition}: {text}"))
+                    .1.split_once("\n}").unwrap().0
+            };
+            let entry = body("define i32 @main()");
+            let allocation = entry.find("call ptr @__wosy_core_alloc").unwrap();
+            let publication = entry.find(&format!("store ptr %allocation, ptr @{global}")).unwrap();
+            let first_write = entry.find("store i8 7").unwrap();
+            let first_read = entry.find(&format!("call i8 @{read}()")).unwrap();
+            let write_call = entry.find(&format!("call void @{write}(i8 9)")).unwrap();
+            let last_read = entry.rfind(&format!("call i8 @{read}()")).unwrap();
+            let cleanup = entry.find("call void @__wosy_core_free").unwrap();
+            assert!(allocation < publication && publication < first_write && first_write < first_read
+                && first_read < write_call && write_call < last_read && last_read < cleanup, "{entry}");
+            assert_eq!(text.matches("call ptr @__wosy_core_alloc").count(), 1, "{text}");
+            assert_eq!(text.matches("call void @__wosy_core_free").count(), 1, "{text}");
+            for name in [read, write] {
+                let definition = text.lines().find(|line| line.starts_with("define ")
+                    && line.contains(&format!("@{name}("))).unwrap();
+                assert!(body(definition).contains(&format!("load ptr, ptr @{global}")), "{text}");
             }
         }
     }
@@ -4911,6 +5002,39 @@ fn emits_float_conversions_for_single_file_and_project() {
 }
 
 #[test]
+fn emits_float_conversions_of_width_inferred_arithmetic() {
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let text = "%%start
+i32(f32, f32) narrow = fn(a, b) { core.float_to_sint_trunc<i32>(a / b) };
+u64(f64, f64) wide = fn(a, b) { core.float_to_uint_trunc<u64>(a * b) };
+narrow(1.5, 2.0);
+wide(1.5, 2.0);
+%%end";
+    let program = derive_scalar_program(&parse_source(source.clone(), text.into(), &[]).result);
+    assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+    let single = emit_scalar_llvm(&program).unwrap().to_text();
+    let validation = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(program.program, Vec::new())],
+        vec![source],
+    ));
+    assert!(validation.diagnostics.is_empty(), "{:?}", validation.diagnostics);
+    let project = emit_scalar_project_llvm(&validation).unwrap().to_text();
+    for ir in [single, project] {
+        for operation in ["fdiv float", "fptosi float", "fmul double", "fptoui double"] {
+            assert!(ir.contains(operation), "{operation}: {ir}");
+        }
+        for operation in ["bitcast", "fptrunc", "fpext"] {
+            assert!(!ir.contains(operation), "{operation}: {ir}");
+        }
+    }
+}
+
+#[test]
 fn emits_bitcast_for_single_file_and_project() {
     let source = SourceIdentity::new(
         "project".into(),
@@ -5414,6 +5538,74 @@ i32 value = env.read();
             .get_string_attribute(AttributeLoc::Function, key)
             .expect("extern string attribute");
         assert_eq!(attribute.get_string_value().to_bytes(), expected.as_bytes());
+    }
+}
+
+#[test]
+fn extern_import_groups_do_not_replace_llvm_function_attributes() {
+    use inkwell::{attributes::AttributeLoc, memory_buffer::MemoryBuffer};
+
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let text = "%%start
+scene = extern wasm \"showcase\" { unit() mesh; };
+events = extern wasm \"events\" { unit() frame; };
+u8[2] row = [1, 2];
+u8[2][2] grid = [row, row];
+scene.mesh();
+events.frame();
+%%end";
+    let parsed = parse_source(source.clone(), text.into(), &[]);
+    let single = derive_scalar_program_with_layout(&parsed.result, ScalarTargetLayout::WASM32);
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    let single_partition = emit_scalar_llvm(&single).unwrap();
+    let project = validate_scalar_project(ScalarProject::new(
+        vec![ScalarModule::from_program(single.program, Vec::new())],
+        vec![source],
+    ));
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+    let project_partition = emit_scalar_project_llvm(&project).unwrap();
+
+    for partition in [single_partition, project_partition] {
+        let ir = partition.to_text();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "extern-groups");
+        let context = Context::create();
+        let module = context.create_module_from_ir(buffer).expect("parse emitted LLVM");
+        module.verify().expect("verify emitted LLVM");
+        assert_eq!(partition.declarations.len(), 2, "{ir}");
+        for (declaration, (module_name, import_name)) in partition
+            .declarations
+            .iter()
+            .zip([("showcase", "mesh"), ("events", "frame")])
+        {
+            let attributes = &declaration.attributes[0];
+            assert_eq!(attributes.wasm_import_module, module_name);
+            assert_eq!(attributes.wasm_import_name, import_name);
+            assert!(
+                ir.contains(&format!("declare void @{}() #{}", declaration.name, attributes.group)),
+                "{ir}"
+            );
+            let function = module.get_function(&declaration.name).unwrap();
+            for (key, expected) in [
+                ("wasm-import-module", module_name),
+                ("wasm-import-name", import_name),
+            ] {
+                let attribute = function.get_string_attribute(AttributeLoc::Function, key).unwrap();
+                assert_eq!(attribute.get_string_value().to_bytes(), expected.as_bytes());
+            }
+        }
+        assert!(module.get_functions().any(|function| {
+            !function.is_null()
+                && function.count_basic_blocks() > 0
+                && function
+                    .get_string_attribute(AttributeLoc::Function, "target-features")
+                    .is_some_and(|attribute| attribute.get_string_value().to_bytes() == b"+bulk-memory")
+        }), "{ir}");
+        assert!(ir.contains("attributes #") && ir.contains("memory(argmem: readwrite)"), "{ir}");
     }
 }
 
@@ -7506,10 +7698,9 @@ fn emits_direct_local_struct_addresses_and_loaded_pointer_bindings_for_externs()
     assert!(text.contains("wasm-import-name\"=\"touch"), "{text}");
     assert!(text.contains("wasm-import-name\"=\"inspect"), "{text}");
     assert!(forward.contains("alloca [8 x i8]"), "{forward}");
-    assert!(forward.contains("store [8 x i8]"), "{forward}");
     assert!(forward.contains("%local = alloca [8 x i8]"), "{forward}");
     assert!(
-        forward.contains("store [8 x i8] %struct_value") && forward.contains("ptr %local"),
+        forward.contains("ptr align 1 %local, ptr align 1 %struct_literal"),
         "{forward}"
     );
     assert!(forward.contains("ptrtoint ptr %pair"), "{forward}");
@@ -8024,8 +8215,11 @@ u64(bool) verify = fn(flag) { Pair value = _make(flag); value.total };
             let (_, hidden) = body.split_once("ptr ").expect("caller destination parameter");
             let destination = hidden.split(')').next().unwrap();
             assert!(body.contains("phi ptr "), "{body}");
-            assert!(body.contains("load [16 x i8]"), "{body}");
-            assert!(body.contains(&format!(", ptr {destination},")), "{body}");
+            assert!(body.lines().any(|line| {
+                line.contains("@llvm.memmove.")
+                    && line.contains(&format!("ptr align 1 {destination}, ptr align 1 %if,"))
+                    && (line.contains("i32 16, i1 false") || line.contains("i64 16, i1 false"))
+            }), "{body}");
             assert!(body.contains("ret void"), "{body}");
             assert!(!body.contains("ret ptr"), "{body}");
 
@@ -8038,7 +8232,7 @@ u64(bool) verify = fn(flag) { Pair value = _make(flag); value.total };
             }).expect("caller-owned aligned storage");
             assert!(body.lines().any(|line| line.contains(&format!("call void @{producer}("))
                 && line.ends_with(&format!(", ptr {slot})"))), "{body}");
-            assert!(body.contains(&format!("load [16 x i8], ptr {slot}")), "{body}");
+            assert_eq!(fixed_aggregate_move_count(body, slot, 16), 1, "{body}");
         }
     }
 }
@@ -8139,6 +8333,67 @@ struct copy Cell { u8 value; }
                 .expect("mixed owner merge");
             assert!(phi.contains("[ true,") && phi.contains(&format!("[ {flag},")), "{mixed}");
             assert!(!nullable.contains("forwarded_return_present"), "{nullable}");
+        }
+    }
+}
+
+
+#[test]
+fn emits_contextual_float_literals_in_left_operands_and_conditional_arms() {
+    let source = "
+%%start
+f32(f32) f32_ratio = fn(v) { 1.0 / v };
+f64(f64) f64_ratio = fn(v) { 1.0 / v };
+f32(f32) f32_branch = fn(v) { if (v < 0.0) { 1.0 } else { v } };
+f64(f64) f64_branch = fn(v) { if (v < 0.0) { v } else { 1.0 } };
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for partition in [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ] {
+            let ir = partition.expect("contextual float LLVM").to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+                ir.as_bytes(), "contextual-float",
+            );
+            let module = context.create_module_from_ir(buffer).expect("parse contextual LLVM");
+            module.verify().expect("verify contextual LLVM");
+            for ty in ["float", "double"] {
+                assert!(ir.contains(&format!("fdiv {ty} 1.000000e+00,")), "{ir}");
+                assert!(ir.contains(&format!("phi {ty} ")), "{ir}");
+            }
+        }
+    }
+}
+
+#[test]
+fn emits_fixed_width_integer_results_for_both_conditional_arms() {
+    let source = "
+%%start
+u8(bool, u8) mixed = fn(b, n) { if (b) { n } else { 0 } };
+u8(bool) literals = fn(b) { if (b) { 1 } else { 0 } };
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for partition in [
+            emit_scalar_build_single_module_llvm(&build),
+            emit_scalar_build_project_llvm(&build),
+        ] {
+            let ir = partition.expect("conditional result LLVM").to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+                ir.as_bytes(), "conditional-integer-width",
+            );
+            let module = context.create_module_from_ir(buffer).expect("parse conditional LLVM");
+            module.verify().expect("verify conditional LLVM");
+            assert_eq!(ir.matches("phi i8 ").count(), 2, "{ir}");
+            assert!(!ir.contains("phi i32"), "{ir}");
         }
     }
 }
