@@ -84,6 +84,30 @@ pub fn copy_policy(
     enums: &[ScalarEnum],
     generic_parameters: &BTreeSet<String>,
 ) -> Result<CopyPolicy, ScalarType> {
+    copy_policy_with(
+        ty,
+        generic_parameters,
+        &mut |id| {
+            structs
+                .iter()
+                .find(|structure| structure.id == *id)
+                .map(|structure| structure.copy_policy)
+        },
+        &mut |id| {
+            enums
+                .iter()
+                .find(|enumeration| enumeration.id == *id)
+                .map(|enumeration| enumeration.copy_policy)
+        },
+    )
+}
+
+fn copy_policy_with(
+    ty: &ScalarType,
+    generic_parameters: &BTreeSet<String>,
+    struct_policy: &mut impl FnMut(&ScalarStructId) -> Option<CopyPolicy>,
+    enum_policy: &mut impl FnMut(&ScalarEnumId) -> Option<CopyPolicy>,
+) -> Result<CopyPolicy, ScalarType> {
     match ty {
         ScalarType::Unit
         | ScalarType::Bool
@@ -107,18 +131,10 @@ pub fn copy_policy(
             mutability: ScalarReferenceMutability::Shared,
             ..
         } => Ok(CopyPolicy::Copy),
-        ScalarType::Struct(id) => structs
-            .iter()
-            .find(|structure| structure.id == *id)
-            .map(|structure| structure.copy_policy)
-            .ok_or_else(|| ty.clone()),
-        ScalarType::Enum(id) => enums
-            .iter()
-            .find(|enumeration| enumeration.id == *id)
-            .map(|enumeration| enumeration.copy_policy)
-            .ok_or_else(|| ty.clone()),
+        ScalarType::Struct(id) => struct_policy(id).ok_or_else(|| ty.clone()),
+        ScalarType::Enum(id) => enum_policy(id).ok_or_else(|| ty.clone()),
         ScalarType::Array { element, .. } => {
-            copy_policy(element, structs, enums, generic_parameters)
+            copy_policy_with(element, generic_parameters, struct_policy, enum_policy)
         }
         ScalarType::CheckedReference {
             mutability: ScalarReferenceMutability::Mutable,
@@ -139,57 +155,141 @@ fn resolve_copy_policies(
     enums: &mut [ScalarEnum],
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    for enumeration in enums.iter_mut() {
-        if enumeration.copy_modifier_span.is_some() {
-            enumeration.copy_policy = CopyPolicy::Copy;
-        }
+    if structs.iter().all(|item| item.copy_modifier_span.is_none())
+        && enums.iter().all(|item| item.copy_modifier_span.is_none())
+    {
+        return;
     }
-    loop {
-        let promotable = structs
-            .iter()
-            .enumerate()
-            .filter(|(_, structure)| {
-                structure.copy_modifier_span.is_some()
-                    && structure.copy_policy == CopyPolicy::Move
-                    && structure.fields.iter().all(|field| {
-                        copy_policy(&field.ty, structs, enums, &BTreeSet::new())
-                            == Ok(CopyPolicy::Copy)
-                    })
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if promotable.is_empty() {
-            break;
-        }
-        for index in promotable {
-            structs[index].copy_policy = CopyPolicy::Copy;
-        }
+    let (struct_policies, enum_policies) = compute_copy_policies(
+        &structs.iter().collect::<Vec<_>>(),
+        &enums.iter().collect::<Vec<_>>(),
+        false,
+        diagnostics,
+    );
+    for (structure, policy) in structs.iter_mut().zip(struct_policies) {
+        structure.copy_policy = policy;
     }
-    for structure in structs.iter() {
-        if let Some(span) = structure.copy_modifier_span {
-            if structure.copy_policy == CopyPolicy::Copy {
-                continue;
+    for (enumeration, policy) in enums.iter_mut().zip(enum_policies) {
+        enumeration.copy_policy = policy;
+    }
+}
+
+fn compute_copy_policies(
+    structs: &[&ScalarStruct],
+    enums: &[&ScalarEnum],
+    project_copyback: bool,
+    diagnostics: &mut Vec<super::Diagnostic>,
+) -> (Vec<CopyPolicy>, Vec<CopyPolicy>) {
+    let mut struct_indices = BTreeMap::new();
+    for (index, structure) in structs.iter().enumerate() {
+        struct_indices.entry(&structure.id).or_insert(index);
+    }
+    let mut enum_indices = BTreeMap::new();
+    for (index, enumeration) in enums.iter().enumerate() {
+        enum_indices.entry(&enumeration.id).or_insert(index);
+    }
+    let mut struct_policies = structs
+        .iter()
+        .map(|item| item.copy_policy)
+        .collect::<Vec<_>>();
+    let mut enum_policies = enums
+        .iter()
+        .map(|item| {
+            if item.copy_modifier_span.is_some() {
+                CopyPolicy::Copy
+            } else {
+                item.copy_policy
             }
-            if structure
-                .fields
-                .iter()
-                .any(|field| copy_policy(&field.ty, structs, enums, &BTreeSet::new()).is_err())
+        })
+        .collect::<Vec<_>>();
+    if structs.iter().any(|structure| {
+        structure.copy_modifier_span.is_some() && structure.copy_policy != CopyPolicy::Copy
+    }) {
+        let mut dependents = vec![Vec::new(); structs.len()];
+        let mut pending_counts = vec![0; structs.len()];
+        let mut unknown_fields = vec![false; structs.len()];
+        let mut ready = Vec::new();
+        let mut dependencies = Vec::new();
+        let generic_parameters = BTreeSet::new();
+        for (index, structure) in structs.iter().enumerate() {
+            if structure.copy_modifier_span.is_none() || struct_policies[index] == CopyPolicy::Copy
             {
                 continue;
             }
-            diagnostics.push(super::Diagnostic {
-                code: "B0003".to_owned(),
-                severity: super::DiagnosticSeverity::Error,
-                message: "copy declaration contains a move-only member".to_owned(),
-                labels: vec![super::DiagnosticLabel {
-                    kind: super::DiagnosticLabelKind::Primary,
-                    span: SourceSpan::new(structure.id.source.clone(), span),
+            dependencies.clear();
+            let mut blocked = struct_policies[index] != CopyPolicy::Move;
+            for field in &structure.fields {
+                let mut dependency = None;
+                let policy = copy_policy_with(
+                    &field.ty,
+                    &generic_parameters,
+                    &mut |id| {
+                        let ordinal = *struct_indices.get(&id)?;
+                        let policy = struct_policies[ordinal];
+                        if policy == CopyPolicy::Move
+                            && structs[ordinal].copy_modifier_span.is_some()
+                        {
+                            dependency = Some(ordinal);
+                        }
+                        Some(policy)
+                    },
+                    &mut |id| enum_indices.get(&id).map(|&index| enum_policies[index]),
+                );
+                if let Some(dependency) = dependency {
+                    dependencies.push(dependency);
+                } else {
+                    blocked |= policy != Ok(CopyPolicy::Copy);
+                    unknown_fields[index] |= policy.is_err();
+                }
+            }
+            if blocked {
+                continue;
+            }
+            pending_counts[index] = dependencies.len();
+            for &dependency in &dependencies {
+                dependents[dependency].push(index);
+            }
+            if dependencies.is_empty() {
+                ready.push(index);
+            }
+        }
+        while let Some(index) = ready.pop() {
+            struct_policies[index] = CopyPolicy::Copy;
+            for &dependent in &dependents[index] {
+                pending_counts[dependent] -= 1;
+                if pending_counts[dependent] == 0 {
+                    ready.push(dependent);
+                }
+            }
+        }
+        for (index, structure) in structs.iter().enumerate() {
+            if let Some(span) = structure.copy_modifier_span {
+                if struct_policies[index] == CopyPolicy::Copy || unknown_fields[index] {
+                    continue;
+                }
+                diagnostics.push(super::Diagnostic {
+                    code: "B0003".to_owned(),
+                    severity: super::DiagnosticSeverity::Error,
                     message: "copy declaration contains a move-only member".to_owned(),
-                }],
-                notes: Vec::new(),
-            });
+                    labels: vec![super::DiagnosticLabel {
+                        kind: super::DiagnosticLabelKind::Primary,
+                        span: SourceSpan::new(structure.id.source.clone(), span),
+                        message: "copy declaration contains a move-only member".to_owned(),
+                    }],
+                    notes: Vec::new(),
+                });
+            }
         }
     }
+    if project_copyback {
+        for (index, structure) in structs.iter().enumerate() {
+            struct_policies[index] = struct_policies[struct_indices[&&structure.id]];
+        }
+        for (index, enumeration) in enums.iter().enumerate() {
+            enum_policies[index] = enum_policies[enum_indices[&&enumeration.id]];
+        }
+    }
+    (struct_policies, enum_policies)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2425,32 +2525,35 @@ fn typecheck_scalar_project_with_occurrences(
     }
     let declarations = declarations::resolve_project_types(&mut project.modules);
     resolve_project_struct_layouts(&mut project, &mut diagnostics);
-    let mut structs = project
+    let (struct_policies, enum_policies) = compute_copy_policies(
+        &project
+            .modules
+            .iter()
+            .flat_map(|module| &module.structs)
+            .collect::<Vec<_>>(),
+        &project
+            .modules
+            .iter()
+            .flat_map(|module| &module.enums)
+            .collect::<Vec<_>>(),
+        true,
+        &mut diagnostics,
+    );
+    for (structure, policy) in project
         .modules
-        .iter()
-        .flat_map(|module| module.structs.clone())
-        .collect::<Vec<_>>();
-    let mut enums = project
+        .iter_mut()
+        .flat_map(|module| &mut module.structs)
+        .zip(struct_policies)
+    {
+        structure.copy_policy = policy;
+    }
+    for (enumeration, policy) in project
         .modules
-        .iter()
-        .flat_map(|module| module.enums.clone())
-        .collect::<Vec<_>>();
-    resolve_copy_policies(&mut structs, &mut enums, &mut diagnostics);
-    for module in &mut project.modules {
-        for structure in &mut module.structs {
-            structure.copy_policy = structs
-                .iter()
-                .find(|item| item.id == structure.id)
-                .expect("project struct policy")
-                .copy_policy;
-        }
-        for enumeration in &mut module.enums {
-            enumeration.copy_policy = enums
-                .iter()
-                .find(|item| item.id == enumeration.id)
-                .expect("project enum policy")
-                .copy_policy;
-        }
+        .iter_mut()
+        .flat_map(|module| &mut module.enums)
+        .zip(enum_policies)
+    {
+        enumeration.copy_policy = policy;
     }
     let overloads = ScalarOverloadEnvironment::project(&project.modules);
     let owners = project
