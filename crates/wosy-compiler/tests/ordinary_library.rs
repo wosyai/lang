@@ -143,10 +143,24 @@ fn ordinary_library_calls_keep_their_typed_routes_without_test_models() {
 
 #[test]
 fn ordinary_stdlib_print_still_uses_its_declared_call() {
+    assert_stdlib_print(
+        "%%start\nstd = namespace std \"bootstrap.w\";\nstd.print(\"ordinary\");\n%%end",
+        false,
+    );
+}
+
+#[test]
+fn stdlib_print_releases_formatted_owner_not_its_passive_iovec() {
+    assert_stdlib_print(
+        "%%start\nstd = namespace std \"bootstrap.w\";\nu64 n = 42;\nstd.print(std.format(n));\n%%end",
+        true,
+    );
+}
+
+fn assert_stdlib_print(text: &str, owning: bool) {
     let app = source("workbench", "src/run.w");
     let std = source("std", "src/bootstrap.w");
     let preview = source("std", "src/wasi/preview1.w");
-    let text = "%%start\nstd = namespace std \"bootstrap.w\";\nstd.print(\"ordinary\");\n%%end";
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         let prepared = prepare_scalar_project(
             vec![
@@ -178,9 +192,25 @@ fn ordinary_stdlib_print_still_uses_its_declared_call() {
         let ir = partition.to_text();
         let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "ordinary-stdlib");
         let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
         assert!(direct_calls(&module, "main")
             .iter()
             .any(|target| target == STD_PRINT));
+        let print = module.get_function(STD_PRINT).unwrap();
+        let frees: Vec<_> = print.get_basic_blocks().into_iter()
+            .flat_map(|block| block.get_instructions())
+            .filter(|instruction| instruction.get_opcode() == InstructionOpcode::Call
+                && CallSiteValue::try_from(*instruction).unwrap().get_called_fn_value()
+                    .is_some_and(|callee| callee.get_name().to_bytes() == b"__wosy_core_free"))
+            .collect();
+        if owning {
+            let [free] = frees.as_slice() else {
+                panic!("{target_layout:?}: expected one formal release");
+            };
+            assert_eq!(free.get_operand(0).unwrap().value(), print.get_last_param());
+        } else {
+            assert!(frees.is_empty());
+        }
     }
 }
 

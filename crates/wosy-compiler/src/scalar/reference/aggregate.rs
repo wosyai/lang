@@ -1243,10 +1243,15 @@ impl AggregateFlowFacts {
                         if *owner_scope != point.scope {
                             return true;
                         }
-                        if let Some(Value::Aggregate { backing, .. }) = value {
-                            if exit.is_some() && !state.moved.contains(backing)
-                                && (position.is_some() || matches!(backing, OwnerSource::Formal(_)))
-                            {
+                        // A field-backed carrier can use an owner's storage but
+                        // is not a whole Call or Formal receipt to release.
+                        if let Some(Value::Aggregate { backing, field: None }) = value {
+                            let installed = match backing {
+                                OwnerSource::Formal(_) => true,
+                                OwnerSource::Call(_) => position.is_some(),
+                                OwnerSource::Allocation(_) => false,
+                            };
+                            if exit.is_some() && installed && !state.moved.contains(backing) {
                                 live.insert((*backing, binding.clone()));
                             }
                         }
