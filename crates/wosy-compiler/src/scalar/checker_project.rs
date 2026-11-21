@@ -6,12 +6,15 @@ use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation},
     checker_flow::{
         check_integer_requirements, check_integer_return_bound, check_integer_return_bound_where,
-        check_integer_return_bound_with_shows, CheckerPredicate, IntegerBranchProof,
+        check_integer_return_bound_with_shows, proves_requirement_with_imported_root_local,
+        CheckerPredicate, IntegerBranchProof,
         IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
+    control::BlockItemKind,
     derive_block, derive_expression, project_from_declarations,
     reference::{DirectDestinationIdentity, FunctionCallSites, ProjectCallSiteResults},
     static_calls::prepare_project_occurrences,
+    symbolic_integer::{IntegerRelation, IntegerSet},
     typecheck::{integer_literal_fits_type, is_integer_type},
     typecheck_scalar_project_in_mode, BinaryOperator, ByteSpan, ConcreteCallSelection,
     ReferenceBindingId, ResolvedCallTarget, ScalarBlock, ScalarBlockItem, ScalarExpression, ScalarFunction,
@@ -78,11 +81,12 @@ fn check_closed_project_callable(
     root_source: &SourceIdentity,
     root_name: &str,
 ) -> ProjectCheck {
-    let (project, calls) = match prepare_checker_project(declarations, initialization_order, inputs) {
+    let prepared = match prepare_checker_project(declarations, initialization_order, inputs) {
         Ok(prepared) => prepared,
         Err(error) => return error,
     };
-    let (module, item, function) = match select_checked_root(&project, root_source, root_name) {
+    let (project, calls) = prepared.parts();
+    let (module, item, function) = match select_checked_root(project, root_source, root_name) {
         Ok(root) => root,
         Err(error) => return error,
     };
@@ -107,15 +111,35 @@ fn check_closed_project_callable(
     }
 }
 
-fn prepare_checker_project(
-    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
-    initialization_order: Vec<SourceIdentity>,
-    inputs: ScalarPreparationInputs,
-) -> Result<(ScalarProject, ProjectCallSiteResults), ProjectCheck> {
-    project_from_declarations(declarations, initialization_order, inputs)
-        .and_then(|project| prepare_project_occurrences(typecheck_scalar_project_in_mode(project, true)))
-        .map_err(|rejected| ProjectCheck::Invalid(rejected.into_inspection().diagnostics))
+use prepared::PreparedCheckerProject;
+
+mod prepared {
+    use super::*;
+
+    pub(super) struct PreparedCheckerProject {
+        project: ScalarProject,
+        calls: ProjectCallSiteResults,
+    }
+
+    impl PreparedCheckerProject {
+        pub(super) fn parts(&self) -> (&ScalarProject, &ProjectCallSiteResults) {
+            (&self.project, &self.calls)
+        }
+    }
+
+    pub(super) fn prepare_checker_project(
+        declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+        initialization_order: Vec<SourceIdentity>,
+        inputs: ScalarPreparationInputs,
+    ) -> Result<PreparedCheckerProject, ProjectCheck> {
+        let (project, calls) = project_from_declarations(declarations, initialization_order, inputs)
+            .and_then(|project| prepare_project_occurrences(typecheck_scalar_project_in_mode(project, true)))
+            .map_err(|rejected| ProjectCheck::Invalid(rejected.into_inspection().diagnostics))?;
+        Ok(PreparedCheckerProject { project, calls })
+    }
 }
+
+use prepared::prepare_checker_project;
 
 fn select_checked_root<'a>(
     project: &'a ScalarProject,
@@ -226,8 +250,9 @@ fn check_proof_fragment_impl(
     )?);
     let ensures = IntegerComparison::from_expression(&ensures).ok_or(ProjectCheck::Unsupported)?;
 
-    let (project, calls) = prepare_checker_project(declarations, initialization_order, inputs)?;
-    let (module, item, function) = select_checked_root(&project, target_source, &name)?;
+    let prepared = prepare_checker_project(declarations, initialization_order, inputs)?;
+    let (project, calls) = prepared.parts();
+    let (module, item, function) = select_checked_root(project, target_source, &name)?;
     let target = &project.modules[module];
     if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
         return Err(ProjectCheck::Unsupported);
@@ -344,6 +369,87 @@ fn issue_return_bound(
         operator: ensures.operator.clone(),
         bound: ensures.bound.clone(),
         guard,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ImportedRequirement {
+    Proved,
+    NotEstablished,
+}
+
+fn use_verified_return_bound(
+    prepared: &PreparedCheckerProject,
+    caller_source: &SourceIdentity,
+    caller_name: &str,
+    proof_identity: (&SourceIdentity, ByteSpan, &str),
+    verified: &VerifiedReturnBound,
+) -> Option<ImportedRequirement> {
+    if proof_identity != (&verified.proof_source, verified.proof_span, verified.proof_name.as_str()) {
+        return None;
+    }
+    let (project, calls) = prepared.parts();
+    let (module, item, function) = select_checked_root(project, caller_source, caller_name).ok()?;
+    if project.modules[module].target_layout != verified.target_layout
+        || !function.generic_parameters.is_empty()
+        || !function.overload_arms.is_empty()
+        || verified.target == (ResolvedCallTarget::ModuleCallable {
+            source: caller_source.clone(),
+            declaration_span: function.name_span,
+            concrete: ConcreteCallSelection::Declaration,
+        })
+    {
+        return None;
+    }
+    let body = calls.function_body(module, item, None)?;
+    let structure = &body.structure;
+    let root = structure.root;
+    let [binding_item, requirement_item, tail @ ..] = structure.blocks.get(root.0)?.items.as_slice() else {
+        return None;
+    };
+    if binding_item.position != 0
+        || !matches!(binding_item.kind, BlockItemKind::Binding(_))
+        || !(tail.is_empty() || matches!(tail, [item] if matches!(item.kind, BlockItemKind::FinalOutput(_))))
+    {
+        return None;
+    }
+    let BlockItemKind::Evaluation { expression } = requirement_item.kind else {
+        return None;
+    };
+    let directive = structure.checker_directives.get(&expression)?;
+    let CheckerPredicate::Integer(predicate) = directive.predicate.as_ref()? else {
+        return None;
+    };
+    let origin = structure.checker_integer_call_locals.get(&(root, binding_item.position))?;
+    let site = body.resolved_call_site(origin.call)?;
+    let signature = body.checked_call_signatures.get(&origin.call)?;
+    let [parameter] = signature.parameters.as_slice() else {
+        return None;
+    };
+    let [output] = signature.outputs.outputs.as_slice() else {
+        return None;
+    };
+    if directive.operation != CheckerOperation::Require
+        || predicate.binding != origin.binding
+        || site.target != verified.target
+        || signature.parameters != verified.parameters
+        || verified.output_slot != 0
+        || output.ty != verified.output_type
+        || structure.checked_types.expressions.get(&origin.argument_ordinal)? != parameter
+    {
+        return None;
+    }
+    match &verified.guard {
+        None | Some(VerifiedEntryGuard::Boolean(true)) => {}
+        Some(VerifiedEntryGuard::Integer { slot: 0, ty, operator, bound })
+            if ty == parameter && IntegerRelation::from_operator(operator)?.accepts(origin.argument.cmp(bound)) => {}
+        _ => return None,
+    }
+    let (values, _) = IntegerSet::from_type(&verified.output_type)?.split(&verified.operator, &verified.bound)?;
+    Some(if proves_requirement_with_imported_root_local(body, values) {
+        ImportedRequirement::Proved
+    } else {
+        ImportedRequirement::NotEstablished
     })
 }
 
@@ -833,12 +939,13 @@ mod tests {
             let text = format!(
                 "%%start\nu8(u8) clamp = fn(value) {{ if (value > 10) {{ 10 }} else {{ value }} }};\n                 u8({caller_input}) caller = fn{params} {{ u8 result = clamp({arg});                  core.require(result <= 10, {OUTPUT}); result }};\n%%end",
             );
-            let (project, calls) = prepare_checker_project(
+            let prepared = prepare_checker_project(
                 vec![(declarations(&app, &text), Vec::new())],
                 vec![app.clone()],
                 inputs(),
             ).unwrap();
-            let (module, item, _) = select_checked_root(&project, &app, "caller").unwrap();
+            let (project, calls) = prepared.parts();
+            let (module, item, _) = select_checked_root(project, &app, "caller").unwrap();
             let body = calls.function_body(module, item, None).unwrap();
             let origin = body.structure.checker_integer_call_locals.get(&(body.structure.root, 0));
             if caller_input.is_empty() {
@@ -870,6 +977,54 @@ mod tests {
             }
             assert_eq!(check_integer_requirements(body), None);
         }
+    }
+
+    #[test]
+    fn verified_bound_can_establish_a_later_requirement_but_not_an_authored_failure() {
+        let app = source("src/main.w", "consumer");
+        let proof_source = source("proof/clamp.fragment.w", "proof-r1");
+        let proof = "proof bounded for clamp(x) -> (out) where (x <= 10) ensures (out <= 10) {}";
+        let text = format!(r#"%%start
+            u8(u8) clamp = fn(value) {{ if (value > 10) {{ 10 }} else {{ value }} }};
+            u8(u8) other = fn(value) {{ value }};
+            u8() accepted = fn {{ u8 result = clamp(7); core.require(result <= 10, {OUTPUT}); result }};
+            u8() insufficient = fn {{ u8 result = clamp(7); core.require(result <= 8, {OUTPUT}); result }};
+            u8() outside = fn {{ u8 result = clamp(11); core.require(result <= 10, {OUTPUT}); result }};
+            u8() different = fn {{ u8 result = other(7); core.require(result <= 10, {OUTPUT}); result }};
+            u8(u8) dynamic = fn(value) {{ u8 result = clamp(value); core.require(result <= 10, {OUTPUT}); result }};
+            u8(u8) wrong_binding = fn(value) {{ u8 result = clamp(7); core.require(value <= 10, {OUTPUT}); result }};
+        %%end"#);
+        let verified = verified_summary(&app, &text, &app, &proof_source, proof).unwrap();
+        let prepared = prepare_checker_project(
+            vec![(declarations(&app, &text), Vec::new())],
+            vec![app.clone()],
+            inputs(),
+        ).unwrap();
+        let identity = (&proof_source, verified.proof_span, "bounded");
+        let use_at = |name| use_verified_return_bound(&prepared, &app, name, identity, &verified);
+        assert_eq!(use_at("accepted"), Some(ImportedRequirement::Proved));
+        assert_eq!(use_at("insufficient"), Some(ImportedRequirement::NotEstablished));
+        for name in ["outside", "different", "dynamic", "wrong_binding", "clamp", "nonexistent"] {
+            assert_eq!(use_at(name), None);
+        }
+        let different_source = source("proof/clamp.fragment.w", "proof-r2");
+        for wrong in [
+            (&different_source, verified.proof_span, "bounded"),
+            (&proof_source, ByteSpan::new(0, 1), "bounded"),
+            (&proof_source, verified.proof_span, "different"),
+        ] {
+            assert_eq!(use_verified_return_bound(&prepared, &app, "accepted", wrong, &verified), None);
+        }
+        let changed = source("src/main.w", "consumer-r2");
+        let changed_prepared = prepare_checker_project(
+            vec![(declarations(&changed, &text), Vec::new())],
+            vec![changed.clone()],
+            inputs(),
+        ).unwrap();
+        assert_eq!(
+            use_verified_return_bound(&changed_prepared, &changed, "accepted", identity, &verified),
+            None,
+        );
     }
 
 }

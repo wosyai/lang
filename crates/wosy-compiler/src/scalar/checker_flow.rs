@@ -78,6 +78,7 @@ struct IntegerRoots<'a> {
     axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
     by_binding: HashMap<&'a ReferenceBindingId, usize>,
     parameters: usize,
+    imported_local: Option<IntegerSet>,
 }
 
 impl<'a> IntegerRoots<'a> {
@@ -177,8 +178,8 @@ impl IntegerInputs {
         Self::compact_axis(self.0, axis)
     }
 
-    fn append_local(&mut self, value: &BigInt) {
-        let value = Rc::new(IntegerSet::singleton(value));
+    fn append_local(&mut self, values: IntegerSet) {
+        let value = Rc::new(values);
         for row in &mut self.0 {
             row.push(Rc::clone(&value));
         }
@@ -349,8 +350,19 @@ pub(super) enum ProofCoverage<T> {
 pub(super) fn check_integer_requirements(
     calls: &FunctionCallSites,
 ) -> Option<Result<(), IntegerCheckFailure<'_>>> {
-    run_integer_callable(calls, integer_tail_type(calls), None, None)
+    run_integer_callable(calls, integer_tail_type(calls), None, None, None)
         .map(|result| result.map(drop))
+}
+
+pub(super) fn proves_requirement_with_imported_root_local(
+    calls: &FunctionCallSites,
+    values: IntegerSet,
+) -> bool {
+    !values.is_empty()
+        && matches!(
+            run_integer_callable(calls, integer_tail_type(calls), None, None, Some(values)),
+            Some(Ok(ProofCoverage::Applicable(())))
+        )
 }
 
 pub(super) fn observe_integer_returns(
@@ -369,7 +381,7 @@ fn observe_integer_returns_in_scope<'a>(
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
     let tail = integer_tail_type(calls)?;
     let mut paths = Vec::new();
-    match run_integer_callable(calls, Some(tail), entry_filter, Some(&mut paths))? {
+    match run_integer_callable(calls, Some(tail), entry_filter, Some(&mut paths), None)? {
         Ok(ProofCoverage::Applicable(())) if !paths.is_empty() => {
             Some(Ok(ProofCoverage::Applicable(paths)))
         }
@@ -451,12 +463,14 @@ fn run_integer_callable<'a>(
     tail: Option<&'a ScalarType>,
     entry_filter: Option<&CheckerPredicate>,
     returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
+    imported_local: Option<IntegerSet>,
 ) -> Option<Result<ProofCoverage<()>, IntegerCheckFailure<'a>>> {
     let boundary = &calls.boundary;
     let checker_parameters = boundary.checker_parameter_bindings.as_deref()?;
     debug_assert_eq!(boundary.parameters.len(), checker_parameters.len());
     let mut roots = IntegerRoots {
         parameters: boundary.parameters.len(),
+        imported_local,
         ..IntegerRoots::default()
     };
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
@@ -592,9 +606,20 @@ fn walk_integer_block<'a>(
                 path = path.overwrite(axis, value);
             }
             BlockItemKind::Binding(ref binding) => {
+                if block == structure.root && item.position == 0 {
+                    if let Some(values) = roots.imported_local.take() {
+                        let origin = structure.checker_integer_call_locals.get(&(block, item.position))?;
+                        let [receiver] = binding.receivers() else {
+                            return None;
+                        };
+                        roots.add(&origin.binding, &receiver.ty);
+                        path.append_local(values);
+                        continue;
+                    }
+                }
                 let (identity, ty, value) = integer_local(calls, binding, block, item.position)?;
                 roots.add(identity, ty);
-                path.append_local(value);
+                path.append_local(IntegerSet::singleton(value));
             }
         }
     }
