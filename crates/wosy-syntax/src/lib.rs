@@ -533,13 +533,14 @@ fn build_pair(
         kind(pair.as_rule())
     };
     let mut inner = pair.into_inner();
-    let Some(first) = inner.next() else {
+    let first = inner.next();
+    if first.is_none() && !matches!(kind, SyntaxKind::Block | SyntaxKind::StructLiteral) {
         builder.token(WosyLanguage::kind_to_raw(kind), span.as_str());
         return;
-    };
+    }
     builder.start_node(WosyLanguage::kind_to_raw(kind));
     let mut cursor = span.start();
-    for child in std::iter::once(first).chain(inner) {
+    for child in first.into_iter().chain(inner) {
         let child_span = child.as_span();
         add_gap(builder, &text[cursor..child_span.start()], cursor, comments);
         build_pair(builder, child, text, comments, errors);
@@ -1645,6 +1646,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["wasi.fd_write(descriptor, iovec_address, 1, byte_count_address)"]
         );
+    }
+
+    #[test]
+    fn empty_blocks_and_struct_literals_are_lossless_nodes() {
+        let text = "%%start\nstruct Empty {}\nEmpty value = {};\nunit() empty = fn {};\nunit() example = fn { if (true) { } else {\r\n\t}; if (false) {}; unsafe {}; };\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+
+        let empty = result.root.descendants().filter_map(|node| {
+            (matches!(node.kind(), SyntaxKind::Block | SyntaxKind::StructLiteral)
+                && node.children().next().is_none()).then_some(node)
+        }).map(|node| {
+            let span = byte_span(&node);
+            assert_eq!(&text[span.start as usize..span.end as usize], node.text().to_string());
+            (node.kind(), node.text().to_string())
+        }).collect::<Vec<_>>();
+        assert_eq!(empty, [
+            (SyntaxKind::StructLiteral, "{}".to_owned()),
+            (SyntaxKind::Block, "{}".to_owned()),
+            (SyntaxKind::Block, "{ }".to_owned()),
+            (SyntaxKind::Block, "{\r\n\t}".to_owned()),
+            (SyntaxKind::Block, "{}".to_owned()),
+            (SyntaxKind::Block, "{}".to_owned()),
+        ]);
     }
 
     #[test]
