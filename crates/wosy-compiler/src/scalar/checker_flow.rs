@@ -239,14 +239,56 @@ pub(super) struct IntegerCheckFailure<'a> {
     pub(super) axes: Vec<&'a ReferenceBindingId>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum IntegerReturn<'a> {
+    Alias(&'a ReferenceBindingId),
+    Const(&'a BigInt),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct IntegerReturningPath<'a> {
+    pub(super) value: IntegerReturn<'a>,
+    pub(super) ty: &'a ScalarType,
+    pub(super) state: IntegerInputs,
+    pub(super) axes: Vec<&'a ReferenceBindingId>,
+}
+
 enum IntegerControl<'a> {
     Continue(IntegerInputs),
+    Returned,
     Fail(IntegerCheckFailure<'a>),
 }
 
 pub(super) fn check_integer_requirements(
     calls: &FunctionCallSites,
 ) -> Option<Result<(), IntegerCheckFailure<'_>>> {
+    run_integer_callable(calls, None)
+}
+
+pub(super) fn observe_integer_returns(
+    calls: &FunctionCallSites,
+) -> Option<Result<Vec<IntegerReturningPath<'_>>, IntegerCheckFailure<'_>>> {
+    let [result] = calls.boundary.results.as_slice() else {
+        return None;
+    };
+    let [output] = calls.boundary.root_outputs.as_slice() else {
+        return None;
+    };
+    if !is_integer_type(&result.ty) || result.ty != output.ty {
+        return None;
+    }
+    let mut paths = Vec::new();
+    match run_integer_callable(calls, Some(&mut paths))? {
+        Ok(()) if !paths.is_empty() => Some(Ok(paths)),
+        Ok(()) => None,
+        Err(failure) => Some(Err(failure)),
+    }
+}
+
+fn run_integer_callable<'a>(
+    calls: &'a FunctionCallSites,
+    returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
+) -> Option<Result<(), IntegerCheckFailure<'a>>> {
     let boundary = &calls.boundary;
     let checker_parameters = boundary.checker_parameter_bindings.as_deref()?;
     debug_assert_eq!(boundary.parameters.len(), checker_parameters.len());
@@ -263,8 +305,8 @@ pub(super) fn check_integer_requirements(
         .map(|parameter| IntegerSet::from_type(&parameter.ty).map(Rc::new))
         .collect::<Option<IntegerRow>>()?;
     let root = IntegerInputs(vec![root]);
-    match walk_integer_block(calls, &mut roots, calls.structure.root, root)? {
-        IntegerControl::Continue(_) => Some(Ok(())),
+    match walk_integer_block(calls, &mut roots, calls.structure.root, root, returns)? {
+        IntegerControl::Continue(_) | IntegerControl::Returned => Some(Ok(())),
         IntegerControl::Fail(failure) => Some(Err(failure)),
     }
 }
@@ -274,6 +316,7 @@ fn walk_integer_block<'a>(
     roots: &mut IntegerRoots<'a>,
     block: BlockOrdinal,
     mut path: IntegerInputs,
+    mut returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
 ) -> Option<IntegerControl<'a>> {
     let depth = roots.axes.len();
     let structure = &calls.structure;
@@ -310,19 +353,43 @@ fn walk_integer_block<'a>(
                     };
                     let predicate = structure.checker_branches.get(condition)?;
                     let (yes, no, axis) = path.split(roots, predicate)?;
-                    match walk_integer_block(calls, roots, *then_block, yes)? {
+                    match walk_integer_block(calls, roots, *then_block, yes, None)? {
                         IntegerControl::Continue(then_path) => path = then_path.join(no, axis),
                         failure @ IntegerControl::Fail(_) => return Some(failure),
+                        IntegerControl::Returned => return None,
                     }
                 }
             }
             BlockItemKind::FinalOutput(slot) => {
-                let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(slot.expression)?
-                else {
+                let ty = structure.checked_types.expressions.get(&slot.expression)?;
+                if !is_integer_type(ty) {
                     return None;
+                }
+                let value = if let Some(value) = structure.checker_integer_literals.get(&slot.expression) {
+                    IntegerReturn::Const(value)
+                } else {
+                    let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(slot.expression)?
+                    else {
+                        return None;
+                    };
+                    let (_, binding_type) = roots.lookup(binding)?;
+                    if binding_type != ty {
+                        return None;
+                    }
+                    IntegerReturn::Alias(binding)
                 };
-                if !roots.by_binding.contains_key(binding) {
-                    return None;
+                if let Some(returns) = returns.as_deref_mut() {
+                    if slot.output != 0 {
+                        return None;
+                    }
+                    returns.push(IntegerReturningPath {
+                        value,
+                        ty,
+                        state: path,
+                        axes: roots.axes.iter().map(|(binding, _)| *binding).collect(),
+                    });
+                    roots.truncate(depth);
+                    return Some(IntegerControl::Returned);
                 }
             }
             BlockItemKind::Assignment { group } => {

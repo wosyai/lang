@@ -6704,7 +6704,12 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         }
         #[cfg(test)]
         if self.occurrence_typing.checker_directives_enabled()
-            && matches!(edge, OccurrenceEdge::AssignmentRhs { .. } | OccurrenceEdge::BindingRoot { .. })
+            && matches!(
+                edge,
+                OccurrenceEdge::AssignmentRhs { .. }
+                    | OccurrenceEdge::BindingRoot { .. }
+                    | OccurrenceEdge::FinalOutput { .. }
+            )
             && self.structure.checked_types.expressions.get(&ordinal).is_some_and(is_integer_type)
         {
             if let ScalarExpression::Integer { value, .. } = expression {

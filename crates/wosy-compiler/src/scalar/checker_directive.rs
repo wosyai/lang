@@ -958,4 +958,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn observes_typed_return_alias_after_narrowing() {
+        use crate::scalar::checker_flow::{observe_integer_returns, IntegerReturn};
+
+        check_source(
+            r#"
+            u8(u8) bounded_identity = fn(value) {
+                core.narrow(value <= 10, { .stdout = ""; .stderr = "range"; .code = 1; .files = []; });
+                value
+            };
+            "#,
+            |body| {
+                let mut returns = observe_integer_returns(body).unwrap().unwrap();
+                assert_eq!(returns.len(), 1);
+                let returned = returns.pop().unwrap();
+                let parameter = &body.boundary.checker_parameter_bindings.as_deref().unwrap()[0];
+                assert_eq!(returned.value, IntegerReturn::Alias(parameter));
+                assert_eq!(returned.ty, &crate::ScalarType::U8);
+                assert_eq!(returned.axes, [parameter]);
+                for value in 0..=255 {
+                    assert_eq!(returned.state.includes(&[value]), value <= 10);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn observes_typed_constant_and_refuses_effectful_return_values() {
+        use crate::scalar::checker_flow::{observe_integer_returns, IntegerReturn};
+        check_source("u8() ten = fn { 10 };", |body| {
+            let mut returns = observe_integer_returns(body).unwrap().unwrap();
+            assert_eq!(returns.len(), 1);
+            let returned = returns.pop().unwrap();
+            assert_eq!(returned.value, IntegerReturn::Const(&BigInt::from(10)));
+            assert_eq!(returned.ty, &crate::ScalarType::U8);
+            assert!(returned.axes.is_empty());
+            assert!(returned.state.includes(&[]));
+        });
+        check_source(
+            "u8() ignored = fn { effect() }; u8() effect = fn { 10 };",
+            |body| assert_eq!(observe_integer_returns(body), None),
+        );
+    }
+
 }
