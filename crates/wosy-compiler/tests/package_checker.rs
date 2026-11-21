@@ -336,3 +336,42 @@ fn main_initializer_keeps_bool_storage_separate_across_namespaces() {
     assert_eq!(failure.source, lib);
     assert_eq!(failure.operation, ScalarCheckerOperation::Narrow);
 }
+
+#[test]
+fn main_initializer_follows_only_a_selected_unit_conditional_arm() {
+    assert_eq!(
+        check_scoped(
+            &format!("bool enabled = false; if (enabled) {{ core.require(false, {OUTPUT}); }};"),
+            ScalarCheckerScope::MainFlowOnly,
+        ),
+        ScalarCheckerOutcome::NoChecks,
+    );
+    assert_eq!(
+        check_scoped(
+            &format!("bool enabled = true; if (enabled) {{ if (2 <= 2) {{ core.require(true, {OUTPUT}); }}; }};"),
+            ScalarCheckerScope::MainFlowOnly,
+        ),
+        ScalarCheckerOutcome::Passed,
+    );
+    let text = format!("if (false) {{ core.narrow(false, {OUTPUT}); }}; if (true) {{ core.require(false, {OUTPUT}); }}; core.narrow(false, {OUTPUT});");
+    let ScalarCheckerOutcome::Failed(failure) = check(&text) else {
+        panic!("expected the selected conditional arm to fail first");
+    };
+    assert_eq!(failure.operation, ScalarCheckerOperation::Require);
+    let canonical = format!("%%start\n{text}\n%%end");
+    assert_eq!(&canonical[failure.condition.start as usize..failure.condition.end as usize], "false");
+    assert_eq!(failure.condition.start as usize, canonical.find("core.require(false").unwrap() + "core.require(".len());
+}
+
+#[test]
+fn main_initializer_does_not_assume_unknown_branch_state_or_skip_reached_mutation() {
+    let body = format!("core.require(false, {OUTPUT});");
+    assert_eq!(
+        check(&format!("bool enabled = true; if (enabled) {{ enabled = false; {body} }};")),
+        ScalarCheckerOutcome::Unsupported,
+    );
+    assert_eq!(
+        check(&format!("bool enabled = true; if (!enabled) {{ {body} }};")),
+        ScalarCheckerOutcome::Unsupported,
+    );
+}

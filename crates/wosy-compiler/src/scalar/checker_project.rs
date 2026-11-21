@@ -9,13 +9,13 @@ use super::{
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument,
         IntegerCheckFailure, IntegerInputs,
     },
-    control::{BindingInitialization, BlockItemKind, CheckedCallSignature, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, NamespaceTarget},
+    control::{BindingInitialization, BlockItemKind, CheckedCallSignature, ConditionalRegion, InitializationName, InitializationStorage, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, ModuleInitializationTopology, NamespaceTarget},
     project_from_declarations,
-    reference::{FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, ProjectCallSiteResults},
+    reference::{FunctionCallSites, OccurrenceOrdinal, OccurrenceStructure, ProjectCallSiteResults},
     static_calls::prepare_project_occurrences,
     typecheck::is_integer_type,
     typecheck_scalar_project_in_mode, ByteSpan, ConcreteCallSelection, ReferenceBindingId, ResolvedCallTarget,
-    ScalarBlockItem, ScalarExpression, ScalarItem, ScalarNamespaceBinding, ScalarPreparationInputs,
+    ScalarExpression, ScalarItem, ScalarNamespaceBinding, ScalarPreparationInputs,
     ScalarProject, ScalarSourceDeclarations, ScalarType,
 };
 #[cfg(test)]
@@ -29,7 +29,7 @@ use super::{
     reference::{CheckerTargetQuery, DirectDestinationIdentity, ResolvedCheckerTarget},
     symbolic_integer::{IntegerRelation, IntegerSet},
     typecheck::{integer_literal_fits_type, typecheck_proof_where},
-    ScalarBlock, ScalarFunction, ScalarTargetLayout, UnaryOperator,
+    ScalarBlock, ScalarBlockItem, ScalarFunction, ScalarTargetLayout, UnaryOperator,
 };
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
@@ -373,45 +373,77 @@ fn walk_package_initialization(
             bool_storage.insert(receiver.span, *value);
             continue;
         }
-        if !matches!((&step.kind, module.items.get(step.item)),
-            (ModuleInitializationStepKind::ExecutableItem, Some(ScalarItem::Executable(
-                ScalarBlockItem::Expression(ScalarExpression::Call { .. }),
-            )))
-        ) {
-            return Err(ProjectCheck::Unsupported);
-        }
-        let Some(OccurrenceNode::Expression(call)) = structure.edges.get(&(
-            OccurrenceParent::Block(structure.root),
-            OccurrenceEdge::ExpressionItem { item: step.item },
-        )) else {
-            return Err(ProjectCheck::Unsupported);
-        };
-        if let Some(directive) = structure.checker_directives.get(call) {
-            let value = match (&directive.predicate, directive.initializer_bool_storage) {
-                (Some(CheckerPredicate::Boolean(value)), None) => *value,
-                (None, Some(storage)) => *bool_storage.get(&storage).ok_or(ProjectCheck::Unsupported)?,
-                _ => return Err(ProjectCheck::Unsupported),
+        let (ModuleInitializationStepKind::ExecutableItem, BlockItemKind::Evaluation { expression }) =
+            (&step.kind, &checked_item.kind) else {
+                return Err(ProjectCheck::Unsupported);
             };
-            actual.had_obligations = true;
-            if directive.operation.rejects(value, !value) {
-                let span = topology.occurrences.get(call.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
-                return Err(selected_failure(source, directive, span, IntegerInputs::closed(), Vec::new()));
-            }
-            continue;
-        }
-        let Some(ModuleInitializationCallTarget::Direct {
-            declaration,
-            concrete: ConcreteCallSelection::Declaration,
-        }) = region.call_target(*call) else {
-            return Err(ProjectCheck::Unsupported);
-        };
-        let signature = topology.checked_call_signatures.get(call).ok_or(ProjectCheck::MissingRootOccurrences)?;
-        let argument = exact_integer_call_argument(structure, *call, |_, _| None);
-        actual.run(structure, *call, signature, argument, &declaration.source, declaration.range, &ScalarType::Unit)?;
+        check_initializer_expression(topology, actual, source, &bool_storage, *expression, 0)?;
     }
     visits[ordinal] = InitializationVisit::Completed;
     Ok(())
 }
+
+fn check_initializer_expression(
+    topology: &ModuleInitializationTopology,
+    actual: &mut ActualCalls<'_>,
+    source: &SourceIdentity,
+    bool_storage: &HashMap<ByteSpan, bool>,
+    expression: OccurrenceOrdinal,
+    depth: usize,
+) -> Result<(), ProjectCheck> {
+    let structure = &topology.structure;
+    if let Some(directive) = structure.checker_directives.get(&expression) {
+        let value = match (&directive.predicate, directive.initializer_bool_storage) {
+            (Some(CheckerPredicate::Boolean(value)), None) => *value,
+            (None, Some(storage)) => *bool_storage.get(&storage).ok_or(ProjectCheck::Unsupported)?,
+            _ => return Err(ProjectCheck::Unsupported),
+        };
+        actual.had_obligations = true;
+        if directive.operation.rejects(value, !value) {
+            let span = topology.occurrences.get(expression.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+            return Err(selected_failure(source, directive, span, IntegerInputs::closed(), Vec::new()));
+        }
+        return Ok(());
+    }
+    if let Some(ConditionalRegion::Unit { condition, then_block, .. }) = topology.conditionals.get(&expression) {
+        let value = match structure.checker_branches.get(condition) {
+            Some(CheckerPredicate::Boolean(value)) => *value,
+            None if structure.checked_types.expressions.get(condition) == Some(&ScalarType::Bool) => {
+                let Some(InitializationName::Storage(InitializationStorage::Module(span))) =
+                    topology.identities.names.get(condition) else {
+                        return Err(ProjectCheck::Unsupported);
+                    };
+                *bool_storage.get(span).ok_or(ProjectCheck::Unsupported)?
+            }
+            _ => return Err(ProjectCheck::Unsupported),
+        };
+        if value {
+            if depth == MAX_INITIALIZER_BRANCH_DEPTH {
+                return Err(ProjectCheck::Unsupported);
+            }
+            let block = structure.blocks.get(then_block.0).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            for item in &block.items {
+                let BlockItemKind::Evaluation { expression } = item.kind else {
+                    return Err(ProjectCheck::Unsupported);
+                };
+                check_initializer_expression(topology, actual, source, bool_storage, expression, depth + 1)?;
+            }
+        }
+        return Ok(());
+    }
+    let Some(ModuleInitializationCallTarget::Direct {
+        declaration,
+        concrete: ConcreteCallSelection::Declaration,
+    }) = topology.call_targets.get(&expression) else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    let signature = topology.checked_call_signatures.get(&expression).ok_or(ProjectCheck::MissingRootOccurrences)?;
+    let argument = exact_integer_call_argument(structure, expression, |_, _| None);
+    actual.run(structure, expression, signature, argument, &declaration.source, declaration.range, &ScalarType::Unit)?;
+    Ok(())
+}
+
+const MAX_INITIALIZER_BRANCH_DEPTH: usize = 64;
 
 struct ActualCalls<'a> {
     project: &'a ScalarProject,
