@@ -476,7 +476,7 @@ pub fn parse_proof_fragment(
     ProofFragmentParse(parse_entry(source, text, configured_comments, Rule::proof_fragment))
 }
 
-#[cfg(any(test, feature = "checker-test-support"))]
+#[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
 #[doc(hidden)]
 pub fn parse_proof_module(
     source: SourceIdentity,

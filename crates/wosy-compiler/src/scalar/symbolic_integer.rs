@@ -64,7 +64,6 @@ impl IntegerSet {
         self.0.is_empty()
     }
 
-    #[cfg(test)]
     pub(super) fn every(&self, relation: IntegerRelation, bound: &BigInt) -> bool {
         self.0.iter().all(|interval| {
             (relation.less || &interval.first >= bound)

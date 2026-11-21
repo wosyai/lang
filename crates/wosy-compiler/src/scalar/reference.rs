@@ -6327,14 +6327,14 @@ impl FunctionCallSites {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-checker"))]
 pub(super) struct CheckerTargetQuery<'a> {
     pub(super) source: &'a SourceIdentity,
     pub(super) receiver: Option<&'a str>,
     pub(super) name: &'a str,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-checker"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ResolvedCheckerTarget {
     pub(super) target: ResolvedCallTarget,
@@ -6343,7 +6343,7 @@ pub(super) struct ResolvedCheckerTarget {
 
 pub(super) struct ProjectCallSiteResults {
     modules: Vec<Result<ModuleCallSites, ReferenceAnalysisError>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_targets: Vec<Option<ResolvedCheckerTarget>>,
 }
 
@@ -6424,12 +6424,12 @@ pub(super) fn resolve_project_call_sites_with_occurrences(
     resolve_project_call_sites_impl(
         modules,
         OccurrenceTypingInputs::Typed(occurrence_typing.into_iter()),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "internal-checker"))]
         &[],
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-checker"))]
 pub(super) fn resolve_project_call_sites_with_checker_targets(
     modules: &[ScalarModule],
     occurrence_typing: Vec<PreparationOccurrenceTyping>,
@@ -6455,7 +6455,7 @@ enum OccurrenceTypingInputs {
 fn resolve_project_call_sites_impl(
     modules: &[ScalarModule],
     mut occurrence_inputs: OccurrenceTypingInputs,
-    #[cfg(test)] checker_targets: &[CheckerTargetQuery<'_>],
+    #[cfg(any(test, feature = "internal-checker"))] checker_targets: &[CheckerTargetQuery<'_>],
 ) -> ProjectCallSiteResults {
     let views = modules
         .iter()
@@ -6463,7 +6463,7 @@ fn resolve_project_call_sites_impl(
         .collect::<Vec<_>>();
     let declarations = CallDeclarationIndex::new(&views);
     ProjectCallSiteResults {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "internal-checker"))]
         checker_targets: checker_targets.iter().map(|query| {
             let CallDeclaration::Function(source, declaration_span, CallFunctionKind::Ordinary, declaration) =
                 declarations.callable(query.source, query.receiver, query.name)?

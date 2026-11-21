@@ -182,7 +182,7 @@ impl ScalarProjectPreparationRejection {
 
 pub(super) fn prepare_project_occurrences(
     (validation, occurrence_typing): (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>),
-    #[cfg(test)] checker_targets: &[reference::CheckerTargetQuery<'_>],
+    #[cfg(any(test, feature = "internal-checker"))] checker_targets: &[reference::CheckerTargetQuery<'_>],
 ) -> Result<(ScalarProject, reference::ProjectCallSiteResults), ScalarProjectPreparationRejection> {
     if !validation.diagnostics.is_empty() {
         return Err(ScalarProjectPreparationRejection::extraction_or_typing(
@@ -190,9 +190,9 @@ pub(super) fn prepare_project_occurrences(
         ));
     }
     let project = validation.project;
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "internal-checker")))]
     let calls = reference::resolve_project_call_sites_with_occurrences(&project.modules, occurrence_typing);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     let calls = reference::resolve_project_call_sites_with_checker_targets(
         &project.modules, occurrence_typing, checker_targets,
     );
@@ -225,7 +225,7 @@ impl PreparedScalarProject {
     pub(crate) fn new(project: ScalarProject) -> Result<Self, ScalarProjectPreparationRejection> {
         let (project, calls) = prepare_project_occurrences(
             typecheck_scalar_project_with_occurrences(project),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "internal-checker"))]
             &[],
         )?;
         Ok(Self { project, calls })

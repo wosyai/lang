@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-internal-checker = []
+internal-checker = ["wosy-syntax/internal-checker"]
 
 [dependencies]
 codespan-reporting.workspace = true

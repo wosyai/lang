@@ -2308,14 +2308,14 @@ pub fn derive_scalar_declarations_from_cst(
 ) -> ScalarSourceDeclarations {
     derive_scalar_declarations(
         canonical,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "internal-checker"))]
         None,
     )
 }
 
 fn derive_scalar_declarations(
     canonical: &CanonicalCstRoot,
-    #[cfg(test)] mut proofs: Option<&mut Vec<CstNode>>,
+    #[cfg(any(test, feature = "internal-checker"))] mut proofs: Option<&mut Vec<CstNode>>,
 ) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
     let diagnostics = derive_scalar_diagnostics_from_cst(canonical);
@@ -2357,7 +2357,7 @@ fn derive_scalar_declarations(
     let mut generic_function = false;
     for node in source_root.children() {
         match node.kind() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "internal-checker"))]
             SyntaxKind::ProofDecl if proofs.is_some() => {
                 if let Some(proofs) = proofs.as_deref_mut() {
                     proofs.push(node);
@@ -3715,7 +3715,7 @@ mod symbolic_integer;
 #[cfg(feature = "internal-checker")]
 pub use checker_directive::ScalarCheckerTextFile;
 #[cfg(feature = "internal-checker")]
-pub use checker_project::{check_scalar_package, ScalarCheckerFailure, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope};
+pub use checker_project::{check_scalar_module_proof, check_scalar_package, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope};
 pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};
 pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{

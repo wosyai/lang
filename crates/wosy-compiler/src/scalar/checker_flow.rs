@@ -9,8 +9,9 @@ use super::{
     typecheck::is_integer_type,
     BinaryOperator, ReferenceBindingId, ScalarExpression, ScalarType, UnaryOperator,
 };
+use super::symbolic_integer::IntegerRelation;
 #[cfg(test)]
-use super::{reference::CheckerIntegerCallArgument, symbolic_integer::IntegerRelation};
+use super::reference::CheckerIntegerCallArgument;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum CheckerPredicate {
@@ -309,7 +310,6 @@ pub(super) struct IntegerBranchProof<'a> {
     pub(super) else_claim: IntegerReturn<'a>,
 }
 
-#[cfg(test)]
 fn binding_satisfies(
     state: &IntegerInputs,
     axes: &[&ReferenceBindingId],
@@ -347,7 +347,6 @@ fn shows_return_equality(
     }
 }
 
-#[cfg(test)]
 impl IntegerReturningPath<'_> {
     pub(super) fn binding_satisfies(
         &self,
@@ -365,6 +364,7 @@ impl IntegerReturningPath<'_> {
         }
     }
 
+    #[cfg(test)]
     fn shows_branch(self, proof: &IntegerBranchProof<'_>) -> Option<bool> {
         let (yes, no) = match &proof.guard {
             CheckerPredicate::Boolean(true) => (self.state, IntegerInputs::default()),
@@ -536,13 +536,12 @@ pub(super) fn exact_integer_return_at_entry(
     rest.iter().all(|path| singleton(path) == Some(value)).then(|| value.clone())
 }
 
-#[cfg(test)]
 pub(super) fn check_integer_return_bound<'a>(
     calls: &'a FunctionCallSites,
     operator: &BinaryOperator,
     bound: &BigInt,
 ) -> Option<Result<bool, IntegerCheckFailure<'a>>> {
-    match check_integer_return_bound_in_scope(calls, operator, bound, None, None)? {
+    match check_integer_return_bound_in_scope(calls, operator, bound, None, #[cfg(test)] None)? {
         Ok(ProofCoverage::Applicable(holds)) => Some(Ok(holds)),
         Ok(ProofCoverage::NoApplicableInputs) => None,
         Err(failure) => Some(Err(failure)),
@@ -570,13 +569,12 @@ pub(super) fn check_integer_return_bound_with_shows<'a>(
     check_integer_return_bound_in_scope(calls, operator, bound, entry_filter, Some(proof))
 }
 
-#[cfg(test)]
 fn check_integer_return_bound_in_scope<'a>(
     calls: &'a FunctionCallSites,
     operator: &BinaryOperator,
     bound: &BigInt,
     entry_filter: Option<&[CheckerPredicate]>,
-    proof: Option<&IntegerBranchProof<'_>>,
+    #[cfg(test)] proof: Option<&IntegerBranchProof<'_>>,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let relation = IntegerRelation::from_operator(operator)?;
     let paths = match observe_integer_returns_in_scope(calls, entry_filter, None)? {
@@ -588,6 +586,7 @@ fn check_integer_return_bound_in_scope<'a>(
         if !path.output_satisfies(relation, bound)? {
             return Some(Ok(ProofCoverage::Applicable(false)));
         }
+        #[cfg(test)]
         if let Some(proof) = proof {
             if !path.shows_branch(proof)? {
                 return Some(Ok(ProofCoverage::Applicable(false)));

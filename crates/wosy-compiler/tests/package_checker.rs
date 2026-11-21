@@ -1,9 +1,9 @@
 #![cfg(feature = "internal-checker")]
 
 use wosy_compiler::{
-    check_scalar_package, derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project,
+    check_scalar_module_proof, check_scalar_package, derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project,
     ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarNamespaceBinding,
-    ScalarPreparationInputs, ScalarTargetLayout,
+    ScalarModuleProofOutcome, ScalarPreparationInputs, ScalarProofModuleInput, ScalarTargetLayout,
 };
 use wosy_syntax::SourceIdentity;
 
@@ -397,4 +397,80 @@ fn main_initializer_compares_canonical_installed_integer_literals() {
         check(&format!("u8 value = 256; core.require(value > 0, {OUTPUT});")),
         ScalarCheckerOutcome::Invalid(_),
     ));
+}
+
+#[test]
+fn explicit_proof_module_checks_unused_pure_callable_over_arbitrary_inputs() {
+    let identity = source();
+    let base = "u8(u8) identity = fn(value) { value };";
+    let declarations = format!(
+        "{base}\nproof bounded for identity(input) -> (out) ensures (out <= 255) {{}}\nproof too_small for identity(input) -> (out) ensures (out <= 10) {{}}\nproof restricted for identity(input) -> (out) where (input <= 10) ensures (out <= 10) {{}}",
+    );
+    let proof = |name: &str, text: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            name,
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!("%%start\n{text}\n%%end"),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    assert_eq!(proof("bounded", &declarations), ScalarModuleProofOutcome::Proved);
+    assert_eq!(proof("too_small", &declarations), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(proof("restricted", &declarations), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(
+        proof("bounded", &format!("{declarations}\nu8 real = identity(7);")),
+        ScalarModuleProofOutcome::Unsupported,
+    );
+    assert!(matches!(
+        proof("invalid", &format!("{base}\nproof invalid for identity(input) -> (out) ensures (out <= 256) {{}}")),
+        ScalarModuleProofOutcome::Invalid(_),
+    ));
+    let ordinary = parse_source(identity.clone(), format!("%%start\n{base}\n%%end"), &[]);
+    assert!(ordinary.diagnostics.is_empty());
+    assert!(prepare_scalar_project(
+        vec![(derive_scalar_declarations_from_cst(ordinary.result.canonical_cst()), Vec::new())],
+        vec![identity.clone()],
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    ).is_ok());
+    let ordinary_proof = parse_source(identity, format!("%%start\n{declarations}\n%%end"), &[]);
+    assert!(!ordinary_proof.diagnostics.is_empty(), "the ordinary parse/Build entry must remain proof-free");
+}
+
+#[test]
+fn explicit_proof_module_resolves_named_callable_through_checked_namespace() {
+    let app = source();
+    let lib = SourceIdentity::new("local".into(), "demo".into(), "src/lib.w".into(), "phase4".into());
+    let app_text = "%%start\nlib = namespace demo \"src/lib.w\";\nproof all_paths for lib.choose(input) -> (out) ensures (out <= 8) {}\nproof one_path for lib.choose(input) -> (out) ensures (out <= 7) {}\n%%end";
+    let lib_text = "%%start\nu8(u8) choose = fn(input) { if (input == 0) { 7 } else { 8 } };\n%%end";
+    let ns_start = app_text.find("lib =").unwrap() as u32;
+    let ns_end = app_text.find(';').unwrap() as u32 + 1;
+    let proof = |name| check_scalar_module_proof(
+        app.clone(),
+        name,
+        vec![
+            ScalarProofModuleInput {
+                source: app.clone(),
+                text: app_text.into(),
+                namespaces: vec![ScalarNamespaceBinding {
+                    binding: "lib".into(),
+                    target: lib.clone(),
+                    span: wosy_syntax::ByteSpan::new(ns_start, ns_end),
+                }],
+            },
+            ScalarProofModuleInput {
+                source: lib.clone(),
+                text: lib_text.into(),
+                namespaces: Vec::new(),
+            },
+        ],
+        vec![app.clone(), lib.clone()],
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    );
+    assert_eq!(proof("all_paths"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(proof("one_path"), ScalarModuleProofOutcome::Refuted);
 }
