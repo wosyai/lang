@@ -3152,7 +3152,11 @@ fn float_literal_fits_type(value: f64, ty: &ScalarType) -> bool {
 }
 
 fn integer_literal_fits_type(value: &BigInt, ty: &ScalarType) -> bool {
-    let (minimum, maximum) = match ty {
+    integer_bounds(ty).is_some_and(|(minimum, maximum)| value >= &minimum && value <= &maximum)
+}
+
+pub(super) fn integer_bounds(ty: &ScalarType) -> Option<(BigInt, BigInt)> {
+    Some(match ty {
         ScalarType::I8 => (BigInt::from(i8::MIN), BigInt::from(i8::MAX)),
         ScalarType::I16 => (BigInt::from(i16::MIN), BigInt::from(i16::MAX)),
         ScalarType::I32 => (BigInt::from(i32::MIN), BigInt::from(i32::MAX)),
@@ -3163,9 +3167,8 @@ fn integer_literal_fits_type(value: &BigInt, ty: &ScalarType) -> bool {
         ScalarType::U32 => (BigInt::from(0), BigInt::from(u32::MAX)),
         ScalarType::U64 => (BigInt::from(0), BigInt::from(u64::MAX)),
         ScalarType::U128 => (BigInt::from(0), BigInt::from(u128::MAX)),
-        _ => return false,
-    };
-    value >= &minimum && value <= &maximum
+        _ => return None,
+    })
 }
 
 pub(super) fn expression_type_in_module(

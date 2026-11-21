@@ -1,0 +1,181 @@
+use std::cmp::Ordering;
+
+use num_bigint::BigInt;
+
+use super::{typecheck::integer_bounds, BinaryOperator, ScalarType};
+
+#[derive(Debug, PartialEq, Eq)]
+struct Interval {
+    first: BigInt,
+    last: BigInt,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct IntegerSet(Vec<Interval>);
+
+impl IntegerSet {
+    pub(super) fn from_type(ty: &ScalarType) -> Option<Self> {
+        let (first, last) = integer_bounds(ty)?;
+        Some(Self(vec![Interval { first, last }]))
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(super) fn split(&self, operator: &BinaryOperator, bound: &BigInt) -> Option<(Self, Self)> {
+        let (select_less, select_equal, select_greater) = match operator {
+            BinaryOperator::Equal => (false, true, false),
+            BinaryOperator::NotEqual => (true, false, true),
+            BinaryOperator::Less => (true, false, false),
+            BinaryOperator::LessEqual => (true, true, false),
+            BinaryOperator::Greater => (false, false, true),
+            BinaryOperator::GreaterEqual => (false, true, true),
+            _ => return None,
+        };
+        let mut yes = Self::default();
+        let mut no = Self::default();
+        let append = |yes: &mut Self, no: &mut Self, select, first: BigInt, last: BigInt| {
+            (if select { yes } else { no }).append(Interval { first, last });
+        };
+        for interval in &self.0 {
+            if &interval.first < bound {
+                let last = if &interval.last < bound {
+                    interval.last.clone()
+                } else {
+                    bound - 1
+                };
+                append(&mut yes, &mut no, select_less, interval.first.clone(), last);
+            }
+            if &interval.first <= bound && bound <= &interval.last {
+                append(&mut yes, &mut no, select_equal, bound.clone(), bound.clone());
+            }
+            if &interval.last > bound {
+                let first = if &interval.first > bound {
+                    interval.first.clone()
+                } else {
+                    bound + 1
+                };
+                append(&mut yes, &mut no, select_greater, first, interval.last.clone());
+            }
+        }
+        Some((yes, no))
+    }
+
+    pub(super) fn join(self, other: Self) -> Self {
+        if self.is_empty() {
+            return other;
+        }
+        if other.is_empty() {
+            return self;
+        }
+
+        let mut left = self.0.into_iter().peekable();
+        let mut right = other.0.into_iter().peekable();
+        let mut joined = Self::default();
+
+        while let (Some(a), Some(b)) = (left.peek(), right.peek()) {
+            let interval = match a.first.cmp(&b.first) {
+                Ordering::Less | Ordering::Equal => left.next(),
+                Ordering::Greater => right.next(),
+            };
+            joined.append(interval.expect("nonempty input interval stream"));
+        }
+        for interval in left.chain(right) {
+            joined.append(interval);
+        }
+        joined
+    }
+
+    fn append(&mut self, interval: Interval) {
+        if let Some(previous) = self
+            .0
+            .last_mut()
+            .filter(|previous| interval.first <= &previous.last + 1)
+        {
+            if interval.last > previous.last {
+                previous.last = interval.last;
+            }
+        } else {
+            self.0.push(interval);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_condition_proves_local_bound_and_join_keeps_only_common_facts() {
+        let input = IntegerSet::from_type(&ScalarType::U8).unwrap();
+        let (yes, no) = input.split(&BinaryOperator::Greater, &10.into()).unwrap();
+        let (passing, failing) = yes.split(&BinaryOperator::GreaterEqual, &11.into()).unwrap();
+        assert!(!passing.is_empty());
+        assert!(failing.is_empty());
+
+        let joined = yes.join(no);
+        assert_eq!(joined, input);
+        let (passing, failing) = joined.split(&BinaryOperator::GreaterEqual, &11.into()).unwrap();
+        assert!(!passing.is_empty());
+        assert!(!failing.is_empty());
+        let (_, failing) = joined.split(&BinaryOperator::LessEqual, &255.into()).unwrap();
+        assert!(failing.is_empty());
+    }
+
+    #[test]
+    fn disequality_keeps_the_hole_and_refines_against_it() {
+        let input = IntegerSet::from_type(&ScalarType::U8).unwrap();
+        let (excluding, matching) = input.split(&BinaryOperator::NotEqual, &10.into()).unwrap();
+        let (impossible, unchanged) = excluding.split(&BinaryOperator::Equal, &10.into()).unwrap();
+        assert!(impossible.is_empty());
+        assert_eq!(unchanged, excluding);
+        assert_eq!(excluding.join(matching), input);
+    }
+
+    #[test]
+    fn comparison_partitions_match_concrete_u8_values() {
+        let input = IntegerSet::from_type(&ScalarType::U8).unwrap();
+        let cases: [(BinaryOperator, fn(i32, i32) -> bool); 6] = [
+            (BinaryOperator::Equal, |value, bound| value == bound),
+            (BinaryOperator::NotEqual, |value, bound| value != bound),
+            (BinaryOperator::Less, |value, bound| value < bound),
+            (BinaryOperator::LessEqual, |value, bound| value <= bound),
+            (BinaryOperator::Greater, |value, bound| value > bound),
+            (BinaryOperator::GreaterEqual, |value, bound| value >= bound),
+        ];
+        for (operator, relation) in cases {
+            for bound in [-1, 0, 1, 126, 254, 255, 256] {
+                let (yes, no) = input.split(&operator, &bound.into()).unwrap();
+                for value in 0..=255 {
+                    let contains = |set: &IntegerSet| {
+                        let value = BigInt::from(value);
+                        set.0
+                            .iter()
+                            .any(|interval| interval.first <= value && value <= interval.last)
+                    };
+                    assert_eq!(contains(&yes), relation(value, bound));
+                    assert_eq!(contains(&no), !relation(value, bound));
+                }
+                assert_eq!(yes.join(no), input);
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_bounds_do_not_overflow() {
+        let signed = IntegerSet::from_type(&ScalarType::I128).unwrap();
+        let (impossible, unchanged) = signed
+            .split(&BinaryOperator::Less, &i128::MIN.into())
+            .unwrap();
+        assert!(impossible.is_empty());
+        assert_eq!(unchanged, signed);
+
+        let unsigned = IntegerSet::from_type(&ScalarType::U128).unwrap();
+        let (impossible, unchanged) = unsigned
+            .split(&BinaryOperator::Greater, &u128::MAX.into())
+            .unwrap();
+        assert!(impossible.is_empty());
+        assert_eq!(unchanged, unsigned);
+    }
+}

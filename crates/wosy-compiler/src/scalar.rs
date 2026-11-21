@@ -3660,6 +3660,8 @@ pub(crate) mod control;
 mod occurrence_obligations;
 mod reference;
 mod static_calls;
+#[cfg(test)]
+mod symbolic_integer;
 pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};
 pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{
