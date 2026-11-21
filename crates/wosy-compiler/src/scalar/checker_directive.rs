@@ -568,7 +568,7 @@ mod tests {
         "#;
         let suffix = "x };";
         check_source(&[prefix, guarded, suffix].concat(), |body| {
-            let bindings = &body.boundary.checker_parameter_bindings;
+            let bindings = body.boundary.checker_parameter_bindings.as_deref().unwrap();
             assert_ne!(bindings[0], bindings[1]);
             assert_eq!(check_integer_requirements(body), Some(Ok(())));
         });
@@ -697,7 +697,7 @@ mod tests {
                 assert_ne!(locals[0], locals[1]);
 
                 let failure = check_integer_requirements(body).unwrap().unwrap_err();
-                assert_eq!(failure.axes, body.boundary.checker_parameter_bindings.iter().collect::<Vec<_>>());
+                assert_eq!(failure.axes, body.boundary.checker_parameter_bindings.as_deref().unwrap().iter().collect::<Vec<_>>());
                 assert!(failure.state.includes(&[0, 0]));
                 assert!(!failure.state.includes(&[1, 0]));
             },
@@ -720,7 +720,7 @@ mod tests {
             |body| {
                 let failure = check_integer_requirements(body).unwrap().unwrap_err();
                 let local = body.structure.checker_integer_locals.values().next().unwrap();
-                assert_eq!(failure.axes, [&body.boundary.checker_parameter_bindings[0], local]);
+                assert_eq!(failure.axes, [&body.boundary.checker_parameter_bindings.as_deref().unwrap()[0], local]);
                 assert!(failure.state.includes(&[1, 7]));
                 assert!(!failure.state.includes(&[0, 7]));
                 assert!(!failure.state.includes(&[1, 6]));
@@ -764,6 +764,83 @@ mod tests {
             "{:?}",
             rejected.diagnostics,
         );
+    }
+
+    #[test]
+    fn closed_checker_root_has_one_initial_state_and_local_facts() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        for (condition, succeeds) in [("local == 7", true), ("local != 7", false)] {
+            let output = r#"{ .stdout = ""; .stderr = "closed failure"; .code = 1; .files = []; }"#;
+            let source =
+                format!("unit() check_value = fn {{ u8 local = 7; core.require({condition}, {output}); }};");
+            check_source(&source, |body| {
+                assert_eq!(body.boundary.checker_parameter_bindings.as_deref(), Some([].as_slice()));
+                let result = check_integer_requirements(body).unwrap();
+                if succeeds {
+                    assert_eq!(result, Ok(()));
+                } else {
+                    let failure = result.unwrap_err();
+                    let local = body.structure.checker_integer_locals.values().next().unwrap();
+                    assert_eq!(failure.axes, [local]);
+                    assert_eq!(failure.state.row_count(), 1);
+                    assert!(failure.state.includes(&[7]));
+                    assert!(!failure.state.includes(&[0]));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn closed_checker_failure_retains_only_live_local_axes() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        check_source(
+            r#"
+            unit() check_value = fn {
+                u8 outer = 7;
+                if (outer == 7) {
+                    u8 expired = 2;
+                    core.require(expired == 2, { .stdout = ""; .stderr = "expired"; .code = 1; .files = []; });
+                }
+                if (outer == 7) {
+                    u8 active = 3;
+                    core.require(active == 4, { .stdout = ""; .stderr = "active"; .code = 1; .files = []; });
+                }
+                core.require(outer == 7, { .stdout = ""; .stderr = "outer"; .code = 1; .files = []; });
+            };
+            "#,
+            |body| {
+                let failure = check_integer_requirements(body).unwrap().unwrap_err();
+                assert_eq!(body.structure.checker_integer_locals.len(), 3);
+                assert_eq!(failure.axes.len(), 2);
+                assert!(failure.state.includes(&[7, 3]));
+                assert!(!failure.state.includes(&[7, 2]));
+            },
+        );
+    }
+
+    #[test]
+    fn closed_root_unsupported_expressions_and_ordinary_preparation_are_not_success() {
+        use crate::scalar::{checker_flow::check_integer_requirements, reference, typecheck_scalar_project_in_mode};
+        for source in [
+            r#"unit() check_value = fn {
+                core.require(true, { .stdout = ""; .stderr = "unsupported"; .code = 1; .files = []; });
+            };"#,
+            r#"
+            unit() check_value = fn { effect(); };
+            unit() effect = fn {};
+            "#,
+        ] {
+            check_source(source, |body| assert_eq!(check_integer_requirements(body), None));
+        }
+
+        let project = checker_project("unit() ordinary = fn {};");
+        let (checked, typing) = typecheck_scalar_project_in_mode(project, false);
+        assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
+        let calls = reference::resolve_project_call_sites_with_occurrences(&checked.project.modules, typing);
+        assert_eq!(calls.lookup_errors().count(), 0);
+        let body = calls.function(0, 0);
+        assert!(body.boundary.checker_parameter_bindings.is_none());
+        assert_eq!(check_integer_requirements(body), None);
     }
 
 }

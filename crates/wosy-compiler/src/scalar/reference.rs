@@ -6093,7 +6093,7 @@ pub(super) struct RootOutputType {
 pub(super) struct CallableBoundary {
     pub(super) parameters: Vec<ParameterSlot>,
     #[cfg(test)]
-    pub(super) checker_parameter_bindings: Vec<ReferenceBindingId>,
+    pub(super) checker_parameter_bindings: Option<Vec<ReferenceBindingId>>,
     pub(super) results: Vec<DeclaredResultSlot>,
     pub(super) root_outputs: Vec<RootOutputType>,
     pub(super) generics: Vec<ScalarGenericParameter>,
@@ -8291,7 +8291,10 @@ fn resolve_function_call_sites(
         })
         .collect::<Vec<_>>();
     #[cfg(test)]
-    let mut checker_parameter_bindings = Vec::new();
+    let mut checker_parameter_bindings = resolver
+        .occurrence_typing
+        .checker_directives_enabled()
+        .then(|| Vec::with_capacity(parameters.len()));
     for slot in &parameters {
         let binding = WalkBinding {
             declaration_span: slot.span,
@@ -8299,8 +8302,8 @@ fn resolve_function_call_sites(
             introduced_by_assignment: false,
         };
         #[cfg(test)]
-        if resolver.occurrence_typing.checker_directives_enabled() {
-            checker_parameter_bindings.push(binding.reference_id(source, function.span));
+        if let Some(bindings) = &mut checker_parameter_bindings {
+            bindings.push(binding.reference_id(source, function.span));
         }
         parameter_types.insert(slot.name.clone(), slot.ty.clone());
         parameter_names.insert(slot.name.clone(), binding);

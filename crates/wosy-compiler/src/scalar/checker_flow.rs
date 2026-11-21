@@ -236,16 +236,13 @@ pub(super) fn check_integer_requirements(
     calls: &FunctionCallSites,
 ) -> Option<Result<(), IntegerCheckFailure<'_>>> {
     let boundary = &calls.boundary;
-    if boundary.parameters.is_empty()
-        || boundary.parameters.len() != boundary.checker_parameter_bindings.len()
-    {
-        return None;
-    }
+    let checker_parameters = boundary.checker_parameter_bindings.as_deref()?;
+    debug_assert_eq!(boundary.parameters.len(), checker_parameters.len());
     let mut roots = IntegerRoots {
         parameters: boundary.parameters.len(),
         ..IntegerRoots::default()
     };
-    for (binding, parameter) in boundary.checker_parameter_bindings.iter().zip(&boundary.parameters) {
+    for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
         roots.add(binding, &parameter.ty);
     }
     let root = boundary
