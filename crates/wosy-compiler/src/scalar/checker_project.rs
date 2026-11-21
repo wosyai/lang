@@ -1,5 +1,5 @@
 use super::{
-    checker_directive::CheckerOperation,
+    checker_directive::{CheckedLiteralOutput, CheckerOperation},
     checker_flow::{check_integer_requirements, IntegerInputs},
     project_from_declarations,
     static_calls::prepare_project_occurrences,
@@ -26,6 +26,7 @@ enum ProjectCheck {
         condition: ByteSpan,
         state: IntegerInputs,
         axes: Vec<ReferenceBindingId>,
+        output: CheckedLiteralOutput,
     },
 }
 
@@ -90,6 +91,7 @@ fn check_closed_project_callable(
                 condition: directive.condition,
                 state: failure.state,
                 axes: failure.axes.into_iter().cloned().collect(),
+                output: directive.output.clone(),
             }
         }
     }
@@ -97,6 +99,7 @@ fn check_closed_project_callable(
 
 mod tests {
     use super::*;
+    use num_bigint::BigInt;
     use crate::{derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project, ScalarTargetLayout};
 
     const OUTPUT: &str = r#"{ .stdout = ""; .stderr = "unexpected state"; .code = 1; .files = []; }"#;
@@ -134,7 +137,8 @@ mod tests {
         let app = source("src/main.w", "app");
         let other = source("src/other.w", "dependency");
         let passing = script(&format!("u8 local = 7; if (local == 7) {{}}; core.require(local == 7, {OUTPUT});"));
-        let failing = script(&format!("u8 local = 7; if (local == 7) {{}}; core.require(local == 8, {OUTPUT});"));
+        let failure_output = r#"{ .stdout = "saída\n"; .stderr = "erro\t☕"; .code = 340282366920938463463374607431768211456; .files = []; }"#;
+        let failing = script(&format!("u8 local = 7; if (local == 7) {{}}; core.require(local == 8, {failure_output});"));
         for (source, expected_proof) in [(&app, false), (&other, true)] {
             let result = check_closed_project_callable(
                 vec![
@@ -149,7 +153,7 @@ mod tests {
             if expected_proof {
                 assert_eq!(result, ProjectCheck::Proved);
             } else {
-                let ProjectCheck::Failed { source, operation, directive, condition, state, axes } = result else {
+                let ProjectCheck::Failed { source, operation, directive, condition, state, axes, output } = result else {
                     panic!("expected exact failure, found {result:?}");
                 };
                 assert_eq!(source, app);
@@ -157,8 +161,16 @@ mod tests {
                 assert_eq!(&failing[condition.start as usize..condition.end as usize], "local == 8");
                 assert_eq!(
                     &failing[directive.start as usize..directive.end as usize],
-                    format!("core.require(local == 8, {OUTPUT})")
+                    format!("core.require(local == 8, {failure_output})")
                 );
+                let authored = |span: ByteSpan| &failing[span.start as usize..span.end as usize];
+                assert_eq!(output.stdout_bytes.as_ref(), "saída\n".as_bytes());
+                assert_eq!(output.stderr_bytes.as_ref(), "erro\t☕".as_bytes());
+                assert_eq!(output.code_value, BigInt::from(u128::MAX) + 1);
+                assert_eq!(authored(output.stdout), r#""saída\n""#);
+                assert_eq!(authored(output.stderr), r#""erro\t☕""#);
+                assert_eq!(authored(output.code), "340282366920938463463374607431768211456");
+                assert_eq!(authored(output.files), "[]");
                 assert_eq!(axes.len(), 1);
                 assert!(state.includes(&[7]));
                 assert!(!state.includes(&[8]));
