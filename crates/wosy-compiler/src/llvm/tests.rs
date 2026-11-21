@@ -5373,6 +5373,51 @@ fn emits_generic_extern_module_symbol_and_signature() {
 }
 
 #[test]
+fn extern_import_module_roundtrips_escaped_llvm_attribute_bytes() {
+    use inkwell::{attributes::AttributeLoc, memory_buffer::MemoryBuffer};
+
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    let validation = derive_scalar_program(
+        &parse_source(
+            source,
+            r#"%%start
+env = extern wasm "café\" tools\\path\n\t" { i32() read; };
+i32 value = env.read();
+%%end"#
+                .into(),
+            &[],
+        )
+        .result,
+    );
+    assert!(validation.diagnostics.is_empty(), "{:?}", validation.diagnostics);
+    let partition = emit_scalar_llvm(&validation).expect("valid Wosy import");
+    let [declaration] = partition.declarations.as_slice() else {
+        panic!("expected one extern declaration")
+    };
+    let ir = partition.to_text();
+    assert!(ir.contains(r#"wasm-import-module"="caf\C3\A9\22 tools\5Cpath\0A\09""#));
+    let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "extern-attribute");
+    let context = Context::create();
+    let module = context.create_module_from_ir(buffer).expect("parse emitted LLVM");
+    module.verify().expect("verify emitted LLVM");
+    let function = module.get_function(&declaration.name).expect("extern symbol");
+    for (key, expected) in [
+        ("wasm-import-module", "café\" tools\\path\n\t"),
+        ("wasm-import-name", "read"),
+    ] {
+        let attribute = function
+            .get_string_attribute(AttributeLoc::Function, key)
+            .expect("extern string attribute");
+        assert_eq!(attribute.get_string_value().to_bytes(), expected.as_bytes());
+    }
+}
+
+#[test]
 fn emits_injective_extern_identity_for_same_symbols() {
     let source = SourceIdentity::new(
         "project".into(),

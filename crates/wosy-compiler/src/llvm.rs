@@ -1198,8 +1198,8 @@ impl LlvmPartition {
                     serialized,
                     "attributes #{} = {{ \"wasm-import-module\"=\"{}\" \"wasm-import-name\"=\"{}\" }}",
                     attributes.group,
-                    attributes.wasm_import_module,
-                    attributes.wasm_import_name
+                    LlvmQuotedAttribute(&attributes.wasm_import_module),
+                    LlvmQuotedAttribute(&attributes.wasm_import_name)
                 )
                 .expect("writing to a String cannot fail");
             }
@@ -1243,6 +1243,26 @@ impl LlvmPartition {
             }
             serialized
         }
+    }
+}
+
+struct LlvmQuotedAttribute<'a>(&'a str);
+
+impl std::fmt::Display for LlvmQuotedAttribute<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut start = 0;
+        for (index, ch) in self.0.char_indices() {
+            if ch.is_ascii() && !ch.is_ascii_control() && !matches!(ch, '"' | '\\') {
+                continue;
+            }
+            formatter.write_str(&self.0[start..index])?;
+            let mut buffer = [0; 4];
+            for byte in ch.encode_utf8(&mut buffer).bytes() {
+                write!(formatter, "\\{byte:02X}")?;
+            }
+            start = index + ch.len_utf8();
+        }
+        formatter.write_str(&self.0[start..])
     }
 }
 
