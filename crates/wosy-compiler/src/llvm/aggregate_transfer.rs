@@ -427,9 +427,10 @@ fn emit_selected_call<'ctx, 'module>(
             let [output] = outputs.outputs.as_slice() else {
                 return Err(format!("invalid closed aggregate output {symbol}"));
             };
-            Some(entry_alloca(
+            Some(entry_storage_alloca(
+                context,
                 state,
-                storage_type(context, &output.ty, state.layouts, state.target_layout)?,
+                &output.ty,
                 "aggregate_destination",
             )?)
         }

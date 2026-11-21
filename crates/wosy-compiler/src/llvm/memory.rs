@@ -1,3 +1,5 @@
+use inkwell::values::BasicValue;
+
 use super::expression::{
     emit_expression, emit_project_expression, emit_project_typed_expression, emit_unary_value,
 };
@@ -76,6 +78,15 @@ pub(super) fn storage_type<'ctx>(
     layouts: &crate::scalar::layout::ScalarLayoutIndex<'_>,
     target_layout: ScalarTargetLayout,
 ) -> Result<BasicTypeEnum<'ctx>, String> {
+    storage_type_and_alignment(context, ty, layouts, target_layout).map(|(ty, _)| ty)
+}
+
+pub(super) fn storage_type_and_alignment<'ctx>(
+    context: &'ctx Context,
+    ty: &ScalarType,
+    layouts: &crate::scalar::layout::ScalarLayoutIndex<'_>,
+    target_layout: ScalarTargetLayout,
+) -> Result<(BasicTypeEnum<'ctx>, Option<u64>), String> {
     match ty {
         ScalarType::Struct(id) => {
             let structure = layouts
@@ -87,16 +98,31 @@ pub(super) fn storage_type<'ctx>(
                 .ok_or_else(|| format!("LLVM struct {} has no valid layout", id.index))?;
             let size =
                 u32::try_from(layout.size).map_err(|_| "struct layout exceeds LLVM array size")?;
-            Ok(context.i8_type().array_type(size).into())
+            Ok((context.i8_type().array_type(size).into(), Some(layout.alignment)))
         }
         ScalarType::Array {
             element, length, ..
-        } => Ok(storage_type(context, element, layouts, target_layout)?
-            .array_type(
-                u32::try_from(*length).map_err(|_| "fixed array length exceeds LLVM array size")?,
-            )
-            .into()),
-        _ => basic_type(context, ty, target_layout),
+        } => {
+            let (element, alignment) =
+                storage_type_and_alignment(context, element, layouts, target_layout)?;
+            let length =
+                u32::try_from(*length).map_err(|_| "fixed array length exceeds LLVM array size")?;
+            Ok((element.array_type(length).into(), alignment))
+        }
+        _ => Ok((basic_type(context, ty, target_layout)?, None)),
+    }
+}
+
+pub(super) fn storage_alignment(alignment: Option<u64>) -> Result<Option<u32>, String> {
+    match alignment {
+        None | Some(1) => Ok(None),
+        Some(alignment) => {
+            let alignment = u32::try_from(alignment)
+                .ok()
+                .filter(|alignment| alignment.is_power_of_two())
+                .ok_or_else(|| "LLVM aggregate storage alignment is not representable".to_owned())?;
+            Ok(Some(alignment))
+        }
     }
 }
 
@@ -250,6 +276,31 @@ pub(super) fn entry_alloca<'ctx, 'module>(
         .build_alloca(ty, name)
         .map_err(builder_error)?;
     state.builder.position_at_end(insert);
+    Ok(slot)
+}
+
+pub(super) fn align_storage_alloca(
+    slot: PointerValue<'_>,
+    alignment: Option<u64>,
+) -> Result<(), String> {
+    if let Some(alignment) = storage_alignment(alignment)? {
+        slot.as_instruction_value()
+            .ok_or_else(|| "LLVM aggregate storage is not an alloca".to_owned())?
+            .set_alignment(alignment)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+pub(super) fn entry_storage_alloca<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    ty: &ScalarType,
+    name: &str,
+) -> Result<PointerValue<'ctx>, String> {
+    let (ty, alignment) = storage_type_and_alignment(context, ty, state.layouts, state.target_layout)?;
+    let slot = entry_alloca(state, ty, name)?;
+    align_storage_alloca(slot, alignment)?;
     Ok(slot)
 }
 
@@ -548,6 +599,7 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
         u32::try_from(layout.size).map_err(|_| "struct layout exceeds LLVM array size")?,
     );
     let destination = entry_alloca(state, storage.into(), "struct_literal")?;
+    align_storage_alloca(destination, Some(layout.alignment))?;
     let mut values = BTreeMap::new();
     for field in &structure.fields {
         values.entry(field.name.as_str()).or_insert((&field.ty, None));
@@ -590,9 +642,10 @@ pub(super) fn emit_array_literal<'ctx, 'module>(
     if elements.len() as u64 != *length {
         return Err("array literal element count does not match fixed array length".to_owned());
     }
-    let storage = storage_type(context, expected, state.layouts, state.target_layout)?;
+    let (storage, alignment) =
+        storage_type_and_alignment(context, expected, state.layouts, state.target_layout)?;
     let destination = entry_alloca(state, storage, "array_literal")?;
-    let element_storage = storage_type(context, element, state.layouts, state.target_layout)?;
+    align_storage_alloca(destination, alignment)?;
     for (index, expression) in elements.iter().enumerate() {
         let pointer = unsafe {
             state.builder.build_in_bounds_gep(
@@ -607,7 +660,6 @@ pub(super) fn emit_array_literal<'ctx, 'module>(
         }
         .map_err(builder_error)?;
         let value = emit_typed_expression(context, state, expression, element)?;
-        let _ = element_storage;
         store_value(context, state, pointer, element, value)?;
     }
     Ok(EmitValue::Basic(destination.into()))
@@ -681,11 +733,7 @@ pub(super) fn emit_utf8_literal<'ctx, 'module>(
         .map(|byte| byte_type.const_int(u64::from(*byte), false))
         .collect::<Vec<_>>();
     literal.set_initializer(&byte_type.const_array(&bytes));
-    let destination = entry_alloca(
-        state,
-        storage_type(context, expected, state.layouts, state.target_layout)?,
-        "utf8_literal",
-    )?;
+    let destination = entry_storage_alloca(context, state, expected, "utf8_literal")?;
     let data_offset = state
         .layouts
         .field(&structure.fields[0].id)

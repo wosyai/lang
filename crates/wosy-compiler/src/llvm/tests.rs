@@ -7027,6 +7027,75 @@ fn emits_project_short_circuit_cfg_with_qualified_rhs() {
 }
 
 #[test]
+fn aligns_byte_backed_aggregate_storage_at_each_typed_producer() {
+    let text = "%%start
+struct copy Packet { u8 tag; *?u8 data; }
+Packet first = { .tag = 7; .data = null; };
+Packet[2] collection = [first, first];
+*?u8(Packet) read_packet = fn(input) { *Packet view = &input; (*view).data };
+u8() read_local = fn { Packet local = { .tag = 9; .data = null; }; local.tag };
+%%end";
+    let source = SourceIdentity::new(
+        "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+    );
+    for (layout, alignment, size) in [
+        (ScalarTargetLayout::WASM32, 4, 8),
+        (ScalarTargetLayout::NATIVE64, 8, 16),
+    ] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (project_route, llvm) in [
+            (false, emit_scalar_llvm(&single).unwrap().to_text()),
+            (true, emit_scalar_project_llvm(&project).unwrap().to_text()),
+        ] {
+            for (name, ty) in [
+                ("first", format!("[{size} x i8]")),
+                ("collection", format!("[2 x [{size} x i8]]")),
+            ] {
+                let name = if project_route {
+                    project_global_name(&source, name)
+                } else {
+                    name.to_owned()
+                };
+                assert!(
+                    llvm.contains(&format!(
+                        "@{name} = internal global {ty} zeroinitializer, align {alignment}"
+                    )),
+                    "{llvm}"
+                );
+            }
+            for (name, ty) in [
+                ("struct_literal", format!("[{size} x i8]")),
+                ("local", format!("[{size} x i8]")),
+                ("array_literal", format!("[2 x [{size} x i8]]")),
+            ] {
+                assert!(
+                    llvm.contains(&format!("%{name} = alloca {ty}, align {alignment}")),
+                    "{llvm}"
+                );
+            }
+            assert!(
+                llvm.lines().any(|line| line.trim_start().starts_with("%input")
+                    && line.contains(&format!(" = alloca [{size} x i8], align {alignment}"))),
+                "{llvm}"
+            );
+            assert!(
+                llvm.lines().any(|line| line.contains("getelementptr inbounds i8, ptr %deref")
+                    && line.ends_with(&format!(", i8 {alignment}"))),
+                "{llvm}"
+            );
+        }
+    }
+}
+
+#[test]
 fn preserves_large_aggregate_byte_offsets_in_literals_and_resolved_accesses() {
     let padding = vec!["0"; 127].join(", ");
     let middle = vec!["0"; 126].join(", ");
