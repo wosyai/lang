@@ -1968,29 +1968,48 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             };
                             if *mutability == ScalarReferenceMutability::Mutable
                                 && matches!(place, ScalarPlace::Dereference { .. })
-                                && self.proof_points.pending_named_reborrow.as_ref()
-                                    .is_none_or(|pending| pending.handle == binding)
                             {
                                 let read = self.cursor.expect("named checked read");
-                                if let Some((_, root, entry, origin)) = self.deferred_reborrow_roots
-                                    .iter().find(|(handle, root, entry, _)| *handle == binding
+                                let pending = self.proof_points.pending_named_reborrow.as_ref();
+                                let direct = self.deferred_reborrow_roots.iter().find(|(handle, root, entry, _)| {
+                                    *handle == binding
                                         && (matches!(root, super::control::DeferredReborrowRoot::Formal { .. })
-                                            || self.cfg.points[entry.0].scope == scope))
+                                            || self.cfg.points[entry.0].scope == scope)
+                                });
+                                let nested = pending.filter(|pending| pending.handle != binding
+                                    && pending.sites.iter().all(|site| site.parent.is_none()))
+                                    .and_then(|pending| pending.sites.iter().find_map(|site| {
+                                        let holder = site.holder?;
+                                        let point = &self.cfg.points[holder.0];
+                                        (holder < read && point.scope == scope
+                                            && self.cfg.points[site.point.0].scope == scope
+                                            && matches!(&point.kind, CfgPointKind::Bind { binding: child } if *child == binding))
+                                            .then_some((site.point, holder))
+                                    }));
+                                if nested.is_some() || (direct.is_some()
+                                    && pending.is_none_or(|pending| pending.handle == binding))
                                 {
-                                    let (root, entry, origin) = (root.clone(), *entry, *origin);
                                     if matches!(&self.cfg.points[read.0].kind,
                                         CfgPointKind::Read { binding: read_binding } if *read_binding == binding)
                                         && self.cfg.points[read.0].possible_origins.is_none()
                                     {
+                                        let seed = if pending.is_none() {
+                                            direct.map(|(_, root, entry, origin)| (root.clone(), *entry, *origin))
+                                        } else {
+                                            None
+                                        };
                                         let point = self.point_with_origins(
                                             CfgPointKind::Evaluate(expression.clone()), span, scope, None,
                                         );
                                         let pending = self.proof_points.pending_named_reborrow
-                                            .get_or_insert_with(|| super::control::PendingNamedReborrow {
-                                                sites: Vec::new(), entry, handle: binding, root, origin,
+                                            .get_or_insert_with(|| {
+                                                let (root, entry, origin) = seed.expect("initial named reborrow root");
+                                                super::control::PendingNamedReborrow {
+                                                    sites: Vec::new(), entry, handle: binding, root, origin,
+                                                }
                                             });
                                         pending.sites.push(super::control::PendingReborrowSite {
-                                            point, read, holder: None,
+                                            point, read, holder: None, parent: nested,
                                         });
                                         self.aggregate_facts.receipt_loan_sinks.insert(point, vec![read]);
                                         return Ok(ReferenceValue::Uncomputed);
@@ -4745,30 +4764,16 @@ fn is_deferred_reborrow_child(parent: &ReferenceOrigin, child: &ReferenceOrigin,
     }
 }
 
-fn exact_live_named_reborrow(
+fn exact_live_reborrow_holder(
     state: &ReferenceEdgeState,
-    pending: &super::control::PendingNamedReborrow,
-    site: &super::control::PendingReborrowSite,
-    facts: &[ReferenceOrigin],
+    binding: &ReferenceBindingId,
+    origin: ReferenceOriginId,
 ) -> bool {
-    let exact = |origins: Option<&BTreeSet<ReferenceOriginId>>| {
-        origins.is_some_and(|origins| origins.len() == 1 && origins.contains(&pending.origin))
-    };
-    if !exact(state.point_values.get(site.read))
-        || !exact(state.bindings.get(&pending.handle))
-        || state.released.contains(&pending.handle)
-        || state.invalidated.contains(&pending.handle)
-        || state.uninitialized.contains(&pending.handle)
-        || !unavailable_checked_handles(state, &pending.handle, &[], CheckedHandleStorage::Lexical).is_empty()
-    {
-        return false;
-    }
-    let owner = deferred_reborrow_owner(pending);
-    !state.released.contains(owner)
-        && !state.invalidated.contains(owner)
-        && !state.uninitialized.contains(owner)
-        && deferred_reborrow_fact(pending, facts)
-            .is_some_and(|(_, loan)| !unavailable_place(state, &loan.origin_place))
+    state.bindings.get(binding).is_some_and(|origins| origins.len() == 1 && origins.contains(&origin))
+        && !state.released.contains(binding)
+        && !state.invalidated.contains(binding)
+        && !state.uninitialized.contains(binding)
+        && unavailable_checked_handles(state, binding, &[], CheckedHandleStorage::Lexical).is_empty()
 }
 
 fn transfer_reference_facts(
@@ -4867,6 +4872,16 @@ fn transfer_reference_facts(
                 CfgPointKind::Read { binding } if child_holders.contains_key(binding) =>
                     original_points.get(index + 1).is_none_or(|next| {
                         if exact_child_store(next).is_some() {
+                            return false;
+                        }
+                        if point.successors.as_slice() == [next.id]
+                            && pending.sites.binary_search_by_key(&next.id, |site| site.point).ok()
+                                .is_some_and(|position| {
+                                    let site = &pending.sites[position];
+                                    site.read == point.id && site.parent.is_some_and(|(parent, _)|
+                                        child_holders.get(binding).copied() == Some(parent))
+                                })
+                        {
                             return false;
                         }
                         point.successors.as_slice() != [next.id]
@@ -5001,6 +5016,34 @@ fn transfer_reference_facts(
             };
             site.map(|site| (pending, site))
         });
+        let selected_parent = pending_here.and_then(|(pending, site)| {
+            let (root, root_loan) = deferred_reborrow_fact(pending, cfg.facts)?;
+            let Some((producer, holder)) = site.parent else {
+                return Some((pending.origin, &pending.handle));
+            };
+            let read = &original_points[site.read.0];
+            let declaration = &original_points[holder.0];
+            let CfgPointKind::Bind { binding } = &declaration.kind else { return None };
+            if producer >= holder || holder >= site.read
+                || read.successors.as_slice() != [site.point]
+                || declaration.scope != read.scope || read.scope != original_points[site.point.0].scope
+                || !matches!(&read.kind, CfgPointKind::Read { binding: read_binding } if read_binding == binding)
+                || child_holders.get(binding).copied() != Some(producer)
+            {
+                return None;
+            }
+            let source = &cfg.points[producer.0];
+            let CfgPointKind::Borrow { loan, .. } = &source.kind else { return None };
+            let origins = source.possible_origins.as_ref()?;
+            let origin = *origins.first().filter(|_| origins.len() == 1)?;
+            if source.scope != read.scope || loan.parent.as_deref() != Some(root_loan)
+                || loan.mode != ScalarReferenceMutability::Mutable
+                || !is_deferred_reborrow_child(root, cfg.facts.get(origin.0)?, loan)
+            {
+                return None;
+            }
+            Some((origin, binding))
+        });
         let effective_point = pending_here.map(|(pending, site)| {
             let mut point = original_points[id.0].clone();
             let valid = pending_allowed && strictly_forward
@@ -5023,16 +5066,31 @@ fn transfer_reference_facts(
                     }
                 }
                 && !states.is_empty()
-                && states.iter().all(|state| exact_live_named_reborrow(state, pending, site, cfg.facts));
+                && selected_parent.is_some_and(|(origin, binding)| states.iter().all(|state| {
+                    let owner = deferred_reborrow_owner(pending);
+                    let read = state.point_values.get(site.read);
+                    exact_live_reborrow_holder(state, &pending.handle, pending.origin)
+                        && (binding == &pending.handle || exact_live_reborrow_holder(state, binding, origin))
+                        && read.is_some_and(|origins| origins.len() == 1 && origins.contains(&origin))
+                        && !state.released.contains(owner) && !state.invalidated.contains(owner)
+                        && !state.uninitialized.contains(owner)
+                        && deferred_reborrow_fact(pending, cfg.facts)
+                            .is_some_and(|(_, loan)| !unavailable_place(state, &loan.origin_place))
+                }));
             if valid {
+                let (origin, _) = selected_parent.expect("validated immediate reborrow parent");
+                let parent_fact = &cfg.facts[origin.0];
+                let parent = match parent_fact {
+                    ReferenceOrigin::BorrowedFrom { loan, .. } | ReferenceOrigin::Fresh { loan, .. } => loan,
+                    _ => unreachable!("validated immediate reborrow loan"),
+                };
                 if cfg.resolve_pending_named_reborrow {
                     let CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { place, mutability, .. }) = &point.kind else {
                         unreachable!("provisional named reborrow expression")
                     };
-                    let (root, parent) = deferred_reborrow_fact(pending, cfg.facts)
-                        .expect("validated deferred reborrow root");
                     let mut origin_place = parent.origin_place.clone();
                     origin_place.place = place.clone();
+                    origin_place.projections.clear();
                     collect_reference_projections(place, Some(parent), &mut origin_place.projections);
                     let loan = ReferenceLoanId {
                         mode: *mutability,
@@ -5040,7 +5098,7 @@ fn transfer_reference_facts(
                         creation_span: point.source_span.range,
                         parent: Some(Box::new(parent.clone())),
                     };
-                    let child = deferred_reborrow_child(root, loan.clone());
+                    let child = deferred_reborrow_child(parent_fact, loan.clone());
                     let child_id = match cfg.facts.iter().position(|origin| *origin == child) {
                         Some(index) => ReferenceOriginId(index),
                         None => {
@@ -5054,13 +5112,11 @@ fn transfer_reference_facts(
                     return point;
                 }
                 if matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
-                    if deferred_reborrow_fact(pending, cfg.facts).is_some_and(|(root, parent)| {
-                        loan.parent.as_deref() == Some(parent)
-                            && point.possible_origins.as_ref().is_some_and(|origins| {
-                                origins.len() == 1 && origins.first().is_some_and(|child|
-                                    cfg.facts.get(child.0).is_some_and(|child| is_deferred_reborrow_child(root, child, loan)))
-                            })
-                    }))
+                    if loan.parent.as_deref() == Some(parent)
+                        && point.possible_origins.as_ref().is_some_and(|origins| {
+                            origins.len() == 1 && origins.first().is_some_and(|child|
+                                cfg.facts.get(child.0).is_some_and(|child| is_deferred_reborrow_child(parent_fact, child, loan)))
+                        }))
                 {
                     return point;
                 }
@@ -6015,8 +6071,8 @@ fn transfer_reference_facts(
                         let check = if loan.parent.is_none() {
                             is_lexical_field_path(&place.projections)
                         } else {
-                            pending_here.is_some_and(|(pending, site)| state.point_values.get(site.read)
-                                .is_some_and(|origins| origins.contains(&pending.origin)))
+                            pending_here.is_some_and(|(_, site)| selected_parent.is_some_and(|(origin, _)|
+                                state.point_values.get(site.read).is_some_and(|origins| origins.contains(&origin))))
                                 || cfg.named_reborrow_parents
                                 .binary_search_by_key(&id, |parent| parent.borrow)
                                 .ok()
@@ -10153,9 +10209,29 @@ fn build_function_reference_cfg(
                 let prior_errors = errors.len();
                 if pending.sites.len() > 1 {
                     errors.extend(provisional.iter().filter(|error| matches!(error,
-                        ReferenceAnalysisError::ConflictingPlace { source_span, .. } if pending.sites.iter().any(|site| {
+                        ReferenceAnalysisError::ConflictingPlace { source_span, origins } if pending.sites.iter().any(|site| {
                             let solved = &builder.cfg.points[site.point.0];
-                            matches!(solved.kind, CfgPointKind::Borrow { .. }) && solved.source_span == *source_span
+                            matches!(solved.kind, CfgPointKind::Borrow { .. })
+                                && (solved.source_span == *source_span
+                                    || (site.parent.is_some_and(|(_, holder)| {
+                                        origins.contains(&solved.source_span)
+                                            && builder.proof_points.checked_pointee_reads.iter()
+                                                .chain(&builder.proof_points.deferred_child_scalar_stores)
+                                                .any(|access| {
+                                                    let point = &builder.cfg.points[access.0];
+                                                    let pointer = match &point.kind {
+                                                        CfgPointKind::ReadPlace { pointer_point: Some(pointer), .. }
+                                                        | CfgPointKind::AssignThrough { pointer_point: pointer, .. } => *pointer,
+                                                        _ => return false,
+                                                    };
+                                                    point.source_span == *source_span
+                                                        && matches!(&builder.cfg.initial_points[pointer.0].kind,
+                                                            CfgPointKind::Read { binding }
+                                                                if binding == &pending.handle || matches!(
+                                                                    &builder.cfg.initial_points[holder.0].kind,
+                                                                    CfgPointKind::Bind { binding: parent } if parent == binding))
+                                                })
+                                    })))
                         })
                     )).cloned());
                 }

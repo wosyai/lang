@@ -50,6 +50,7 @@ pub(super) struct PendingReborrowSite {
     pub(super) point: super::CfgPointId,
     pub(super) read: super::CfgPointId,
     pub(super) holder: Option<super::CfgPointId>,
+    pub(super) parent: Option<(super::CfgPointId, super::CfgPointId)>,
 }
 
 pub(super) struct PendingNamedReborrow {
