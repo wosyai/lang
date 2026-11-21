@@ -3,6 +3,7 @@ target triple = "wasm32-wasi"
 ; Heap starts above the default 64 KiB stack-last region so the bump region never grows through live frames.
 @__wosy_core_heap_cursor = internal global i64 131072
 @__wosy_core_free_head = internal global i32 0
+@__wosy_wasm_tail = internal global i32 0
 
 declare i32 @llvm.wasm.memory.size.i32(i32)
 declare i32 @llvm.wasm.memory.grow.i32(i32, i32)
@@ -10,169 +11,285 @@ declare void @proc_exit(i32) #0
 
 attributes #0 = { "wasm-import-module"="wasi_snapshot_preview1" "wasm-import-name"="proc_exit" }
 
+declare i32 @llvm.ctlz.i32(i32, i1 immarg)
+declare i32 @llvm.cttz.i32(i32, i1 immarg)
+
+define internal void @__wosy_wasm_block(i32 %h, i32 %span, i32 %prev, i32 %log, i32 %free) {
+entry:
+  %p = inttoptr i32 %h to ptr
+  %slot = getelementptr i8, ptr %p, i32 4
+  %log_lo = and i32 %log, 3
+  %log_shifted = shl i32 %log_lo, 1
+  %flags = or i32 %log_shifted, %free
+  %span_word = or i32 %span, %flags
+  %log_hi = lshr i32 %log, 2
+  %prev_word = or i32 %prev, %log_hi
+  store i32 %span_word, ptr %p, align 4
+  store i32 %prev_word, ptr %slot, align 4
+  ret void
+}
+
+define internal void @__wosy_wasm_set_prev(i32 %h, i32 %prev) {
+entry:
+  %p = inttoptr i32 %h to ptr
+  %slot = getelementptr i8, ptr %p, i32 4
+  %word = load i32, ptr %slot, align 4
+  %align_bits = and i32 %word, 7
+  %new = or i32 %prev, %align_bits
+  store i32 %new, ptr %slot, align 4
+  ret void
+}
+
+define internal void @__wosy_wasm_unlink(i32 %h) {
+entry:
+  %p = inttoptr i32 %h to ptr
+  %back_slot = getelementptr i8, ptr %p, i32 8
+  %next_slot = getelementptr i8, ptr %p, i32 12
+  %back = load i32, ptr %back_slot, align 4
+  %next = load i32, ptr %next_slot, align 4
+  %has_back = icmp ne i32 %back, 0
+  br i1 %has_back, label %update_back, label %update_head
+
+update_back:
+  %back_ptr = inttoptr i32 %back to ptr
+  %back_next = getelementptr i8, ptr %back_ptr, i32 12
+  store i32 %next, ptr %back_next, align 4
+  br label %try_next
+
+update_head:
+  store i32 %next, ptr @__wosy_core_free_head, align 4
+  br label %try_next
+
+try_next:
+  %has_next = icmp ne i32 %next, 0
+  br i1 %has_next, label %update_next, label %complete
+
+update_next:
+  %next_ptr = inttoptr i32 %next to ptr
+  %next_back = getelementptr i8, ptr %next_ptr, i32 8
+  store i32 %back, ptr %next_back, align 4
+  br label %complete
+
+complete:
+  ret void
+}
+
+define internal void @__wosy_wasm_push(i32 %h) {
+entry:
+  %p = inttoptr i32 %h to ptr
+  %back_slot = getelementptr i8, ptr %p, i32 8
+  %next_slot = getelementptr i8, ptr %p, i32 12
+  %head = load i32, ptr @__wosy_core_free_head, align 4
+  store i32 0, ptr %back_slot, align 4
+  store i32 %head, ptr %next_slot, align 4
+  store i32 %h, ptr @__wosy_core_free_head, align 4
+  %has_head = icmp ne i32 %head, 0
+  br i1 %has_head, label %link, label %complete
+
+link:
+  %head_ptr = inttoptr i32 %head to ptr
+  %head_back = getelementptr i8, ptr %head_ptr, i32 8
+  store i32 %h, ptr %head_back, align 4
+  br label %complete
+
+complete:
+  ret void
+}
+
+define internal void @__wosy_wasm_fragment(i32 %h, i32 %span, i32 %prev) {
+entry:
+  %first_before = add i32 %h, 11
+  %last_offset = sub i32 %span, 1
+  %last = add i32 %h, %last_offset
+  %difference = xor i32 %first_before, %last
+  %leading = call i32 @llvm.ctlz.i32(i32 %difference, i1 true)
+  %log = sub i32 31, %leading
+  call void @__wosy_wasm_block(i32 %h, i32 %span, i32 %prev, i32 %log, i32 1)
+  call void @__wosy_wasm_push(i32 %h)
+  ret void
+}
+
 define ptr @__wosy_core_alloc(i64 %size, i64 %alignment) {
 entry:
   %size_fits = icmp ule i64 %size, 4294967295
   %alignment_fits = icmp ule i64 %alignment, 2147483648
-  %alignment_is_zero = icmp eq i64 %alignment, 0
+  %nonzero_alignment = icmp ne i64 %alignment, 0
   %alignment_minus_one = sub i64 %alignment, 1
   %alignment_power_mask = and i64 %alignment, %alignment_minus_one
-  %alignment_is_power_of_two = icmp eq i64 %alignment_power_mask, 0
-  %alignment_is_not_power_of_two = xor i1 %alignment_is_power_of_two, true
-  %alignment_is_invalid = or i1 %alignment_is_zero, %alignment_is_not_power_of_two
-  %fits = and i1 %size_fits, %alignment_fits
-  %is_valid = xor i1 %alignment_is_invalid, true
-  %can_allocate = and i1 %fits, %is_valid
-  br i1 %can_allocate, label %reuse_check, label %failure
+  %power_of_two = icmp eq i64 %alignment_power_mask, 0
+  %range_valid = and i1 %size_fits, %alignment_fits
+  %alignment_valid = and i1 %nonzero_alignment, %power_of_two
+  %valid = and i1 %range_valid, %alignment_valid
+  br i1 %valid, label %prepare, label %failure
 
-reuse_check:
-  %free_head = load i32, ptr @__wosy_core_free_head
-  %has_free_block = icmp ne i32 %free_head, 0
-  br i1 %has_free_block, label %reuse_search, label %extend_header
+prepare:
+  %cursor = load i64, ptr @__wosy_core_heap_cursor
+  %zero_size = icmp eq i64 %size, 0
+  %extent = select i1 %zero_size, i64 1, i64 %size
+  %inverse = xor i64 %alignment_minus_one, -1
+  %alignment32 = trunc i64 %alignment to i32
+  %log = call i32 @llvm.cttz.i32(i32 %alignment32, i1 true)
+  %head = load i32, ptr @__wosy_core_free_head, align 4
+  %has_head = icmp ne i32 %head, 0
+  br i1 %has_head, label %search, label %extend
 
-reuse_search:
-  %current_address = phi i32 [ %free_head, %reuse_check ], [ %next_free, %reuse_continue ]
-  %previous_address = phi i32 [ 0, %reuse_check ], [ %current_address, %reuse_continue ]
-  %free_header = inttoptr i32 %current_address to ptr
-  %free_size_address = getelementptr i8, ptr %free_header, i32 4
-  %free_size = load i32, ptr %free_size_address, align 1
-  %free_size64 = zext i32 %free_size to i64
-  %free_alignment_address = getelementptr i8, ptr %free_header, i32 8
-  %free_alignment = load i32, ptr %free_alignment_address, align 1
-  %free_alignment64 = zext i32 %free_alignment to i64
-  %size_reusable = icmp uge i64 %free_size64, %size
-  %alignment_reusable = icmp uge i64 %free_alignment64, %alignment
-  %reusable = and i1 %size_reusable, %alignment_reusable
-  br i1 %reusable, label %reuse, label %reuse_continue
+search:
+  %candidate = phi i32 [ %head, %prepare ], [ %next, %advance ]
+  %candidate_ptr = inttoptr i32 %candidate to ptr
+  %packed = load i32, ptr %candidate_ptr, align 4
+  %candidate_span = and i32 %packed, -8
+  %candidate_prev_slot = getelementptr i8, ptr %candidate_ptr, i32 4
+  %candidate_prev_packed = load i32, ptr %candidate_prev_slot, align 4
+  %stored_lo_shifted = lshr i32 %packed, 1
+  %stored_lo = and i32 %stored_lo_shifted, 3
+  %stored_hi = and i32 %candidate_prev_packed, 7
+  %stored_hi_shifted = shl i32 %stored_hi, 2
+  %stored_log = or i32 %stored_lo, %stored_hi_shifted
+  %enough_alignment = icmp uge i32 %stored_log, %log
+  br i1 %enough_alignment, label %fit, label %advance
 
-reuse_continue:
-  %next_free = load i32, ptr %free_header, align 1
-  %has_next_free = icmp ne i32 %next_free, 0
-  br i1 %has_next_free, label %reuse_search, label %extend_header
+fit:
+  %candidate64 = zext i32 %candidate to i64
+  %span64 = zext i32 %candidate_span to i64
+  %limit = add i64 %candidate64, %span64
+  %minimum = add i64 %candidate64, 12
+  %adjusted = add i64 %minimum, %alignment_minus_one
+  %placed = and i64 %adjusted, %inverse
+  %used = add i64 %placed, %extent
+  %fits = icmp ule i64 %used, %limit
+  br i1 %fits, label %reuse, label %advance
+
+advance:
+  %next_slot = getelementptr i8, ptr %candidate_ptr, i32 12
+  %next = load i32, ptr %next_slot, align 4
+  %has_next = icmp ne i32 %next, 0
+  br i1 %has_next, label %search, label %extend
 
 reuse:
-  %free_alignment_fits = icmp ule i64 %free_alignment64, 2147483648
-  %free_alignment_is_zero = icmp eq i64 %free_alignment64, 0
-  %free_alignment_minus_one = sub i64 %free_alignment64, 1
-  %free_alignment_power_mask = and i64 %free_alignment64, %free_alignment_minus_one
-  %free_alignment_is_power_of_two = icmp eq i64 %free_alignment_power_mask, 0
-  %free_alignment_is_not_power_of_two = xor i1 %free_alignment_is_power_of_two, true
-  %free_alignment_is_invalid = or i1 %free_alignment_is_zero, %free_alignment_is_not_power_of_two
-  %free_alignment_is_valid = xor i1 %free_alignment_is_invalid, true
-  %free_alignment_can_derive = and i1 %free_alignment_fits, %free_alignment_is_valid
-  br i1 %free_alignment_can_derive, label %reuse_header_end, label %reuse_continue
+  %candidate_prev = and i32 %candidate_prev_packed, -8
+  %rounded_base = add i64 %used, 7
+  %rounded = and i64 %rounded_base, -8
+  %splits_tail = sub i64 %limit, %rounded
+  %may_split_tail = icmp uge i64 %splits_tail, 16
+  %reuse_end = select i1 %may_split_tail, i64 %rounded, i64 %limit
+  br label %commit
 
-reuse_header_end:
-  %free_header64 = zext i32 %current_address to i64
-  %free_header_end = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %free_header64, i64 16)
-  %free_header_end_value = extractvalue { i64, i1 } %free_header_end, 0
-  %free_header_end_overflow = extractvalue { i64, i1 } %free_header_end, 1
-  br i1 %free_header_end_overflow, label %reuse_continue, label %reuse_alignment
+extend:
+  %tail = load i32, ptr @__wosy_wasm_tail, align 4
+  %has_tail = icmp ne i32 %tail, 0
+  br i1 %has_tail, label %tail_kind, label %extend_place
 
-reuse_alignment:
-  %free_aligned_sum = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %free_header_end_value, i64 %free_alignment_minus_one)
-  %free_aligned_sum_value = extractvalue { i64, i1 } %free_aligned_sum, 0
-  %free_aligned_sum_overflow = extractvalue { i64, i1 } %free_aligned_sum, 1
-  br i1 %free_aligned_sum_overflow, label %reuse_continue, label %reuse_size
+tail_kind:
+  %tail_ptr = inttoptr i32 %tail to ptr
+  %tail_word = load i32, ptr %tail_ptr, align 4
+  %tail_free_bit = and i32 %tail_word, 1
+  %tail_is_free = icmp ne i32 %tail_free_bit, 0
+  br i1 %tail_is_free, label %extend_free_tail, label %extend_append
 
-reuse_size:
-  %free_alignment_inverse = xor i64 %free_alignment_minus_one, -1
-  %reused_pointer_address = and i64 %free_aligned_sum_value, %free_alignment_inverse
-  %reused_allocation_end = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %reused_pointer_address, i64 %free_size64)
-  %reused_allocation_end_value = extractvalue { i64, i1 } %reused_allocation_end, 0
-  %reused_allocation_end_overflow = extractvalue { i64, i1 } %reused_allocation_end, 1
-  %reused_address_space_end = icmp ule i64 %reused_allocation_end_value, 4294967296
-  %reused_address_space_pointer = icmp ult i64 %reused_pointer_address, 4294967296
-  %reused_address_space_fits = and i1 %reused_address_space_end, %reused_address_space_pointer
-  %reused_exceeds_address_space = xor i1 %reused_address_space_fits, true
-  %reused_extends_address_space = or i1 %reused_allocation_end_overflow, %reused_exceeds_address_space
-  br i1 %reused_extends_address_space, label %reuse_continue, label %reuse_unlink
+extend_free_tail:
+  %tail_prev_slot = getelementptr i8, ptr %tail_ptr, i32 4
+  %tail_prev_word = load i32, ptr %tail_prev_slot, align 4
+  %tail_prev = and i32 %tail_prev_word, -8
+  %tail64 = zext i32 %tail to i64
+  br label %extend_place
 
-reuse_unlink:
-  %selected_next_free = load i32, ptr %free_header, align 1
-  %selects_head = icmp eq i32 %previous_address, 0
-  br i1 %selects_head, label %reuse_head, label %reuse_after
+extend_append:
+  %tail_span = and i32 %tail_word, -8
+  br label %extend_place
 
-reuse_head:
-  store i32 %selected_next_free, ptr @__wosy_core_free_head
-  br label %reuse_return
+extend_place:
+  %extension_start = phi i64 [ %cursor, %extend ], [ %tail64, %extend_free_tail ], [ %cursor, %extend_append ]
+  %extension_prev = phi i32 [ 0, %extend ], [ %tail_prev, %extend_free_tail ], [ %tail_span, %extend_append ]
+  %extension_unlink = phi i32 [ 0, %extend ], [ %tail, %extend_free_tail ], [ 0, %extend_append ]
+  %extension_minimum = add i64 %extension_start, 12
+  %extension_adjusted = add i64 %extension_minimum, %alignment_minus_one
+  %extension_pointer = and i64 %extension_adjusted, %inverse
+  %extension_used = add i64 %extension_pointer, %extent
+  %extension_round = add i64 %extension_used, 7
+  %extension_end = and i64 %extension_round, -8
+  %end_fits = icmp ule i64 %extension_end, 4294967296
+  %pointer_fits = icmp ult i64 %extension_pointer, 4294967296
+  %extension_fits = and i1 %end_fits, %pointer_fits
+  br i1 %extension_fits, label %capacity, label %failure
 
-reuse_after:
-  %previous_header = inttoptr i32 %previous_address to ptr
-  store i32 %selected_next_free, ptr %previous_header, align 1
-  br label %reuse_return
-
-reuse_return:
-  %reused_payload_address = trunc i64 %reused_pointer_address to i32
-  %reused_pointer = inttoptr i32 %reused_payload_address to ptr
-  ret ptr %reused_pointer
-
-extend_header:
-  %cursor = load i64, ptr @__wosy_core_heap_cursor
-  %header_end = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %cursor, i64 16)
-  %header_end_value = extractvalue { i64, i1 } %header_end, 0
-  %header_end_overflow = extractvalue { i64, i1 } %header_end, 1
-  br i1 %header_end_overflow, label %failure, label %extend_alignment
-
-extend_alignment:
-  %aligned_sum = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %header_end_value, i64 %alignment_minus_one)
-  %aligned_sum_value = extractvalue { i64, i1 } %aligned_sum, 0
-  %aligned_sum_overflow = extractvalue { i64, i1 } %aligned_sum, 1
-  br i1 %aligned_sum_overflow, label %failure, label %extend_size
-
-extend_size:
-  %alignment_inverse = xor i64 %alignment_minus_one, -1
-  %pointer_address = and i64 %aligned_sum_value, %alignment_inverse
-  %allocation_end = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %pointer_address, i64 %size)
-  %allocation_end_value = extractvalue { i64, i1 } %allocation_end, 0
-  %allocation_end_overflow = extractvalue { i64, i1 } %allocation_end, 1
-  %address_space_end = icmp ule i64 %allocation_end_value, 4294967296
-  %address_space_pointer = icmp ult i64 %pointer_address, 4294967296
-  %address_space_fits = and i1 %address_space_end, %address_space_pointer
-  %exceeds_address_space = xor i1 %address_space_fits, true
-  %extends_address_space = or i1 %allocation_end_overflow, %exceeds_address_space
-  br i1 %extends_address_space, label %failure, label %capacity_check
-
-capacity_check:
+capacity:
   %pages = call i32 @llvm.wasm.memory.size.i32(i32 0)
   %pages64 = zext i32 %pages to i64
-  %current_bytes = shl i64 %pages64, 16
-  %has_capacity = icmp ule i64 %allocation_end_value, %current_bytes
-  br i1 %has_capacity, label %commit, label %grow_difference
-
-grow_difference:
-  %required_bytes = sub i64 %allocation_end_value, %current_bytes
-  %pages_before_rounding = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %required_bytes, i64 65535)
-  %pages_before_rounding_value = extractvalue { i64, i1 } %pages_before_rounding, 0
-  %pages_before_rounding_overflow = extractvalue { i64, i1 } %pages_before_rounding, 1
-  br i1 %pages_before_rounding_overflow, label %failure, label %grow_limit
-
-grow_limit:
-  %pages_to_grow64 = lshr i64 %pages_before_rounding_value, 16
-  %growth_fits = icmp ule i64 %pages_to_grow64, 65536
-  br i1 %growth_fits, label %grow, label %failure
+  %bytes = shl i64 %pages64, 16
+  %has_capacity = icmp ule i64 %extension_end, %bytes
+  br i1 %has_capacity, label %commit, label %grow
 
 grow:
-  %pages_to_grow = trunc i64 %pages_to_grow64 to i32
-  %grown_pages = call i32 @llvm.wasm.memory.grow.i32(i32 0, i32 %pages_to_grow)
-  %growth_failed = icmp eq i32 %grown_pages, -1
-  br i1 %growth_failed, label %failure, label %commit
+  %needed = sub i64 %extension_end, %bytes
+  %needed_rounded = add i64 %needed, 65535
+  %needed_pages64 = lshr i64 %needed_rounded, 16
+  %needed_pages = trunc i64 %needed_pages64 to i32
+  %grown = call i32 @llvm.wasm.memory.grow.i32(i32 0, i32 %needed_pages)
+  %grow_failed = icmp eq i32 %grown, -1
+  br i1 %grow_failed, label %failure, label %commit
 
 commit:
-  %header_address = trunc i64 %cursor to i32
-  %payload_address = trunc i64 %pointer_address to i32
-  %header = inttoptr i32 %header_address to ptr
-  %payload = inttoptr i32 %payload_address to ptr
-  %back_pointer = getelementptr i8, ptr %payload, i32 -4
-  store i32 %header_address, ptr %back_pointer, align 1
-  store i32 0, ptr %header, align 1
-  %size_address = getelementptr i8, ptr %header, i32 4
-  %size32 = trunc i64 %size to i32
-  store i32 %size32, ptr %size_address, align 1
-  %alignment_address = getelementptr i8, ptr %header, i32 8
-  %alignment32 = trunc i64 %alignment to i32
-  store i32 %alignment32, ptr %alignment_address, align 1
-  store i64 %allocation_end_value, ptr @__wosy_core_heap_cursor
+  %start = phi i64 [ %candidate64, %reuse ], [ %extension_start, %capacity ], [ %extension_start, %grow ]
+  %previous = phi i32 [ %candidate_prev, %reuse ], [ %extension_prev, %capacity ], [ %extension_prev, %grow ]
+  %old_free = phi i32 [ %candidate, %reuse ], [ %extension_unlink, %capacity ], [ %extension_unlink, %grow ]
+  %pointer = phi i64 [ %placed, %reuse ], [ %extension_pointer, %capacity ], [ %extension_pointer, %grow ]
+  %reserved_end = phi i64 [ %reuse_end, %reuse ], [ %extension_end, %capacity ], [ %extension_end, %grow ]
+  %block_end = phi i64 [ %limit, %reuse ], [ %extension_end, %capacity ], [ %extension_end, %grow ]
+  %takes_free = icmp ne i32 %old_free, 0
+  br i1 %takes_free, label %unlink, label %prefix
+
+unlink:
+  call void @__wosy_wasm_unlink(i32 %old_free)
+  br label %prefix
+
+prefix:
+  %prefix_end_limit = sub i64 %pointer, 12
+  %prefix_end = and i64 %prefix_end_limit, -8
+  %prefix_length = sub i64 %prefix_end, %start
+  %splits_prefix = icmp uge i64 %prefix_length, 16
+  %prefix_span = trunc i64 %prefix_length to i32
+  br i1 %splits_prefix, label %save_prefix, label %allocation
+
+save_prefix:
+  %prefix32 = trunc i64 %start to i32
+  call void @__wosy_wasm_fragment(i32 %prefix32, i32 %prefix_span, i32 %previous)
+  br label %allocation
+
+allocation:
+  %h = phi i64 [ %start, %prefix ], [ %prefix_end, %save_prefix ]
+  %prev = phi i32 [ %previous, %prefix ], [ %prefix_span, %save_prefix ]
+  %allocation_span64 = sub i64 %reserved_end, %h
+  %span = trunc i64 %allocation_span64 to i32
+  %h32 = trunc i64 %h to i32
+  call void @__wosy_wasm_block(i32 %h32, i32 %span, i32 %prev, i32 %log, i32 0)
+  %pointer32 = trunc i64 %pointer to i32
+  %payload = inttoptr i32 %pointer32 to ptr
+  %back = getelementptr i8, ptr %payload, i32 -4
+  store i32 %h32, ptr %back, align 1
+  %has_suffix = icmp ult i64 %reserved_end, %block_end
+  br i1 %has_suffix, label %suffix, label %update_boundary
+
+suffix:
+  %suffix64 = sub i64 %block_end, %reserved_end
+  %suffix_span = trunc i64 %suffix64 to i32
+  %suffix32 = trunc i64 %reserved_end to i32
+  call void @__wosy_wasm_fragment(i32 %suffix32, i32 %suffix_span, i32 %span)
+  br label %update_boundary
+
+update_boundary:
+  %boundary_prev = phi i32 [ %span, %allocation ], [ %suffix_span, %suffix ]
+  %boundary_tail = phi i32 [ %h32, %allocation ], [ %suffix32, %suffix ]
+  %has_successor = icmp ult i64 %block_end, %cursor
+  br i1 %has_successor, label %update_successor, label %update_tail
+
+update_successor:
+  %successor = trunc i64 %block_end to i32
+  call void @__wosy_wasm_set_prev(i32 %successor, i32 %boundary_prev)
+  ret ptr %payload
+
+update_tail:
+  store i32 %boundary_tail, ptr @__wosy_wasm_tail, align 4
+  store i64 %block_end, ptr @__wosy_core_heap_cursor
   ret ptr %payload
 
 failure:
@@ -185,12 +302,73 @@ entry:
   br i1 %is_null, label %complete, label %release
 
 release:
-  %back_pointer = getelementptr i8, ptr %pointer, i32 -4
-  %header_address = load i32, ptr %back_pointer, align 1
-  %header = inttoptr i32 %header_address to ptr
-  %free_head = load i32, ptr @__wosy_core_free_head
-  store i32 %free_head, ptr %header, align 1
-  store i32 %header_address, ptr @__wosy_core_free_head
+  %back = getelementptr i8, ptr %pointer, i32 -4
+  %h = load i32, ptr %back, align 1
+  %p = inttoptr i32 %h to ptr
+  %packed = load i32, ptr %p, align 4
+  %span = and i32 %packed, -8
+  %prev_slot = getelementptr i8, ptr %p, i32 4
+  %packed_prev = load i32, ptr %prev_slot, align 4
+  %prev = and i32 %packed_prev, -8
+  %has_prev = icmp ne i32 %prev, 0
+  br i1 %has_prev, label %previous, label %try_next
+
+previous:
+  %prev_h = sub i32 %h, %prev
+  %prev_p = inttoptr i32 %prev_h to ptr
+  %prev_word = load i32, ptr %prev_p, align 4
+  %prev_free_bit = and i32 %prev_word, 1
+  %prev_is_free = icmp ne i32 %prev_free_bit, 0
+  br i1 %prev_is_free, label %merge_prev, label %try_next
+
+merge_prev:
+  call void @__wosy_wasm_unlink(i32 %prev_h)
+  %prev_prev_slot = getelementptr i8, ptr %prev_p, i32 4
+  %prev_prev_word = load i32, ptr %prev_prev_slot, align 4
+  %prev_prev_span = and i32 %prev_prev_word, -8
+  %left_span = add i32 %span, %prev
+  br label %try_next
+
+try_next:
+  %left = phi i32 [ %h, %release ], [ %h, %previous ], [ %prev_h, %merge_prev ]
+  %left_prev = phi i32 [ %prev, %release ], [ %prev, %previous ], [ %prev_prev_span, %merge_prev ]
+  %left_size = phi i32 [ %span, %release ], [ %span, %previous ], [ %left_span, %merge_prev ]
+  %left64 = zext i32 %left to i64
+  %left_size64 = zext i32 %left_size to i64
+  %right64 = add i64 %left64, %left_size64
+  %cursor = load i64, ptr @__wosy_core_heap_cursor
+  %has_right = icmp ult i64 %right64, %cursor
+  br i1 %has_right, label %next, label %finalize
+
+next:
+  %right = trunc i64 %right64 to i32
+  %right_p = inttoptr i32 %right to ptr
+  %right_word = load i32, ptr %right_p, align 4
+  %right_free_bit = and i32 %right_word, 1
+  %right_is_free = icmp ne i32 %right_free_bit, 0
+  br i1 %right_is_free, label %merge_next, label %finalize
+
+merge_next:
+  call void @__wosy_wasm_unlink(i32 %right)
+  %right_span = and i32 %right_word, -8
+  %both_span = add i32 %left_size, %right_span
+  br label %finalize
+
+finalize:
+  %final_span = phi i32 [ %left_size, %try_next ], [ %left_size, %next ], [ %both_span, %merge_next ]
+  call void @__wosy_wasm_fragment(i32 %left, i32 %final_span, i32 %left_prev)
+  %final_span64 = zext i32 %final_span to i64
+  %end = add i64 %left64, %final_span64
+  %successor_exists = icmp ult i64 %end, %cursor
+  br i1 %successor_exists, label %successor, label %tail
+
+successor:
+  %successor_h = trunc i64 %end to i32
+  call void @__wosy_wasm_set_prev(i32 %successor_h, i32 %final_span)
+  br label %complete
+
+tail:
+  store i32 %left, ptr @__wosy_wasm_tail, align 4
   br label %complete
 
 complete:
