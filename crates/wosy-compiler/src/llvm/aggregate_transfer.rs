@@ -1,5 +1,5 @@
 use super::*;
-use crate::scalar::{ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn, ScalarBinding};
+use crate::scalar::{ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn, ConcreteCallSelection, ScalarBinding};
 use inkwell::types::AnyType;
 
 pub(super) struct InitializerEmitter<'ctx, 'plan> {
@@ -56,6 +56,9 @@ enum CallInput {
 pub(super) struct AggregateEmitter<'ctx, 'plan> {
     plan: &'plan ClosedBody,
     destination: Option<PointerValue<'ctx>>,
+    ordinary_destination: Option<PointerValue<'ctx>>,
+    ordinary_committed: bool,
+    ordinary_called: bool,
     base: Option<PointerValue<'ctx>>,
     registered_allocation: Option<String>,
     failure_site: Option<((usize, usize), usize)>,
@@ -96,6 +99,23 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
         } else {
             None
         };
+        if (plan.ordinary_result || !plan.ordinary_calls.is_empty())
+            && (plan.checked_backing_producer.is_some() || plan.checked_backing_consumer.is_some())
+        {
+            return Err("overlapping ordinary and checked aggregate conventions".into());
+        }
+        let ordinary_destination = if plan.ordinary_result {
+            if destination.is_some() || plan.input.is_some() || definition.count_params() as usize != parameter_count + 1 {
+                return Err("overlapping ordinary aggregate destination".into());
+            }
+            Some(
+                definition.get_nth_param(parameter_count as u32)
+                    .ok_or_else(|| "missing ordinary aggregate destination".to_owned())?
+                    .into_pointer_value(),
+            )
+        } else {
+            None
+        };
         let input = plan.input.map(|slot| definition.get_nth_param(definition.count_params() - 1)
             .ok_or_else(|| "missing aggregate formal input base".to_owned())
             .map(|base| (slot, base.into_pointer_value()))).transpose()?;
@@ -106,6 +126,9 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             plan,
             input,
             destination,
+            ordinary_destination,
+            ordinary_committed: false,
+            ordinary_called: false,
             base: None,
             registered_allocation: None,
             failure_site: plan.local_array_failure.filter(|_| {
@@ -135,7 +158,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
 }
 
 pub(super) fn linkage(plan: Option<&ClosedBody>) -> Option<Linkage> {
-    plan.filter(|body| body.returning.is_some() || body.input.is_some() || body.checked_backing_producer.is_some())
+    plan.filter(|body| body.returning.is_some() || body.input.is_some() || body.checked_backing_producer.is_some() || body.ordinary_result)
         .map(|_| Linkage::Internal)
 }
 
@@ -146,6 +169,25 @@ pub(super) fn definition_type<'ctx>(
     layout: ScalarTargetLayout,
     plan: Option<&ClosedBody>,
 ) -> Result<FunctionType<'ctx>, String> {
+    if plan.is_some_and(|body| body.ordinary_result) {
+        let ScalarType::Callable { parameters, outputs } = &function.signature else {
+            return Err("invalid ordinary aggregate declaration".into());
+        };
+        if !matches!(outputs.outputs.as_slice(), [crate::ScalarOutput { ty: ScalarType::Struct(_), .. }])
+            || !dynamic_return_outputs(function.span, cfg).is_empty()
+        {
+            return Err("invalid ordinary aggregate result signature".into());
+        }
+        let original = definition_function_type(context, function, cfg, layout)?;
+        if original.count_param_types() as usize != parameters.len() {
+            return Err("unexpected ordinary aggregate return sidecar".into());
+        }
+        let mut arguments = original.get_param_types().into_iter().map(Into::into)
+            .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
+        let pointer = context.ptr_type(AddressSpace::default());
+        arguments.push(pointer.into());
+        return Ok(context.void_type().fn_type(&arguments, false));
+    }
     if plan.and_then(|body| body.returning).is_none() {
         let original = definition_function_type(context, function, cfg, layout)?;
         if !plan.is_some_and(|body| body.input.is_some() || body.checked_backing_producer.is_some()) {
@@ -412,6 +454,22 @@ pub(super) fn emit_call<'ctx, 'module>(
     if aggregate.plan.checked_backing_consumer.is_some_and(|(_, call)| ordinal == call) {
         return emit_checked_backing_call(context, state, expression, arguments, project).map(Some);
     }
+    if let Some(declaration) = aggregate.plan.ordinary_calls.get(&ordinal) {
+        let Some(nodes) = state.body_call_nodes else {
+            return Err("missing ordinary aggregate call identity".into());
+        };
+        let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } = nodes.target(expression)? else {
+            return Err("ordinary aggregate call changed its selected target".into());
+        };
+        if &declaration.source != source || declaration.range != *declaration_span {
+            return Err("ordinary aggregate call changed its declaration identity".into());
+        }
+        let aggregate = state.aggregate.as_mut().expect("ordinary aggregate call frame");
+        if std::mem::replace(&mut aggregate.ordinary_called, true) {
+            return Err("ordinary aggregate call occurrence emitted twice".into());
+        }
+        return emit_ordinary_result_call(context, state, expression, arguments, project).map(Some);
+    }
     let action = aggregate.plan.calls.get(&ordinal).copied().map(CallDestination::Body);
     let input = aggregate.plan.input_calls.get(&ordinal).map(|&(_, input)| CallInput::Body(input));
     if action.is_none() && input.is_none() {
@@ -495,6 +553,44 @@ pub(super) fn release_checked_backing<'ctx>(
     state.builder.build_call(free, &[base.into()], "checked_backing_release").map_err(builder_error)?;
     aggregate.checked_backing_released = true;
     Ok(())
+}
+
+fn emit_ordinary_result_call<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
+    arguments: &[ScalarExpression],
+    project: Option<(&ScalarModule, &[&ScalarModule])>,
+) -> Result<EmitValue<'ctx>, String> {
+    let symbol = state.direct_aggregate_symbol(expression, None)?;
+    let function = *state.functions.get(symbol)
+        .ok_or_else(|| "missing ordinary aggregate producer".to_owned())?;
+    let Some(ScalarType::Callable { parameters, outputs }) = state.signatures.get(symbol) else {
+        return Err("missing ordinary aggregate call signature".into());
+    };
+    let [output] = outputs.outputs.as_slice() else {
+        return Err("invalid ordinary aggregate output sequence".into());
+    };
+    if !matches!(output.ty, ScalarType::Struct(_)) || parameters.len() != arguments.len()
+        || function.count_params() as usize != parameters.len() + 1
+        || function.get_type().get_return_type().is_some()
+        || function.get_linkage() != Linkage::Internal
+        || state.dynamic_owner_outputs.get(symbol).is_some_and(|owners| !owners.is_empty())
+    {
+        return Err("invalid ordinary aggregate destination call ABI".into());
+    }
+    let destination = entry_storage_alloca(context, state, &output.ty, "ordinary_result_destination")?;
+    let mut operands = Vec::with_capacity(parameters.len() + 1);
+    for (argument, parameter) in arguments.iter().zip(parameters) {
+        let emitted = match project {
+            Some((module, modules)) => emit_project_typed_expression(context, state, argument, parameter, module, modules)?,
+            None => emit_typed_expression(context, state, argument, parameter)?,
+        };
+        operands.push(BasicMetadataValueEnum::from(take_basic(emitted)?));
+    }
+    operands.push(destination.into());
+    state.builder.build_call(function, &operands, "").map_err(builder_error)?;
+    Ok(EmitValue::Basic(destination.into()))
 }
 
 fn emit_selected_call<'ctx, 'module>(
@@ -708,6 +804,19 @@ pub(super) fn commit_return<'ctx>(
     let Some(aggregate) = &mut state.aggregate else {
         return Ok(());
     };
+    if let Some(destination) = aggregate.ordinary_destination {
+        let [output] = outputs.outputs.as_slice() else {
+            return Err("invalid ordinary aggregate returned value".into());
+        };
+        if aggregate.ordinary_committed || !matches!(output.ty, ScalarType::Struct(_))
+            || !state.return_owner_slots.is_empty() || !state.fresh_return_outputs.is_empty()
+        {
+            return Err("overlapping ordinary aggregate result materialization".into());
+        }
+        store_value(context, state, destination, &output.ty, result.clone())?;
+        state.aggregate.as_mut().expect("ordinary aggregate frame").ordinary_committed = true;
+        return Ok(());
+    }
     if !matches!(aggregate.plan.returning, Some(ClosedReturn::Allocation { .. })) {
         return Ok(());
     }
@@ -751,6 +860,16 @@ pub(super) fn finish_return<'ctx>(
     }
     if !aggregate.receipts.is_empty() || aggregate.input.is_some() {
         return Err("unreleased closed aggregate receipt".into());
+    }
+    if aggregate.ordinary_called == aggregate.plan.ordinary_calls.is_empty() {
+        return Err("ordinary aggregate call occurrence was not emitted".into());
+    }
+    if aggregate.ordinary_destination.is_some() {
+        if !aggregate.ordinary_committed {
+            return Err("ordinary aggregate result did not materialize before cleanup".into());
+        }
+        state.builder.build_return(None).map_err(builder_error)?;
+        return Ok(Some(()));
     }
     let Some(route) = aggregate.plan.returning else {
         return Ok(None);

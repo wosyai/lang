@@ -1936,12 +1936,12 @@ fn emit_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if !aggregate_plan.is_some_and(|plan| plan.input.is_some()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
+    if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(context, &mut state, value, function, None);
     }
     let result = match function.body.items.as_slice() {
         [ScalarBlockItem::Expression(expression)]
-            if !aggregate_plan.is_some_and(|plan| plan.input.is_some()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
+            if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
         {
             if outputs.outputs.len() == 1 {
                 emit_typed_expression(context, &mut state, expression, &outputs.outputs[0].ty)?
@@ -2240,7 +2240,7 @@ fn emit_project_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if !aggregate_plan.is_some_and(|plan| plan.input.is_some()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
+    if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(
             context,
             &mut state,
@@ -2254,7 +2254,7 @@ fn emit_project_function<'ctx, 'module>(
     }
     let result = match function.body.items.as_slice() {
         [ScalarBlockItem::Expression(expression)]
-            if !aggregate_plan.is_some_and(|plan| plan.input.is_some()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
+            if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
         {
             if outputs.outputs.len() == 1 {
                 emit_project_typed_expression(
