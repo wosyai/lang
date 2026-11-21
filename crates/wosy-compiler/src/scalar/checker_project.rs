@@ -374,17 +374,20 @@ fn walk_package_initialization(
             let value = match (&receiver.ty, &binding.value) {
                 (ScalarType::Bool, ScalarExpression::Boolean { value, .. }) => InitializerValue::Boolean(*value),
                 (ty, expression) if is_integer_type(ty) => {
-                    if let Some(value) = concrete_integer_literal(expression) {
-                        InitializerValue::Integer(value)
+                    let value = if let Some(value) = concrete_integer_literal(expression) {
+                        value
                     } else if matches!(expression, ScalarExpression::Call { .. }) {
-                        let ActualCallResult::Integer(value) =
-                            run_initializer_call(topology, actual, outputs.primary, ty)? else {
-                                return Err(ProjectCheck::Unsupported);
-                            };
-                        InitializerValue::Integer(Cow::Owned(value))
+                        let ActualCallResult::Integer(value) = run_initializer_call(
+                            topology, actual, outputs.primary, ty,
+                            |argument, argument_type| initialized_integer_argument(topology, &storage, argument, argument_type),
+                        )? else {
+                            return Err(ProjectCheck::Unsupported);
+                        };
+                        Cow::Owned(value)
                     } else {
                         return Err(ProjectCheck::Unsupported);
-                    }
+                    };
+                    InitializerValue::Integer { ty, value }
                 }
                 _ => return Err(ProjectCheck::Unsupported),
             };
@@ -449,14 +452,15 @@ fn check_initializer_expression(
         }
         return Ok(());
     }
-    run_initializer_call(topology, actual, expression, &ScalarType::Unit).map(drop)
+    run_initializer_call(topology, actual, expression, &ScalarType::Unit, |_, _| None).map(drop)
 }
 
-fn run_initializer_call(
-    topology: &ModuleInitializationTopology,
+fn run_initializer_call<'a>(
+    topology: &'a ModuleInitializationTopology,
     actual: &mut ActualCalls<'_, impl ActualIntegerObserver>,
     occurrence: OccurrenceOrdinal,
     expected: &ScalarType,
+    initialized_argument: impl FnOnce(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
 ) -> Result<ActualCallResult, ProjectCheck> {
     let Some(ModuleInitializationCallTarget::Direct {
         declaration,
@@ -465,7 +469,7 @@ fn run_initializer_call(
         return Err(ProjectCheck::Unsupported);
     };
     let signature = topology.checked_call_signatures.get(&occurrence).ok_or(ProjectCheck::MissingRootOccurrences)?;
-    let argument = exact_integer_call_argument(&topology.structure, occurrence, |_, _| None);
+    let argument = exact_integer_call_argument(&topology.structure, occurrence, initialized_argument);
     if *expected != ScalarType::Unit && argument.is_none() {
         return Err(ProjectCheck::Unsupported);
     }
@@ -474,7 +478,23 @@ fn run_initializer_call(
 
 enum InitializerValue<'a> {
     Boolean(bool),
-    Integer(Cow<'a, BigInt>),
+    Integer { ty: &'a ScalarType, value: Cow<'a, BigInt> },
+}
+
+fn initialized_integer_argument<'a>(
+    topology: &ModuleInitializationTopology,
+    storage: &'a HashMap<ByteSpan, InitializerValue<'_>>,
+    argument: OccurrenceOrdinal,
+    argument_type: &ScalarType,
+) -> Option<&'a BigInt> {
+    let InitializationName::Storage(InitializationStorage::Module(span)) =
+        topology.identities.names.get(&argument)? else {
+            return None;
+        };
+    let InitializerValue::Integer { ty, value } = storage.get(span)? else {
+        return None;
+    };
+    (*ty == argument_type).then_some(value.as_ref())
 }
 
 fn evaluate_initializer_predicate(
@@ -485,7 +505,7 @@ fn evaluate_initializer_predicate(
         InitializerPredicate::Boolean(value) => Some(*value),
         InitializerPredicate::BooleanStorage(span) => match storage.get(span)? {
             InitializerValue::Boolean(value) => Some(*value),
-            InitializerValue::Integer(_) => None,
+            InitializerValue::Integer { .. } => None,
         },
         InitializerPredicate::IntegerComparison { relation, operands } => {
             fn integer<'a>(
@@ -495,7 +515,7 @@ fn evaluate_initializer_predicate(
                 match operand {
                     InitializerIntegerOperand::Literal(value) => Some(value),
                     InitializerIntegerOperand::Storage(span) => match storage.get(span)? {
-                        InitializerValue::Integer(value) => Some(value.as_ref()),
+                        InitializerValue::Integer { value, .. } => Some(value.as_ref()),
                         InitializerValue::Boolean(_) => None,
                     },
                 }

@@ -549,6 +549,10 @@ fn explicit_module_proof_uses_all_and_only_resolved_actual_call_contexts() {
     assert_eq!(proof("use(5); use(7);", "", "out <= 7"), ScalarModuleProofOutcome::Proved);
     assert_eq!(proof("u8 first = project(5); u8 second = project(7);", "", "out <= 7"), ScalarModuleProofOutcome::Proved);
     assert_eq!(proof("u8 first = project(5); u8 second = project(7);", "", "out <= 6"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(
+        proof("u8 first = project(5); u8 second = project(first);", "", "out <= 5"),
+        ScalarModuleProofOutcome::Proved,
+    );
     assert_eq!(proof("", "", "out <= 7"), ScalarModuleProofOutcome::Refuted);
     assert_eq!(proof("use(5); use(7);", "", "out <= 6"), ScalarModuleProofOutcome::Refuted);
     assert_eq!(
@@ -603,6 +607,10 @@ fn main_initializer_installs_pure_scalar_call_results_from_prepared_bindings() {
         check(&text),
         ScalarCheckerOutcome::Failed(failure) if failure.operation == ScalarCheckerOperation::Narrow,
     ));
-    let text = format!("{base} i8 argument = -128; i8 result = bounded(argument); core.require(result < 0, {OUTPUT});");
+    let text = format!("{base} i8 argument = -128; i8 first = bounded(argument); i8 result = bounded(first); core.require(result == -128, {OUTPUT});");
+    assert_eq!(check(&text), ScalarCheckerOutcome::Passed);
+    let text = format!("{base} i8 argument = -128; argument = 0; i8 result = bounded(argument); core.require(result == -128, {OUTPUT});");
     assert_eq!(check(&text), ScalarCheckerOutcome::Unsupported);
+    let text = format!("{base} u8 argument = 128; i8 result = bounded(argument); core.require(result == -128, {OUTPUT});");
+    assert!(matches!(check(&text), ScalarCheckerOutcome::Invalid(_)));
 }
