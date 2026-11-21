@@ -635,8 +635,10 @@ impl AggregateFlowFacts {
                     CfgPointKind::Call { .. } => self.neutral_array_projections.get(&id)
                         .and_then(|primary| self.array_calls.get(primary))
                         .is_some_and(|(_, moved, binding)| binding == formal && Some(*moved) == state.array_formal_pending),
-                    CfgPointKind::Move { place, owner, .. } => owner == formal
-                        && &place.binding == formal && place.projections.is_empty(),
+                    CfgPointKind::Move { place, owner, ty } => &place.binding == owner
+                        && place.projections.is_empty()
+                        && (owner == formal
+                            || matches!(ty, ScalarType::Enum(_)) && self.neutral_array_scalars.contains(owner)),
                     CfgPointKind::Evaluate(value) => neutral_scalar_evaluation(value),
                     _ => false,
                 };

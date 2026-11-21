@@ -4016,7 +4016,6 @@ fn passive_descriptor_read(
     facts: &aggregate::AggregateFlowFacts,
     sites: &FunctionCallSites,
     proofs: &CallablePointFacts,
-    binding_types: &HashMap<ReferenceBindingId, ScalarType>,
     structs: &[ScalarStruct],
 ) -> Option<PassiveDescriptorRead> {
     if sites.call_occurrences.len() != 2 || !sites.allocation_length_call_targets.is_empty()
@@ -4134,7 +4133,7 @@ fn passive_descriptor_read(
         [output @ ScalarOutput { ty: ScalarType::CheckedReference {
             mutability: ScalarReferenceMutability::Shared, inner,
         }, .. }] if aggregate::ordinary_value(inner) => Some(passive_checked_reader(
-            cfg, call, &output.ty, facts, proofs, binding_types)?),
+            cfg, call, &output.ty, facts, proofs, &sites.structure)?),
         _ => return None,
     };
     Some(PassiveDescriptorRead { checked_reader, projection, scalar_projection, literal, call, field: field.clone() })
@@ -4146,16 +4145,23 @@ fn passive_checked_reader(
     ty: &ScalarType,
     facts: &aggregate::AggregateFlowFacts,
     proofs: &CallablePointFacts,
-    binding_types: &HashMap<ReferenceBindingId, ScalarType>,
+    structure: &OccurrenceStructure,
 ) -> Option<PassiveCheckedReader> {
-    let mut bindings = proofs.definitions.values().filter_map(|definition| match definition {
-        BindingDefinition::Initialized { bind, value } if *value == call => Some(*bind),
+    let mut bindings = proofs.definitions.iter().filter_map(|(&position, definition)| match definition {
+        BindingDefinition::Initialized { bind, value } if *value == call => Some((position, *bind)),
         _ => None,
     });
-    let bind = bindings.next()?;
+    let ((block, item, receiver), bind) = bindings.next()?;
     let point = cfg.points.get(bind.0)?;
     let CfgPointKind::Bind { binding } = &point.kind else { return None };
-    if bindings.next().is_some() || point.scope != ReferenceScopeId(0) || binding_types.get(binding) != Some(ty) {
+    if bindings.next().is_some() || point.scope != ReferenceScopeId(0) || block != structure.root {
+        return None;
+    }
+    let BlockItemKind::Binding(declaration) = &structure.blocks.get(block.0)?.items.get(item)?.kind else {
+        return None;
+    };
+    let receiver = declaration.receivers().get(receiver)?;
+    if receiver.span != binding.declaration_span || &receiver.ty != ty {
         return None;
     }
 
@@ -9278,7 +9284,7 @@ fn build_function_reference_cfg(
     if let ScalarDescriptorCandidates::One(_, marker) = &builder.proof_points.backing_descriptor_install {
         aggregate.passive_descriptor_read = passive_descriptor_read(
             &builder.cfg, marker, &builder.aggregate_facts, call_sites,
-            &builder.proof_points, &builder.binding_types, builder.structs).map(Box::new);
+            &builder.proof_points, builder.structs).map(Box::new);
     }
     if prior_children_succeeded && errors.is_empty() && !builder.cfg.points.is_empty() {
         builder.cfg.initial_points = builder.cfg.points.clone();
