@@ -8172,6 +8172,7 @@ fn collect_concrete_output_contracts(
     cursor: &mut usize,
 ) {
     result.aggregate.checked_successor_contract = false;
+    result.aggregate.raw_read_forward_contract = false;
     for arm in &mut result.arms {
         collect_concrete_output_contracts(arm, templates, concrete, replays, cursor);
     }
@@ -8212,10 +8213,17 @@ fn collect_concrete_output_contracts(
         let Some(template) = matching.next() else {
             continue;
         };
-        if result.aggregate.checked_successor_candidate == Some(point.id) && *output == 0
+        let successor = result.aggregate.checked_successor_candidate == Some(point.id);
+        let raw_read_forward = result.aggregate.raw_read_forward_candidate == Some(point.id)
+            && match selection {
+                ConcreteCallSelection::Declaration => true,
+                ConcreteCallSelection::Overload(arm) => arm.substitutions.is_empty(),
+            };
+        if (successor || raw_read_forward) && *output == 0
             && type_arguments.is_empty() && template.independent_static && matching.next().is_none()
         {
-            result.aggregate.checked_successor_contract = true;
+            result.aggregate.checked_successor_contract |= successor;
+            result.aggregate.raw_read_forward_contract |= raw_read_forward;
         }
         let contract = ConcreteReferenceOutputContract {
             source: source.clone(),
@@ -8245,6 +8253,7 @@ fn collect_function_output_contracts(
     let mut independent = !result.aggregate.checked_result_origins.is_empty();
     let mut saw_checked = false;
     let mut checked_successor_result = result.aggregate.checked_successor_contract;
+    let mut raw_read_forward_result = result.aggregate.raw_read_forward_contract;
     let start = contracts.len();
     for point in &result.cfg.points {
         let CfgPointKind::ReturnOutput { output, value_point, .. } = point.kind else {
@@ -8254,11 +8263,14 @@ fn collect_function_output_contracts(
         {
             continue;
         }
-        if checked_successor_result {
-            checked_successor_result = !saw_checked && output == 0
-                && result.aggregate.checked_successor_candidate == Some(value_point)
+        if checked_successor_result || raw_read_forward_result {
+            let exact_forward = !saw_checked && output == 0
                 && point.possible_origins.as_ref().is_some_and(|origins| !origins.is_empty()
                     && result.cfg.points[value_point.0].possible_origins.as_ref() == Some(origins));
+            checked_successor_result &= exact_forward
+                && result.aggregate.checked_successor_candidate == Some(value_point);
+            raw_read_forward_result &= exact_forward
+                && result.aggregate.raw_read_forward_candidate == Some(value_point);
         }
         saw_checked = true;
         let Some(origins) = &point.possible_origins else {
@@ -8283,6 +8295,7 @@ fn collect_function_output_contracts(
     }
     result.aggregate.independent_checked_result = saw_checked && independent;
     result.aggregate.checked_successor_result = saw_checked && checked_successor_result;
+    result.aggregate.raw_read_forward_result = saw_checked && raw_read_forward_result;
     if result.aggregate.independent_checked_result && contracts.len() == start + 1 {
         contracts[start].independent_static = true;
     }
@@ -8887,6 +8900,21 @@ fn build_function_reference_cfg(
         && matches!(builder.cfg.points.last().map(|point| &point.kind), Some(CfgPointKind::Return));
     if builder.independent_checked_query {
         aggregate.checked_successor_candidate = aggregate.formal_forward.map(|(_, point, _, _)| point);
+        if !builder.cfg.initial_points.is_empty()
+            && (!builder.aggregate_facts.raw_formals.is_empty()
+                || !builder.aggregate_facts.read_fields.is_empty())
+        {
+            let returned = builder.cfg.initial_points.iter().rev().find_map(|point| {
+                match point.kind {
+                    CfgPointKind::ReturnOutput { output: 0, value_point, checked: true } => Some(value_point),
+                    _ => None,
+                }
+            });
+            aggregate.raw_read_forward_candidate = returned.filter(|point| {
+                matches!(&builder.cfg.initial_points[point.0].kind,
+                    CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable { .. }, .. })
+            });
+        }
     }
     if !errors.is_empty() || !prior_children_succeeded {
         aggregate.array_returns.clear();
