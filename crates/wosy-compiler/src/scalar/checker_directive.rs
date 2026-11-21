@@ -469,7 +469,7 @@ mod tests {
         let failure = check_integer_requirements(body).unwrap().unwrap_err();
         assert_eq!(&body.structure.checker_directives[&failure.directive], after_join);
         for value in 0..=255 {
-            assert_eq!(failure.inputs.includes(&[value]), value <= 10);
+            assert_eq!(failure.state.includes(&[value]), value <= 10);
         }
     }
 
@@ -522,14 +522,14 @@ mod tests {
                     .unwrap().1;
                 assert_ne!(failing_directive, initial_directive);
                 for value in 0..=255 {
-                    assert_eq!(failure.inputs.includes(&[value]), value >= 11);
+                    assert_eq!(failure.state.includes(&[value]), value >= 11);
                 }
             },
         );
     }
 
     #[test]
-    fn reachable_assignment_never_reuses_a_stale_range() {
+    fn literal_assignment_overwrites_the_previous_range() {
         use crate::scalar::checker_flow::check_integer_requirements;
         check_source(
             r#"
@@ -540,7 +540,12 @@ mod tests {
                 value
             };
             "#,
-            |body| assert_eq!(check_integer_requirements(body), None),
+            |body| {
+                let failure = check_integer_requirements(body).unwrap().unwrap_err();
+                for value in 0..=255 {
+                    assert_eq!(failure.state.includes(&[value]), value == 5);
+                }
+            },
         );
     }
 
@@ -569,9 +574,9 @@ mod tests {
         });
         check_source(&[prefix, guarded, unconditional, suffix].concat(), |body| {
             let failure = check_integer_requirements(body).unwrap().unwrap_err();
-            assert!(failure.inputs.includes(&[0, 0]));
-            assert!(!failure.inputs.includes(&[1, 0]));
-            assert!(!failure.inputs.includes(&[0, 1]));
+            assert!(failure.state.includes(&[0, 0]));
+            assert!(!failure.state.includes(&[1, 0]));
+            assert!(!failure.state.includes(&[0, 1]));
         });
     }
 
@@ -591,12 +596,12 @@ mod tests {
         source.push_str(&format!("core.require(p0 > 0, {output});\np0 }};"));
         check_source(&source, |body| {
             let failure = check_integer_requirements(body).unwrap().unwrap_err();
-            assert_eq!(failure.inputs.row_count(), 1);
+            assert_eq!(failure.state.row_count(), 1);
             let mut input = vec![255; width];
-            assert!(!failure.inputs.includes(&input));
+            assert!(!failure.state.includes(&input));
             input[0] = 0;
-            assert!(failure.inputs.includes(&input));
-            assert!(failure.inputs.includes(&vec![0; width]));
+            assert!(failure.state.includes(&input));
+            assert!(failure.state.includes(&vec![0; width]));
         });
     }
 
@@ -618,12 +623,49 @@ mod tests {
             "#,
             |body| {
                 let failure = check_integer_requirements(body).unwrap().unwrap_err();
-                assert_eq!(failure.inputs.row_count(), 2);
-                assert!(failure.inputs.includes(&[0, 0, 0]));
-                assert!(failure.inputs.includes(&[1, 1, 0]));
-                assert!(!failure.inputs.includes(&[1, 0, 0]));
-                assert!(!failure.inputs.includes(&[1, 1, 1]));
+                assert_eq!(failure.state.row_count(), 2);
+                assert!(failure.state.includes(&[0, 0, 0]));
+                assert!(failure.state.includes(&[1, 1, 0]));
+                assert!(!failure.state.includes(&[1, 0, 0]));
+                assert!(!failure.state.includes(&[1, 1, 1]));
             },
+        );
+    }
+
+    #[test]
+    fn assignment_keeps_correlations_between_other_fixed_width_bindings() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        check_source(
+            r#"
+            u8(u8, u8, u8) check_three = fn(x, y, z) {
+                if (x > 0) {
+                    core.narrow(y > 0, { .stdout = ""; .stderr = "narrow"; .code = 1; .files = []; });
+                }
+                z = 5;
+                if (x > 0) {
+                    core.require(y > 0, { .stdout = ""; .stderr = "guarded"; .code = 1; .files = []; });
+                }
+                core.require(z == 5, { .stdout = ""; .stderr = "assigned"; .code = 1; .files = []; });
+                x
+            };
+            "#,
+            |body| assert_eq!(check_integer_requirements(body), Some(Ok(()))),
+        );
+    }
+
+    #[test]
+    fn nonliteral_assignment_is_not_proved_using_stale_facts() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        check_source(
+            r#"
+            u8(u8, u8) check_pair = fn(value, another) {
+                core.narrow(value >= 11, { .stdout = ""; .stderr = "narrow"; .code = 1; .files = []; });
+                value = another;
+                core.require(value >= 11, { .stdout = ""; .stderr = "changed"; .code = 1; .files = []; });
+                value
+            };
+            "#,
+            |body| assert_eq!(check_integer_requirements(body), None),
         );
     }
 

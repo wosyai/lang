@@ -4,8 +4,8 @@ use num_bigint::BigInt;
 
 use super::{
     checker_directive::CheckerOperation,
-    control::{BlockItemKind, ConditionalRegion},
-    reference::{BlockOrdinal, FunctionCallSites, OccurrenceOrdinal, PlainNameIdentity},
+    control::{AssignmentReplacement, BlockItemKind, BlockPosition, ConditionalRegion},
+    reference::{BlockOrdinal, DirectDestinationIdentity, FunctionCallSites, OccurrenceOrdinal, PlainNameIdentity},
     symbolic_integer::IntegerSet,
     typecheck::is_integer_type,
     BinaryOperator, ReferenceBindingId, ScalarExpression, ScalarType,
@@ -122,9 +122,24 @@ impl IntegerInputs {
             return self;
         }
 
+        Self::compact_axis(self.0.into_iter().chain(other.0), axis)
+    }
+
+    fn overwrite(mut self, axis: usize, value: &BigInt) -> Self {
+        let value = Rc::new(IntegerSet::singleton(value));
+        for row in &mut self.0 {
+            row[axis] = Rc::clone(&value);
+        }
+        if self.0.len() < 2 {
+            return self;
+        }
+        Self::compact_axis(self.0, axis)
+    }
+
+    fn compact_axis(rows: impl IntoIterator<Item = IntegerRow>, axis: usize) -> Self {
         let mut joined = Self::default();
         let mut representatives = HashMap::new();
-        for row in self.0.into_iter().chain(other.0) {
+        for row in rows {
             let key: Vec<_> = row[..axis].iter().chain(&row[axis + 1..]).map(Rc::as_ptr).collect();
             match representatives.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
@@ -159,6 +174,9 @@ impl IntegerInputs {
 }
 
 fn merge_axis(representative: &mut IntegerRow, row: IntegerRow, axis: usize) {
+    if Rc::ptr_eq(&representative[axis], &row[axis]) {
+        return;
+    }
     let replacement = row.into_iter().nth(axis).expect("canonical integer axis");
     let previous = std::mem::replace(&mut representative[axis], replacement);
     let target = Rc::make_mut(&mut representative[axis]);
@@ -168,7 +186,7 @@ fn merge_axis(representative: &mut IntegerRow, row: IntegerRow, axis: usize) {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct IntegerCheckFailure {
     pub(super) directive: OccurrenceOrdinal,
-    pub(super) inputs: IntegerInputs,
+    pub(super) state: IntegerInputs,
 }
 
 enum IntegerControl {
@@ -223,13 +241,13 @@ fn walk_integer_block(
                         CheckerOperation::Require if !failing.is_unreachable() => {
                             return Some(IntegerControl::Fail(IntegerCheckFailure {
                                 directive: expression,
-                                inputs: failing,
+                                state: failing,
                             }));
                         }
                         CheckerOperation::Narrow if passing.is_unreachable() => {
                             return Some(IntegerControl::Fail(IntegerCheckFailure {
                                 directive: expression,
-                                inputs: failing,
+                                state: failing,
                             }));
                         }
                         CheckerOperation::Require | CheckerOperation::Narrow => path = passing,
@@ -257,8 +275,43 @@ fn walk_integer_block(
                     return None;
                 }
             }
-            BlockItemKind::Binding(_) | BlockItemKind::Assignment { .. } => return None,
+            BlockItemKind::Assignment { group } => {
+                let (axis, value) = integer_assignment(calls, roots, group)?;
+                path = path.overwrite(axis, value);
+            }
+            BlockItemKind::Binding(_) => return None,
         }
     }
     Some(IntegerControl::Continue(path))
+}
+
+fn integer_assignment<'a>(
+    calls: &'a FunctionCallSites,
+    roots: &IntegerRoots<'_>,
+    position: BlockPosition,
+) -> Option<(usize, &'a BigInt)> {
+    let group = calls.assignments.get(&(position.block, position.item))?;
+    let [rhs] = group.rhs_evaluations().as_slice() else {
+        return None;
+    };
+    let [destination] = group.destinations().as_slice() else {
+        return None;
+    };
+    if group.projected_outputs().len() != 0 {
+        return None;
+    }
+    let DirectDestinationIdentity::Existing(binding) =
+        calls.prepared_direct_destination(destination.destination)?
+    else {
+        return None;
+    };
+    let &(axis, ty) = roots.get(binding)?;
+    let AssignmentReplacement::Resolved(replacement) = &destination.replacement else {
+        return None;
+    };
+    if ty != replacement {
+        return None;
+    }
+    let value = calls.structure.checker_integer_assignment_rhs.get(&rhs.expression)?;
+    Some((axis, value))
 }

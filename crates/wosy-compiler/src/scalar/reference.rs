@@ -5996,6 +5996,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) checker_directives: HashMap<OccurrenceOrdinal, super::checker_directive::PreparedCheckerDirective>,
     #[cfg(test)]
     pub(super) checker_integer_branches: HashMap<OccurrenceOrdinal, super::checker_flow::IntegerPredicate>,
+    #[cfg(test)]
+    pub(super) checker_integer_assignment_rhs: HashMap<OccurrenceOrdinal, BigInt>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
     pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
@@ -6019,6 +6021,8 @@ impl OccurrenceStructure {
             checker_directives: HashMap::new(),
             #[cfg(test)]
             checker_integer_branches: HashMap::new(),
+            #[cfg(test)]
+            checker_integer_assignment_rhs: HashMap::new(),
             literal_fields: HashMap::new(),
             module_storage_uses: HashMap::new(),
             module_storage_installs: BTreeMap::new(),
@@ -6689,6 +6693,15 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         {
             if let Some(predicate) = self.checker_integer_predicate(expression, names) {
                 self.structure.checker_integer_branches.insert(ordinal, predicate);
+            }
+        }
+        #[cfg(test)]
+        if self.occurrence_typing.checker_directives_enabled()
+            && matches!(edge, OccurrenceEdge::AssignmentRhs { .. })
+            && self.structure.checked_types.expressions.get(&ordinal).is_some_and(is_integer_type)
+        {
+            if let ScalarExpression::Integer { value, .. } = expression {
+                self.structure.checker_integer_assignment_rhs.insert(ordinal, value.clone());
             }
         }
         if matches!(&self.mode, WalkMode::ModuleInitialization { .. })

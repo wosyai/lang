@@ -19,6 +19,10 @@ impl IntegerSet {
         Some(Self(vec![Interval { first, last }]))
     }
 
+    pub(super) fn singleton(value: &BigInt) -> Self {
+        Self(vec![Interval { first: value.clone(), last: value.clone() }])
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
