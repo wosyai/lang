@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use wosy_syntax::{
-    ByteSpan, CstNode, CstToken, ParseResult, SourceIdentity, SourceSpan, SyntaxKind,
+    ByteSpan, CstNode, CstToken, ParseResult, SourceIdentity, SourceSpan, SyntaxKind, TypedComment,
 };
 
 mod scalar;
@@ -47,6 +49,33 @@ mod tests {
         parse_source, validate_scalar_project, ScalarModule, ScalarProject,
     };
     use wosy_syntax::{ByteSpan, CanonicalCstRoot, CanonicalCstSnapshot, SourceIdentity};
+
+    #[test]
+    fn publication_uses_first_comment_with_an_exact_span() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let mut parsed = parse_source(
+            source,
+            "%%start\n# NOTE: first\nu8 value = 1;\n# NOTE: second\n%%end".to_owned(),
+            &["NOTE".to_owned()],
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.result.comments.len(), 2);
+        let before = super::publication(&parsed);
+
+        parsed.result.comments.reverse();
+        let mut duplicate = parsed.result.comments[1].clone();
+        duplicate.raw_payload = "duplicate must not replace the first match".to_owned();
+        parsed.result.comments.push(duplicate);
+
+        let after = super::publication(&parsed);
+        assert_eq!(after.root, before.root);
+        assert_eq!(after.comments, parsed.result.comments);
+    }
 
     #[test]
     fn derives_core_runtime_from_llvm_output() {
@@ -328,10 +357,14 @@ pub fn parse_source(
 }
 
 pub fn publication(output: &ParseOutput) -> CstPublication {
+    let mut comments_by_span = HashMap::with_capacity(output.result.comments.len());
+    for comment in &output.result.comments {
+        comments_by_span.entry(comment.span).or_insert(comment);
+    }
     CstPublication {
         source: output.result.source.clone(),
         source_revision: output.result.source.revision.clone(),
-        root: project_node(&output.result.root, &output.result.comments, "0"),
+        root: project_node(&output.result.root, &comments_by_span, "0"),
         comments: output.result.comments.clone(),
         diagnostics: output.diagnostics.clone(),
     }
@@ -339,7 +372,7 @@ pub fn publication(output: &ParseOutput) -> CstPublication {
 
 fn project_node(
     node: &CstNode,
-    comments: &[wosy_syntax::TypedComment],
+    comments: &HashMap<ByteSpan, &TypedComment>,
     selector: &str,
 ) -> CstElement {
     let span = wosy_syntax::byte_span(node);
@@ -369,12 +402,12 @@ fn project_node(
 
 fn project_token(
     token: &CstToken,
-    comments: &[wosy_syntax::TypedComment],
+    comments: &HashMap<ByteSpan, &TypedComment>,
     selector: &str,
 ) -> CstElement {
     let token_range = token.text_range();
     let exact_span = ByteSpan::new(u32::from(token_range.start()), u32::from(token_range.end()));
-    let comment = comments.iter().find(|comment| comment.span == exact_span);
+    let comment = comments.get(&exact_span);
     CstElement {
         selector: selector.to_owned(),
         kind: format!("{:?}", token.kind()),

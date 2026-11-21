@@ -532,61 +532,28 @@ fn add_gap(
     offset: usize,
     comments: &[TypedComment],
 ) {
-    let mut start = 0;
     let mut index = 0;
     while index < text.len() {
-        let byte = text.as_bytes()[index];
-        let (kind, end) = match byte {
-            b' ' => (Some(SyntaxKind::Whitespace), index + 1),
-            b'\t' => (Some(SyntaxKind::Indentation), index + 1),
+        let (kind, end) = match text.as_bytes()[index] {
+            b' ' => (SyntaxKind::Whitespace, index + 1),
+            b'\t' => (SyntaxKind::Indentation, index + 1),
             b'\r' if text.as_bytes().get(index + 1) == Some(&b'\n') => {
-                (Some(SyntaxKind::LineEnding), index + 2)
+                (SyntaxKind::LineEnding, index + 2)
             }
-            b'\r' | b'\n' => (Some(SyntaxKind::LineEnding), index + 1),
-            _ if comments
-                .iter()
-                .any(|comment| comment.span.start as usize == offset + index) =>
+            b'\r' | b'\n' => (SyntaxKind::LineEnding, index + 1),
+            b'#' => match comments
+                .binary_search_by_key(&(offset + index), |comment| comment.span.start as usize)
             {
-                let end = comments
-                    .iter()
-                    .find(|comment| comment.span.start as usize == offset + index)
-                    .expect("comment span")
-                    .span
-                    .end as usize
-                    - offset;
-                if index > start {
-                    builder.token(
-                        WosyLanguage::kind_to_raw(SyntaxKind::Punctuation),
-                        &text[start..index],
-                    );
-                }
-                builder.token(
-                    WosyLanguage::kind_to_raw(SyntaxKind::TypedComment),
-                    &text[index..end],
-                );
-                start = end;
-                index = end;
-                continue;
-            }
-            _ => (Some(SyntaxKind::Punctuation), next_char_end(text, index)),
+                Ok(ordinal) => (
+                    SyntaxKind::TypedComment,
+                    comments[ordinal].span.end as usize - offset,
+                ),
+                Err(_) => (SyntaxKind::Punctuation, index + 1),
+            },
+            _ => (SyntaxKind::Punctuation, next_char_end(text, index)),
         };
-        if let Some(kind) = kind {
-            if index > start {
-                builder.token(
-                    WosyLanguage::kind_to_raw(SyntaxKind::Punctuation),
-                    &text[start..index],
-                );
-            }
-            builder.token(WosyLanguage::kind_to_raw(kind), &text[index..end]);
-            start = end;
-        }
+        builder.token(WosyLanguage::kind_to_raw(kind), &text[index..end]);
         index = end;
-    }
-    if start < text.len() {
-        builder.token(
-            WosyLanguage::kind_to_raw(SyntaxKind::Punctuation),
-            &text[start..],
-        );
     }
 }
 
@@ -888,6 +855,32 @@ mod tests {
         assert_eq!(result.comments[4].category, "\"quoted # text\"");
         assert_eq!(result.reconstruct(), text);
     }
+    #[test]
+    fn gap_comment_tokens_have_exact_ranges_in_valid_and_recovered_source() {
+        for text in [
+            "%%start\n# NOTE: begin\nu8 value = 1; # NOTE: end\n%%end",
+            "broken Ω \"# not a comment\" # NOTE: begin\r\n# NOTE: end",
+        ] {
+            let result = parse(identity(), text.into(), &["NOTE".to_owned()]);
+            assert_eq!(result.reconstruct(), text);
+            let comments = result
+                .root
+                .descendants_with_tokens()
+                .filter_map(|element| element.into_token())
+                .filter(|token| token.kind() == SyntaxKind::TypedComment)
+                .map(|token| {
+                    let range = token.text_range();
+                    ByteSpan::new(range.start().into(), range.end().into())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(comments.len(), 2);
+            assert_eq!(
+                comments,
+                result.comments.iter().map(|comment| comment.span).collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn recovery_is_lossless() {
         let text = "%%start\n# nope\n%%end";
