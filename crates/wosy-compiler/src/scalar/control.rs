@@ -160,7 +160,6 @@ pub(super) struct ModuleInitializationTopology {
     pub(super) callable_escapes: HashSet<SourceSpan>,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
-    pub(super) loops: HashMap<(BlockOrdinal, usize), WhileRegion>,
     pub(super) short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
 }
 
@@ -503,7 +502,6 @@ pub(super) enum BlockItemKind {
     Evaluation { expression: OccurrenceOrdinal },
     FinalOutput(FinalOutputSlot),
     Assignment { group: BlockPosition },
-    While { region: BlockPosition },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -567,20 +565,6 @@ pub(super) enum ConditionalRegion {
 pub(super) struct BlockPosition {
     pub(super) block: BlockOrdinal,
     pub(super) item: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct WhileRegion {
-    pub(super) span: ByteSpan,
-    pub(super) test: OccurrenceOrdinal,
-    pub(super) body: BlockOrdinal,
-    pub(super) on_false: BlockPosition,
-}
-
-impl WhileRegion {
-    pub(super) fn body_to_test(&self) -> (BlockOrdinal, OccurrenceOrdinal) {
-        (self.body, self.test)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

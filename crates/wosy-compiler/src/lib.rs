@@ -22,7 +22,7 @@ pub use scalar::{
     ScalarProgram, ScalarProject, ScalarProjectPreparationRejection, ScalarProjectValidation,
     ScalarSourceDeclarations, ScalarStruct, ScalarStructField, ScalarStructFieldId, ScalarStructId,
     ScalarStructLiteral, ScalarStructLiteralField, ScalarTargetLayout, ScalarType,
-    ScalarValidation, ScalarWhile, UnaryOperator,
+    ScalarValidation, UnaryOperator,
 };
 
 mod llvm;
@@ -43,8 +43,8 @@ pub fn core_runtime(backend: &str, output: &str) -> Result<&'static str, String>
 mod tests {
     use super::ScalarNamespaceBinding;
     use super::{
-        core_runtime, derive_scalar_program, emit_scalar_project_llvm, parse_source,
-        validate_scalar_project, ScalarModule, ScalarProject,
+        core_runtime, derive_scalar_program, emit_scalar_llvm, emit_scalar_project_llvm,
+        parse_source, validate_scalar_project, ScalarModule, ScalarProject,
     };
     use wosy_syntax::{ByteSpan, CanonicalCstRoot, CanonicalCstSnapshot, SourceIdentity};
 
@@ -72,8 +72,8 @@ mod tests {
     }
 
     #[test]
-    fn reports_only_the_trailing_while_semicolon_syntax_diagnostic() {
-        let text = "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t};\n};\n%%end";
+    fn rejects_retired_while_block_form_with_a_syntax_diagnostic() {
+        let text = "%%start\nunit() repeat = fn { while (true) {} };\n%%end";
         let output = parse_source(
             SourceIdentity::new(
                 "project".into(),
@@ -86,11 +86,30 @@ mod tests {
         );
 
         assert_eq!(output.diagnostics.len(), 1);
-        let semicolon = text.find("\n\t};\n").expect("trailing semicolon") as u32 + 3;
-        assert_eq!(
-            output.diagnostics[0].labels[0].span.range,
-            ByteSpan::new(semicolon, semicolon + 1)
+        assert_eq!(output.diagnostics[0].code, "S0001");
+        let range = output.diagnostics[0].labels[0].span.range;
+        let start = text.find("while").unwrap() as u32;
+        assert!(range.start <= start && range.end > start);
+        assert_eq!(output.result.reconstruct(), text);
+    }
+
+    #[test]
+    fn validates_an_ordinary_function_named_while() {
+        let text = "%%start\ni32(i32) while = fn(value) { value };\ni32 result = while(2);\n%%end";
+        let output = parse_source(
+            SourceIdentity::new(
+                "project".into(),
+                "package".into(),
+                "src/main.w".into(),
+                "r1".into(),
+            ),
+            text.into(),
+            &[],
         );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let scalar = derive_scalar_program(&output.result);
+        assert!(scalar.diagnostics.is_empty(), "{:?}", scalar.diagnostics);
+        emit_scalar_llvm(&scalar).expect("ordinary named call LLVM");
     }
 
     #[test]
@@ -101,7 +120,7 @@ mod tests {
             "src/bootstrap.w".into(),
             "r1".into(),
         );
-        let text = "%%start\nstruct utf8 { *?u8 data; u64 length; }\nenum ReadLineStatus { line; eof; }\n(*?utf8, ReadLineStatus)(u64) read_line = fn(max_bytes) {\n\tu8[max_bytes] bytes;\n\tbool reading = true;\n\tReadLineStatus status = ReadLineStatus::line;\n\twhile (reading) {\n\t\tif (reading) { bytes[0] = 13; reading = false; } else { status = ReadLineStatus::eof; };\n\t}\n\tnull, status\n};\n%%end";
+        let text = "%%start\nstruct utf8 { *?u8 data; u64 length; }\nenum ReadLineStatus { line; eof; }\n(*?utf8, ReadLineStatus)(u64) read_line = fn(max_bytes) {\n\tu8[max_bytes] bytes;\n\tbool reading = true;\n\tReadLineStatus status = ReadLineStatus::line;\n\tif (reading) {\n\t\tif (reading) { bytes[0] = 13; reading = false; } else { status = ReadLineStatus::eof; };\n\t};\n\tnull, status\n};\n%%end";
         let output = parse_source(source, text.into(), &[]);
 
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
@@ -109,7 +128,7 @@ mod tests {
         assert!(scalar.diagnostics.is_empty(), "{:?}", scalar.diagnostics);
     }
     #[test]
-    fn lowers_a_valid_read_line_loop_shape() {
+    fn lowers_a_valid_read_line_branch_shape() {
         let source = SourceIdentity::new(
             "project".into(),
             "package".into(),
@@ -123,9 +142,9 @@ enum ReadLineStatus { line; eof; }
 	u8[max_bytes] bytes;
 	bool reading = true;
 	ReadLineStatus status = ReadLineStatus::line;
-	while (reading) {
+	if (reading) {
 		if (reading) { bytes[0] = 13; reading = false; } else { status = ReadLineStatus::eof; };
-	}
+	};
 	null, status
 };
 %%end";
@@ -142,7 +161,7 @@ enum ReadLineStatus { line; eof; }
             "{:?}",
             validation.diagnostics
         );
-        emit_scalar_project_llvm(&validation).expect("read_line loop project LLVM");
+        emit_scalar_project_llvm(&validation).expect("read_line branch project LLVM");
     }
 
     #[test]

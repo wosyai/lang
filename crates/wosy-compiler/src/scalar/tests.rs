@@ -1359,8 +1359,8 @@ fn both_reference_functions(text: &str) -> (ScalarValidation, ScalarProjectValid
 }
 
 #[test]
-fn loop_local_move_state_ends_with_its_scope_in_both_validators() {
-    let text = "%%start\nstruct Payload { u64 length; }\nu64(Payload) parse = fn(text) { text.length };\nunit() run = fn { bool running = true; while (running) { Payload line = { .length = 1; }; u64 value = parse(line); value; running = false; } };\n%%end";
+fn branch_local_move_state_ends_with_its_scope_in_both_validators() {
+    let text = "%%start\nstruct Payload { u64 length; }\nu64(Payload) parse = fn(text) { text.length };\nunit() run = fn { bool running = true; if (running) { Payload line = { .length = 1; }; u64 value = parse(line); value; running = false; }; };\n%%end";
     let (single, project) = both_reference_functions(text);
     for (items, diagnostics) in [
         (&single.program.items, &single.diagnostics),
@@ -1506,8 +1506,8 @@ fn sole_fact<'a>(function: &'a ScalarFunction, point: &ReferenceFlowPoint) -> &'
 }
 
 #[test]
-fn reference_cfg_loop_and_multi_output_call_have_source_points_in_both_validators() {
-    let text = "%%start\n(u8, bool)(bool) pair = fn(flag) { u8 value = 1; value, flag };\n*u8(*u8, bool) loop_ref = fn(input, flag) { *u8 result = input; while (flag) { result = null; } result };\nbool(bool) call_pair = fn(flag) { u8 magnitude, bool valid = pair(flag); magnitude; valid };\nbool(bool) assigned = fn(flag) { u8 magnitude = 0; bool valid = false; magnitude, valid = pair(flag); magnitude; valid };\n(*u8, bool)(bool) nullable = fn(flag) { null, flag };\n%%end";
+fn reference_cfg_branch_and_multi_output_call_have_source_points_in_both_validators() {
+    let text = "%%start\n(u8, bool)(bool) pair = fn(flag) { u8 value = 1; value, flag };\n*u8(*u8, bool) branch_ref = fn(input, flag) { *u8 result = input; if (flag) { result = null; }; result };\nbool(bool) call_pair = fn(flag) { u8 magnitude, bool valid = pair(flag); magnitude; valid };\nbool(bool) assigned = fn(flag) { u8 magnitude = 0; bool valid = false; magnitude, valid = pair(flag); magnitude; valid };\n(*u8, bool)(bool) nullable = fn(flag) { null, flag };\n%%end";
     let (single, project) = both_reference_functions(text);
     for (items, source) in [
         (&single.program.items, &single.program.source),
@@ -1523,37 +1523,26 @@ fn reference_cfg_loop_and_multi_output_call_have_source_points_in_both_validator
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let loop_cfg = &functions[1].reference_cfg;
-        let head = loop_cfg
-            .points
-            .iter()
-            .find(|point| matches!(point.kind, CfgPointKind::LoopTest { .. }))
-            .expect("loop head");
-        let test = loop_cfg
+        let branch_cfg = &functions[1].reference_cfg;
+        let test = branch_cfg
             .points
             .iter()
             .find(|point| matches!(point.kind, CfgPointKind::Branch { .. }))
-            .expect("loop test branch");
-        assert_eq!(head.source_span.source, *source);
+            .expect("branch test");
+        assert_eq!(test.source_span.source, *source);
+        let condition = text.find("if (flag)").unwrap() as u32 + "if (".len() as u32;
         assert_eq!(
-            head.source_span.range,
-            ByteSpan::new(
-                text.find("while (flag)").unwrap() as u32 + 7,
-                text.find("while (flag)").unwrap() as u32 + 11
-            )
+            test.source_span.range,
+            ByteSpan::new(condition, condition + 4)
         );
         assert_eq!(test.successors.len(), 2);
-        assert!(loop_cfg
-            .points
-            .iter()
-            .any(|point| point.id.0 > test.id.0 && point.successors.contains(&head.id)));
-        assert!(loop_cfg
+        assert!(branch_cfg
             .points
             .iter()
             .any(|point| matches!(point.kind, CfgPointKind::Join)
                 && test.successors.contains(&point.id)));
         assert_eq!(
-            loop_cfg
+            branch_cfg
                 .points
                 .iter()
                 .filter(|point| matches!(point.kind, CfgPointKind::Return))
@@ -1955,8 +1944,8 @@ fn returned_reborrow_of_field_preserves_disjoint_caller_place() {
 }
 
 #[test]
-fn loop_reference_facts_converge_across_zero_and_repeated_iterations_in_both_validators() {
-    let text = "%%start\nunit(bool) repeat = fn(flag) { u8 first = 1; u8 second = 2; *u8 alias = &first; while (flag) { *u8 local = &second; local; alias = &second; alias = &first; } alias; };\n%%end";
+fn branch_reference_facts_merge_at_fallthrough_in_both_validators() {
+    let text = "%%start\nunit(bool) repeat = fn(flag) { u8 first = 1; u8 second = 2; *u8 alias = &first; if (flag) { *u8 local = &second; local; alias = &second; alias = &first; }; alias; };\n%%end";
     let (single, project) = both_reference_functions(text);
     for (items, diagnostics) in [
         (&single.program.items, &single.diagnostics),
@@ -1980,8 +1969,8 @@ fn loop_reference_facts_converge_across_zero_and_repeated_iterations_in_both_val
 }
 
 #[test]
-fn loop_carried_loan_conflicts_with_owner_move_after_exit_in_both_validators() {
-    let text = "%%start\nstruct Payload { u8 value; }\nunit(bool) consume = fn(flag) { Payload item = { .value = 1; }; *Payload retained = &item; while (flag) { retained; } Payload taken = item; retained; taken.value; };\n%%end";
+fn loan_live_across_branch_conflicts_with_owner_move_in_both_validators() {
+    let text = "%%start\nstruct Payload { u8 value; }\nunit(bool) consume = fn(flag) { Payload item = { .value = 1; }; *Payload retained = &item; if (flag) { retained; }; Payload taken = item; retained; taken.value; };\n%%end";
     let (single, project) = both_reference_functions(text);
     let moved = text.find("taken = item").unwrap() as u32 + 8;
     for diagnostics in [&single.diagnostics, &project.diagnostics] {
@@ -1996,21 +1985,21 @@ fn loop_carried_loan_conflicts_with_owner_move_after_exit_in_both_validators() {
 }
 
 #[test]
-fn loop_local_loan_ends_before_owner_move_in_both_validators() {
-    let text = "%%start\nstruct Payload { u8 value; }\nunit(bool) consume = fn(flag) { Payload item = { .value = 1; }; while (flag) { *Payload local = &item; local; } Payload taken = item; taken.value; };\n%%end";
+fn branch_local_loan_ends_before_owner_move_in_both_validators() {
+    let text = "%%start\nstruct Payload { u8 value; }\nunit(bool) consume = fn(flag) { Payload item = { .value = 1; }; if (flag) { *Payload local = &item; local; }; Payload taken = item; taken.value; };\n%%end";
     let (single, project) = both_reference_functions(text);
     assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
     assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
 }
 
 #[test]
-fn loop_aggregate_copy_and_move_preserve_availability_in_both_validators() {
-    let copy = "%%start\nstruct copy Point { u8 value; }\nunit(bool) repeat = fn(flag) { Point item = { .value = 1; }; *Point reader = &item; while (flag) { Point seen = *reader; seen.value; } item.value; };\n%%end";
+fn branch_aggregate_copy_and_move_preserve_availability_in_both_validators() {
+    let copy = "%%start\nstruct copy Point { u8 value; }\nunit(bool) repeat = fn(flag) { Point item = { .value = 1; }; *Point reader = &item; if (flag) { Point seen = *reader; seen.value; }; item.value; };\n%%end";
     let (single, project) = both_reference_functions(copy);
     assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
     assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
 
-    let moved = "%%start\nstruct Payload { u8 value; }\nunit(bool) repeat = fn(flag) { Payload item = { .value = 1; }; while (flag) { Payload taken = item; taken.value; } item.value; };\n%%end";
+    let moved = "%%start\nstruct Payload { u8 value; }\nunit(bool) repeat = fn(flag) { Payload item = { .value = 1; }; if (flag) { Payload taken = item; taken.value; }; item.value; };\n%%end";
     let (single, project) = both_reference_functions(moved);
     let read = moved.rfind("item.value").unwrap() as u32;
     for diagnostics in [&single.diagnostics, &project.diagnostics] {
@@ -5333,9 +5322,9 @@ fn preserves_scalar_precedence_and_left_associativity() {
 }
 
 #[test]
-fn derives_and_validates_ordered_local_mutation_and_unit_while() {
+fn derives_and_validates_ordered_local_mutation_and_unit_branch() {
     let result = validate_text(
-            "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t}\n\tvalue\n};\n%%end",
+            "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\tif (value < 3) {\n\t\tvalue = value + 1;\n\t};\n\tvalue\n};\n%%end",
         );
     assert!(
         result.diagnostics.is_empty(),
@@ -5351,12 +5340,14 @@ fn derives_and_validates_ordered_local_mutation_and_unit_while() {
         function.body.items[0],
         ScalarBlockItem::LocalBinding(_)
     ));
-    let ScalarBlockItem::While(while_expression) = &function.body.items[1] else {
-        panic!("while item");
+    let ScalarBlockItem::Expression(
+        expression @ ScalarExpression::UnitIf { then_branch, .. },
+    ) = &function.body.items[1] else {
+        panic!("unit branch");
     };
-    assert_eq!(while_expression.span, ByteSpan::new(57, 100));
+    assert_eq!(expression_span(expression), ByteSpan::new(57, 97));
     assert!(matches!(
-        while_expression.body.items[0],
+        then_branch.items[0],
         ScalarBlockItem::Assignment(_)
     ));
     let overloads =
@@ -5372,7 +5363,7 @@ fn derives_and_validates_ordered_local_mutation_and_unit_while() {
     };
     assert_eq!(
         block_type(
-            &while_expression.body,
+            then_branch,
             &BTreeMap::new(),
             &BTreeSet::new(),
             &BTreeMap::new(),
@@ -5557,13 +5548,20 @@ fn rejects_const_binding_assignments_at_target_span_in_project() {
 }
 
 #[test]
-fn rejects_non_boolean_while_condition() {
-    let result =
-        validate_text("%%start\ni32(i32) f = fn(value) { while (value) { value } 0 };\n%%end");
-    assert!(result
+fn rejects_non_boolean_unit_condition() {
+    let text = "%%start\ni32(i32) f = fn(value) { if (value) { value; }; 0 };\n%%end";
+    let result = validate_text(text);
+    let condition = text.find("if (value)").unwrap() as u32 + "if (".len() as u32;
+    let diagnostic = result
         .diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code == "B0005"));
+        .find(|diagnostic| {
+            diagnostic.code == "B0003"
+                && diagnostic.message == "expression type does not match expected type"
+                && diagnostic.labels[0].span.range == ByteSpan::new(condition, condition + 5)
+        })
+        .unwrap_or_else(|| panic!("{:?}", result.diagnostics));
+    assert_eq!(diagnostic.labels[0].span.source, result.program.source);
 }
 
 #[test]
@@ -7204,7 +7202,7 @@ fn reports_unused_local_and_parameter_at_declaration_spans() {
 #[test]
 fn counts_resolved_uses_across_initializers_assignments_conditions_calls_and_branches() {
     let result = validate_text(
-            "%%start\nunit(i32) consume = fn(value) { value; };\ni32(i32) f = fn(input) { i32 local = input; while (local < 2) { local = local + 1; } if (local == 2) { consume(local); } else { consume(input); } local };\n%%end",
+            "%%start\nunit(i32) consume = fn(value) { value; };\ni32(i32) f = fn(input) { i32 local = input; if (local < 2) { local = local + 1; }; if (local == 2) { consume(local); } else { consume(input); } local };\n%%end",
         );
     assert!(
         result.diagnostics.is_empty(),
@@ -9453,7 +9451,7 @@ fn reports_final_output_list_type_and_arity_diagnostics() {
 
 #[test]
 fn validates_control_flow_prefix_before_final_output_list_as_unit() {
-    let text = "%%start\n(i32, bool)() pair = fn { if (true) { 1; } else { 2; } while (false) { 3; } 7, true };\n%%end";
+    let text = "%%start\n(i32, bool)() pair = fn { if (true) { 1; } else { 2; } if (false) { 3; }; 7, true };\n%%end";
     let result = validate_text(text);
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
 

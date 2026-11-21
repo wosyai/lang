@@ -3279,7 +3279,7 @@ fn accepts_fixed_array_lengths_at_llvm_array_size_limit() {
 }
 
 #[test]
-fn lowers_nested_project_while_loops_with_runtime_array_operations_and_conditionals() {
+fn lowers_nested_project_conditionals_with_runtime_array_operations() {
     let source = SourceIdentity::new(
         "project".into(),
         "package".into(),
@@ -3289,7 +3289,7 @@ fn lowers_nested_project_while_loops_with_runtime_array_operations_and_condition
     let scalar = derive_scalar_program(
             &parse_source(
                 source.clone(),
-                "%%start\ni32(u64) count = fn(length) { u8[length] bytes; i32 outer = 0; while (outer < 1) { i32 index = 0; while (index < 1) { if (index == 0) { bytes[0] = 1; }; index = index + 1; } outer = outer + 1; } outer };\n%%end".into(),
+                "%%start\ni32(u64) count = fn(length) { u8[length] bytes; i32 outer = 0; if (outer < 1) { i32 index = 0; if (index < 1) { if (index == 0) { bytes[0] = 1; }; index = index + 1; }; outer = outer + 1; }; outer };\n%%end".into(),
                 &[],
             )
             .result,
@@ -3307,10 +3307,13 @@ fn lowers_nested_project_while_loops_with_runtime_array_operations_and_condition
     );
 
     let llvm = emit_scalar_project_llvm(&validation)
-        .expect("project loop LLVM")
+        .expect("project nested conditional LLVM")
         .to_text();
-    assert!(llvm.contains("while.cond.0:"), "{llvm}");
-    assert!(llvm.contains("while.cond.3:"), "{llvm}");
+    assert!(
+        llvm.lines().filter(|line| line.contains("br i1 ")).count() >= 3,
+        "{llvm}"
+    );
+    assert!(llvm.contains("store i8 1"), "{llvm}");
     assert!(llvm.contains("getelementptr inbounds i8"), "{llvm}");
 }
 
@@ -3342,7 +3345,7 @@ fn lowers_integer_literals_in_binary_expressions_to_the_left_operand_width() {
 }
 
 #[test]
-fn emits_multiple_unit_conditionals_in_a_while_body() {
+fn emits_multiple_unit_conditionals_in_a_branch() {
     let source = SourceIdentity::new(
         "project".into(),
         "package".into(),
@@ -3352,7 +3355,7 @@ fn emits_multiple_unit_conditionals_in_a_while_body() {
     let validation = derive_scalar_program(
             &parse_source(
                 source,
-                "%%start\n(i32, bool)() run = fn { bool running = true; if (true) { while (running) { if (running) { running = false; } else { running = false; }; if (running) { running = running; } else { running = running; }; } running = false; 1, true } else { 2, false } };\n%%end".into(),
+                "%%start\n(i32, bool)() run = fn { bool running = true; if (true) { if (running) { if (running) { running = false; } else { running = false; }; if (running) { running = running; } else { running = running; }; }; running = false; 1, true } else { 2, false } };\n%%end".into(),
                 &[],
             )
             .result,
@@ -3364,19 +3367,19 @@ fn emits_multiple_unit_conditionals_in_a_while_body() {
     );
 
     let llvm = emit_scalar_llvm(&validation)
-        .expect("multiple loop unit conditional LLVM")
+        .expect("multiple nested unit conditional LLVM")
         .to_text();
     assert_eq!(
         llvm.lines()
-            .filter(|line| line.starts_with("while.cond.") && line.contains(':'))
+            .filter(|line| line.contains("br i1 "))
             .count(),
-        1,
+        4,
         "{llvm}"
     );
 }
 
 #[test]
-fn emits_project_multiple_unit_conditionals_in_a_while_body_once() {
+fn emits_project_multiple_unit_conditionals_in_a_branch_once() {
     let source = SourceIdentity::new(
         "project".into(),
         "package".into(),
@@ -3386,7 +3389,7 @@ fn emits_project_multiple_unit_conditionals_in_a_while_body_once() {
     let scalar = derive_scalar_program(
             &parse_source(
                 source.clone(),
-                "%%start\n(i32, bool)() run = fn { bool running = true; if (true) { while (running) { if (running) { running = false; } else { running = false; }; if (running) { running = running; } else { running = running; }; } running = false; 1, true } else { 2, false } };\n%%end".into(),
+                "%%start\n(i32, bool)() run = fn { bool running = true; if (true) { if (running) { if (running) { running = false; } else { running = false; }; if (running) { running = running; } else { running = running; }; }; running = false; 1, true } else { 2, false } };\n%%end".into(),
                 &[],
             )
             .result,
@@ -3404,13 +3407,13 @@ fn emits_project_multiple_unit_conditionals_in_a_while_body_once() {
     );
 
     let llvm = emit_scalar_project_llvm(&validation)
-        .expect("project multiple loop unit conditional LLVM")
+        .expect("project multiple nested unit conditional LLVM")
         .to_text();
     assert_eq!(
         llvm.lines()
-            .filter(|line| line.starts_with("while.cond.") && line.contains(':'))
+            .filter(|line| line.contains("br i1 "))
             .count(),
-        1,
+        4,
         "{llvm}"
     );
 }

@@ -5,30 +5,24 @@ source_filename = "src/main.w"
 
 define i32 @loop(i32 %start) {
 entry:
-  %assignment_value = alloca i32, align 4
-  %value = alloca i32, align 4
   %start1 = alloca i32, align 4
   store i32 %start, ptr %start1, align 4
+  br label %self_tail.header
+
+self_tail.header:                                 ; preds = %self_tail.then, %entry
   %start2 = load i32, ptr %start1, align 4
-  store i32 %start2, ptr %value, align 4
-  br label %while.cond.0
+  %lt = icmp slt i32 %start2, 3
+  br i1 %lt, label %self_tail.then, label %self_tail.else
 
-while.cond.0:                                     ; preds = %while.body.1, %entry
-  %value3 = load i32, ptr %value, align 4
-  %lt = icmp slt i32 %value3, 3
-  br i1 %lt, label %while.body.1, label %while.exit.2
+self_tail.then:                                   ; preds = %self_tail.header
+  %start3 = load i32, ptr %start1, align 4
+  %add = add i32 %start3, 1
+  store i32 %add, ptr %start1, align 4
+  br label %self_tail.header
 
-while.body.1:                                     ; preds = %while.cond.0
-  %value4 = load i32, ptr %value, align 4
-  %add = add i32 %value4, 1
-  store i32 %add, ptr %assignment_value, align 4
-  %assignment_value5 = load i32, ptr %assignment_value, align 4
-  store i32 %assignment_value5, ptr %value, align 4
-  br label %while.cond.0
-
-while.exit.2:                                     ; preds = %while.cond.0
-  %value6 = load i32, ptr %value, align 4
-  ret i32 %value6
+self_tail.else:                                   ; preds = %self_tail.header
+  %start4 = load i32, ptr %start1, align 4
+  ret i32 %start4
 }
 
 define i32 @main() {

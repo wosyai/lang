@@ -513,9 +513,6 @@ pub enum CfgPointKind {
         condition: ScalarExpression,
     },
     Join,
-    LoopTest {
-        condition: ScalarExpression,
-    },
     ReturnOutput {
         output: usize,
         value_point: CfgPointId,
@@ -930,7 +927,6 @@ enum ScalarBlockItemIdentity {
     ),
     Expression(ScalarExpressionIdentity),
     Assignment(Vec<ScalarPlaceIdentity>, Vec<ScalarExpressionIdentity>),
-    While(ScalarExpressionIdentity, ScalarBlockIdentity),
 }
 
 fn scalar_place_identity(place: &ScalarPlace) -> ScalarPlaceIdentity {
@@ -1134,10 +1130,6 @@ fn scalar_block_identity(block: &ScalarBlock) -> ScalarBlockIdentity {
                         .iter()
                         .map(scalar_expression_identity)
                         .collect(),
-                ),
-                ScalarBlockItem::While(while_expression) => ScalarBlockItemIdentity::While(
-                    scalar_expression_identity(&while_expression.condition),
-                    scalar_block_identity(&while_expression.body),
                 ),
             })
             .collect(),
@@ -1890,7 +1882,6 @@ pub enum ScalarBlockItem {
     LocalBinding(ScalarBinding),
     Expression(ScalarExpression),
     Assignment(ScalarAssignment),
-    While(ScalarWhile),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1941,13 +1932,6 @@ pub struct ScalarAssignmentTarget {
     pub target_span: ByteSpan,
     pub span: ByteSpan,
     pub place: ScalarPlace,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ScalarWhile {
-    pub condition: ScalarExpression,
-    pub body: ScalarBlock,
-    pub span: ByteSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -4147,12 +4131,10 @@ fn derive_block_item(node: &CstNode) -> ScalarBlockItem {
     let child = direct_nodes(node).into_iter().next().expect("block item");
     match child.kind() {
         SyntaxKind::LocalBinding => ScalarBlockItem::LocalBinding(derive_binding(&child)),
-        SyntaxKind::While => ScalarBlockItem::While(derive_while(&child)),
         SyntaxKind::Expression => {
             let actual = direct_nodes(&child).into_iter().next().expect("expression");
             match actual.kind() {
                 SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&actual)),
-                SyntaxKind::While => ScalarBlockItem::While(derive_while(&actual)),
                 _ => ScalarBlockItem::Expression(derive_expression(&child)),
             }
         }
@@ -4245,15 +4227,6 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
         targets,
         value,
         values,
-        span: wosy_syntax::byte_span(node),
-    }
-}
-
-fn derive_while(node: &CstNode) -> ScalarWhile {
-    let children = direct_nodes(node);
-    ScalarWhile {
-        condition: derive_expression(&children[0]),
-        body: derive_block(&children[1]),
         span: wosy_syntax::byte_span(node),
     }
 }

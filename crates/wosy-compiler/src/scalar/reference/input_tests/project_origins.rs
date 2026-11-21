@@ -503,7 +503,6 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
                         callable_escapes: HashSet::new(),
                         assignments: HashMap::new(),
                         conditionals: HashMap::new(),
-                        loops: HashMap::new(),
                         short_circuits: HashMap::new(),
                     }
                 )),
@@ -591,7 +590,7 @@ fn prepared_module_initialization_publishes_nested_canonical_occurrences() {
     use OccurrenceNode as Node;
     use OccurrenceParent as Parent;
 
-    let text = "%%start\nfirst = namespace package \"child.w\";\ni32(i32) identity = fn(input) { input };\nsecond = namespace package \"child.w\";\ni32 value = if (true && second.echo(false)) { if (false) { 1 } else { 2 } } else { 3 };\nif (true) { while (false) { value = identity(4); } };\n%%end";
+    let text = "%%start\nfirst = namespace package \"child.w\";\ni32(i32) identity = fn(input) { input };\nsecond = namespace package \"child.w\";\ni32 value = if (true && second.echo(false)) { if (false) { 1 } else { 2 } } else { 3 };\nif (true) { if (false) { value = identity(4); }; };\n%%end";
     let source = |path: &str| {
         SourceIdentity::new("project".into(), "package".into(), path.into(), "r1".into())
     };
@@ -724,13 +723,18 @@ fn prepared_module_initialization_publishes_nested_canonical_occurrences() {
         let ConditionalRegion::Unit { then_block, .. } = topology.conditionals[&executable] else {
             panic!("executable conditional");
         };
-        let loop_region = topology.loops[&(then_block, 0)];
-        assert_eq!(
-            loop_region.body_to_test(),
-            (loop_region.body, loop_region.test)
-        );
-        assert_eq!(spelling(loop_region.test), "false");
-        let group = &topology.assignments[&(loop_region.body, 0)];
+        let Node::Expression(nested) = structure.edges[&(
+            Parent::Block(then_block),
+            Edge::ExpressionItem { item: 0 },
+        )] else {
+            panic!("nested executable conditional");
+        };
+        let ConditionalRegion::Unit { condition, then_block, .. } = topology.conditionals[&nested]
+        else {
+            panic!("nested unit conditional");
+        };
+        assert_eq!(spelling(condition), "false");
+        let group = &topology.assignments[&(then_block, 0)];
         let rhs = group.rhs_evaluations().next().unwrap();
         let destination = group.destinations().next().unwrap();
         assert_eq!(spelling(rhs.expression), "identity(4)");
@@ -749,7 +753,7 @@ fn prepared_module_initialization_publishes_nested_canonical_occurrences() {
         assert_eq!(
             group.continuation(),
             BlockPosition {
-                block: loop_region.body,
+                block: then_block,
                 item: 1
             }
         );

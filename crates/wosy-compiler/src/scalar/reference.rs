@@ -8,7 +8,7 @@ use super::control::{
     InitializationDestination, InitializationIdentities, InitializationLocal, InitializationMember,
     InitializationName, InitializationStorage, ModuleInitializationCallTarget,
     ModuleInitializationDetail, ModuleInitializationRegion, ModuleInitializationStepKind,
-    ModuleInitializationTopology, ShortCircuitRegion, SyntheticOccurrence, WhileRegion,
+    ModuleInitializationTopology, ShortCircuitRegion, SyntheticOccurrence,
 };
 use super::control::{
     AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentReplacement,
@@ -3250,46 +3250,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     );
                     next_item = continuation.item;
                 }
-                (ScalarBlockItem::While(loop_), BlockItemKind::While { region: key }) => {
-                    let loop_region = self.call_sites.loops[&(key.block, key.item)];
-                    let (body, test) = loop_region.body_to_test();
-                    let loop_head = self.point(
-                        CfgPointKind::LoopTest {
-                            condition: loop_.condition.clone(),
-                        },
-                        expression_span(&loop_.condition),
-                        scope,
-                        BTreeSet::new(),
-                    );
-                    self.expression(&loop_.condition, scope, test)?;
-                    let branch = self.point(
-                        CfgPointKind::Branch {
-                            condition: loop_.condition.clone(),
-                        },
-                        expression_span(&loop_.condition),
-                        scope,
-                        BTreeSet::new(),
-                    );
-                    let names = self.names.clone();
-                    let origins = self.origins.clone();
-                    let checked = self.checked.clone();
-                    self.block(&loop_.body, body)?;
-                    let back = self.cursor.expect("loop body terminal");
-                    self.cfg.points[back.0].successors.push(loop_head);
-                    self.names = names;
-                    self.origins = origins;
-                    self.checked = checked;
-                    self.cursor = Some(branch);
-                    self.point(CfgPointKind::Join, loop_.span, scope, BTreeSet::new());
-                    assert_eq!(
-                        loop_region.on_false,
-                        BlockPosition {
-                            block: ordinal,
-                            item: item_index + 1
-                        }
-                    );
-                    next_item = loop_region.on_false.item;
-                }
                 _ => panic!(
                     "mismatched block item {ordinal:?}/{item_index} in {:?}",
                     self.source
@@ -5171,8 +5131,6 @@ pub(super) enum OccurrenceEdge {
     FinalOutput { item: usize, output: usize },
     AssignmentRhs { item: usize, output: usize },
     AssignmentDestination { item: usize, destination: usize },
-    WhileCondition { item: usize },
-    WhileBody { item: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5382,7 +5340,6 @@ pub(super) struct FunctionCallSites {
     pub(super) structure: OccurrenceStructure,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
-    pub(super) loops: HashMap<(BlockOrdinal, usize), WhileRegion>,
     pub(super) short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
 }
 
@@ -5690,7 +5647,6 @@ struct StructuralWalker<'a, 'typing> {
     structure: OccurrenceStructure,
     assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
-    loops: HashMap<(BlockOrdinal, usize), WhileRegion>,
     short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
 }
 
@@ -5738,7 +5694,6 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             structure: OccurrenceStructure::new(span),
             assignments: HashMap::new(),
             conditionals: HashMap::new(),
-            loops: HashMap::new(),
             short_circuits: HashMap::new(),
         }
     }
@@ -7113,38 +7068,6 @@ impl StructuralWalker<'_, '_> {
                 }
                 BlockItemKind::Assignment { group: position }
             }
-            ScalarBlockItem::While(while_expression) => {
-                let test = self.expression_at(
-                    &while_expression.condition,
-                    names,
-                    types,
-                    parent,
-                    OccurrenceEdge::WhileCondition { item: item_index },
-                )?;
-                let body = self.block(
-                    &while_expression.body,
-                    names,
-                    types,
-                    parent,
-                    OccurrenceEdge::WhileBody { item: item_index },
-                )?;
-                assert!(self
-                    .loops
-                    .insert(
-                        (ordinal, item_index),
-                        WhileRegion {
-                            span: while_expression.span,
-                            test,
-                            body,
-                            on_false: BlockPosition {
-                                block: ordinal,
-                                item: item_index + 1
-                            },
-                        },
-                    )
-                    .is_none());
-                BlockItemKind::While { region: position }
-            }
         };
         Ok(BlockItem {
             position: item_index,
@@ -7271,7 +7194,6 @@ fn walk_module_initialization(
                     ScalarBlockItem::LocalBinding(binding) => binding.span,
                     ScalarBlockItem::Expression(expression) => expression_span(expression),
                     ScalarBlockItem::Assignment(assignment) => assignment.span,
-                    ScalarBlockItem::While(while_expression) => while_expression.span,
                 };
                 let node = walker.block_item(
                     item,
@@ -7338,7 +7260,6 @@ fn walk_module_initialization(
         callable_escapes: walker.callable_escapes,
         assignments: walker.assignments,
         conditionals: walker.conditionals,
-        loops: walker.loops,
         short_circuits: walker.short_circuits,
     })
 }
@@ -7497,7 +7418,6 @@ fn resolve_function_call_sites(
         structure: resolver.structure,
         assignments: resolver.assignments,
         conditionals: resolver.conditionals,
-        loops: resolver.loops,
         short_circuits: resolver.short_circuits,
     })
 }

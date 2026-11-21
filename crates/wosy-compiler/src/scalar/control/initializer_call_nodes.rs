@@ -1194,10 +1194,6 @@ impl<'a> Binder<'a, '_> {
                 }
                 Ok(())
             }
-            ScalarBlockItem::While(statement) => {
-                self.expression(parent, Edge::WhileCondition { item }, &statement.condition)?;
-                self.block(parent, Edge::WhileBody { item }, &statement.body)
-            }
         }
     }
 }

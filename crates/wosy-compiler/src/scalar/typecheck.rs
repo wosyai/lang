@@ -1210,18 +1210,6 @@ pub(super) fn block_item_type_in_module(
             overloads,
             inference,
         ),
-        ScalarBlockItem::While(while_expression) => while_type_in_module(
-            while_expression,
-            scope,
-            visible_names,
-            folded_names,
-            module,
-            modules,
-            diagnostics,
-            unsafe_context,
-            overloads,
-            inference,
-        ),
     }
 }
 
@@ -1448,53 +1436,6 @@ fn validate_assignment_target_distinctness_in_module(
             }
         }
     }
-}
-
-fn while_type_in_module(
-    while_expression: &ScalarWhile,
-    scope: &BTreeMap<String, ScalarType>,
-    visible_names: &BTreeSet<String>,
-    folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    module: &ScalarModuleTyping<'_>,
-    modules: &[ScalarModuleTyping<'_>],
-    diagnostics: &mut Vec<super::Diagnostic>,
-    unsafe_context: bool,
-    overloads: &ScalarTypingView<'_>,
-    inference: &mut ScalarInferenceBuilder<'_>,
-) -> ScalarType {
-    let condition = expression_type_in_module(
-        &while_expression.condition,
-        scope,
-        visible_names,
-        folded_names,
-        module,
-        modules,
-        diagnostics,
-        unsafe_context,
-        overloads,
-        inference,
-    );
-    if !is_error_type(&condition) && !scalar_type_equal(&condition, &ScalarType::Bool) {
-        diagnostics.push(module_diagnostic(
-            module,
-            "B0005",
-            "while expression requires bool",
-            while_expression.span,
-        ));
-    }
-    let _ = block_type_in_module(
-        &while_expression.body,
-        scope,
-        visible_names,
-        folded_names,
-        module,
-        modules,
-        diagnostics,
-        unsafe_context,
-        overloads,
-        inference,
-    );
-    ScalarType::Unit
 }
 
 fn type_core_memory_in_module(
@@ -6390,10 +6331,6 @@ fn validate_unit_if_positions_in_item(
                 validate_unit_if_position(value, false, source, diagnostics);
             }
         }
-        ScalarBlockItem::While(while_expression) => {
-            validate_unit_if_position(&while_expression.condition, false, source, diagnostics);
-            validate_unit_if_positions_in_block(&while_expression.body, source, diagnostics);
-        }
     }
 }
 
@@ -7001,10 +6938,6 @@ impl StaticUseAnalyzer {
                     self.use_name(&assignment.target, visible);
                 }
             }
-            ScalarBlockItem::While(while_expression) => {
-                self.expression(&while_expression.condition, visible);
-                self.block(&while_expression.body, visible);
-            }
         }
     }
 
@@ -7444,17 +7377,6 @@ fn block_item_type(
             overloads,
             inference,
         ),
-        ScalarBlockItem::While(while_expression) => while_type(
-            while_expression,
-            scope,
-            visible_names,
-            folded_names,
-            program,
-            diagnostics,
-            unsafe_context,
-            overloads,
-            inference,
-        ),
     }
 }
 
@@ -7648,50 +7570,6 @@ fn place_contains_dynamic_index(place: &ScalarPlace) -> bool {
                 || !matches!(index.as_ref(), ScalarExpression::Integer { .. })
         }
     }
-}
-
-fn while_type(
-    while_expression: &ScalarWhile,
-    scope: &BTreeMap<String, ScalarType>,
-    visible_names: &BTreeSet<String>,
-    folded_names: &BTreeMap<String, (String, ByteSpan)>,
-    program: &ScalarProgramTyping<'_>,
-    diagnostics: &mut Vec<super::Diagnostic>,
-    unsafe_context: bool,
-    overloads: &ScalarTypingView<'_>,
-    inference: &mut ScalarInferenceBuilder<'_>,
-) -> ScalarType {
-    let condition = expression_type(
-        &while_expression.condition,
-        scope,
-        visible_names,
-        folded_names,
-        program,
-        diagnostics,
-        unsafe_context,
-        overloads,
-        inference,
-    );
-    if !is_error_type(&condition) && !scalar_type_equal(&condition, &ScalarType::Bool) {
-        diagnostics.push(diagnostic(
-            program,
-            "B0005",
-            "while expression requires bool",
-            while_expression.span,
-        ));
-    }
-    let _ = block_type(
-        &while_expression.body,
-        scope,
-        visible_names,
-        folded_names,
-        program,
-        diagnostics,
-        unsafe_context,
-        overloads,
-        inference,
-    );
-    ScalarType::Unit
 }
 
 pub(super) fn expression_type(

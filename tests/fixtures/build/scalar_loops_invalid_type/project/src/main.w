@@ -1,10 +1,12 @@
 %%start
 i32(i32) loop = fn(start) {
 	i32 value = start;
-	while (value < 3) {
+	if (value < 3) {
 		value = true;
+		loop(value)
+	} else {
+		value
 	}
-	value
 };
 
 i32 result = loop(0);

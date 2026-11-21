@@ -627,9 +627,6 @@ fn record_block_item_overload_selections(
                 );
             }
         }
-        ScalarBlockItem::While(while_expression) => {
-            record_block_overload_selections(&mut while_expression.body, &scope, overloads)
-        }
     }
 }
 
