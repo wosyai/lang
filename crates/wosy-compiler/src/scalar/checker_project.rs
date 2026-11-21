@@ -12,7 +12,7 @@ use super::{
     },
     control::BlockItemKind,
     derive_block, derive_expression, project_from_declarations,
-    reference::{CheckerTargetQuery, DirectDestinationIdentity, FunctionCallSites, ProjectCallSiteResults},
+    reference::{CheckerTargetQuery, DirectDestinationIdentity, FunctionCallSites, ProjectCallSiteResults, ResolvedCheckerTarget},
     static_calls::prepare_project_occurrences,
     symbolic_integer::{IntegerRelation, IntegerSet},
     typecheck::{integer_literal_fits_type, is_integer_type},
@@ -22,7 +22,7 @@ use super::{
     ScalarSourceDeclarations, ScalarTargetLayout, ScalarType,
 };
 use crate::Diagnostic;
-use wosy_syntax::{byte_span, CstNode, ProofFragmentParse, SourceIdentity, SyntaxKind};
+use wosy_syntax::{byte_span, CstNode, CstToken, ProofFragmentParse, SourceIdentity, SyntaxKind};
 
 #[derive(Debug, PartialEq)]
 enum ProjectCheck {
@@ -224,9 +224,14 @@ struct ProofModuleInput {
     namespaces: Vec<ScalarNamespaceBinding>,
 }
 
+struct ModuleProofs {
+    definitions: Vec<CstNode>,
+    first_query: usize,
+}
+
 struct PreparedProofModule {
     source: SourceIdentity,
-    proofs: HashMap<SourceIdentity, Vec<CstNode>>,
+    proofs: HashMap<SourceIdentity, ModuleProofs>,
     prepared: PreparedCheckerProject,
 }
 
@@ -277,30 +282,43 @@ impl PreparedProofModule {
             let mut module_proofs = Vec::new();
             let module_declarations = super::derive_scalar_declarations(canonical, Some(&mut module_proofs));
             if !module_proofs.is_empty() {
-                proofs.insert(canonical.source.clone(), module_proofs);
+                proofs.insert(canonical.source.clone(), ModuleProofs { definitions: module_proofs, first_query: 0 });
             }
             declarations.push((module_declarations, module.namespaces));
         }
         if graph_sources.values().any(|seen| !seen) {
             return Err(ProjectCheck::MissingRoot);
         }
-        let prepared = prepare_checker_project(declarations, initialization_order, inputs)?;
+        let mut targets = Vec::new();
+        for (source, proofs) in &mut proofs {
+            proofs.first_query = targets.len();
+            for definition in &proofs.definitions {
+                let (receiver, name) = proof_target_tokens(definition)?;
+                targets.push((source, receiver, name));
+            }
+        }
+        let queries = targets.iter().map(|(source, receiver, name)| CheckerTargetQuery {
+            source,
+            receiver: receiver.as_ref().map(CstToken::text),
+            name: name.text(),
+        }).collect::<Vec<_>>();
+        let prepared = prepared::prepare_checker_project_with_queries(declarations, initialization_order, inputs, &queries)?;
         Ok(Self { source, proofs, prepared })
     }
 
-    fn select(&self, source: &SourceIdentity, proof_name: &str) -> Result<&CstNode, ProjectCheck> {
+    fn select(&self, source: &SourceIdentity, proof_name: &str) -> Result<(&CstNode, usize), ProjectCheck> {
         let proofs = self.proofs.get(source).ok_or(ProjectCheck::MissingRoot)?;
-        let mut selected = proofs.iter().filter(|proof| {
+        let mut selected = proofs.definitions.iter().enumerate().filter(|(_, proof)| {
             proof.children_with_tokens()
                 .filter_map(|element| element.into_token())
                 .find(|token| token.kind() == SyntaxKind::Identifier)
                 .is_some_and(|token| token.text() == proof_name)
         });
-        let proof = selected.next().ok_or(ProjectCheck::MissingRoot)?;
+        let (index, proof) = selected.next().ok_or(ProjectCheck::MissingRoot)?;
         if selected.next().is_some() {
             return Err(ProjectCheck::AmbiguousRoot);
         }
-        Ok(proof)
+        Ok((proof, proofs.first_query + index))
     }
 
     fn check(&self, proof_name: &str) -> Result<(ByteSpan, ProjectCheck), ProjectCheck> {
@@ -308,20 +326,40 @@ impl PreparedProofModule {
     }
 
     fn check_at(&self, source: &SourceIdentity, proof_name: &str) -> Result<(ByteSpan, ProjectCheck), ProjectCheck> {
-        let proof = self.select(source, proof_name)?;
-        let (outcome, _) = check_selected_proof(&self.prepared, source, proof, None)?;
+        let (proof, query) = self.select(source, proof_name)?;
+        let function = self.resolve(query)?;
+        let (outcome, _) = check_selected_proof(&self.prepared, function, proof, None)?;
         Ok((byte_span(proof), outcome))
     }
 
     fn verify(&self, proof_name: &str) -> Option<VerifiedModuleReturnBound<'_>> {
-        let proof = self.select(&self.source, proof_name).ok()?;
+        let (proof, query) = self.select(&self.source, proof_name).ok()?;
+        let function = self.resolve(query).ok()?;
         let (_, verified) = check_selected_proof(
             &self.prepared,
-            &self.source,
+            function,
             proof,
             Some(ProofSummaryOrigin::ModuleDeclaration(&self.source)),
         ).ok()?;
         Some(VerifiedModuleReturnBound { issuer: self, proof, bound: verified? })
+    }
+
+    fn resolve(&self, query: usize) -> Result<(usize, usize, &ScalarFunction), ProjectCheck> {
+        let (project, calls) = self.prepared.parts();
+        let ResolvedCheckerTarget { target, declaration: (module, item) } =
+            calls.checker_targets.get(query).and_then(Option::as_ref).ok_or(ProjectCheck::MissingRoot)?;
+        let owner = project.modules.get(*module).ok_or(ProjectCheck::MissingRoot)?;
+        let Some(ScalarItem::Function(function)) = owner.items.get(*item) else {
+            return Err(ProjectCheck::MissingRoot);
+        };
+        let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } = target
+        else {
+            return Err(ProjectCheck::Unsupported);
+        };
+        if source != &owner.source || *declaration_span != function.name_span {
+            return Err(ProjectCheck::MissingRoot);
+        }
+        Ok((*module, *item, function))
     }
 
     fn apply(
@@ -340,6 +378,20 @@ impl PreparedProofModule {
             return None;
         }
         apply_verified_return_bound(&self.prepared, &self.source, caller_name, bound)
+    }
+}
+
+fn proof_target_tokens(declaration: &CstNode) -> Result<(Option<CstToken>, CstToken), ProjectCheck> {
+    let target = child(declaration, SyntaxKind::ProofTarget)?;
+    let qualified = child(&target, SyntaxKind::QualifiedCall)?;
+    let mut identifiers = qualified.children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| token.kind() == SyntaxKind::Identifier);
+    let first = identifiers.next().ok_or(ProjectCheck::InvalidProof)?;
+    match (identifiers.next(), identifiers.next()) {
+        (None, None) => Ok((None, first)),
+        (Some(member), None) => Ok((Some(first), member)),
+        _ => Err(ProjectCheck::InvalidProof),
     }
 }
 
@@ -378,18 +430,22 @@ fn check_proof_fragment_impl(
     let summary_source = retain_bound.then_some(&root.source)
         .filter(|source| !prepared.parts().0.modules.iter().any(|module| &module.source == *source))
         .map(ProofSummaryOrigin::DetachedFragment);
-    check_selected_proof(prepared, target_source, &declaration, summary_source)
+    let (receiver, name) = proof_target_tokens(&declaration)?;
+    if receiver.is_some() {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let function = select_checked_root(prepared.parts().0, target_source, name.text())?;
+    check_selected_proof(prepared, function, &declaration, summary_source)
 }
 
 fn check_selected_proof(
     prepared: &PreparedCheckerProject,
-    target_source: &SourceIdentity,
+    (module, item, function): (usize, usize, &ScalarFunction),
     declaration: &CstNode,
     summary_source: Option<ProofSummaryOrigin<'_>>,
 ) -> Result<(ProjectCheck, Option<VerifiedReturnBound>), ProjectCheck> {
     let steps = derive_block(&child(declaration, SyntaxKind::Block)?);
     let target = child(declaration, SyntaxKind::ProofTarget)?;
-    let name = identifiers(&target).next().ok_or(ProjectCheck::InvalidProof)?;
     let input_names = identifiers(&child(&target, SyntaxKind::Parameters)?).collect::<Vec<_>>();
     let outputs = child(declaration, SyntaxKind::ProofOutputs)?;
     let output_names = identifiers(&child(&outputs, SyntaxKind::Parameters)?).collect::<Vec<_>>();
@@ -404,7 +460,6 @@ fn check_selected_proof(
     let ensures = IntegerComparison::from_expression(&ensures).ok_or(ProjectCheck::Unsupported)?;
 
     let (project, calls) = prepared.parts();
-    let (module, item, function) = select_checked_root(project, target_source, &name)?;
     let target = &project.modules[module];
     if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
         return Err(ProjectCheck::Unsupported);
@@ -1046,8 +1101,12 @@ mod tests {
         let empty = source("src/empty.w", "proof-free");
         let app_proof = "proof bound for value(x) -> (out) ensures (out <= 7) {}";
         let lib_proof = "proof bound for value(x) -> (out) ensures (out <= 8) {}";
-        let app_text = format!("%%start\nlib = namespace demo \"src/lib.w\";\nfree = namespace demo \"src/empty.w\";\nu8(u8) value = fn(x) {{ if (x == 0) {{}}; 7 }};\nu8() use_lib = fn {{ lib.value(0) }};\n{app_proof}\n%%end");
-        let lib_text = format!("%%start\nu8(u8) value = fn(x) {{ if (x == 0) {{}}; 9 }};\n{lib_proof}\n%%end");
+        let imported = "proof imported for lib.value(x) -> (out) ensures (out <= 9) {}";
+        let tighter = "proof tighter for lib.value(x) -> (out) ensures (out <= 7) {}";
+        let private = "proof inaccessible for lib._hidden(x) -> (out) ensures (out <= 7) {}";
+        let unknown = "proof missing_namespace for absent.value(x) -> (out) ensures (out <= 7) {}";
+        let app_text = format!("%%start\nlib = namespace demo \"src/lib.w\";\nfree = namespace demo \"src/empty.w\";\nu8(u8) value = fn(x) {{ if (x == 0) {{}}; 7 }};\nu8() use_lib = fn {{ lib.value(0) }};\n{app_proof}\n{imported}\n{tighter}\n{private}\n{unknown}\n%%end");
+        let lib_text = format!("%%start\nu8(u8) value = fn(x) {{ if (x == 0) {{}}; 9 }};\nu8(u8) _hidden = fn(x) {{ x }};\n{lib_proof}\n%%end");
         let namespace = |name: &str, target: &SourceIdentity| {
             let declaration = format!("{name} =");
             let start = app_text.find(&declaration).unwrap();
@@ -1082,6 +1141,15 @@ mod tests {
             assert_eq!(project.check_at(file, "bound"), Ok((ByteSpan::new(start, start + proof.len() as u32), outcome)));
         }
         assert_eq!(project.check_at(&empty, "bound"), Err(ProjectCheck::MissingRoot));
+        for (name, proof, expected) in [("imported", imported, ProjectCheck::Proved), ("tighter", tighter, ProjectCheck::Refuted)] {
+            let start = app_text.find(proof).unwrap() as u32;
+            assert_eq!(project.check_at(&app, name), Ok((ByteSpan::new(start, start + proof.len() as u32), expected)));
+        }
+        for name in ["inaccessible", "missing_namespace"] {
+            assert_eq!(project.check_at(&app, name), Err(ProjectCheck::MissingRoot));
+        }
+        assert_eq!(project.check_at(&source("src/main.w", "stale"), "imported"), Err(ProjectCheck::MissingRoot));
+        assert!(project.verify("imported").is_none());
     }
 
     #[test]

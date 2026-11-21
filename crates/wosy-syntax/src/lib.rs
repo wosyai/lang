@@ -2592,7 +2592,7 @@ mod proof_fragment_tests {
     #[test]
     fn proof_module_keeps_proofs_as_module_siblings_with_exact_spans() {
         let first = "proof bounded for identity(x) -> (out) where (x <= 10) ensures (out <= 10) {}";
-        let second = "proof limit for identity(v) -> (r) ensures (r <= 255) {}";
+        let second = "proof limit for library.identity(v) -> (r) ensures (r <= 255) {}";
         let text = format!("%%start\n{first}\nu8(u8) identity = fn(value) {{ value }};\n{second}\n%%end");
         let identity = source();
         let result: ParseResult = parse_proof_module(identity.clone(), text.clone(), &[]);
@@ -2611,6 +2611,8 @@ mod proof_fragment_tests {
             assert_eq!(byte_span(node), ByteSpan::new(start, start + original.len() as u32));
             assert_eq!(node.text(), original);
         }
+        let target = declarations[2].children().find(|node| node.kind() == SyntaxKind::ProofTarget).unwrap();
+        assert!(target.children().any(|node| node.kind() == SyntaxKind::QualifiedCall && node.text() == "library.identity"));
         assert!(!parse(identity, text, &[]).is_valid());
     }
 
