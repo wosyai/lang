@@ -1,0 +1,33 @@
+%%start
+std = namespace std "bootstrap.w";
+
+unit(u128) show_unsigned = fn(value) {
+	std.utf8 text = std.format(value);
+	std.print(text);
+	std.print("\n");
+};
+
+unit(i128) show_signed = fn(value) {
+	std.utf8 text = std.format(value);
+	std.print(text);
+	std.print("\n");
+};
+
+show_unsigned(0);
+show_unsigned(9999999999999999999);
+show_unsigned(10000000000000000000);
+show_unsigned(10000000000000000001);
+show_unsigned(99999999999999999999999999999999999999);
+show_unsigned(100000000000000000000000000000000000000);
+show_unsigned(100000000000000000000000000000000000001);
+show_unsigned(200000000000000000000000000000000000001);
+show_unsigned(300000000000000000000000000000000000001);
+show_unsigned(340282366920938463463374607431768211455);
+show_signed(-170141183460469231731687303715884105728);
+show_signed(-100000000000000000000000000000000000001);
+show_signed(-10000000000000000001);
+show_signed(-10000000000000000000);
+show_signed(-9999999999999999999);
+show_signed(0);
+show_signed(170141183460469231731687303715884105727);
+%%end

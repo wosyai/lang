@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+import subprocess
+import sys
+
+partition, output_dir, manifest, runtime = sys.argv[1:]
+main_object = output_dir + "/main.obj"
+runtime_object = output_dir + "/runtime.obj"
+redirected_object = output_dir + "/runtime-redirected.obj"
+observer_object = output_dir + "/observer.obj"
+for source, object_file in ((partition, main_object), (runtime, runtime_object)):
+    subprocess.run(["clang", "-O0", "-c", "-x", "ir", source, "-o", object_file], check=True)
+
+suffix = "__".join(part.encode().hex() for part in ("probe", "fixture_resource", "checkpoint"))
+(checkpoint,) = (
+    symbol for symbol in subprocess.check_output(
+        ["llvm-nm", "--undefined-only", "--just-symbol-name", main_object], text=True,
+    ).splitlines()
+    if symbol.startswith("wosy_extern__") and symbol.endswith("__" + suffix)
+)
+ops = ("__wosy_core_alloc", "__wosy_core_free")
+subprocess.run([
+    "llvm-objcopy", *(f"--redefine-sym={op}=__real_{op}" for op in ops),
+    runtime_object, redirected_object,
+], check=True)
+subprocess.run([
+    "clang", "-O0", "-ffreestanding", "-Wall", "-Wextra", "-Werror", "-c",
+    f"-DCHECKPOINT={checkpoint}", *(f"-D__wrap_{op}={op}" for op in ops),
+    "scripts/observer.c", "-o", observer_object,
+], check=True)
+subprocess.run([
+    "clang", "-fuse-ld=lld", main_object, redirected_object, observer_object,
+    "-Xlinker", "/stack:1048576,65536", "-o", output_dir + "/main",
+], check=True)

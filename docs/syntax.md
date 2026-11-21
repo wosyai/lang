@@ -66,16 +66,16 @@ value;
 ## Blocks and local bindings
 
 ```wosy
-i32(i32) loop = fn(start) {
-  i32 value = start;
-  while (value < 3) {
-    value = value + 1;
+i32(i32) advance_to_three = fn(value) {
+  if (value < 3) {
+    advance_to_three(value + 1)
+  } else {
+    value
   }
-  value
 };
 ```
 
-A block holds local bindings, `if` and `while` items, `unsafe` items, and expressions. Bindings ending with `;` are statements. The trailing value list without `;` is the block result. A `while` body followed by `;` is rejected.
+A block holds local bindings, `if` and `unsafe` items, and expressions. Bindings ending with `;` are statements. The trailing value list without `;` is the block result. The base language expresses repetition with recursion, as above.
 
 ## Control flow
 

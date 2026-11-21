@@ -1,0 +1,28 @@
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/stdout"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/invalid_escape.w"
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["B0003", "src/main.w", "&local"]
+
+[[assert]]
+source = "project/src/second_move.w"
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["B0003", "src/main.w", "read or move of unavailable place", "*writer", "&!specimen"]
+
+[[assert]]
+source = "project/src/live_loan.w"
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["B0003", "src/main.w", "read or move of unavailable place", "specimen", "&specimen"]

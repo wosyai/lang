@@ -1,4 +1,8 @@
 [[steps]]
+command = ["wosy", "build"]
+exit = 0
+
+[[steps]]
 remove = ".wosy/artifacts/app/dev/main/artifact-manifest.json"
 exit = 0
 
