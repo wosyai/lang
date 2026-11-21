@@ -49,6 +49,8 @@ Rules:
 - Each target needs `root` (entry file relative to the project root), at least one artifact, one artifact profile, and one target profile naming its `main_artifact`.
 - Supported backend/output pairs are `llvm/native` and `llvm/wasm-wasip1` or `llvm/wasm-wasip2`.
 
+Wasm builders must link `runtime.ll` with a linker that provides `__heap_base` after static storage and the reserved stack, as `wasm-ld` does. The generated LLVM IR enables Wasm bulk memory for functions that copy fixed-size aggregates. This per-function setting overrides Clang’s `-mno-bulk-memory` for those functions. Use a Wasm runner that supports `memory.copy`.
+
 The standard library itself is a dependency-style package (`stdlib/wosy.toml`):
 
 ```toml
