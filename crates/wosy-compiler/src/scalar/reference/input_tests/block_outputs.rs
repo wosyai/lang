@@ -600,3 +600,102 @@ fn block_output_roles_borrow_actual_suffix_items_and_preserve_return_point_order
         assert_eq!(program, before);
     }
 }
+
+#[test]
+fn checked_terminal_descriptor_observes_original_local_backing_or_explicit_absence() {
+    use super::aggregate::CheckedProducerBacking;
+    let source = source();
+    let text = r#"%%start
+struct Packet { *?u8 data; u64 length; }
+*?u8 captured = null;
+
+(*Packet, bool)(u64, bool) make_backed = fn(count, present) {
+	u8[count] bytes;
+	if (present) {
+		*?u8 data = null;
+		unsafe { data = &?bytes[0]; };
+		Packet descriptor = { .data = data; .length = count; };
+		&descriptor, true
+	} else { null, false }
+};
+(*Packet, bool)(u64, bool) make_empty = fn(count, present) {
+	u8[count] bytes;
+	if (present) {
+		Packet descriptor = { .data = null; .length = 0; };
+		&descriptor, true
+	} else { null, false }
+};
+bool() unknown_effect = fn { true };
+(*Packet, bool)(u64, bool) make_conflicted = fn(count, present) {
+	u8[count] bytes;
+	if (present) {
+		*?u8 data = null;
+		unsafe { data = &?bytes[0]; };
+		Packet descriptor = { .data = data; .length = count; };
+		&descriptor, unknown_effect()
+	} else { null, false }
+};
+(*Packet, bool)(u64, bool) make_nonlocal = fn(count, present) {
+	u8[count] bytes;
+	if (present) {
+		*?u8 data = null;
+		unsafe { data = &?bytes[0]; };
+		captured = data;
+		Packet descriptor = { .data = data; .length = count; };
+		&descriptor, true
+	} else { null, false }
+};
+%%end"#;
+    let parsed = parse_source(source.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        let module = &prepared.project().modules[0];
+        let mut checked = 0;
+        for (item, definition) in module.items.iter().enumerate() {
+            let ScalarItem::Function(function) = definition else { continue };
+            if function.name == "unknown_effect" {
+                continue;
+            }
+            let mut result = derive_function_reference_result(
+                &source, function, &HashSet::from(["captured".to_owned()]), prepared.function_calls(0, item),
+                &module.structs, &module.enums, true, &mut Vec::new(),
+            );
+            assert!(!result.aggregate.checked_producer_authoritative);
+            let mut concrete = Vec::new();
+            let mut replays = Vec::new();
+            let mut cursor = 0;
+            collect_concrete_output_contracts(
+                &mut result, &[], &mut concrete, &mut replays, &mut cursor,
+            );
+            let mut replay_order = replays.iter_mut();
+            transfer_function_output_contracts(&mut result, &concrete, &mut replay_order, true);
+            assert_eq!(replay_order.len(), 0);
+            assert!(replays.iter().all(|replay| replay.errors.is_empty()));
+            assert!(result.aggregate.checked_producer_authoritative);
+            let proof = &result.aggregate.checked_producer_backing;
+            assert_eq!(proof.len(), 2, "{function:?}");
+            let positive = match function.name.as_str() {
+                "make_backed" => {
+                    let allocation = result.cfg.points.iter().find_map(|point| match &point.kind {
+                        CfgPointKind::Bind { binding } if result.cfg.allocations.contains(binding) => Some(point.id),
+                        _ => None,
+                    }).expect("actual typed local runtime array allocation");
+                    CheckedProducerBacking::FreshWithAllocation(allocation)
+                }
+                "make_empty" => CheckedProducerBacking::FreshWithoutBacking,
+                "make_conflicted" | "make_nonlocal" => CheckedProducerBacking::Unknown,
+                unexpected => panic!("unexpected producer {unexpected}"),
+            };
+            assert!(proof.values().any(|result| *result == positive), "{proof:?}");
+            assert!(proof.values().any(|result| *result == CheckedProducerBacking::NoDescriptor), "{proof:?}");
+            checked += 1;
+        }
+        assert_eq!(checked, 4);
+    }
+}

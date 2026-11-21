@@ -552,3 +552,80 @@ i32(i32) use_opaque = fn(input) {
         }
     }
 }
+
+#[test]
+fn private_checked_pair_tracks_an_original_backing_without_loading_the_descriptor_field() {
+    let positive = r#"%%start
+struct Packet { *?u8 data; u64 length; }
+(*Packet, bool)(u64, bool) make_checked = fn(count, flag) {
+	u8[count] bytes;
+	if (flag) {
+		*?u8 data = null;
+		unsafe { data = &?bytes[0]; };
+		Packet packet = { .data = data; .length = count; };
+		&packet, true
+	} else {
+		*?u8 data = null;
+		unsafe { data = &?bytes[0]; };
+		Packet packet = { .data = data; .length = count; };
+		&packet, false
+	}
+};
+i32(u64, bool) inspect_checked = fn(count, flag) {
+	*Packet received = null;
+	bool status = false;
+	received, status = make_checked(count, flag);
+	if (received != null && status) { 1 } else { 0 }
+};
+%%end"#;
+    let unproved = positive.replace("if (received != null && status) { 1 } else { 0 }",
+        "if (received != null && status) { if ((*received).data != null) { 1 } else { 2 } } else { 0 }");
+    let module_sink = positive.replace("i32(u64, bool) inspect_checked", "*Packet escaped = null;\ni32(u64, bool) inspect_checked")
+        .replace("if (received != null && status)", "escaped = received;\n\tif (received != null && status)");
+    let qualified_sink = positive.replace("struct Packet", "imported = namespace package \"values.w\";\nstruct Packet")
+        .replace("if (received != null && status)", "imported.value = 4;\n\tif (received != null && status)");
+    let app = source("private_checked_backing", "src/main.w");
+    let values = source("package", "src/values.w");
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (text, expected_transport, qualified) in [
+            (positive, true, false), (unproved.as_str(), false, false),
+            (module_sink.as_str(), false, false), (qualified_sink.as_str(), false, true),
+        ] {
+            let (inputs, order) = if qualified {
+                (vec![(declarations(&app, text), vec![namespace("imported", &values)]),
+                    (declarations(&values, "%%start\nu16 value = 0;\n%%end"), Vec::new())],
+                    vec![app.clone(), values.clone()])
+            } else {
+                (vec![(declarations(&app, text), Vec::new())], vec![app.clone()])
+            };
+            let prepared = prepare_scalar_project(
+                inputs,
+                order,
+                ScalarPreparationInputs { target_layout },
+            ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+            let llvm = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "private-checked-backing");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            use inkwell::values::AnyValue;
+            let producer = module.get_function(&function_with_suffix(&module, "make_checked")).unwrap();
+            let consumer = module.get_function(&function_with_suffix(&module, "inspect_checked")).unwrap();
+            let consumer_ir = consumer.print_to_string().to_string();
+            if expected_transport {
+                let producer_ir = producer.print_to_string().to_string();
+                assert_eq!(producer.count_params(), 3);
+                assert_eq!(producer.get_linkage(), inkwell::module::Linkage::Internal);
+                assert_eq!(producer_ir.matches("store ptr %allocation, ptr").count(), 2, "{producer_ir}");
+                assert!(!producer_ir.contains("call void @__wosy_core_free"), "{producer_ir}");
+                assert_eq!(consumer_ir.matches("call void @__wosy_core_free").count(), 2, "{consumer_ir}");
+                assert!(consumer_ir.contains("call void @__wosy_core_free(ptr %checked_backing_base)"), "{consumer_ir}");
+            } else {
+                assert_eq!(producer.count_params(), 2);
+                assert!(!consumer_ir.contains("checked_backing_call"), "{consumer_ir}");
+            }
+        }
+    }
+}

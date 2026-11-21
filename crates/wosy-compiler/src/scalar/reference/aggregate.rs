@@ -33,6 +33,9 @@ pub(super) struct AggregateFlowFacts {
     pub(super) local_array_copy_allocation: Option<CfgPointId>,
     pub(super) local_array_nulls: BTreeSet<CfgPointId>,
     pub(super) local_array_failure_arms: BTreeMap<CfgPointId, BlockOrdinal>,
+    pub(super) checked_producer_arms: Vec<(CfgPointId, CheckedProducerTerminal)>,
+    pub(super) checked_backing_free_literals: BTreeSet<CfgPointId>,
+    pub(super) checked_producer_nonlocal_installs: BTreeSet<CfgPointId>,
 }
 
 impl AggregateFlowFacts {
@@ -74,6 +77,20 @@ pub(super) enum OwnerSource {
     Allocation(CfgPointId),
     Call(CfgPointId),
     Formal(usize),
+}
+
+pub(super) enum CheckedProducerTerminal {
+    Null(CfgPointId),
+    Fresh { borrow: CfgPointId, descriptor: ReferenceBindingId },
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CheckedProducerBacking {
+    NoDescriptor,
+    FreshWithoutBacking,
+    FreshWithAllocation(CfgPointId),
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -191,6 +208,9 @@ struct LocalArrayLife {
     pending: Option<CfgPointId>,
     invalid: bool,
     has_rebind: bool,
+    viewed: bool,
+    checked_producer_conflict: bool,
+    checked_borrow: Option<(CfgPointId, CheckedProducerBacking)>,
 }
 
 impl AggregateEdgeState {
@@ -236,7 +256,12 @@ impl AggregateEdgeState {
 
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
+    pub(super) checked_backing_assignment: Option<(usize, usize, CfgPointId)>,
+    pub(super) checked_producer_blocks: BTreeMap<CfgPointId, usize>,
     pub(super) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
+    pub(super) checked_producer_backing: BTreeMap<CfgPointId, CheckedProducerBacking>,
+    pub(super) checked_producer_sources: Vec<(CfgPointId, CheckedProducerTerminal)>,
+    pub(super) checked_producer_authoritative: bool,
     pub(super) array_invalid: bool,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     pub(super) array_returns: BTreeSet<Option<BTreeSet<CfgPointId>>>,
@@ -292,7 +317,9 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        self.scalar_descriptor_assignment.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
+        (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
+            || self.checked_backing_assignment.is_some()
+            || self.scalar_descriptor_assignment.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
             || self.returning_leaf || !self.calls.is_empty() || !self.returns.is_empty() || !self.formals.is_empty() || !self.inputs.is_empty() || !self.raw_terminals.is_empty() || !self.read_formals.is_empty()
     }
 }
@@ -344,7 +371,8 @@ impl AggregateFlowFacts {
     pub(super) fn entry_state(&self) -> AggregateEdgeState {
         let mut state = AggregateEdgeState {
             array_formal_live: self.array_formal.is_some(),
-            local_array: (self.local_array_copy_allocation.is_some() && !self.local_array_failure_arms.is_empty())
+            local_array: (self.local_array_copy_allocation.is_some()
+                && (!self.local_array_failure_arms.is_empty() || !self.checked_producer_arms.is_empty()))
                 .then(LocalArrayLife::default),
             ..AggregateEdgeState::default()
         };
@@ -367,7 +395,7 @@ impl AggregateFlowFacts {
 
     pub(super) fn observes_values(&self) -> bool {
         self.array_formal.is_some() || !self.array_calls.is_empty()
-            || !self.views.is_empty() || !self.calls.is_empty() || !self.formals.is_empty() || !self.input_moves.is_empty() || !self.raw_formals.is_empty()
+            || !self.checked_producer_arms.is_empty() || !self.views.is_empty() || !self.calls.is_empty() || !self.formals.is_empty() || !self.input_moves.is_empty() || !self.raw_formals.is_empty()
     }
 
     pub(super) fn visit(
@@ -385,8 +413,34 @@ impl AggregateFlowFacts {
                 local.invalid |= local.live || local.pending.is_some() || point.scope != ReferenceScopeId(0);
                 local.live = true;
             }
-            if self.views.get(&id) == Some(&allocation) {
-                local.invalid = true;
+            let view = self.views.get(&id) == Some(&allocation);
+            if view {
+                if self.checked_producer_arms.is_empty() {
+                    local.invalid = true;
+                } else {
+                    local.checked_producer_conflict |= local.viewed;
+                    local.viewed = true;
+                }
+            }
+            if !self.checked_producer_arms.is_empty() {
+                local.checked_producer_conflict |= self.checked_producer_nonlocal_installs.contains(&id);
+                local.checked_producer_conflict |= match &point.kind {
+                    CfgPointKind::Call { .. } | CfgPointKind::AssignThrough { .. }
+                    | CfgPointKind::MoveThrough { .. } | CfgPointKind::DeferredMoveThrough { .. }
+                    | CfgPointKind::Invalidate { .. } | CfgPointKind::Release { .. }
+                    | CfgPointKind::Evaluate(ScalarExpression::ArrayLiteral { .. }) => true,
+                    CfgPointKind::Assign { target, rhs_point, .. } => {
+                        !target.projections.is_empty() || !state.bindings.contains_key(&target.binding)
+                            || state.values.get(rhs_point) != Some(&Value::View(OwnerSource::Allocation(allocation)))
+                    }
+                    CfgPointKind::Move { place, owner, .. } | CfgPointKind::DeferredMove { place, owner, .. } => {
+                        self.checked_producer_arms.iter().any(|(_, terminal)| matches!(terminal,
+                            CheckedProducerTerminal::Fresh { descriptor, .. }
+                                if descriptor == owner || *descriptor == place.binding))
+                    }
+                    CfgPointKind::Evaluate(ScalarExpression::RawAddress { .. }) => !view,
+                    _ => false,
+                };
             }
             match &point.kind {
                 CfgPointKind::Borrow { place, .. } if &place.binding == binding => local.invalid = true,
@@ -420,7 +474,8 @@ impl AggregateFlowFacts {
                 _ => {}
             }
             if let Some(&arm) = self.local_array_failure_arms.get(&id) {
-                let witness = (local.live && !local.invalid && local.pending.is_none() && local.has_rebind)
+                let witness = (local.live && !local.invalid && !local.viewed
+                    && local.pending.is_none() && local.has_rebind)
                     .then_some(allocation);
                 result.local_array_failure_arms
                     .entry(arm.0)
@@ -430,6 +485,44 @@ impl AggregateFlowFacts {
                         }
                     })
                     .or_insert(witness);
+            }
+            if let Some((_, CheckedProducerTerminal::Fresh { descriptor, .. })) = self.checked_producer_arms.iter().find(
+                |(_, terminal)| matches!(terminal, CheckedProducerTerminal::Fresh { borrow, .. } if *borrow == id),
+            ) {
+                let backing = match state.bindings.get(descriptor).and_then(|(value, _, _)| *value) {
+                    Some(Value::Aggregate { backing: OwnerSource::Allocation(base), field: Some(_) })
+                        if local.live && local.viewed && base == allocation =>
+                        CheckedProducerBacking::FreshWithAllocation(base),
+                    Some(Value::Plain(origin)) if !local.viewed && self.checked_backing_free_literals.contains(&origin) =>
+                        CheckedProducerBacking::FreshWithoutBacking,
+                    _ => CheckedProducerBacking::Unknown,
+                };
+                if local.checked_borrow.replace((id, backing)).is_some() {
+                    local.checked_producer_conflict = true;
+                }
+            }
+            if let Some((_, terminal)) = self.checked_producer_arms.iter().find(|(end, _)| *end == id) {
+                let backing = if local.invalid || local.checked_producer_conflict || local.pending.is_some() {
+                    CheckedProducerBacking::Unknown
+                } else {
+                    match terminal {
+                        CheckedProducerTerminal::Null(_) if !local.viewed => CheckedProducerBacking::NoDescriptor,
+                        CheckedProducerTerminal::Fresh { borrow, .. } => {
+                            match local.checked_borrow {
+                                Some((source, backing)) if source == *borrow => backing,
+                                _ => CheckedProducerBacking::Unknown,
+                            }
+                        }
+                        _ => CheckedProducerBacking::Unknown,
+                    }
+                };
+                result.checked_producer_backing.entry(id)
+                    .and_modify(|known| {
+                        if *known != backing {
+                            *known = CheckedProducerBacking::Unknown;
+                        }
+                    })
+                    .or_insert(backing);
             }
         }
         if let CfgPointKind::Assign { target, rhs_point, .. } = &point.kind {
@@ -942,9 +1035,17 @@ pub(crate) enum ClosedInput {
     Plain,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClosedCheckedBacking {
+    pub(crate) allocation: (usize, usize),
+    pub(crate) arms: [usize; 2],
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ClosedBody {
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
+    pub(crate) checked_backing_producer: Option<ClosedCheckedBacking>,
+    pub(crate) checked_backing_consumer: Option<(usize, usize)>,
     pub(crate) returning: Option<ClosedReturn>,
     pub(crate) calls: BTreeMap<usize, ClosedCall>,
     pub(crate) scope_exits: BTreeMap<usize, CfgPointId>,
@@ -1133,6 +1234,69 @@ fn initializer_target(
     Some((module, item, arm))
 }
 
+fn closed_checked_backing_consumer<'a>(
+    reservations: &AggregateReservations,
+    module_at: &impl Fn(usize) -> Option<ModuleInput<'a>>,
+    bodies: &BTreeMap<BodyKey, Body<'_>>,
+    declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
+    initializers: impl Iterator<Item = &'a ModuleInitializationRegion>,
+    producer: BodyKey,
+) -> Result<Option<(BodyKey, (usize, usize))>, String> {
+    let input = module_at(producer.0).ok_or_else(|| "missing checked backing module".to_owned())?;
+    let Some(ScalarItem::Function(definition)) = input.items.get(producer.1) else {
+        return Err("missing checked backing declaration".into());
+    };
+    let same_declaration = |source: &SourceIdentity, span| source == input.source && span == definition.name_span;
+    let mut consumer = None;
+    for (&key @ (module, item, arm), &monomorphic) in &reservations.bodies {
+        let input = module_at(module).ok_or_else(|| "missing checked backing user module".to_owned())?;
+        let sites = input.calls.function_body(item, arm).ok_or_else(|| "missing checked backing user body".to_owned())?;
+        if sites.callable_escapes.iter().any(|decl| same_declaration(&decl.source, decl.range)) {
+            return Ok(None);
+        }
+        if sites.allocation_length_call_targets.values().any(|target| matches!(target,
+            ResolvedCallTarget::ModuleCallable { source, declaration_span, .. } if same_declaration(source, *declaration_span)))
+        {
+            return Ok(None);
+        }
+        for call in &sites.call_occurrences {
+            let Some(site) = sites.sites.get(call.site) else { return Ok(None) };
+            let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete } = &site.target else { continue };
+            if !same_declaration(source, *declaration_span) { continue }
+            if consumer.is_some() || !monomorphic || key == producer || arm.is_some()
+                || sites.call_occurrences.len() != 1 || !sites.allocation_length_call_targets.is_empty()
+                || !matches!(concrete, ConcreteCallSelection::Declaration)
+            {
+                return Ok(None);
+            }
+            let Some(body) = bodies.get(&key) else { return Ok(None) };
+            let Some((destination, callee, point)) = body.facts.and_then(|facts| facts.checked_backing_assignment) else {
+                return Ok(None);
+            };
+            if callee != call.ordinal.0 || target_body(declarations, body.cfg, point) != Some(producer) {
+                return Ok(None);
+            }
+            consumer = Some((key, (destination, callee)));
+        }
+    }
+    if consumer.is_none() { return Ok(None) }
+    for region in initializers {
+        let ModuleInitializationDetail::Occurrences(topology) = &region.detail else { return Ok(None) };
+        if topology.callable_escapes.iter().any(|decl| same_declaration(&decl.source, decl.range))
+            || topology.calls.iter().any(|call| {
+                match region.call_target(*call) {
+                    Some(ModuleInitializationCallTarget::Direct { declaration, .. }) => same_declaration(&declaration.source, declaration.range),
+                    Some(_) => false,
+                    None => true,
+                }
+            })
+        {
+            return Ok(None);
+        }
+    }
+    Ok(consumer)
+}
+
 fn closed_aggregates<'a>(
     reservations: &AggregateReservations,
     module_at: impl Fn(usize) -> Option<ModuleInput<'a>>,
@@ -1297,6 +1461,34 @@ fn closed_aggregates<'a>(
         plan.local_array_failure = Some((position, *arm));
     }
     if outgoing.is_empty() {
+        let mut producers = bodies.iter().filter_map(|(&key, body)| {
+            if !body.is_monomorphic || key.2.is_some() {
+                return None;
+            }
+            let facts = body.facts?;
+            if !facts.checked_producer_authoritative || facts.checked_producer_backing.len() != 2 {
+                return None;
+            }
+            let mut arms = facts.checked_producer_backing.iter();
+            let ((first, left), (last, right)) = (arms.next()?, arms.next()?);
+            let (CheckedProducerBacking::FreshWithAllocation(left), CheckedProducerBacking::FreshWithAllocation(right)) = (left, right) else {
+                return None;
+            };
+            if left != right { return None }
+            let allocation = *facts.allocation_slots.get(left)?;
+            let arms = [*facts.checked_producer_blocks.get(first)?, *facts.checked_producer_blocks.get(last)?];
+            Some((key, ClosedCheckedBacking { allocation, arms }))
+        });
+        if let Some((producer, plan)) = producers.next() {
+            if producers.next().is_none() {
+                if let Some((consumer, install)) = closed_checked_backing_consumer(
+                    reservations, &module_at, &bodies, &declarations, initializers, producer,
+                )? {
+                    result.bodies.entry(producer).or_default().checked_backing_producer = Some(plan);
+                    result.bodies.entry(consumer).or_default().checked_backing_consumer = Some(install);
+                }
+            }
+        }
         return Ok(result);
     }
     let mut initializer_uses = Vec::new();
