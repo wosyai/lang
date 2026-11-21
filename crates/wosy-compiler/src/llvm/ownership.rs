@@ -648,6 +648,26 @@ pub(super) fn consume_runtime_array_release<'ctx, 'module>(
     Ok(())
 }
 
+pub(super) fn release_proven_local_array<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    pointer: PointerValue<'ctx>,
+    live_slot: PointerValue<'ctx>,
+) -> Result<(), String> {
+    let live = state.builder
+        .build_load(context.bool_type(), live_slot, "allocation_live")
+        .map_err(builder_error)?
+        .into_int_value();
+    declare_core_runtime(context, state.module);
+    consume_runtime_array_release(context, state, RuntimeArrayRelease {
+        pointer: pointer.into(),
+        live: Some(live),
+    })?;
+    state.builder.build_store(live_slot, context.bool_type().const_zero())
+        .map_err(builder_error)?;
+    Ok(())
+}
+
 pub(super) fn release_runtime_array_owner<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,

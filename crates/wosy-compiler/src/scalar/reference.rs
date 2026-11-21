@@ -931,6 +931,20 @@ impl<'a> ReferenceFlowBuilder<'a> {
         )?;
         let arity = row.types.len();
         assert!(arity > 1);
+        if scope == ReferenceScopeId(0)
+            && matches!(row.types.first(), Some(ScalarType::CheckedReference { .. }))
+            && row.types.iter().skip(1).all(|ty| aggregate::ordinary_value(ty) || matches!(ty, ScalarType::Enum(_)))
+        {
+            if let ConditionalRegion::Value { then_block, else_block, .. } = region {
+                for (arm, ordinal) in [(&then_arm, *then_block), (&else_arm, *else_block)] {
+                    if arm.result.output_points.first().is_some_and(|point| {
+                        self.aggregate_facts.local_array_nulls.contains(point)
+                    }) {
+                        self.aggregate_facts.local_array_failure_arms.insert(arm.end, ordinal);
+                    }
+                }
+            }
+        }
         assert_eq!(then_arm.result.output_points.len(), arity);
         assert_eq!(else_arm.result.output_points.len(), arity);
         let mut result = ReferenceBlockResult {
@@ -1583,8 +1597,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         scope,
                         origins.clone(),
                     );
-                    if canonical_null && self.aggregate_facts.tracks_read_sources() {
-                        self.aggregate_facts.raw_nulls.insert(point);
+                    if canonical_null {
+                        if self.aggregate_facts.tracks_read_sources() {
+                            self.aggregate_facts.raw_nulls.insert(point);
+                        }
+                        if self.aggregate_facts.local_array_copy_allocation.is_some() {
+                            self.aggregate_facts.local_array_nulls.insert(point);
+                        }
                     }
                     return Ok(ReferenceValue::Checked(origins));
                 }
@@ -8502,6 +8521,7 @@ fn build_function_reference_cfg(
     if !errors.is_empty() || !prior_children_succeeded {
         aggregate.array_returns.clear();
         aggregate.array_rebinds.clear();
+        aggregate.local_array_failure_arms.clear();
     }
     aggregate.array_calls = builder.aggregate_facts.array_calls;
     aggregate.checked_result_origins = builder.checked_result_origins;

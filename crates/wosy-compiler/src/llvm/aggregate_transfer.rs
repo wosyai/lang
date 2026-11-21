@@ -58,6 +58,9 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     destination: Option<PointerValue<'ctx>>,
     base: Option<PointerValue<'ctx>>,
     registered_allocation: Option<String>,
+    failure_site: Option<((usize, usize), usize)>,
+    failure_allocation: Option<(PointerValue<'ctx>, PointerValue<'ctx>, String)>,
+    failure_arm_visited: bool,
     committed: bool,
     receipts: BTreeMap<usize, PointerValue<'ctx>>,
     input: Option<(usize, PointerValue<'ctx>)>,
@@ -95,6 +98,12 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             destination,
             base: None,
             registered_allocation: None,
+            failure_site: plan.local_array_failure.filter(|_| {
+                plan.returning.is_none() && plan.input.is_none() && plan.calls.is_empty()
+                    && plan.releases.is_empty() && plan.input_calls.is_empty()
+            }),
+            failure_allocation: None,
+            failure_arm_visited: false,
             committed: false,
             receipts: BTreeMap::new(),
         }))
@@ -180,6 +189,56 @@ pub(super) fn record_allocation<'ctx>(
     aggregate.set_base(base)?;
     aggregate.registered_allocation = Some(name.to_owned());
     Ok(())
+}
+
+pub(super) fn record_failure_allocation<'ctx>(
+    state: &mut EmitState<'ctx, '_>,
+    binding: &ScalarBinding,
+    name: &str,
+    base: PointerValue<'ctx>,
+    live: PointerValue<'ctx>,
+) -> Result<(), String> {
+    let Some(aggregate) = &mut state.aggregate else {
+        return Ok(());
+    };
+    let Some((position, _)) = aggregate.failure_site else {
+        return Ok(());
+    };
+    if state.body_call_nodes.and_then(|nodes| nodes.binding_position(binding)) == Some(position)
+        && aggregate.failure_allocation.replace((base, live, name.to_owned())).is_some()
+    {
+        return Err("duplicate local array failure allocation".into());
+    }
+    Ok(())
+}
+
+pub(super) fn release_failure_allocation<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    block: &crate::scalar::ScalarBlock,
+) -> Result<(), String> {
+    let Some(aggregate) = &mut state.aggregate else {
+        return Ok(());
+    };
+    let Some((_, arm)) = aggregate.failure_site else {
+        return Ok(());
+    };
+    let ordinal = state.body_call_nodes.and_then(|nodes| nodes.block_ordinal(block))
+        .ok_or_else(|| "missing bound block for local array failure".to_owned())?;
+    if ordinal != arm {
+        return Ok(());
+    }
+    if std::mem::replace(&mut aggregate.failure_arm_visited, true) {
+        return Err("duplicate local array failure arm".into());
+    }
+    let (base, live, owner) = aggregate.failure_allocation.take()
+        .ok_or_else(|| "missing original local array failure allocation".to_owned())?;
+    if !state.automatic_return_result_owners.is_empty() || !state.joined_return_bindings.is_empty()
+        || state.runtime_array_owners.keys().any(|name| name != &owner)
+    {
+        return Ok(());
+    }
+    super::ownership::release_proven_local_array(context, state, base, live)
 }
 
 fn call_action(
@@ -519,6 +578,11 @@ pub(super) fn finish_return<'ctx>(
     let Some(aggregate) = &mut state.aggregate else {
         return Ok(None);
     };
+    if aggregate.failure_site.is_some()
+        && (!aggregate.failure_arm_visited || aggregate.failure_allocation.is_some())
+    {
+        return Err("unconsumed local array failure allocation".into());
+    }
     if !aggregate.receipts.is_empty() || aggregate.input.is_some() {
         return Err("unreleased closed aggregate receipt".into());
     }

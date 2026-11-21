@@ -1474,6 +1474,7 @@ fn store_binding_outputs<'ctx, 'module>(
             .builder
             .build_store(live, context.bool_type().const_int(1, false))
             .map_err(builder_error)?;
+        aggregate_transfer::record_failure_allocation(state, binding, &receiver.name, slot, live)?;
         state.runtime_array_live.insert(receiver.name.clone(), live);
         state
             .storage
@@ -2716,6 +2717,9 @@ fn emit_block_at<'ctx, 'module>(
     aggregate_transfer::release_scope(context, state, block)?;
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
+    if matches!(emission, BlockEmission::TailArm(_)) {
+        aggregate_transfer::release_failure_allocation(context, state, block)?;
+    }
     state.storage = storage;
     state.values = values;
     state.runtime_array_owners = runtime_array_owners
@@ -2793,6 +2797,9 @@ fn emit_project_block_at<'ctx, 'module>(
     aggregate_transfer::release_scope(context, state, block)?;
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     release_automatic_return_result_owners(context, state, &automatic_return_result_owners)?;
+    if matches!(emission, BlockEmission::TailArm(_)) {
+        aggregate_transfer::release_failure_allocation(context, state, block)?;
+    }
     state.storage = storage;
     state.values = values;
     state.runtime_array_owners = runtime_array_owners
