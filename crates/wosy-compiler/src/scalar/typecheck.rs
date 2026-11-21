@@ -1225,8 +1225,6 @@ fn assignment_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    let mut inferred_names = visible_names.clone();
-    let mut inferred_folded_names = folded_names.clone();
     let expected = assignment
         .targets
         .iter()
@@ -1289,6 +1287,7 @@ fn assignment_type_in_module(
                 assignment.span,
             ));
         }
+        let mut inferred_names = None;
         for ((index, (target, expected)), output) in assignment
             .targets
             .iter()
@@ -1310,12 +1309,14 @@ fn assignment_type_in_module(
                 );
             } else if let ScalarPlace::Name { name, span } = &target.place {
                 validate_identifier_style(&module.source, name, *span, diagnostics);
+                let (names, folded) = inferred_names
+                    .get_or_insert_with(|| (visible_names.clone(), folded_names.clone()));
                 if declare_module_name(
                     module,
                     name,
                     *span,
-                    &mut inferred_names,
-                    &mut inferred_folded_names,
+                    names,
+                    folded,
                     diagnostics,
                 ) {
                     scope.insert(name.clone(), output.ty.clone());
@@ -7391,8 +7392,6 @@ fn assignment_type(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    let mut inferred_names = visible_names.clone();
-    let mut inferred_folded_names = folded_names.clone();
     let expected = assignment
         .targets
         .iter()
@@ -7459,6 +7458,7 @@ fn assignment_type(
                 assignment.span,
             ));
         }
+        let mut inferred_names = None;
         for ((index, (target, expected)), output) in assignment
             .targets
             .iter()
@@ -7480,12 +7480,14 @@ fn assignment_type(
                 );
             } else if let ScalarPlace::Name { name, span } = &target.place {
                 validate_program_identifier_style(program, name, *span, diagnostics);
+                let (names, folded) = inferred_names
+                    .get_or_insert_with(|| (visible_names.clone(), folded_names.clone()));
                 if declare_program_name(
                     program,
                     name,
                     *span,
-                    &mut inferred_names,
-                    &mut inferred_folded_names,
+                    names,
+                    folded,
                     diagnostics,
                 ) {
                     scope.insert(name.clone(), output.ty.clone());
