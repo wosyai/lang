@@ -441,6 +441,8 @@ fn compile_project(
                 .ok_or_else(|| format!("missing module {}", node.source.path.as_path().display()))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    drop(source_by_path);
+    drop(declarations_by_path);
     #[cfg(test)]
     routing_observations::record(|counts| counts.preparations += 1);
     let prepared = prepare_scalar_project(
@@ -471,10 +473,10 @@ fn compile_project(
     };
     let source_observations = graph
         .nodes
-        .iter()
+        .into_iter()
         .map(|node| SourceObservation {
-            source: node.source.clone(),
-            content_revision: node.content_revision.clone(),
+            source: node.source,
+            content_revision: node.content_revision,
         })
         .collect();
     Ok((llvm, source_observations))

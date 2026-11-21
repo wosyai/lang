@@ -10,6 +10,9 @@ pub(super) struct AggregateFlowFacts {
     pub(super) scalar_cells: BTreeSet<CfgPointId>,
     pub(super) raw_addresses: BTreeMap<CfgPointId, (ReferenceBindingId, bool)>,
     pub(super) opaque_container_inputs: BTreeMap<CfgPointId, Vec<CfgPointId>>,
+    pub(super) receipt_loan_sinks: BTreeMap<CfgPointId, Vec<CfgPointId>>,
+    pub(super) receipt_loan_address_sinks: BTreeMap<CfgPointId, ReferenceBindingId>,
+    pub(super) receipt_loan_forwarding: BTreeMap<CfgPointId, Vec<CfgPointId>>,
     pub(super) raw_formals: BTreeMap<usize, ReferenceBindingId>,
     pub(super) raw_calls: BTreeMap<CfgPointId, (Vec<usize>, bool)>,
     pub(super) read_consumers: BTreeSet<CfgPointId>,
@@ -19,8 +22,10 @@ pub(super) struct AggregateFlowFacts {
     pub(super) plain_aliases: BTreeMap<CfgPointId, ReferenceBindingId>,
     pub(super) literals: BTreeMap<CfgPointId, Vec<(OccurrenceOrdinal, CfgPointId)>>,
     pub(super) installations: BTreeMap<CfgPointId, (CfgPointId, BlockPosition)>,
+    receipt_aliases: BTreeSet<CfgPointId>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) projected_reads: BTreeMap<CfgPointId, bool>,
+    pub(super) scalar_receipt_reads: BTreeSet<CfgPointId>,
     pub(super) scope_exits: BTreeMap<CfgPointId, BlockOrdinal>,
     pub(super) formals: BTreeMap<usize, ReferenceBindingId>,
     pub(super) input_moves: BTreeMap<CfgPointId, (OccurrenceOrdinal, BTreeMap<usize, ArgumentProvenance>)>,
@@ -77,6 +82,12 @@ impl AggregateFlowFacts {
                         self.checked_raw_bindings.insert(point);
                     }
                     self.installations.insert(point, (initializer, position));
+                }
+            }
+            ScalarType::CheckedReference { .. } if !allocation => {
+                if let Some(initializer) = initializer {
+                    self.installations.insert(point, (initializer, position));
+                    self.receipt_aliases.insert(point);
                 }
             }
             _ => {}
@@ -141,6 +152,8 @@ enum Value {
     CheckedRawNull,
     CheckedNullDescriptor,
     View(OwnerSource),
+    // A checked loan of a receipt's descriptor does not own the backing.
+    ReceiptLoan(CfgPointId),
     Aggregate {
         backing: OwnerSource,
         field: Option<OccurrenceOrdinal>,
@@ -258,6 +271,14 @@ struct LocalArrayLife {
 }
 
 impl AggregateEdgeState {
+    fn holds_receipt(&self, call: CfgPointId) -> bool {
+        let owner = OwnerSource::Call(call);
+        !self.moved.contains(&owner)
+            && self.bindings.values().any(|(value, _, _)| {
+                matches!(value, Some(Value::Aggregate { backing, .. }) if *backing == owner)
+            })
+    }
+
     pub(super) fn expire_before(&mut self, successor: CfgPointId, last_use: &[usize]) {
         if self.earliest_value_use.is_none_or(|deadline| deadline >= successor.0) {
             return;
@@ -298,6 +319,33 @@ impl AggregateEdgeState {
     }
 }
 
+type LiveReceipt = (OwnerSource, ReferenceBindingId);
+
+#[derive(Default)]
+struct ScopeEndpoint {
+    possible: BTreeSet<LiveReceipt>,
+    // None means no path has been observed, not a path with no live receipts.
+    always: Option<BTreeSet<LiveReceipt>>,
+}
+
+impl ScopeEndpoint {
+    fn observe(&mut self, live: BTreeSet<LiveReceipt>) {
+        self.possible.extend(live.iter().cloned());
+        if let Some(always) = &mut self.always {
+            always.retain(|receipt| live.contains(receipt));
+        } else {
+            self.always = Some(live);
+        }
+    }
+
+    fn receipt(&self, owner: OwnerSource) -> Option<bool> {
+        let mut bindings = self.possible.iter().filter(|(source, _)| *source == owner);
+        let receipt = bindings.next()?;
+        Some(bindings.next().is_none()
+            && self.always.as_ref().is_some_and(|always| always.contains(receipt)))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
     pub(super) checked_backing_forward_candidate: Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>,
@@ -318,8 +366,9 @@ pub(super) struct AggregateFlowResult {
     pub(super) allocation_slots: BTreeMap<CfgPointId, (usize, usize)>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) returns: BTreeMap<CfgPointId, BTreeSet<Option<OwnerSource>>>,
-    pub(super) endpoints: BTreeMap<(CfgPointId, usize), BTreeSet<Option<OwnerSource>>>,
+    endpoints: BTreeMap<(CfgPointId, usize), ScopeEndpoint>,
     pub(super) unsupported: BTreeSet<CfgPointId>,
+    unproved_receipt_loans: BTreeMap<CfgPointId, CfgPointId>,
     abandoned_temporaries: BTreeMap<CfgPointId, CfgPointId>,
     crossed_temporary_calls: BTreeMap<CfgPointId, BTreeSet<CfgPointId>>,
     pub(super) returning_leaf: bool,
@@ -348,6 +397,21 @@ pub(super) struct AggregateFlowResult {
 }
 
 impl AggregateFlowResult {
+    fn reject_receipt_loan(&mut self, point: CfgPointId, value: Option<&Value>) -> bool {
+        if let Some(Value::ReceiptLoan(call)) = value {
+            self.unproved_receipt_loans.entry(*call).or_insert(point);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn owner_endpoints(&self, owner: OwnerSource) -> impl Iterator<Item = ((CfgPointId, usize), bool)> + '_ {
+        self.endpoints.iter().filter_map(move |(&endpoint, receipts)| {
+            receipts.receipt(owner).map(|always| (endpoint, always))
+        })
+    }
+
     fn invalidate_raw(&mut self, point: CfgPointId) {
         self.raw_invalid = Some(self.raw_invalid.map_or(point, |previous| previous.min(point)));
     }
@@ -404,7 +468,7 @@ impl AggregateFlowFacts {
                 deadlines.to_mut()[producer.0] = consumer.0;
             }
         };
-        for (&consumer, inputs) in &self.opaque_container_inputs {
+        for (&consumer, inputs) in self.opaque_container_inputs.iter().chain(&self.receipt_loan_sinks) {
             for &producer in inputs {
                 record(producer, consumer);
             }
@@ -416,6 +480,11 @@ impl AggregateFlowFacts {
         }
         for (&consumer, &(producer, _)) in &self.installations {
             record(producer, consumer);
+        }
+        for (&consumer, producers) in &self.receipt_loan_forwarding {
+            for &producer in producers {
+                record(producer, consumer);
+            }
         }
         deadlines
     }
@@ -703,11 +772,25 @@ impl AggregateFlowFacts {
             }
         }
         match &point.kind {
-            CfgPointKind::ReadPlace { pointer_point: Some(pointer), .. }
-            | CfgPointKind::AssignThrough { pointer_point: pointer, .. }
+            CfgPointKind::ReadPlace { pointer_point: Some(pointer), .. } => {
+                let value = state.values.get(pointer);
+                if let Some(Value::ReceiptLoan(call)) = value {
+                    if !self.scalar_receipt_reads.contains(&id) || !state.holds_receipt(*call) {
+                        result.reject_receipt_loan(id, value);
+                    }
+                }
+                result.account_raw(id, value);
+            }
+            CfgPointKind::AssignThrough { pointer_point: pointer, .. }
             | CfgPointKind::Invalidate { address_point: pointer, .. }
             | CfgPointKind::Release { target: ReleaseTarget::Checked { address_point: pointer, .. } } => {
-                result.account_raw(id, state.values.get(pointer));
+                let value = state.values.get(pointer);
+                result.reject_receipt_loan(id, value);
+                result.account_raw(id, value);
+            }
+            CfgPointKind::MoveThrough { pointer_point, .. }
+            | CfgPointKind::DeferredMoveThrough { pointer_point, .. } => {
+                result.reject_receipt_loan(id, state.values.get(pointer_point));
             }
             CfgPointKind::Release { target: ReleaseTarget::Raw { binding } } => {
                 result.account_raw(id, state.bindings.get(binding).and_then(|(value, _, _)| value.as_ref()));
@@ -719,10 +802,31 @@ impl AggregateFlowFacts {
                 result.account_raw(id, state.values.get(operand));
             }
         }
+        if let Some(operands) = self.receipt_loan_sinks.get(&id) {
+            for operand in operands {
+                result.reject_receipt_loan(id, state.values.get(operand));
+            }
+        }
+        if let Some(binding) = self.receipt_loan_address_sinks.get(&id) {
+            result.reject_receipt_loan(id, state.bindings.get(binding).and_then(|(value, _, _)| value.as_ref()));
+        }
         if let Some(binding) = self.plain_aliases.get(&id) {
             state.forget_plain(binding);
         }
-        let value = if let Some((root, whole)) = self.raw_addresses.get(&id) {
+        let value = if let Some(sources) = self.receipt_loan_forwarding.get(&id) {
+            let mut loans = sources.iter().filter_map(|source| match state.values.get(source) {
+                Some(loan @ Value::ReceiptLoan(_)) => Some(*loan),
+                _ => None,
+            });
+            let loan = loans.next();
+            for other in loans {
+                if Some(other) != loan {
+                    result.reject_receipt_loan(id, loan.as_ref());
+                    result.reject_receipt_loan(id, Some(&other));
+                }
+            }
+            loan
+        } else if let Some((root, whole)) = self.raw_addresses.get(&id) {
             match state.bindings.get(root) {
                 Some((Some(Value::Aggregate { backing: OwnerSource::Formal(slot), field: Some(_) }), _, Some(_))) if *whole =>
                     Some(Value::RawCell { point: id, owner: Some(*slot) }),
@@ -749,6 +853,10 @@ impl AggregateFlowFacts {
                         result.account_raw(id, Some(value));
                         Value::Unknown
                     }
+                    Some(value @ Value::ReceiptLoan(_)) => {
+                        result.reject_receipt_loan(id, Some(value));
+                        continue;
+                    }
                     Some(Value::Unknown) => Value::Unknown,
                     Some(Value::Plain(_) | Value::CheckedRawNull | Value::CheckedNullDescriptor | Value::ScalarCell) | None => continue,
                 };
@@ -772,8 +880,16 @@ impl AggregateFlowFacts {
             match &point.kind {
                 CfgPointKind::Borrow { place, .. } => {
                     state.forget_plain(&place.binding);
-                    result.account_raw(id, state.bindings.get(&place.binding).and_then(|(value, _, _)| value.as_ref()));
-                    None
+                    let value = state.bindings.get(&place.binding).and_then(|(value, _, _)| value.as_ref());
+                    result.account_raw(id, value);
+                    if let Some(Value::Aggregate { backing: OwnerSource::Call(call), .. } | Value::ReceiptLoan(call)) = value {
+                        if !state.holds_receipt(*call) {
+                            result.reject_receipt_loan(id, Some(&Value::ReceiptLoan(*call)));
+                        }
+                        Some(Value::ReceiptLoan(*call))
+                    } else {
+                        None
+                    }
                 }
                 CfgPointKind::Read { binding } => {
                     state.bindings.get(binding).and_then(|(value, _, _)| *value)
@@ -846,7 +962,9 @@ impl AggregateFlowFacts {
                         } else {
                             state.values.get(&rhs).copied().filter(|value| !matches!(value, Value::Plain(origin) if *origin != rhs))
                         };
-                        state.bindings.insert(binding.clone(), (value, point.scope, Some(position)));
+                        if !self.receipt_aliases.contains(&id) || matches!(value, Some(Value::ReceiptLoan(_))) {
+                            state.bindings.insert(binding.clone(), (value, point.scope, Some(position)));
+                        }
                     }
                     None
                 }
@@ -856,8 +974,11 @@ impl AggregateFlowFacts {
                     for value in state.bindings.get(&target.binding).and_then(|(value, _, _)| value.as_ref()).into_iter().chain(state.values.get(rhs_point)) {
                         result.account_raw(id, Some(value));
                     }
-                    if target.projections.is_empty() {
-                        let source = state.values.get(rhs_point).copied().filter(|value| !matches!(value, Value::Plain(_)));
+                    let rhs = state.values.get(rhs_point);
+                    if result.reject_receipt_loan(id, rhs) {
+                        // An assignment is not a supported proof of a local loan alias.
+                    } else if target.projections.is_empty() {
+                        let source = rhs.copied().filter(|value| !matches!(value, Value::Plain(_)));
                         if let Some((previous, _, _)) = state.bindings.get(&target.binding) {
                             if matches!(previous, Some(Value::Aggregate { .. })) {
                                 result.unsupported.insert(id);
@@ -922,7 +1043,7 @@ impl AggregateFlowFacts {
                 CfgPointKind::AssignThrough { rhs_point, .. } => {
                     let value = state.values.get(rhs_point);
                     result.account_raw(id, value);
-                    if value.is_some() {
+                    if !result.reject_receipt_loan(id, value) && value.is_some() {
                         result.unsupported.insert(id);
                     }
                     None
@@ -966,6 +1087,9 @@ impl AggregateFlowFacts {
                     let mut offset = None;
                     for (slot, argument) in argument_points.iter().enumerate() {
                         let value = state.values.get(argument);
+                        if result.reject_receipt_loan(id, value) {
+                            continue;
+                        }
                         if ordinary_read.is_some() && matches!(value, Some(Value::RawFormal(_))) {
                             result.invalidate_raw(id);
                         }
@@ -1082,7 +1206,9 @@ impl AggregateFlowFacts {
                     (Some(left), Some(right)) => {
                         result.account_raw(id, Some(left));
                         result.account_raw(id, Some(right));
-                        Some(Value::Unknown)
+                        let receipt = result.reject_receipt_loan(id, Some(left))
+                            | result.reject_receipt_loan(id, Some(right));
+                        (!receipt).then_some(Value::Unknown)
                     }
                 },
                 CfgPointKind::ReturnOutput { value_point, .. } => {
@@ -1096,6 +1222,10 @@ impl AggregateFlowFacts {
                             state.moved.insert(*backing);
                             Some(*backing)
                         }
+                        Some(Value::ReceiptLoan(_)) => {
+                            result.reject_receipt_loan(id, return_value);
+                            None
+                        }
                         Some(Value::View(_) | Value::Unknown) => {
                             result.unsupported.insert(id);
                             None
@@ -1107,20 +1237,29 @@ impl AggregateFlowFacts {
                     None
                 }
                 CfgPointKind::ScopeExit => {
-                    state.bindings.retain(|_, (value, owner_scope, position)| {
+                    let exit = self.scope_exits.get(&id);
+                    let mut live = BTreeSet::new();
+                    state.bindings.retain(|binding, (value, owner_scope, position)| {
                         if *owner_scope != point.scope {
                             return true;
                         }
-                        if let (Some(Value::Aggregate { backing, .. }), Some(exit)) =
-                            (value, self.scope_exits.get(&id))
-                        {
-                            if position.is_some() || matches!(backing, OwnerSource::Formal(_)) {
-                                result.endpoints.entry((id, exit.0)).or_default()
-                                    .insert((!state.moved.contains(backing)).then_some(*backing));
+                        // A field-backed carrier can use an owner's storage but
+                        // is not a whole Call or Formal receipt to release.
+                        if let Some(Value::Aggregate { backing, field: None }) = value {
+                            let installed = match backing {
+                                OwnerSource::Formal(_) => true,
+                                OwnerSource::Call(_) => position.is_some(),
+                                OwnerSource::Allocation(_) => false,
+                            };
+                            if exit.is_some() && installed && !state.moved.contains(backing) {
+                                live.insert((*backing, binding.clone()));
                             }
                         }
                         false
                     });
+                    if let Some(exit) = exit {
+                        result.endpoints.entry((id, exit.0)).or_default().observe(live);
+                    }
                     None
                 }
                 _ => None,
@@ -2104,8 +2243,7 @@ fn closed_aggregates<'a>(
         if facts.read_active.contains(&read_owner) {
             prove_read_views((callee, read_owner), &bodies, &declarations, &mut proven_read_views)?;
         }
-        let origin = Some(OwnerSource::Formal(slot));
-        let mut exits = facts.endpoints.iter().filter(|(_, owners)| owners.contains(&origin));
+        let mut exits = facts.owner_endpoints(OwnerSource::Formal(slot));
         let release = if let Some(&next) = forward_edges.get(&(callee, slot)) {
             if exits.next().is_some() {
                 return Err(format!("aggregate owning formal has both release and transfer in {:?} at slot {slot}", body.source));
@@ -2113,10 +2251,10 @@ fn closed_aggregates<'a>(
             forward_predecessors.entry(next).or_default().push((callee, slot));
             None
         } else {
-            let Some((&endpoint, observed)) = exits.next() else {
+            let Some((endpoint, always)) = exits.next() else {
                 return Err(format!("aggregate owning input has no proved formal exit in {:?} at slot {slot}", body.source));
             };
-            if observed.len() != 1 || exits.next().is_some() {
+            if !always || exits.next().is_some() {
                 return Err(format!("aggregate owning input has ambiguous formal exit in {:?} at slot {slot}", body.source));
             }
             terminal_formals.push((callee, slot));
@@ -2263,6 +2401,11 @@ fn closed_aggregates<'a>(
             ));
         }
         let Some(facts) = body.facts else { continue };
+        for (&call, &point) in &facts.unproved_receipt_loans {
+            if target_body(&declarations, body.cfg, call).is_some_and(|target| outgoing.contains(&target)) {
+                return Err(format!("aggregate owning receipt has an unproved checked loan in {:?} at point {point:?}", body.source));
+            }
+        }
         let returning = outgoing.contains(&key);
         let return_route = if returning {
             if !body.is_monomorphic {
@@ -2334,23 +2477,20 @@ fn closed_aggregates<'a>(
                 continue;
             }
             if discharged_by_inputs.contains(&(key, point)) {
-                if facts.endpoints.values().any(|owners| owners.contains(&Some(OwnerSource::Call(point)))) {
+                if facts.owner_endpoints(OwnerSource::Call(point)).next().is_some() {
                     return Err(format!("aggregate input transfer does not cover every owning path in {:?}", body.source));
                 }
                 plan.calls.insert(call.0, ClosedCall::Receive);
                 continue;
             }
-            let mut endpoints = facts
-                .endpoints
-                .iter()
-                .filter(|(_, alternatives)| alternatives.contains(&Some(OwnerSource::Call(point))));
-            let Some((&(exit, block), alternatives)) = endpoints.next() else {
+            let mut endpoints = facts.owner_endpoints(OwnerSource::Call(point));
+            let Some(((exit, block), always)) = endpoints.next() else {
                 return Err(format!(
                     "aggregate owning call has no proved endpoint in {:?}",
                     body.source
                 ));
             };
-            if alternatives.len() != 1 || endpoints.next().is_some() {
+            if !always || endpoints.next().is_some() {
                 return Err(format!(
                     "aggregate owning call has ambiguous endpoint in {:?}",
                     body.source
@@ -2568,6 +2708,83 @@ pick = overload {
             assert!(prove_read_views(((0, selection, Some(2)), ReadSource::Carrier(0)),
                 &bodies, &declarations, &mut proven).unwrap_err().contains("unproved ordinary raw read formal"));
         }
+    }
+
+    #[test]
+    fn checked_loan_of_received_aggregate_cannot_escape() {
+        let text = r#"%%start
+struct Reading { *?u8 data; u64 length; }
+Reading(u64) make_reading = fn(length) {
+    u8[length] backing;
+    backing[0] = 19;
+    *?u8 data = null;
+    unsafe { data = &?backing[0]; };
+    Reading packet = { .data = data; .length = length; };
+    packet
+};
+*Reading(u64) expose = fn(length) {
+    Reading packet = make_reading(length);
+    *Reading view = &packet;
+    view
+};
+%%end"#;
+        let conditional = text.replace(
+            "    view\n",
+            "    *Reading alias = if (length == 0) { null } else { view };\n    alias\n",
+        );
+        assert_ne!(text, conditional);
+        for text in [text, conditional.as_str()] {
+            for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+                let source = SourceIdentity::new("project".into(), "package".into(), "main.w".into(), "r1".into());
+                let parsed = crate::parse_source(source.clone(), text.into(), &[]);
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                let prepared = crate::prepare_scalar_project(
+                    vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                    vec![source],
+                    crate::ScalarPreparationInputs { target_layout },
+                )
+                .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+                let build = crate::analyze_scalar_build(&prepared);
+                assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+                let module = &prepared.project().modules[0];
+                let reservations = AggregateReservations {
+                    bodies: module.items.iter().enumerate().filter_map(|(item, declaration)| {
+                        matches!(declaration, ScalarItem::Function(_)).then_some(((0, item, None), true))
+                    }).collect(),
+                    modules: vec![0],
+                };
+                let error = build.aggregate(&reservations).err().expect("escaped receipt loan");
+                assert!(error.contains("aggregate owning receipt has an unproved checked loan"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn scope_receipts_reject_disagreement_between_paths() {
+        let span = ByteSpan::new(0, 8);
+        let left = ReferenceBindingId {
+            source: SourceIdentity::new("project".into(), "package".into(), "main.w".into(), "r1".into()),
+            function_span: span,
+            declaration_span: ByteSpan::new(1, 2),
+            block_span: span,
+            kind: ReferenceBindingKind::Declared,
+        };
+        let right = ReferenceBindingId { declaration_span: ByteSpan::new(3, 4), ..left.clone() };
+        let a = OwnerSource::Call(CfgPointId(1));
+        let b = OwnerSource::Call(CfgPointId(2));
+        let mut exit = ScopeEndpoint::default();
+        exit.observe(BTreeSet::from([(a, left.clone()), (b, right.clone())]));
+        exit.observe(BTreeSet::from([(b, right.clone())]));
+        assert_eq!(exit.receipt(a), Some(false));
+        assert_eq!(exit.receipt(b), Some(true));
+        exit.observe(BTreeSet::from([(b, left.clone())]));
+        assert_eq!(exit.receipt(b), Some(false));
+
+        let mut empty_first = ScopeEndpoint::default();
+        empty_first.observe(BTreeSet::new());
+        empty_first.observe(BTreeSet::from([(a, left)]));
+        assert_eq!(empty_first.receipt(a), Some(false));
+        assert_eq!(empty_first.receipt(b), None);
     }
 
     #[test]

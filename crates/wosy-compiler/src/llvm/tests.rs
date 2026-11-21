@@ -43,6 +43,30 @@ fn prepare_initializer_test(
 }
 
 #[test]
+fn consuming_llvm_text_preserves_exact_header_formatting() {
+    for (raw, expected) in [
+        ("source_filename = \"x\"\n", "source_filename = \"x\"\n"),
+        ("source_filename = \"x\"\n\n", "source_filename = \"x\"\n\n"),
+        ("source_filename = \"x\"\n\n\n", "source_filename = \"x\"\n\n"),
+        ("préface\nsource_filename = \"日\"\n\n\n\n; finé",
+         "préface\nsource_filename = \"日\"\n\n\n; finé"),
+        ("source_filename = \"x\"\r\n\r\n\r\n; body\r\n",
+         "source_filename = \"x\"\n\n; body\n"),
+        ("source_filename = \"x\"\n\n\n\r", "source_filename = \"x\"\n\n\r"),
+        ("; no header\n\n\n", "; no header\n\n\n"),
+    ] {
+        let partition = LlvmPartition {
+            module_name: String::new(),
+            declarations: Vec::new(),
+            functions: Vec::new(),
+            text: raw.to_owned(),
+        };
+        assert_eq!(partition.to_text(), expected, "borrowed: {raw:?}");
+        assert_eq!(partition.into_text(), expected, "consuming: {raw:?}");
+    }
+}
+
+#[test]
 fn text_only_emission_matches_structured_partitions_on_both_targets() {
     let source = SourceIdentity::new(
         "project".into(),

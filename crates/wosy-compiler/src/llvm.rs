@@ -353,7 +353,7 @@ pub fn emit_scalar_build_single_module_llvm_text(
 ) -> Result<String, String> {
     Ok(
         emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly)?
-            .to_text(),
+            .into_text(),
     )
 }
 
@@ -733,7 +733,7 @@ pub fn emit_scalar_build_project_llvm_text(
         EmissionPolicy::Prepared,
         PartitionMetadata::ExternsOnly,
     )?
-    .to_text())
+    .into_text())
 }
 
 fn emit_scalar_build_project_with_policy(
@@ -1213,10 +1213,22 @@ fn emit_project_llvm<'a>(
 }
 
 pub fn emit_scalar_llvm_text(validation: &ScalarValidation) -> Result<String, String> {
-    Ok(emit_scalar_llvm_with_metadata(validation, PartitionMetadata::ExternsOnly)?.to_text())
+    Ok(emit_scalar_llvm_with_metadata(validation, PartitionMetadata::ExternsOnly)?.into_text())
 }
 
 impl LlvmPartition {
+    fn into_text(mut self) -> String {
+        if !self.declarations.is_empty() || self.text.contains("\r\n") {
+            return self.to_text();
+        }
+        if let Some(index) = extra_source_filename_blank(&self.text) {
+            let offset = self.text.match_indices('\n').nth(index)
+                .expect("blank LLVM header line has a newline").0;
+            self.text.remove(offset);
+        }
+        self.text
+    }
+
     pub fn to_text(&self) -> String {
         if !self.declarations.is_empty() {
             let mut declarations = self
@@ -1299,12 +1311,7 @@ impl LlvmPartition {
             }
             serialized
         } else {
-            let mut lines = self.text.lines().enumerate();
-            let excluded = lines.find(|(_, line)| line.starts_with("source_filename"))
-                .and_then(|(index, _)| {
-                    (matches!(lines.next(), Some((_, ""))) && matches!(lines.next(), Some((_, ""))))
-                        .then_some(index + 2)
-                });
+            let excluded = extra_source_filename_blank(&self.text);
             if excluded.is_none() && !self.text.contains("\r\n") {
                 return self.text.clone();
             }
@@ -1325,6 +1332,13 @@ impl LlvmPartition {
             serialized
         }
     }
+}
+
+fn extra_source_filename_blank(text: &str) -> Option<usize> {
+    let mut lines = text.lines().enumerate();
+    let (index, _) = lines.find(|(_, line)| line.starts_with("source_filename"))?;
+    (matches!(lines.next(), Some((_, ""))) && matches!(lines.next(), Some((_, ""))))
+        .then_some(index + 2)
 }
 
 struct LlvmQuotedAttribute<'a>(&'a str);

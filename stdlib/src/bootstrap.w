@@ -167,7 +167,10 @@ i32(*!u8) _read_line_discard_step = fn(view) {
 };
 
 i32(*!u8, i32) _read_line_discard_continue = fn(view, outcome) {
-	if (outcome == 0) { _read_line_discard_continue(view, _read_line_discard_step(view)) } else { outcome }
+	if (outcome == 0) {
+		i32 next_outcome = _read_line_discard_step(&!(*view));
+		_read_line_discard_continue(view, next_outcome)
+	} else { outcome }
 };
 
 ReadLineStatus(u8) _read_line_zero_capacity = fn(first) {
@@ -186,8 +189,8 @@ ReadLineStatus(u8) _read_line_zero_capacity = fn(first) {
 		if (complete && count != zero && *view == 10) { status = ReadLineStatus::line; discard = false; };
 	};
 	if (discard) {
-		i32 first_outcome = _read_line_discard_step(view);
-		i32 outcome = _read_line_discard_continue(view, first_outcome);
+		i32 first_outcome = _read_line_discard_step(&!scratch[0]);
+		i32 outcome = _read_line_discard_continue(&!scratch[0], first_outcome);
 		if (outcome == 2) { status = ReadLineStatus::io_error; };
 	};
 	status
@@ -238,7 +241,7 @@ ReadLineStatus(u8) _read_line_zero_capacity = fn(first) {
 		} else {
 			u64 two = core.int_extend<u64>(2);
 			u64 left = budget / two;
-			bytes, length, pending_cr, reading, status = _read_line_allocated_range(bytes, view, max_bytes, left, length, pending_cr, reading, status);
+			bytes, length, pending_cr, reading, status = _read_line_allocated_range(bytes, &!(*view), max_bytes, left, length, pending_cr, reading, status);
 			if (reading) {
 				bytes, length, pending_cr, reading, status = _read_line_allocated_range(bytes, view, max_bytes, budget - left, length, pending_cr, reading, status);
 			};
@@ -257,11 +260,10 @@ ReadLineStatus(u8) _read_line_zero_capacity = fn(first) {
 	ReadLineStatus status = ReadLineStatus::line;
 	if (!pending_cr) { bytes[length] = first; length = length + one; };
 	u64 two = core.int_extend<u64>(2);
-	*!u8 view = &!scratch[0];
-	bytes, length, pending_cr, reading, status = _read_line_allocated_range(bytes, view, max_bytes, max_bytes + two, length, pending_cr, reading, status);
+	bytes, length, pending_cr, reading, status = _read_line_allocated_range(bytes, &!scratch[0], max_bytes, max_bytes + two, length, pending_cr, reading, status);
 	if (status == ReadLineStatus::limit_exceeded) {
-		i32 first_outcome = _read_line_discard_step(view);
-		i32 outcome = _read_line_discard_continue(view, first_outcome);
+		i32 first_outcome = _read_line_discard_step(&!scratch[0]);
+		i32 outcome = _read_line_discard_continue(&!scratch[0], first_outcome);
 		if (outcome == 2) { status = ReadLineStatus::io_error; };
 	};
 	if (status == ReadLineStatus::line && pending_cr) {

@@ -143,10 +143,24 @@ fn ordinary_library_calls_keep_their_typed_routes_without_test_models() {
 
 #[test]
 fn ordinary_stdlib_print_still_uses_its_declared_call() {
+    assert_stdlib_print(
+        "%%start\nstd = namespace std \"bootstrap.w\";\nstd.print(\"ordinary\");\n%%end",
+        false,
+    );
+}
+
+#[test]
+fn stdlib_print_releases_formatted_owner_not_its_passive_iovec() {
+    assert_stdlib_print(
+        "%%start\nstd = namespace std \"bootstrap.w\";\nu64 n = 42;\nstd.print(std.format(n));\n%%end",
+        true,
+    );
+}
+
+fn assert_stdlib_print(text: &str, owning: bool) {
     let app = source("workbench", "src/run.w");
     let std = source("std", "src/bootstrap.w");
     let preview = source("std", "src/wasi/preview1.w");
-    let text = "%%start\nstd = namespace std \"bootstrap.w\";\nstd.print(\"ordinary\");\n%%end";
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         let prepared = prepare_scalar_project(
             vec![
@@ -178,9 +192,25 @@ fn ordinary_stdlib_print_still_uses_its_declared_call() {
         let ir = partition.to_text();
         let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "ordinary-stdlib");
         let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
         assert!(direct_calls(&module, "main")
             .iter()
             .any(|target| target == STD_PRINT));
+        let print = module.get_function(STD_PRINT).unwrap();
+        let frees: Vec<_> = print.get_basic_blocks().into_iter()
+            .flat_map(|block| block.get_instructions())
+            .filter(|instruction| instruction.get_opcode() == InstructionOpcode::Call
+                && CallSiteValue::try_from(*instruction).unwrap().get_called_fn_value()
+                    .is_some_and(|callee| callee.get_name().to_bytes() == b"__wosy_core_free"))
+            .collect();
+        if owning {
+            let [free] = frees.as_slice() else {
+                panic!("{target_layout:?}: expected one formal release");
+            };
+            assert_eq!(free.get_operand(0).unwrap().value(), print.get_last_param());
+        } else {
+            assert!(frees.is_empty());
+        }
     }
 }
 
@@ -200,6 +230,65 @@ fn function_with_suffix(module: &Module<'_>, name: &str) -> String {
         .unwrap_or_else(|| panic!("missing function {name}"));
     assert!(matches.next().is_none(), "ambiguous function {name}");
     symbol
+}
+
+#[test]
+fn same_scope_releases_two_independent_aggregate_receipts() {
+    let app = source("workbench", "src/two_receipts.w");
+    let text = r#"%%start
+struct Reading { *?u8 data; u64 length; }
+Reading(u64) make_reading = fn(length) {
+    u8[length] backing;
+    backing[0] = 19;
+    *?u8 data = null;
+    unsafe { data = &?backing[0]; };
+    Reading reading_packet = { .data = data; .length = length; };
+    reading_packet
+};
+u64(u64) drive = fn(length) {
+    Reading left = make_reading(length);
+    Reading right = make_reading(length);
+    *Reading left_view = if (length == 0) { &right } else { &left };
+    (*left_view).length + right.length
+};
+u64 result = drive(2);
+%%end"#;
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())],
+            vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "two-receipts");
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+
+        let drive = module.get_function(&function_with_suffix(&module, "drive")).unwrap();
+        let producer = module.get_function(&function_with_suffix(&module, "make_reading")).unwrap();
+        let release = module.get_function("__wosy_core_free").unwrap();
+        let mut received = Vec::new();
+        let mut released = Vec::new();
+        for instruction in drive.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+            if instruction.get_opcode() != InstructionOpcode::Call {
+                continue;
+            }
+            let call = CallSiteValue::try_from(instruction).unwrap();
+            match call.get_called_fn_value() {
+                Some(callee) if callee == producer => received.push(call.try_as_basic_value().basic().unwrap()),
+                Some(callee) if callee == release => released.push(instruction.get_operand(0).unwrap().value().unwrap()),
+                _ => {}
+            }
+        }
+        assert_eq!(received.len(), 2);
+        assert_ne!(received[0], received[1]);
+        received.reverse();
+        assert_eq!(released, received, "{target_layout:?}");
+    }
 }
 
 #[test]
