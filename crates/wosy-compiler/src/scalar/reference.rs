@@ -3677,6 +3677,7 @@ struct ReferenceEdgeState {
     point_values: ReferencePointValues,
     return_outputs: BTreeMap<usize, BTreeSet<ReferenceOriginId>>,
     moved: Vec<(ReferencePlaceId, SourceSpan)>,
+    moved_checked_handles: BTreeMap<ReferenceBindingId, SourceSpan>,
     assignment_previous: BTreeMap<CfgPointId, BTreeSet<ReferenceOriginId>>,
 }
 
@@ -4931,6 +4932,20 @@ fn transfer_reference_facts(
                 CfgPointKind::Move {
                     place,
                     ty:
+                        ScalarType::CheckedReference {
+                            mutability: ScalarReferenceMutability::Mutable,
+                            ..
+                        },
+                    ..
+                } if place.projections.is_empty() => {
+                    state
+                        .moved_checked_handles
+                        .entry(place.binding.clone())
+                        .or_insert_with(|| point.source_span.clone());
+                }
+                CfgPointKind::Move {
+                    place,
+                    ty:
                         ScalarType::Struct(_)
                         | ScalarType::Array { .. }
                         | ScalarType::RuntimeArray { .. },
@@ -5088,6 +5103,12 @@ fn transfer_reference_facts(
                     }
                 }
                 CfgPointKind::Read { binding } => {
+                    if let Some(origin) = state.moved_checked_handles.get(binding) {
+                        errors.push(ReferenceAnalysisError::ConflictingPlace {
+                            source_span: point.source_span.clone(),
+                            origins: vec![origin.clone()],
+                        });
+                    }
                     if state
                         .moved
                         .iter()
@@ -5169,6 +5190,7 @@ fn transfer_reference_facts(
                 } => {
                     let binding = &target.binding;
                     if target.projections.is_empty() {
+                        state.moved_checked_handles.remove(binding);
                         state.bindings.remove(binding);
                         state
                             .projected
@@ -5354,6 +5376,9 @@ fn transfer_reference_facts(
                     state
                         .moved
                         .retain(|(place, _)| place.binding.block_span != point.source_span.range);
+                    state
+                        .moved_checked_handles
+                        .retain(|binding, _| binding.block_span != point.source_span.range);
                     state
                         .released
                         .retain(|binding| binding.block_span != point.source_span.range);

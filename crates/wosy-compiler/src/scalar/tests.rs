@@ -699,7 +699,7 @@ fn whole_checked_aggregate_reads_preserve_source_places_in_both_validators() {
 
 #[test]
 fn whole_checked_aggregate_move_keeps_joined_owner_candidates() {
-    let text = "%%start\nstruct Payload { u8 value; }\nPayload(*!Payload, *!Payload, bool) choose = fn(first, second, flag) { *!Payload writer = first; if (flag) { writer = first; } else { writer = second; }; Payload moved = *writer; moved };\n%%end";
+    let text = "%%start\nstruct Payload { u8 value; }\nPayload(*!Payload, *!Payload, bool) choose = fn(first, second, flag) { *!Payload writer = null; if (flag) { writer = first; } else { writer = second; }; Payload moved = *writer; moved };\n%%end";
     let single = validate_text(text);
     let parsed = parse_source(source(), text.to_owned(), &[]);
     let project = validate_scalar_project(ScalarProject::new(
@@ -917,7 +917,7 @@ fn checked_dereference_field_move_uses_parent_loan_and_original_owner() {
 
 #[test]
 fn joined_checked_dereference_move_preserves_both_parent_loans() {
-    let text = "%%start\nstruct Payload { i32 value; }\nstruct Holder { Payload nested; }\nPayload(*!Holder, *!Holder, bool) choose = fn(first, second, flag) { *!Holder writer = first; if (flag) { writer = first; } else { writer = second; }; Payload moved = (*writer).nested; moved };\n%%end";
+    let text = "%%start\nstruct Payload { i32 value; }\nstruct Holder { Payload nested; }\nPayload(*!Holder, *!Holder, bool) choose = fn(first, second, flag) { *!Holder writer = null; if (flag) { writer = first; } else { writer = second; }; Payload moved = (*writer).nested; moved };\n%%end";
     let single = validate_text(text);
     let parsed = parse_source(source(), text.to_owned(), &[]);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -981,7 +981,7 @@ fn uneven_checked_dereference_move_preserves_both_parent_loans() {
         (format!("{delay} writer = first;"), "writer = second;".to_owned()),
     ] {
         let text = format!(
-            "%%start\nstruct Payload {{ i32 value; }}\nstruct Holder {{ Payload nested; i32 sibling; }}\nPayload(*!Holder, *!Holder, bool) choose = fn(first, second, flag) {{ *!Holder writer = first; if (flag) {{ {then_arm} }} else {{ {else_arm} }}; Payload moved = (*writer).nested; i32 observed = (*writer).sibling; observed; moved }};\n%%end"
+            "%%start\nstruct Payload {{ i32 value; }}\nstruct Holder {{ Payload nested; i32 sibling; }}\nPayload(*!Holder, *!Holder, bool) choose = fn(first, second, flag) {{ *!Holder writer = null; if (flag) {{ {then_arm} }} else {{ {else_arm} }}; Payload moved = (*writer).nested; i32 observed = (*writer).sibling; observed; moved }};\n%%end"
         );
         let single = validate_text(&text);
         let parsed = parse_source(source(), text.clone(), &[]);
@@ -1562,6 +1562,72 @@ fn inner_scope_exit_preserves_outer_owner_move_in_both_validators() {
             "{diagnostics:?}"
         );
     }
+}
+
+#[test]
+fn moved_mutable_checked_handle_has_unavailable_place_diagnostic() {
+    let text = "%%start
+unit() check_handle = fn {
+    u8 item = 1;
+    *!u8 first = &!item;
+    *!u8 second = first;
+    *second = 3;
+    first;
+};
+%%end";
+    let moved = text.find("first;").unwrap() as u32;
+    let read = text.rfind("first;").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for (diagnostics, source) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected a single unavailable-place diagnostic: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(diagnostic.message, "read or move of unavailable place");
+        assert_eq!(
+            diagnostic.labels[0].span,
+            SourceSpan::new(source.clone(), ByteSpan::new(read, read + 5)),
+        );
+        assert_eq!(
+            diagnostic.labels[1].span,
+            SourceSpan::new(source.clone(), ByteSpan::new(moved, moved + 5)),
+        );
+        assert_eq!(
+            diagnostic.labels[1].kind,
+            super::super::DiagnosticLabelKind::Secondary,
+        );
+    }
+}
+
+#[test]
+fn mutable_checked_handle_transfer_reborrow_and_reinitialization_remain_valid() {
+    let text = "%%start
+unit() check_handle = fn {
+    u8 item = 1;
+    u8 other = 2;
+    *!u8 first = &!item;
+    *!u8 second = first;
+    *second = 3;
+    if (true) {
+        *!u8 child = &!(*second);
+        u8 observed = *child;
+        observed;
+    };
+    *second = 5;
+    first = &!other;
+    *first = 6;
+};
+unit(*!u8) transfer_parameter = fn(first) {
+    *!u8 second = first;
+    *second = 7;
+};
+%%end";
+    let (single, project) = both_reference_functions(text);
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
 }
 
 #[test]
