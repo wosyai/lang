@@ -218,7 +218,8 @@ Reading(u64) make_reading = fn(length) {
 u64(u64) drive = fn(length) {
     Reading left = make_reading(length);
     Reading right = make_reading(length);
-    left.length + right.length
+    *Reading left_view = if (length == 0) { &right } else { &left };
+    (*left_view).length + right.length
 };
 u64 result = drive(2);
 %%end"#;

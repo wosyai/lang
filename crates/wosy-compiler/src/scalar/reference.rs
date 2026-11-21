@@ -962,6 +962,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
             _ if joined_value => self.point_with_origins(CfgPointKind::Join, span, scope, None),
             _ => self.point(CfgPointKind::Join, span, scope, BTreeSet::new()),
         };
+        if joined_value && matches!(self.cfg.points[join.0].kind, CfgPointKind::Join) {
+            if let ([then_point], [else_point]) = (
+                then_arm.result.output_points.as_slice(),
+                else_arm.result.output_points.as_slice(),
+            ) {
+                self.aggregate_facts.receipt_loan_forwarding.insert(join, vec![*then_point, *else_point]);
+            }
+        }
         self.cfg.points[then_arm.end.0].successors.push(join);
         self.cfg.points[else_arm.end.0].successors.push(join);
         Ok(if joined_value {
@@ -1106,6 +1114,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 self.proof_points.evaluations.insert(ordinal, point);
             }
         }
+        if let Some(point) = self.cursor.filter(|point| Some(*point) != before) {
+            if matches!(&self.cfg.points[point.0].kind,
+                CfgPointKind::ReadPlace { place: ScalarPlace::Field { base, .. }, pointer_point: Some(_), .. }
+                    if matches!(base.as_ref(), ScalarPlace::Dereference { .. }))
+                && self.call_sites.structure.checked_types.expressions.get(&ordinal)
+                    .is_some_and(aggregate::ordinary_value)
+            {
+                self.aggregate_facts.scalar_receipt_reads.insert(point);
+            }
+        }
         if matches!(
             expression,
             ScalarExpression::Member { .. }
@@ -1178,32 +1196,41 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 );
                 self.conditional(condition, then_branch, None, span, scope, region, false)
             }
-            ScalarExpression::Block(block) => match self
-                .block(block, self.block_ordinal(parent, OccurrenceEdge::BlockBody))?
-            {
-                Some(ReferenceValue::Checked(origins)) => {
-                    self.point(
-                        CfgPointKind::Evaluate(expression.clone()),
-                        span,
-                        scope,
-                        origins.clone(),
-                    );
-                    Ok(ReferenceValue::Checked(origins))
+            ScalarExpression::Block(block) => {
+                let result = self.block_result(block, self.block_ordinal(parent, OccurrenceEdge::BlockBody), false)?;
+                let value = match result.scalar {
+                    Some(ReferenceValue::Checked(origins)) => {
+                        self.point(
+                            CfgPointKind::Evaluate(expression.clone()),
+                            span,
+                            scope,
+                            origins.clone(),
+                        );
+                        ReferenceValue::Checked(origins)
+                    }
+                    Some(ReferenceValue::Uncomputed) => {
+                        self.uncomputed_point(CfgPointKind::Evaluate(expression.clone()), span, scope);
+                        ReferenceValue::Uncomputed
+                    }
+                    _ => {
+                        self.point(
+                            CfgPointKind::Evaluate(expression.clone()),
+                            span,
+                            scope,
+                            BTreeSet::new(),
+                        );
+                        ReferenceValue::Other
+                    }
+                };
+                if !matches!(value, ReferenceValue::Other) {
+                    if let [output] = result.output_points.as_slice() {
+                        self.aggregate_facts.receipt_loan_forwarding.insert(
+                            self.cursor.expect("block value"), vec![*output],
+                        );
+                    }
                 }
-                Some(ReferenceValue::Uncomputed) => {
-                    self.uncomputed_point(CfgPointKind::Evaluate(expression.clone()), span, scope);
-                    Ok(ReferenceValue::Uncomputed)
-                }
-                _ => {
-                    self.point(
-                        CfgPointKind::Evaluate(expression.clone()),
-                        span,
-                        scope,
-                        BTreeSet::new(),
-                    );
-                    Ok(ReferenceValue::Other)
-                }
-            },
+                Ok(value)
+            }
             ScalarExpression::Call { arguments, .. } => {
                 let target = self.call_target(expression, ordinal)?;
                 let mut address = None;
@@ -1539,15 +1566,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
             ScalarExpression::ArrayLiteral { elements, .. } => {
                 let track_raw = !self.aggregate_facts.raw_formals.is_empty() || !self.aggregate_facts.formals.is_empty();
                 let mut operands = Vec::new();
+                let mut checked_inputs = Vec::new();
                 for (position, element) in elements.iter().enumerate() {
                     let ordinal =
                         self.expression_ordinal(parent, OccurrenceEdge::AggregateElement(position));
                     let before = self.cursor;
                     self.expression(element, scope, ordinal)?;
-                    if track_raw && matches!(calls.structure.checked_types.expressions.get(&ordinal),
-                        Some(ScalarType::RawPointer(_) | ScalarType::Struct(_))) {
-                        if let Some(point) = self.cursor.filter(|point| Some(*point) != before) {
-                            operands.push(point);
+                    if let Some(point) = self.cursor.filter(|point| Some(*point) != before) {
+                        match calls.structure.checked_types.expressions.get(&ordinal) {
+                            Some(ScalarType::RawPointer(_) | ScalarType::Struct(_)) if track_raw => operands.push(point),
+                            Some(ScalarType::CheckedReference { .. }) => checked_inputs.push(point),
+                            _ => {}
                         }
                     }
                     self.move_value(element, scope, ordinal)?;
@@ -1561,6 +1590,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 if !operands.is_empty() {
                     self.aggregate_facts.opaque_container_inputs.insert(point, operands);
                 }
+                if !checked_inputs.is_empty() {
+                    self.aggregate_facts.receipt_loan_sinks.insert(point, checked_inputs);
+                }
                 Ok(ReferenceValue::Other)
             }
             ScalarExpression::Utf8 { .. } => {
@@ -1572,6 +1604,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
             ScalarExpression::StructLiteral { fields, .. } => {
                 let mut inputs = Vec::new();
+                let mut checked_inputs = Vec::new();
                 let structure_id = match calls.structure.checked_types.expressions.get(&ordinal) {
                     Some(ScalarType::Struct(id)) => Some(id),
                     _ => None,
@@ -1633,6 +1666,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             _ => false,
                         };
                     }
+                    if matches!(member_type, Some(ScalarType::CheckedReference { .. })) {
+                        if let Some(point) = self.cursor.filter(|point| Some(*point) != before) {
+                            checked_inputs.push(point);
+                        }
+                    }
                     if matches!(member_type, Some(ScalarType::RawPointer(_) | ScalarType::Struct(_))) {
                         if member.is_some() {
                             if let Some(point) = self.cursor.filter(|point| Some(*point) != before)
@@ -1649,6 +1687,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     scope,
                     BTreeSet::new(),
                 );
+                if !checked_inputs.is_empty() {
+                    self.aggregate_facts.receipt_loan_sinks.insert(literal, checked_inputs);
+                }
                 if let Some(read) = nullable_read.filter(|_| nullable && carrier && raw_fields == 1) {
                     self.aggregate_facts.checked_nullable_literals.insert(literal, read);
                 }
@@ -1687,6 +1728,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     scope,
                     BTreeSet::new(),
                 );
+                let root = self.place_root(place, place_ordinal);
+                if let Some(&pointer) = self.dereference_points.get(&root.ordinal) {
+                    self.aggregate_facts.receipt_loan_sinks.insert(value, vec![pointer]);
+                } else if let ScalarPlace::Name { span, .. } = root.place {
+                    if let Some(PreparedPlaceRoot::Lexical(binding)) =
+                        self.prepared_place_root(root.ordinal, *span)?
+                    {
+                        if self.checked.contains(binding) {
+                            self.aggregate_facts.receipt_loan_address_sinks.insert(value, binding.clone());
+                        }
+                    }
+                }
                 if !self.aggregate_facts.allocations.is_empty() || !self.aggregate_facts.plain_literals.is_empty()
                     || !self.aggregate_facts.formals.is_empty() || !self.aggregate_facts.raw_formals.is_empty()
                     || self.aggregate_facts.array_formal.is_some() {
@@ -1825,6 +1878,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             } => {
                 let place_ordinal = self.place_ordinal(parent, OccurrenceEdge::ExpressionPlace);
                 let root = self.place_root(place, place_ordinal);
+                let mut reborrow = None;
                 let parents = match root.place {
                     ScalarPlace::Dereference { pointer, .. } => {
                         let pointer_ordinal = self.expression_ordinal(
@@ -1849,6 +1903,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
                             ));
                         };
+                        reborrow = self.cursor;
                         Some(origins)
                     }
                     _ => None,
@@ -1975,6 +2030,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         scope,
                         BTreeSet::from([id]),
                     );
+                }
+                if let (Some(operand), Some(value)) = (reborrow, self.cursor) {
+                    if value != operand {
+                        self.aggregate_facts.receipt_loan_sinks.insert(value, vec![operand]);
+                    }
                 }
                 Ok(ReferenceValue::Checked(origins))
             }
