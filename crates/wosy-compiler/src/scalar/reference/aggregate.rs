@@ -36,6 +36,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) checked_producer_arms: Vec<(CfgPointId, CheckedProducerTerminal)>,
     pub(super) checked_nullable_literals: BTreeMap<CfgPointId, ReferenceBindingId>,
     pub(super) checked_raw_null_initializers: BTreeSet<CfgPointId>,
+    pub(super) passive_checked_comparisons: BTreeMap<CfgPointId, (CfgPointId, bool)>,
     pub(super) checked_raw_bindings: BTreeSet<CfgPointId>,
     pub(super) checked_backing_free_literals: BTreeSet<CfgPointId>,
     pub(super) checked_producer_nonlocal_installs: BTreeSet<CfgPointId>,
