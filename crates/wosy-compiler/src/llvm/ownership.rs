@@ -684,7 +684,25 @@ pub(super) fn transfer_runtime_array_return(
     ty: &ScalarType,
 ) {
     if !matches!(ty, ScalarType::RuntimeArray { .. }) {
-        if super::aggregate_transfer::holds_registered_return(state) {
+        if matches!(
+            ty,
+            ScalarType::Unit
+                | ScalarType::Bool
+                | ScalarType::I8
+                | ScalarType::I16
+                | ScalarType::I32
+                | ScalarType::I64
+                | ScalarType::I128
+                | ScalarType::U8
+                | ScalarType::U16
+                | ScalarType::U32
+                | ScalarType::U64
+                | ScalarType::U128
+                | ScalarType::F32
+                | ScalarType::F64
+                | ScalarType::Char
+        ) || super::aggregate_transfer::holds_registered_return(state)
+        {
             return;
         }
         let mut bindings = state.return_bindings.clone();

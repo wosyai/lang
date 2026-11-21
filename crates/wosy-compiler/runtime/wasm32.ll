@@ -35,10 +35,10 @@ reuse_search:
   %previous_address = phi i32 [ 0, %reuse_check ], [ %current_address, %reuse_continue ]
   %free_header = inttoptr i32 %current_address to ptr
   %free_size_address = getelementptr i8, ptr %free_header, i32 4
-  %free_size = load i32, ptr %free_size_address, align 4
+  %free_size = load i32, ptr %free_size_address, align 1
   %free_size64 = zext i32 %free_size to i64
   %free_alignment_address = getelementptr i8, ptr %free_header, i32 8
-  %free_alignment = load i32, ptr %free_alignment_address, align 4
+  %free_alignment = load i32, ptr %free_alignment_address, align 1
   %free_alignment64 = zext i32 %free_alignment to i64
   %size_reusable = icmp uge i64 %free_size64, %size
   %alignment_reusable = icmp uge i64 %free_alignment64, %alignment
@@ -46,7 +46,7 @@ reuse_search:
   br i1 %reusable, label %reuse, label %reuse_continue
 
 reuse_continue:
-  %next_free = load i32, ptr %free_header, align 4
+  %next_free = load i32, ptr %free_header, align 1
   %has_next_free = icmp ne i32 %next_free, 0
   br i1 %has_next_free, label %reuse_search, label %extend_header
 
@@ -82,12 +82,14 @@ reuse_size:
   %reused_allocation_end_value = extractvalue { i64, i1 } %reused_allocation_end, 0
   %reused_allocation_end_overflow = extractvalue { i64, i1 } %reused_allocation_end, 1
   %reused_address_space_end = icmp ule i64 %reused_allocation_end_value, 4294967296
-  %reused_exceeds_address_space = xor i1 %reused_address_space_end, true
+  %reused_address_space_pointer = icmp ult i64 %reused_pointer_address, 4294967296
+  %reused_address_space_fits = and i1 %reused_address_space_end, %reused_address_space_pointer
+  %reused_exceeds_address_space = xor i1 %reused_address_space_fits, true
   %reused_extends_address_space = or i1 %reused_allocation_end_overflow, %reused_exceeds_address_space
   br i1 %reused_extends_address_space, label %reuse_continue, label %reuse_unlink
 
 reuse_unlink:
-  %selected_next_free = load i32, ptr %free_header, align 4
+  %selected_next_free = load i32, ptr %free_header, align 1
   %selects_head = icmp eq i32 %previous_address, 0
   br i1 %selects_head, label %reuse_head, label %reuse_after
 
@@ -97,7 +99,7 @@ reuse_head:
 
 reuse_after:
   %previous_header = inttoptr i32 %previous_address to ptr
-  store i32 %selected_next_free, ptr %previous_header, align 4
+  store i32 %selected_next_free, ptr %previous_header, align 1
   br label %reuse_return
 
 reuse_return:
@@ -125,7 +127,9 @@ extend_size:
   %allocation_end_value = extractvalue { i64, i1 } %allocation_end, 0
   %allocation_end_overflow = extractvalue { i64, i1 } %allocation_end, 1
   %address_space_end = icmp ule i64 %allocation_end_value, 4294967296
-  %exceeds_address_space = xor i1 %address_space_end, true
+  %address_space_pointer = icmp ult i64 %pointer_address, 4294967296
+  %address_space_fits = and i1 %address_space_end, %address_space_pointer
+  %exceeds_address_space = xor i1 %address_space_fits, true
   %extends_address_space = or i1 %allocation_end_overflow, %exceeds_address_space
   br i1 %extends_address_space, label %failure, label %capacity_check
 
@@ -160,14 +164,14 @@ commit:
   %header = inttoptr i32 %header_address to ptr
   %payload = inttoptr i32 %payload_address to ptr
   %back_pointer = getelementptr i8, ptr %payload, i32 -4
-  store i32 %header_address, ptr %back_pointer, align 4
-  store i32 0, ptr %header, align 4
+  store i32 %header_address, ptr %back_pointer, align 1
+  store i32 0, ptr %header, align 1
   %size_address = getelementptr i8, ptr %header, i32 4
   %size32 = trunc i64 %size to i32
-  store i32 %size32, ptr %size_address, align 4
+  store i32 %size32, ptr %size_address, align 1
   %alignment_address = getelementptr i8, ptr %header, i32 8
   %alignment32 = trunc i64 %alignment to i32
-  store i32 %alignment32, ptr %alignment_address, align 4
+  store i32 %alignment32, ptr %alignment_address, align 1
   store i64 %allocation_end_value, ptr @__wosy_core_heap_cursor
   ret ptr %payload
 
@@ -182,10 +186,10 @@ entry:
 
 release:
   %back_pointer = getelementptr i8, ptr %pointer, i32 -4
-  %header_address = load i32, ptr %back_pointer, align 4
+  %header_address = load i32, ptr %back_pointer, align 1
   %header = inttoptr i32 %header_address to ptr
   %free_head = load i32, ptr @__wosy_core_free_head
-  store i32 %free_head, ptr %header, align 4
+  store i32 %free_head, ptr %header, align 1
   store i32 %header_address, ptr @__wosy_core_free_head
   br label %complete
 

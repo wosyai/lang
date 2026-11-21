@@ -3507,6 +3507,60 @@ fn emits_runtime_array_allocation_and_indexing_for_both_targets() {
 }
 
 #[test]
+fn releases_runtime_array_backing_after_copying_primitive_returns() {
+    let text = "%%start
+u8(u64) indexed = fn(length) { u8[length] bytes; bytes[0] = 7; bytes[0] };
+u8(u64) copied = fn(length) { u8[length] bytes; bytes[0] = 7; u8 result = bytes[0]; result };
+u8(u64) indirect = fn(length) { u8[length] bytes; bytes[0] = 7; *u8 view = &bytes[0]; *view };
+%%end";
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (project_route, llvm) in [
+            (false, emit_scalar_llvm(&single).unwrap().to_text()),
+            (true, emit_scalar_project_llvm(&project).unwrap().to_text()),
+        ] {
+            for name in ["indexed", "copied", "indirect"] {
+                let symbol = if project_route {
+                    project_function_name(&source, name)
+                } else {
+                    name.to_owned()
+                };
+                let (_, tail) = llvm
+                    .split_once(&format!("@{symbol}("))
+                    .unwrap_or_else(|| panic!("{name}: {llvm}"));
+                let (body, _) = tail.split_once("\n}").expect("function end");
+                let allocation = "call ptr @__wosy_core_alloc";
+                let release = "call void @__wosy_core_free";
+                assert_eq!(body.matches(allocation).count(), 1, "{name}: {body}");
+                assert_eq!(body.matches(release).count(), 1, "{name}: {body}");
+                let allocation = body.find(allocation).unwrap();
+                let loaded = body.rfind("load i8, ptr").expect("result load");
+                let release = body.find(release).unwrap();
+                let returned = body.find("ret i8 ").expect("primitive return");
+                assert!(
+                    allocation < loaded && loaded < release && release < returned,
+                    "{name}: {body}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn emits_one_release_for_a_moved_top_level_runtime_array_for_both_targets() {
     let source = SourceIdentity::new(
         "project".into(),
@@ -3563,6 +3617,56 @@ fn transfers_runtime_array_ownership_through_a_returned_aggregate_pointer() {
             1,
             "{llvm}"
         );
+    }
+}
+
+#[test]
+fn primitive_return_lanes_do_not_release_backing_escaped_by_sibling() {
+    let text = "%%start
+struct Packet { *?u8 data; u64 length; }
+(u8, *Packet)(u64) scalar_first = fn(length) { u8[length] bytes; bytes[0] = 7; *?u8 data = null; unsafe { data = &?bytes[0]; }; Packet packet = { .data = data; .length = length; }; bytes[0], &packet };
+(*Packet, u8)(u64) pointer_first = fn(length) { u8[length] bytes; bytes[0] = 7; *?u8 data = null; unsafe { data = &?bytes[0]; }; Packet packet = { .data = data; .length = length; }; &packet, bytes[0] };
+%%end";
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (project_route, llvm) in [
+            (false, emit_scalar_llvm(&single).unwrap().to_text()),
+            (true, emit_scalar_project_llvm(&project).unwrap().to_text()),
+        ] {
+            let pointer = if layout == ScalarTargetLayout::WASM32 { "i32" } else { "i64" };
+            for (name, shape) in [
+                ("scalar_first", format!("{{ i8, {pointer} }}")),
+                ("pointer_first", format!("{{ {pointer}, i8 }}")),
+            ] {
+                let symbol = if project_route {
+                    project_function_name(&source, name)
+                } else {
+                    name.to_owned()
+                };
+                let (_, tail) = llvm
+                    .split_once(&format!("@{symbol}("))
+                    .unwrap_or_else(|| panic!("{name}: {llvm}"));
+                let (body, _) = tail.split_once("\n}").expect("function end");
+                assert!(body.contains("call ptr @__wosy_core_alloc"), "{name}: {body}");
+                assert!(body.contains("load i8, ptr"), "{name}: {body}");
+                assert!(body.contains(&format!("ret {shape} ")), "{name}: {body}");
+                assert!(!body.contains("call void @__wosy_core_free"), "{name}: {body}");
+            }
+        }
     }
 }
 
