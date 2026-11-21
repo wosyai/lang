@@ -2122,8 +2122,13 @@ fn emit_function<'ctx, 'module>(
     if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(context, &mut state, value, function, None);
     }
-    let result = match function.body.items.as_slice() {
-        [ScalarBlockItem::Expression(expression)]
+    let single_output = if function.body.items.len() == 1 {
+        function.body.final_expressions().next()
+    } else {
+        None
+    };
+    let result = match single_output {
+        Some((expression, _))
             if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
         {
             if outputs.outputs.len() == 1 {
@@ -2153,7 +2158,7 @@ fn emit_function<'ctx, 'module>(
             BlockEmission::Return(outputs),
         )?,
     };
-    if let [ScalarBlockItem::Expression(expression)] = function.body.items.as_slice() {
+    if let Some((expression, _)) = single_output {
         for output in state.return_owner_slots.keys().copied().collect::<Vec<_>>() {
             record_forwarded_return_owner(context, &mut state, expression, output)?;
         }
@@ -2442,8 +2447,13 @@ fn emit_project_function<'ctx, 'module>(
             }),
         );
     }
-    let result = match function.body.items.as_slice() {
-        [ScalarBlockItem::Expression(expression)]
+    let single_output = if function.body.items.len() == 1 {
+        function.body.final_expressions().next()
+    } else {
+        None
+    };
+    let result = match single_output {
+        Some((expression, _))
             if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
         {
             if outputs.outputs.len() == 1 {
@@ -2488,7 +2498,7 @@ fn emit_project_function<'ctx, 'module>(
             BlockEmission::Return(outputs),
         )?,
     };
-    if let [ScalarBlockItem::Expression(expression)] = function.body.items.as_slice() {
+    if let Some((expression, _)) = single_output {
         for output in state.return_owner_slots.keys().copied().collect::<Vec<_>>() {
             record_forwarded_return_owner(context, &mut state, expression, output)?;
         }
@@ -2898,23 +2908,16 @@ fn emit_block_at<'ctx, 'module>(
     let runtime_array_live = state.runtime_array_live.clone();
     let automatic_return_result_owners = state.automatic_return_result_owners.clone();
     let checked_owner_flags = state.checked_owner_flags.clone();
-    let mut result = EmitValue::Unit;
     let final_start = block.items.len() - block.final_output_values.len();
     for item in &block.items[..final_start] {
-        result = match item {
-            ScalarBlockItem::LocalBinding(binding) => {
-                let value = emit_binding_value(context, state, binding)?;
-                store_binding_outputs(context, state, binding, value)?;
-                EmitValue::Unit
-            }
-            ScalarBlockItem::Expression(expression) => emit_expression(context, state, expression)?,
-            ScalarBlockItem::Assignment(assignment) => emit_assignment(context, state, assignment)?,
-        };
+        emit_block_item(context, state, item)?;
     }
-    if !block.final_output_values.is_empty() || matches!(emission, BlockEmission::TailArm(_)) {
-        result = emit_final_outputs(context, state, block, emission)?;
-    }
-    result = finish_block_return(context, state, block, result, emission)?;
+    let result = if final_start < block.items.len() || matches!(emission, BlockEmission::TailArm(_)) {
+        emit_final_outputs(context, state, block, emission)?
+    } else {
+        EmitValue::Unit
+    };
+    let result = finish_block_return(context, state, block, result, emission)?;
     if let BlockEmission::Return(outputs) = emission {
         aggregate_transfer::commit_return(context, state, &result, outputs)?;
     }
@@ -2978,27 +2981,27 @@ fn emit_project_block_at<'ctx, 'module>(
     let runtime_array_live = state.runtime_array_live.clone();
     let automatic_return_result_owners = state.automatic_return_result_owners.clone();
     let checked_owner_flags = state.checked_owner_flags.clone();
-    let mut result = EmitValue::Unit;
     let final_start = block.items.len() - block.final_output_values.len();
     for item in &block.items[..final_start] {
-        result = match item {
+        match item {
             ScalarBlockItem::LocalBinding(binding) => {
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 store_binding_outputs(context, state, binding, value)?;
-                EmitValue::Unit
             }
             ScalarBlockItem::Expression(expression) => {
-                emit_project_expression(context, state, expression, module, modules)?
+                emit_project_expression(context, state, expression, module, modules)?;
             }
             ScalarBlockItem::Assignment(assignment) => {
-                emit_project_assignment(context, state, assignment, module, modules)?
+                emit_project_assignment(context, state, assignment, module, modules)?;
             }
-        };
+        }
     }
-    if !block.final_output_values.is_empty() || matches!(emission, BlockEmission::TailArm(_)) {
-        result = emit_project_final_outputs(context, state, block, module, modules, emission)?;
-    }
-    result = finish_block_return(context, state, block, result, emission)?;
+    let result = if final_start < block.items.len() || matches!(emission, BlockEmission::TailArm(_)) {
+        emit_project_final_outputs(context, state, block, module, modules, emission)?
+    } else {
+        EmitValue::Unit
+    };
+    let result = finish_block_return(context, state, block, result, emission)?;
     if let BlockEmission::Return(outputs) = emission {
         aggregate_transfer::commit_return(context, state, &result, outputs)?;
     }
