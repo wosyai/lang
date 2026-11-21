@@ -592,6 +592,12 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
         Packet carrier = { .data = content; .length = count; };
         u8 byte = reader(carrier);
         if (status && byte == 0) { 1 } else { 0 }"#);
+    let projecting_length = passive.replace(
+        "if (received != null) { content = (*received).data; };",
+        "u64 size = 0; if (received != null) { content = (*received).data; size = (*received).length; };")
+        .replace(".data = content; .length = count;", ".data = content; .length = size;");
+    let repeated_projection = projecting_length.replace("size = (*received).length;",
+        "size = (*received).length; size = (*received).length;");
     let consuming = passive.replace("byte = core.load<u8>(input.data);",
         "byte = core.load<u8>(input.data); core.free(input.data);");
     let nonreturning = passive.replace("byte = core.load<u8>(input.data);",
@@ -638,7 +644,8 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         for (text, expected_transport, qualified) in [
             (positive, true, false), (unproved.as_str(), false, false),
-            (passive.as_str(), true, false), (consuming.as_str(), false, false),
+            (passive.as_str(), true, false), (projecting_length.as_str(), true, false),
+            (repeated_projection.as_str(), false, false), (consuming.as_str(), false, false),
             (ambiguous_alias.as_str(), false, false), (nonreturning.as_str(), false, false),
             (length_call.as_str(), false, false),
             (module_sink.as_str(), false, false), (qualified_sink.as_str(), false, true),

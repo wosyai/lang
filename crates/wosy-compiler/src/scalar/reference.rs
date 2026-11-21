@@ -3898,6 +3898,7 @@ fn previous_origin_loans(
 
 struct PassiveDescriptorRead {
     projection: CfgPointId,
+    scalar_projection: Option<CfgPointId>,
     literal: CfgPointId,
     call: CfgPointId,
     field: ScalarStructFieldId,
@@ -3908,6 +3909,7 @@ fn passive_descriptor_read(
     marker: &ScalarDescriptorInstall,
     facts: &aggregate::AggregateFlowFacts,
     sites: &FunctionCallSites,
+    structs: &[ScalarStruct],
 ) -> Option<PassiveDescriptorRead> {
     if sites.call_occurrences.len() != 2 || !sites.allocation_length_call_targets.is_empty()
         || facts.literals.len() != 1
@@ -3946,6 +3948,7 @@ fn passive_descriptor_read(
     let mut call = None;
     let mut carrier_read = None;
     let mut carrier_move = None;
+    let mut scalar_projection = None;
     for point in &cfg.points {
         if point.successors.iter().any(|next| next.0 <= point.id.0) { return None }
         match &point.kind {
@@ -3963,6 +3966,24 @@ fn passive_descriptor_read(
             }
             CfgPointKind::Borrow { place, .. } | CfgPointKind::DeferredMove { place, .. }
                 if &place.binding == carrier || &place.binding == alias => return None,
+            CfgPointKind::ReadPlace {
+                place: ScalarPlace::Field { field: ScalarFieldReference::Resolved(scalar), .. },
+                pointer_point: Some(pointer),
+                reads_origin: false,
+                ..
+            } if scalar != field && scalar.structure == marker.structure
+                && marker.frozen.install.0 < point.id.0
+                && matches!(&cfg.points.get(pointer.0)?.kind,
+                    CfgPointKind::Read { binding } if binding == &marker.binding) =>
+            {
+                let declared = structs.iter().find(|decl| decl.id == scalar.structure)?
+                    .fields.iter().find(|decl| decl.id == *scalar)?;
+                if !aggregate::ordinary_value(&declared.ty)
+                    || scalar_projection.replace(point.id).is_some()
+                {
+                    return None;
+                }
+            }
             CfgPointKind::Call { output: 0, .. } if point.id == marker.frozen.rhs => {}
             CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable { .. }, argument_points, .. } => {
                 let [actual] = argument_points.as_slice() else { return None };
@@ -3997,7 +4018,7 @@ fn passive_descriptor_read(
     {
         return None;
     }
-    Some(PassiveDescriptorRead { projection, literal, call, field: field.clone() })
+    Some(PassiveDescriptorRead { projection, scalar_projection, literal, call, field: field.clone() })
 }
 
 struct ScalarDescriptorReplay<'a> {
@@ -4041,7 +4062,8 @@ impl ScalarDescriptorReplay<'_> {
                 self.invalid |= carries(point.possible_origins.as_ref()) || competing_owner();
             }
             CfgPointKind::ReadPlace { pointer_point, .. } if candidate.validate_backing => {
-                self.invalid |= !self.passive.is_some_and(|proof| proof.projection == point.id)
+                self.invalid |= !self.passive.is_some_and(|proof| proof.projection == point.id
+                        || proof.scalar_projection == Some(point.id))
                     || !pointer_point.and_then(|pointer| state.point_values.get(pointer)).is_some_and(|origins| {
                         !origins.is_empty() && origins.iter().all(owns)
                     });
@@ -9035,7 +9057,7 @@ fn build_function_reference_cfg(
     let mut aggregate = std::mem::take(&mut builder.aggregate_result);
     if let ScalarDescriptorCandidates::One(_, marker) = &builder.proof_points.backing_descriptor_install {
         aggregate.passive_descriptor_read = passive_descriptor_read(
-            &builder.cfg, marker, &builder.aggregate_facts, call_sites).map(Box::new);
+            &builder.cfg, marker, &builder.aggregate_facts, call_sites, builder.structs).map(Box::new);
     }
     if prior_children_succeeded && errors.is_empty() && !builder.cfg.points.is_empty() {
         builder.cfg.initial_points = builder.cfg.points.clone();
