@@ -2482,6 +2482,29 @@ fn joined_checked_release_reports_second_release_for_each_possible_owner() {
 }
 
 #[test]
+fn uneven_checked_release_diagnostics_follow_structural_flow_order() {
+    let delay = "u64 tick = count; tick = tick + 1; tick = tick + 1; tick = tick + 1; tick = tick + 1; tick = tick + 1; tick;";
+    let text = format!(
+        "%%start\nunit(u64, bool) release = fn(count, flag) {{ u8[count] first; u8[count] second; if (flag) {{ {delay} unsafe {{ core.free(&first); core.free(&first); }}; }} else {{ unsafe {{ core.free(&second); core.free(&second); }}; }}; }};\n%%end"
+    );
+    let (single, project) = both_reference_functions(&text);
+    let sites = [
+        text.rfind("&first").unwrap() as u32,
+        text.rfind("&second").unwrap() as u32,
+    ];
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let ordered = diagnostics
+            .iter()
+            .filter_map(|diagnostic| {
+                let start = diagnostic.labels.first()?.span.range.start;
+                (diagnostic.code == "B0003" && sites.contains(&start)).then_some(start)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ordered, sites, "{diagnostics:?}");
+    }
+}
+
+#[test]
 fn joined_checked_release_preserves_correlated_untouched_alias() {
     let text = "%%start\nunit(u64, bool) release = fn(count, flag) { u8[count] first; u8[count] second; *u8 selected = &first[0]; *u8 untouched = &second[0]; if (flag) { selected, untouched = untouched, selected; }; unsafe { core.free(selected); }; untouched; } ;\n%%end";
     let (single, project) = both_reference_functions(text);

@@ -3661,7 +3661,10 @@ fn transfer_reference_facts(
         .copied()
         .collect::<BTreeSet<_>>();
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
-    for point in &original_points {
+    let mut strictly_forward = true;
+    for (index, point) in original_points.iter().enumerate() {
+        strictly_forward = strictly_forward && point.id.0 == index
+            && point.successors.iter().all(|successor| successor.0 > index && successor.0 < original_points.len());
         let dependencies = match &point.kind {
             CfgPointKind::Invalidate { address_point, .. }
             | CfgPointKind::Release {
@@ -3701,18 +3704,51 @@ fn transfer_reference_facts(
         aggregate: aggregate.as_ref().map(|(facts, _, _)| facts.entry_state()),
         ..ReferenceEdgeState::default()
     });
-    let mut visited = vec![Vec::<ReferenceEdgeState>::new(); cfg.points.len()];
-    let mut queued = vec![false; cfg.points.len()];
-    queued[0] = true;
-    let mut ready = std::collections::VecDeque::from([CfgPointId(0)]);
+    let mut fallback = (!strictly_forward).then(|| {
+        let mut queued = vec![false; cfg.points.len()];
+        queued[0] = true;
+        (
+            vec![Vec::<ReferenceEdgeState>::new(); cfg.points.len()],
+            queued,
+            std::collections::VecDeque::from([CfgPointId(0)]),
+        )
+    });
+    let mut forward_cursor = 0;
+    let mut forward_single_observation = strictly_forward.then(|| vec![false; cfg.points.len()]);
     let mut errors = Vec::new();
-    while let Some(id) = ready.pop_front() {
-        queued[id.0] = false;
-        for mut state in std::mem::take(&mut incoming[id.0]) {
-            if visited[id.0].contains(&state) {
-                continue;
+    loop {
+        let id = if let Some((_, queued, ready)) = &mut fallback {
+            let Some(id) = ready.pop_front() else { break };
+            queued[id.0] = false;
+            id
+        } else {
+            let Some(offset) = incoming[forward_cursor..].iter().position(|slot| !slot.is_empty()) else {
+                break;
+            };
+            let id = CfgPointId(forward_cursor + offset);
+            forward_cursor = id.0 + 1;
+            id
+        };
+        let states = std::mem::take(&mut incoming[id.0]);
+        if let Some(single_observation) = &mut forward_single_observation {
+            if matches!(&original_points[id.0].kind, CfgPointKind::MoveThrough { place, .. }
+                if !matches!(place, ScalarPlace::Dereference { .. }))
+            {
+                single_observation[id.0] = states.len() == 1;
             }
-            visited[id.0].push(state.clone());
+        }
+        let mut forward_visits = 0;
+        for mut state in states {
+            let visits = if let Some((visited, _, _)) = &mut fallback {
+                if visited[id.0].contains(&state) {
+                    continue;
+                }
+                visited[id.0].push(state.clone());
+                visited[id.0].len()
+            } else {
+                forward_visits += 1;
+                forward_visits
+            };
             if let (Some((facts, sites, result)), Some(flow)) =
                 (&mut aggregate, &mut state.aggregate)
             {
@@ -3795,7 +3831,7 @@ fn transfer_reference_facts(
                 let contract = match contracts {
                     [] => None,
                     [contract] => matches_contract(contract).then_some(contract),
-                    _ if visited[id.0].len() == 1 => {
+                    _ if visits == 1 => {
                         contracts.iter().find(|contract| matches_contract(contract))
                     }
                     _ => *call_contracts.entry(id).or_insert_with(|| {
@@ -4782,7 +4818,8 @@ fn transfer_reference_facts(
                     if successor.0 <= id.0 {
                         next.point_values.clear_from(*successor);
                     }
-                    if !visited[successor.0].contains(&next) && !slot.contains(&next) {
+                    if fallback.as_ref().is_none_or(|(visited, _, _)| !visited[successor.0].contains(&next))
+                        && !slot.contains(&next) {
                         slot.push(next);
                     }
                 } else {
@@ -4794,14 +4831,17 @@ fn transfer_reference_facts(
                         if successor.0 <= id.0 {
                             next.point_values.clear_from(*successor);
                         }
-                        if !visited[successor.0].contains(&next) && !slot.contains(&next) {
+                        if fallback.as_ref().is_none_or(|(visited, _, _)| !visited[successor.0].contains(&next))
+                            && !slot.contains(&next) {
                             slot.push(next);
                         }
                     }
                 }
-                if !slot.is_empty() && !queued[successor.0] {
-                    queued[successor.0] = true;
-                    ready.push_back(*successor);
+                if let Some((_, queued, ready)) = &mut fallback {
+                    if !slot.is_empty() && !queued[successor.0] {
+                        queued[successor.0] = true;
+                        ready.push_back(*successor);
+                    }
                 }
             }
         }
@@ -4812,7 +4852,10 @@ fn transfer_reference_facts(
             CfgPointKind::MoveThrough { place, ty, mut candidates, .. }
                 if !matches!(place, ScalarPlace::Dereference { .. })
                     && candidates.len() == 1
-                    && visited[observed.id.0].len() == 1
+                    && fallback.as_ref().map_or_else(
+                        || forward_single_observation.as_ref().is_some_and(|single| single[observed.id.0]),
+                        |(visited, _, _)| visited[observed.id.0].len() == 1,
+                    )
                     && observed.possible_origins.as_ref().is_some_and(|origins| origins.len() == 1) =>
             {
                 let candidate = candidates.pop().unwrap();
