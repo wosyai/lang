@@ -769,3 +769,68 @@ fn checked_block_observes_the_exact_terminal_before_scope_exit_and_converges() {
         }
     }
 }
+
+#[test]
+fn checked_ordinary_join_preserves_null_and_missing_provenance_on_separate_arms() {
+    let text = r#"%%start
+*u8(*u8) forward = fn(input) { input };
+*u8(*u8, bool) select = fn(input, flag) {
+    *u8 selected = if (flag) { forward(input) } else { null };
+    selected
+};
+%%end"#;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let (mut results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let result = &mut results[1].1;
+        let [(join, [Some(then_point), Some(else_point)])] = result.proof_points.checked_join_values.as_slice() else {
+            panic!("expected ordered exact checked arm terminals")
+        };
+        let (join, then_point, else_point) = (*join, *then_point, *else_point);
+        assert!(then_point < else_point && else_point < join);
+        let points = &result.cfg.points;
+        assert!(matches!(points[join.0].kind, CfgPointKind::Join));
+        assert!(matches!(&points[then_point.0].kind,
+            CfgPointKind::Call { target: ResolvedCallTarget::ModuleCallable { .. }, .. }));
+        assert!(points[then_point.0].possible_origins.is_none());
+        let null = points[else_point.0].possible_origins.as_ref().expect("known null arm");
+        assert_eq!(null.len(), 1);
+        assert!(matches!(&result.cfg.facts[null.first().unwrap().0], ReferenceOrigin::Null { .. }));
+        assert_eq!(points[join.0].possible_origins.as_ref(), Some(null));
+
+        let contracts = ReferenceOutputContracts::default();
+        let mut replays = Vec::new();
+        transfer_function_output_contracts(
+            result, &contracts, &contracts, &mut HashMap::new(), &mut replays, &mut 0,
+        );
+        let selected_span = text.find("selected =").unwrap() as u32;
+        assert!(replays[0].errors.iter().any(|error| matches!(error,
+            ReferenceAnalysisError::MissingOrigin {
+                binding_id, reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin, ..
+            } if binding_id.declaration_span.start == selected_span
+        )), "{:?}", replays[0].errors);
+
+        let public = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
+        let ScalarItem::Function(function) = &public.program.items[1] else {
+            panic!("expected checked function")
+        };
+        let cfg = &function.reference_cfg;
+        let known_then = cfg.points[then_point.0].possible_origins.as_ref().expect("converged checked call");
+        let known_else = cfg.points[else_point.0].possible_origins.as_ref().expect("preserved null arm");
+        assert_eq!(known_then.len(), 1);
+        assert_eq!(known_else.len(), 1);
+        assert!(matches!(&cfg.facts[known_then.first().unwrap().0], ReferenceOrigin::BorrowedFrom { parameter: 0, .. }));
+        assert!(matches!(&cfg.facts[known_else.first().unwrap().0], ReferenceOrigin::Null { .. }));
+        assert_eq!(cfg.points[join.0].possible_origins.as_ref(), Some(&known_then.union(known_else).copied().collect()));
+    }
+}

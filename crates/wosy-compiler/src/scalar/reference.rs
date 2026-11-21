@@ -935,6 +935,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         scope: ReferenceScopeId,
         region: &ConditionalRegion,
         projected_origins: bool,
+        checked_result: bool,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
         let [then_arm, else_arm] = self.conditional_branches(
             condition,
@@ -959,20 +960,45 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 scope,
                 None,
             ),
-            _ if joined_value => self.point_with_origins(CfgPointKind::Join, span, scope, None),
+            _ if joined_value || checked_result => {
+                self.point_with_origins(CfgPointKind::Join, span, scope, None)
+            }
             _ => self.point(CfgPointKind::Join, span, scope, BTreeSet::new()),
         };
-        if joined_value && matches!(self.cfg.points[join.0].kind, CfgPointKind::Join) {
-            if let ([then_point], [else_point]) = (
-                then_arm.result.output_points.as_slice(),
-                else_arm.result.output_points.as_slice(),
-            ) {
-                self.aggregate_facts.receipt_loan_forwarding.insert(join, vec![*then_point, *else_point]);
+        if matches!(self.cfg.points[join.0].kind, CfgPointKind::Join) {
+            let exact_checked_receipt = if checked_result {
+                let terminal = |arm: &ReferenceConditionalArm| {
+                    let [terminal] = arm.result.output_points.as_slice() else { return None };
+                    let stored = &self.cfg.points[terminal.0].possible_origins;
+                    match &arm.result.scalar {
+                        Some(ReferenceValue::Checked(origins)) if stored.as_ref() == Some(origins) =>
+                            Some(*terminal),
+                        Some(ReferenceValue::Uncomputed) => Some(*terminal),
+                        None if stored.is_none() => Some(*terminal),
+                        _ => None,
+                    }
+                };
+                let mut terminals = [terminal(&then_arm), terminal(&else_arm)];
+                if terminals[0].is_some() && terminals[0] == terminals[1] {
+                    terminals = [None, None];
+                }
+                self.proof_points.checked_join_values.push((join, terminals));
+                terminals.iter().all(Option::is_some)
+            } else {
+                false
+            };
+            if joined_value || exact_checked_receipt {
+                if let ([then_point], [else_point]) = (
+                    then_arm.result.output_points.as_slice(),
+                    else_arm.result.output_points.as_slice(),
+                ) {
+                    self.aggregate_facts.receipt_loan_forwarding.insert(join, vec![*then_point, *else_point]);
+                }
             }
         }
         self.cfg.points[then_arm.end.0].successors.push(join);
         self.cfg.points[else_arm.end.0].successors.push(join);
-        Ok(if joined_value {
+        Ok(if joined_value || checked_result {
             ReferenceValue::Uncomputed
         } else {
             ReferenceValue::Other
@@ -1181,6 +1207,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     scope,
                     region,
                     projected_origins,
+                    matches!(calls.structure.checked_types.expressions.get(&ordinal),
+                        Some(ScalarType::CheckedReference { .. })),
                 )
             }
             ScalarExpression::UnitIf {
@@ -1194,7 +1222,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     "expected unit conditional at {ordinal:?} in {:?}",
                     self.source
                 );
-                self.conditional(condition, then_branch, None, span, scope, region, false)
+                self.conditional(condition, then_branch, None, span, scope, region, false, false)
             }
             ScalarExpression::Block(block) => {
                 let result = self.block_result(block, self.block_ordinal(parent, OccurrenceEdge::BlockBody), false)?;
@@ -4530,6 +4558,7 @@ struct ReferenceTransferCfg<'a> {
     points: &'a mut [ReferenceFlowPoint],
     facts: &'a mut Vec<ReferenceOrigin>,
     allocations: &'a BTreeSet<ReferenceBindingId>,
+    checked_join_values: &'a [(CfgPointId, [Option<CfgPointId>; 2])],
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
@@ -4544,6 +4573,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             points: &mut cfg.points,
             facts: &mut cfg.facts,
             allocations: &cfg.allocations,
+            checked_join_values: proof.map_or(&[], |proof| &proof.checked_join_values),
             checked_block_values: proof.map_or(&[], |proof| &proof.checked_block_values),
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
@@ -4620,6 +4650,11 @@ fn transfer_reference_facts(
             descriptor.invalid = true;
         }
         descriptor = None;
+    }
+    for &(join, terminals) in cfg.checked_join_values {
+        for value in terminals.into_iter().flatten() {
+            last_use[value.0] = last_use[value.0].max(join.0);
+        }
     }
     for &(wrapper, value) in cfg.checked_block_values {
         last_use[value.0] = last_use[value.0].max(wrapper.0);
@@ -5368,6 +5403,12 @@ fn transfer_reference_facts(
                 }
                 _ => {}
             }
+            let checked_join_values = if matches!(point.kind, CfgPointKind::Join) {
+                cfg.checked_join_values.binary_search_by_key(&id, |&(join, _)| join)
+                    .ok().map(|index| cfg.checked_join_values[index].1)
+            } else {
+                None
+            };
             let checked_block_value = matches!(&point.kind, CfgPointKind::Evaluate(ScalarExpression::Block(_)))
                 .then(|| cfg.checked_block_values.binary_search_by_key(&id, |&(wrapper, _)| wrapper).ok())
                 .flatten()
@@ -5632,6 +5673,16 @@ fn transfer_reference_facts(
                         point.possible_origins.clone().filter(|set| !set.is_empty())
                     }
                 }
+                CfgPointKind::Join if let Some([then_point, else_point]) = checked_join_values => {
+                    let terminal = |id: Option<CfgPointId>| {
+                        id.and_then(|id| state.point_values.get(id))
+                            .filter(|origins| !origins.is_empty())
+                    };
+                    match (terminal(then_point), terminal(else_point)) {
+                        (Some(origins), None) | (None, Some(origins)) => Some(origins.clone()),
+                        _ => None,
+                    }
+                }
                 CfgPointKind::Join if point.possible_origins.is_none() => state.value.clone(),
                 CfgPointKind::ConditionalOutput {
                     then_point,
@@ -5701,7 +5752,7 @@ fn transfer_reference_facts(
                     | CfgPointKind::AssignThrough { .. }
                     | CfgPointKind::ReturnOutput { .. }
                     | CfgPointKind::Return
-            ) || checked_block_value.is_some() || point.possible_origins.is_none()
+            ) || checked_join_values.is_some() || checked_block_value.is_some() || point.possible_origins.is_none()
             {
                 point.possible_origins = checked_value.clone();
             }
@@ -9371,6 +9422,7 @@ fn derive_function_specialized_copy_policies(
                     points: &mut points,
                     facts: &mut facts,
                     allocations: &template_cfg.allocations,
+                    checked_join_values: &template_result.proof_points.checked_join_values,
                     checked_block_values: &template_result.proof_points.checked_block_values,
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
