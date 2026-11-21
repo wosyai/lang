@@ -12,7 +12,7 @@ use super::control::{
 };
 use super::control::{
     AssignmentEvaluation, AssignmentGroup, AssignmentProjection, AssignmentReplacement,
-    AssignmentSlot, BindingDefinition, CallablePointFacts, FrozenInstall,
+    AssignmentSlot, BindingDefinition, CallablePointFacts, FrozenInstall, ScalarDescriptorCandidates, ScalarDescriptorInstall,
 };
 use super::inference::CheckedMember;
 use super::*;
@@ -3246,6 +3246,61 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             array_rebind = Some(install);
                         }
                         self.record_frozen_install(slot.destination, rhs_point);
+                        if let Some(capture) = capture.filter(|_| {
+                            self.capture_call_points && scope == ReferenceScopeId(0)
+                                && assignment.values.len() == 1
+                                && !matches!(self.proof_points.scalar_descriptor_install, ScalarDescriptorCandidates::Multiple)
+                                && matches!(&calls.named_place_roots, NamedPlaceRootFacts::Prepared(_))
+                        }) {
+                            if let (
+                                ScalarType::CheckedReference { inner, .. },
+                                CfgPointKind::Assign { target, .. },
+                                CfgPointKind::Call { output, target: ResolvedCallTarget::ModuleCallable { .. }, .. },
+                                Some(evaluation),
+                            ) = (
+                                &output_types[position],
+                                &self.cfg.points[install.0].kind,
+                                &self.cfg.points[rhs_point.0].kind,
+                                group.rhs_evaluations().next(),
+                            ) {
+                                if let ScalarType::Struct(id) = inner.as_ref() {
+                                    if target.projections.is_empty() && *output == position
+                                        && calls.boundary.root_outputs.iter().all(|output| {
+                                            aggregate::ordinary_value(&output.ty) || matches!(output.ty, ScalarType::Unit | ScalarType::Enum(_))
+                                        })
+                                    {
+                                        let candidate = &mut self.proof_points.scalar_descriptor_install;
+                                        let known = matches!(candidate, ScalarDescriptorCandidates::One(_, marker) if &marker.structure == id);
+                                        if known || self.structs.iter().find(|declaration| &declaration.id == id)
+                                            .is_some_and(|declaration| !declaration.fields.is_empty()
+                                                && declaration.fields.iter().all(|field| aggregate::ordinary_value(&field.ty)
+                                                    || matches!(field.ty, ScalarType::Enum(_))))
+                                        {
+                                            match candidate {
+                                                ScalarDescriptorCandidates::One(previous, _) if *previous != slot.destination => {
+                                                    *candidate = ScalarDescriptorCandidates::Multiple;
+                                                }
+                                                _ => {
+                                                    let marker = ScalarDescriptorInstall {
+                                                        frozen: FrozenInstall { rhs: rhs_point, install },
+                                                        capture,
+                                                        binding: target.binding.clone(),
+                                                        call: evaluation.expression,
+                                                        output: *output,
+                                                        structure: id.clone(),
+                                                    };
+                                                    if let ScalarDescriptorCandidates::One(_, previous) = candidate {
+                                                        **previous = marker;
+                                                    } else {
+                                                        *candidate = ScalarDescriptorCandidates::One(slot.destination, Box::new(marker));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if let Some(capture) = capture {
                             let install = self.cursor.expect("assignment install point");
                             let CfgPointKind::CaptureAssignmentPrevious { writes } =
@@ -3659,6 +3714,62 @@ fn previous_origin_loans(
         .collect()
 }
 
+struct ScalarDescriptorReplay<'a> {
+    candidate: &'a ScalarDescriptorInstall,
+    invalid: bool,
+    exited: bool,
+}
+
+impl ScalarDescriptorReplay<'_> {
+    fn observe(
+        &mut self,
+        point: &ReferenceFlowPoint,
+        state: &ReferenceEdgeState,
+        facts: &[ReferenceOrigin],
+    ) {
+        let candidate = self.candidate;
+        let owns = |id: &ReferenceOriginId| matches!(&facts[id.0], ReferenceOrigin::Fresh { loan, .. }
+            if matches!(loan.origin_place.binding.kind, ReferenceBindingKind::CallOutput { point, output }
+                if point == candidate.frozen.rhs && output == candidate.output));
+        let carries = |origins: Option<&BTreeSet<ReferenceOriginId>>| {
+            origins.is_some_and(|origins| origins.iter().any(owns))
+        };
+        match &point.kind {
+            CfgPointKind::Assign { target, rhs_point, previous_origins, .. } if point.id == candidate.frozen.install => {
+                self.invalid |= target.binding != candidate.binding || *rhs_point != candidate.frozen.rhs
+                    || previous_origins.is_empty()
+                    || !previous_origins.iter().all(|id| matches!(&facts[id.0], ReferenceOrigin::Null { .. }))
+                    || !carries(point.possible_origins.as_ref())
+                    || point.possible_origins.as_ref().is_some_and(|origins| origins.iter().any(|id| {
+                        matches!(&facts[id.0], ReferenceOrigin::Invalid { .. })
+                    }));
+            }
+            CfgPointKind::Assign { target, .. } => {
+                self.invalid |= target.binding == candidate.binding || carries(point.possible_origins.as_ref());
+            }
+            CfgPointKind::Bind { .. } => self.invalid |= carries(point.possible_origins.as_ref()),
+            CfgPointKind::Borrow { place, .. }
+            | CfgPointKind::Move { place, .. }
+            | CfgPointKind::DeferredMove { place, .. } => {
+                self.invalid |= place.binding == candidate.binding;
+            }
+            CfgPointKind::Evaluate(ScalarExpression::RawAddress { .. } | ScalarExpression::StructLiteral { .. } | ScalarExpression::ArrayLiteral { .. })
+            | CfgPointKind::AssignThrough { .. } | CfgPointKind::MoveThrough { .. }
+            | CfgPointKind::DeferredMoveThrough { .. } | CfgPointKind::Release { .. } | CfgPointKind::Invalidate { .. } => {
+                self.invalid = true;
+            }
+            CfgPointKind::Call { argument_points, .. } => {
+                self.invalid |= argument_points.iter().any(|&point| carries(state.point_values.get(point)));
+            }
+            CfgPointKind::ScopeExit if point.scope == ReferenceScopeId(0) => {
+                self.exited = true;
+                self.invalid |= !carries(state.bindings.get(&candidate.binding));
+            }
+            _ => {}
+        }
+    }
+}
+
 fn transfer_reference_facts(
     cfg: &mut ScalarReferenceCfg,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
@@ -3668,6 +3779,7 @@ fn transfer_reference_facts(
         &FunctionCallSites,
         &mut aggregate::AggregateFlowResult,
     )>,
+    mut descriptor: Option<&mut ScalarDescriptorReplay<'_>>,
 ) -> Vec<ReferenceAnalysisError> {
     let original_points = cfg.points.clone();
     let grouped_installs = original_points
@@ -3719,6 +3831,12 @@ fn transfer_reference_facts(
         for dependency in dependencies {
             last_use[dependency.0] = point.id.0;
         }
+    }
+    if !strictly_forward {
+        if let Some(descriptor) = descriptor.as_deref_mut() {
+            descriptor.invalid = true;
+        }
+        descriptor = None;
     }
     let aggregate_deadlines = aggregate.as_ref()
         .filter(|_| aggregate_expiry_allowed)
@@ -4692,6 +4810,9 @@ fn transfer_reference_facts(
             ) || point.possible_origins.is_none()
             {
                 point.possible_origins = checked_value.clone();
+            }
+            if let Some(descriptor) = descriptor.as_deref_mut() {
+                descriptor.observe(point, &state, &cfg.facts);
             }
             match &point.kind {
                 CfgPointKind::ScopeExit => {
@@ -8020,12 +8141,27 @@ fn transfer_function_output_contracts(
     }
     if !result.cfg.initial_points.is_empty() {
         result.cfg.points = result.cfg.initial_points.clone();
-        errors.extend(transfer_reference_facts(
+        let candidate = match &result.proof_points.scalar_descriptor_install {
+            ScalarDescriptorCandidates::One(destination, marker) => Some((destination, marker)),
+            _ => None,
+        };
+        let mut descriptor = candidate.and_then(|(_, marker)| {
+            let capture = result.cfg.points.get(marker.capture.0)?;
+            matches!(&capture.kind, CfgPointKind::CaptureAssignmentPrevious { writes }
+                if writes.get(marker.output) == Some(&marker.frozen.install))
+                .then_some(ScalarDescriptorReplay { candidate: marker.as_ref(), invalid: false, exited: false })
+        });
+        let transferred = transfer_reference_facts(
             &mut result.cfg,
             &BTreeMap::new(),
             contracts,
             None,
-        ));
+            descriptor.as_mut(),
+        );
+        result.aggregate.scalar_descriptor_assignment = descriptor
+            .filter(|proof| transferred.is_empty() && proof.exited && !proof.invalid)
+            .and_then(|proof| candidate.map(|(destination, _)| (destination.0, proof.candidate.call.0, proof.candidate.output)));
+        errors.extend(transferred);
     }
     errors
 }
@@ -8270,7 +8406,7 @@ fn derive_function_specialized_copy_policies(
         if !deferred.is_empty() {
             let mut concrete_cfg = template_result.cfg.clone();
             concrete_cfg.points = concrete_cfg.initial_points.clone();
-            let transferred = transfer_reference_facts(&mut concrete_cfg, &deferred, &[], None);
+            let transferred = transfer_reference_facts(&mut concrete_cfg, &deferred, &[], None, None);
             errors.extend(transferred.into_iter().map(|error| {
                 ReferenceAnalysisError::MissingContext {
                     source_span: point.source_span.clone(),
@@ -8534,7 +8670,7 @@ fn build_function_reference_cfg(
             call_sites,
             &mut aggregate,
         ));
-        let _ = transfer_reference_facts(&mut builder.cfg, &BTreeMap::new(), &[], flow);
+        let _ = transfer_reference_facts(&mut builder.cfg, &BTreeMap::new(), &[], flow, None);
     }
     aggregate.returning_leaf = errors.is_empty() && prior_children_succeeded && builder.returning_leaf_prefix
         && matches!(builder.cfg.points.last().map(|point| &point.kind), Some(CfgPointKind::Return));
