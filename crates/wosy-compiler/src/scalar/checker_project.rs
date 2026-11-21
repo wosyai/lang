@@ -825,4 +825,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn canonical_scalar_call_binding_retains_typed_literal_and_exact_target() {
+        let app = source("src/main.w", "literal-call");
+        for (arg, caller_input) in [("7", ""), ("input", "u8")] {
+            let params = if caller_input.is_empty() { "" } else { "(input)" };
+            let text = format!(
+                "%%start\nu8(u8) clamp = fn(value) {{ if (value > 10) {{ 10 }} else {{ value }} }};\n                 u8({caller_input}) caller = fn{params} {{ u8 result = clamp({arg});                  core.require(result <= 10, {OUTPUT}); result }};\n%%end",
+            );
+            let (project, calls) = prepare_checker_project(
+                vec![(declarations(&app, &text), Vec::new())],
+                vec![app.clone()],
+                inputs(),
+            ).unwrap();
+            let (module, item, _) = select_checked_root(&project, &app, "caller").unwrap();
+            let body = calls.function_body(module, item, None).unwrap();
+            let origin = body.structure.checker_integer_call_locals.get(&(body.structure.root, 0));
+            if caller_input.is_empty() {
+                let origin = origin.expect("canonical one-integer call");
+                let site = body.resolved_call_site(origin.call).unwrap();
+                let offset = text.find("clamp").unwrap() as u32;
+                assert_eq!(site.target, ResolvedCallTarget::ModuleCallable {
+                    source: app.clone(),
+                    declaration_span: ByteSpan::new(offset, offset + "clamp".len() as u32),
+                    concrete: ConcreteCallSelection::Declaration,
+                });
+                assert_eq!(site.source_span.source, app);
+                assert_eq!(
+                    &text[site.source_span.range.start as usize..site.source_span.range.end as usize],
+                    "clamp(7)",
+                );
+                let signature = &body.checked_call_signatures[&origin.call];
+                assert_eq!(signature.parameters, [ScalarType::U8]);
+                assert_eq!(signature.outputs.outputs[0].ty, ScalarType::U8);
+                assert_eq!(body.structure.checked_types.expressions[&origin.argument_ordinal], ScalarType::U8);
+                assert_eq!(origin.argument, BigInt::from(7));
+                let directive = body.structure.checker_directives.values().next().unwrap();
+                let Some(CheckerPredicate::Integer(requirement)) = &directive.predicate else {
+                    panic!("expected a typed integer requirement");
+                };
+                assert_eq!(requirement.binding, origin.binding);
+            } else {
+                assert!(origin.is_none());
+            }
+            assert_eq!(check_integer_requirements(body), None);
+        }
+    }
+
 }

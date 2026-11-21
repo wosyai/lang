@@ -420,14 +420,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
     ) -> Result<ResolvedCallTarget, ReferenceAnalysisError> {
         let span = expression_span(expression);
         self.call_sites
-            .call_occurrences
-            .binary_search_by_key(&ordinal.0, |association| association.ordinal.0)
-            .ok()
-            .and_then(|index| {
-                self.call_sites
-                    .sites
-                    .get(self.call_sites.call_occurrences[index].site)
-            })
+            .resolved_call_site(ordinal)
             .map(|site| site.target.clone())
             .ok_or_else(|| {
                 self.missing_context(
@@ -5986,6 +5979,15 @@ pub(super) struct ModuleStorageInstall {
     pub(super) consumer: Option<OccurrenceOrdinal>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CheckerIntegerCallOrigin {
+    pub(super) binding: ReferenceBindingId,
+    pub(super) call: OccurrenceOrdinal,
+    pub(super) argument_ordinal: OccurrenceOrdinal,
+    pub(super) argument: BigInt,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct OccurrenceStructure {
     pub(super) root: BlockOrdinal,
@@ -6000,6 +6002,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) checker_integer_literals: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(test)]
     pub(super) checker_integer_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
+    #[cfg(test)]
+    pub(super) checker_integer_call_locals: HashMap<(BlockOrdinal, usize), CheckerIntegerCallOrigin>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
     pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
@@ -6027,6 +6031,8 @@ impl OccurrenceStructure {
             checker_integer_literals: HashMap::new(),
             #[cfg(test)]
             checker_integer_locals: HashMap::new(),
+            #[cfg(test)]
+            checker_integer_call_locals: HashMap::new(),
             literal_fields: HashMap::new(),
             module_storage_uses: HashMap::new(),
             module_storage_installs: BTreeMap::new(),
@@ -6181,6 +6187,13 @@ pub(super) struct FunctionCallSites {
 }
 
 impl FunctionCallSites {
+    pub(super) fn resolved_call_site(&self, ordinal: OccurrenceOrdinal) -> Option<&ResolvedCallSite> {
+        self.call_occurrences
+            .binary_search_by_key(&ordinal.0, |association| association.ordinal.0)
+            .ok()
+            .and_then(|index| self.sites.get(self.call_occurrences[index].site))
+    }
+
     pub(super) fn overload_reservations(&self) -> impl Iterator<Item = &ResolvedCallTarget> {
         self.overload_reservation_sites
             .iter()
@@ -7702,6 +7715,41 @@ impl StructuralWalker<'_, '_> {
         Ok(BindingOutputs { primary, secondary })
     }
 
+    #[cfg(test)]
+    fn checker_integer_call_argument<'a>(
+        &self,
+        binding: &'a ScalarBinding,
+        call: OccurrenceOrdinal,
+    ) -> Option<(OccurrenceOrdinal, &'a BigInt)> {
+        let ScalarExpression::Call { arguments, .. } = &binding.value else {
+            return None;
+        };
+        let [ScalarExpression::Integer { value, .. }] = arguments.as_slice() else {
+            return None;
+        };
+        let signature = self.checked_call_signatures.get(&call)?;
+        let [parameter] = signature.parameters.as_slice() else {
+            return None;
+        };
+        let [output] = signature.outputs.outputs.as_slice() else {
+            return None;
+        };
+        let OccurrenceNode::Expression(argument) = self.structure.edges.get(&(
+            OccurrenceParent::Expression(call),
+            OccurrenceEdge::CallArgument(0),
+        ))? else {
+            return None;
+        };
+        if !is_integer_type(parameter)
+            || !is_integer_type(&output.ty)
+            || output.ty != binding.declared_type
+            || self.structure.checked_types.expressions.get(argument)? != parameter
+        {
+            return None;
+        }
+        Some((*argument, value))
+    }
+
     fn binding_region(
         &mut self,
         binding: &ScalarBinding,
@@ -7725,15 +7773,19 @@ impl StructuralWalker<'_, '_> {
             BindingInitialization::Outputs(self.binding_outputs(binding, position, scope)?)
         };
         #[cfg(test)]
-        let checker_local = match &initialization {
-            BindingInitialization::Outputs(outputs)
-                if binding.receivers.len() == 1
-                    && outputs.secondary.is_empty()
-                    && self.structure.checker_integer_literals.contains_key(&outputs.primary) =>
+        let checker_local = match (&initialization, &self.mode) {
+            (BindingInitialization::Outputs(outputs), WalkMode::Callable(callable))
+                if self.occurrence_typing.checker_directives_enabled()
+                    && binding.receivers.len() == 1
+                    && outputs.secondary.is_empty() =>
             {
-                match &self.mode {
-                    WalkMode::Callable(callable) => Some(callable.target_resolver),
-                    _ => None,
+                if self.structure.checker_integer_literals.contains_key(&outputs.primary) {
+                    Some((callable.target_resolver, None))
+                } else {
+                    self.checker_integer_call_argument(binding, outputs.primary)
+                        .map(|(argument, value)| {
+                            (callable.target_resolver, Some((outputs.primary, argument, value)))
+                        })
                 }
             }
             _ => None,
@@ -7754,11 +7806,22 @@ impl StructuralWalker<'_, '_> {
                     introduced_by_assignment: false,
                 };
                 #[cfg(test)]
-                if let Some(callable) = checker_local {
-                    self.structure.checker_integer_locals.insert(
-                        (position.block, position.item),
-                        lexical.reference_id(callable.source, callable.function_span),
-                    );
+                if let Some((callable, from_call)) = checker_local {
+                    let binding = lexical.reference_id(callable.source, callable.function_span);
+                    let key = (position.block, position.item);
+                    if let Some((call, argument_ordinal, argument)) = from_call {
+                        self.structure.checker_integer_call_locals.insert(
+                            key,
+                            CheckerIntegerCallOrigin {
+                                binding,
+                                call,
+                                argument_ordinal,
+                                argument: argument.clone(),
+                            },
+                        );
+                    } else {
+                        self.structure.checker_integer_locals.insert(key, binding);
+                    }
                 }
                 scope.names.insert(receiver.name.clone(), lexical);
             }
