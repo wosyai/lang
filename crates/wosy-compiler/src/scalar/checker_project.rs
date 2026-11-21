@@ -753,11 +753,11 @@ fn check_selected_proof(
             ProjectCheck::Invalid(_) => ProjectCheck::InvalidProof,
             error => error,
         })?;
-    let filter = where_clause.as_ref().map(|expression| proof_input_condition(expression, &input_names, body)).transpose()?;
+    let filter = where_clause.as_ref().map(|expression| proof_entry_filters(expression, &input_names, body)).transpose()?;
     let checked = if !steps.items.is_empty() {
         let proof = proof_show_branch(&steps, &input_names, output, &result.ty, body)?;
-        check_integer_return_bound_with_shows(body, ensures.operator, ensures.bound, filter.as_ref(), &proof)
-    } else if let Some(filter) = filter.as_ref() {
+        check_integer_return_bound_with_shows(body, ensures.operator, ensures.bound, filter.as_deref(), &proof)
+    } else if let Some(filter) = filter.as_deref() {
         check_integer_return_bound_where(body, ensures.operator, ensures.bound, filter)
     } else {
         check_integer_return_bound(body, ensures.operator, ensures.bound)
@@ -779,7 +779,7 @@ fn check_selected_proof(
             body,
             target.target_layout,
             &ensures,
-            filter.as_ref(),
+            filter.as_deref(),
         )
     });
     Ok((outcome, verified))
@@ -793,7 +793,7 @@ fn issue_return_bound(
     body: &FunctionCallSites,
     target_layout: ScalarTargetLayout,
     ensures: &IntegerComparison<'_>,
-    condition: Option<&CheckerPredicate>,
+    condition: Option<&[CheckerPredicate]>,
 ) -> Option<VerifiedReturnBound> {
     if !body.structure.checker_directives.is_empty()
         || !body.call_occurrences.is_empty()
@@ -807,8 +807,8 @@ fn issue_return_bound(
     };
     let guard = match condition {
         None => None,
-        Some(CheckerPredicate::Boolean(value)) => Some(VerifiedEntryGuard::Boolean(*value)),
-        Some(CheckerPredicate::Integer(predicate)) => {
+        Some([CheckerPredicate::Boolean(value)]) => Some(VerifiedEntryGuard::Boolean(*value)),
+        Some([CheckerPredicate::Integer(predicate)]) => {
             let slot = body.boundary.checker_parameter_bindings.as_deref()?
                 .iter().position(|binding| *binding == predicate.binding)?;
             Some(VerifiedEntryGuard::Integer {
@@ -818,6 +818,7 @@ fn issue_return_bound(
                 bound: predicate.bound.clone(),
             })
         }
+        Some(_) => return None,
     };
     let (proof_venue, proof_source, target) = match origin {
         ProofSummaryOrigin::DetachedFragment(source) => (
@@ -991,6 +992,24 @@ fn typed_proof_where(
     let inputs = input_names.iter().zip(&body.boundary.parameters).map(|(name, parameter)| (name.clone(), parameter.ty.clone()));
     typecheck_proof_where(source, target_layout, &expression, inputs).map_err(ProjectCheck::Invalid)?;
     Ok(Some(expression))
+}
+
+fn proof_entry_filters(
+    expression: &ScalarExpression,
+    inputs: &[String],
+    body: &FunctionCallSites,
+) -> Result<Vec<CheckerPredicate>, ProjectCheck> {
+    let mut filters = Vec::new();
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        if let ScalarExpression::Binary { operator: BinaryOperator::And, left, right, .. } = expression {
+            pending.push(right);
+            pending.push(left);
+        } else {
+            filters.push(proof_input_condition(expression, inputs, body)?);
+        }
+    }
+    Ok(filters)
 }
 
 fn proof_input_condition(
@@ -1798,7 +1817,7 @@ mod tests {
     }
 
     #[test]
-    fn parsed_where_types_in_isolated_proof_scope_without_symbolic_evaluation() {
+    fn parsed_where_types_in_isolated_proof_scope() {
         for condition in ["true", "false", "x <= 10 && x >= 3", "x", "out <= 10", "unknown <= 10", "identity(x) <= 10"] {
             let text = format!(r#"%%start
                 u8(u8) identity = fn(value) {{ value }};
@@ -1817,7 +1836,8 @@ mod tests {
                 }
                 "x <= 10 && x >= 3" => {
                     assert_eq!(prepared.type_where("bounded"), Ok(()));
-                    assert!(matches!(prepared.check("bounded"), Ok((_, ProjectCheck::Unsupported)) | Err(ProjectCheck::Unsupported)));
+                    assert!(matches!(prepared.check("bounded"), Ok((_, ProjectCheck::Proved))));
+                    assert!(prepared.verify("bounded").is_none());
                 }
                 "identity(x) <= 10" => assert_eq!(prepared.type_where("bounded"), Err(ProjectCheck::Unsupported)),
                 _ => {
@@ -1830,6 +1850,29 @@ mod tests {
                     }));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn conjunctive_where_narrows_all_axes_without_issuing_a_summary() {
+        for (guard, expected) in [
+            ("lo <= 10 && hi >= 7 && hi <= 10", ProjectCheck::Proved),
+            ("lo <= 10 && hi >= 7", ProjectCheck::Refuted),
+            ("hi >= 7 && hi <= 10", ProjectCheck::Refuted),
+            ("hi <= 10 && (hi >= 11 && lo <= 10)", ProjectCheck::NoApplicableInputs),
+            ("false && hi >= 7", ProjectCheck::NoApplicableInputs),
+            ("false && (hi >= 7 || hi <= 10)", ProjectCheck::Unsupported),
+            ("hi >= lo && hi <= 10", ProjectCheck::Unsupported),
+        ] {
+            let text = format!(r#"%%start
+                u8(u8, u8) second = fn(left, right) {{ if (left <= 10) {{ right }} else {{ left }} }};
+                proof bounded for second(lo, hi) -> (out) where ({guard}) ensures (out <= 10) {{}}
+            %%end"#);
+            let revision = source("src/main.w", guard);
+            let prepared = PreparedProofModule::prepare(revision, text, inputs()).unwrap();
+            assert_eq!(prepared.type_where("bounded"), Ok(()));
+            assert_eq!(prepared.check("bounded").map(|(_, outcome)| outcome).unwrap_or_else(|error| error), expected);
+            assert!(prepared.verify("bounded").is_none());
         }
     }
 

@@ -1104,11 +1104,11 @@ mod tests {
                     Some(Ok(false)),
                 );
                 assert_eq!(
-                    check_integer_return_bound_where(body, &BinaryOperator::LessEqual, &9.into(), filter),
+                    check_integer_return_bound_where(body, &BinaryOperator::LessEqual, &9.into(), std::slice::from_ref(filter)),
                     Some(Ok(ProofCoverage::Applicable(true))),
                 );
                 assert_eq!(
-                    check_integer_return_bound_where(body, &BinaryOperator::LessEqual, &8.into(), filter),
+                    check_integer_return_bound_where(body, &BinaryOperator::LessEqual, &8.into(), std::slice::from_ref(filter)),
                     Some(Ok(ProofCoverage::Applicable(false))),
                 );
                 assert_eq!(
@@ -1130,7 +1130,7 @@ mod tests {
             |body| {
                 let filter = body.structure.checker_branches.values().next().unwrap();
                 assert_eq!(
-                    check_integer_return_bound_where(body, &BinaryOperator::Equal, &0.into(), filter),
+                    check_integer_return_bound_where(body, &BinaryOperator::Equal, &0.into(), std::slice::from_ref(filter)),
                     Some(Ok(ProofCoverage::Applicable(true))),
                 );
             },
@@ -1149,7 +1149,7 @@ mod tests {
                 let filter = body.structure.checker_branches.values().next().unwrap();
                 assert_eq!(check_integer_return_bound(body, &BinaryOperator::Equal, &0.into()), None);
                 assert_eq!(
-                    check_integer_return_bound_where(body, &BinaryOperator::Equal, &0.into(), filter),
+                    check_integer_return_bound_where(body, &BinaryOperator::Equal, &0.into(), std::slice::from_ref(filter)),
                     Some(Ok(ProofCoverage::NoApplicableInputs)),
                 );
             },
@@ -1159,7 +1159,7 @@ mod tests {
             |body| {
                 let filter = body.structure.checker_branches.values().next().unwrap();
                 assert_eq!(
-                    check_integer_return_bound_where(body, &BinaryOperator::LessEqual, &255.into(), filter),
+                    check_integer_return_bound_where(body, &BinaryOperator::LessEqual, &255.into(), std::slice::from_ref(filter)),
                     None,
                 );
             },

@@ -73,34 +73,45 @@ impl IntegerSet {
     }
 
     pub(super) fn split(&self, operator: &BinaryOperator, bound: &BigInt) -> Option<(Self, Self)> {
-        let relation = IntegerRelation::from_operator(operator)?;
+        Some(self.partition::<true>(IntegerRelation::from_operator(operator)?, bound))
+    }
+
+    pub(super) fn keep(&self, operator: &BinaryOperator, bound: &BigInt) -> Option<Self> {
+        Some(self.partition::<false>(IntegerRelation::from_operator(operator)?, bound).0)
+    }
+
+    fn partition<const KEEP_COMPLEMENT: bool>(&self, relation: IntegerRelation, bound: &BigInt) -> (Self, Self) {
         let mut yes = Self::default();
         let mut no = Self::default();
-        let append = |yes: &mut Self, no: &mut Self, select, first: BigInt, last: BigInt| {
-            (if select { yes } else { no }).append(Interval { first, last });
+        let mut append = |selected, first, last| {
+            if selected {
+                yes.append(Interval { first, last });
+            } else {
+                no.append(Interval { first, last });
+            }
         };
         for interval in &self.0 {
-            if &interval.first < bound {
+            if (KEEP_COMPLEMENT || relation.less) && &interval.first < bound {
                 let last = if &interval.last < bound {
                     interval.last.clone()
                 } else {
                     bound - 1
                 };
-                append(&mut yes, &mut no, relation.less, interval.first.clone(), last);
+                append(relation.less, interval.first.clone(), last);
             }
-            if &interval.first <= bound && bound <= &interval.last {
-                append(&mut yes, &mut no, relation.equal, bound.clone(), bound.clone());
+            if (KEEP_COMPLEMENT || relation.equal) && &interval.first <= bound && bound <= &interval.last {
+                append(relation.equal, bound.clone(), bound.clone());
             }
-            if &interval.last > bound {
+            if (KEEP_COMPLEMENT || relation.greater) && &interval.last > bound {
                 let first = if &interval.first > bound {
                     interval.first.clone()
                 } else {
                     bound + 1
                 };
-                append(&mut yes, &mut no, relation.greater, first, interval.last.clone());
+                append(relation.greater, first, interval.last.clone());
             }
         }
-        Some((yes, no))
+        (yes, no)
     }
 
     pub(super) fn join(self, other: Self) -> Self {
@@ -191,6 +202,7 @@ mod tests {
         for (operator, relation) in cases {
             for bound in [-1, 0, 1, 126, 254, 255, 256] {
                 let (yes, no) = input.split(&operator, &bound.into()).unwrap();
+                assert_eq!(input.keep(&operator, &bound.into()), Some(yes.clone()));
                 let abstract_relation = IntegerRelation::from_operator(&operator).unwrap();
                 assert_eq!(input.every(abstract_relation, &bound.into()), no.is_empty());
                 assert!(yes.every(abstract_relation, &bound.into()));

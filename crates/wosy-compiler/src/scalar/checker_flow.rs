@@ -452,7 +452,7 @@ pub(super) fn observe_integer_returns(
 
 fn observe_integer_returns_in_scope<'a>(
     calls: &'a FunctionCallSites,
-    entry_filter: Option<&CheckerPredicate>,
+    entry_filter: Option<&[CheckerPredicate]>,
     exact_arguments: Option<&[&BigInt]>,
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
     let tail = integer_tail_type(calls)?;
@@ -508,7 +508,7 @@ pub(super) fn check_integer_return_bound_where<'a>(
     calls: &'a FunctionCallSites,
     operator: &BinaryOperator,
     bound: &BigInt,
-    entry_filter: &CheckerPredicate,
+    entry_filter: &[CheckerPredicate],
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     check_integer_return_bound_in_scope(calls, operator, bound, Some(entry_filter), None)
 }
@@ -517,7 +517,7 @@ pub(super) fn check_integer_return_bound_with_shows<'a>(
     calls: &'a FunctionCallSites,
     operator: &BinaryOperator,
     bound: &BigInt,
-    entry_filter: Option<&CheckerPredicate>,
+    entry_filter: Option<&[CheckerPredicate]>,
     proof: &IntegerBranchProof<'_>,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     check_integer_return_bound_in_scope(calls, operator, bound, entry_filter, Some(proof))
@@ -527,7 +527,7 @@ fn check_integer_return_bound_in_scope<'a>(
     calls: &'a FunctionCallSites,
     operator: &BinaryOperator,
     bound: &BigInt,
-    entry_filter: Option<&CheckerPredicate>,
+    entry_filter: Option<&[CheckerPredicate]>,
     proof: Option<&IntegerBranchProof<'_>>,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let relation = IntegerRelation::from_operator(operator)?;
@@ -562,7 +562,7 @@ fn integer_tail_type(calls: &FunctionCallSites) -> Option<&ScalarType> {
 fn run_integer_callable<'a>(
     calls: &'a FunctionCallSites,
     tail: Option<&'a ScalarType>,
-    entry_filter: Option<&CheckerPredicate>,
+    entry_filter: Option<&[CheckerPredicate]>,
     returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
     imported_local: Option<ImportedLocal<'a>>,
     exact_arguments: Option<&[&BigInt]>,
@@ -579,7 +579,7 @@ fn run_integer_callable<'a>(
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
         roots.add(binding, &parameter.ty);
     }
-    let root = if let Some(arguments) = exact_arguments {
+    let mut row: IntegerRow = if let Some(arguments) = exact_arguments {
         if arguments.len() != boundary.parameters.len() {
             return None;
         }
@@ -589,15 +589,24 @@ fn run_integer_callable<'a>(
             .map(|parameter| IntegerSet::from_type(&parameter.ty).map(Rc::new))
             .collect::<Option<IntegerRow>>()?
     };
-    let mut root = IntegerInputs(vec![root]);
-    if let Some(filter) = entry_filter {
-        let (applicable, _, _) = root.split(&roots, filter)?;
-        if applicable.is_unreachable() {
-            return Some(Ok(ProofCoverage::NoApplicableInputs));
+    for filter in entry_filter.into_iter().flatten() {
+        match filter {
+            CheckerPredicate::Boolean(true) => {}
+            CheckerPredicate::Boolean(false) => return Some(Ok(ProofCoverage::NoApplicableInputs)),
+            CheckerPredicate::Integer(predicate) => {
+                let (axis, ty) = roots.lookup(&predicate.binding)?;
+                if ty != &predicate.ty {
+                    return None;
+                }
+                let kept = row[axis].keep(&predicate.operator, &predicate.bound)?;
+                if kept.is_empty() {
+                    return Some(Ok(ProofCoverage::NoApplicableInputs));
+                }
+                row[axis] = Rc::new(kept);
+            }
         }
-        root = applicable;
     }
-    let result = walk_integer_block(calls, &mut roots, calls.structure.root, root, tail, returns, &mut handle_call)?;
+    let result = walk_integer_block(calls, &mut roots, calls.structure.root, IntegerInputs(vec![row]), tail, returns, &mut handle_call)?;
     if roots.imported_local.is_some() {
         return None;
     }
