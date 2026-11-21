@@ -3211,6 +3211,57 @@ fn check_expression_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    #[cfg(test)]
+    if inference.checker_directives_enabled() {
+        if let Some(directive) = super::checker_directive::CheckerDirective::from_expression(expression) {
+            let directive = match directive {
+                Ok(directive) => directive,
+                Err(error) => {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0003",
+                        error.kind.message(),
+                        error.span,
+                    ));
+                    return ScalarType::Error;
+                }
+            };
+            let previous_diagnostics = diagnostics.len();
+            let condition = expression_type_in_module_expected(
+                directive.condition,
+                Some(&ScalarType::Bool),
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            );
+            expect_module_type(
+                module,
+                &ScalarType::Bool,
+                &condition,
+                expression_span(directive.condition),
+                diagnostics,
+            );
+            if !directive.output.is_explicit_literal() {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "checker directive preparation currently requires explicit literal output",
+                    expression_span(expression),
+                ));
+            }
+            if !matches!(condition, ScalarType::Bool) || diagnostics.len() != previous_diagnostics {
+                return ScalarType::Error;
+            }
+            inference.record_checker_directive(expression, directive.operation);
+            return ScalarType::Unit;
+        }
+    }
     match expression {
         ScalarExpression::Name { name, span } if name == "null" => {
             diagnostics.push(module_diagnostic(

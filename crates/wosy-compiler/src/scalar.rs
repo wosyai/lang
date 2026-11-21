@@ -2517,6 +2517,17 @@ fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
 fn typecheck_scalar_project_with_occurrences(
     project: ScalarProject,
 ) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
+    typecheck_scalar_project_in_mode(
+        project,
+        #[cfg(test)]
+        false,
+    )
+}
+
+fn typecheck_scalar_project_in_mode(
+    project: ScalarProject,
+    #[cfg(test)] checker_directives: bool,
+) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
     let mut project = project;
     let mut diagnostics = Vec::new();
     for module in &mut project.modules {
@@ -2579,6 +2590,8 @@ fn typecheck_scalar_project_with_occurrences(
         let items: &[ScalarItem] = module_items[ordinal];
         let overloads = overloads.typing(ordinal);
         let mut inference = ScalarInferenceBuilder::for_validation(&owners[ordinal]);
+        #[cfg(test)]
+        inference.enable_checker_directives(checker_directives);
         validate_unit_if_positions_in_module(items, module.source, &mut diagnostics);
         for structure in module.structs {
             for field in &structure.fields {

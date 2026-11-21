@@ -5992,6 +5992,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) blocks: Vec<BlockRegion>,
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
+    #[cfg(test)]
+    pub(super) checker_directives: HashMap<OccurrenceOrdinal, super::checker_directive::CheckerOperation>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
     pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
@@ -6011,6 +6013,8 @@ impl OccurrenceStructure {
             blocks: vec![BlockRegion::new(span, Vec::new())],
             edges: HashMap::new(),
             checked_types: CheckedOccurrenceTypes::default(),
+            #[cfg(test)]
+            checker_directives: HashMap::new(),
             literal_fields: HashMap::new(),
             module_storage_uses: HashMap::new(),
             module_storage_installs: BTreeMap::new(),
@@ -6628,6 +6632,11 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 )
             );
             self.structure.checked_types.expressions.insert(ordinal, ty);
+        }
+        #[cfg(test)]
+        if let Some(operation) = self.occurrence_typing.take_checker_directive(expression) {
+            self.structure.checker_directives.insert(ordinal, operation);
+            return Ok(ordinal);
         }
         if matches!(&self.mode, WalkMode::ModuleInitialization { .. })
             && matches!(expression, ScalarExpression::Utf8 { .. })

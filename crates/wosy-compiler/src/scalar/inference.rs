@@ -87,6 +87,8 @@ pub(super) struct PreparationOccurrenceTyping {
     folded_expressions: HashMap<*const ScalarExpression, FoldedOccurrence>,
     places: HashMap<*const ScalarPlace, ScalarType>,
     resolved_namespace_places: HashMap<*const ScalarPlace, SourceIdentity>,
+    #[cfg(test)]
+    checker_directives: HashMap<*const ScalarExpression, super::checker_directive::CheckerOperation>,
 }
 
 struct CheckedExpressionType {
@@ -102,6 +104,32 @@ pub(super) enum CheckedMember {
 }
 
 impl PreparationOccurrenceTyping {
+    #[cfg(test)]
+    pub(super) fn take_checker_directive(
+        &mut self,
+        expression: &ScalarExpression,
+    ) -> Option<super::checker_directive::CheckerOperation> {
+        self.checker_directives.remove(&std::ptr::from_ref(expression))
+    }
+
+    #[cfg(test)]
+    pub(super) fn checked_expression_type(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Option<&ScalarType> {
+        self.expressions
+            .get(&std::ptr::from_ref(expression))
+            .map(|checked| &checked.ty)
+    }
+
+    #[cfg(test)]
+    pub(super) fn checked_call_signature(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Option<&CheckedCallSignature> {
+        self.calls.get(&std::ptr::from_ref(expression))
+    }
+
     pub(super) fn take_literal_field(
         &mut self,
         value: &ScalarExpression,
@@ -195,6 +223,8 @@ pub(super) struct ScalarInferenceBuilder<'a> {
     occurrences: PreparationOccurrenceTyping,
     in_module_initialization: bool,
     suppress_checked_occurrences: bool,
+    #[cfg(test)]
+    checker_directives: bool,
 }
 
 impl<'a> ScalarInferenceBuilder<'a> {
@@ -205,6 +235,8 @@ impl<'a> ScalarInferenceBuilder<'a> {
             occurrences: PreparationOccurrenceTyping::default(),
             in_module_initialization: false,
             suppress_checked_occurrences: true,
+            #[cfg(test)]
+            checker_directives: false,
         }
     }
 
@@ -247,6 +279,29 @@ impl<'a> ScalarInferenceBuilder<'a> {
         let is_raw = matches!(check_pointer(self), ScalarType::RawPointer(_));
         self.suppress_checked_occurrences = previous;
         is_raw
+    }
+
+    #[cfg(test)]
+    pub(super) fn enable_checker_directives(&mut self, enabled: bool) {
+        self.checker_directives = enabled;
+    }
+
+    #[cfg(test)]
+    pub(super) fn checker_directives_enabled(&self) -> bool {
+        self.checker_directives
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_checker_directive(
+        &mut self,
+        expression: &ScalarExpression,
+        operation: super::checker_directive::CheckerOperation,
+    ) {
+        if !self.suppress_checked_occurrences {
+            self.occurrences
+                .checker_directives
+                .insert(std::ptr::from_ref(expression), operation);
+        }
     }
 
     pub(super) fn record_expression_type(

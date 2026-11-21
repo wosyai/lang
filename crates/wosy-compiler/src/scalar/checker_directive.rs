@@ -80,6 +80,29 @@ impl<'a> CheckerDirective<'a> {
     }
 }
 
+impl CheckerDirectiveShapeErrorKind {
+    pub(super) fn message(self) -> &'static str {
+        match self {
+            Self::CallShape => "checker directive requires a condition and an output record",
+            Self::ExpectedRecord => "checker directive requires a record literal",
+            Self::ExpectedList => "checker output files require a list literal",
+            Self::UnknownField => "unknown checker output field",
+            Self::DuplicateField => "duplicate checker output field",
+            Self::MissingPath => "checker output file requires a path",
+            Self::ExpectedOneContent => "checker output file requires exactly one of state or text",
+        }
+    }
+}
+
+impl CheckerOutput<'_> {
+    pub(super) fn is_explicit_literal(&self) -> bool {
+        matches!(self.stdout, Some(ScalarExpression::Utf8 { .. }))
+            && matches!(self.stderr, Some(ScalarExpression::Utf8 { .. }))
+            && matches!(self.code, Some(ScalarExpression::Integer { .. }))
+            && self.files.as_ref().is_some_and(Vec::is_empty)
+    }
+}
+
 impl<'a> CheckerOutput<'a> {
     fn from_expression(expression: &'a ScalarExpression) -> Result<Self, CheckerDirectiveShapeError> {
         let [stdout, stderr, code, files] =
@@ -229,4 +252,110 @@ mod tests {
             assert!(CheckerDirective::from_expression(expression).is_none());
         });
     }
+
+    fn checker_project(source: &str) -> crate::ScalarProject {
+        let source_id = SourceIdentity::new(
+            "local".into(),
+            "demo".into(),
+            "src/main.w".into(),
+            "test".into(),
+        );
+        let parse = parse_source(source_id.clone(), format!("%%start\n{source}\n%%end"), &[]);
+        assert!(parse.diagnostics.is_empty(), "{:?}", parse.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parse.result.canonical_cst());
+        assert!(declarations.diagnostics.is_empty(), "{:?}", declarations.diagnostics);
+        let module = crate::ScalarModule::new(source_id.clone(), declarations.items, Vec::new());
+        crate::ScalarProject::new(vec![module], vec![source_id])
+    }
+
+    #[test]
+    fn check_only_conditions_have_canonical_types_but_no_runtime_call_edges() {
+        use crate::scalar::reference::{self, OccurrenceParent};
+        use crate::scalar::typecheck_scalar_project_in_mode;
+        use crate::ScalarType;
+
+        let project = checker_project(
+            r#"
+            bool() probe = fn { true };
+            u8(u8) check_value = fn(value) {
+                core.require(value > 10, { .stdout = ""; .stderr = "bound"; .code = 1; .files = []; });
+                core.narrow(probe(), { .stdout = ""; .stderr = "probe"; .code = 1; .files = []; });
+                value
+            };
+            "#,
+        );
+        let (checked, typing) = typecheck_scalar_project_in_mode(project, true);
+        assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
+        let ScalarItem::Function(function) = &checked.project.modules[0].items[1] else {
+            panic!("expected helper function")
+        };
+        let ScalarBlockItem::Expression(expression) = &function.body.items[0] else {
+            panic!("expected directive")
+        };
+        let directive = CheckerDirective::from_expression(expression).unwrap().unwrap();
+        let ScalarExpression::Binary { left, right, .. } = directive.condition else {
+            panic!("expected scalar comparison")
+        };
+        assert_eq!(
+            typing[0].checked_expression_type(directive.condition),
+            Some(&ScalarType::Bool),
+        );
+        assert_eq!(typing[0].checked_expression_type(left), Some(&ScalarType::U8));
+        assert_eq!(typing[0].checked_expression_type(right), Some(&ScalarType::U8));
+
+        let ScalarBlockItem::Expression(expression) = &function.body.items[1] else {
+            panic!("expected directive")
+        };
+        let narrow = CheckerDirective::from_expression(expression).unwrap().unwrap();
+        let signature = typing[0]
+            .checked_call_signature(narrow.condition)
+            .expect("probe resolved as a checked call before runtime projection");
+        assert!(signature.parameters.is_empty());
+        let [output] = signature.outputs.outputs.as_slice() else {
+            panic!("expected one probe output")
+        };
+        assert_eq!(output.ty, ScalarType::Bool);
+
+        let calls = reference::resolve_project_call_sites_with_occurrences(&checked.project.modules, typing);
+        assert_eq!(calls.lookup_errors().count(), 0);
+        let body = calls.function(0, 1);
+        let directives = &body.structure.checker_directives;
+        assert_eq!(directives.len(), 2);
+        assert!(directives.values().any(|operation| *operation == CheckerOperation::Require));
+        assert!(directives.values().any(|operation| *operation == CheckerOperation::Narrow));
+        assert!(body.call_occurrences.is_empty());
+        for occurrence in directives.keys() {
+            assert_eq!(body.structure.checked_types.expressions.get(occurrence), Some(&ScalarType::Unit));
+            assert!(!body.structure.edges.keys().any(|(parent, _)| *parent == OccurrenceParent::Expression(*occurrence)));
+        }
+    }
+
+    #[test]
+    fn checker_condition_does_not_bypass_standard_type_errors() {
+        let project = checker_project(
+            r#"
+            unit() check_value = fn {
+                core.require(10, { .stdout = ""; .stderr = "bound"; .code = 1; .files = []; });
+            };
+            "#,
+        );
+        let (rejected, _) = crate::scalar::typecheck_scalar_project_in_mode(project, true);
+        let ScalarItem::Function(function) = &rejected.project.modules[0].items[0] else {
+            panic!("expected helper function")
+        };
+        let ScalarBlockItem::Expression(expression) = &function.body.items[0] else {
+            panic!("expected directive")
+        };
+        let directive = CheckerDirective::from_expression(expression).unwrap().unwrap();
+        let span = expression_span(directive.condition);
+        assert!(
+            rejected.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.labels.iter().any(|label| label.span.range == span)
+            }),
+            "{:?}",
+            rejected.diagnostics,
+        );
+    }
+
 }
