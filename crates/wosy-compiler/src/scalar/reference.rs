@@ -3704,6 +3704,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                         );
                                     }
                                 }
+                                if capture.is_none() && self.proof_points.pending_named_reborrow.is_some()
+                                    && matches!(target.place, ScalarPlace::Dereference { ref pointer, .. }
+                                        if matches!(pointer.as_ref(), ScalarExpression::Name { .. }))
+                                    && matches!(&self.cfg.points[pointer_point.0].kind,
+                                        CfgPointKind::Read { binding } if matches!(self.binding_types.get(binding),
+                                            Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner })
+                                                if aggregate::ordinary_value(inner) && **inner == output_types[position]))
+                                {
+                                    self.proof_points.deferred_child_scalar_stores
+                                        .push(self.cursor.expect("typed scalar store"));
+                                }
                             } else {
                                 let target_place = match destination {
                                     ReferenceAssignmentDestination::EvaluationOnly => continue,
@@ -4661,6 +4672,7 @@ struct ReferenceTransferCfg<'a> {
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
     checked_pointee_reads: &'a [CfgPointId],
+    deferred_child_scalar_stores: &'a [CfgPointId],
     named_reborrow_parents: &'a [super::control::NamedReborrowParent],
 }
 
@@ -4679,6 +4691,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
+            deferred_child_scalar_stores: proof.map_or(&[], |proof| &proof.deferred_child_scalar_stores),
             named_reborrow_parents: proof.map_or(&[], |proof| &proof.named_reborrow_parents),
         }
     }
@@ -4784,7 +4797,7 @@ fn transfer_reference_facts(
     let mut aggregate_expiry_allowed = aggregate.is_some();
     let pending = cfg.pending_named_reborrow;
     let mut local_definition = None;
-    let mut child_holders = HashSet::new();
+    let mut child_holders = HashMap::new();
     let mut pending_allowed = pending.is_some_and(|pending| {
         if pending.sites.len() > 1 {
             for site in &pending.sites {
@@ -4794,14 +4807,33 @@ fn transfer_reference_facts(
                     return false;
                 }
                 let CfgPointKind::Bind { binding } = &point.kind else { return false };
-                if !child_holders.insert(binding) {
+                if child_holders.insert(binding, site.point).is_some() {
                     return false;
                 }
             }
         }
         !cfg.raw_address_exposures.iter().any(|(_, root)| root.as_ref().is_none_or(|root|
-            *root == pending.handle || root == deferred_reborrow_owner(pending) || child_holders.contains(root)))
+            *root == pending.handle || root == deferred_reborrow_owner(pending) || child_holders.contains_key(root)))
     });
+    let exact_child_store = |write: &ReferenceFlowPoint| {
+        let CfgPointKind::AssignThrough {
+            place: ScalarPlace::Dereference { pointer, .. }, pointer_point, rhs_point, ..
+        } = &write.kind else { return None };
+        if child_holders.is_empty() || !matches!(pointer.as_ref(), ScalarExpression::Name { .. })
+            || cfg.deferred_child_scalar_stores.binary_search(&write.id).is_err()
+            || grouped_installs.contains(&write.id)
+            || !write.possible_origins.as_ref().is_some_and(BTreeSet::is_empty)
+            || rhs_point >= pointer_point || pointer_point.0 + 1 != write.id.0
+        {
+            return None;
+        }
+        let read = &original_points[pointer_point.0];
+        let CfgPointKind::Read { binding } = &read.kind else { return None };
+        if read.successors.as_slice() != [write.id] || read.scope != write.scope {
+            return None;
+        }
+        child_holders.get(binding).copied()
+    };
     for (index, point) in original_points.iter().enumerate() {
         strictly_forward = strictly_forward && point.id.0 == index
             && point.successors.iter().all(|successor| successor.0 > index && successor.0 < original_points.len());
@@ -4824,15 +4856,19 @@ fn transfer_reference_facts(
                 CfgPointKind::Call { .. } | CfgPointKind::Invalidate { .. } | CfgPointKind::Release { .. } => true,
                 CfgPointKind::Assign { target, .. } => target.binding == pending.handle
                     || &target.binding == deferred_reborrow_owner(pending)
-                    || child_holders.contains(&target.binding),
-                CfgPointKind::AssignThrough { .. }
-                | CfgPointKind::MoveThrough { .. }
+                    || child_holders.contains_key(&target.binding),
+                CfgPointKind::AssignThrough { .. } => exact_child_store(point).is_none()
+                    && pending.sites.last().is_some_and(|last| point.id < last.point),
+                CfgPointKind::MoveThrough { .. }
                 | CfgPointKind::DeferredMoveThrough { .. } => pending.sites.last()
                     .is_some_and(|last| point.id < last.point),
                 CfgPointKind::Move { place, .. } | CfgPointKind::DeferredMove { place, .. } =>
-                    child_holders.contains(&place.binding),
-                CfgPointKind::Read { binding } if child_holders.contains(binding) =>
+                    child_holders.contains_key(&place.binding),
+                CfgPointKind::Read { binding } if child_holders.contains_key(binding) =>
                     original_points.get(index + 1).is_none_or(|next| {
+                        if exact_child_store(next).is_some() {
+                            return false;
+                        }
                         point.successors.as_slice() != [next.id]
                             || !matches!(&next.kind, CfgPointKind::ReadPlace {
                                 place: ScalarPlace::Dereference { .. },
@@ -4841,7 +4877,7 @@ fn transfer_reference_facts(
                             || cfg.checked_pointee_reads.binary_search(&next.id).is_err()
                     }),
                 CfgPointKind::Borrow { place, loan } => loan.parent.is_none()
-                    && (place.binding == pending.handle || child_holders.contains(&place.binding)
+                    && (place.binding == pending.handle || child_holders.contains_key(&place.binding)
                         || (&place.binding == deferred_reborrow_owner(pending)
                             && !matches!(pending.root, super::control::DeferredReborrowRoot::Local { borrow, .. } if borrow == point.id))),
                 _ => false,
@@ -5100,7 +5136,13 @@ fn transfer_reference_facts(
             };
             let assignment_pointer = match &cfg.points[id.0].kind {
                 CfgPointKind::AssignThrough { pointer_point, .. } => {
-                    Some(state.point_values.get(*pointer_point).cloned())
+                    let origins = state.point_values.get(*pointer_point);
+                    let valid = exact_child_store(&original_points[id.0]).is_none_or(|child| {
+                        origins.is_some_and(|origins| origins.len() == 1
+                            && matches!(&cfg.points[child.0].kind, CfgPointKind::Borrow { .. })
+                            && cfg.points[child.0].possible_origins.as_ref() == Some(origins))
+                    });
+                    Some(origins.filter(|_| valid).cloned())
                 }
                 _ => None,
             };
@@ -9764,6 +9806,7 @@ fn derive_function_specialized_copy_policies(
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
+                    deferred_child_scalar_stores: &template_result.proof_points.deferred_child_scalar_stores,
                     named_reborrow_parents: &template_result.proof_points.named_reborrow_parents,
                 },
                 &deferred,

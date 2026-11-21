@@ -11345,3 +11345,63 @@ unit(bool) inspect = fn(choose) {
         assert_eq!(unresolved, 2);
     }
 }
+
+#[test]
+fn deferred_sibling_scalar_writes_use_the_exact_child_and_count_as_last_uses() {
+    for (body, overlaps) in [
+        ("*left = 8; *!u8 right = &!(*parent); *right = 9;", false),
+        ("*!u8 right = &!(*parent); *left = 8; *right = 9;", true),
+    ] {
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 inside = 9; inside; }};
+    *!u8 left = &!(*parent);
+    {body}
+    u8 resumed = *parent;
+    resumed;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let sites = text.match_indices("&!(*parent)").map(|(start, spelling)|
+            ByteSpan::new(start as u32, (start + spelling.len()) as u32)
+        ).collect::<Vec<_>>();
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            if overlaps {
+                let [diagnostic] = diagnostics.as_slice() else { panic!("expected exact live sibling conflict: {diagnostics:?}") };
+                assert_eq!(diagnostic.code, "B0003");
+                assert_eq!(diagnostic.message, "read or move of unavailable place");
+                let [requested, existing] = diagnostic.labels.as_slice() else { panic!("expected current and peer") };
+                assert_eq!(requested.span.range, sites[1]);
+                assert_eq!(existing.span.range, sites[0]);
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let cfg = &function.reference_cfg;
+            let children = cfg.points.iter().filter(|point| sites.contains(&point.source_span.range)
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).collect::<Vec<_>>();
+            assert_eq!(children.len(), 2);
+            let writes = cfg.points.iter().filter_map(|point| match &point.kind {
+                CfgPointKind::AssignThrough { pointer_point, candidates, .. } => Some((*pointer_point, candidates)),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(writes.len(), children.len());
+            for (child, (pointer, candidates)) in children.into_iter().zip(writes) {
+                assert_eq!(&cfg.initial_points[child.id.0], child);
+                let [actual] = candidates.as_slice() else { panic!("expected singleton exact write target") };
+                assert_eq!(child.possible_origins, Some(BTreeSet::from([actual.origin])));
+                assert_eq!(cfg.points[pointer.0].possible_origins, child.possible_origins);
+                let ReferenceOrigin::Fresh { loan, .. } = sole_fact(function, child) else {
+                    panic!("expected local child allocation")
+                };
+                assert_eq!(&actual.loan, loan);
+                assert!(loan.parent.is_some());
+            }
+        }
+    }
+}
