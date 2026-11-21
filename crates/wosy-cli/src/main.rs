@@ -161,6 +161,7 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
         &source_identity,
         &llvm,
     )?;
+    drop(llvm);
     let executable = output_dir.join("main");
     let pending_manifest = output_dir.join("artifact-manifest.pending.json");
     let pending = wosy_project::ArtifactManifest {
