@@ -5,14 +5,14 @@ use num_bigint::BigInt;
 use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation},
     checker_flow::{
-        check_integer_requirements, check_integer_return_bound, check_integer_return_bound_where,
+        check_integer_requirements, check_integer_requirements_at_entry, check_integer_return_bound, check_integer_return_bound_where,
         check_integer_return_bound_with_shows, proves_requirement_with_imported_root_local,
         CheckerPredicate, ImportedLocal, IntegerBranchProof,
         IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
-    control::BlockItemKind,
+    control::{BlockItemKind, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, NamespaceTarget},
     derive_block, derive_expression, project_from_declarations,
-    reference::{CheckerTargetQuery, DirectDestinationIdentity, FunctionCallSites, ProjectCallSiteResults, ResolvedCheckerTarget},
+    reference::{CheckerTargetQuery, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceParent, ProjectCallSiteResults, ResolvedCheckerTarget},
     static_calls::prepare_project_occurrences,
     symbolic_integer::{IntegerRelation, IntegerSet},
     typecheck::{integer_literal_fits_type, is_integer_type},
@@ -87,6 +87,120 @@ enum VerifiedEntryGuard {
         operator: BinaryOperator,
         bound: BigInt,
     },
+}
+
+#[derive(Clone, Copy)]
+enum InitializationVisit {
+    Unseen,
+    Started,
+    Completed,
+}
+
+fn check_package_initialization(
+    prepared: &PreparedCheckerProject,
+) -> Result<HashSet<(usize, usize)>, ProjectCheck> {
+    let (project, calls) = prepared.parts();
+    let ordinals: HashMap<_, _> = project.modules.iter().enumerate()
+        .map(|(ordinal, module)| (&module.source, ordinal)).collect();
+    if ordinals.len() != project.modules.len() {
+        return Err(ProjectCheck::AmbiguousRoot);
+    }
+    let root = project.initialization_order.first().ok_or(ProjectCheck::MissingRoot)?;
+    if project.initialization_order.len() != ordinals.len()
+        || !project.initialization_order.iter().all(|source| ordinals.contains_key(source))
+    {
+        return Err(ProjectCheck::RootSourceOutsideInitOrder);
+    }
+    let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
+    let mut reached = HashSet::new();
+    walk_package_initialization(project, calls, &ordinals, &mut visits, &mut reached, root)?;
+    Ok(reached)
+}
+
+fn walk_package_initialization(
+    project: &ScalarProject,
+    calls: &ProjectCallSiteResults,
+    ordinals: &HashMap<&SourceIdentity, usize>,
+    visits: &mut [InitializationVisit],
+    reached: &mut HashSet<(usize, usize)>,
+    source: &SourceIdentity,
+) -> Result<(), ProjectCheck> {
+    let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
+    match visits[ordinal] {
+        InitializationVisit::Completed => return Ok(()),
+        InitializationVisit::Started => return Err(ProjectCheck::Unsupported),
+        InitializationVisit::Unseen => visits[ordinal] = InitializationVisit::Started,
+    }
+    let module = &project.modules[ordinal];
+    let region = calls.initialization_region(ordinal).ok_or(ProjectCheck::MissingRootOccurrences)?;
+    let ModuleInitializationDetail::Occurrences(topology) = &region.detail else {
+        return Err(ProjectCheck::MissingRootOccurrences);
+    };
+    for step in &region.steps {
+        if let ModuleInitializationStepKind::NamespaceDispatch { target, .. } = &step.kind {
+            let NamespaceTarget::Bound(target) = target else {
+                return Err(ProjectCheck::Unsupported);
+            };
+            walk_package_initialization(project, calls, ordinals, visits, reached, target)?;
+            continue;
+        }
+        let (ModuleInitializationStepKind::ExecutableItem, Some(ScalarItem::Executable(
+            ScalarBlockItem::Expression(ScalarExpression::Call { arguments, .. }),
+        ))) = (&step.kind, module.items.get(step.item)) else {
+            return Err(ProjectCheck::Unsupported);
+        };
+        let structure = &topology.structure;
+        let Some(OccurrenceNode::Expression(call)) = structure.edges.get(&(
+            OccurrenceParent::Block(structure.root),
+            OccurrenceEdge::ExpressionItem { item: step.item },
+        )) else {
+            return Err(ProjectCheck::Unsupported);
+        };
+        let Some(ModuleInitializationCallTarget::Direct {
+            declaration,
+            concrete: ConcreteCallSelection::Declaration,
+        }) = region.call_target(*call) else {
+            return Err(ProjectCheck::Unsupported);
+        };
+        let &(target_module, target_item) = structure.checker_initializer_targets.get(call)
+            .ok_or(ProjectCheck::MissingRootOccurrences)?;
+        let owner = project.modules.get(target_module).ok_or(ProjectCheck::MissingRoot)?;
+        let Some(ScalarItem::Function(function)) = owner.items.get(target_item) else {
+            return Err(ProjectCheck::MissingRoot);
+        };
+        if owner.source != declaration.source || function.name_span != declaration.range {
+            return Err(ProjectCheck::MissingRoot);
+        }
+        let signature = topology.checked_call_signatures.get(call).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        if !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let body = calls.function_body(target_module, target_item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        let argument;
+        let exact: &[&BigInt] = match (arguments.as_slice(), signature.parameters.as_slice(), body.boundary.parameters.as_slice()) {
+            ([], [], []) => &[],
+            ([ScalarExpression::Integer { .. }], [parameter], [slot]) if *parameter == slot.ty && is_integer_type(parameter) => {
+                let Some(OccurrenceNode::Expression(input)) = structure.edges.get(&(
+                    OccurrenceParent::Expression(*call), OccurrenceEdge::CallArgument(0),
+                )) else {
+                    return Err(ProjectCheck::Unsupported);
+                };
+                if structure.checked_types.expressions.get(input) != Some(parameter) {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                argument = [structure.checker_integer_literals.get(input).ok_or(ProjectCheck::Unsupported)?];
+                &argument
+            }
+            _ => return Err(ProjectCheck::Unsupported),
+        };
+        match check_integer_requirements_at_entry(body, exact) {
+            Some(Ok(())) => { reached.insert((target_module, target_item)); }
+            Some(Err(failure)) => return Err(project_failure(body, &owner.source, failure)),
+            None => return Err(ProjectCheck::Unsupported),
+        }
+    }
+    visits[ordinal] = InitializationVisit::Completed;
+    Ok(())
 }
 
 fn check_closed_project_callable(
@@ -1272,6 +1386,71 @@ mod tests {
         let occurrence = &caller.call_occurrences[0];
         let resolved = caller.resolved_call_site(occurrence.ordinal).unwrap();
         assert_eq!(resolved.target, imported.target);
+    }
+
+    #[test]
+    fn package_initializer_uses_canonical_calls_with_actual_integer_entry_arguments() {
+        let file = source("src/main.w", "initializer");
+        let text = |argument: &str| format!(r#"%%start
+            unit(u8) need_small = fn(value) {{ if (value == 0) {{}}; core.require(value <= 10, {OUTPUT}); }};
+            unit() noop = fn {{}};
+            noop();
+            need_small({argument});
+        %%end"#);
+        let package = prepare_proof_target(&file, &text("7")).unwrap();
+        assert_eq!(check_package_initialization(&package), Ok(HashSet::from([(0, 0), (0, 1)])));
+        let (_, calls) = package.parts();
+        assert!(matches!(check_integer_requirements(calls.function_body(0, 0, None).unwrap()), Some(Err(_))));
+        let failure = prepare_proof_target(&source("src/main.w", "initializer-refuted"), &text("11")).unwrap();
+        assert!(matches!(check_package_initialization(&failure), Err(ProjectCheck::Failed { .. })));
+        let unsupported = prepare_proof_target(&source("src/main.w", "initializer-unsupported"), &text("3 + 4")).unwrap();
+        assert_eq!(check_package_initialization(&unsupported), Err(ProjectCheck::Unsupported));
+    }
+
+    #[test]
+    fn package_initializer_dispatches_at_authored_namespace_steps_from_the_root() {
+        let app = source("src/main.w", "initializer-root");
+        let lib = source("src/lib.w", "initializer-lib");
+        let disconnected = source("src/disconnected.w", "initializer-disconnected");
+        let prepare = |root_argument: u8, library_argument: u8| {
+            let app_text = format!(r#"%%start
+                unit(u8) root_check = fn(value) {{ if (value == 0) {{}}; core.require(value <= 10, {OUTPUT}); }};
+                root_check({root_argument});
+                lib = namespace demo "src/lib.w";
+                duplicate = namespace demo "src/lib.w";
+                duplicate.check(7);
+            %%end"#);
+            let lib_text = format!(r#"%%start
+                unit(u8) check = fn(value) {{ if (value == 0) {{}}; core.require(value <= 10, {OUTPUT}); }};
+                check({library_argument});
+            %%end"#);
+            let disconnected_text = "%%start\nu8 poison = 1;\n%%end";
+            let namespace = |name: &str| {
+                let start = app_text.find(&format!("{name} =")).unwrap();
+                let end = start + app_text[start..].find(';').unwrap() + 1;
+                ScalarNamespaceBinding {
+                    binding: name.into(), target: lib.clone(), span: ByteSpan::new(start as u32, end as u32),
+                }
+            };
+            prepare_checker_project(
+                vec![
+                    (declarations(&app, &app_text), vec![namespace("lib"), namespace("duplicate")]),
+                    (declarations(&lib, &lib_text), Vec::new()),
+                    (declarations(&disconnected, disconnected_text), Vec::new()),
+                ],
+                vec![app.clone(), lib.clone(), disconnected.clone()],
+                inputs(),
+            ).unwrap()
+        };
+        for (root, library, first_failure) in [(11, 11, &app), (7, 11, &lib)] {
+            let prepared = prepare(root, library);
+            let Err(ProjectCheck::Failed { source, .. }) = check_package_initialization(&prepared) else {
+                panic!("expected authored initializer failure");
+            };
+            assert_eq!(&source, first_failure);
+        }
+        let prepared = prepare(7, 7);
+        assert_eq!(check_package_initialization(&prepared), Ok(HashSet::from([(0, 0), (1, 0)])));
     }
 
     #[test]

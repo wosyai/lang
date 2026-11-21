@@ -356,8 +356,15 @@ pub(super) enum ProofCoverage<T> {
 pub(super) fn check_integer_requirements(
     calls: &FunctionCallSites,
 ) -> Option<Result<(), IntegerCheckFailure<'_>>> {
-    run_integer_callable(calls, integer_tail_type(calls), None, None, None)
+    run_integer_callable(calls, integer_tail_type(calls), None, None, None, None)
         .map(|result| result.map(drop))
+}
+
+pub(super) fn check_integer_requirements_at_entry<'a>(
+    calls: &'a FunctionCallSites,
+    arguments: &[&BigInt],
+) -> Option<Result<(), IntegerCheckFailure<'a>>> {
+    run_integer_callable(calls, None, None, None, None, Some(arguments)).map(|result| result.map(drop))
 }
 
 pub(super) fn proves_requirement_with_imported_root_local(
@@ -367,7 +374,7 @@ pub(super) fn proves_requirement_with_imported_root_local(
     if local.values.is_empty() {
         return None;
     }
-    match run_integer_callable(calls, integer_tail_type(calls), None, None, Some(local))? {
+    match run_integer_callable(calls, integer_tail_type(calls), None, None, Some(local), None)? {
         Ok(ProofCoverage::Applicable(())) => Some(true),
         Ok(ProofCoverage::NoApplicableInputs) => None,
         Err(_) => Some(false),
@@ -390,7 +397,7 @@ fn observe_integer_returns_in_scope<'a>(
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
     let tail = integer_tail_type(calls)?;
     let mut paths = Vec::new();
-    match run_integer_callable(calls, Some(tail), entry_filter, Some(&mut paths), None)? {
+    match run_integer_callable(calls, Some(tail), entry_filter, Some(&mut paths), None, None)? {
         Ok(ProofCoverage::Applicable(())) if !paths.is_empty() => {
             Some(Ok(ProofCoverage::Applicable(paths)))
         }
@@ -473,6 +480,7 @@ fn run_integer_callable<'a>(
     entry_filter: Option<&CheckerPredicate>,
     returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
     imported_local: Option<ImportedLocal<'a>>,
+    exact_arguments: Option<&[&BigInt]>,
 ) -> Option<Result<ProofCoverage<()>, IntegerCheckFailure<'a>>> {
     let boundary = &calls.boundary;
     let checker_parameters = boundary.checker_parameter_bindings.as_deref()?;
@@ -485,11 +493,16 @@ fn run_integer_callable<'a>(
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
         roots.add(binding, &parameter.ty);
     }
-    let root = boundary
-        .parameters
-        .iter()
-        .map(|parameter| IntegerSet::from_type(&parameter.ty).map(Rc::new))
-        .collect::<Option<IntegerRow>>()?;
+    let root = if let Some(arguments) = exact_arguments {
+        if arguments.len() != boundary.parameters.len() {
+            return None;
+        }
+        arguments.iter().map(|value| Rc::new(IntegerSet::singleton(value))).collect()
+    } else {
+        boundary.parameters.iter()
+            .map(|parameter| IntegerSet::from_type(&parameter.ty).map(Rc::new))
+            .collect::<Option<IntegerRow>>()?
+    };
     let mut root = IntegerInputs(vec![root]);
     if let Some(filter) = entry_filter {
         let (applicable, _, _) = root.split(&roots, filter)?;

@@ -6068,6 +6068,8 @@ pub(super) struct OccurrenceStructure {
     #[cfg(test)]
     pub(super) checker_integer_literals: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(test)]
+    pub(super) checker_initializer_targets: HashMap<OccurrenceOrdinal, (usize, usize)>,
+    #[cfg(test)]
     pub(super) checker_integer_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(test)]
     pub(super) checker_integer_call_locals: HashMap<(BlockOrdinal, usize), CheckerIntegerCallOrigin>,
@@ -6096,6 +6098,8 @@ impl OccurrenceStructure {
             checker_branches: HashMap::new(),
             #[cfg(test)]
             checker_integer_literals: HashMap::new(),
+            #[cfg(test)]
+            checker_initializer_targets: HashMap::new(),
             #[cfg(test)]
             checker_integer_locals: HashMap::new(),
             #[cfg(test)]
@@ -6836,12 +6840,13 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         }
         #[cfg(test)]
         if self.occurrence_typing.checker_directives_enabled()
-            && matches!(
+            && (matches!(
                 edge,
                 OccurrenceEdge::AssignmentRhs { .. }
                     | OccurrenceEdge::BindingRoot { .. }
                     | OccurrenceEdge::FinalOutput { .. }
-            )
+            ) || (matches!(edge, OccurrenceEdge::CallArgument(0))
+                && matches!(self.mode, WalkMode::ModuleInitialization { .. })))
             && self.structure.checked_types.expressions.get(&ordinal).is_some_and(is_integer_type)
         {
             if let ScalarExpression::Integer { value, .. } = expression {
@@ -7225,6 +7230,7 @@ fn initialization_call_target(
     names: &BTreeMap<String, WalkBinding>,
     types: &BTreeMap<String, ScalarType>,
     signature: Option<&CheckedCallSignature>,
+    #[cfg(test)] ordinary_origin: &mut Option<(usize, usize)>,
 ) -> Result<ModuleInitializationCallTarget, ReferenceAnalysisError> {
     use ModuleInitializationCallTarget as Target;
     let ScalarExpression::Call {
@@ -7276,10 +7282,14 @@ fn initialization_call_target(
                             .map(|argument| argument.ty.clone())
                             .collect(),
                     },
-                    CallFunctionKind::Ordinary => Target::Direct {
-                        declaration,
-                        concrete: ConcreteCallSelection::Declaration,
-                    },
+                    CallFunctionKind::Ordinary => {
+                        #[cfg(test)]
+                        { *ordinary_origin = Some(origin); }
+                        Target::Direct {
+                            declaration,
+                            concrete: ConcreteCallSelection::Declaration,
+                        }
+                    }
                     CallFunctionKind::Overload => Target::Direct {
                         declaration,
                         concrete: ConcreteCallSelection::Overload(
@@ -7343,6 +7353,8 @@ impl StructuralWalker<'_, '_> {
                         source,
                         declarations,
                     } => {
+                        #[cfg(test)]
+                        let mut ordinary_origin = None;
                         let target = initialization_call_target(
                             source,
                             declarations,
@@ -7350,7 +7362,15 @@ impl StructuralWalker<'_, '_> {
                             names,
                             types,
                             self.checked_call_signatures.get(&ordinal),
+                            #[cfg(test)]
+                            &mut ordinary_origin,
                         )?;
+                        #[cfg(test)]
+                        if self.occurrence_typing.checker_directives_enabled() {
+                            if let Some(origin) = ordinary_origin {
+                                self.structure.checker_initializer_targets.insert(ordinal, origin);
+                            }
+                        }
                         if self.reserve_legacy_occurrences[ordinal.0]
                             && matches!(
                                 target,
