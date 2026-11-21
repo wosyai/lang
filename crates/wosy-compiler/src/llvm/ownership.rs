@@ -548,8 +548,8 @@ pub(super) fn function_runtime_array_result_provenance(
 }
 
 pub(super) struct RuntimeArrayRelease<'ctx> {
-    pointer: BasicValueEnum<'ctx>,
-    live: Option<inkwell::values::IntValue<'ctx>>,
+    pub(super) pointer: BasicValueEnum<'ctx>,
+    pub(super) live: Option<inkwell::values::IntValue<'ctx>>,
 }
 
 pub(super) fn capture_runtime_array_release<'ctx, 'module>(

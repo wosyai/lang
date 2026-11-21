@@ -1113,6 +1113,7 @@ pub(crate) enum ClosedInput {
 pub(crate) struct ClosedCheckedBacking {
     pub(crate) allocation: (usize, usize),
     pub(crate) arms: [usize; 2],
+    pub(crate) failure: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -1120,6 +1121,7 @@ pub(crate) struct ClosedBody {
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
     pub(crate) checked_backing_producer: Option<ClosedCheckedBacking>,
     pub(crate) checked_backing_consumer: Option<(usize, usize)>,
+    pub(crate) checked_backing_optional: bool,
     pub(crate) returning: Option<ClosedReturn>,
     pub(crate) ordinary_result: bool,
     pub(crate) ordinary_calls: BTreeMap<usize, SourceSpan>,
@@ -1747,8 +1749,13 @@ fn closed_aggregates<'a>(
             }
             let mut arms = facts.checked_producer_backing.iter();
             let ((first, left), (last, right)) = (arms.next()?, arms.next()?);
-            let base = left.proven_allocation()?;
-            if right.proven_allocation() != Some(base) { return None }
+            let arms = [*facts.checked_producer_blocks.get(first)?, *facts.checked_producer_blocks.get(last)?];
+            let (base, failure) = match (left.proven_allocation(), right.proven_allocation()) {
+                (Some(left), Some(right)) if left == right => (left, None),
+                (Some(base), None) if *right == CheckedProducerBacking::NoDescriptor => (base, Some(arms[1])),
+                (None, Some(base)) if *left == CheckedProducerBacking::NoDescriptor => (base, Some(arms[0])),
+                _ => return None,
+            };
             let CfgPointKind::Bind { binding } = &body.cfg.points.get(base.0)?.kind else { return None };
             for &(call, ref destination) in facts.array_rebinds.values() {
                 if destination != binding { continue }
@@ -1768,8 +1775,14 @@ fn closed_aggregates<'a>(
                 }
             }
             let allocation = *facts.allocation_slots.get(&base)?;
-            let arms = [*facts.checked_producer_blocks.get(first)?, *facts.checked_producer_blocks.get(last)?];
-            Some((key, ClosedCheckedBacking { allocation, arms }))
+            if failure.is_some_and(|arm| {
+                !body.sites.boundary.parameters.iter().all(|parameter| ordinary_value(&parameter.ty))
+                    || result.bodies.get(&key).and_then(|plan| plan.local_array_failure) != Some((allocation, arm))
+            })
+            {
+                return None;
+            }
+            Some((key, ClosedCheckedBacking { allocation, arms, failure }))
         });
         if let Some((producer, plan)) = producers.next() {
             if producers.next().is_none() {
@@ -1777,7 +1790,9 @@ fn closed_aggregates<'a>(
                     reservations, &module_at, &bodies, &declarations, initializers, producer,
                 )? {
                     result.bodies.entry(producer).or_default().checked_backing_producer = Some(plan);
-                    result.bodies.entry(consumer).or_default().checked_backing_consumer = Some(install);
+                    let receiver = result.bodies.entry(consumer).or_default();
+                    receiver.checked_backing_consumer = Some(install);
+                    receiver.checked_backing_optional = plan.failure.is_some();
                 }
             }
         }
