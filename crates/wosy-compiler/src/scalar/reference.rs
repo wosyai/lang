@@ -1504,12 +1504,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, ..
                 }) && signature.is_some_and(|signature|
                     aggregate::neutral_array_signature(&signature.parameters, &signature.outputs));
-                let checked_module_output = matches!(&call, CfgPointKind::Call {
-                    target: ResolvedCallTarget::ModuleCallable { .. }, ..
+                let checked_call_output = matches!(&call, CfgPointKind::Call {
+                    target: ResolvedCallTarget::ModuleCallable { .. }
+                        | ResolvedCallTarget::LocalCallable(_)
+                        | ResolvedCallTarget::CallableField { .. }, ..
                 }) && matches!(signature.and_then(|signature| signature.outputs.outputs.first()),
                     Some(ScalarOutput { ty: ScalarType::CheckedReference { .. }, .. }));
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
-                if checked_module_output {
+                if checked_call_output {
                     self.proof_points.resolved_checked_call_outputs.push(id);
                 }
                 if let Some((moved, binding)) = array_argument.filter(|_| array_call) {
@@ -2902,7 +2904,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
         else {
             unreachable!("evaluated output-zero call")
         };
-        let checked_module_output = matches!(target, ResolvedCallTarget::ModuleCallable { .. })
+        let checked_call_output = matches!(target, ResolvedCallTarget::ModuleCallable { .. }
+            | ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. })
             && self.call_sites.checked_call_signatures.get(&ordinal)
                 .and_then(|signature| signature.outputs.outputs.get(output))
                 .is_some_and(|slot| matches!(slot.ty, ScalarType::CheckedReference { .. }));
@@ -2913,7 +2916,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             argument_points: argument_points.clone(),
         };
         let projection = self.point_with_origins(kind, point.source_span.range, point.scope, None);
-        if checked_module_output {
+        if checked_call_output {
             self.proof_points.resolved_checked_call_outputs.push(projection);
         }
         if self.aggregate_facts.neutral_array_calls.contains(&producer) {

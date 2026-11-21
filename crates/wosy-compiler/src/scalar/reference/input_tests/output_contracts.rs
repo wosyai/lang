@@ -373,3 +373,52 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
         }
     }
 }
+
+#[test]
+fn discarded_checked_indirect_call_does_not_take_its_checked_argument_origin() {
+    let text = r#"%%start
+struct Reader { *u8(*u8) pick; }
+*u8(*u8) forward = fn(input) { input };
+unit((*u8(*u8)), *u8) inspect = fn(callback, input) {
+    Reader holder = { .pick = forward; };
+    callback(input);
+    holder.pick(input);
+};
+%%end"#;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let (results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let result = &results[1].1;
+        let points = &result.cfg.points;
+        let indirect = points.iter().filter_map(|point| match &point.kind {
+            CfgPointKind::Call {
+                target: ResolvedCallTarget::LocalCallable(_),
+                output: 0, argument_points, ..
+            } => Some((false, point, argument_points)),
+            CfgPointKind::Call {
+                target: ResolvedCallTarget::CallableField { .. },
+                output: 0, argument_points, ..
+            } => Some((true, point, argument_points)),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert!(matches!(indirect.as_slice(), [(false, _, _), (true, _, _)]));
+        let exact_outputs = indirect.iter().map(|(_, point, _)| point.id).collect::<Vec<_>>();
+        assert_eq!(result.proof_points.resolved_checked_call_outputs, exact_outputs);
+        for (_, result, arguments) in indirect {
+            let [argument] = arguments.as_slice() else { panic!("one checked argument") };
+            assert!(points[argument.0].possible_origins.as_ref().is_some_and(|origins| !origins.is_empty()));
+            assert!(result.possible_origins.is_none());
+        }
+        let public = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
+    }
+}
