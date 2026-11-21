@@ -267,11 +267,63 @@ struct CanonicalProjectInputs {
     texts: BTreeMap<ProjectSourceIdentity, String>,
 }
 
+#[derive(Clone, Copy)]
+enum CanonicalLoadPurpose {
+    Build,
+    #[cfg(feature = "internal-checker")]
+    Check,
+}
+
+#[derive(Debug)]
+enum CanonicalLoadFailure {
+    Input(String),
+    Syntax {
+        source: SourceIdentity,
+        text: String,
+        diagnostics: Vec<wosy_compiler::Diagnostic>,
+    },
+    Derivation {
+        diagnostics: Vec<wosy_compiler::Diagnostic>,
+        texts: BTreeMap<ProjectSourceIdentity, String>,
+    },
+    Graph {
+        error: wosy_project::GraphLoadError,
+        texts: BTreeMap<ProjectSourceIdentity, String>,
+    },
+}
+
+impl From<String> for CanonicalLoadFailure {
+    fn from(error: String) -> Self {
+        Self::Input(error)
+    }
+}
+
+impl CanonicalLoadFailure {
+    fn report_build(self) -> String {
+        match self {
+            Self::Input(error) => error,
+            Self::Syntax { source, text, diagnostics } => {
+                render_diagnostics(&text, &diagnostics, &source);
+                "build rejected by syntax diagnostics".to_owned()
+            }
+            Self::Derivation { diagnostics, texts } => {
+                render_project_diagnostics(&diagnostics, &texts);
+                "build rejected by CST derivation diagnostics".to_owned()
+            }
+            Self::Graph { error, texts } => {
+                render_graph_diagnostics(&error, &texts);
+                format_graph_error(error)
+            }
+        }
+    }
+}
+
 fn load_canonical_project_inputs(
     root: &std::path::Path,
     project: &ProjectContext,
     configuration: &ProjectConfiguration,
-) -> Result<CanonicalProjectInputs, String> {
+    purpose: CanonicalLoadPurpose,
+) -> Result<CanonicalProjectInputs, CanonicalLoadFailure> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
     let root_project = root.to_string_lossy().into_owned();
     let mut discovered = HashMap::from([(
@@ -307,12 +359,15 @@ fn load_canonical_project_inputs(
             revision.clone(),
         );
         let output = parse_source(source, text, &project.comment_categories);
-        let source = &output.result.source;
-        render_diagnostics(&output.result.text, &output.diagnostics, source);
         if !output.diagnostics.is_empty() {
-            return Err("build rejected by syntax diagnostics".to_owned());
+            return Err(CanonicalLoadFailure::Syntax {
+                source: output.result.source, text: output.result.text, diagnostics: output.diagnostics,
+            });
         }
-        persist_cst(root, &output)?;
+        let source = &output.result.source;
+        if matches!(purpose, CanonicalLoadPurpose::Build) {
+            persist_cst(root, &output)?;
+        }
         #[cfg(test)]
         routing_observations::record(|counts| counts.extractions += 1);
         let declarations = derive_scalar_declarations_from_cst(output.result.canonical_cst());
@@ -381,16 +436,15 @@ fn load_canonical_project_inputs(
         .first()
         .cloned()
         .ok_or_else(|| "project root source is missing".to_owned())?;
-    let graph = load_reachable_source_graph(
+    let graph = match load_reachable_source_graph(
         &project.package,
         root_node,
         nodes,
         &configuration.resolved_packages,
-    )
-    .map_err(|error| {
-        render_graph_diagnostics(&error, &texts);
-        format_graph_error(error)
-    })?;
+    ) {
+        Ok(graph) => graph,
+        Err(error) => return Err(CanonicalLoadFailure::Graph { error, texts }),
+    };
     let mut project_declarations = Vec::new();
     let mut source_by_path = BTreeMap::new();
     let mut derivation_diagnostics = Vec::new();
@@ -429,9 +483,8 @@ fn load_canonical_project_inputs(
             .collect::<Result<Vec<_>, String>>()?;
         project_declarations.push((declarations, namespace_bindings));
     }
-    render_project_diagnostics(&derivation_diagnostics, &texts);
     if !derivation_diagnostics.is_empty() {
-        return Err("build rejected by CST derivation diagnostics".to_owned());
+        return Err(CanonicalLoadFailure::Derivation { diagnostics: derivation_diagnostics, texts });
     }
     let initialization_order = graph
         .initialization_order
@@ -455,6 +508,30 @@ fn load_canonical_project_inputs(
     })
 }
 
+#[cfg(feature = "internal-checker")]
+type InternalCheckResult = Result<
+    (wosy_compiler::ScalarCheckerOutcome, BTreeMap<ProjectSourceIdentity, String>),
+    CanonicalLoadFailure,
+>;
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_loaded_project(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+) -> InternalCheckResult {
+    let CanonicalProjectInputs { declarations, initialization_order, texts, .. } =
+        load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Check)?;
+    #[cfg(test)]
+    routing_observations::record(|counts| counts.checks += 1);
+    let outcome = wosy_compiler::check_scalar_package(
+        declarations, initialization_order, ScalarPreparationInputs { target_layout },
+    );
+    Ok((outcome, texts))
+}
+
 fn compile_project(
     root: &std::path::Path,
     project: &ProjectContext,
@@ -466,7 +543,8 @@ fn compile_project(
         initialization_order,
         graph,
         texts,
-    } = load_canonical_project_inputs(root, project, configuration)?;
+    } = load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Build)
+        .map_err(CanonicalLoadFailure::report_build)?;
     #[cfg(test)]
     routing_observations::record(|counts| counts.preparations += 1);
     let prepared = prepare_scalar_project(
@@ -799,6 +877,7 @@ mod routing_observations {
         pub(super) extractions: usize,
         pub(super) preparations: usize,
         pub(super) builds: usize,
+        pub(super) checks: usize,
         pub(super) single_module_emissions: usize,
         pub(super) project_emissions: usize,
     }
@@ -816,10 +895,7 @@ mod routing_observations {
         });
     }
 
-    pub(super) fn observe_compile(
-        project: &ProjectContext,
-        configuration: &ProjectConfiguration,
-    ) -> (Result<(String, Vec<SourceObservation>), String>, Counts) {
+    pub(super) fn observe<T>(run: impl FnOnce() -> T) -> (T, Counts) {
         struct Restore(Option<Counts>);
 
         impl Drop for Restore {
@@ -829,13 +905,15 @@ mod routing_observations {
         }
 
         let _restore = Restore(COUNTS.replace(Some(Counts::default())));
-        let result = compile_project(
-            &project.root,
-            project,
-            configuration,
-            ScalarTargetLayout::NATIVE64,
-        );
+        let result = run();
         (result, COUNTS.get().expect("active routing observations"))
+    }
+
+    pub(super) fn observe_compile(
+        project: &ProjectContext,
+        configuration: &ProjectConfiguration,
+    ) -> (Result<(String, Vec<SourceObservation>), String>, Counts) {
+        observe(|| compile_project(&project.root, project, configuration, ScalarTargetLayout::NATIVE64))
     }
 }
 
@@ -889,6 +967,66 @@ mod tests {
         (project, configuration)
     }
 
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_checker_adapter_uses_canonical_graph_once_and_never_publishes() {
+        use wosy_compiler::{ScalarCheckerOperation, ScalarCheckerOutcome};
+        let sources = [
+            ("main.w", "%%start\nlib = namespace app \"lib.w\"; lib.require_small(8);\n%%end"),
+            ("lib.w", r#"%%start
+                unit(u8) require_small = fn(value) {
+                    core.require(value <= 7, { .stdout = "out"; .stderr = "bad"; .code = 17; .files = []; });
+                };
+            %%end"#),
+        ];
+        let (project, configuration) = routing_test_project("internal-checked-graph", &sources);
+        let (result, counts) = routing_observations::observe(|| {
+            check_loaded_project(&project.root, &project, &configuration, ScalarTargetLayout::NATIVE64)
+        });
+        let (outcome, texts) = result.expect("canonical checker input");
+        let ScalarCheckerOutcome::Failed(failure) = outcome else { panic!("expected authored dependency failure"); };
+        assert_eq!(failure.operation, ScalarCheckerOperation::Require);
+        assert_eq!(failure.source.path, "lib.w");
+        assert_eq!(failure.source.revision, blake3::hash(sources[1].1.as_bytes()).to_string());
+        assert_eq!(&*failure.stdout, b"out");
+        assert_eq!(&*failure.stderr, b"bad");
+        assert_eq!(failure.code, 17.into());
+        assert_eq!(texts.len(), 2);
+        assert!(texts.values().any(|text| text == sources[1].1));
+        assert_eq!(counts, routing_observations::Counts { extractions: 2, checks: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_checker_adapter_preserves_load_errors_without_build_receipts() {
+        let samples = [
+            ("checker-parse-rejection", "%%start\n???\n%%end"),
+            ("checker-graph-rejection", "%%start\nmissing = namespace app \"missing.w\";\n%%end"),
+        ];
+        for (name, text) in samples {
+            let (project, configuration) = routing_test_project(name, &[("main.w", text)]);
+            let (result, counts) = routing_observations::observe(|| {
+                check_loaded_project(&project.root, &project, &configuration, ScalarTargetLayout::NATIVE64)
+            });
+            if name == "checker-parse-rejection" {
+                let Err(CanonicalLoadFailure::Syntax { source, diagnostics, .. }) = result else { panic!("expected typed syntax error"); };
+                assert_eq!(source.path, "main.w");
+                assert_eq!(diagnostics[0].code, "S0001");
+                assert_eq!(counts.extractions, 0);
+            } else {
+                let Err(CanonicalLoadFailure::Graph { error, texts }) = result else { panic!("expected typed graph error"); };
+                assert_eq!(error.diagnostics.len(), 1);
+                assert_eq!(format_graph_error(error), "M0001: missing module app::missing.w");
+                assert_eq!(texts.len(), 1);
+                assert_eq!(counts.extractions, 1);
+            }
+            assert_eq!(counts.checks, 0);
+            assert_eq!(counts.builds, 0);
+            assert!(!project.root.join(".wosy").exists());
+        }
+    }
+
     #[test]
     fn static_boundary_routes_single_and_multi_module_build_once() {
         let single = [(
@@ -915,6 +1053,7 @@ mod tests {
                     extractions: sources.len(),
                     preparations: 1,
                     builds: 1,
+                    checks: 0,
                     single_module_emissions,
                     project_emissions,
                 },
