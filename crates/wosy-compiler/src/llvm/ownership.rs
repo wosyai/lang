@@ -935,14 +935,48 @@ pub(super) fn emit_runtime_array_allocation<'ctx, 'module>(
 ) -> Result<PointerValue<'ctx>, String> {
     declare_core_runtime(context, state.module);
     let (element_size, alignment) = allocation_layout(element, state.layouts, state.target_layout)?;
-    let size = state
+    let function = state
         .builder
-        .build_int_mul(
-            length,
-            context.i64_type().const_int(element_size, false),
-            "allocation_size",
-        )
-        .map_err(builder_error)?;
+        .get_insert_block()
+        .and_then(|block| block.get_parent())
+        .ok_or_else(|| "runtime allocation has no containing function".to_owned())?;
+    let panic_block = context.append_basic_block(function, "allocation_panic");
+    let integer = context.i64_type();
+    let size = match element_size {
+        0 => integer.const_zero(),
+        1 => length,
+        _ => {
+            let limit = u64::MAX / element_size;
+            if !length
+                .get_zero_extended_constant()
+                .is_some_and(|constant| constant <= limit)
+            {
+                let overflow = state
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::UGT,
+                        length,
+                        integer.const_int(limit, false),
+                        "allocation_size_overflow",
+                    )
+                    .map_err(builder_error)?;
+                let allocate = context.append_basic_block(function, "allocation_size_valid");
+                state
+                    .builder
+                    .build_conditional_branch(overflow, panic_block, allocate)
+                    .map_err(builder_error)?;
+                state.builder.position_at_end(allocate);
+            }
+            state
+                .builder
+                .build_int_nuw_mul(
+                    length,
+                    integer.const_int(element_size, false),
+                    "allocation_size",
+                )
+                .map_err(builder_error)?
+        }
+    };
     let allocator = state
         .module
         .get_function(CORE_ALLOC_SYMBOL)
@@ -966,12 +1000,6 @@ pub(super) fn emit_runtime_array_allocation<'ctx, 'module>(
         .builder
         .build_is_null(allocation, "allocation_failed")
         .map_err(builder_error)?;
-    let function = state
-        .builder
-        .get_insert_block()
-        .and_then(|block| block.get_parent())
-        .ok_or_else(|| "runtime allocation has no containing function".to_owned())?;
-    let panic_block = context.append_basic_block(function, "allocation_panic");
     let continue_block = context.append_basic_block(function, "allocation_continue");
     state
         .builder

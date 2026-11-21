@@ -3448,6 +3448,23 @@ fn emits_recursive_fixed_array_index_reads_and_addresses_for_both_targets() {
     }
 }
 
+fn length_loaded_for_runtime_array(llvm: &str) -> &str {
+    let slot = llvm
+        .lines()
+        .find_map(|line| {
+            line.trim_start()
+                .strip_prefix("store i64 %length, ptr ")
+                .map(|rest| rest.split(',').next().unwrap())
+        })
+        .expect("length parameter storage");
+    llvm.lines()
+        .find_map(|line| {
+            let (value, load) = line.trim_start().split_once(" = load i64, ptr ")?;
+            (load.split(',').next() == Some(slot)).then_some(value)
+        })
+        .expect("length parameter load")
+}
+
 #[test]
 fn emits_runtime_array_allocation_and_indexing_for_both_targets() {
     let source = SourceIdentity::new(
@@ -3486,8 +3503,9 @@ fn emits_runtime_array_allocation_and_indexing_for_both_targets() {
                 llvm.contains("declare ptr @__wosy_core_alloc(i64, i64)"),
                 "{llvm}"
             );
+            let length = length_loaded_for_runtime_array(&llvm);
             assert!(
-                llvm.contains("call ptr @__wosy_core_alloc(i64 %allocation_size, i64 1)"),
+                llvm.contains(&format!("call ptr @__wosy_core_alloc(i64 {length}, i64 1)")),
                 "{llvm}"
             );
             assert!(llvm.contains("icmp eq ptr %allocation, null"), "{llvm}");
@@ -3502,6 +3520,82 @@ fn emits_runtime_array_allocation_and_indexing_for_both_targets() {
             );
             assert!(!llvm.contains("%bytes_backing"), "{llvm}");
             assert!(!llvm.contains("icmp ult"), "{llvm}");
+        }
+    }
+}
+
+#[test]
+fn checks_runtime_array_byte_products_before_calling_the_allocator() {
+    let text = "%%start
+unit(u64) wide = fn(length) { u64[length] words; words; };
+unit(u64) narrow = fn(length) { u8[length] bytes; bytes; };
+%%end";
+    let source = SourceIdentity::new(
+        "project".into(),
+        "package".into(),
+        "src/main.w".into(),
+        "r1".into(),
+    );
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (project_route, llvm) in [
+            (false, emit_scalar_llvm(&single).unwrap().to_text()),
+            (true, emit_scalar_project_llvm(&project).unwrap().to_text()),
+        ] {
+            let body = |name: &str| {
+                let name = if project_route {
+                    project_function_name(&source, name)
+                } else {
+                    name.to_owned()
+                };
+                llvm.split_once(&format!("@{name}("))
+                    .and_then(|(_, rest)| rest.split_once("\n}"))
+                    .map(|(body, _)| body)
+                    .unwrap_or_else(|| panic!("{name}: {llvm}"))
+            };
+            let wide = body("wide");
+            let length = length_loaded_for_runtime_array(wide);
+            assert!(
+                wide.contains(&format!("icmp ugt i64 {length}, {}", u64::MAX / 8)),
+                "{wide}"
+            );
+            assert!(
+                wide.contains("br i1 %allocation_size_overflow, label %allocation_panic, label %allocation_size_valid"),
+                "{wide}"
+            );
+            let (_, valid) = wide.split_once("\nallocation_size_valid:").expect("valid size");
+            let size = valid
+                .lines()
+                .find_map(|line| {
+                    let (value, operands) = line.trim_start().split_once(" = mul nuw i64 ")?;
+                    (operands == format!("{length}, 8")).then_some(value)
+                })
+                .expect("unsigned product uses guarded length");
+            assert!(
+                valid.contains(&format!("call ptr @__wosy_core_alloc(i64 {size}, i64 8)")),
+                "{valid}"
+            );
+            let (_, panic) = wide.split_once("\nallocation_panic:").expect("shared panic");
+            let (panic, _) = panic.split_once("\nallocation_size_valid:").expect("panic end");
+            assert!(panic.contains("call void @__wosy_core_system_panic()"), "{panic}");
+            assert!(panic.contains("unreachable"), "{panic}");
+            assert!(!panic.contains("@__wosy_core_alloc("), "{panic}");
+            let narrow = body("narrow");
+            let length = length_loaded_for_runtime_array(narrow);
+            assert!(
+                narrow.contains(&format!("call ptr @__wosy_core_alloc(i64 {length}, i64 1)")),
+                "{narrow}"
+            );
+            assert!(!narrow.contains("allocation_size_overflow"), "{narrow}");
+            assert!(!narrow.contains("mul "), "{narrow}");
         }
     }
 }
