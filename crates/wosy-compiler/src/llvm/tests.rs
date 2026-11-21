@@ -4016,6 +4016,37 @@ fn serializes_each_extern_with_its_wasm_import_attribute_group() {
 }
 
 #[test]
+fn serializes_imports_in_metadata_order_without_changing_body_lines() {
+    let attribute = |name: &str, group| LlvmFunction {
+        name: name.into(),
+        result: LlvmValueType::Void,
+        parameters: Vec::new(),
+        attributes: vec![LlvmFunctionAttributes {
+            group,
+            wasm_import_module: "imports".into(),
+            wasm_import_name: format!("import{group}"),
+        }],
+        body: String::new(),
+    };
+    let source = "; ModuleID = 'test'\r\nsource_filename = \"test\"\r\n";
+    for name in ["\"quoted\"", "\"quoted(@name)\""] {
+        let raw = format!(
+            "{source}\r\ndeclare void @first_extra()\r\ndeclare void @first()\r\ndeclare void @{name}()\r\ndeclare void @first() ; second instance\r\n\r\ndefine void @main() {{\r\n  ret void\r\n}}\r\n\r\n"
+        );
+        let partition = LlvmPartition {
+            module_name: "test".into(),
+            declarations: vec![attribute(name, 7), attribute("first", 3)],
+            functions: Vec::new(),
+            text: raw,
+        };
+        let expected = format!(
+            "; ModuleID = 'test'\nsource_filename = \"test\"\n\ndeclare void @{name}() #7\ndeclare void @first() #3\n\nattributes #3 = {{ \"wasm-import-module\"=\"imports\" \"wasm-import-name\"=\"import3\" }}\nattributes #7 = {{ \"wasm-import-module\"=\"imports\" \"wasm-import-name\"=\"import7\" }}\n\ndeclare void @first_extra()\n\ndefine void @main() {{\n  ret void\n}}\n"
+        );
+        assert_eq!(partition.to_text(), expected, "{name}");
+    }
+}
+
+#[test]
 fn preserves_callable_return_metadata_for_every_output_form() {
     let context = Context::create();
     let sequence = |types: Vec<ScalarType>| ScalarOutputSequence {
