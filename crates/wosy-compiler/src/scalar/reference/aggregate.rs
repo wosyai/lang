@@ -277,6 +277,9 @@ pub(super) struct AggregateFlowResult {
     pub(super) returning_leaf: bool,
     pub(super) checked_result_origins: BTreeSet<ReferenceOriginId>,
     pub(super) independent_checked_result: bool,
+    pub(super) raw_read_forward_candidate: Option<CfgPointId>,
+    pub(super) raw_read_forward_contract: bool,
+    pub(super) raw_read_forward_result: bool,
     pub(super) formals: BTreeMap<usize, ReferenceBindingId>,
     pub(super) formal_unsupported: BTreeSet<usize>,
     pub(super) formal_forward: Option<(usize, CfgPointId, usize, usize)>,
@@ -1165,7 +1168,8 @@ fn prove_read_views(
         let facts = body.facts.ok_or_else(|| format!("missing ordinary raw read facts {key:?}"))?;
         let outputs = &body.sites.boundary.root_outputs;
         let supported_outputs = outputs.iter().all(|output| ordinary_value(&output.ty) || output.ty == ScalarType::Unit)
-            || (checked_scalar_output(outputs) && facts.independent_checked_result);
+            || (checked_scalar_output(outputs)
+                && (facts.independent_checked_result || facts.raw_read_forward_result));
         if matches!(source, ReadSource::Formal(slot) if !facts.read_formals.contains(&slot) || !supported_outputs)
             || !body.is_monomorphic
         {
@@ -2186,6 +2190,7 @@ leaf = overload {
     };
 };
 *u8(*?u8, *u8) relay = fn(data, foreign) { leaf(data, foreign) };
+*u32(*?u32, *u32) borrowed_relay = fn(data, foreign) { leaf(data, foreign) };
 *u8(*?u8) unknown = fn(data) { u8 value = 0; &value };
 *u8(*?u8) consuming = fn(data) {
     u8 value = 0;
@@ -2226,9 +2231,10 @@ leaf = overload {
             for (item, arm, expected_error) in [
                 (0, Some(0), None),
                 (0, Some(1), Some("unproved ordinary raw read formal")),
-                (1, None, Some("unproved ordinary raw read formal")),
-                (2, None, Some("no proven load")),
-                (3, None, Some("unproved ordinary raw read use")),
+                (1, None, None),
+                (2, None, Some("unproved ordinary raw read formal")),
+                (3, None, Some("no proven load")),
+                (4, None, Some("unproved ordinary raw read use")),
             ] {
                 let result = prove_read_views(((0, item, arm), ReadSource::Formal(0)), &bodies, &declarations, &mut proven);
                 match expected_error {
