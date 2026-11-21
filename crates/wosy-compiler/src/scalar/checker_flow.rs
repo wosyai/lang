@@ -77,7 +77,7 @@ impl IntegerInputs {
         self,
         roots: &IntegerRoots<'_>,
         predicate: &IntegerPredicate,
-    ) -> Option<(Self, Self)> {
+    ) -> Option<(Self, Self, usize)> {
         let &(index, ty) = roots.get(&predicate.binding)?;
         if ty != &predicate.ty {
             return None;
@@ -98,16 +98,53 @@ impl IntegerInputs {
                 failing.0.push(alternate);
             }
         }
-        Some((passing, failing))
+        Some((passing, failing, index))
     }
 
-    fn join(mut self, other: Self) -> Self {
-        self.0.extend(other.0);
-        self
+    fn join(mut self, mut other: Self, axis: usize) -> Self {
+        if self.is_unreachable() {
+            return other;
+        }
+        if other.is_unreachable() {
+            return self;
+        }
+        if self.0.len() == 1 && other.0.len() == 1 {
+            let left = &mut self.0[0];
+            let right = &other.0[0];
+            if left.iter().zip(right).enumerate().all(|(index, (a, b))| {
+                index == axis || Rc::ptr_eq(a, b)
+            }) {
+                let right = other.0.pop().unwrap();
+                merge_axis(left, right, axis);
+            } else {
+                self.0.append(&mut other.0);
+            }
+            return self;
+        }
+
+        let mut joined = Self::default();
+        let mut representatives = HashMap::new();
+        for row in self.0.into_iter().chain(other.0) {
+            let key: Vec<_> = row[..axis].iter().chain(&row[axis + 1..]).map(Rc::as_ptr).collect();
+            match representatives.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    merge_axis(&mut joined.0[*entry.get()], row, axis);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(joined.0.len());
+                    joined.0.push(row);
+                }
+            }
+        }
+        joined
     }
 
     fn is_unreachable(&self) -> bool {
         self.0.is_empty()
+    }
+
+    pub(super) fn row_count(&self) -> usize {
+        self.0.len()
     }
 
     pub(super) fn includes(&self, coordinates: &[u128]) -> bool {
@@ -119,6 +156,13 @@ impl IntegerInputs {
                 })
         })
     }
+}
+
+fn merge_axis(representative: &mut IntegerRow, row: IntegerRow, axis: usize) {
+    let replacement = row.into_iter().nth(axis).expect("canonical integer axis");
+    let previous = std::mem::replace(&mut representative[axis], replacement);
+    let target = Rc::make_mut(&mut representative[axis]);
+    *target = Rc::unwrap_or_clone(previous).join(std::mem::take(target));
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -174,7 +218,7 @@ fn walk_integer_block(
         match item.kind {
             BlockItemKind::Evaluation { expression } => {
                 if let Some(directive) = structure.checker_directives.get(&expression) {
-                    let (passing, failing) = path.split(roots, directive.integer_predicate.as_ref()?)?;
+                    let (passing, failing, _) = path.split(roots, directive.integer_predicate.as_ref()?)?;
                     match directive.operation {
                         CheckerOperation::Require if !failing.is_unreachable() => {
                             return Some(IntegerControl::Fail(IntegerCheckFailure {
@@ -197,9 +241,9 @@ fn walk_integer_block(
                         return None;
                     };
                     let predicate = structure.checker_integer_branches.get(condition)?;
-                    let (yes, no) = path.split(roots, predicate)?;
+                    let (yes, no, axis) = path.split(roots, predicate)?;
                     match walk_integer_block(calls, roots, *then_block, yes)? {
-                        IntegerControl::Continue(then_path) => path = then_path.join(no),
+                        IntegerControl::Continue(then_path) => path = then_path.join(no, axis),
                         failure @ IntegerControl::Fail(_) => return Some(failure),
                     }
                 }

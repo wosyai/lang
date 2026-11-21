@@ -575,4 +575,56 @@ mod tests {
         });
     }
 
+    #[test]
+    fn independent_no_op_branches_rejoin_as_one_exact_row() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+
+        let width = 12;
+        let parameters = (0..width).map(|index| format!("p{index}")).collect::<Vec<_>>();
+        let types = vec!["u8"; width].join(", ");
+        let signature = parameters.join(", ");
+        let mut source = format!("u8({types}) check_many = fn({signature}) {{\n");
+        let output = r#"{ .stdout = ""; .stderr = "failed"; .code = 1; .files = []; }"#;
+        for name in &parameters {
+            source.push_str(&format!("if ({name} > 0) {{ core.require({name} > 0, {output}); }}\n"));
+        }
+        source.push_str(&format!("core.require(p0 > 0, {output});\np0 }};"));
+        check_source(&source, |body| {
+            let failure = check_integer_requirements(body).unwrap().unwrap_err();
+            assert_eq!(failure.inputs.row_count(), 1);
+            let mut input = vec![255; width];
+            assert!(!failure.inputs.includes(&input));
+            input[0] = 0;
+            assert!(failure.inputs.includes(&input));
+            assert!(failure.inputs.includes(&vec![0; width]));
+        });
+    }
+
+    #[test]
+    fn coalescing_an_unrelated_axis_keeps_existing_correlations() {
+        use crate::scalar::checker_flow::check_integer_requirements;
+        check_source(
+            r#"
+            u8(u8, u8, u8) check_three = fn(x, y, z) {
+                if (x > 0) {
+                    core.narrow(y > 0, { .stdout = ""; .stderr = "narrow"; .code = 1; .files = []; });
+                }
+                if (z > 0) {
+                    core.require(z > 0, { .stdout = ""; .stderr = "guarded"; .code = 1; .files = []; });
+                }
+                core.require(z > 0, { .stdout = ""; .stderr = "unconditional"; .code = 1; .files = []; });
+                x
+            };
+            "#,
+            |body| {
+                let failure = check_integer_requirements(body).unwrap().unwrap_err();
+                assert_eq!(failure.inputs.row_count(), 2);
+                assert!(failure.inputs.includes(&[0, 0, 0]));
+                assert!(failure.inputs.includes(&[1, 1, 0]));
+                assert!(!failure.inputs.includes(&[1, 0, 0]));
+                assert!(!failure.inputs.includes(&[1, 1, 1]));
+            },
+        );
+    }
+
 }
