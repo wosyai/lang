@@ -10,9 +10,9 @@ use super::{
         CheckerPredicate, ImportedLocal, IntegerBranchProof,
         IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
-    control::{BlockItemKind, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, NamespaceTarget},
+    control::{BlockItemKind, CheckedCallSignature, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, NamespaceTarget},
     derive_block, derive_expression, project_from_declarations,
-    reference::{CheckerTargetQuery, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceParent, ProjectCallSiteResults, ResolvedCheckerTarget},
+    reference::{CheckerTargetQuery, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, ProjectCallSiteResults, ResolvedCheckerTarget},
     static_calls::prepare_project_occurrences,
     symbolic_integer::{IntegerRelation, IntegerSet},
     typecheck::{integer_literal_fits_type, is_integer_type},
@@ -158,9 +158,9 @@ fn check_package_initialization(
         return Err(ProjectCheck::RootSourceOutsideInitOrder);
     }
     let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
-    let mut reached = HashSet::new();
-    walk_package_initialization(project, calls, &ordinals, &mut visits, &mut reached, root)?;
-    Ok(CheckedInitialization { visits, reached, ordinals })
+    let mut actual = ActualCalls { project, calls, active: HashSet::new(), reached: HashSet::new() };
+    walk_package_initialization(project, calls, &ordinals, &mut visits, &mut actual, root)?;
+    Ok(CheckedInitialization { visits, reached: actual.reached, ordinals })
 }
 
 fn walk_package_initialization(
@@ -168,7 +168,7 @@ fn walk_package_initialization(
     calls: &ProjectCallSiteResults,
     ordinals: &HashMap<&SourceIdentity, usize>,
     visits: &mut [InitializationVisit],
-    reached: &mut HashSet<(usize, usize)>,
+    actual: &mut ActualCalls<'_>,
     source: &SourceIdentity,
 ) -> Result<(), ProjectCheck> {
     let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
@@ -187,14 +187,16 @@ fn walk_package_initialization(
             let NamespaceTarget::Bound(target) = target else {
                 return Err(ProjectCheck::Unsupported);
             };
-            walk_package_initialization(project, calls, ordinals, visits, reached, target)?;
+            walk_package_initialization(project, calls, ordinals, visits, actual, target)?;
             continue;
         }
-        let (ModuleInitializationStepKind::ExecutableItem, Some(ScalarItem::Executable(
-            ScalarBlockItem::Expression(ScalarExpression::Call { arguments, .. }),
-        ))) = (&step.kind, module.items.get(step.item)) else {
+        if !matches!((&step.kind, module.items.get(step.item)),
+            (ModuleInitializationStepKind::ExecutableItem, Some(ScalarItem::Executable(
+                ScalarBlockItem::Expression(ScalarExpression::Call { .. }),
+            )))
+        ) {
             return Err(ProjectCheck::Unsupported);
-        };
+        }
         let structure = &topology.structure;
         let Some(OccurrenceNode::Expression(call)) = structure.edges.get(&(
             OccurrenceParent::Block(structure.root),
@@ -208,26 +210,61 @@ fn walk_package_initialization(
         }) = region.call_target(*call) else {
             return Err(ProjectCheck::Unsupported);
         };
-        let &(target_module, target_item) = structure.checker_initializer_targets.get(call)
+        let signature = topology.checked_call_signatures.get(call).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        actual.run(structure, *call, signature, &declaration.source, declaration.range)?;
+    }
+    visits[ordinal] = InitializationVisit::Completed;
+    Ok(())
+}
+
+struct ActualCalls<'a> {
+    project: &'a ScalarProject,
+    calls: &'a ProjectCallSiteResults,
+    active: HashSet<(usize, usize)>,
+    reached: HashSet<(usize, usize)>,
+}
+
+impl ActualCalls<'_> {
+    fn nested(&mut self, caller: &FunctionCallSites, call: OccurrenceOrdinal) -> Result<(), ProjectCheck> {
+        let site = caller.resolved_call_site(call).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        let ResolvedCallTarget::ModuleCallable {
+            source,
+            declaration_span,
+            concrete: ConcreteCallSelection::Declaration,
+        } = &site.target else {
+            return Err(ProjectCheck::Unsupported);
+        };
+        let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        self.run(&caller.structure, call, signature, source, *declaration_span)
+    }
+
+    fn run(
+        &mut self,
+        structure: &OccurrenceStructure,
+        call: OccurrenceOrdinal,
+        signature: &CheckedCallSignature,
+        target_source: &SourceIdentity,
+        target_span: ByteSpan,
+    ) -> Result<(), ProjectCheck> {
+        let &(target_module, target_item) = structure.checker_direct_targets.get(&call)
             .ok_or(ProjectCheck::MissingRootOccurrences)?;
-        let owner = project.modules.get(target_module).ok_or(ProjectCheck::MissingRoot)?;
+        let owner = self.project.modules.get(target_module).ok_or(ProjectCheck::MissingRoot)?;
         let Some(ScalarItem::Function(function)) = owner.items.get(target_item) else {
             return Err(ProjectCheck::MissingRoot);
         };
-        if owner.source != declaration.source || function.name_span != declaration.range {
+        if &owner.source != target_source || function.name_span != target_span {
             return Err(ProjectCheck::MissingRoot);
         }
-        let signature = topology.checked_call_signatures.get(call).ok_or(ProjectCheck::MissingRootOccurrences)?;
         if !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit) {
             return Err(ProjectCheck::Unsupported);
         }
-        let body = calls.function_body(target_module, target_item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        let body = self.calls.function_body(target_module, target_item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let argument;
-        let exact: &[&BigInt] = match (arguments.as_slice(), signature.parameters.as_slice(), body.boundary.parameters.as_slice()) {
-            ([], [], []) => &[],
-            ([ScalarExpression::Integer { .. }], [parameter], [slot]) if *parameter == slot.ty && is_integer_type(parameter) => {
+        let exact: &[&BigInt] = match (signature.parameters.as_slice(), body.boundary.parameters.as_slice()) {
+            ([], []) => &[],
+            ([parameter], [slot]) if *parameter == slot.ty && is_integer_type(parameter) => {
                 let Some(OccurrenceNode::Expression(input)) = structure.edges.get(&(
-                    OccurrenceParent::Expression(*call), OccurrenceEdge::CallArgument(0),
+                    OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(0),
                 )) else {
                     return Err(ProjectCheck::Unsupported);
                 };
@@ -239,14 +276,30 @@ fn walk_package_initialization(
             }
             _ => return Err(ProjectCheck::Unsupported),
         };
-        match check_integer_requirements_at_entry(body, exact) {
-            Some(Ok(())) => { reached.insert((target_module, target_item)); }
-            Some(Err(failure)) => return Err(project_failure(body, &owner.source, failure)),
-            None => return Err(ProjectCheck::Unsupported),
+        let target = (target_module, target_item);
+        if !self.active.insert(target) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let mut nested_error = None;
+        let checked = check_integer_requirements_at_entry(body, exact, &mut |caller, occurrence| {
+            match self.nested(caller, occurrence) {
+                Ok(()) => true,
+                Err(error) => {
+                    nested_error = Some(error);
+                    false
+                }
+            }
+        });
+        self.active.remove(&target);
+        match checked {
+            Some(Ok(())) => {
+                self.reached.insert(target);
+                Ok(())
+            }
+            Some(Err(failure)) => Err(project_failure(body, &owner.source, failure)),
+            None => Err(nested_error.unwrap_or(ProjectCheck::Unsupported)),
         }
     }
-    visits[ordinal] = InitializationVisit::Completed;
-    Ok(())
 }
 
 fn check_closed_project_callable(
@@ -1509,7 +1562,7 @@ mod tests {
                 local = namespace demo "src/local.w";
                 dep = namespace dependency "src/lib.w";
                 unit(u8) actual = fn(value) {{
-                    if (value == 0) {{ local.unreachable_to_caller(7); }};
+                    if (value == 0) {{ local.unreachable_to_caller(value); }};
                     core.require(value <= 10, {OUTPUT});
                 }};
                 actual({argument});
@@ -1552,6 +1605,54 @@ mod tests {
             let unsupported = prepare(argument, 10, 255);
             assert_eq!(check_package_roots(&unsupported), Err(ProjectCheck::Unsupported));
         }
+    }
+
+    #[test]
+    fn actual_nested_calls_use_each_reaching_literal_context_and_callee_failure() {
+        let app = source("src/main.w", "actual-nested");
+        let dependency = source("src/lib.w", "actual-callee");
+        let prepare = |second: &str| {
+            let text = format!(r#"%%start
+                lib = namespace demo "src/lib.w";
+                unit() enter = fn {{ lib.gate(7); lib.gate({second}); }};
+                enter();
+            %%end"#);
+            let library = format!(r#"%%start
+                unit(u8) gate = fn(value) {{ if (value == 0) {{}}; core.require(value <= 10, {OUTPUT}); }};
+            %%end"#);
+            let start = text.find("lib =").unwrap();
+            let end = start + text[start..].find(';').unwrap() + 1;
+            prepare_checker_project(
+                vec![
+                    (declarations(&app, &text), vec![ScalarNamespaceBinding {
+                        binding: "lib".into(), target: dependency.clone(),
+                        span: ByteSpan::new(start as u32, end as u32),
+                    }]),
+                    (declarations(&dependency, &library), Vec::new()),
+                ],
+                vec![app.clone(), dependency.clone()],
+                inputs(),
+            ).unwrap()
+        };
+        let actual = prepare("9");
+        assert_eq!(check_package_roots(&actual), Ok(()));
+        let failure = prepare("11");
+        let Err(ProjectCheck::Failed { source, state, .. }) = check_package_roots(&failure) else {
+            panic!("expected the second nested call's authored failure");
+        };
+        assert_eq!(source, dependency);
+        assert!(state.includes(&[11]));
+        assert!(!state.includes(&[7]));
+        let unsupported = prepare("3 + 4");
+        assert_eq!(check_package_roots(&unsupported), Err(ProjectCheck::Unsupported));
+    }
+
+    #[test]
+    fn reachable_nested_recursion_is_not_a_completed_package() {
+        let file = source("src/main.w", "actual-cycle");
+        let text = "%%start\nunit() cycle = fn { cycle(); };\ncycle();\n%%end";
+        let prepared = prepare_proof_target(&file, text).unwrap();
+        assert_eq!(check_package_roots(&prepared), Err(ProjectCheck::Unsupported));
     }
 
     #[test]

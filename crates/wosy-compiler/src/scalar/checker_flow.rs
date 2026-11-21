@@ -356,15 +356,19 @@ pub(super) enum ProofCoverage<T> {
 pub(super) fn check_integer_requirements(
     calls: &FunctionCallSites,
 ) -> Option<Result<(), IntegerCheckFailure<'_>>> {
-    run_integer_callable(calls, integer_tail_type(calls), None, None, None, None)
+    run_integer_callable(calls, integer_tail_type(calls), None, None, None, None, None)
         .map(|result| result.map(drop))
 }
+
+type ActualCallHandler<'a, 'handler> = dyn FnMut(&'a FunctionCallSites, OccurrenceOrdinal) -> bool + 'handler;
 
 pub(super) fn check_integer_requirements_at_entry<'a>(
     calls: &'a FunctionCallSites,
     arguments: &[&BigInt],
+    handle_call: &mut ActualCallHandler<'a, '_>,
 ) -> Option<Result<(), IntegerCheckFailure<'a>>> {
-    run_integer_callable(calls, None, None, None, None, Some(arguments)).map(|result| result.map(drop))
+    run_integer_callable(calls, None, None, None, None, Some(arguments), Some(handle_call))
+        .map(|result| result.map(drop))
 }
 
 pub(super) fn proves_requirement_with_imported_root_local(
@@ -374,7 +378,7 @@ pub(super) fn proves_requirement_with_imported_root_local(
     if local.values.is_empty() {
         return None;
     }
-    match run_integer_callable(calls, integer_tail_type(calls), None, None, Some(local), None)? {
+    match run_integer_callable(calls, integer_tail_type(calls), None, None, Some(local), None, None)? {
         Ok(ProofCoverage::Applicable(())) => Some(true),
         Ok(ProofCoverage::NoApplicableInputs) => None,
         Err(_) => Some(false),
@@ -397,7 +401,7 @@ fn observe_integer_returns_in_scope<'a>(
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
     let tail = integer_tail_type(calls)?;
     let mut paths = Vec::new();
-    match run_integer_callable(calls, Some(tail), entry_filter, Some(&mut paths), None, None)? {
+    match run_integer_callable(calls, Some(tail), entry_filter, Some(&mut paths), None, None, None)? {
         Ok(ProofCoverage::Applicable(())) if !paths.is_empty() => {
             Some(Ok(ProofCoverage::Applicable(paths)))
         }
@@ -481,6 +485,7 @@ fn run_integer_callable<'a>(
     returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
     imported_local: Option<ImportedLocal<'a>>,
     exact_arguments: Option<&[&BigInt]>,
+    mut handle_call: Option<&mut ActualCallHandler<'a, '_>>,
 ) -> Option<Result<ProofCoverage<()>, IntegerCheckFailure<'a>>> {
     let boundary = &calls.boundary;
     let checker_parameters = boundary.checker_parameter_bindings.as_deref()?;
@@ -511,7 +516,7 @@ fn run_integer_callable<'a>(
         }
         root = applicable;
     }
-    let result = walk_integer_block(calls, &mut roots, calls.structure.root, root, tail, returns)?;
+    let result = walk_integer_block(calls, &mut roots, calls.structure.root, root, tail, returns, &mut handle_call)?;
     if roots.imported_local.is_some() {
         return None;
     }
@@ -530,6 +535,7 @@ fn walk_integer_block<'a>(
     mut path: IntegerInputs,
     tail: Option<&'a ScalarType>,
     mut returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
+    handle_call: &mut Option<&mut ActualCallHandler<'a, '_>>,
 ) -> Option<IntegerControl<'a>> {
     let depth = roots.axes.len();
     let structure = &calls.structure;
@@ -558,6 +564,10 @@ fn walk_integer_block<'a>(
                         }
                         CheckerOperation::Require | CheckerOperation::Narrow => path = passing,
                     }
+                } else if structure.checker_direct_targets.contains_key(&expression) {
+                    if !handle_call.as_mut()?(calls, expression) {
+                        return None;
+                    }
                 } else {
                     let ConditionalRegion::Unit { condition, then_block, .. } =
                         calls.conditionals.get(&expression)?
@@ -566,7 +576,7 @@ fn walk_integer_block<'a>(
                     };
                     let predicate = structure.checker_branches.get(condition)?;
                     let (yes, no, axis) = path.split(roots, predicate)?;
-                    match walk_integer_block(calls, roots, *then_block, yes, None, None)? {
+                    match walk_integer_block(calls, roots, *then_block, yes, None, None, handle_call)? {
                         IntegerControl::Continue(then_path) => path = then_path.join(no, axis),
                         failure @ IntegerControl::Fail(_) => return Some(failure),
                         IntegerControl::Returned => return None,
@@ -592,7 +602,7 @@ fn walk_integer_block<'a>(
                         if incoming.is_unreachable() {
                             continue;
                         }
-                        match walk_integer_block(calls, roots, arm, incoming, Some(expected), returns.as_deref_mut())? {
+                        match walk_integer_block(calls, roots, arm, incoming, Some(expected), returns.as_deref_mut(), handle_call)? {
                             IntegerControl::Returned => {}
                             failure @ IntegerControl::Fail(_) => return Some(failure),
                             IntegerControl::Continue(_) => return None,

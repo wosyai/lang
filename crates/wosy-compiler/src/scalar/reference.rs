@@ -6068,7 +6068,7 @@ pub(super) struct OccurrenceStructure {
     #[cfg(test)]
     pub(super) checker_integer_literals: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(test)]
-    pub(super) checker_initializer_targets: HashMap<OccurrenceOrdinal, (usize, usize)>,
+    pub(super) checker_direct_targets: HashMap<OccurrenceOrdinal, (usize, usize)>,
     #[cfg(test)]
     pub(super) checker_integer_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(test)]
@@ -6099,7 +6099,7 @@ impl OccurrenceStructure {
             #[cfg(test)]
             checker_integer_literals: HashMap::new(),
             #[cfg(test)]
-            checker_initializer_targets: HashMap::new(),
+            checker_direct_targets: HashMap::new(),
             #[cfg(test)]
             checker_integer_locals: HashMap::new(),
             #[cfg(test)]
@@ -6846,7 +6846,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     | OccurrenceEdge::BindingRoot { .. }
                     | OccurrenceEdge::FinalOutput { .. }
             ) || (matches!(edge, OccurrenceEdge::CallArgument(0))
-                && matches!(self.mode, WalkMode::ModuleInitialization { .. })))
+                && matches!(self.mode, WalkMode::Callable(_) | WalkMode::ModuleInitialization { .. })))
             && self.structure.checked_types.expressions.get(&ordinal).is_some_and(is_integer_type)
         {
             if let ScalarExpression::Integer { value, .. } = expression {
@@ -7065,6 +7065,7 @@ impl CallableTargetResolver<'_> {
         names: &BTreeMap<String, WalkBinding>,
         types: &BTreeMap<String, ScalarType>,
         signature: Option<&CheckedCallSignature>,
+        #[cfg(test)] ordinary_origin: &mut Option<(usize, usize)>,
     ) -> Result<(ResolvedCallTarget, bool), ReferenceAnalysisError> {
         let ScalarExpression::Call {
             receiver,
@@ -7125,6 +7126,15 @@ impl CallableTargetResolver<'_> {
                             checked_overload_selection(signature, origin)?.clone(),
                         ),
                     }),
+                    #[cfg(test)]
+                    CallDeclaration::Function(source, declaration_span, CallFunctionKind::Ordinary, origin) => {
+                        *ordinary_origin = Some(origin);
+                        Some(ResolvedCallTarget::ModuleCallable {
+                            source: source.clone(),
+                            declaration_span,
+                            concrete: ConcreteCallSelection::Declaration,
+                        })
+                    }
                     CallDeclaration::Function(source, declaration_span, _, _)
                     | CallDeclaration::Binding(source, declaration_span) => {
                         Some(ResolvedCallTarget::ModuleCallable {
@@ -7155,12 +7165,13 @@ impl CallableWalk<'_> {
         types: &BTreeMap<String, ScalarType>,
         signature: Option<&CheckedCallSignature>,
         reserve_legacy: bool,
+        #[cfg(test)] ordinary_origin: &mut Option<(usize, usize)>,
     ) -> Result<(), ReferenceAnalysisError> {
         use std::collections::btree_map::Entry;
 
         let (target, declared_unsafe) = self
             .target_resolver
-            .resolve(expression, names, types, signature)?;
+            .resolve(expression, names, types, signature, #[cfg(test)] ordinary_origin)?;
         if declared_unsafe {
             self.declared_unsafe_calls.insert(ordinal.0);
         }
@@ -7327,6 +7338,8 @@ impl StructuralWalker<'_, '_> {
                 }
                 match &mut self.mode {
                     WalkMode::Callable(callable) => {
+                        #[cfg(test)]
+                        let mut ordinary_origin = None;
                         callable.register_call(
                             ordinal,
                             expression,
@@ -7334,7 +7347,15 @@ impl StructuralWalker<'_, '_> {
                             types,
                             self.checked_call_signatures.get(&ordinal),
                             self.reserve_legacy_occurrences[ordinal.0],
+                            #[cfg(test)]
+                            &mut ordinary_origin,
                         )?;
+                        #[cfg(test)]
+                        if self.occurrence_typing.checker_directives_enabled() {
+                            if let Some(origin) = ordinary_origin {
+                                self.structure.checker_direct_targets.insert(ordinal, origin);
+                            }
+                        }
                     }
                     WalkMode::CallableAllocationLength(resolver) => {
                         let (target, _) = resolver.resolve(
@@ -7342,6 +7363,8 @@ impl StructuralWalker<'_, '_> {
                             names,
                             types,
                             self.checked_call_signatures.get(&ordinal),
+                            #[cfg(test)]
+                            &mut None,
                         )?;
                         self.structural_calls.push(ordinal);
                         assert!(self
@@ -7368,7 +7391,7 @@ impl StructuralWalker<'_, '_> {
                         #[cfg(test)]
                         if self.occurrence_typing.checker_directives_enabled() {
                             if let Some(origin) = ordinary_origin {
-                                self.structure.checker_initializer_targets.insert(ordinal, origin);
+                                self.structure.checker_direct_targets.insert(ordinal, origin);
                             }
                         }
                         if self.reserve_legacy_occurrences[ordinal.0]
