@@ -159,6 +159,20 @@ def main():
         local_incomplete = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
         assert local_incomplete.returncode == 2 and local_incomplete.stdout == b"", local_incomplete
         assert local_incomplete.stderr == b"ordered check: incomplete: checker did not complete analysis\n", local_incomplete
+        main_command = [*command, "--main-flow-only"]
+        local_main = subprocess.run(main_command, cwd=root, capture_output=True, timeout=15)
+        expected_main = local.stdout.replace(b"unused proof failures: 1", b"unused proof failures: 0")
+        assert (local_main.returncode, local_main.stdout, local_main.stderr) == (1, expected_main, b""), local_main
+
+        source.write_text(
+            '%%start lib = namespace app "lib.w"; i8 result = lib.echo(4); %%end',
+            encoding="utf-8",
+        )
+        local_main_pass = subprocess.run(main_command, cwd=root, capture_output=True, timeout=15)
+        expected_pass = expected_main.replace(b"actual proof failures: 1", b"actual proof failures: 0")
+        assert (local_main_pass.returncode, local_main_pass.stdout, local_main_pass.stderr) == (
+            0, expected_pass, b""
+        ), local_main_pass
         assert sorted(entry.name for entry in root.iterdir()) == ["lib.w", "main.w", "wosy.toml"]
 
 

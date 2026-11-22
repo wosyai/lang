@@ -13,7 +13,9 @@ use wosy_project::{ProjectConfiguration, ProjectContext};
 mod canonical_loader;
 use canonical_loader::{load_canonical_project_inputs, CanonicalLoadPurpose};
 
-fn inspect(root: &Path, target: &str, profile: &str) -> Result<MainFlowProofReceipt, &'static str> {
+fn inspect(
+    root: &Path, target: &str, profile: &str, scope: ScalarCheckerScope,
+) -> Result<MainFlowProofReceipt, &'static str> {
     let root = root.canonicalize().map_err(|_| "invalid project root")?;
     let (configuration, manifest) =
         ProjectConfiguration::load_with_manifest(&root).map_err(|_| "invalid manifest")?;
@@ -30,7 +32,7 @@ fn inspect(root: &Path, target: &str, profile: &str) -> Result<MainFlowProofRece
     ).map_err(|_| "canonical source load failed")?;
     check_loaded_scalar_ordered_local_proof_contexts(
         loaded.declarations, loaded.proofs.into_values(), loaded.initialization_order, ScalarPreparationInputs { target_layout },
-        ScalarCheckerScope::CurrentPackage,
+        scope,
     ).map_err(|outcome| match outcome {
         ScalarOrderedCheckerOutcome::Invalid(_) => "checker rejected invalid input",
         _ => "checker did not complete analysis",
@@ -55,15 +57,20 @@ fn render(report: &MainFlowProofReceipt) -> String {
 
 fn main() -> ExitCode {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
-    let [root, target, profile] = args.as_slice() else {
-        eprintln!("expected explicit PROJECT_ROOT TARGET PROFILE");
-        return ExitCode::from(2);
+    let (root, target, profile, scope) = match args.as_slice() {
+        [root, target, profile] => (root, target, profile, ScalarCheckerScope::CurrentPackage),
+        [root, target, profile, option] if option == "--main-flow-only" =>
+            (root, target, profile, ScalarCheckerScope::MainFlowOnly),
+        _ => {
+            eprintln!("expected explicit PROJECT_ROOT TARGET PROFILE [--main-flow-only]");
+            return ExitCode::from(2);
+        }
     };
     let (Some(target), Some(profile)) = (target.to_str(), profile.to_str()) else {
         eprintln!("invalid target or profile");
         return ExitCode::from(2);
     };
-    let report = match inspect(Path::new(root), target, profile) {
+    let report = match inspect(Path::new(root), target, profile, scope) {
         Ok(report) => report,
         Err(reason) => {
             eprintln!("ordered check: incomplete: {reason}");
