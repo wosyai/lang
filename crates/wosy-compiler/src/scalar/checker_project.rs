@@ -2096,6 +2096,20 @@ struct PlannedModuleProof<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+#[derive(Default)]
+struct UnusedModuleProofGroup<'plan, 'project> {
+    direct: Vec<(usize, &'plan PlannedModuleProof<'project>)>,
+    peer_uses: Vec<(usize, &'plan PlannedModuleProof<'project>, &'plan str)>,
+}
+
+#[cfg(feature = "internal-checker")]
+enum CheckedPeerLeaf {
+    Proven,
+    Refuted,
+    Unavailable,
+}
+
+#[cfg(feature = "internal-checker")]
 impl PreparedProofModule {
     #[cfg(test)]
     fn plan_module_proof<'a>(&'a self, proof_source: &SourceIdentity, proof_name: &'a str) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
@@ -2166,7 +2180,7 @@ impl PreparedProofModule {
                 }
             }
         }
-        self.run_module_proof_plans(&plans, selected.len() == 1, &mut outcomes);
+        self.run_module_proof_plans(&plans, &selected, &mut outcomes);
         for (index, first) in duplicate {
             outcomes[index] = outcomes[first].clone();
         }
@@ -2176,7 +2190,7 @@ impl PreparedProofModule {
     fn run_module_proof_plans(
         &self,
         plans: &[(usize, PlannedModuleProof<'_>)],
-        one_distinct_selection: bool,
+        selected: &HashMap<(&SourceIdentity, &str), usize>,
         outcomes: &mut [ScalarModuleProofOutcome],
     ) {
         if plans.is_empty() {
@@ -2185,7 +2199,7 @@ impl PreparedProofModule {
         let Ok((root, ordinals)) = package_initialization_order(self.prepared.parts().0) else { return; };
         let mut independently_checked = None;
         let mut induction = None;
-        if let (true, [(_, plan)]) = (one_distinct_selection, plans) {
+        if let (true, [(_, plan)]) = (selected.len() == 1, plans) {
             if plan.proof_source == root && &plan.typed.target.source == root
                 && matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
             {
@@ -2210,7 +2224,7 @@ impl PreparedProofModule {
         let Ok((initialization, observers)) =
             check_package_initialization_observing(&self.prepared, root, ordinals, observers)
         else { return; };
-        let mut arbitrary_groups = HashMap::<_, Vec<_>>::new();
+        let mut arbitrary_groups = HashMap::<_, UnusedModuleProofGroup<'_, '_>>::new();
         for ((index, plan), observer) in plans.iter().zip(observers.proofs) {
             let Some(&proof_module) = initialization.ordinals.get(plan.proof_source) else { continue; };
             if initialization.visits[proof_module] != InitializationVisit::Completed
@@ -2236,19 +2250,92 @@ impl PreparedProofModule {
                 continue;
             } else if plan.uses_direct_goal() {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
-                arbitrary_groups.entry(key).or_default().push((*index, plan));
+                arbitrary_groups.entry(key).or_default().direct.push((*index, plan));
+            } else if let Some(peer) = plan.direct_peer_use() {
+                let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
+                arbitrary_groups.entry(key).or_default().peer_uses.push((*index, plan, peer));
             } else {
                 outcomes[*index] = module_proof_outcome(plan.verify_arbitrary_with_steps());
             }
         }
         for ((_, guard), group) in arbitrary_groups {
-            let body = group[0].1.typed.body;
+            let body = group.direct.first().map(|entry| entry.1)
+                .or_else(|| group.peer_uses.first().map(|entry| entry.1))
+                .expect("nonempty unused proof group").typed.body;
             if !valid_arbitrary_proof_body(body) {
+                continue;
+            }
+            let mut peers = HashMap::new();
+            for (index, plan, peer) in group.peer_uses {
+                let identity = (plan.proof_source, peer);
+                let admitted = peers.entry(identity).or_insert_with(|| {
+                    let compatible = |leaf: &PlannedModuleProof<'_>| {
+                        leaf.typed.measure.is_none() && leaf.steps.items.is_empty()
+                            && leaf.target == plan.target && leaf.canonical_target == plan.canonical_target
+                            && !is_null_literal_name(&leaf.typed.output)
+                            && !leaf.typed.input_names.iter().any(|name| is_null_literal_name(name))
+                            && ExactGuardGroup(leaf.filter.as_deref()) == guard
+                    };
+                    let (relation, bound) = if let Some(request) = selected.get(&identity) {
+                        let at = plans.binary_search_by_key(request, |(index, _)| *index).ok()?;
+                        let leaf = &plans[at].1;
+                        if !compatible(leaf) {
+                            return None;
+                        }
+                        let TypedProofGoal::Literal { operator: BinaryOperator::Equal, relation, bound } = &leaf.typed.goal
+                            else { return None; };
+                        (*relation, Cow::Borrowed(bound))
+                    } else {
+                        let leaf = self.plan_module_proof_in_scope::<false, true, false>(plan.proof_source, peer).ok()?;
+                        if !compatible(&leaf) {
+                            return None;
+                        }
+                        let TypedProofGoal::Literal { operator: BinaryOperator::Equal, relation, bound } = leaf.typed.goal
+                            else { return None; };
+                        (relation, Cow::Owned(bound))
+                    };
+                    Some((relation, bound, Vec::new()))
+                });
+                if let Some((_, _, uses)) = admitted {
+                    uses.push((index, plan));
+                }
+            }
+            if group.direct.is_empty() && peers.values().all(Option::is_none) {
                 continue;
             }
             match observe_unused_module_proof_returns(body, guard.0) {
                 Some(Ok(ProofCoverage::Applicable(paths))) => {
-                    for (index, plan) in group {
+                    let mut checked_peers = HashMap::new();
+                    for (identity, admitted) in peers {
+                        let Some((relation, bound, consumers)) = admitted else { continue; };
+                        let proof = paths.iter().map(|path| path.output_satisfies(relation, &bound))
+                            .find(|holds| *holds != Some(true)).unwrap_or(Some(true));
+                        let checked = if proof == Some(true) {
+                            for (index, consumer) in consumers {
+                                let TypedProofGoal::Literal { relation, bound: requested, .. } = &consumer.typed.goal else { continue; };
+                                outcomes[index] = if relation.accepts(bound.as_ref().cmp(requested)) {
+                                    ScalarModuleProofOutcome::Proved
+                                } else {
+                                    ScalarModuleProofOutcome::Refuted
+                                };
+                            }
+                            CheckedPeerLeaf::Proven
+                        } else if proof == Some(false) {
+                            CheckedPeerLeaf::Refuted
+                        } else {
+                            CheckedPeerLeaf::Unavailable
+                        };
+                        checked_peers.insert(identity, checked);
+                    }
+                    for (index, plan) in group.direct {
+                        if let Some(peer) = checked_peers.get(&(plan.proof_source, plan.name)) {
+                            outcomes[index] = match peer {
+                                CheckedPeerLeaf::Proven => ScalarModuleProofOutcome::Proved,
+                                CheckedPeerLeaf::Refuted => ScalarModuleProofOutcome::Refuted,
+                                CheckedPeerLeaf::Unavailable => ScalarModuleProofOutcome::Unsupported,
+                            };
+                            continue;
+                        }
                         let goal = &plan.typed.goal;
                         let entry = if let TypedProofGoal::EntryComparison { slot, relation } = goal {
                             let Some(binding) = body.boundary.checker_parameter_bindings.as_ref().and_then(|bindings| bindings.get(*slot)) else {
@@ -2286,8 +2373,13 @@ impl PreparedProofModule {
                     }
                 }
                 Some(Ok(ProofCoverage::NoApplicableInputs)) if guard.0.is_some() => {
-                    for (index, _) in group {
+                    for (index, _) in group.direct {
                         outcomes[index] = ScalarModuleProofOutcome::NoApplicableInputs;
+                    }
+                    for (_, _, consumers) in peers.into_values().flatten() {
+                        for (index, _) in consumers {
+                            outcomes[index] = ScalarModuleProofOutcome::NoApplicableInputs;
+                        }
                     }
                 }
                 _ => (),
@@ -2341,6 +2433,39 @@ impl PlannedModuleProof<'_> {
             goal: &self.typed.goal,
             coverage: ActualProofCoverage::Unseen,
         }
+    }
+
+    fn direct_peer_use(&self) -> Option<&str> {
+        let boundary = &self.typed.body.boundary;
+        let bindings = boundary.checker_parameter_bindings.as_deref()?;
+        if bindings.len() != self.typed.input_names.len() || !boundary.parameters.iter().all(|slot| is_integer_type(&slot.ty)) {
+            return None;
+        }
+        if !matches!(self.typed.goal, TypedProofGoal::Literal { .. })
+            || !matches!(self.typed.input_names.len(), 1 | 2)
+            || is_null_literal_name(&self.typed.output)
+            || self.typed.input_names.iter().any(|name| is_null_literal_name(name))
+            || self.steps.terminated_items.as_slice() != [true]
+        {
+            return None;
+        }
+        let [ScalarBlockItem::Expression(ScalarExpression::Call {
+            receiver: Some(core), name: use_step, type_arguments: use_types, arguments: use_arguments, ..
+        })] = self.steps.items.as_slice() else { return None; };
+        if core != "core" || use_step != "use" || !use_types.is_empty() {
+            return None;
+        }
+        let [ScalarExpression::Call {
+            receiver: None, name: peer, type_arguments, arguments, ..
+        }] = use_arguments.as_slice() else { return None; };
+        if peer == self.name || !type_arguments.is_empty() || arguments.len() != self.typed.input_names.len()
+            || !arguments.iter().zip(&self.typed.input_names).all(|(argument, input)| {
+                matches!(argument, ScalarExpression::Name { name, .. } if name == input)
+            })
+        {
+            return None;
+        }
+        Some(peer)
     }
 
     fn verify_arbitrary_with_steps(&self) -> Result<ProjectCheck, ProjectCheck> {

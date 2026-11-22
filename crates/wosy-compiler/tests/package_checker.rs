@@ -984,6 +984,59 @@ fn sequential_named_proof_shows_reject_the_intrinsic_null_as_an_integer_alias() 
 }
 
 #[test]
+fn named_proof_peer_use_checks_one_independent_same_domain_leaf() {
+    let identity = source();
+    let check = |leaf: &str, consumer_guard: &str, goal: &str, use_step: &str, startup: &str, names: &[&str]| {
+        check_scalar_module_proofs(
+            identity.clone(), names,
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    u8(u8, u8) fixed = fn(x, y) {{ if (x == 0) {{}}; if (y == 0) {{}}; 7 }};
+                    u8(u8, u8) other = fn(x, y) {{ if (x == 0) {{}}; if (y == 0) {{}}; 7 }};
+                    {startup}
+                    {leaf}
+                    proof consumer for fixed(first, second) -> (out) where ({consumer_guard}) ensures ({goal}) {{
+                        {use_step}
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ).unwrap()
+    };
+    let leaf = "proof leaf for fixed(a, b) -> (value) where (a == 7) ensures (value == 7) {}";
+    let good = "core.use(leaf(first, second));";
+    let guard = "first == 7";
+    let one = |leaf, guard, goal, step, startup| check(leaf, guard, goal, step, startup, &["consumer"]);
+    assert_eq!(one(leaf, guard, "out <= 7", good, ""), [ScalarModuleProofOutcome::Proved]);
+    assert_eq!(check(leaf, guard, "out <= 7", good, "", &["consumer", "leaf"]), [
+        ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Proved,
+    ]);
+    assert_eq!(one(leaf, guard, "out < 7", good, ""), [ScalarModuleProofOutcome::Refuted]);
+    assert_eq!(one(leaf, "first <= 7", "out <= 7", good, ""), [ScalarModuleProofOutcome::Unsupported]);
+    assert_eq!(one(leaf, guard, "out <= 7", "core.use(leaf(second, first));", ""), [ScalarModuleProofOutcome::Unsupported]);
+    assert_eq!(one(leaf, guard, "out <= 7", "core.use(consumer(first, second));", ""), [ScalarModuleProofOutcome::Unsupported]);
+    assert_eq!(one("", guard, "out <= 7", good, ""), [ScalarModuleProofOutcome::Unsupported]);
+    let wrong_target = leaf.replace("for fixed", "for other");
+    let false_leaf = leaf.replace("value == 7", "value == 8");
+    assert_eq!(one(&wrong_target, guard, "out <= 7", good, ""), [ScalarModuleProofOutcome::Unsupported]);
+    assert_eq!(one(&false_leaf, guard, "out <= 7", good, ""),
+        [ScalarModuleProofOutcome::Unsupported]);
+    let invalid = leaf.replace("value == 7", "value == 256");
+    assert!(matches!(check(&invalid, guard, "out <= 7", good, "", &["consumer", "leaf"]).as_slice(),
+        [ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Invalid(_)]));
+    let cycle = leaf.replace("{}", "{ core.use(consumer(a, b)); }");
+    assert_eq!(check(&cycle, guard, "out <= 7", good, "", &["consumer", "leaf"]), [
+        ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Unsupported,
+    ]);
+    let empty_leaf = leaf.replace("a == 7", "false");
+    assert_eq!(one(&empty_leaf, "false", "out <= 7", good, ""), [ScalarModuleProofOutcome::NoApplicableInputs]);
+    assert_eq!(one(leaf, guard, "out <= 7", good, "u8 actual = fixed(7, 0);"), [ScalarModuleProofOutcome::Unsupported]);
+}
+
+#[test]
 fn verified_bound_checks_both_ordered_typed_call_arguments_and_repeated_aliases() {
     let identity = source();
     let use_bound = |proof: &str, caller: &str, extra: &str| {
