@@ -9101,6 +9101,8 @@ impl<'a> ReferenceOutputContracts<'a> {
 struct ReferenceContractReplay {
     module_calls: Vec<CfgPointId>,
     errors: Vec<ReferenceAnalysisError>,
+    #[cfg(test)]
+    transfers: usize,
 }
 
 fn collect_function_output_contracts<'a>(
@@ -9164,6 +9166,61 @@ fn collect_function_output_contracts<'a>(
     }
 }
 
+fn reset_contract_replay_points(live: &mut Vec<ReferenceFlowPoint>, pristine: &[ReferenceFlowPoint]) {
+    if live.len() != pristine.len() {
+        *live = pristine.to_vec();
+        return;
+    }
+    for (live, pristine) in live.iter_mut().zip(pristine) {
+        if live.id == pristine.id && matches!((&live.kind, &pristine.kind),
+            (CfgPointKind::Call { .. }, CfgPointKind::Call { .. })
+            | (CfgPointKind::Branch { .. }, CfgPointKind::Branch { .. }))
+        {
+            live.possible_origins.clone_from(&pristine.possible_origins);
+        } else {
+            live.clone_from(pristine);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn contract_replay_reset_reuses_only_matching_call_and_branch_structure() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 10);
+    let point = |kind| ReferenceFlowPoint {
+        id: CfgPointId(0), kind, source_span: SourceSpan::new(source.clone(), span),
+        scope: ReferenceScopeId(0), possible_origins: None, successors: vec![CfgPointId(1)],
+    };
+    let branch = point(CfgPointKind::Branch { condition: ScalarExpression::Boolean { value: true, span } });
+    let pristine = [branch.clone()];
+    let mut live = vec![branch];
+    live[0].possible_origins = Some(BTreeSet::from([ReferenceOriginId(0)]));
+    let successors = live[0].successors.as_ptr();
+    reset_contract_replay_points(&mut live, &pristine);
+    assert_eq!(live[0].successors.as_ptr(), successors);
+    assert_eq!(live.as_slice(), &pristine);
+
+    live[0].id = CfgPointId(2);
+    live[0].kind = CfgPointKind::Branch { condition: ScalarExpression::Boolean { value: false, span } };
+    reset_contract_replay_points(&mut live, &pristine);
+    assert_eq!(live.as_slice(), &pristine);
+
+    live[0].kind = CfgPointKind::Evaluate(ScalarExpression::Boolean { value: false, span });
+    reset_contract_replay_points(&mut live, &pristine);
+    assert_eq!(live.as_slice(), &pristine);
+
+    live.push(point(CfgPointKind::ScopeExit));
+    reset_contract_replay_points(&mut live, &pristine);
+    assert_eq!(live.as_slice(), &pristine);
+
+    let mut evaluated = pristine.clone();
+    evaluated[0].kind = CfgPointKind::Evaluate(ScalarExpression::Boolean { value: true, span });
+    live[0].kind = CfgPointKind::Evaluate(ScalarExpression::Boolean { value: false, span });
+    reset_contract_replay_points(&mut live, &evaluated);
+    assert_eq!(live.as_slice(), &evaluated);
+}
+
 fn transfer_function_output_contracts<'a>(
     result: &mut FunctionReferenceResult,
     previous: &ReferenceOutputContracts<'_>,
@@ -9222,7 +9279,7 @@ fn transfer_function_output_contracts<'a>(
         }
     }
     if !result.cfg.initial_points.is_empty() && changed {
-        result.cfg.points = result.cfg.initial_points.clone();
+        reset_contract_replay_points(&mut result.cfg.points, &result.cfg.initial_points);
         let candidate = match (&result.proof_points.scalar_descriptor_install, &result.proof_points.backing_descriptor_install) {
             (ScalarDescriptorCandidates::One(destination, marker), _) => Some((destination, marker)),
             (ScalarDescriptorCandidates::None, ScalarDescriptorCandidates::One(destination, marker))
@@ -9244,6 +9301,10 @@ fn transfer_function_output_contracts<'a>(
             None,
             descriptor.as_mut(),
         );
+        #[cfg(test)]
+        {
+            replay.transfers += 1;
+        }
         result.aggregate.checked_producer_authoritative = transferred.is_empty()
             && !result.aggregate.checked_producer_sources.is_empty()
             && result.aggregate.checked_producer_sources.iter().all(|(_, terminal)| {
