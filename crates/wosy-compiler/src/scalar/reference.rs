@@ -11455,26 +11455,29 @@ fn specialize_reference_results(
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
 ) -> Vec<ReferenceAnalysisError> {
-    let templates = ReferenceTemplateIndex::new(modules);
     let mut errors = Vec::new();
     let mut updates = Vec::new();
-    for module in modules.iter() {
-        #[cfg(test)]
-        stage_observations::record_copy_specialization();
-        let mut module_updates = Vec::new();
-        for (ordinal, result) in module.results.iter() {
-            let ScalarItem::Function(function) = &module.items[*ordinal] else {
-                unreachable!("function result ordinal")
-            };
-            let (update, current_errors) = derive_function_specialized_copy_policies(
-                function, result, &templates, structs, enums,
-            );
-            module_updates.push(update);
-            errors.extend(current_errors);
+    {
+        let index = std::cell::OnceCell::new();
+        let views: &[ModuleReferenceView<'_>] = modules;
+        let templates = || index.get_or_init(|| ReferenceTemplateIndex::new(views));
+        for module in views {
+            #[cfg(test)]
+            stage_observations::record_copy_specialization();
+            let mut module_updates = Vec::new();
+            for (ordinal, result) in module.results.iter() {
+                let ScalarItem::Function(function) = &module.items[*ordinal] else {
+                    unreachable!("function result ordinal")
+                };
+                let (update, current_errors) = derive_function_specialized_copy_policies(
+                    function, result, &templates, structs, enums,
+                );
+                module_updates.push(update);
+                errors.extend(current_errors);
+            }
+            updates.push(module_updates);
         }
-        updates.push(module_updates);
     }
-    drop(templates);
     for (module, updates) in modules.iter_mut().zip(updates) {
         for ((_, result), update) in module.results.iter_mut().zip(updates) {
             update.apply(result);
@@ -11483,10 +11486,10 @@ fn specialize_reference_results(
     errors
 }
 
-fn derive_function_specialized_copy_policies(
+fn derive_function_specialized_copy_policies<'a>(
     function: &ScalarFunction,
     result: &FunctionReferenceResult,
-    templates: &ReferenceTemplateIndex<'_>,
+    templates: &impl Fn() -> &'a ReferenceTemplateIndex<'a>,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
 ) -> (FunctionPolicyResult, Vec<ReferenceAnalysisError>) {
@@ -11523,7 +11526,7 @@ fn derive_function_specialized_copy_policies(
             source_span: point.source_span.clone(),
             reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
         };
-        let Some((declaration, declaration_result)) = templates
+        let Some((declaration, declaration_result)) = templates()
             .modules
             .get(source)
             .and_then(|module| module.get(declaration_span))
