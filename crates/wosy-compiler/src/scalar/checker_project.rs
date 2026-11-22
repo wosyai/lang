@@ -1406,6 +1406,7 @@ mod production_bound_reuse {
         (caller_source, caller_name): (&SourceIdentity, &str),
     ) -> Option<ScalarProofCallOutcome> {
         let plan = project.plan_module_proof(source, name).ok()?;
+        let TypedProofGoal::Literal { operator, relation, bound } = &plan.typed.goal else { return None; };
         let (scalar, calls) = project.prepared.parts();
         let caller = select_checked_root(scalar, caller_source, caller_name).ok()?;
         let (root, ordinals) = package_initialization_order(scalar).ok()?;
@@ -1433,7 +1434,7 @@ mod production_bound_reuse {
         let site = body.resolved_call_site(origin.call)?;
         let signature = body.checked_call_signatures.get(&origin.call)?;
         let identity = (plan.proof_source, wosy_syntax::byte_span(plan.proof), name);
-        let verified = VerifiedModuleBound::establish(project, &plan, identity)?;
+        let verified = VerifiedModuleBound::establish(project, &plan, identity, (operator, *relation, bound))?;
         verified.consume(project, identity, scalar.modules[caller.0].target_layout, body, position, origin, &site.target, signature)
     }
 
@@ -1442,6 +1443,7 @@ mod production_bound_reuse {
             issuer: &'a PreparedProofModule,
             plan: &'a PlannedModuleProof<'_>,
             proof_identity: (&'a SourceIdentity, ByteSpan, &'a str),
+            (operator, relation, bound): (&BinaryOperator, IntegerRelation, &BigInt),
         ) -> Option<Self> {
             let body = plan.typed.body;
             if !plan.steps.items.is_empty() || !valid_arbitrary_proof_body(body) {
@@ -1462,10 +1464,10 @@ mod production_bound_reuse {
             let ProofCoverage::Applicable(paths) = observe_arbitrary_integer_returns(body, plan.filter.as_deref())?.ok()? else {
                 return None;
             };
-            if !paths.iter().all(|path| path.output_satisfies(plan.relation, &plan.typed.bound) == Some(true)) {
+            if !paths.iter().all(|path| path.output_satisfies(relation, bound) == Some(true)) {
                 return None;
             }
-            let values = IntegerSet::from_type(&output.ty)?.keep(&plan.typed.operator, &plan.typed.bound)?;
+            let values = IntegerSet::from_type(&output.ty)?.keep(operator, bound)?;
             Some(Self {
                 issuer, proof_identity, canonical_target: plan.canonical_target,
                 target_layout: plan.typed.target.target_layout,
@@ -1549,7 +1551,6 @@ struct PlannedModuleProof<'a> {
     typed: TypedProofPostcondition<'a>,
     steps: ScalarBlock,
     filter: Option<Vec<CheckerPredicate>>,
-    relation: IntegerRelation,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1563,8 +1564,7 @@ impl PreparedProofModule {
         let filter = prepare_proof_entry_filter(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
         )?;
-        let relation = IntegerRelation::from_operator(&typed.operator).ok_or(ProjectCheck::Unsupported)?;
-        Ok(PlannedModuleProof { proof_source, proof: proof.node, canonical_target: proof.target, target: (module, item), typed, steps, filter, relation })
+        Ok(PlannedModuleProof { proof_source, proof: proof.node, canonical_target: proof.target, target: (module, item), typed, steps, filter })
     }
 
     fn check_module_proofs(&self, proof_names: &[&str]) -> Vec<ScalarModuleProofOutcome> {
@@ -1623,6 +1623,8 @@ impl PreparedProofModule {
             }
             if initialization.reached.contains(&plan.target) {
                 outcomes[*index] = module_proof_outcome(observer.outcome());
+            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. }) {
+                continue;
             } else if plan.steps.items.is_empty() {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
                 arbitrary_groups.entry(key).or_default().push((*index, plan));
@@ -1638,9 +1640,10 @@ impl PreparedProofModule {
             match observe_arbitrary_integer_returns(body, guard.0) {
                 Some(Ok(ProofCoverage::Applicable(paths))) => {
                     for (index, plan) in group {
+                        let TypedProofGoal::Literal { relation, bound, .. } = &plan.typed.goal else { continue; };
                         let mut holds = Some(true);
                         for path in &paths {
-                            holds = path.output_satisfies(plan.relation, &plan.typed.bound);
+                            holds = path.output_satisfies(*relation, bound);
                             if holds != Some(true) {
                                 break;
                             }
@@ -1672,14 +1675,16 @@ impl PlannedModuleProof<'_> {
             } else {
                 None
             },
-            relation: self.relation,
-            bound: &self.typed.bound,
+            goal: &self.typed.goal,
             coverage: ActualProofCoverage::Unseen,
         }
     }
 
     fn verify_arbitrary_with_steps(&self) -> Result<ProjectCheck, ProjectCheck> {
-        let TypedProofPostcondition { target, body, result_type, input_names, output, operator, bound } = &self.typed;
+        let TypedProofPostcondition { target, body, result_type, input_names, output, goal } = &self.typed;
+        let TypedProofGoal::Literal { operator, bound, .. } = goal else {
+            return Err(ProjectCheck::Unsupported);
+        };
         if !valid_arbitrary_proof_body(body) {
             return Err(ProjectCheck::Unsupported);
         }
@@ -1740,8 +1745,7 @@ fn checked_integer_guard_slots<'a>(
 #[cfg(feature = "internal-checker")]
 struct SelectedProofObserver<'a> {
     guard: Option<CheckedIntegerGuardSlots<'a>>,
-    relation: IntegerRelation,
-    bound: &'a BigInt,
+    goal: &'a TypedProofGoal,
     coverage: ActualProofCoverage,
 }
 
@@ -1778,10 +1782,14 @@ impl SelectedProofObserver<'_> {
                 arguments.get(comparison.slot).is_some_and(|argument| comparison.relation.accepts((*argument).cmp(comparison.bound)))
             })
         {
-            self.coverage = if self.relation.accepts(value.cmp(self.bound)) {
-                ActualProofCoverage::Proved
-            } else {
-                ActualProofCoverage::Refuted
+            let holds = match self.goal {
+                TypedProofGoal::Literal { relation, bound, .. } => Some(relation.accepts(value.cmp(bound))),
+                TypedProofGoal::EntryEqual { slot } => arguments.get(*slot).map(|entry| *entry == value),
+            };
+            self.coverage = match holds {
+                Some(true) => ActualProofCoverage::Proved,
+                Some(false) => ActualProofCoverage::Refuted,
+                None => ActualProofCoverage::Unsupported,
             };
         } else if matches!(self.coverage, ActualProofCoverage::Unseen) {
             self.coverage = ActualProofCoverage::Inapplicable;
@@ -1868,14 +1876,22 @@ fn check_proof_fragment_impl(
     check_selected_proof(prepared, function, &declaration, &root.source, summary_source)
 }
 
+enum TypedProofGoal {
+    Literal {
+        operator: BinaryOperator,
+        relation: IntegerRelation,
+        bound: BigInt,
+    },
+    EntryEqual { slot: usize },
+}
+
 struct TypedProofPostcondition<'a> {
     target: &'a ScalarModule,
     body: &'a FunctionCallSites,
     result_type: &'a ScalarType,
     input_names: Vec<String>,
     output: String,
-    operator: BinaryOperator,
-    bound: BigInt,
+    goal: TypedProofGoal,
 }
 
 fn typed_proof_postcondition<'a>(
@@ -1895,7 +1911,6 @@ fn typed_proof_postcondition<'a>(
         &child(declaration, SyntaxKind::ProofEnsures)?,
         SyntaxKind::Expression,
     )?);
-    let ensures = IntegerComparison::from_expression(&ensures).ok_or(ProjectCheck::Unsupported)?;
 
     let (project, calls) = prepared.parts();
     let target = &project.modules[module];
@@ -1913,16 +1928,46 @@ fn typed_proof_postcondition<'a>(
     if !is_integer_type(&result.ty) {
         return Err(ProjectCheck::Unsupported);
     }
-    if ensures.name != output {
-        return Err(if input_names.iter().any(|input| input == ensures.name) {
-            ProjectCheck::Unsupported
-        } else {
-            ProjectCheck::InvalidProof
-        });
-    }
-    if !integer_literal_fits_type(ensures.bound.as_ref(), &result.ty) {
-        return Err(ProjectCheck::InvalidProof);
-    }
+    let goal = if let Some(ensures) = IntegerComparison::from_expression(&ensures) {
+        if ensures.name != output {
+            return Err(if input_names.iter().any(|input| input == ensures.name) {
+                ProjectCheck::Unsupported
+            } else {
+                ProjectCheck::InvalidProof
+            });
+        }
+        if !integer_literal_fits_type(ensures.bound.as_ref(), &result.ty) {
+            return Err(ProjectCheck::InvalidProof);
+        }
+        TypedProofGoal::Literal {
+            operator: ensures.operator.clone(),
+            relation: IntegerRelation::from_operator(ensures.operator).ok_or(ProjectCheck::Unsupported)?,
+            bound: ensures.bound.into_owned(),
+        }
+    } else {
+        let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } = &ensures else {
+            return Err(ProjectCheck::Unsupported);
+        };
+        let (ScalarExpression::Name { name: out, .. }, ScalarExpression::Call {
+            receiver: Some(core), name: old, type_arguments, arguments, ..
+        }) = (left.as_ref(), right.as_ref()) else {
+            return Err(ProjectCheck::Unsupported);
+        };
+        if core != "core" || old != "old" || !type_arguments.is_empty() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let [ScalarExpression::Name { name: input, .. }] = arguments.as_slice() else {
+            return Err(ProjectCheck::Unsupported);
+        };
+        if out != output {
+            return Err(ProjectCheck::InvalidProof);
+        }
+        let slot = input_names.iter().position(|name| name == input).ok_or(ProjectCheck::InvalidProof)?;
+        if boundary.parameters.len() != 1 || boundary.parameters[slot].ty != result.ty {
+            return Err(ProjectCheck::Unsupported);
+        }
+        TypedProofGoal::EntryEqual { slot }
+    };
 
     Ok(TypedProofPostcondition {
         target,
@@ -1930,8 +1975,7 @@ fn typed_proof_postcondition<'a>(
         result_type: &result.ty,
         input_names,
         output: output.clone(),
-        operator: ensures.operator.clone(),
-        bound: ensures.bound.into_owned(),
+        goal,
     })
 }
 
@@ -1944,8 +1988,11 @@ fn check_selected_proof(
     summary_source: Option<ProofSummaryOrigin<'_>>,
 ) -> Result<(ProjectCheck, Option<VerifiedReturnBound>), ProjectCheck> {
     let steps = derive_block(&child(declaration, SyntaxKind::Block)?);
-    let TypedProofPostcondition { target, body, result_type, input_names, output, operator, bound } =
+    let TypedProofPostcondition { target, body, result_type, input_names, output, goal } =
         typed_proof_postcondition(prepared, (module, item, function), declaration)?;
+    let TypedProofGoal::Literal { operator, bound, .. } = goal else {
+        return Err(ProjectCheck::Unsupported);
+    };
 
     let filter = prepare_proof_entry_filter(declaration, proof_source, target.target_layout, &input_names, body)
         .map_err(|error| match error {
@@ -2360,6 +2407,36 @@ mod tests {
     use crate::{derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project, ScalarTargetLayout};
 
     const OUTPUT: &str = r#"{ .stdout = ""; .stderr = "unexpected state"; .code = 1; .files = []; }"#;
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn non_reusable_entry_goal_does_not_replay_actual_initialization() {
+        use super::super::checker_flow::take_integer_observations;
+        let file = source("src/main.w", "no-replay");
+        let text = format!(r#"%%start
+            u8(u8) producer = fn(value) {{ value }};
+            u8(u8) live = fn(value) {{ value }};
+            u8 actual = live(7);
+            unit() caller = fn {{
+                u8 result = producer(7);
+                core.require(result <= 7, {OUTPUT});
+            }};
+            proof entry for producer(input) -> (out) where (input <= 7) ensures (out == core.old(input)) {{}}
+            proof literal for producer(input) -> (out) where (input <= 7) ensures (out <= 7) {{}}
+        %%end"#);
+        let run = |name| {
+            let (_, catalog) = crate::parse_proof_source(file.clone(), text.clone(), &[]).ok().unwrap();
+            check_loaded_scalar_module_proof_call(
+                (&file, name), (&file, "caller"), Vec::new(), (catalog, Vec::new()),
+                vec![file.clone()], inputs(),
+            )
+        };
+        let _ = take_integer_observations();
+        assert_eq!(run("entry"), ScalarProofCallOutcome::Unavailable);
+        assert_eq!(take_integer_observations(), (0, 0));
+        assert_eq!(run("literal"), ScalarProofCallOutcome::Established);
+        assert_eq!(take_integer_observations(), (1, 1));
+    }
 
     #[cfg(feature = "internal-checker")]
     #[test]

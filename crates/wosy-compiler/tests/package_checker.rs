@@ -1172,3 +1172,59 @@ fn callable_unit_if_else_joins_only_the_remaining_feasible_rows() {
     assert_eq!(check_scoped(&selected, ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::Passed);
     assert_eq!(check(&selected.replace("retained(9);", "retained(7);")), ScalarCheckerOutcome::Unsupported);
 }
+
+#[test]
+fn observed_module_proof_old_compares_the_exact_original_entry_of_each_call() {
+    let identity = source();
+    let check_old = |target: &str, argument: &str, guard: &str, start: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "snapshot",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) identity_value = fn(value) {{ value }};
+                    i16(i16) constant_value = fn(value) {{ if (value == 0) {{}}; 7 }};
+                    u16(u8) different_width = fn(value) {{ if (value == 0) {{}}; 7 }};
+                    {start}
+                    proof snapshot for {target}(input) -> (out) where ({guard}) ensures (out == core.old({argument})) {{}}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+
+    let separate = "i16 early = identity_value(-128); i16 late = identity_value(7);";
+    assert_eq!(check_old("identity_value", "input", "true", separate), ScalarModuleProofOutcome::Proved);
+    let same = "i16 early = constant_value(7); i16 late = constant_value(7);";
+    assert_eq!(check_old("constant_value", "input", "true", same), ScalarModuleProofOutcome::Proved);
+    let wrong_then_right = "i16 early = constant_value(6); i16 late = constant_value(7);";
+    assert_eq!(check_old("constant_value", "input", "true", wrong_then_right), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check_old("constant_value", "input", "input == 7", wrong_then_right), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check_old("constant_value", "input", "input > 7", wrong_then_right), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check_old("identity_value", "input", "true", ""), ScalarModuleProofOutcome::Unsupported);
+    assert!(matches!(check_old("identity_value", "out", "true", separate), ScalarModuleProofOutcome::Invalid(_)));
+    assert_eq!(check_old("identity_value", "input + 0", "true", separate), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check_old("different_width", "input", "true", "u16 observed = different_width(7);"), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
+fn observed_entry_comparison_does_not_supply_a_reusable_module_bound() {
+    let identity = source();
+    let text = format!(r#"%%start
+        u8(u8) producer = fn(value) {{ value }};
+        unit() caller = fn {{
+            u8 answer = producer(7);
+            core.require(answer <= 7, {OUTPUT});
+        }};
+        proof snapshot for producer(input) -> (out) where (input <= 7) ensures (out == core.old(input)) {{}}
+    %%end"#);
+    let (_, catalog) = wosy_compiler::parse_proof_source(identity.clone(), text, &[])
+        .ok().expect("valid named proof syntax");
+    assert_eq!(check_loaded_scalar_module_proof_call(
+        (&identity, "snapshot"), (&identity, "caller"), Vec::new(), (catalog, Vec::new()),
+        vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    ), ScalarProofCallOutcome::Unavailable);
+}
