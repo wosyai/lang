@@ -390,6 +390,52 @@ impl<'a, 'bound, const STEP_FIRST: bool> ScopedAuthoredReturn<'a> for OrderedRoo
 }
 
 #[cfg(feature = "internal-checker")]
+struct ConstantProofEvidence<'a, 'check> {
+    select_witness: &'check mut dyn FnMut(&BigInt) -> bool,
+    returned: bool,
+    failure: Option<SymbolicLiteralFailure<'a>>,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+struct OrderedRootConstantProof<'a, 'check, 'observation> {
+    conditions: OrderedRootConditions<'a>,
+    observed: &'observation std::cell::RefCell<ConstantProofEvidence<'a, 'check>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ScopedAuthoredReturn<'a> for OrderedRootConstantProof<'a, '_, '_> {
+    const ENABLED: bool = false;
+    const OBSERVE_RETURN: bool = true;
+
+    fn at(
+        self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
+        _: &IntegerRoots<'_>, _: &IntegerInputs,
+    ) -> Option<&'a BigInt> {
+        None
+    }
+
+    fn split_unprepared(
+        self, calls: &FunctionCallSites, slot: RootBranchSlot, roots: &IntegerRoots<'_>, path: IntegerInputs,
+    ) -> Option<(IntegerInputs, IntegerInputs, Option<usize>)> {
+        self.conditions.split_unprepared(calls, slot, roots, path)
+    }
+
+    fn observe_return(
+        self, slot: FinalOutputSlot, value: IntegerReturn<'a>, roots: &IntegerRoots<'a>, path: &IntegerInputs,
+    ) -> Option<()> {
+        let Some(row) = path.0.first() else { return Some(()); };
+        let IntegerReturn::Const(value) = value else { return None; };
+        let mut observed = self.observed.borrow_mut();
+        observed.returned = true;
+        if (observed.select_witness)(value) {
+            observed.failure = Some(SymbolicLiteralFailure::from_row(slot, roots, row, None, Cow::Borrowed(value), None));
+        }
+        Some(())
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 struct LiteralGuardAtReturn<'a> {
     axis: usize,
     relation: IntegerRelation,
@@ -1953,6 +1999,21 @@ pub(super) fn collect_ordered_root_literal_proofs<'a, const STEP_FIRST: bool>(
         OrderedRootLiteralProofs::<STEP_FIRST> { conditions: OrderedRootConditions(body), observed: &observed },
     )?;
     Some((active, failures, observed.into_inner().returned))
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn collect_ordered_root_constant_proof<'a>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, select_witness: &mut dyn FnMut(&BigInt) -> bool,
+) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
+    let observed = std::cell::RefCell::new(ConstantProofEvidence { select_witness, returned: false, failure: None });
+    let mut failures = Vec::new();
+    let mut sink = |failure| failures.push(failure);
+    let (active, _) = collect_integer_requirement_failures_in_scope(
+        calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink,
+        OrderedRootConstantProof { conditions: OrderedRootConditions(body), observed: &observed },
+    )?;
+    let observed = observed.into_inner();
+    Some((active, failures, observed.returned, observed.failure))
 }
 
 fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredReturn<'a>>(

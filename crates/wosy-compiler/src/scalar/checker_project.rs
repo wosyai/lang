@@ -2054,12 +2054,39 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         let (first, rest) = match &group.cases {
             MainFlowProofCases::Bare { first, rest } => (first, rest),
             MainFlowProofCases::Authored(cases) => {
-                let [(proof, Some(MainFlowAuthoredShows::Single(step)))] = cases.as_slice() else {
+                let [(proof, Some(shows))] = cases.as_slice() else {
                     return Err(ProjectCheck::Unsupported);
                 };
                 if !tautological(proof) {
                     return Err(ProjectCheck::Unsupported);
                 }
+                let MainFlowAuthoredShows::Single(step) = shows else {
+                    let MainFlowAuthoredShows::Multiple(groups) = shows else { unreachable!(); };
+                    let mut failed_step: Option<ByteSpan> = None;
+                    let mut failed_goal = false;
+                    let mut select_witness = |value: &BigInt| {
+                        if let Some(candidate) = first_failed_show(groups, value) {
+                            if failed_step.is_none_or(|prior| candidate.start < prior.start) {
+                                failed_step = Some(candidate);
+                                return true;
+                            }
+                        } else if failed_step.is_none() && !failed_goal && !proof.relation.accepts(value.cmp(proof.bound)) {
+                            failed_goal = true;
+                            return true;
+                        }
+                        false
+                    };
+                    let (active, directives, returned, failure) = super::checker_flow::collect_ordered_root_constant_proof(
+                        calls, &function.body, &mut select_witness,
+                    ).ok_or(ProjectCheck::Unsupported)?;
+                    for directive in directives {
+                        effects.push_callable(calls, source, directive);
+                    }
+                    if let Some(failure) = failure {
+                        self.record(proof, function, source, effects.records.len(), failure, failed_step);
+                    }
+                    return Ok(Some(active || returned));
+                };
                 let mut checks = [
                     super::checker_flow::SymbolicLiteralCheck {
                         relation: step.relation, bound: &step.bound, failure: None,
@@ -2148,6 +2175,17 @@ fn earliest_show_failure(first: Option<ByteSpan>, second: Option<ByteSpan>) -> O
         (Some(first), Some(second)) if second.start < first.start => Some(second),
         (first, second) => first.or(second),
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn first_failed_show(groups: &[MainFlowShowBound<'_>], value: &BigInt) -> Option<ByteSpan> {
+    let (below, equal, above) = match groups.binary_search_by(|group| group.bound.as_ref().cmp(value)) {
+        Ok(index) => (index, groups[index].failures[1], index + 1),
+        Err(index) => (index, None, index),
+    };
+    let lower_failure = below.checked_sub(1).and_then(|index| groups[index].failures[2]);
+    let upper_failure = groups.get(above).and_then(|group| group.failures[0]);
+    earliest_show_failure(equal, earliest_show_failure(lower_failure, upper_failure))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2411,13 +2449,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                             }
                         }
                         Some(MainFlowAuthoredShows::Multiple(groups)) => {
-                            let (below, equal, above) = match groups.binary_search_by(|group| group.bound.as_ref().cmp(value)) {
-                                Ok(index) => (index, groups[index].failures[1], index + 1),
-                                Err(index) => (index, None, index),
-                            };
-                            let lower_failure = below.checked_sub(1).and_then(|index| groups[index].failures[2]);
-                            let upper_failure = groups.get(above).and_then(|group| group.failures[0]);
-                            let failed = earliest_show_failure(equal, earliest_show_failure(lower_failure, upper_failure));
+                            let failed = first_failed_show(groups, value);
                             if failed.is_none() && proof.relation.accepts(value.cmp(proof.bound)) {
                                 continue;
                             }
@@ -7151,6 +7183,67 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(matches!(run(&mixed, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
         let incomplete = text.replace("\n                    6\n", "\n                    value + 1\n");
         assert!(matches!(run(&incomplete, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_current_package_auto_proof_multi_show_uses_earliest_step_across_constant_returns() {
+        let app = source("src/main.w", "ordered-automatic-proof-unused-multi-show");
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope,
+            )
+        };
+        let text = format!(r#"%%start
+            u8(u8) checked = fn(value) {{
+                if (value < 7) {{
+                    core.require(false, {OUTPUT});
+                    8
+                }} else {{
+                    core.require(false, {OUTPUT});
+                    6
+                }}
+            }};
+            proof bound for checked(entry) -> (out) where (true && true) ensures (out == 7) {{
+                core.show(out >= 7);
+                core.show(out <= 7);
+            }}
+        %%end"#);
+        let report = run(&text, ScalarCheckerScope::CurrentPackage).unwrap();
+        let [first, second] = report.directives.as_slice() else { panic!("two directive receipts"); };
+        assert!(first.directive.start < second.directive.start);
+        assert!(report.active && report.diagnostics.is_empty() && report.additional_symbolic_diagnostics.is_empty());
+        let diagnostic = report.symbolic_diagnostic.unwrap();
+        let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        let step = diagnostic.failed_step.unwrap();
+        assert_eq!(step.source, app);
+        assert_eq!(snippet(step.range), "core.show(out >= 7)");
+        assert_eq!(snippet(diagnostic.goal.range), "out == 7");
+        assert_eq!(snippet(diagnostic.output.range), "6");
+        assert_eq!(diagnostic.returned, BigInt::from(6));
+        assert_eq!(diagnostic.directive_position, 2);
+        assert_eq!(diagnostic.witness.intervals_at(0, 0).unwrap().next().unwrap().0, &BigInt::from(7));
+
+        let goal_only = text.replace("out >= 7", "out >= 6").replace("out <= 7", "out <= 8");
+        let goal = run(&goal_only, ScalarCheckerScope::CurrentPackage).unwrap().symbolic_diagnostic.unwrap();
+        assert!(goal.failed_step.is_none());
+        assert_eq!(goal.returned, BigInt::from(8));
+
+        let tie = text.replace("out >= 7", "out < 6");
+        let tied = run(&tie, ScalarCheckerScope::CurrentPackage).unwrap().symbolic_diagnostic.unwrap();
+        assert!(tied.failed_step.is_some());
+        assert_eq!(tied.returned, BigInt::from(8));
+
+        let alias = tie.replace("\n                    6\n", "\n                    value\n");
+        assert_ne!(alias, tie);
+        assert!(matches!(run(&alias, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        let dead = alias.replace("core.require", "core.narrow");
+        let dead = run(&dead, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(dead.active && dead.directives.len() == 2 && dead.symbolic_diagnostic.is_none());
+        let main = run(&text, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!main.active && main.directives.is_empty() && main.symbolic_diagnostic.is_none());
     }
 
     #[cfg(feature = "internal-checker")]
