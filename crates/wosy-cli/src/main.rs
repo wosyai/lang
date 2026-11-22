@@ -266,7 +266,7 @@ struct CanonicalProjectInputs {
     graph: wosy_project::SourceGraph,
     texts: BTreeMap<ProjectSourceIdentity, String>,
     #[cfg(feature = "internal-checker")]
-    proof: Option<(wosy_compiler::ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
+    proofs: BTreeMap<PackageRelativePath, (wosy_compiler::ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
 }
 
 enum CanonicalLoadPurpose {
@@ -274,7 +274,7 @@ enum CanonicalLoadPurpose {
     #[cfg(feature = "internal-checker")]
     Check,
     #[cfg(feature = "internal-checker")]
-    Proof(PackageRelativePath),
+    Proof(HashSet<PackageRelativePath>),
 }
 
 enum CanonicalSourceDeclarations {
@@ -387,7 +387,7 @@ fn load_canonical_project_inputs(
         );
         let (text, declarations) = match &purpose {
             #[cfg(feature = "internal-checker")]
-            CanonicalLoadPurpose::Proof(selected) if package == project.package && selected == &path => {
+            CanonicalLoadPurpose::Proof(selected) if package == project.package && selected.contains(&path) => {
                 let (text, proof) = wosy_compiler::parse_proof_source(source, text, &project.comment_categories)
                     .map_err(canonical_syntax_failure)?;
                 (text, CanonicalSourceDeclarations::Proof(proof))
@@ -483,7 +483,7 @@ fn load_canonical_project_inputs(
     };
     let mut project_declarations = Vec::new();
     #[cfg(feature = "internal-checker")]
-    let mut proof = None;
+    let mut proofs = BTreeMap::new();
     let mut source_by_path = BTreeMap::new();
     let mut derivation_diagnostics = Vec::new();
     for node in &graph.nodes {
@@ -522,7 +522,9 @@ fn load_canonical_project_inputs(
         match declarations {
             CanonicalSourceDeclarations::Ordinary(declarations) => project_declarations.push((declarations, namespace_bindings)),
             #[cfg(feature = "internal-checker")]
-            CanonicalSourceDeclarations::Proof(declarations) => proof = Some((declarations, namespace_bindings)),
+            CanonicalSourceDeclarations::Proof(declarations) => {
+                proofs.insert(node.source.path.clone(), (declarations, namespace_bindings));
+            }
         }
     }
     if !derivation_diagnostics.is_empty() {
@@ -548,7 +550,7 @@ fn load_canonical_project_inputs(
         graph,
         texts,
         #[cfg(feature = "internal-checker")]
-        proof,
+        proofs,
     })
 }
 
@@ -593,17 +595,42 @@ fn check_loaded_proofs(
     proof_file: PackageRelativePath,
     proof_names: &[&str],
 ) -> InternalProofResults {
-    if proof_names.is_empty() {
+    let selections = proof_names.iter().map(|&name| (&proof_file, name)).collect::<Vec<_>>();
+    check_loaded_proof_selections(root, project, configuration, target_layout, &selections)
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_loaded_proof_selections(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    selections: &[(&PackageRelativePath, &str)],
+) -> InternalProofResults {
+    if selections.is_empty() {
         return Ok((Ok(Vec::new()), BTreeMap::new()));
     }
-    let loaded = load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Proof(proof_file))?;
-    let Some(proof) = loaded.proof else {
-        return Err(CanonicalLoadFailure::Input("selected proof source is outside the canonical target graph".to_owned()));
-    };
+    let selected = selections.iter().map(|(path, _)| (*path).clone()).collect();
+    let loaded = load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Proof(selected))?;
+    let mut authorities = HashMap::new();
+    for &(path, _) in selections {
+        if let std::collections::hash_map::Entry::Vacant(entry) = authorities.entry(path) {
+            let Some((proof, _)) = loaded.proofs.get(path) else {
+                return Err(CanonicalLoadFailure::Input(format!(
+                    "selected proof source {} is outside the canonical target graph",
+                    path.as_path().display(),
+                )));
+            };
+            entry.insert(proof.declarations().source().clone());
+        }
+    }
+    let proofs = selections.iter().map(|&(path, name)| (&authorities[path], name)).collect::<Vec<_>>();
     #[cfg(test)]
     routing_observations::record(|counts| counts.checks += 1);
-    let outcomes = wosy_compiler::check_loaded_scalar_module_proofs(
-        proof_names, loaded.declarations, proof, loaded.initialization_order, ScalarPreparationInputs { target_layout },
+    let outcomes = wosy_compiler::check_loaded_scalar_module_proof_selections(
+        &proofs, loaded.declarations, loaded.proofs.into_values().collect(), loaded.initialization_order,
+        ScalarPreparationInputs { target_layout },
     );
     Ok((outcomes, loaded.texts))
 }
@@ -1074,6 +1101,54 @@ mod tests {
         assert!(texts.values().any(|value| value == sources[1].1));
         assert_eq!(counts, routing_observations::Counts { extractions: 2, checks: 1, ..Default::default() });
         assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_proof_adapter_batches_multiple_exact_sources_in_request_order() {
+        use wosy_compiler::ScalarModuleProofOutcome;
+        let sources = [
+            ("main.w", r#"%%start
+                first = namespace app "first.w";
+                second = namespace app "second.w";
+                ignored = namespace app "ignored.w";
+                u8 a = first.project(7);
+                u8 b = second.project(12);
+            %%end"#),
+            ("first.w", r#"%%start
+                u8(u8) project = fn(input) { input };
+                proof same for project(input) -> (out) ensures (out <= 7) {}
+            %%end"#),
+            ("second.w", r#"%%start
+                u8(u8) project = fn(input) { input };
+                proof same for project(input) -> (out) ensures (out <= 10) {}
+            %%end"#),
+            ("ignored.w", r#"%%start
+                u8(u8) project = fn(input) { input };
+                proof inert for project(input) -> (out) ensures (out <= 255) { core.show(out == 1__0); }
+            %%end"#),
+        ];
+        let (project, configuration) = routing_test_project("internal-proof-multi-sources", &sources);
+        let first = PackageRelativePath::new("first.w".into()).unwrap();
+        let second = PackageRelativePath::new("second.w".into()).unwrap();
+        let (result, counts) = routing_observations::observe(|| check_loaded_proof_selections(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+            &[(&second, "same"), (&first, "same"), (&second, "same")],
+        ));
+        let (outcomes, texts) = result.expect("all selected proof sources are in the graph");
+        assert_eq!(outcomes.unwrap(), [
+            ScalarModuleProofOutcome::Refuted, ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Refuted,
+        ]);
+        assert_eq!(texts.len(), sources.len());
+        assert_eq!(counts, routing_observations::Counts { extractions: 4, checks: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
+        let missing_one = PackageRelativePath::new("absent-z.w".into()).unwrap();
+        let missing_two = PackageRelativePath::new("absent-a.w".into()).unwrap();
+        let missing = check_loaded_proof_selections(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+            &[(&second, "same"), (&missing_one, "same"), (&missing_two, "same")],
+        );
+        assert!(matches!(missing, Err(CanonicalLoadFailure::Input(error)) if error.contains("absent-z.w")));
     }
 
     #[cfg(feature = "internal-checker")]

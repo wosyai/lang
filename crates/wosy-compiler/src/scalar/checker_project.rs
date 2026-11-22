@@ -1112,22 +1112,45 @@ pub fn check_scalar_module_proofs(
 #[doc(hidden)]
 pub fn check_loaded_scalar_module_proofs(
     proof_names: &[&str],
-    mut declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
-    (proof, namespaces): (ScalarProofDeclarations, Vec<ScalarNamespaceBinding>),
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    proof: (ScalarProofDeclarations, Vec<ScalarNamespaceBinding>),
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
 ) -> Result<Vec<ScalarModuleProofOutcome>, ScalarModuleProofOutcome> {
     if proof_names.is_empty() {
         return Ok(Vec::new());
     }
-    let ScalarProofDeclarations { declarations: proof_declarations, definitions } = proof;
-    let source = proof_declarations.source().clone();
-    let catalog = ModuleProofCatalog { source: source.clone(), definitions };
-    declarations.push((proof_declarations, namespaces));
+    let source = proof.0.declarations.source().clone();
+    let selections = proof_names.iter().map(|&name| (&source, name)).collect::<Vec<_>>();
+    check_loaded_scalar_module_proof_selections(&selections, declarations, vec![proof], initialization_order, inputs)
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn check_loaded_scalar_module_proof_selections(
+    selections: &[(&SourceIdentity, &str)],
+    mut declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    proofs: Vec<(ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+) -> Result<Vec<ScalarModuleProofOutcome>, ScalarModuleProofOutcome> {
+    if selections.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut catalogs = Vec::with_capacity(proofs.len());
+    declarations.reserve(proofs.len());
+    for (proof, namespaces) in proofs {
+        let ScalarProofDeclarations { declarations: proof_declarations, definitions } = proof;
+        catalogs.push(ModuleProofCatalog { source: proof_declarations.source().clone(), definitions });
+        declarations.push((proof_declarations, namespaces));
+    }
+    let Some(root) = initialization_order.first().cloned() else {
+        return Err(ScalarModuleProofOutcome::Unsupported);
+    };
     let prepared = PreparedProofModule::prepare_declarations(
-        source, declarations, vec![catalog], initialization_order, inputs,
+        root, declarations, catalogs, initialization_order, inputs,
     ).map_err(|error| module_proof_outcome(Err(error)))?;
-    Ok(prepared.check_module_proofs(proof_names))
+    Ok(prepared.check_module_proof_selections(selections))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1166,6 +1189,7 @@ impl Hash for ExactGuardGroup<'_> {
 
 #[cfg(feature = "internal-checker")]
 struct PlannedModuleProof<'a> {
+    proof_source: &'a SourceIdentity,
     target: (usize, usize),
     typed: TypedProofPostcondition<'a>,
     steps: ScalarBlock,
@@ -1175,29 +1199,35 @@ struct PlannedModuleProof<'a> {
 
 #[cfg(feature = "internal-checker")]
 impl PreparedProofModule {
-    fn plan_module_proof(&self, proof_name: &str) -> Result<PlannedModuleProof<'_>, ProjectCheck> {
-        let proof = self.select_resolved(&self.source, proof_name)?;
+    fn plan_module_proof(&self, proof_source: &SourceIdentity, proof_name: &str) -> Result<PlannedModuleProof<'_>, ProjectCheck> {
+        let (proof_source, _) = self.proofs.get_key_value(proof_source).ok_or(ProjectCheck::MissingRoot)?;
+        let proof = self.select_resolved(proof_source, proof_name)?;
         let (module, item, _) = proof.function;
         let steps = derive_block(&child(proof.node, SyntaxKind::Block)?);
         let typed = typed_proof_postcondition(&self.prepared, proof.function, proof.node)?;
         let filter = prepare_proof_entry_filter(
-            proof.node, &self.source, typed.target.target_layout, &typed.input_names, typed.body,
+            proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
         )?;
         let relation = IntegerRelation::from_operator(&typed.operator).ok_or(ProjectCheck::Unsupported)?;
-        Ok(PlannedModuleProof { target: (module, item), typed, steps, filter, relation })
+        Ok(PlannedModuleProof { proof_source, target: (module, item), typed, steps, filter, relation })
     }
 
     fn check_module_proofs(&self, proof_names: &[&str]) -> Vec<ScalarModuleProofOutcome> {
-        let mut outcomes = vec![ScalarModuleProofOutcome::Unsupported; proof_names.len()];
+        let selections = proof_names.iter().map(|&name| (&self.source, name)).collect::<Vec<_>>();
+        self.check_module_proof_selections(&selections)
+    }
+
+    fn check_module_proof_selections(&self, selections: &[(&SourceIdentity, &str)]) -> Vec<ScalarModuleProofOutcome> {
+        let mut outcomes = vec![ScalarModuleProofOutcome::Unsupported; selections.len()];
         let mut selected = HashMap::new();
         let mut duplicate = Vec::new();
         let mut plans = Vec::new();
-        for (index, &name) in proof_names.iter().enumerate() {
-            match selected.entry(name) {
+        for (index, &(proof_source, name)) in selections.iter().enumerate() {
+            match selected.entry((proof_source, name)) {
                 std::collections::hash_map::Entry::Occupied(first) => duplicate.push((index, *first.get())),
                 std::collections::hash_map::Entry::Vacant(first) => {
                     first.insert(index);
-                    match self.plan_module_proof(name) {
+                    match self.plan_module_proof(proof_source, name) {
                         Ok(plan) => plans.push((index, plan)),
                         Err(error) => outcomes[index] = module_proof_outcome(Err(error)),
                     }
@@ -1220,7 +1250,6 @@ impl PreparedProofModule {
             return;
         }
         let Ok((root, ordinals)) = package_initialization_order(self.prepared.parts().0) else { return; };
-        let Some(&proof_module) = ordinals.get(&self.source) else { return; };
         let mut observers = ActualProofBatch { targets: HashMap::new(), proofs: Vec::with_capacity(plans.len()) };
         for (plan_index, (_, plan)) in plans.iter().enumerate() {
             observers.targets.entry(plan.target).or_default().push(plan_index);
@@ -1229,12 +1258,12 @@ impl PreparedProofModule {
         let Ok((initialization, observers)) =
             check_package_initialization_observing(&self.prepared, root, ordinals, observers)
         else { return; };
-        if initialization.visits[proof_module] != InitializationVisit::Completed {
-            return;
-        }
         let mut arbitrary_groups = HashMap::<_, Vec<_>>::new();
         for ((index, plan), observer) in plans.iter().zip(observers.proofs) {
-            if initialization.visits[plan.target.0] != InitializationVisit::Completed {
+            let Some(&proof_module) = initialization.ordinals.get(plan.proof_source) else { continue; };
+            if initialization.visits[proof_module] != InitializationVisit::Completed
+                || initialization.visits[plan.target.0] != InitializationVisit::Completed
+            {
                 continue;
             }
             if initialization.reached.contains(&plan.target) {
