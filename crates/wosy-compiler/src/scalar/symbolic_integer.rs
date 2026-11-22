@@ -139,6 +139,36 @@ impl<'a> IntegerShowConstraints<'a> {
         }
         true
     }
+
+    pub(super) fn holds_set_avoiding(&self, values: &IntegerSet, forbidden: &IntegerSet) -> bool {
+        let Some((first, last)) = values.extremes() else { return true; };
+        if forbidden.extremes().is_none_or(|(start, end)| last < start || end < first) {
+            return self.holds_set(values);
+        }
+        if !self.endpoints_hold(first, last) {
+            return false;
+        }
+        let mut holes = self.excluded[self.excluded.partition_point(|hole| hole.as_ref() < first)..].iter().peekable();
+        let mut forbidden = forbidden.0[forbidden.0.partition_point(|interval| &interval.last < first)..].iter().peekable();
+        for output in &values.0 {
+            while holes.peek().is_some_and(|hole| hole.as_ref() < &output.first) {
+                holes.next();
+            }
+            if holes.peek().is_some_and(|hole| hole.as_ref() <= &output.last) {
+                return false;
+            }
+            while forbidden.peek().is_some_and(|interval| interval.last < output.first) {
+                forbidden.next();
+            }
+            if forbidden.peek().is_some_and(|interval| interval.first <= output.last) {
+                return false;
+            }
+            if holes.peek().is_none() && forbidden.peek().is_none() {
+                break;
+            }
+        }
+        true
+    }
 }
 
 impl IntegerSet {

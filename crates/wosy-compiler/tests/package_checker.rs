@@ -2869,7 +2869,7 @@ fn named_universal_conjunction_checks_exact_order_and_empty_inner_vacuity() {
     assert_eq!(check("value", "false", same, "false", "i16 a = echo(0);"), NoApplicableInputs);
     assert_eq!(check("if (value == 0) {}; 3 + 4", "false", same, "true", "i16 a = echo(0);"), Unsupported);
     assert_eq!(check("value", "false", "out <= k", "true", ""), Unsupported);
-    assert_eq!(check("value", "false", "out <= k && out == k", "true", ""), Unsupported);
+    assert_eq!(check("value", "false", "out <= k && out == core.old(input)", "true", ""), Unsupported);
     assert!(matches!(check("value", "false", "out <= k && out < 32768", "true", ""), Invalid(_)));
 }
 
@@ -2907,6 +2907,45 @@ fn named_universal_exact_equality_and_disjointness_use_nonempty_typed_domains() 
     assert_eq!(check("value", "false", "out == k", "true", ""), Unsupported);
     assert!(matches!(check("value", "k <= 32768", "out != k", "false", ""), Invalid(_)));
     assert_eq!(check("if (value == 0) {}; 3 + 4", domain, "out != k", "true", "i16 a = echo(0);"), Unsupported);
+}
+
+#[test]
+fn named_universal_conjunction_combines_equality_and_disjointness_with_bounds() {
+    let identity = source();
+    let check = |domain: &str, goal: &str, guard: &str, actual: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "bounded",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ value }};
+                    proof bounded for echo(input) -> (out) where ({guard}) forall (i16 k where {domain})
+                        ensures ({goal}) {{}}
+                    {actual}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Refuted, Unsupported};
+    let domain = "k >= -8 && k <= -6 && k != -7";
+    let constraints = "out != k && out >= -9 && out != -7";
+    assert_eq!(check(domain, constraints, "input >= -9 && input <= -5 && input != -8 && input != -7 && input != -6", ""), Proved);
+    assert_eq!(check(domain, constraints, "input == -8", ""), Refuted);
+    assert_eq!(check(domain, constraints, "input == -7", ""), Refuted);
+    assert_eq!(check(domain, constraints, "input == -10", ""), Refuted);
+    assert_eq!(check(domain, constraints, "true", "i16 a = echo(-9); i16 b = echo(-5);"), Proved);
+    assert_eq!(check(domain, constraints, "true", "i16 a = echo(-9); i16 b = echo(-8);"), Refuted);
+    assert_eq!(check(domain, "out != k && out != k", "input == -7", ""), Proved);
+    assert_eq!(check(domain, "out <= k && out != k && out >= -10", "input == -9", ""), Proved);
+    assert_eq!(check(domain, "out <= k && out != k && out >= -10", "input == -8", ""), Refuted);
+    assert_eq!(check("k == -7", "out == k && out >= -7", "input == -7", ""), Proved);
+    assert_eq!(check(domain, "out == k && out >= -8", "input == -8", ""), Refuted);
+    assert_eq!(check("false", "out == k && out != k && out >= 1", "true", ""), Proved);
+    assert_eq!(check("false", "out == k && out != k && out >= 1", "false", ""), NoApplicableInputs);
+    assert_eq!(check("false", "out != k", "true", ""), Unsupported);
+    assert!(matches!(check("false", "out != k && out <= 32768", "true", ""), Invalid(_)));
 }
 
 #[test]

@@ -3363,6 +3363,8 @@ impl SelectedProofObserver<'_> {
                         UniversalConjunction::Vacuous => true,
                         UniversalConjunction::Impossible => false,
                         UniversalConjunction::Output(output) => output.holds_value(value),
+                        UniversalConjunction::OutputAvoiding(bounds) =>
+                            bounds.0.holds_value(value) && !bounds.1.covers_closed(value, value),
                     }),
                     TypedProofGoal::ConjunctiveExistential(goal) => goal.holds_at(value, arguments),
                     TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
@@ -3564,6 +3566,7 @@ enum UniversalConjunction {
     Vacuous,
     Impossible,
     Output(Box<IntegerShowConstraints<'static>>),
+    OutputAvoiding(Box<(IntegerShowConstraints<'static>, IntegerSet)>),
 }
 
 enum TypedProofGoal {
@@ -3606,6 +3609,7 @@ impl TypedProofGoal {
                 UniversalConjunction::Vacuous => Some(true),
                 UniversalConjunction::Impossible => Some(false),
                 UniversalConjunction::Output(output) => path.output_satisfies_constraints(output),
+                UniversalConjunction::OutputAvoiding(bounds) => path.output_satisfies_constraints_avoiding(&bounds.0, &bounds.1),
             },
             Self::Conjunction(atoms) => {
                 for (relation, bound) in atoms {
@@ -3697,12 +3701,11 @@ fn typed_named_universal_conjunction(
     let (ty, binder) = typed_quantifier_binder(forall, output, inputs, output_type)?;
     let mut binder_relation: Option<IntegerRelation> = None;
     let mut output_bounds = IntegerShowConstraints::default();
+    let mut saw_literal = false;
     visit_output_conjuncts(ensures, |atom| {
         if let ScalarExpression::Binary { operator, left, right, .. } = atom {
             if matches!(right.as_ref(), ScalarExpression::Name { name, .. } if name == &binder) {
-                if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output)
-                    || !matches!(operator, BinaryOperator::Less | BinaryOperator::LessEqual | BinaryOperator::Greater | BinaryOperator::GreaterEqual)
-                {
+                if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output) {
                     return Err(ProjectCheck::Unsupported);
                 }
                 let relation = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
@@ -3712,6 +3715,7 @@ fn typed_named_universal_conjunction(
         }
         let (relation, bound) = typed_output_atom(atom, output, inputs, &ty)?;
         output_bounds.add(relation, Cow::Owned(bound));
+        saw_literal = true;
         Ok(())
     })?;
     let relation = binder_relation.ok_or(ProjectCheck::Unsupported)?;
@@ -3724,6 +3728,14 @@ fn typed_named_universal_conjunction(
         (false, true, _) => maximum,
         (false, false, true) if minimum == maximum => minimum,
         (false, false, _) => return Ok(TypedProofGoal::UniversalConjunction(UniversalConjunction::Impossible)),
+        (true, true, false) => {
+            return if saw_literal {
+                output_bounds.normalize();
+                Ok(TypedProofGoal::UniversalConjunction(UniversalConjunction::OutputAvoiding(Box::new((output_bounds, domain)))))
+            } else {
+                Ok(TypedProofGoal::UniversalNotEqual(domain))
+            };
+        }
         _ => return Err(ProjectCheck::Unsupported),
     };
     output_bounds.add(relation, Cow::Owned(bound.clone()));
