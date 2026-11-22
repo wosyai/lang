@@ -5612,6 +5612,31 @@ fn point_last_use_dependencies_keep_canonical_order_and_storage() {
     assert!(point_last_use_dependencies(&CfgPointKind::ScopeExit, &mut pair).is_empty());
 }
 
+fn forwarded_edge_seed(state: &mut Option<ReferenceEdgeState>, final_edge: bool) -> ReferenceEdgeState {
+    if final_edge {
+        state.take().expect("one seed for the final successor alternative")
+    } else {
+        state.as_ref().expect("seed for remaining successor alternatives").clone()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn final_forwarded_alternative_reuses_the_unmodified_edge_seed() {
+    let uses = [2, 2, 2];
+    let id = CfgPointId(0);
+    let original = Some(BTreeSet::from([ReferenceOriginId(0)]));
+    let modified = Some(BTreeSet::from([ReferenceOriginId(1)]));
+    let mut seed = Some(ReferenceEdgeState::default());
+    seed.as_mut().unwrap().point_values.record(id, &original, &uses);
+    let mut first = forwarded_edge_seed(&mut seed, false);
+    first.point_values.record(id, &modified, &uses);
+    let last = forwarded_edge_seed(&mut seed, true);
+    assert!(seed.is_none());
+    assert_eq!(first.point_values.get(id), modified.as_ref());
+    assert_eq!(last.point_values.get(id), original.as_ref());
+}
+
 fn keep_forward_point_in_place(
     kind: &CfgPointKind,
     ordinary_forward: bool,
@@ -7419,12 +7444,9 @@ fn transfer_reference_facts(
             let mut successors = point.successors.iter().peekable();
             while let Some(successor) = successors.next() {
                 let slot = &mut incoming[successor.0];
+                let final_successor = successors.peek().is_none();
                 if move_alternatives.is_empty() {
-                    let mut next = if successors.peek().is_none() {
-                        state.take().expect("one state for the final successor")
-                    } else {
-                        state.as_ref().expect("state for remaining successors").clone()
-                    };
+                    let mut next = forwarded_edge_seed(&mut state, final_successor);
                     if successor.0 <= id.0 {
                         next.point_values.clear_from(*successor);
                     }
@@ -7434,8 +7456,10 @@ fn transfer_reference_facts(
                         slot.push(next);
                     }
                 } else {
-                    for (place, origin) in &move_alternatives {
-                        let mut next = state.as_ref().expect("state for move alternatives").clone();
+                    let mut alternatives = move_alternatives.iter().peekable();
+                    while let Some((place, origin)) = alternatives.next() {
+                        let final_edge = final_successor && alternatives.peek().is_none();
+                        let mut next = forwarded_edge_seed(&mut state, final_edge);
                         if !next.moved.iter().any(|(moved, _)| moved == place) {
                             next.moved.push((place.clone(), origin.clone()));
                         }
