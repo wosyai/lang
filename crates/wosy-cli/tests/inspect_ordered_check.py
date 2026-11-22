@@ -1,0 +1,82 @@
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+
+MANIFEST = """
+[package]
+name = "app"
+default_target = "app"
+
+[comments]
+categories = []
+
+[builders]
+
+[runners]
+
+[targets.app]
+root = "main.w"
+
+[targets.app.artifacts.main]
+artifact = "RuntimeStdio"
+
+[targets.app.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "never"
+run_runner = "never"
+
+[targets.app.profiles.dev]
+main_artifact = "main"
+"""
+
+PROGRAM = """%%start
+    i8(i8) identity = fn(value) { value };
+    unit(i8) wrapper = fn(arg) {
+        i8 result = identity(arg);
+        core.require(result == 6, { .stdout = "must not emit"; .stderr = "not stderr"; .code = 71;
+            .files = [{ .path = "must-not-create.txt"; .text = "ignored"; }]; });
+    };
+    i8(i8) unused = fn(value) { value };
+    proof actual for identity(entry) -> (out) ensures (out <= 5) {}
+    proof symbolic for unused(entry) -> (out) ensures (out != 7) {}
+    wrapper(6);
+    wrapper(9);
+%%end
+"""
+
+EXPECTED = (
+    b"ordered check: complete\n"
+    b"directive failures: 1\n"
+    b"actual proof failures: 2 (2 nested)\n"
+    b"unused proof failures: 1\n"
+)
+
+
+def main():
+    executable = Path(sys.argv[1]).resolve(strict=True)
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "wosy.toml").write_text(MANIFEST, encoding="utf-8")
+        source = root / "main.w"
+        source.write_text(PROGRAM, encoding="utf-8")
+        command = [executable, root, "app", "dev"]
+        complete = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
+        assert complete.returncode == 1, complete
+        assert complete.stdout == EXPECTED, complete
+        assert complete.stderr == b"", complete
+
+        incomplete_program = PROGRAM.replace("unused = fn(value) { value }", "unused = fn(value) { value + 1 }")
+        assert incomplete_program != PROGRAM
+        source.write_text(incomplete_program, encoding="utf-8")
+        incomplete = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
+        assert incomplete.returncode == 2, incomplete
+        assert incomplete.stdout == b"", incomplete
+        assert incomplete.stderr == b"ordered check: incomplete: checker did not complete analysis\n", incomplete
+        assert sorted(entry.name for entry in root.iterdir()) == ["main.w", "wosy.toml"]
+
+
+if __name__ == "__main__":
+    main()

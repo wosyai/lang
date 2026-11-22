@@ -31,7 +31,7 @@ pub use scalar::{
 
 #[cfg(feature = "internal-checker")]
 #[doc(hidden)]
-pub use scalar::{check_loaded_scalar_module_proof_call, check_loaded_scalar_module_proof_selections, check_loaded_scalar_module_proofs, check_scalar_module_proof, check_scalar_module_proofs, ScalarProofDeclarations, ScalarProofCallOutcome, check_scalar_package, check_scalar_package_with_dormant_sources, check_scalar_package_ordered_with_dormant_sources, ScalarOrderedCheckerOutcome, ScalarOrderedCheckerFailure, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerIntegerWitness, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarCheckerTextFile};
+pub use scalar::{check_loaded_scalar_module_proof_call, check_loaded_scalar_ordered_proof_contexts, MainFlowProofReceipt, MainFlowProofDiagnostic, MainFlowProofInvocation, SymbolicProofDiagnostic, check_loaded_scalar_module_proof_selections, check_loaded_scalar_module_proofs, check_scalar_module_proof, check_scalar_module_proofs, ScalarProofDeclarations, ScalarProofCallOutcome, check_scalar_package, check_scalar_package_with_dormant_sources, check_scalar_package_ordered_with_dormant_sources, ScalarOrderedCheckerOutcome, ScalarOrderedCheckerFailure, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerIntegerWitness, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarCheckerTextFile};
 
 mod llvm;
 

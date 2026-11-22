@@ -2062,44 +2062,48 @@ fn prepare_loaded_proof_project(
 
 #[cfg(feature = "internal-checker")]
 #[cfg_attr(not(test), allow(dead_code))]
-struct MainFlowProofReceipt {
-    active: bool,
-    directives: Vec<ScalarOrderedCheckerFailure>,
-    diagnostics: Vec<MainFlowProofDiagnostic>,
-    symbolic_diagnostic: Option<SymbolicProofDiagnostic>,
-    additional_symbolic_diagnostics: Vec<SymbolicProofDiagnostic>,
+#[doc(hidden)]
+pub struct MainFlowProofReceipt {
+    pub active: bool,
+    pub directives: Vec<ScalarOrderedCheckerFailure>,
+    pub diagnostics: Vec<MainFlowProofDiagnostic>,
+    pub symbolic_diagnostic: Option<SymbolicProofDiagnostic>,
+    pub additional_symbolic_diagnostics: Vec<SymbolicProofDiagnostic>,
 }
 
 #[cfg(feature = "internal-checker")]
 #[cfg_attr(not(test), allow(dead_code))]
-struct MainFlowProofDiagnostic {
-    proof: wosy_syntax::SourceSpan,
-    goal: wosy_syntax::SourceSpan,
-    failed_step: Option<wosy_syntax::SourceSpan>,
-    invocation: Rc<MainFlowProofInvocation>,
+#[doc(hidden)]
+pub struct MainFlowProofDiagnostic {
+    pub proof: wosy_syntax::SourceSpan,
+    pub goal: wosy_syntax::SourceSpan,
+    pub failed_step: Option<wosy_syntax::SourceSpan>,
+    pub invocation: Rc<MainFlowProofInvocation>,
 }
 
 #[cfg(feature = "internal-checker")]
 #[cfg_attr(not(test), allow(dead_code))]
-struct MainFlowProofInvocation {
-    outer_call: Option<wosy_syntax::SourceSpan>,
-    call: wosy_syntax::SourceSpan,
-    directive_position: usize,
-    arguments: Vec<(ScalarType, BigInt)>,
-    returned: BigInt,
+#[doc(hidden)]
+pub struct MainFlowProofInvocation {
+    pub outer_call: Option<wosy_syntax::SourceSpan>,
+    pub call: wosy_syntax::SourceSpan,
+    pub directive_position: usize,
+    pub arguments: Vec<(ScalarType, BigInt)>,
+    pub returned: BigInt,
 }
 
 #[cfg(feature = "internal-checker")]
 #[cfg_attr(not(test), allow(dead_code))]
-struct SymbolicProofDiagnostic {
-    proof: wosy_syntax::SourceSpan,
-    goal: wosy_syntax::SourceSpan,
-    failed_step: Option<wosy_syntax::SourceSpan>,
-    callable: wosy_syntax::SourceSpan,
-    output: wosy_syntax::SourceSpan,
-    directive_position: usize,
-    witness: ScalarCheckerIntegerWitness,
-    returned: BigInt,
+#[doc(hidden)]
+pub struct SymbolicProofDiagnostic {
+    pub proof: wosy_syntax::SourceSpan,
+    pub goal: wosy_syntax::SourceSpan,
+    pub failed_step: Option<wosy_syntax::SourceSpan>,
+    pub callable: wosy_syntax::SourceSpan,
+    pub output: wosy_syntax::SourceSpan,
+    pub directive_position: usize,
+    pub witness: ScalarCheckerIntegerWitness,
+    pub returned: BigInt,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2937,6 +2941,22 @@ fn check_loaded_ordered_proof_diagnostics(
     Ok(MainFlowProofReceipt {
         active: run.active, directives: run.directives, diagnostics: run.actual.observed.diagnostics,
         symbolic_diagnostic, additional_symbolic_diagnostics,
+    })
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn check_loaded_scalar_ordered_proof_contexts(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    selected_root: (ScalarProofDeclarations, Vec<ScalarNamespaceBinding>),
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+) -> Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome> {
+    check_loaded_ordered_proof_diagnostics(
+        declarations, vec![selected_root], initialization_order, inputs, ScalarCheckerScope::CurrentPackage,
+    ).map_err(|error| match error {
+        ProjectCheck::Invalid(diagnostics) => ScalarOrderedCheckerOutcome::Invalid(diagnostics),
+        _ => ScalarOrderedCheckerOutcome::Unsupported,
     })
 }
 

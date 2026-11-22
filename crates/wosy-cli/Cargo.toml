@@ -20,3 +20,8 @@ wosy-syntax.workspace = true
 [[bin]]
 name = "wosy"
 path = "src/main.rs"
+
+[[example]]
+name = "inspect-ordered-check"
+required-features = ["internal-checker"]
+test = false
