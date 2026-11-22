@@ -4666,25 +4666,89 @@ fn reference_places_same(left: &ReferencePlaceId, right: &ReferencePlaceId) -> b
             })
 }
 
+fn available_place_replacement(place: &ReferencePlaceId) -> Option<(&ReferenceBindingId, Vec<ReferencePlaceProjection>)> {
+    let last = place.projections.iter().rposition(|projection| matches!(projection, ReferencePlaceProjection::Dereference(_)))?;
+    let ReferencePlaceProjection::Dereference(loan) = &place.projections[last] else { unreachable!() };
+    let owner = &loan.origin_place;
+    let (binding, mut projections) = available_place_replacement(owner)
+        .unwrap_or_else(|| (&owner.binding, owner.projections.clone()));
+    projections.extend_from_slice(&place.projections[last + 1..]);
+    Some((binding, projections))
+}
+
 fn available_place(place: &ReferencePlaceId) -> ReferencePlaceId {
-    let mut resolved = place.clone();
-    let mut projections = Vec::new();
-    for projection in &place.projections {
-        match projection {
-            ReferencePlaceProjection::Dereference(loan) => {
-                let owner = available_place(&loan.origin_place);
-                resolved.binding = owner.binding;
-                projections = owner.projections;
-            }
-            projection => projections.push(projection.clone()),
-        }
+    available_place_for_check(place).into_owned()
+}
+
+fn available_place_for_check(place: &ReferencePlaceId) -> std::borrow::Cow<'_, ReferencePlaceId> {
+    match available_place_replacement(place) {
+        Some((binding, projections)) => std::borrow::Cow::Owned(ReferencePlaceId {
+            binding: binding.clone(),
+            projections,
+            source: place.source.clone(),
+            function_span: place.function_span,
+            declaration_span: place.declaration_span,
+            block_span: place.block_span,
+            place: place.place.clone(),
+        }),
+        None => std::borrow::Cow::Borrowed(place),
     }
-    resolved.projections = projections;
-    resolved
+}
+
+#[cfg(test)]
+#[test]
+fn read_only_place_normalization_borrows_only_unchanged_places() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 10);
+    let place = |start| {
+        let declaration_span = ByteSpan::new(start, start + 1);
+        ReferencePlaceId {
+            source: source.clone(), function_span: span, block_span: span, declaration_span,
+            binding: ReferenceBindingId {
+                source: source.clone(), function_span: span, block_span: span, declaration_span,
+                kind: ReferenceBindingKind::Declared,
+            },
+            place: ScalarPlace::Name { name: String::new(), span },
+            projections: vec![ReferencePlaceProjection::Index(ScalarExpression::Integer { value: 0.into(), span })],
+        }
+    };
+    let index = |value: u32| ReferencePlaceProjection::Index(ScalarExpression::Integer { value: value.into(), span });
+    let deref = |origin_place| ReferencePlaceProjection::Dereference(Box::new(ReferenceLoanId {
+        mode: ScalarReferenceMutability::Shared, origin_place, creation_span: span, parent: None,
+    }));
+    let first_owner = place(1);
+    assert!(std::ptr::eq(available_place_for_check(&first_owner).as_ref(), &first_owner));
+
+    let mut final_owner = place(4);
+    final_owner.projections = vec![index(4)];
+    let mut intermediate = place(3);
+    intermediate.projections = vec![index(5), deref(final_owner.clone()), index(6)];
+    let mut through = place(2);
+    through.source = SourceIdentity::new("project".into(), "package".into(), "receiver".into(), "r2".into());
+    through.function_span = ByteSpan::new(10, 20);
+    through.block_span = ByteSpan::new(12, 18);
+    through.declaration_span = ByteSpan::new(13, 14);
+    through.binding.source = through.source.clone();
+    through.binding.function_span = through.function_span;
+    through.binding.block_span = through.block_span;
+    through.binding.declaration_span = through.declaration_span;
+    through.place = ScalarPlace::Name { name: "receiver".into(), span: through.declaration_span };
+    through.projections = vec![index(7), deref(first_owner), index(8), deref(intermediate), index(9)];
+    let resolved = available_place_for_check(&through);
+    assert!(matches!(&resolved, std::borrow::Cow::Owned(_)));
+    assert_eq!(resolved.as_ref(), &ReferencePlaceId {
+        binding: final_owner.binding,
+        projections: vec![index(4), index(6), index(9)],
+        source: through.source.clone(),
+        function_span: through.function_span,
+        declaration_span: through.declaration_span,
+        block_span: through.block_span,
+        place: through.place.clone(),
+    });
 }
 
 fn unavailable_place(state: &ReferenceEdgeState, place: &ReferencePlaceId) -> bool {
-    let place = available_place(place);
+    let place = available_place_for_check(place);
     state
         .moved
         .iter()
@@ -4692,7 +4756,7 @@ fn unavailable_place(state: &ReferenceEdgeState, place: &ReferencePlaceId) -> bo
 }
 
 fn unavailable_origins(state: &ReferenceEdgeState, place: &ReferencePlaceId) -> Vec<SourceSpan> {
-    let place = available_place(place);
+    let place = available_place_for_check(place);
     state
         .moved
         .iter()
@@ -4806,7 +4870,7 @@ fn loan_borrows_place(
     let mut candidate = Some(loan);
     while let Some(current) = candidate {
         if mode.is_none_or(|mode| current.mode == mode)
-            && reference_places_overlap(&available_place(&current.origin_place), place)
+            && reference_places_overlap(&available_place_for_check(&current.origin_place), place)
         {
             return true;
         }
@@ -4879,7 +4943,7 @@ fn conflicting_live_loan(
     place: &ReferencePlaceId,
     access: LoanAccess<'_>,
 ) -> Vec<SourceSpan> {
-    let place = available_place(place);
+    let place = available_place_for_check(place);
     let mut conflicts = Vec::new();
     for (binding, origins) in &state.bindings {
         let mut reachable = false;
@@ -4899,7 +4963,7 @@ fn conflicting_live_loan(
                 LoanAccess::ReadThrough(selected) => {
                     loan.mode == ScalarReferenceMutability::Mutable
                         && loan_has_ancestor(loan, selected)
-                        && reference_places_overlap(&available_place(&loan.origin_place), &place)
+                        && reference_places_overlap(&available_place_for_check(&loan.origin_place), &place)
                 }
                 LoanAccess::WriteThrough(selected, projected) => {
                     !projected.is_some_and(|projected| projected.excludes(*origin, loan))
@@ -4909,7 +4973,7 @@ fn conflicting_live_loan(
                 LoanAccess::Borrow(new) => {
                     (new.mode == ScalarReferenceMutability::Mutable
                         || loan.mode == ScalarReferenceMutability::Mutable)
-                        && reference_places_overlap(&available_place(&loan.origin_place), &place)
+                        && reference_places_overlap(&available_place_for_check(&loan.origin_place), &place)
                         && !loan_has_ancestor(new, loan)
                 }
                 LoanAccess::DirectShared => loan_borrows_place(loan, &place, Some(ScalarReferenceMutability::Mutable)),
