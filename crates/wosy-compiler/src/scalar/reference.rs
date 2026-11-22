@@ -5003,6 +5003,74 @@ fn conflicting_live_loan(
     conflicts
 }
 
+fn update_projected_assignment<'a>(
+    state: &mut ReferenceEdgeState,
+    targets: impl ExactSizeIterator<Item = &'a ReferencePlaceId> + Clone,
+    origins: Option<&BTreeSet<ReferenceOriginId>>,
+) {
+    let retire = |state: &mut ReferenceEdgeState, target| {
+        state.projected.retain(|known| !reference_places_overlap(&known.place, target));
+    };
+    if let Some(origins) = origins {
+        if targets.len() > 1 {
+            for target in targets.clone() {
+                retire(state, target);
+            }
+        }
+        for target in targets {
+            write_projected_reference(state, target, origins);
+        }
+    } else {
+        for target in targets {
+            retire(state, target);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn projected_assignment_replaces_previous_rows_once_in_candidate_order() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 10);
+    let place = |start, indices: &[u32]| {
+        let declaration_span = ByteSpan::new(start, start + 1);
+        ReferencePlaceId {
+            source: source.clone(), function_span: span, block_span: span, declaration_span,
+            binding: ReferenceBindingId {
+                source: source.clone(), function_span: span, block_span: span, declaration_span,
+                kind: ReferenceBindingKind::Declared,
+            },
+            place: ScalarPlace::Name { name: String::new(), span },
+            projections: indices.iter().map(|index| ReferencePlaceProjection::Index(
+                ScalarExpression::Integer { value: (*index).into(), span },
+            )).collect(),
+        }
+    };
+    let root = place(1, &[]);
+    let projected = place(1, &[0]);
+    let unrelated = place(2, &[]);
+    let previous = BTreeSet::from([ReferenceOriginId(0)]);
+    let replacement = BTreeSet::from([ReferenceOriginId(1)]);
+    let mut state = ReferenceEdgeState::default();
+    write_projected_reference(&mut state, &projected, &previous);
+    write_projected_reference(&mut state, &unrelated, &previous);
+    let mut without_rhs = state.clone();
+    let mut single = state.clone();
+    let capacity = single.projected.capacity();
+    update_projected_assignment(&mut single, [&root].into_iter(), Some(&replacement));
+    assert_eq!(single.projected.capacity(), capacity);
+    assert!(matches!(single.projected.as_slice(), [first, last]
+        if first.place == unrelated && first.origins == previous
+        && last.place == root && last.origins == replacement));
+    update_projected_assignment(&mut state, [&root, &projected].into_iter(), Some(&replacement));
+    assert!(matches!(state.projected.as_slice(), [first, last]
+        if first.place == unrelated && first.origins == previous
+        && last.place == projected && last.origins == replacement));
+    update_projected_assignment(&mut without_rhs, [&root, &projected].into_iter(), None);
+    assert!(matches!(without_rhs.projected.as_slice(), [first]
+        if first.place == unrelated && first.origins == previous));
+}
+
 fn write_projected_reference(
     state: &mut ReferenceEdgeState,
     place: &ReferencePlaceId,
@@ -7289,26 +7357,17 @@ fn transfer_reference_facts(
                     let rhs = assignment_rhs
                         .flatten()
                         .filter(|origins| !origins.is_empty());
-                    for candidate in candidates {
-                        state.projected.retain(|known| {
-                            !reference_places_overlap(&known.place, &candidate.place)
+                    let installs_reference = point.possible_origins.as_ref().is_none_or(|origins| !origins.is_empty());
+                    update_projected_assignment(
+                        &mut state,
+                        candidates.iter().map(|candidate| &candidate.place),
+                        if installs_reference { rhs.as_ref() } else { None },
+                    );
+                    if installs_reference && rhs.is_none() {
+                        errors.push(ReferenceAnalysisError::MissingContext {
+                            source_span: point.source_span.clone(),
+                            reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
                         });
-                    }
-                    if point
-                        .possible_origins
-                        .as_ref()
-                        .is_none_or(|origins| !origins.is_empty())
-                    {
-                        if let Some(origins) = &rhs {
-                            for candidate in candidates {
-                                write_projected_reference(&mut state, &candidate.place, origins);
-                            }
-                        } else {
-                            errors.push(ReferenceAnalysisError::MissingContext {
-                                source_span: point.source_span.clone(),
-                                reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
-                            });
-                        }
                     }
                     rhs
                 }
