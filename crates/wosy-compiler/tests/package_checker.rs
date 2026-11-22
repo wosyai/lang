@@ -1096,9 +1096,6 @@ fn named_proof_show_old_orders_same_width_formals_without_crossing_return_rows()
     assert_eq!(check("echo", &format!("{disconnected} && limit >= 0"), "out <= 0", "out <= core.old(limit)"), ScalarModuleProofOutcome::Proved);
     assert_eq!(check("echo", &format!("{disconnected} && limit <= -2"), "out <= 0", "out >= core.old(limit)"), ScalarModuleProofOutcome::Proved);
     assert_eq!(check("echo", &format!("{disconnected} && limit >= 1"), "out < 0", strict), ScalarModuleProofOutcome::Refuted);
-    // Marginal extrema (output 19 and limit 10) would refute, but they never
-    // co-occur: alias rows pair output <= 9 with limit >= 10, or output <= 19
-    // with limit >= 20. The remaining feasible rows return 0.
     assert_eq!(check("correlated", "limit >= 10 && limit <= 30", "out < 20", strict), ScalarModuleProofOutcome::Proved);
     assert_eq!(check("echo", "false", "out < 0", strict), ScalarModuleProofOutcome::NoApplicableInputs);
     let equal = "out == core.old(limit)";

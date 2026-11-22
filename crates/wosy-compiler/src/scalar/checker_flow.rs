@@ -119,8 +119,6 @@ pub(super) struct ImportedEntryGuard<'a> {
     pub(super) bound: &'a BigInt,
 }
 
-// The ordinary specialization carries no context. Rust monomorphizes this
-// extension point and eliminates its constant-false branch for the unit type.
 trait ScopedAuthoredReturn<'a>: Copy {
     const ENABLED: bool;
     fn at(
@@ -137,8 +135,6 @@ impl<'a> ScopedAuthoredReturn<'a> for () {
 }
 
 #[cfg(feature = "internal-checker")]
-// Only an admitted named authored proof can supply these borrowed inputs. No
-// arithmetic receipt is attached to the common occurrence data or startup.
 #[derive(Clone, Copy)]
 struct NamedAuthoredReturn<'a> {
     body: &'a super::ScalarBlock,
@@ -590,9 +586,6 @@ impl IntegerShowOutput {
     }
 }
 
-// Regions induced by two checked integer cuts. The middle region exists only
-// when the two distinct cuts are not consecutive. No interval endpoints or
-// caller rows are manufactured to test these proof-only implications.
 #[cfg(feature = "internal-checker")]
 struct ForbiddenCutPair<'a> {
     lower: &'a BigInt,
@@ -649,8 +642,6 @@ fn forbidden_guarded_cuts<'a>(
 #[cfg(feature = "internal-checker")]
 fn consecutive_integer_cuts(lower: &BigInt, upper: &BigInt) -> bool {
     use num_bigint::Sign::Minus;
-    // An ordered pair crossing from negative to nonnegative is consecutive
-    // only at -1 and 0. Within one sign, advance the smaller magnitude.
     let (smaller, larger) = match (lower.sign() == Minus, upper.sign() == Minus) {
         (true, false) => return upper.bits() == 0 && lower.bits() == 1,
         (true, true) => (upper, lower),
@@ -708,8 +699,6 @@ impl CartesianRelation {
     }
 
     fn holds(self, result: &IntegerSet, old: &IntegerSet) -> Option<bool> {
-        // Entry rows are exact Cartesian products. Combine independently attained
-        // extrema only within the SAME row, never over the marginal unions.
         Some(match self {
             Self::Never => false,
             Self::Equal => result.singleton_value().is_some_and(|value| Some(value) == old.singleton_value()),
@@ -1345,8 +1334,6 @@ pub(super) fn evaluate_mixed_entry_output(
     output: &IntegerShowConstraints<'_>, entry: &[Option<IntegerRelation>; 2],
 ) -> Option<bool> {
     let mut proved = true;
-    // At most two checked formal slots. Densify and precompute per-relation
-    // facts once; every row only visits present authored old constraints.
     let inactive = IntegerRelation::from_operator(&BinaryOperator::Equal)?;
     let mut typed_entry = [(0, inactive, false, CartesianRelation::Never); 2];
     let mut active = 0;
@@ -1379,8 +1366,6 @@ pub(super) fn evaluate_mixed_entry_output(
                 None
             }
         };
-        // IntegerRoots installs the immutable formals in the canonical
-        // boundary order; local introductions only append axes.
         if uses_entry && !path.axes.get(..formals.len())?.iter().copied().eq(formals.iter()) {
             return None;
         }
@@ -1503,7 +1488,6 @@ pub(super) fn evaluate_borrowed_return_proof(
                     if !relation.accepts(value.cmp(bound)) {
                         false
                     } else {
-                        // out rel old(input) translates to input rel.reversed() out.
                         let (yes_cut, no_cut) = forbidden_guarded_cuts(guard_cut, else_cut, (yes.reversed(), value), (no.reversed(), value));
                         rows.iter().all(|row| row[axis].intervals().all(|(first, last)|
                             !yes_cut.hits(first, last) && !no_cut.hits(first, last)))

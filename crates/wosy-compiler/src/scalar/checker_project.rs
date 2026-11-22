@@ -2495,7 +2495,6 @@ fn verify_authored_show_group<'step, 'project: 'step>(
             }
         }
         Some(Err(failure)) => {
-            // Indirect failures are unavailable authority, not published diagnostics.
             let mut indices = checks.filter_map(|check| match check.destination {
                 AuthoredShowDestination::Selected(index) => Some(index),
                 AuthoredShowDestination::Implicit(_) => None,
@@ -2803,8 +2802,6 @@ impl PreparedProofModule {
                 let strict_entry = if ExactGuardGroup(plan.filter.as_deref()) == ExactGuardGroup(immediate.filter.as_deref()) {
                     None
                 } else if immediate.steps.items.is_empty() {
-                    // Narrower caller evidence is admission only. Verification
-                    // and conclusion implication still use the full leaf scope.
                     let Some(entry) = plan.closed_entry_admitted_by_peer(immediate) else { continue; };
                     Some(entry)
                 } else {
@@ -2815,8 +2812,6 @@ impl PreparedProofModule {
             }
             graph.resolve_edges(self, selected, plans);
             graph.resolve_terminals();
-            // Canonical terminal identity keeps independent authored recipes
-            // distinct while deduplicating repeated uses of the same leaf.
             let integer_equality = IntegerRelation::from_operator(&BinaryOperator::Equal).expect("checked integer equality");
             for (index, plan, requested, strict_entry) in admitted_roots {
                 let Some(leaf) = graph.terminal(requested) else { continue; };
@@ -2828,8 +2823,6 @@ impl PreparedProofModule {
                     let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
                         &plan.typed.goal else { continue; };
                     let equality = relation == integer_equality;
-                    // A failed implication is a negative admission filter.
-                    // It never grants authority on its own.
                     if !equality && !cited_bounds.implies(
                         plan.typed.result_type, (relation, bound), (*requested_relation, requested),
                     ) {
@@ -2861,9 +2854,6 @@ impl PreparedProofModule {
                     }
                     continue;
                 }
-                // An incompatible strict citation always yields Unsupported,
-                // even if the broader leaf has no returning inputs. Exact
-                // contexts must still observe the leaf's applicability.
                 let implication_checked = strict_entry.is_some() && relation != integer_equality
                     && selected.request(leaf.proof_source, leaf.name).is_none();
                 if implication_checked {
@@ -4766,7 +4756,6 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_NAMED_STEPS:
                             let known = entry.get_mut(slot).ok_or(ProjectCheck::Unsupported)?;
                             *known = Some(known.map_or(relation, |current| current.intersection(relation)));
                         } else {
-                            // Keep equality admission consistent with legacy prefixes.
                             if matches!(expression, ScalarExpression::Binary {
                                 operator: BinaryOperator::Equal, right, ..
                             } if !matches!(right.as_ref(), ScalarExpression::Integer { .. })) {
