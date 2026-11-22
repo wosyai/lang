@@ -433,6 +433,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             checked_scalar_storage: BTreeSet::new(),
             checked_result_origins: BTreeSet::new(),
             proof_points: CallablePointFacts {
+                has_grouped_assignment_capture: Some(false),
                 scope_exit_bindings: matches!(&call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(_))
                     .then(HashMap::new),
                 ..CallablePointFacts::default()
@@ -3944,6 +3945,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let capture = if group.previous_observations().len() > 1 {
+                        self.proof_points.has_grouped_assignment_capture = Some(true);
                         Some(self.point(
                             CfgPointKind::CaptureAssignmentPrevious { writes: Vec::new() },
                             group.span,
@@ -5628,6 +5630,7 @@ impl ScalarDescriptorReplay<'_> {
 
 struct ReferenceTransferCfg<'a> {
     initial_points: &'a [ReferenceFlowPoint],
+    has_grouped_assignment_capture: Option<bool>,
     strictly_forward_out: Option<&'a mut bool>,
     scope_exit_bindings: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     pending_named_reborrow: Option<&'a super::control::PendingNamedReborrow>,
@@ -5650,6 +5653,7 @@ impl<'a> ReferenceTransferCfg<'a> {
     fn new(cfg: &'a mut ScalarReferenceCfg, proof: Option<&'a CallablePointFacts>) -> Self {
         Self {
             initial_points: &cfg.initial_points,
+            has_grouped_assignment_capture: proof.and_then(|proof| proof.has_grouped_assignment_capture),
             strictly_forward_out: None,
             scope_exit_bindings: proof.and_then(|proof| proof.scope_exit_bindings.as_ref()),
             pending_named_reborrow: proof.and_then(|proof| proof.pending_named_reborrow.as_ref()),
@@ -6006,6 +6010,42 @@ fn keep_forward_point_in_place(
         && matches!(kind, CfgPointKind::Call { .. } | CfgPointKind::Branch { .. })
 }
 
+fn grouped_assignment_installs(
+    original_points: &[ReferenceFlowPoint],
+    has_capture: Option<bool>,
+) -> BTreeSet<CfgPointId> {
+    if has_capture == Some(false) {
+        return BTreeSet::new();
+    }
+    original_points.iter()
+        .filter_map(|point| match &point.kind {
+            CfgPointKind::CaptureAssignmentPrevious { writes } => Some(writes.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn grouped_install_inventory_preserves_detached_and_canonical_capture() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 10);
+    let point = |kind| ReferenceFlowPoint {
+        id: CfgPointId(0), kind, source_span: SourceSpan::new(source.clone(), span),
+        scope: ReferenceScopeId(0), possible_origins: None, successors: Vec::new(),
+    };
+    let empty = [point(CfgPointKind::Entry)];
+    assert!(grouped_assignment_installs(&empty, Some(false)).is_empty());
+    let points = [point(CfgPointKind::CaptureAssignmentPrevious {
+        writes: vec![CfgPointId(1), CfgPointId(2)],
+    })];
+    let expected = BTreeSet::from([CfgPointId(1), CfgPointId(2)]);
+    assert_eq!(grouped_assignment_installs(&points, Some(true)), expected);
+    assert_eq!(grouped_assignment_installs(&points, None), expected);
+}
+
 fn transfer_reference_facts(
     mut cfg: ReferenceTransferCfg<'_>,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
@@ -6019,15 +6059,7 @@ fn transfer_reference_facts(
     mut descriptor: Option<&mut ScalarDescriptorReplay<'_>>,
 ) -> Vec<ReferenceAnalysisError> {
     let original_points = cfg.initial_points;
-    let grouped_installs = original_points
-        .iter()
-        .filter_map(|point| match &point.kind {
-            CfgPointKind::CaptureAssignmentPrevious { writes } => Some(writes.as_slice()),
-            _ => None,
-        })
-        .flatten()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    let grouped_installs = grouped_assignment_installs(original_points, cfg.has_grouped_assignment_capture);
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
     let mut strictly_forward = true;
     let mut projected_leaf_sites = HashMap::new();
@@ -11373,6 +11405,7 @@ fn derive_function_specialized_copy_policies(
             let transferred = transfer_reference_facts(
                 ReferenceTransferCfg {
                     initial_points: &template_cfg.initial_points,
+                    has_grouped_assignment_capture: template_result.proof_points.has_grouped_assignment_capture,
                     strictly_forward_out: None,
                     scope_exit_bindings: template_result.proof_points.scope_exit_bindings.as_ref(),
                     pending_named_reborrow: template_result.proof_points.pending_named_reborrow.as_ref(),
