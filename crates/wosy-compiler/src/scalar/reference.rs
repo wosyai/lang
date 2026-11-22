@@ -4489,6 +4489,9 @@ fn transfer_reference_facts(
         let common_aggregate_cutoff = aggregate_deadlines.as_ref()
             .and_then(|_| original_points[id.0].successors.iter().copied().min());
         let states = std::mem::take(&mut incoming[id.0]);
+        let snapshot_required = fallback.is_some() || states.len() != 1
+            || !matches!(&original_points[id.0].kind,
+                CfgPointKind::Evaluate(_) | CfgPointKind::Call { .. } | CfgPointKind::Branch { .. });
         if let Some(single_observation) = &mut forward_single_observation {
             if matches!(&original_points[id.0].kind, CfgPointKind::MoveThrough { place, .. }
                 if !matches!(place, ScalarPlace::Dereference { .. }))
@@ -5543,7 +5546,7 @@ fn transfer_reference_facts(
                         }
                     }
                 }
-            } else {
+            } else if snapshot_required {
                 observed[id.0] = Some(point.clone());
             }
             if let (Some(cutoff), Some(last_use), Some(flow)) =
