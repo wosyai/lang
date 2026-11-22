@@ -394,35 +394,128 @@ fn check_package_roots_with_policy<const COLLECT: bool>(
     if scope == ScalarCheckerScope::MainFlowOnly {
         return Ok(had_obligations);
     }
+    let mut ordered_roots = if COLLECT {
+        close_ordered_symbolic_roots(std::mem::take(&mut authored_roots), || {
+            ordered_symbolic_callers(project, calls, root)
+        })?
+    } else {
+        HashMap::new()
+    };
+    let mut module_roots = |ordinal: usize, module: &ScalarModule| {
+        if COLLECT {
+            Ok(ordered_roots.remove(&ordinal))
+        } else {
+            authored_roots.remove(&ordinal).map(|seeds| symbolic_obligation_roots(calls, module, ordinal, seeds)).transpose()
+        }
+    };
     for source in &project.initialization_order {
         if source.project != root.project || source.package != root.package {
             continue;
         }
         let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
-        if let Some(seeds) = authored_roots.remove(&ordinal) {
-            let module = &project.modules[ordinal];
-            if visits[ordinal] != InitializationVisit::Completed {
-                if COLLECT && symbolic_obligation_roots(calls, module, ordinal, seeds)?
-                    .into_iter().any(|item| !reached.contains(&(ordinal, item)))
-                {
+        let completed = visits[ordinal] == InitializationVisit::Completed;
+        if !COLLECT && !completed {
+            continue;
+        }
+        let module = &project.modules[ordinal];
+        if let Some(selected) = module_roots(ordinal, module)? {
+            if !completed {
+                if selected.into_iter().any(|item| !reached.contains(&(ordinal, item))) {
                     return Err(ProjectCheck::Unsupported);
                 }
                 continue;
             }
             had_obligations |= check_unused_module::<COLLECT>(
-                project, calls, module, ordinal, &reached, seeds, failures.as_deref_mut(), Some(&visits),
+                project, calls, module, ordinal, &reached, selected, failures.as_deref_mut(), Some(&visits),
             )?;
         }
     }
     for (index, module) in dormant.iter().enumerate() {
         let ordinal = startup_count + index;
-        if let Some(seeds) = authored_roots.remove(&ordinal) {
+        if let Some(selected) = module_roots(ordinal, module)? {
             had_obligations |= check_unused_module::<COLLECT>(
-                project, calls, module, ordinal, &reached, seeds, failures.as_deref_mut(), None,
+                project, calls, module, ordinal, &reached, selected, failures.as_deref_mut(), None,
             )?;
         }
     }
     Ok(had_obligations)
+}
+
+type PreparedCallable = (usize, usize);
+
+fn ordered_symbolic_callers(
+    project: &ScalarProject,
+    calls: &ProjectCallSiteResults,
+    root: &SourceIdentity,
+) -> Result<HashMap<PreparedCallable, Vec<PreparedCallable>>, ProjectCheck> {
+    let mut callers = HashMap::new();
+    for (module, source_module) in project.modules.iter().enumerate() {
+        if source_module.source.project != root.project || source_module.source.package != root.package {
+            continue;
+        }
+        for (item, declaration) in source_module.items.iter().enumerate() {
+            if !matches!(declaration, ScalarItem::Function(_)) {
+                continue;
+            }
+            let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            record_ordered_symbolic_callable_edges(body, (module, item), project, root, &mut callers);
+        }
+    }
+    Ok(callers)
+}
+
+fn record_ordered_symbolic_callable_edges(
+    body: &FunctionCallSites,
+    caller: PreparedCallable,
+    project: &ScalarProject,
+    root: &SourceIdentity,
+    callers: &mut HashMap<PreparedCallable, Vec<PreparedCallable>>,
+) {
+    for (occurrence, &target) in &body.structure.checker_direct_targets {
+        if target.0 != caller.0 {
+            let Some(signature) = body.checked_call_signatures.get(occurrence) else { continue; };
+            if !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit) {
+                continue;
+            }
+            let Some(owner) = project.modules.get(target.0) else { continue; };
+            if root.project != owner.source.project || root.package != owner.source.package {
+                continue;
+            }
+        }
+        let edges = callers.entry(target).or_default();
+        if edges.last() != Some(&caller) {
+            edges.push(caller);
+        }
+    }
+    for arm in &body.arms {
+        record_ordered_symbolic_callable_edges(arm, caller, project, root, callers);
+    }
+}
+
+fn close_ordered_symbolic_roots(
+    authored: HashMap<usize, Vec<usize>>,
+    build_callers: impl FnOnce() -> Result<HashMap<PreparedCallable, Vec<PreparedCallable>>, ProjectCheck>,
+) -> Result<HashMap<usize, HashSet<usize>>, ProjectCheck> {
+    let mut selected = HashMap::new();
+    if authored.is_empty() {
+        return Ok(selected);
+    }
+    let mut callers = build_callers()?;
+    let mut pending = Vec::new();
+    for (module, items) in authored {
+        selected.insert(module, items.iter().copied().collect::<HashSet<_>>());
+        pending.extend(items.into_iter().map(|item| (module, item)));
+    }
+    while let Some(target) = pending.pop() {
+        if let Some(edges) = callers.remove(&target) {
+            for (module, item) in edges {
+                if selected.entry(module).or_default().insert(item) {
+                    pending.push((module, item));
+                }
+            }
+        }
+    }
+    Ok(selected)
 }
 
 fn record_symbolic_callable_edges(
@@ -475,11 +568,10 @@ fn check_unused_module<const COLLECT: bool>(
     module: &ScalarModule,
     ordinal: usize,
     reached: &HashSet<(usize, usize)>,
-    authored_roots: Vec<usize>,
+    symbolic_roots: HashSet<usize>,
     mut failures: Option<&mut Vec<ProjectCheck>>,
     completed_visits: Option<&[InitializationVisit]>,
 ) -> Result<bool, ProjectCheck> {
-    let symbolic_roots = symbolic_obligation_roots(calls, module, ordinal, authored_roots)?;
     let mut active = false;
     for (item, declaration) in module.items.iter().enumerate() {
         let ScalarItem::Function(function) = declaration else {
@@ -3604,6 +3696,77 @@ mod tests {
         assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 2),
             Err(ProjectCheck::Unsupported));
         assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 2),
+            Ok((true, Vec::new())));
+    }
+
+    #[test]
+    fn ordered_symbolic_census_never_indexes_without_authored_seeds() {
+        let roots = close_ordered_symbolic_roots(HashMap::new(), || panic!("indexed graph without a seed")).unwrap();
+        assert!(roots.is_empty());
+
+        let roots = close_ordered_symbolic_roots(HashMap::from([(1, vec![7])]), || {
+            Ok(HashMap::from([((1, 7), vec![(0, 2)]), ((0, 2), vec![(0, 3)])]))
+        }).unwrap();
+        assert_eq!(roots, HashMap::from([(0, HashSet::from([2, 3])), (1, HashSet::from([7]))]));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_package_symbolic_discovery_follows_cross_only_namespace_wrappers() {
+        let app = source("src/main.w", "collect-unselected-namespace-wrapper");
+        let child = source("src/child.w", "collect-obligated-namespace-leaf");
+        let prepare = |body: &str, startup: &str| {
+            let root_text = format!(r#"%%start
+                lib = namespace demo "src/child.w";
+                alias = namespace demo "src/child.w";
+                unit(u8) wrapper = fn(value) {{ if (value == 0) {{}}; {body} }};
+                {startup}
+            %%end"#);
+            let child_text = format!("%%start\nunit(u8) leaf = fn(value) {{ core.require(value < 2, {OUTPUT}); }};\n%%end");
+            let namespace = |name: &str| {
+                let start = root_text.find(&format!("{name} =")).unwrap();
+                let end = start + root_text[start..].find(';').unwrap() + 1;
+                ScalarNamespaceBinding {
+                    binding: name.into(), target: child.clone(), span: ByteSpan::new(start as u32, end as u32),
+                }
+            };
+            prepare_checker_project(
+                vec![
+                    (declarations(&app, &root_text), vec![namespace("lib"), namespace("alias")]),
+                    (declarations(&child, &child_text), Vec::new()),
+                ],
+                vec![app.clone(), child.clone()],
+                inputs(),
+            ).unwrap()
+        };
+        let read = |prepared: &PreparedCheckerProject| {
+            let (active, reports) = collect_ordered_package_failures(prepared, ScalarCheckerScope::CurrentPackage, 2)
+                .expect("complete selected namespace roots");
+            assert!(active);
+            reports.into_iter().map(|report| {
+                let ProjectCheck::Failed { source, axes, state, .. } = report else { panic!("expected authored report"); };
+                assert_eq!(source, child);
+                assert_eq!(axes[0].0.source, source);
+                let mut values = state.intervals_at(0, 0).unwrap();
+                let (lo, hi) = values.next().unwrap();
+                assert!(values.next().is_none());
+                (lo.clone(), hi.clone())
+            }).collect::<Vec<_>>()
+        };
+        let domains = |pairs: &[(i32, i32)]| pairs.iter().map(|(lo, hi)| (BigInt::from(*lo), BigInt::from(*hi))).collect::<Vec<_>>();
+        let aliases = "lib.leaf(3); alias.leaf(4);";
+        let prepared = prepare(aliases, "");
+        assert_eq!(read(&prepared), domains(&[(3, 3), (4, 4), (2, 255)]));
+        let prepared = prepare(aliases, "lib.leaf(1);");
+        assert_eq!(read(&prepared), domains(&[(3, 3), (4, 4)]));
+        assert_eq!(check_package_roots(&prepared), Ok(()));
+        assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 2),
+            Ok((true, Vec::new())));
+
+        let prepared = prepare("alias.leaf(value);", "lib.leaf(1);");
+        assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 2), Err(ProjectCheck::Unsupported));
+        let prepared = prepare("if (false) { alias.leaf(value); };", "lib.leaf(1);");
+        assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 2),
             Ok((true, Vec::new())));
     }
 
