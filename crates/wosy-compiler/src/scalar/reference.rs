@@ -6046,6 +6046,31 @@ fn grouped_install_inventory_preserves_detached_and_canonical_capture() {
     assert_eq!(grouped_assignment_installs(&points, None), expected);
 }
 
+enum ReferenceStateBatch {
+    Single(Option<ReferenceEdgeState>),
+    Many(std::vec::IntoIter<ReferenceEdgeState>),
+}
+
+impl ReferenceStateBatch {
+    fn as_slice(&self) -> &[ReferenceEdgeState] {
+        match self {
+            Self::Single(state) => state.as_slice(),
+            Self::Many(states) => states.as_slice(),
+        }
+    }
+}
+
+impl Iterator for ReferenceStateBatch {
+    type Item = ReferenceEdgeState;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Single(state) => state.take(),
+            Self::Many(states) => states.next(),
+        }
+    }
+}
+
 enum ReferenceIncomingStates {
     Linear { destination: CfgPointId, states: Vec<ReferenceEdgeState> },
     Indexed(Vec<Vec<ReferenceEdgeState>>),
@@ -6071,6 +6096,16 @@ impl ReferenceIncomingStates {
         }
     }
 
+    fn take(&mut self, id: CfgPointId) -> ReferenceStateBatch {
+        let linear = matches!(self, Self::Linear { .. });
+        let slot = self.slot(id);
+        if linear && slot.len() == 1 {
+            ReferenceStateBatch::Single(slot.pop())
+        } else {
+            ReferenceStateBatch::Many(std::mem::take(slot).into_iter())
+        }
+    }
+
     fn slot(&mut self, id: CfgPointId) -> &mut Vec<ReferenceEdgeState> {
         match self {
             Self::Linear { destination, states } => {
@@ -6089,16 +6124,25 @@ fn linear_incoming_slot_preserves_gaps_and_distinct_ordered_states() {
     let mut incoming = ReferenceIncomingStates::new(8, true);
     incoming.slot(CfgPointId(0)).push(ReferenceEdgeState::default());
     assert_eq!(incoming.next_forward(0), Some(CfgPointId(0)));
-    let mut first = std::mem::take(incoming.slot(CfgPointId(0))).pop().unwrap();
+    let allocation = incoming.slot(CfgPointId(0)).as_ptr();
+    let capacity = incoming.slot(CfgPointId(0)).capacity();
+    let mut initial = incoming.take(CfgPointId(0));
+    assert_eq!(initial.as_slice().len(), 1);
+    let mut first = initial.next().unwrap();
     assert_eq!(incoming.next_forward(1), None);
+    assert_eq!(incoming.slot(CfgPointId(4)).as_ptr(), allocation);
+    assert_eq!(incoming.slot(CfgPointId(4)).capacity(), capacity);
 
     first.value = Some(BTreeSet::from([ReferenceOriginId(0)]));
     let mut second = ReferenceEdgeState::default();
     second.value = Some(BTreeSet::from([ReferenceOriginId(1)]));
     incoming.slot(CfgPointId(4)).push(first.clone());
+    assert_eq!(incoming.slot(CfgPointId(4)).as_ptr(), allocation);
     incoming.slot(CfgPointId(4)).push(second.clone());
     assert_eq!(incoming.next_forward(1), Some(CfgPointId(4)));
-    assert!(std::mem::take(incoming.slot(CfgPointId(4))) == vec![first, second]);
+    let states = incoming.take(CfgPointId(4));
+    assert!(states.as_slice() == &[first, second]);
+    assert_eq!(incoming.slot(CfgPointId(4)).capacity(), 0);
     assert_eq!(incoming.next_forward(5), None);
     incoming.slot(CfgPointId(7)).push(ReferenceEdgeState::default());
     assert_eq!(incoming.next_forward(5), Some(CfgPointId(7)));
@@ -6442,14 +6486,15 @@ fn transfer_reference_facts(
         };
         let common_aggregate_cutoff = aggregate_deadlines.as_ref()
             .and_then(|_| original_points[id.0].successors.iter().copied().min());
-        let states = std::mem::take(incoming.slot(id));
-        let keep_in_place = keep_forward_point_in_place(&original_points[id.0].kind, ordinary_forward, states.len());
+        let states = incoming.take(id);
+        let incoming_count = states.as_slice().len();
+        let keep_in_place = keep_forward_point_in_place(&original_points[id.0].kind, ordinary_forward, incoming_count);
         let mut snapshot = if keep_in_place {
             None
         } else {
             Some(&mut observed.get_or_insert_with(|| vec![None::<ReferenceFlowPoint>; point_count])[id.0])
         };
-        if strictly_forward && states.len() == 1
+        if strictly_forward && incoming_count == 1
             && matches!(&original_points[id.0].kind, CfgPointKind::MoveThrough { place, .. }
                 if !matches!(place, ScalarPlace::Dereference { .. }))
         {
@@ -6522,8 +6567,8 @@ fn transfer_reference_facts(
                                 .is_some_and(|origins| origins.len() == 1 && origins.contains(&pending.origin))
                     }
                 }
-                && !states.is_empty()
-                && selected_parent.is_some_and(|(origin, binding)| states.iter().all(|state| {
+                && incoming_count != 0
+                && selected_parent.is_some_and(|(origin, binding)| states.as_slice().iter().all(|state| {
                     let owner = deferred_reborrow_owner(pending);
                     let read = state.point_values.get(site.read);
                     exact_live_reborrow_holder(state, &pending.handle, pending.origin)
@@ -7929,6 +7974,7 @@ fn transfer_reference_facts(
             }
         }
     }
+    drop(incoming);
     for (point, observed) in cfg.points.iter_mut().zip(observed.into_iter().flatten()) {
         let Some(mut observed) = observed else { continue };
         observed.kind = match observed.kind {
