@@ -9193,21 +9193,61 @@ u8(Pair) inspect = fn(owner) {
     }
 }
 
+fn known_store_precedes_load<'ctx>(
+    write: InstructionValue<'ctx>, read: InstructionValue<'ctx>, entry: inkwell::basic_block::BasicBlock<'ctx>,
+) -> bool {
+    let store_block = write.get_parent().expect("checked store block");
+    let read_block = read.get_parent().expect("checked return load block");
+    if store_block == read_block {
+        std::iter::successors(write.get_next_instruction(), |instruction| instruction.get_next_instruction())
+            .any(|instruction| instruction == read)
+    } else {
+        let reaches = |start: inkwell::basic_block::BasicBlock<'_>, end, excluded| {
+            let mut pending = vec![start];
+            let mut seen = std::collections::HashSet::new();
+            while let Some(block) = pending.pop() {
+                if excluded == Some(block) || !seen.insert(block) {
+                    continue;
+                }
+                if block == end {
+                    return true;
+                }
+                if let Some(terminal) = block.get_terminator() {
+                    pending.extend(terminal.get_operands().filter_map(|operand| operand?.block()));
+                }
+            }
+            false
+        };
+        reaches(entry, read_block, None) && !reaches(entry, read_block, Some(store_block))
+    }
+}
+
 #[test]
 fn emits_known_projected_leaf_from_the_original_owner_through_the_ordinary_driver() {
-    for (layout, parent_mode, child_mode, left, store) in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64]
+    for (layout, parent_mode, child_mode, siblings) in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64]
         .into_iter().flat_map(|layout| [
-            (layout, "", "", "owner.left", ""),
-            (layout, "!", "", "(*parent).left", ""),
-            (layout, "!", "!", "(*parent).left", "*leaf = 9;"),
+            (layout, "", "", false),
+            (layout, "!", "", false),
+            (layout, "!", "!", false),
+            (layout, "!", "!", true),
         ])
     {
+        let (left, left_declaration, stores) = if siblings {
+            ("*left_leaf", "*!u8 left_leaf = &!(*parent).left;", "*left_leaf = 7; *leaf = 9;")
+        } else if child_mode == "!" {
+            ("(*parent).left", "", "*leaf = 9;")
+        } else if parent_mode == "!" {
+            ("(*parent).left", "", "")
+        } else {
+            ("owner.left", "", "")
+        };
         let source = format!(r#"%%start
 struct copy Pair {{ u8 left; u8 right; }}
 u8(Pair) inspect = fn(owner) {{
     *{parent_mode}Pair parent = &{parent_mode}owner;
+    {left_declaration}
     *{child_mode}u8 leaf = &{child_mode}(*parent).right;
-    {store}
+    {stores}
     {left} + *leaf
 }};
 %%end"#);
@@ -9238,13 +9278,17 @@ u8(Pair) inspect = fn(owner) {{
             let result = known_field_operand(result, 0).and_then(|value| value.as_instruction_value())
                 .expect("returned add value");
             assert_eq!(result.get_opcode(), InstructionOpcode::Add);
-            let [(direct, _), (checked, returned_leaf_load)] = [0, 1].map(|index| {
+            let [(direct, returned_left_load), (checked, returned_leaf_load)] = [0, 1].map(|index| {
                 let read = known_field_operand(result, index).and_then(|value| value.as_instruction_value())
                     .expect("add consumes field read");
                 assert_eq!(read.get_opcode(), InstructionOpcode::Load);
                 (known_field_operand(read, 0).expect("actual field address"), read)
             });
-            let (direct_base, direct_offset) = known_direct_field_path(direct).expect("left owner field");
+            let (direct_base, direct_offset) = if siblings {
+                known_checked_field_path(&instructions, direct).expect("left checked sibling field")
+            } else {
+                known_direct_field_path(direct).expect("left owner field")
+            };
             let direct_owner = if parent_mode.is_empty() {
                 direct_base
             } else {
@@ -9262,40 +9306,24 @@ u8(Pair) inspect = fn(owner) {{
                         &instructions, known_field_operand(instruction, 1)?,
                     )?;
                     let owner = known_checked_address(&instructions, parent)?;
-                    (owner == loan_owner && offset == leaf_offset)
-                        .then(|| (instruction, known_stored_byte(&instructions, instruction)))
+                    (owner == loan_owner).then(|| (offset, instruction, known_stored_byte(&instructions, instruction)))
                 }).collect::<Vec<_>>();
-                let [(write, Some(9))] = writes.as_slice() else {
-                    panic!("the checked child must store exactly one byte 9 for the returned field: {ir}");
-                };
-                let store_block = write.get_parent().expect("checked store block");
-                let read_block = returned_leaf_load.get_parent().expect("checked return load block");
-                let proven_before = if store_block == read_block {
-                    std::iter::successors(write.get_next_instruction(), |instruction| instruction.get_next_instruction())
-                        .any(|instruction| instruction == returned_leaf_load)
-                } else {
-                    let reaches = |start: inkwell::basic_block::BasicBlock<'_>, end, excluded| {
-                        let mut pending = vec![start];
-                        let mut seen = std::collections::HashSet::new();
-                        while let Some(block) = pending.pop() {
-                            if excluded == Some(block) || !seen.insert(block) {
-                                continue;
-                            }
-                            if block == end {
-                                return true;
-                            }
-                            if let Some(terminal) = block.get_terminator() {
-                                pending.extend(terminal.get_operands().filter_map(|operand| operand?.block()));
-                            }
-                        }
-                        false
+                let expected = [
+                    Some((leaf_offset, 9, returned_leaf_load)),
+                    siblings.then_some((direct_offset, 7, returned_left_load)),
+                ];
+                assert_eq!(writes.len(), expected.iter().flatten().count(), "{ir}");
+                let entry = routine.get_first_basic_block().expect("entry block");
+                for (offset, byte, read) in expected.into_iter().flatten() {
+                    let matches = writes.iter().filter(|(stored, _, _)| *stored == offset).collect::<Vec<_>>();
+                    let [(_, write, Some(actual))] = matches.as_slice() else {
+                        panic!("one checked byte store to each exact returned field: {ir}");
                     };
-                    let entry = routine.get_first_basic_block().expect("entry block");
-                    reaches(entry, read_block, None) && !reaches(entry, read_block, Some(store_block))
-                };
-                assert!(proven_before, "the exact store must precede the returned field load: {ir}");
+                    assert_eq!(*actual, byte, "{ir}");
+                    assert!(known_store_precedes_load(*write, read, entry),
+                        "each exact store precedes its returned field load: {ir}");
+                }
             }
-
         }
     }
 }
