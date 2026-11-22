@@ -66,7 +66,7 @@ enum LiteralArrayReceipt<'ctx> {
         base: PointerValue<'ctx>,
         storage: Option<(PointerValue<'ctx>, PointerValue<'ctx>)>,
         argument_extent: Option<inkwell::values::IntValue<'ctx>>,
-        in_writer: bool,
+        in_writer: Option<ArrayWriterSide>,
     },
     Fresh {
         base: PointerValue<'ctx>,
@@ -76,6 +76,11 @@ enum LiteralArrayReceipt<'ctx> {
     Finished,
 }
 
+struct LiteralArrayBranchOriginal<'ctx> {
+    base: PointerValue<'ctx>,
+    storage: (PointerValue<'ctx>, PointerValue<'ctx>),
+}
+
 pub(super) struct AggregateEmitter<'ctx, 'plan> {
     plan: &'plan ClosedBody,
     destination: Option<PointerValue<'ctx>>,
@@ -83,6 +88,7 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     ordinary_committed: bool,
     ordinary_called: bool,
     literal_array_receipt: LiteralArrayReceipt<'ctx>,
+    literal_array_branch_original: Option<LiteralArrayBranchOriginal<'ctx>>,
     base: Option<PointerValue<'ctx>>,
     registered_allocation: Option<String>,
     failure_site: Option<ClosedLocalArrayRelease>,
@@ -105,6 +111,8 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
     pub(super) fn literal_array_replacement(&self, ordinal: usize) -> Option<usize> {
         match self.plan.literal_array? {
             ClosedLiteralArray::Replacement { call, destination, .. } if call == ordinal => Some(destination),
+            ClosedLiteralArray::Replacement { unit: Some(unit), .. } =>
+                unit.other_writer.filter(|(call, _)| *call == ordinal).map(|(_, destination)| destination),
             _ => None,
         }
     }
@@ -173,6 +181,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             ordinary_committed: false,
             ordinary_called: false,
             literal_array_receipt: LiteralArrayReceipt::Awaiting,
+            literal_array_branch_original: None,
             base: None,
             registered_allocation: None,
             failure_site,
@@ -336,7 +345,7 @@ pub(super) fn enroll_literal_array_allocation<'ctx>(
     {
         return Err("checked literal array allocation does not match its receipt".into());
     }
-    aggregate.literal_array_receipt = LiteralArrayReceipt::Original { base, storage, argument_extent: None, in_writer: false };
+    aggregate.literal_array_receipt = LiteralArrayReceipt::Original { base, storage, argument_extent: None, in_writer: None };
     Ok(())
 }
 
@@ -366,16 +375,31 @@ pub(super) fn begin_literal_array_unit(
     else { return Ok(false) };
     let Some(nodes) = state.body_call_nodes else { return Err("missing checked array branch context".into()) };
     let (writer, retained) = unit.writer_side.split(Some(then_block), else_block);
+    let dual = unit.other_writer.is_some();
     if nodes.expression_ordinal(expression) != Some(unit.expression)
         || writer.and_then(|block| nodes.block_ordinal(block)) != Some(unit.writer_block)
         || !writer.is_some_and(|block| block.items.len() == 1)
         || retained.is_some() != unit.retained_block.is_some()
         || retained.and_then(|block| nodes.block_ordinal(block)) != unit.retained_block
-        || retained.is_some_and(|block| !block.items.is_empty())
+        || retained.is_some_and(|block| block.items.len() != if dual { 1 } else { 0 })
+        || (dual && (unit.writer_side != ArrayWriterSide::Then || retained.is_none()))
     {
         return Err("checked array branch does not match its route".into());
     }
-    if emitting != unit.writer_side {
+    if dual && emitting == ArrayWriterSide::Else {
+        if !matches!(aggregate.literal_array_receipt,
+            LiteralArrayReceipt::Fresh { joined_storage: Some(_), .. })
+        {
+            return Err("first checked array writer did not commit before the alternate arm".into());
+        }
+        let LiteralArrayBranchOriginal { base, storage } = aggregate.literal_array_branch_original.take()
+            .ok_or_else(|| "missing checked original allocation for the alternate arm".to_owned())?;
+        // Restore only the compiler token for the other runtime edge. The
+        // allocation and its private slots dominate both mutually exclusive arms.
+        aggregate.literal_array_receipt = LiteralArrayReceipt::Original {
+            base, storage: Some(storage), argument_extent: None, in_writer: None,
+        };
+    } else if emitting != unit.writer_side {
         // The compiler visits then before else; this is emission state only.
         // The verified empty arm never loads or changes the runtime receipt.
         let matches_order = match unit.writer_side {
@@ -383,7 +407,7 @@ pub(super) fn begin_literal_array_unit(
                 LiteralArrayReceipt::Fresh { joined_storage: Some(_), .. }),
             ArrayWriterSide::Else => matches!(aggregate.literal_array_receipt,
                 LiteralArrayReceipt::Original {
-                    storage: Some(_), argument_extent: None, in_writer: false, ..
+                    storage: Some(_), argument_extent: None, in_writer: None, ..
                 }),
         };
         if !matches_order {
@@ -391,11 +415,18 @@ pub(super) fn begin_literal_array_unit(
         }
         return Ok(false);
     }
-    let LiteralArrayReceipt::Original { storage: Some(_), argument_extent: None, in_writer, .. } =
+    let LiteralArrayReceipt::Original { base, storage: Some(storage), argument_extent: None, in_writer } =
         &mut aggregate.literal_array_receipt
     else { return Err("checked array branch has no original receipt".into()) };
-    if std::mem::replace(in_writer, true) {
+    if std::mem::replace(in_writer, Some(emitting)).is_some() {
         return Err("duplicate checked array writer arm".into());
+    }
+    if dual && emitting == ArrayWriterSide::Then
+        && aggregate.literal_array_branch_original.replace(LiteralArrayBranchOriginal {
+            base: *base, storage: *storage,
+        }).is_some()
+    {
+        return Err("duplicate checked alternate original receipt".into());
     }
     Ok(true)
 }
@@ -408,6 +439,9 @@ pub(super) fn finish_literal_array_unit(
         return Ok(());
     }
     let Some(aggregate) = state.aggregate.as_mut() else { return Err("missing checked array join plan".into()) };
+    if aggregate.literal_array_branch_original.is_some() {
+        return Err("checked array conditional did not visit the alternate writer".into());
+    }
     let LiteralArrayReceipt::Fresh { joined_storage: Some(storage), .. } =
         std::mem::replace(&mut aggregate.literal_array_receipt, LiteralArrayReceipt::Finished)
     else { return Err("checked array branch did not install a fresh receipt".into()) };
@@ -454,9 +488,6 @@ pub(super) fn install_literal_array_replacement<'ctx>(
     let Some(aggregate) = state.aggregate.as_mut() else { return Err("missing checked literal array plan".into()) };
     let Some(ClosedLiteralArray::Replacement { call: planned, extent, unit, .. }) = aggregate.plan.literal_array
         else { return Err("missing checked literal array replacement".into()) };
-    if call != planned {
-        return Err("checked literal array replacement has a different call occurrence".into());
-    }
     let EmitValue::Basic(BasicValueEnum::PointerValue(fresh)) = value else {
         return Err("checked literal array replacement has no backing".into());
     };
@@ -465,8 +496,14 @@ pub(super) fn install_literal_array_replacement<'ctx>(
     } =
         std::mem::replace(&mut aggregate.literal_array_receipt, LiteralArrayReceipt::Finished)
     else { return Err("checked literal array replacement has no original receipt".into()) };
-    if in_writer != unit.is_some() {
-        return Err("checked array writer does not match its branch phase".into());
+    let expected_call = match (unit, in_writer) {
+        (None, None) => Some(planned),
+        (Some(unit), Some(side)) if side == unit.writer_side => Some(planned),
+        (Some(unit), Some(ArrayWriterSide::Else)) => unit.other_writer.map(|(call, _)| call),
+        _ => None,
+    };
+    if expected_call != Some(call) {
+        return Err("checked array writer does not match its branch and call".into());
     }
     let length = match (extent, argument_extent) {
         (ReplacementArrayExtent::Literal(elements), None) => context.i64_type().const_int(elements, false),
@@ -1127,7 +1164,7 @@ pub(super) fn commit_return<'ctx>(
         {
             return Err("checked fresh literal array return does not match its output occurrence".into());
         }
-        let LiteralArrayReceipt::Original { base, storage: None, argument_extent: None, in_writer: false } =
+        let LiteralArrayReceipt::Original { base, storage: None, argument_extent: None, in_writer: None } =
             std::mem::replace(&mut aggregate.literal_array_receipt, LiteralArrayReceipt::Finished)
         else { return Err("checked fresh literal array return has no original receipt".into()) };
         // The admitted immutable direct binding returns the recorded LLVM SSA

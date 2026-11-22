@@ -1030,10 +1030,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 _ => None,
             };
             if let Some((writer_block, retained)) = edges {
-                self.aggregate_facts.literal_array_unit = Some(aggregate::LiteralArrayUnit {
-                    expression, condition, branch, writer_side, writer_entry, writer_exit,
-                    writer_block, retained, writer_scope: self.cfg.points[writer_entry.0].scope, join,
-                });
+                let other_write = self.aggregate_facts.literal_array_other_write;
+                if self.aggregate_facts.literal_array_other_writer.is_some() == other_write.is_some() {
+                    self.aggregate_facts.literal_array_unit = Some(aggregate::LiteralArrayUnit {
+                        expression, condition, branch, writer_side, writer_entry, writer_exit,
+                        writer_block, retained, other_write,
+                        writer_scope: self.cfg.points[writer_entry.0].scope, join,
+                    });
+                }
             }
         }
         if array_return {
@@ -1299,6 +1303,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 (*condition, *then_block, Then),
             (ConditionalRegion::Value { condition, else_block, .. }, 0, Some(1)) =>
                 (*condition, *else_block, Else),
+            (ConditionalRegion::Value { condition, then_block, .. }, 1, Some(1)) =>
+                (*condition, *then_block, Then),
             _ => return None,
         };
         if !matches!(calls.structure.checked_types.expressions.get(&condition_ordinal), Some(ScalarType::Bool))
@@ -1308,6 +1314,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
             return None;
         }
         self.aggregate_facts.literal_array_writer = Some(writer);
+        if let (ConditionalRegion::Value { else_block, .. }, 1, Some(1)) =
+            (region, then_branch.items.len(), else_branch.map(|block| block.items.len()))
+        {
+            self.aggregate_facts.literal_array_other_writer = Some(*else_block);
+        }
         Some((ordinal, side))
     }
 
@@ -4061,22 +4072,29 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             array_rebind = Some((install, slot.destination));
                         }
                         self.record_frozen_install(slot.destination, rhs_point);
+                        let other_writer = item_index == 0
+                            && self.aggregate_facts.literal_array_other_writer == Some(ordinal);
                         let literal_writer = (scope == ReferenceScopeId(0) && item_index == 1)
                             || (item_index == 0 && self.aggregate_facts.literal_array_writer == Some(ordinal));
-                        if literal_writer && existing_prepared
+                        if (literal_writer || other_writer) && existing_prepared
                             && position == 0 && assignment.targets.len() == 1 && assignment.values.len() == 1
                             && self.aggregate_facts.literal_array_bind.is_some()
                             && matches!(output_types[position], ScalarType::RuntimeArray { .. })
                         {
                             if let Some(evaluation) = group.rhs_evaluations().next() {
                                 if let Some(argument) = self.literal_array_argument(evaluation.expression, rhs_point) {
-                                    self.aggregate_facts.literal_array_write = Some(aggregate::LiteralArrayWrite {
+                                    let write = Some(aggregate::LiteralArrayWrite {
                                         rhs: rhs_point,
                                         writer: install,
                                         producer: evaluation.expression,
                                         destination: slot.destination,
                                         argument,
                                     });
+                                    if other_writer {
+                                        self.aggregate_facts.literal_array_other_write = write;
+                                    } else {
+                                        self.aggregate_facts.literal_array_write = write;
+                                    }
                                 }
                             }
                         }
