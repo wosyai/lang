@@ -3286,10 +3286,22 @@ impl<'a> ReferenceFlowBuilder<'a> {
         {
             return;
         }
-        let Some(ScalarExpression::Integer { value, .. }) = receiver.allocation_length.as_ref() else {
-            return;
+        let Some(length_expression) = receiver.allocation_length.as_ref() else { return };
+        let extent = match length_expression {
+            ScalarExpression::Integer { value, .. } => {
+                let Ok(elements) = u64::try_from(value.clone()) else { return };
+                aggregate::FreshArrayExtent::Literal(elements)
+            }
+            ScalarExpression::Name { .. } if matches!(self.call_sites.boundary.root_outputs.as_slice(),
+                [RootOutputType { output: 0, ty: ScalarType::RuntimeArray { .. } }]) =>
+            {
+                if self.literal_array_formal_binding(length.expression, &ScalarType::U64).is_none() {
+                    return;
+                }
+                aggregate::FreshArrayExtent::Formal
+            }
+            _ => return,
         };
-        let Ok(elements) = u64::try_from(value.clone()) else { return };
         let (Some(bind), Some(placeholder)) = (self.cursor, initializer) else { return };
         if !self.aggregate_facts.allocation_slots.contains_key(&bind) {
             return;
@@ -3299,8 +3311,30 @@ impl<'a> ReferenceFlowBuilder<'a> {
             placeholder,
             position,
             length_occurrence: length.expression,
-            elements,
+            extent,
         });
+    }
+
+    fn literal_array_formal_binding(
+        &self,
+        occurrence: OccurrenceOrdinal,
+        ty: &ScalarType,
+    ) -> Option<&ReferenceBindingId> {
+        let [formal] = self.call_sites.boundary.parameters.as_slice() else { return None };
+        if formal.ordinal != 0 || &formal.ty != ty
+            || self.call_sites.structure.checked_types.expressions.get(&occurrence) != Some(ty)
+        {
+            return None;
+        }
+        let span = self.call_sites.occurrences.get(occurrence.0)?.span;
+        let PlainNameIdentity::Lexical(binding) =
+            self.prepared_name_identity(occurrence, span).ok().flatten()?
+        else { return None };
+        let structure = &self.call_sites.structure;
+        let formal = parameter_binding_identity(
+            &self.source, self.function_span, structure.blocks[structure.root.0].span, formal,
+        );
+        (binding == &formal).then_some(binding)
     }
 
     /// A scalar operand enters the private route only as the sole checked
@@ -3309,7 +3343,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         &self,
         producer: OccurrenceOrdinal,
         rhs: CfgPointId,
-    ) -> Option<Option<CfgPointId>> {
+    ) -> Option<Option<aggregate::LiteralArrayArgument>> {
         let CfgPointKind::Call { output: 0, argument_points, .. } = &self.cfg.points.get(rhs.0)?.kind
         else { return None };
         match (self.call_sites.boundary.parameters.as_slice(), argument_points.as_slice()) {
@@ -3321,16 +3355,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 ))? else { return None };
                 let point = self.cfg.points.get(read.0)?;
                 let CfgPointKind::Read { binding } = &point.kind else { return None };
-                let span = self.call_sites.occurrences.get(argument.0)?.span;
-                let PlainNameIdentity::Lexical(argument_binding) =
-                    self.prepared_name_identity(*argument, span).ok().flatten()?
-                else { return None };
-                let formal_binding = parameter_binding_identity(
-                    &self.source, self.function_span, structure.blocks[structure.root.0].span, formal,
-                );
-                (binding == &formal_binding && argument_binding == binding
-                    && structure.checked_types.expressions.get(argument) == Some(&formal.ty))
-                    .then_some(Some(*read))
+                (self.literal_array_formal_binding(*argument, &formal.ty) == Some(binding))
+                    .then_some(Some(aggregate::LiteralArrayArgument {
+                        read: *read, occurrence: *argument,
+                    }))
             }
             _ => None,
         }
@@ -3964,13 +3992,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             && matches!(output_types[position], ScalarType::RuntimeArray { .. })
                         {
                             if let Some(evaluation) = group.rhs_evaluations().next() {
-                                if let Some(argument_read) = self.literal_array_argument(evaluation.expression, rhs_point) {
+                                if let Some(argument) = self.literal_array_argument(evaluation.expression, rhs_point) {
                                     self.aggregate_facts.literal_array_write = Some(aggregate::LiteralArrayWrite {
                                         rhs: rhs_point,
                                         writer: install,
                                         producer: evaluation.expression,
                                         destination: slot.destination,
-                                        argument_read,
+                                        argument,
                                     });
                                 }
                             }

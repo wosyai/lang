@@ -100,6 +100,18 @@ impl AggregateFlowFacts {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FreshArrayExtent {
+    Literal(u64),
+    Formal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplacementArrayExtent {
+    Literal(u64),
+    Argument { occurrence: usize },
+}
+
 /// Exact validated extent at an ordinary root allocation, not a type extent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct LiteralArrayBind {
@@ -107,7 +119,13 @@ pub(super) struct LiteralArrayBind {
     pub(super) placeholder: CfgPointId,
     pub(super) position: BlockPosition,
     pub(super) length_occurrence: OccurrenceOrdinal,
-    pub(super) elements: u64,
+    pub(super) extent: FreshArrayExtent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LiteralArrayArgument {
+    pub(super) read: CfgPointId,
+    pub(super) occurrence: OccurrenceOrdinal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,7 +134,7 @@ pub(super) struct LiteralArrayWrite {
     pub(super) writer: CfgPointId,
     pub(super) producer: OccurrenceOrdinal,
     pub(super) destination: OccurrenceOrdinal,
-    pub(super) argument_read: Option<CfgPointId>,
+    pub(super) argument: Option<LiteralArrayArgument>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -668,14 +686,14 @@ impl AggregateFlowFacts {
                     Finished
                 }
                 (Original, CfgPointKind::Read { .. })
-                    if self.literal_array_write.is_some_and(|write| write.argument_read == Some(point.id)) =>
+                    if self.literal_array_write.is_some_and(|write| write.argument.is_some_and(|argument| argument.read == point.id)) =>
                     ArgumentRead(point.id),
                 (phase @ (Original | ArgumentRead(_)), CfgPointKind::Call { output: 0,
                     target: ResolvedCallTarget::ModuleCallable {
                         concrete: ConcreteCallSelection::Declaration, ..
                     }, argument_points, .. })
                     if self.literal_array_write.is_some_and(|write| write.rhs == point.id
-                        && match (phase, write.argument_read, argument_points.as_slice()) {
+                        && match (phase, write.argument.map(|argument| argument.read), argument_points.as_slice()) {
                             (Original, None, []) => true,
                             (ArgumentRead(seen), Some(expected), [actual]) => seen == expected && seen == *actual,
                             _ => false,
@@ -1548,7 +1566,7 @@ pub(crate) enum ClosedLiteralArray {
     FreshLeaf {
         receipt: OriginalArrayReceipt,
         length_occurrence: usize,
-        elements: u64,
+        extent: FreshArrayExtent,
         output: usize,
     },
     Replacement {
@@ -1559,7 +1577,7 @@ pub(crate) enum ClosedLiteralArray {
         destination: usize,
         exit: CfgPointId,
         block: usize,
-        elements: u64,
+        extent: ReplacementArrayExtent,
     },
 }
 
@@ -2111,13 +2129,21 @@ fn enroll_literal_array_pair(result: &mut ClosedAggregates, pair: LiteralArrayPa
     if caller == callee || result.bodies.contains_key(&caller) || write.rhs == write.writer {
         return;
     }
+    let FreshArrayExtent::Literal(original_elements) = original.extent else { return };
+    let replacement_extent = match fresh.extent {
+        FreshArrayExtent::Literal(elements) => ReplacementArrayExtent::Literal(elements),
+        FreshArrayExtent::Formal => {
+            let Some(argument) = write.argument else { return };
+            ReplacementArrayExtent::Argument { occurrence: argument.occurrence.0 }
+        }
+    };
     let to_receipt = |allocation: LiteralArrayBind| OriginalArrayReceipt {
         origin: allocation.bind,
         allocation: (allocation.position.block.0, allocation.position.item),
     };
     let producer = ClosedLiteralArray::FreshLeaf {
         receipt: to_receipt(fresh), length_occurrence: fresh.length_occurrence.0,
-        elements: fresh.elements, output: final_output.0,
+        extent: fresh.extent, output: final_output.0,
     };
     if let Some(existing) = result.bodies.get(&callee) {
         if existing.literal_array != Some(producer) {
@@ -2130,9 +2156,9 @@ fn enroll_literal_array_pair(result: &mut ClosedAggregates, pair: LiteralArrayPa
     plan.scope_exits.insert(block.0, exit);
     plan.literal_array = Some(ClosedLiteralArray::Replacement {
         original: to_receipt(original), original_length_occurrence: original.length_occurrence.0,
-        original_elements: original.elements,
+        original_elements,
         call: write.producer.0, destination: write.destination.0, exit, block: block.0,
-        elements: fresh.elements,
+        extent: replacement_extent,
     });
 }
 
@@ -2160,7 +2186,7 @@ fn install_literal_array_plans(
         let Some(signature) = body.sites.checked_call_signatures.get(&write.producer) else { continue };
         let [output] = signature.outputs.outputs.as_slice() else { continue };
         let same_parameters = match (
-            write.argument_read,
+            write.argument,
             body.sites.boundary.parameters.as_slice(),
             leaf.sites.boundary.parameters.as_slice(),
             signature.parameters.as_slice(),
@@ -2171,7 +2197,10 @@ fn install_literal_array_plans(
                     && &caller.ty == actual && &callee.ty == actual,
             _ => false,
         };
-        if !same_parameters || !same_runtime_array_type(&output.ty, &returned.ty) {
+        if !same_parameters || !same_runtime_array_type(&output.ty, &returned.ty)
+            || (fresh.extent == FreshArrayExtent::Formal
+                && !matches!(signature.parameters.as_slice(), [ScalarType::U64]))
+        {
             continue;
         }
         enroll_literal_array_pair(result, LiteralArrayPair {
@@ -2938,7 +2967,7 @@ mod tests {
             placeholder: CfgPointId(bind - 1),
             position: BlockPosition { block: BlockOrdinal(0), item: 0 },
             length_occurrence: OccurrenceOrdinal(length),
-            elements,
+            extent: FreshArrayExtent::Literal(elements),
         };
         let pair = LiteralArrayPair {
             caller: (0, 0, None),
@@ -2951,7 +2980,7 @@ mod tests {
                 writer: CfgPointId(4),
                 producer: OccurrenceOrdinal(2),
                 destination: OccurrenceOrdinal(3),
-                argument_read: None,
+                argument: None,
             },
             exit: CfgPointId(5),
             block: BlockOrdinal(0),
@@ -2962,7 +2991,7 @@ mod tests {
         assert_eq!(plans.bodies[&pair.callee].literal_array, Some(ClosedLiteralArray::FreshLeaf {
             receipt: OriginalArrayReceipt { origin: CfgPointId(3), allocation: (0, 0) },
             length_occurrence: 2,
-            elements: 11,
+            extent: FreshArrayExtent::Literal(11),
             output: 3,
         }));
         let caller = &plans.bodies[&pair.caller];
@@ -2974,7 +3003,7 @@ mod tests {
             destination: 3,
             exit: CfgPointId(5),
             block: 0,
-            elements: 11,
+            extent: ReplacementArrayExtent::Literal(11),
         }));
         assert_eq!(caller.scope_exits, BTreeMap::from([(0, CfgPointId(5))]));
         assert!(caller.releases.is_empty());

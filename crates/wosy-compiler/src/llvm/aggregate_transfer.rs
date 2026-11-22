@@ -1,5 +1,5 @@
 use super::*;
-use crate::scalar::{ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, ConcreteCallSelection, ScalarBinding};
+use crate::scalar::{ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, ConcreteCallSelection, FreshArrayExtent, ReplacementArrayExtent, ScalarBinding};
 use inkwell::types::AnyType;
 
 pub(super) struct InitializerEmitter<'ctx, 'plan> {
@@ -65,6 +65,7 @@ enum LiteralArrayReceipt<'ctx> {
     Original {
         base: PointerValue<'ctx>,
         storage: Option<(PointerValue<'ctx>, PointerValue<'ctx>)>,
+        argument_extent: Option<inkwell::values::IntValue<'ctx>>,
     },
     Fresh(PointerValue<'ctx>),
     Finished,
@@ -268,6 +269,39 @@ pub(super) fn has_literal_array_plan(state: &EmitState<'_, '_>) -> bool {
     state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan.literal_array.is_some())
 }
 
+fn literal_array_u64_formal<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+) -> Result<inkwell::values::IntValue<'ctx>, String> {
+    let value = builder.get_insert_block().and_then(|block| block.get_parent())
+        .and_then(|function| function.get_nth_param(0))
+        .ok_or_else(|| "missing checked array extent formal".to_owned())?;
+    let BasicValueEnum::IntValue(value) = value else {
+        return Err("checked array extent formal is not an integer".into());
+    };
+    if value.get_type().get_bit_width() != 64 {
+        return Err("checked array extent formal is not U64".into());
+    }
+    Ok(value)
+}
+
+pub(super) fn checked_array_formal_extent<'ctx>(
+    state: &EmitState<'ctx, '_>,
+    binding: &ScalarBinding,
+    expression: &ScalarExpression,
+) -> Result<Option<inkwell::values::IntValue<'ctx>>, String> {
+    let Some(ClosedLiteralArray::FreshLeaf { receipt, length_occurrence, extent: FreshArrayExtent::Formal, .. }) =
+        state.aggregate.as_ref().and_then(|aggregate| aggregate.plan.literal_array)
+    else { return Ok(None) };
+    if !state.body_call_nodes.is_some_and(|nodes|
+        nodes.binding_position(binding) == Some(receipt.allocation)
+            && nodes.expression_ordinal(expression) == Some(length_occurrence))
+    {
+        return Err("checked array extent formal does not match its allocation".into());
+    }
+    // The typed route proves an immutable direct read of formal zero.
+    Ok(Some(literal_array_u64_formal(&state.builder)?))
+}
+
 pub(super) fn enroll_literal_array_allocation<'ctx>(
     state: &mut EmitState<'ctx, '_>,
     binding: &ScalarBinding,
@@ -277,23 +311,27 @@ pub(super) fn enroll_literal_array_allocation<'ctx>(
 ) -> Result<(), String> {
     let Some(aggregate) = &mut state.aggregate else { return Err("missing checked literal array allocation plan".into()) };
     let Some(plan) = aggregate.plan.literal_array else { return Err("missing checked literal array allocation".into()) };
-    let (receipt, extent, elements) = match plan {
-        ClosedLiteralArray::FreshLeaf { receipt, length_occurrence, elements, .. } =>
-            (receipt, length_occurrence, elements),
+    let (receipt, occurrence, extent) = match plan {
+        ClosedLiteralArray::FreshLeaf { receipt, length_occurrence, extent, .. } =>
+            (receipt, length_occurrence, extent),
         ClosedLiteralArray::Replacement { original, original_length_occurrence, original_elements, .. } =>
-            (original, original_length_occurrence, original_elements),
+            (original, original_length_occurrence, FreshArrayExtent::Literal(original_elements)),
+    };
+    let extent_matches = match extent {
+        FreshArrayExtent::Literal(elements) => length.get_zero_extended_constant() == Some(elements),
+        FreshArrayExtent::Formal => length == literal_array_u64_formal(&state.builder)?,
     };
     let actual_extent = binding.receivers.first().and_then(|receiver| receiver.allocation_length.as_ref())
         .and_then(|expression| state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)));
     if state.body_call_nodes.and_then(|nodes| nodes.binding_position(binding)) != Some(receipt.allocation)
-        || actual_extent != Some(extent)
-        || length.get_zero_extended_constant() != Some(elements)
+        || actual_extent != Some(occurrence)
+        || !extent_matches
         || storage.is_some() != matches!(plan, ClosedLiteralArray::Replacement { .. })
         || !matches!(aggregate.literal_array_receipt, LiteralArrayReceipt::Awaiting)
     {
         return Err("checked literal array allocation does not match its receipt".into());
     }
-    aggregate.literal_array_receipt = LiteralArrayReceipt::Original { base, storage };
+    aggregate.literal_array_receipt = LiteralArrayReceipt::Original { base, storage, argument_extent: None };
     Ok(())
 }
 
@@ -311,6 +349,34 @@ fn release_literal_array_base<'ctx>(
         super::ownership::RuntimeArrayRelease { pointer: base.into(), live: None })
 }
 
+pub(super) fn capture_checked_array_argument_extent<'ctx>(
+    state: &mut EmitState<'ctx, '_>,
+    expression: &ScalarExpression,
+    arguments: &[ScalarExpression],
+    values: &[EmitValue<'ctx>],
+) -> Result<(), String> {
+    let Some(aggregate) = state.aggregate.as_mut() else { return Ok(()) };
+    let Some(ClosedLiteralArray::Replacement {
+        call, extent: ReplacementArrayExtent::Argument { occurrence }, ..
+    }) = aggregate.plan.literal_array else { return Ok(()) };
+    let Some(nodes) = state.body_call_nodes else { return Err("missing checked extent call context".into()) };
+    if nodes.expression_ordinal(expression) != Some(call) {
+        return Ok(());
+    }
+    let ([argument], [EmitValue::Basic(BasicValueEnum::IntValue(extent))]) = (arguments, values)
+        else { return Err("checked array extent requires its one scalar argument".into()) };
+    let LiteralArrayReceipt::Original { storage: Some(_), argument_extent, .. } =
+        &mut aggregate.literal_array_receipt
+    else { return Err("checked array extent has no original receipt".into()) };
+    if nodes.expression_ordinal(argument) != Some(occurrence) || extent.get_type().get_bit_width() != 64
+        || argument_extent.is_some()
+    {
+        return Err("checked array extent argument does not match its occurrence".into());
+    }
+    *argument_extent = Some(*extent);
+    Ok(())
+}
+
 pub(super) fn install_literal_array_replacement<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
@@ -318,7 +384,7 @@ pub(super) fn install_literal_array_replacement<'ctx>(
     value: &EmitValue<'ctx>,
 ) -> Result<(), String> {
     let Some(aggregate) = state.aggregate.as_mut() else { return Err("missing checked literal array plan".into()) };
-    let Some(ClosedLiteralArray::Replacement { call: planned, elements, .. }) = aggregate.plan.literal_array
+    let Some(ClosedLiteralArray::Replacement { call: planned, extent, .. }) = aggregate.plan.literal_array
         else { return Err("missing checked literal array replacement".into()) };
     if call != planned {
         return Err("checked literal array replacement has a different call occurrence".into());
@@ -326,12 +392,19 @@ pub(super) fn install_literal_array_replacement<'ctx>(
     let EmitValue::Basic(BasicValueEnum::PointerValue(fresh)) = value else {
         return Err("checked literal array replacement has no backing".into());
     };
-    let LiteralArrayReceipt::Original { base: original, storage: Some((destination, length_slot)) } =
+    let LiteralArrayReceipt::Original {
+        base: original, storage: Some((destination, length_slot)), argument_extent,
+    } =
         std::mem::replace(&mut aggregate.literal_array_receipt, LiteralArrayReceipt::Finished)
     else { return Err("checked literal array replacement has no original receipt".into()) };
+    let length = match (extent, argument_extent) {
+        (ReplacementArrayExtent::Literal(elements), None) => context.i64_type().const_int(elements, false),
+        (ReplacementArrayExtent::Argument { .. }, Some(length)) => length,
+        _ => return Err("checked array replacement has no matching extent".into()),
+    };
     release_literal_array_base(context, state, original)?;
     state.builder.build_store(destination, *fresh).map_err(builder_error)?;
-    state.builder.build_store(length_slot, context.i64_type().const_int(elements, false)).map_err(builder_error)?;
+    state.builder.build_store(length_slot, length).map_err(builder_error)?;
     state.aggregate.as_mut().expect("checked literal array replacement").literal_array_receipt =
         LiteralArrayReceipt::Fresh(*fresh);
     Ok(())
@@ -978,7 +1051,7 @@ pub(super) fn commit_return<'ctx>(
         {
             return Err("checked fresh literal array return does not match its output occurrence".into());
         }
-        let LiteralArrayReceipt::Original { base, storage: None } =
+        let LiteralArrayReceipt::Original { base, storage: None, argument_extent: None } =
             std::mem::replace(&mut aggregate.literal_array_receipt, LiteralArrayReceipt::Finished)
         else { return Err("checked fresh literal array return has no original receipt".into()) };
         // The admitted immutable direct binding returns the recorded LLVM SSA

@@ -231,6 +231,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                         context,
                         state,
                         target,
+                        expression,
                         receiver.as_deref(),
                         name,
                         arguments,
@@ -455,6 +456,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                         context,
                         state,
                         target,
+                        expression,
                         receiver.as_deref(),
                         name,
                         arguments,
@@ -749,6 +751,7 @@ fn emit_prepared_call<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     selected: &PreparedCall,
+    expression: &ScalarExpression,
     receiver: Option<&str>,
     name: &str,
     arguments: &[ScalarExpression],
@@ -782,6 +785,7 @@ fn emit_prepared_call<'ctx, 'module>(
         return Err(state.missing_prepared_signature(target));
     };
     let values = emit_contextual_arguments(context, state, arguments, parameters, project)?;
+    aggregate_transfer::capture_checked_array_argument_extent(state, expression, arguments, &values)?;
     emit_call_values(context, state, target, values)
 }
 

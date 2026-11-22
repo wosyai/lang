@@ -1611,13 +1611,11 @@ fn store_binding_outputs<'ctx, 'module>(
             .allocation_length
             .as_ref()
             .ok_or_else(|| "runtime allocation has no length".to_owned())?;
-        let length = take_basic(emit_typed_expression(
-            context,
-            state,
-            length,
-            &ScalarType::U64,
-        )?)?
-        .into_int_value();
+        let length = match aggregate_transfer::checked_array_formal_extent(state, binding, length)? {
+            Some(length) => length,
+            None => take_basic(emit_typed_expression(context, state, length, &ScalarType::U64)?)?
+                .into_int_value(),
+        };
         let slot = emit_runtime_array_allocation(context, state, element, length)?;
         aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
         let private_literal = aggregate_transfer::has_literal_array_plan(state);
