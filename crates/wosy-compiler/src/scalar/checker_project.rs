@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
-        check_integer_requirement_activity, check_integer_requirements_with_calls, check_integer_return_bound_with_shows, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
+        check_integer_requirement_activity, check_integer_requirements_with_calls, check_integer_return_bound_with_shows, collect_exact_unit_requirement_failures, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument,
         proves_requirement_with_imported_root_local, ImportedEntryGuard, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
@@ -579,6 +579,7 @@ fn walk_package_initialization<const COLLECT: bool>(
                         let ActualCallResult::Integer(value) = run_initializer_call(
                             topology, actual, outputs.primary, ty,
                             |argument, argument_type| initialized_integer_argument(topology, &storage, argument, argument_type),
+                            None,
                         )? else {
                             return Err(ProjectCheck::Unsupported);
                         };
@@ -664,10 +665,14 @@ fn check_initializer_expression<const COLLECT: bool>(
         }
         return Ok(StartupLane::Feasible);
     }
-    if COLLECT {
-        return Err(ProjectCheck::Unsupported);
+    let collection = if COLLECT {
+        Some(failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?)
+    } else { None };
+    match run_initializer_call(topology, actual, expression, &ScalarType::Unit, |_, _| None, collection)? {
+        ActualCallResult::Unit => Ok(StartupLane::Feasible),
+        ActualCallResult::EmptyUnit if COLLECT => Ok(StartupLane::Empty),
+        _ => Err(ProjectCheck::Unsupported),
     }
-    run_initializer_call(topology, actual, expression, &ScalarType::Unit, |_, _| None).map(|_| StartupLane::Feasible)
 }
 
 fn run_initializer_call<'a>(
@@ -676,6 +681,7 @@ fn run_initializer_call<'a>(
     occurrence: OccurrenceOrdinal,
     expected: &ScalarType,
     initialized_argument: impl Fn(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
+    failures: Option<&mut Vec<ProjectCheck>>,
 ) -> Result<ActualCallResult, ProjectCheck> {
     let Some(ModuleInitializationCallTarget::Direct {
         declaration,
@@ -697,7 +703,7 @@ fn run_initializer_call<'a>(
         }
         ActualProjectedArguments::Single(argument)
     };
-    actual.run(&topology.structure, occurrence, signature, arguments, &declaration.source, declaration.range, expected)
+    actual.run(&topology.structure, occurrence, signature, arguments, &declaration.source, declaration.range, expected, failures)
 }
 
 enum InitializerValue<'a> {
@@ -806,7 +812,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
             return Err(ProjectCheck::Unsupported);
         };
         let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::MissingRootOccurrences)?;
-        self.run(&caller.structure, call, signature, ActualProjectedArguments::Single(argument), source, *declaration_span, expected)
+        self.run(&caller.structure, call, signature, ActualProjectedArguments::Single(argument), source, *declaration_span, expected, None)
     }
 
     fn requirements(
@@ -841,6 +847,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         target_source: &SourceIdentity,
         target_span: ByteSpan,
         expected: &ScalarType,
+        failures: Option<&mut Vec<ProjectCheck>>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         let &(target_module, target_item) = structure.checker_direct_targets.get(&call)
             .ok_or(ProjectCheck::MissingRootOccurrences)?;
@@ -887,10 +894,18 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
             return Err(ProjectCheck::Unsupported);
         }
         let result = if *expected == ScalarType::Unit {
-            self.requirements(body, &owner.source, Some(exact)).map(|active| {
-                self.had_obligations |= active;
-                ActualCallResult::Unit
-            })
+            if let Some(failures) = failures {
+                collect_exact_unit_requirement_failures(body, exact).map(|(active, collected)| {
+                    self.had_obligations |= active;
+                    failures.extend(collected.failures.into_iter().map(|failure| project_failure(body, &owner.source, failure)));
+                    if collected.continued { ActualCallResult::Unit } else { ActualCallResult::EmptyUnit }
+                }).ok_or(ProjectCheck::Unsupported)
+            } else {
+                self.requirements(body, &owner.source, Some(exact)).map(|active| {
+                    self.had_obligations |= active;
+                    ActualCallResult::Unit
+                })
+            }
         } else if is_integer_type(expected)
             && body.structure.checker_directives.is_empty()
             && body.call_occurrences.is_empty()
@@ -3190,11 +3205,69 @@ mod tests {
         assert_eq!(check_package_initialization(&prepared), Err(failures.into_iter().next().unwrap()));
 
         let incomplete = format!(r#"%%start
-            unit() helper = fn {{}};
+            unit() leaf = fn {{}};
+            unit() helper = fn {{ core.require(false, {OUTPUT}); leaf(); }};
             core.require(false, {OUTPUT});
             helper();
         %%end"#);
         assert_eq!(collect_package_startup_failures(&prepare(&incomplete)), Err(ProjectCheck::Unsupported));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn startup_failure_collection_interleaves_exact_unit_calls_and_stops_after_empty_callee() {
+        let app = source("src/main.w", "collect-exact-unit-failures");
+        let text = format!(r#"%%start
+            unit(u8) helper = fn(value) {{
+                core.require(value < 2, {OUTPUT});
+                core.narrow(value < 5, {OUTPUT});
+                core.require(value < 4, {OUTPUT});
+            }};
+            core.require(false, {OUTPUT});
+            helper(3);
+            core.require(false, {OUTPUT});
+            helper(4);
+            if (true) {{
+                helper(5);
+                core.require(false, {OUTPUT});
+            }};
+            core.require(false, {OUTPUT});
+        %%end"#);
+        let prepared = prepare_checker_project(
+            vec![(declarations(&app, &text), Vec::new())], vec![app.clone()], inputs(),
+        ).unwrap();
+        let failures = collect_package_startup_failures(&prepared).unwrap();
+        let rows = failures.iter().map(|failure| {
+            let ProjectCheck::Failed { source, operation, directive, condition, axes, state, .. } = failure else {
+                panic!("expected authored failure");
+            };
+            assert_eq!(source, &app);
+            assert_eq!(state.row_count(), 1);
+            let value = if axes.is_empty() {
+                None
+            } else {
+                assert_eq!(axes.len(), 1);
+                let limits = state.intervals_at(0, 0).unwrap().collect::<Vec<_>>();
+                let [(first, last)] = limits.as_slice() else { panic!("expected exact callee state"); };
+                assert_eq!(first, last);
+                Some((*first).clone())
+            };
+            (*operation, directive.start as usize, &text[condition.start as usize..condition.end as usize], value)
+        }).collect::<Vec<_>>();
+        let top = text.match_indices("core.require(false").map(|(offset, _)| offset).collect::<Vec<_>>();
+        let first_callee = text.find("core.require(value < 2").unwrap();
+        let second_callee = text.find("core.require(value < 4").unwrap();
+        let narrowed = text.find("core.narrow(value < 5").unwrap();
+        assert_eq!(rows, [
+            (CheckerOperation::Require, top[0], "false", None),
+            (CheckerOperation::Require, first_callee, "value < 2", Some(3.into())),
+            (CheckerOperation::Require, top[1], "false", None),
+            (CheckerOperation::Require, first_callee, "value < 2", Some(4.into())),
+            (CheckerOperation::Require, second_callee, "value < 4", Some(4.into())),
+            (CheckerOperation::Require, first_callee, "value < 2", Some(5.into())),
+            (CheckerOperation::Narrow, narrowed, "value < 5", Some(5.into())),
+        ]);
+        assert_eq!(check_package_initialization(&prepared), Err(failures.into_iter().next().unwrap()));
     }
 
     #[cfg(feature = "internal-checker")]
