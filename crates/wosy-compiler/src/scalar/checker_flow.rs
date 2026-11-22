@@ -210,15 +210,18 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
     ) -> Option<&'a BigInt> {
         let output = self.output(structure, block, slot)?;
         self.value.get_or_init(|| {
-            let ScalarExpression::Binary { operator, left, right, .. } = output else { return None; };
-            let operation = AuthoredIntegerOperation::checked(operator)?;
-            if matches!(left.as_ref(), ScalarExpression::Binary { .. })
-                || matches!(right.as_ref(), ScalarExpression::Binary { .. })
-            {
+            let evaluate_closed = || {
                 let (min, max) = super::typecheck::integer_bounds(ty)?;
                 #[cfg(test)]
                 AUTHORED_RETURN_CALCULATIONS.with(|count| count.set(count.get() + 1));
-                return nested_authored_integer_return(output, slot.expression, structure, ty, &min, &max);
+                nested_authored_integer_return(output, slot.expression, structure, ty, &min, &max)
+            };
+            let ScalarExpression::Binary { operator, left, right, .. } = output else {
+                return is_authored_composite(output).then(evaluate_closed).flatten();
+            };
+            let operation = AuthoredIntegerOperation::checked(operator)?;
+            if is_authored_composite(left) || is_authored_composite(right) {
+                return evaluate_closed();
             }
             let parent = OccurrenceParent::Expression(slot.expression);
             let typed_operand = |edge| {
@@ -295,6 +298,16 @@ impl AuthoredIntegerOperation {
 }
 
 #[cfg(feature = "internal-checker")]
+fn is_authored_composite(expression: &ScalarExpression) -> bool {
+    match expression {
+        ScalarExpression::Binary { .. } => true,
+        ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } =>
+            !matches!(operand.as_ref(), ScalarExpression::Integer { .. }),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 fn nested_authored_integer_return<'a>(
     root: &'a ScalarExpression, root_ordinal: OccurrenceOrdinal, structure: &OccurrenceStructure,
     ty: &ScalarType, min: &BigInt, max: &BigInt,
@@ -303,6 +316,7 @@ fn nested_authored_integer_return<'a>(
     enum Frame<'a> {
         Left { right: Node<'a>, operation: AuthoredIntegerOperation },
         Right { left: Cow<'a, BigInt>, operation: AuthoredIntegerOperation },
+        Negate,
     }
     let fits = |value: &BigInt| value >= min && value <= max;
     let mut stack = Vec::new();
@@ -312,15 +326,25 @@ fn nested_authored_integer_return<'a>(
         if structure.checked_types.expressions.get(&ordinal) != Some(ty) {
             return None;
         }
+        let child = |edge| match structure.edges.get(&(OccurrenceParent::Expression(ordinal), edge)) {
+            Some(OccurrenceNode::Expression(ordinal)) => Some(*ordinal),
+            _ => None,
+        };
         if let ScalarExpression::Binary { operator, left, right, .. } = expression {
             let operation = AuthoredIntegerOperation::checked(operator)?;
-            let child = |edge| match structure.edges.get(&(OccurrenceParent::Expression(ordinal), edge)) {
-                Some(OccurrenceNode::Expression(ordinal)) => Some(*ordinal),
-                _ => None,
-            };
             stack.push(Frame::Left { right: (right, child(OccurrenceEdge::BinaryRight)?), operation });
             next = (left, child(OccurrenceEdge::BinaryLeft)?);
             continue;
+        }
+        if let ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } = expression {
+            if !matches!(operand.as_ref(), ScalarExpression::Integer { .. }) {
+                if min.sign() != num_bigint::Sign::Minus {
+                    return None;
+                }
+                stack.push(Frame::Negate);
+                next = (operand, child(OccurrenceEdge::UnaryOperand)?);
+                continue;
+            }
         }
         let mut value = concrete_integer_literal(expression)?;
         if !fits(&value) {
@@ -335,6 +359,16 @@ fn nested_authored_integer_return<'a>(
                 }
                 Some(Frame::Right { left, operation }) => {
                     let computed = operation.apply(left, value, min)?;
+                    if !fits(&computed) {
+                        return None;
+                    }
+                    value = Cow::Owned(computed);
+                }
+                Some(Frame::Negate) => {
+                    let computed = match value {
+                        Cow::Borrowed(value) => -value,
+                        Cow::Owned(value) => -value,
+                    };
                     if !fits(&computed) {
                         return None;
                     }

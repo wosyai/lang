@@ -6790,6 +6790,30 @@ mod tests {
         assert_eq!(count(), 1);
         assert_eq!(check_typed("u8", "(0 - 1) + 2", "true", "out <= 7", "", &["leaf"]), [Unsupported]);
         assert_eq!(count(), 1);
+        let check_i32 = |body: &str, where_guard: &str, ensures: &str, startup: &str, names: &[&str]| {
+            check_typed("i32", body, where_guard, ensures, startup, names)
+        };
+        assert_eq!(check_i32("-(3 + 4)", "true", "out == -7", "", &["leaf"]), [Proved]);
+        assert_eq!(count(), 1);
+        assert_eq!(check_i32("1 + -(2 * 4)", "true", "out == -7", "", &["leaf"]), [Proved]);
+        assert_eq!(count(), 1);
+        assert_eq!(check_i32("-(-(3 + 4))", "true", "out == 7", "", &["leaf", "cite"]), [Proved, Proved]);
+        assert_eq!(count(), 1);
+        assert_eq!(check_i32("-(2147483647 + 1)", "true", "out == -2147483648", "", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 1);
+        assert_eq!(check_i32("(-(-2147483648)) * 0", "true", "out == 0", "", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 1);
+        assert_eq!(check_i32("-(value + 1)", "true", "out == 0", "", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 1);
+        assert_eq!(check_i32("~(1 + 1)", "true", "out == -3", "", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 0);
+        assert_eq!(check_i32("-(2147483647 + 1)", "false", "out == -2147483648", "", &["leaf"]), [NoApplicableInputs]);
+        assert_eq!(count(), 0);
+        assert_eq!(check_i32("-(3 + 4)", "true", "out == -7", "i32 live = number(0);", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 0);
+        let negated_arm = "if (value == 0) { -(3 + 4) } else { 0 - 7 }";
+        assert_eq!(check_i32(negated_arm, "true", "out == -7", "", &["leaf"]), [Proved]);
+        assert_eq!(count(), 2);
         let deep = format!("7{}", " + 0".repeat(32));
         assert_eq!(check(&deep, "true", "out <= 7", "", &["another", "leaf"]), [Proved, Proved]);
         assert_eq!(count(), 1);
