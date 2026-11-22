@@ -4411,33 +4411,36 @@ fn transfer_reference_facts(
         aggregate_expiry_allowed = aggregate_expiry_allowed && strictly_forward
             && !matches!(&point.kind, CfgPointKind::MoveThrough { place, .. }
                 if !matches!(place, ScalarPlace::Dereference { .. }));
-        let dependencies = match &point.kind {
+        let pair;
+        let dependencies: &[CfgPointId] = match &point.kind {
             CfgPointKind::Invalidate { address_point, .. }
             | CfgPointKind::Release {
                 target: ReleaseTarget::Checked { address_point, .. },
-            } => vec![*address_point],
+            } => std::slice::from_ref(address_point),
             CfgPointKind::MoveThrough { pointer_point, .. }
-            | CfgPointKind::DeferredMoveThrough { pointer_point, .. } => vec![*pointer_point],
-            CfgPointKind::Assign { rhs_point, .. } => vec![*rhs_point],
-            CfgPointKind::ReturnOutput { value_point, .. } => vec![*value_point],
+            | CfgPointKind::DeferredMoveThrough { pointer_point, .. } => std::slice::from_ref(pointer_point),
+            CfgPointKind::Assign { rhs_point, .. } => std::slice::from_ref(rhs_point),
+            CfgPointKind::ReturnOutput { value_point, .. } => std::slice::from_ref(value_point),
             CfgPointKind::ConditionalOutput {
                 then_point,
                 else_point,
-            } => vec![*then_point, *else_point],
+            } => {
+                pair = [*then_point, *else_point];
+                &pair
+            }
             CfgPointKind::Call {
                 argument_points, ..
-            } => argument_points.clone(),
+            } => argument_points,
             CfgPointKind::AssignThrough {
                 rhs_point,
                 pointer_point,
                 ..
             } => {
-                vec![*rhs_point, *pointer_point]
+                pair = [*rhs_point, *pointer_point];
+                &pair
             }
-            CfgPointKind::ReadPlace { pointer_point, .. } => {
-                pointer_point.iter().copied().collect()
-            }
-            _ => Vec::new(),
+            CfgPointKind::ReadPlace { pointer_point, .. } => pointer_point.as_slice(),
+            _ => &[],
         };
         for dependency in dependencies {
             last_use[dependency.0] = point.id.0;
