@@ -86,7 +86,13 @@ pub(super) fn concrete_integer_literal(expression: &ScalarExpression) -> Option<
 pub(super) struct ImportedLocal<'a> {
     pub(super) position: usize,
     pub(super) values: IntegerSet,
-    pub(super) guards: Vec<(IntegerRelation, &'a BigInt)>,
+    pub(super) guards: Vec<ImportedEntryGuard<'a>>,
+}
+
+pub(super) struct ImportedEntryGuard<'a> {
+    pub(super) slot: usize,
+    pub(super) relation: IntegerRelation,
+    pub(super) bound: &'a BigInt,
 }
 
 type IntegerRow = Vec<Rc<IntegerSet>>;
@@ -803,24 +809,32 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool>(
                     let [receiver] = binding.receivers() else {
                         return None;
                     };
-                    let applies = match &origin.argument {
-                        CheckerIntegerCallArgument::Literal(value) =>
-                            local.guards.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound))),
-                        CheckerIntegerCallArgument::PlainName => {
-                            let PlainNameIdentity::Lexical(argument) =
-                                calls.prepared_plain_name(origin.argument_ordinal)?
-                            else {
-                                return None;
-                            };
-                            let (axis, ty) = roots.lookup(argument)?;
-                            if structure.checked_types.expressions.get(&origin.argument_ordinal)? != ty {
-                                return None;
+                    #[derive(Clone, Copy)]
+                    enum Argument<'a> {
+                        Literal(&'a BigInt),
+                        Axis(usize),
+                    }
+                    let mut arguments = [None; 2];
+                    for (slot, (ordinal, argument)) in origin.arguments.as_slice().iter().enumerate() {
+                        arguments[slot] = Some(match argument {
+                            CheckerIntegerCallArgument::Literal(value) => Argument::Literal(value),
+                            CheckerIntegerCallArgument::PlainName => {
+                                let PlainNameIdentity::Lexical(argument) = calls.prepared_plain_name(*ordinal)? else {
+                                    return None;
+                                };
+                                let (axis, ty) = roots.lookup(argument)?;
+                                if structure.checked_types.expressions.get(ordinal)? != ty {
+                                    return None;
+                                }
+                                Argument::Axis(axis)
                             }
-                            path.0.iter().all(|row| {
-                                local.guards.iter().all(|(relation, bound)| row[axis].every(*relation, bound))
-                            })
-                        }
-                    };
+                        });
+                    }
+                    let applies = local.guards.iter().all(|guard| match arguments.get(guard.slot).copied().flatten() {
+                        Some(Argument::Literal(value)) => guard.relation.accepts(value.cmp(guard.bound)),
+                        Some(Argument::Axis(axis)) => path.0.iter().all(|row| row[axis].every(guard.relation, guard.bound)),
+                        None => false,
+                    });
                     if !applies {
                         return None;
                     }

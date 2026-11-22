@@ -6044,8 +6044,27 @@ pub(super) struct ModuleStorageInstall {
 pub(super) struct CheckerIntegerCallOrigin {
     pub(super) binding: ReferenceBindingId,
     pub(super) call: OccurrenceOrdinal,
-    pub(super) argument_ordinal: OccurrenceOrdinal,
-    pub(super) argument: CheckerIntegerCallArgument,
+    pub(super) arguments: CheckerIntegerCallArguments,
+}
+
+#[cfg(any(test, feature = "internal-checker"))]
+type CheckerIntegerArgumentSite = (OccurrenceOrdinal, CheckerIntegerCallArgument);
+
+#[cfg(any(test, feature = "internal-checker"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CheckerIntegerCallArguments {
+    Single(CheckerIntegerArgumentSite),
+    Pair(Box<[CheckerIntegerArgumentSite; 2]>),
+}
+
+#[cfg(any(test, feature = "internal-checker"))]
+impl CheckerIntegerCallArguments {
+    pub(super) fn as_slice(&self) -> &[CheckerIntegerArgumentSite] {
+        match self {
+            Self::Single(site) => std::slice::from_ref(site),
+            Self::Pair(sites) => sites.as_ref(),
+        }
+    }
 }
 
 #[cfg(any(test, feature = "internal-checker"))]
@@ -7950,43 +7969,47 @@ impl StructuralWalker<'_, '_> {
     }
 
     #[cfg(any(test, feature = "internal-checker"))]
-    fn checker_integer_call_argument(
+    fn checker_integer_call_arguments(
         &self,
         binding: &ScalarBinding,
         call: OccurrenceOrdinal,
-    ) -> Option<(OccurrenceOrdinal, CheckerIntegerCallArgument)> {
+    ) -> Option<CheckerIntegerCallArguments> {
         let ScalarExpression::Call { arguments, .. } = &binding.value else {
             return None;
         };
-        let [source_argument] = arguments.as_slice() else {
-            return None;
-        };
         let signature = self.checked_call_signatures.get(&call)?;
-        let [parameter] = signature.parameters.as_slice() else {
-            return None;
-        };
         let [output] = signature.outputs.outputs.as_slice() else {
             return None;
         };
-        let OccurrenceNode::Expression(argument) = self.structure.edges.get(&(
-            OccurrenceParent::Expression(call),
-            OccurrenceEdge::CallArgument(0),
-        ))? else {
-            return None;
-        };
-        if !is_integer_type(parameter)
-            || !is_integer_type(&output.ty)
-            || output.ty != binding.declared_type
-            || self.structure.checked_types.expressions.get(argument)? != parameter
-        {
+        if !is_integer_type(&output.ty) || output.ty != binding.declared_type {
             return None;
         }
-        let origin = match source_argument {
-            ScalarExpression::Integer { value, .. } => CheckerIntegerCallArgument::Literal(value.clone()),
-            ScalarExpression::Name { .. } => CheckerIntegerCallArgument::PlainName,
-            _ => return None,
+        let describe = |slot, expression: &ScalarExpression, parameter: &ScalarType| {
+            let OccurrenceNode::Expression(argument) = self.structure.edges.get(&(
+                OccurrenceParent::Expression(call),
+                OccurrenceEdge::CallArgument(slot),
+            ))? else {
+                return None;
+            };
+            if !is_integer_type(parameter)
+                || self.structure.checked_types.expressions.get(argument)? != parameter
+            {
+                return None;
+            }
+            let origin = match expression {
+                ScalarExpression::Integer { value, .. } => CheckerIntegerCallArgument::Literal(value.clone()),
+                ScalarExpression::Name { .. } => CheckerIntegerCallArgument::PlainName,
+                _ => return None,
+            };
+            Some((*argument, origin))
         };
-        Some((*argument, origin))
+        match (arguments.as_slice(), signature.parameters.as_slice()) {
+            ([argument], [parameter]) => Some(CheckerIntegerCallArguments::Single(describe(0, argument, parameter)?)),
+            ([first, second], [first_ty, second_ty]) => Some(CheckerIntegerCallArguments::Pair(Box::new([
+                describe(0, first, first_ty)?, describe(1, second, second_ty)?,
+            ]))),
+            _ => None,
+        }
     }
 
     fn binding_region(
@@ -8021,9 +8044,9 @@ impl StructuralWalker<'_, '_> {
                 if self.structure.checker_integer_literals.contains_key(&outputs.primary) {
                     Some((callable.target_resolver, None))
                 } else {
-                    self.checker_integer_call_argument(binding, outputs.primary)
-                        .map(|(argument, value)| {
-                            (callable.target_resolver, Some((outputs.primary, argument, value)))
+                    self.checker_integer_call_arguments(binding, outputs.primary)
+                        .map(|arguments| {
+                            (callable.target_resolver, Some((outputs.primary, arguments)))
                         })
                 }
             }
@@ -8048,14 +8071,13 @@ impl StructuralWalker<'_, '_> {
                 if let Some((callable, from_call)) = checker_local.take() {
                     let binding = lexical.reference_id(callable.source, callable.function_span);
                     let key = (position.block, position.item);
-                    if let Some((call, argument_ordinal, argument)) = from_call {
+                    if let Some((call, arguments)) = from_call {
                         self.structure.checker_integer_call_locals.insert(
                             key,
                             CheckerIntegerCallOrigin {
                                 binding,
                                 call,
-                                argument_ordinal,
-                                argument,
+                                arguments,
                             },
                         );
                     } else {

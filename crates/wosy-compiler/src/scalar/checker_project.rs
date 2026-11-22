@@ -9,7 +9,7 @@ use super::{
     checker_flow::{
         check_integer_requirement_activity, check_integer_requirements_at_entry, check_integer_return_bound_with_shows, concrete_integer_literal, exact_integer_call_argument,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument,
-        proves_requirement_with_imported_root_local, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
+        proves_requirement_with_imported_root_local, ImportedEntryGuard, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
     control::{BindingInitialization, BlockItemKind, CheckedCallSignature, ConditionalRegion, InitializationName, InitializationStorage, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, ModuleInitializationTopology, NamespaceTarget},
     derive_block, derive_expression, project_from_declarations,
@@ -1195,15 +1195,16 @@ pub fn check_loaded_scalar_module_proof_call(
 #[cfg(feature = "internal-checker")]
 mod production_bound_reuse {
     use super::*;
+    use super::super::reference::ParameterSlot;
 
     struct VerifiedModuleBound<'a> {
         issuer: &'a PreparedProofModule,
         proof_identity: (&'a SourceIdentity, ByteSpan, &'a str),
         canonical_target: &'a ResolvedCallTarget,
         target_layout: ScalarTargetLayout,
-        parameter: &'a ScalarType,
+        parameters: &'a [ParameterSlot],
         output: &'a ScalarType,
-        guard: ActualSingleIntegerGuard<'a>,
+        guards: Vec<ImportedEntryGuard<'a>>,
         values: IntegerSet,
     }
 
@@ -1244,6 +1245,29 @@ mod production_bound_reuse {
         verified.consume(project, identity, scalar.modules[caller.0].target_layout, body, position, origin, &site.target, signature)
     }
 
+    fn verified_entry_guards<'a>(
+        body: &FunctionCallSites,
+        filter: &'a [CheckerPredicate],
+    ) -> Option<Vec<ImportedEntryGuard<'a>>> {
+        let bindings = body.boundary.checker_parameter_bindings.as_deref()?;
+        let mut guards = Vec::new();
+        for predicate in filter {
+            match predicate {
+                CheckerPredicate::Boolean(true) => (),
+                CheckerPredicate::Boolean(false) => return None,
+                CheckerPredicate::Integer(predicate) => {
+                    let slot = bindings.iter().position(|binding| binding == &predicate.binding)?;
+                    guards.push(ImportedEntryGuard {
+                        slot,
+                        relation: IntegerRelation::from_operator(&predicate.operator)?,
+                        bound: &predicate.bound,
+                    });
+                }
+            }
+        }
+        Some(guards)
+    }
+
     impl<'a> VerifiedModuleBound<'a> {
         fn establish(
             issuer: &'a PreparedProofModule,
@@ -1254,12 +1278,15 @@ mod production_bound_reuse {
             if !plan.steps.items.is_empty() || !valid_arbitrary_proof_body(body) {
                 return None;
             }
-            let [parameter] = body.boundary.parameters.as_slice() else { return None; };
+            let parameters = body.boundary.parameters.as_slice();
+            if !matches!(parameters.len(), 1 | 2) {
+                return None;
+            }
             let [output] = body.boundary.results.as_slice() else { return None; };
             if output.ordinal != 0 {
                 return None;
             }
-            let guard = actual_single_integer_guard(body, plan.filter.as_deref().unwrap_or_default())?;
+            let guards = verified_entry_guards(body, plan.filter.as_deref().unwrap_or_default())?;
             let ProofCoverage::Applicable(paths) = observe_arbitrary_integer_returns(body, plan.filter.as_deref())?.ok()? else {
                 return None;
             };
@@ -1270,7 +1297,7 @@ mod production_bound_reuse {
             Some(Self {
                 issuer, proof_identity, canonical_target: plan.canonical_target,
                 target_layout: plan.typed.target.target_layout,
-                parameter: &parameter.ty, output: &output.ty, guard, values,
+                parameters, output: &output.ty, guards, values,
             })
         }
 
@@ -1285,17 +1312,19 @@ mod production_bound_reuse {
             target: &ResolvedCallTarget,
             signature: &CheckedCallSignature,
         ) -> Option<ScalarProofCallOutcome> {
-            let [parameter] = signature.parameters.as_slice() else { return None; };
             let [output] = signature.outputs.outputs.as_slice() else { return None; };
+            let arguments = origin.arguments.as_slice();
             if !std::ptr::eq(self.issuer, issuer) || self.proof_identity != identity
                 || self.canonical_target != target || self.target_layout != caller_layout
-                || self.parameter != parameter || self.output != &output.ty
-                || body.structure.checked_types.expressions.get(&origin.argument_ordinal) != Some(parameter)
-                || self.guard.always_rejects
+                || self.output != &output.ty || self.parameters.len() != signature.parameters.len()
+                || self.parameters.len() != arguments.len()
+                || self.parameters.iter().zip(&signature.parameters).zip(arguments).any(|((producer, caller), (ordinal, _))| {
+                    &producer.ty != caller || body.structure.checked_types.expressions.get(ordinal) != Some(caller)
+                })
             {
                 return None;
             }
-            let fact = ImportedLocal { position, values: self.values, guards: self.guard.comparisons };
+            let fact = ImportedLocal { position, values: self.values, guards: self.guards };
             Some(if proves_requirement_with_imported_root_local(body, fact)? {
                 ScalarProofCallOutcome::Established
             } else {
@@ -1897,6 +1926,7 @@ fn apply_verified_return_bound(
     let body = calls.function_body(module, item, None)?;
     let (position, origin) = root_local_import_requirement(body)?;
     let structure = &body.structure;
+    let [(argument_ordinal, _)] = origin.arguments.as_slice() else { return None; };
     let site = body.resolved_call_site(origin.call)?;
     let signature = body.checked_call_signatures.get(&origin.call)?;
     let [parameter] = signature.parameters.as_slice() else {
@@ -1909,7 +1939,7 @@ fn apply_verified_return_bound(
         || signature.parameters != verified.parameters
         || verified.output_slot != 0
         || output.ty != verified.output_type
-        || structure.checked_types.expressions.get(&origin.argument_ordinal)? != parameter
+        || structure.checked_types.expressions.get(argument_ordinal)? != parameter
     {
         return None;
     }
@@ -1918,7 +1948,7 @@ fn apply_verified_return_bound(
         match guard {
             VerifiedEntryGuard::Boolean(true) => {}
             VerifiedEntryGuard::Integer { slot: 0, ty, operator, bound } if ty == parameter =>
-                guards.push((IntegerRelation::from_operator(operator)?, bound)),
+                guards.push(ImportedEntryGuard { slot: 0, relation: IntegerRelation::from_operator(operator)?, bound }),
             _ => return None,
         }
     }
@@ -3235,8 +3265,9 @@ mod tests {
                 let signature = &body.checked_call_signatures[&origin.call];
                 assert_eq!(signature.parameters, [ScalarType::U8]);
                 assert_eq!(signature.outputs.outputs[0].ty, ScalarType::U8);
-                assert_eq!(body.structure.checked_types.expressions[&origin.argument_ordinal], ScalarType::U8);
-                assert_eq!(origin.argument, super::super::reference::CheckerIntegerCallArgument::Literal(BigInt::from(7)));
+                let [(ordinal, argument)] = origin.arguments.as_slice() else { panic!("expected one canonical argument"); };
+                assert_eq!(body.structure.checked_types.expressions[ordinal], ScalarType::U8);
+                assert_eq!(*argument, super::super::reference::CheckerIntegerCallArgument::Literal(BigInt::from(7)));
                 let directive = body.structure.checker_directives.values().next().unwrap();
                 let Some(CheckerPredicate::Integer(requirement)) = &directive.predicate else {
                     panic!("expected a typed integer requirement");
@@ -3244,7 +3275,8 @@ mod tests {
                 assert_eq!(requirement.binding, origin.binding);
             } else {
                 let origin = origin.expect("canonical plain-name argument");
-                assert_eq!(origin.argument, super::super::reference::CheckerIntegerCallArgument::PlainName);
+                let [(_, argument)] = origin.arguments.as_slice() else { panic!("expected one canonical argument"); };
+                assert_eq!(*argument, super::super::reference::CheckerIntegerCallArgument::PlainName);
             }
             assert_eq!(check_integer_requirements(body), None);
         }

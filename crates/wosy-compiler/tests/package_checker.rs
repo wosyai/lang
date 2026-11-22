@@ -837,3 +837,51 @@ fn standalone_show_is_a_verified_equality_in_the_selected_unused_entry_domain() 
         ScalarModuleProofOutcome::Unsupported,
     );
 }
+
+#[test]
+fn verified_bound_checks_both_ordered_typed_call_arguments_and_repeated_aliases() {
+    let identity = source();
+    let use_bound = |proof: &str, caller: &str, extra: &str| {
+        let text = format!(r#"%%start
+            u16(u8, u16) pair = fn(low, high) {{ if (low == 0) {{}}; high }};
+            u8(u8, u8) same = fn(low, high) {{ if (low == 0) {{}}; high }};
+            unit() accepted = fn {{ u16 result = pair(7, 3); core.require(result <= 3, {OUTPUT}); }};
+            unit() swapped = fn {{ u16 result = pair(3, 7); core.require(result <= 3, {OUTPUT}); }};
+            unit() first_hole = fn {{ u16 result = pair(4, 3); core.require(result <= 3, {OUTPUT}); }};
+            unit() second_hole = fn {{ u16 result = pair(7, 4); core.require(result <= 3, {OUTPUT}); }};
+            unit() exact_alias_pair = fn {{
+                u8 seed = 7;
+                u8 result = same(seed, seed);
+                core.require(result <= 10, {OUTPUT});
+            }};
+            unit() alias_second_hole = fn {{
+                u8 seed = 11;
+                u8 result = same(seed, seed);
+                core.require(result <= 10, {OUTPUT});
+            }};
+            proof bounds for pair(first, second) -> (out) where (first >= 5 && second <= 3) ensures (out <= 3) {{}}
+            proof aliases for same(first, second) -> (out) where (first >= 5 && second <= 10) ensures (out <= 10) {{}}
+            {extra}
+        %%end"#);
+        let (_, catalog) = wosy_compiler::parse_proof_source(identity.clone(), text, &[])
+            .ok().expect("valid named proof module");
+        check_loaded_scalar_module_proof_call(
+            (&identity, proof), (&identity, caller), Vec::new(), (catalog, Vec::new()),
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    assert_eq!(use_bound("bounds", "accepted", ""), ScalarProofCallOutcome::Established);
+    for caller in ["swapped", "first_hole", "second_hole"] {
+        assert_eq!(use_bound("bounds", caller, ""), ScalarProofCallOutcome::Unavailable, "{caller}");
+    }
+    assert_eq!(use_bound("aliases", "exact_alias_pair", ""), ScalarProofCallOutcome::Established);
+    assert_eq!(use_bound("aliases", "alias_second_hole", ""), ScalarProofCallOutcome::Unavailable);
+    assert_eq!(
+        use_bound("bounds", "accepted", "u16 reached = pair(7, 3);"),
+        ScalarProofCallOutcome::Unavailable,
+    );
+    let wrong_width = format!(
+        "unit() wrong_width = fn {{ u16 low = 7; u16 result = pair(low, 3); core.require(result <= 3, {OUTPUT}); }};",
+    );
+    assert_eq!(use_bound("bounds", "wrong_width", &wrong_width), ScalarProofCallOutcome::Unavailable);
+}
