@@ -422,6 +422,14 @@ pub(super) enum IntegerReturn<'a> {
     Const(&'a BigInt),
 }
 
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct ImmutableEntryRange<'a> {
+    pub(super) binding: &'a ReferenceBindingId,
+    pub(super) lower: &'a BigInt,
+    pub(super) upper: &'a BigInt,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct IntegerReturningPath<'a> {
     pub(super) value: IntegerReturn<'a>,
@@ -494,11 +502,19 @@ impl IntegerReturningPath<'_> {
     }
 
     #[cfg(feature = "internal-checker")]
-    pub(super) fn covers_first_immutable_entry(
-        &self, binding: &ReferenceBindingId, lower: &BigInt, upper: &BigInt,
+    pub(super) fn covers_immutable_entry_domain(
+        &self, first: ImmutableEntryRange<'_>, second: Option<ImmutableEntryRange<'_>>,
     ) -> bool {
-        self.axes.first().is_some_and(|axis| *axis == binding)
-            && self.state.0.iter().any(|row| row[0].covers_closed(lower, upper))
+        if self.axes.first() != Some(&first.binding) {
+            return false;
+        }
+        match second {
+            None => self.state.0.iter().any(|row| row[0].covers_closed(first.lower, first.upper)),
+            Some(second) if self.axes.get(1) == Some(&second.binding) => self.state.0.iter().any(|row| {
+                row[0].covers_closed(first.lower, first.upper) && row[1].covers_closed(second.lower, second.upper)
+            }),
+            Some(_) => false,
+        }
     }
 
     #[cfg(feature = "internal-checker")]
@@ -1419,4 +1435,38 @@ fn projected_axis_restriction_reuses_unchanged_rc_and_preserves_correlated_rows(
     assert!(!Rc::ptr_eq(&second[0], &to_change));
     assert_eq!(*second[0], range(5, 5).join(range(7, 8)));
     assert!(Rc::ptr_eq(&second[1], &changed_other));
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+#[test]
+fn strict_peer_typed_tuple_requires_both_axes_in_one_unchanged_return_row() {
+    let binding = |offset| ReferenceBindingId {
+        source: wosy_syntax::SourceIdentity::new("local".into(), "demo".into(), "src/main.w".into(), "tuple-row".into()),
+        function_span: super::ByteSpan::new(0, 9),
+        declaration_span: super::ByteSpan::new(offset, offset + 1),
+        block_span: super::ByteSpan::new(4, 9),
+        kind: super::ReferenceBindingKind::Declared,
+    };
+    let first = binding(1);
+    let second = binding(2);
+    let decoy = binding(3);
+    let returned = BigInt::from(7);
+    let path = IntegerReturningPath {
+        value: IntegerReturn::Const(&returned),
+        ty: &ScalarType::I16,
+        state: IntegerInputs(vec![
+            vec![Rc::new(IntegerSet::singleton(&BigInt::from(1))), Rc::new(IntegerSet::singleton(&BigInt::from(-8)))],
+            vec![Rc::new(IntegerSet::singleton(&BigInt::from(2))), Rc::new(IntegerSet::singleton(&BigInt::from(-3)))],
+        ]),
+        axes: vec![&first, &second],
+    };
+    fn singleton<'a>(binding: &'a ReferenceBindingId, value: &'a BigInt) -> ImmutableEntryRange<'a> {
+        ImmutableEntryRange { binding, lower: value, upper: value }
+    }
+    let one = BigInt::from(1);
+    let minus_eight = BigInt::from(-8);
+    let minus_three = BigInt::from(-3);
+    assert!(path.covers_immutable_entry_domain(singleton(&first, &one), Some(singleton(&second, &minus_eight))));
+    assert!(!path.covers_immutable_entry_domain(singleton(&first, &one), Some(singleton(&second, &minus_three))));
+    assert!(!path.covers_immutable_entry_domain(singleton(&first, &one), Some(singleton(&decoy, &minus_eight))));
 }

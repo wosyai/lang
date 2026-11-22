@@ -28,7 +28,7 @@ use super::{
     },
 };
 #[cfg(feature = "internal-checker")]
-use super::checker_flow::{observe_arbitrary_integer_returns, observe_unused_module_proof_returns};
+use super::checker_flow::{observe_arbitrary_integer_returns, observe_unused_module_proof_returns, ImmutableEntryRange};
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
 use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
@@ -2320,15 +2320,14 @@ struct UnusedPeerUse<'plan, 'project> {
     name: &'plan str,
     relation: IntegerRelation,
     bound: &'plan BigInt,
-    strict_entry: Option<StrictPeerEntry<'plan>>,
+    strict_entry: Option<StrictPeerDomain<'plan>>,
 }
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct StrictPeerEntry<'a> {
-    binding: &'a ReferenceBindingId,
-    lower: &'a BigInt,
-    upper: &'a BigInt,
+struct StrictPeerDomain<'a> {
+    first: ImmutableEntryRange<'a>,
+    second: Option<ImmutableEntryRange<'a>>,
 }
 
 #[cfg(all(test, feature = "internal-checker"))]
@@ -2340,11 +2339,11 @@ thread_local! {
 
 #[cfg(feature = "internal-checker")]
 fn strict_peer_entry_returns(
-    paths: &[super::checker_flow::IntegerReturningPath<'_>], entry: StrictPeerEntry<'_>,
+    paths: &[super::checker_flow::IntegerReturningPath<'_>], entry: StrictPeerDomain<'_>,
 ) -> bool {
     #[cfg(test)]
     STRICT_PEER_ENTRY_CHECKS.with(|count| count.set(count.get() + 1));
-    paths.iter().any(|path| path.covers_first_immutable_entry(entry.binding, entry.lower, entry.upper))
+    paths.iter().any(|path| path.covers_immutable_entry_domain(entry.first, entry.second))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2749,38 +2748,64 @@ impl PlannedModuleProof<'_> {
         Some((*relation, bound))
     }
 
-    fn closed_entry_admitted_by_peer<'a>(&'a self, leaf: &PlannedModuleProof<'_>) -> Option<StrictPeerEntry<'a>> {
+    fn closed_entry_admitted_by_peer<'a>(&'a self, leaf: &PlannedModuleProof<'_>) -> Option<StrictPeerDomain<'a>> {
         let boundary = &self.typed.body.boundary;
-        let ([binding], [parameter]) = (boundary.checker_parameter_bindings.as_deref()?, boundary.parameters.as_slice())
-            else { return None; };
-        let (lower, upper) = match self.filter.as_deref()? {
-            [CheckerPredicate::Integer(entry)] if entry.operator == BinaryOperator::Equal => (entry, entry),
-            [CheckerPredicate::Integer(left), CheckerPredicate::Integer(right)] => match (&left.operator, &right.operator) {
-                (BinaryOperator::GreaterEqual, BinaryOperator::LessEqual) => (left, right),
-                (BinaryOperator::LessEqual, BinaryOperator::GreaterEqual) => (right, left),
-                _ => return None,
-            },
+        let bindings = boundary.checker_parameter_bindings.as_deref()?;
+        let filter = self.filter.as_deref()?;
+        let range = |binding: &'a ReferenceBindingId, ty: &ScalarType, lower: &'a super::checker_flow::IntegerPredicate,
+                     upper: &'a super::checker_flow::IntegerPredicate| {
+            if &lower.binding != binding || &upper.binding != binding
+                || &lower.ty != ty || &upper.ty != ty || lower.bound > upper.bound
+            {
+                return None;
+            }
+            Some(ImmutableEntryRange { binding, lower: &lower.bound, upper: &upper.bound })
+        };
+        let (first, second) = match (bindings, boundary.parameters.as_slice(), filter) {
+            ([binding], [parameter], [CheckerPredicate::Integer(entry)]) if entry.operator == BinaryOperator::Equal =>
+                (range(binding, &parameter.ty, entry, entry)?, None),
+            ([binding], [parameter], [CheckerPredicate::Integer(left), CheckerPredicate::Integer(right)]) => {
+                let (lower, upper) = match (&left.operator, &right.operator) {
+                    (BinaryOperator::GreaterEqual, BinaryOperator::LessEqual) => (left, right),
+                    (BinaryOperator::LessEqual, BinaryOperator::GreaterEqual) => (right, left),
+                    _ => return None,
+                };
+                (range(binding, &parameter.ty, lower, upper)?, None)
+            }
+            ([first, second], [first_param, second_param], [CheckerPredicate::Integer(left), CheckerPredicate::Integer(right)])
+                if left.operator == BinaryOperator::Equal && right.operator == BinaryOperator::Equal =>
+            {
+                let (a, b) = if &left.binding == first { (left, right) } else { (right, left) };
+                (range(first, &first_param.ty, a, a)?, Some(range(second, &second_param.ty, b, b)?))
+            }
             _ => return None,
         };
-        if &lower.binding != binding || &upper.binding != binding
-            || lower.ty != parameter.ty || upper.ty != parameter.ty || lower.bound > upper.bound
-        {
-            return None;
-        }
+        let by_binding = |binding: &ReferenceBindingId| {
+            if binding == first.binding {
+                Some((first, &boundary.parameters[0].ty))
+            } else {
+                second.filter(|entry| binding == entry.binding).map(|entry| (entry, &boundary.parameters[1].ty))
+            }
+        };
         for predicate in leaf.filter.as_deref().unwrap_or_default() {
             let admits = match predicate {
                 CheckerPredicate::Boolean(value) => *value,
-                CheckerPredicate::Integer(atom) if &atom.binding == binding && atom.ty == lower.ty =>
-                    IntegerRelation::from_operator(&atom.operator)?.accepts_closed(&lower.bound, &upper.bound, &atom.bound),
-                CheckerPredicate::EntryDomain { binding: axis, values } if axis == binding =>
-                    values.covers_closed(&lower.bound, &upper.bound),
+                CheckerPredicate::Integer(atom) => {
+                    let (entry, ty) = by_binding(&atom.binding)?;
+                    &atom.ty == ty && IntegerRelation::from_operator(&atom.operator)?
+                        .accepts_closed(entry.lower, entry.upper, &atom.bound)
+                }
+                CheckerPredicate::EntryDomain { binding, values } => {
+                    let (entry, _) = by_binding(binding)?;
+                    values.covers_closed(entry.lower, entry.upper)
+                }
                 _ => return None,
             };
             if !admits {
                 return None;
             }
         }
-        Some(StrictPeerEntry { binding, lower: &lower.bound, upper: &upper.bound })
+        Some(StrictPeerDomain { first, second })
     }
 
     fn direct_peer_use(&self) -> Option<&str> {

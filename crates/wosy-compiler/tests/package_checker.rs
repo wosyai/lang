@@ -1110,6 +1110,40 @@ fn named_proof_peer_use_checks_a_closed_interval_in_one_returned_entry_row() {
 }
 
 #[test]
+fn named_proof_peer_use_checks_a_mixed_width_exact_entry_tuple() {
+    let identity = source();
+    let check = |guard: &str, goal: &str, step: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "consumer",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(u8, i16) fixed = fn(byte, signed) {{
+                        if (byte < 5) {{}};
+                        if (signed < 0) {{ 7 }} else {{ 7 }}
+                    }};
+                    proof leaf for fixed(a, b) -> (out) where (a >= 5 && (b < -3 || b > 3)) ensures (out == 7) {{}}
+                    proof consumer for fixed(first, second) -> (out) where ({guard}) ensures ({goal}) {{
+                        {step}
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let use_leaf = "core.use(leaf(first, second));";
+    let good = "second == -8 && first == 6";
+    assert_eq!(check(good, "out == 7", use_leaf), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("first == 6 && second == -8", "out < 7", use_leaf), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("first == 4 && second == -8", "out == 7", use_leaf), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("first == 6 && second == 0", "out == 7", use_leaf), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("first == 6 && first == 6", "out == 7", use_leaf), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check(good, "out == 7", "core.use(leaf(second, first));"), ScalarModuleProofOutcome::Unsupported);
+    assert!(matches!(check("first == 256 && second == -8", "out == 7", use_leaf), ScalarModuleProofOutcome::Invalid(_)));
+}
+
+#[test]
 fn named_proof_peer_chain_is_iterative_and_shares_explicit_and_implicit_dependencies() {
     let identity = source();
     let check = |text: &str, names: &[&str]| {
