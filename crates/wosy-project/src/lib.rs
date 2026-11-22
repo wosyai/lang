@@ -253,7 +253,7 @@ pub fn load_reachable_source_graph(
         &mut node_by_path,
         &mut stack,
         &root_span,
-        root_key.2.clone(),
+        &root_key.2,
     )?;
     Ok(graph)
 }
@@ -267,7 +267,7 @@ fn visit_source(
     node_by_path: &mut HashMap<(String, String, PackageRelativePath), SourceNodeId>,
     stack: &mut Vec<SourceNodeId>,
     incoming: &SourceSpan,
-    requested_path: PackageRelativePath,
+    requested_path: &PackageRelativePath,
 ) -> Result<SourceNodeId, GraphLoadError> {
     if let Some(id) = node_by_path.get(key) {
         if graph.nodes[id.0].dfs_state == DfsState::Visiting {
@@ -300,7 +300,7 @@ fn visit_source(
                 binding: String::new(),
                 span: incoming.clone(),
             },
-            requested_path,
+            requested_path.clone(),
         )
     })?;
     let id = SourceNodeId(graph.nodes.len());
@@ -317,7 +317,7 @@ fn visit_source(
 
     for edge in &source.namespace_edges {
         let (target_project, target_path) = if edge.origin == package {
-            (source.source.project.clone(), edge.path.clone())
+            (source.source.project.as_str(), edge.path.clone())
         } else {
             let resolved = resolved_packages
                 .get(&edge.origin)
@@ -326,9 +326,9 @@ fn visit_source(
                 resolved.identity.path.as_path().join(edge.path.as_path()),
             )
             .map_err(|_| GraphLoadError::missing(edge, edge.path.clone()))?;
-            (resolved.identity.project.clone(), target_path)
+            (resolved.identity.project.as_str(), target_path)
         };
-        let target_key = source_key_parts(&target_project, &edge.origin, target_path);
+        let target_key = source_key_parts(target_project, &edge.origin, target_path);
         let target = visit_source(
             package,
             &target_key,
@@ -338,11 +338,11 @@ fn visit_source(
             node_by_path,
             stack,
             &edge.span,
-            edge.path.clone(),
+            &edge.path,
         )?;
         graph.nodes[id.0].namespace_edges.push(NamespaceEdge {
             origin: edge.origin.clone(),
-            path: target_key.2.clone(),
+            path: target_key.2,
             binding: edge.binding.clone(),
             span: edge.span.clone(),
             target,
